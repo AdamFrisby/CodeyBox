@@ -1,4 +1,5 @@
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
 
@@ -83,6 +84,33 @@ public sealed class PipelineTuningOptionsValidationTests
         opts.Validate();
         Assert.Null(opts.CSharpTestPassAuditorIdleTimeout);
         Assert.Null(opts.CSharpTestPassBlameHangTimeout);
+    }
+
+    [Fact]
+    public void Validate_NegativeAuditorAbsoluteTimeout_Throws()
+    {
+        var opts = new PipelineTuningOptions
+        {
+            AuditorAbsoluteTimeout = TimeSpan.FromSeconds(-1),
+        };
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(opts.Validate);
+        Assert.Equal(nameof(PipelineTuningOptions.AuditorAbsoluteTimeout), ex.ParamName);
+    }
+
+    [Fact]
+    public void Defaults_AbsoluteTimeoutFitsInsideIterationBudget()
+    {
+        // The absolute bound must sit above the idle window it backstops and
+        // below the per-iteration budget so one auditor cannot outlive its
+        // iteration (see AuditBudgetOrdering).
+        var opts = new PipelineTuningOptions();
+        opts.Validate();
+
+        Assert.True(opts.AuditorAbsoluteTimeout > opts.AuditorIdleTimeout);
+        Assert.True(
+            opts.AuditorAbsoluteTimeout
+                < TimeSpan.FromMinutes(ProjectAuditConfig.DefaultPerIterationTimeoutMinutes));
     }
 
     [Fact]

@@ -155,9 +155,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // routing utilities (not real quota sources) and intentionally excluded.
     // Used by both ResolveAuditAgentRunnerAsync (audit-agent quota gate) and
     // InvokeAgentWithQuotaFallbackAsync (work-agent mid-iteration probe write-back) —
-    // a single probe set serves both because the production wiring registers one
-    // IAgentQuotaProbe singleton per agent kind regardless of caller.
-    private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _quotaProbesByKind;
+    // a single probe set serves both. Probes are resolved by member key
+    // (see AgentQuotaProbeCatalog): one probe per agent kind is the common case,
+    // but several probes may share a kind when each narrows Handles to the
+    // members it meters.
+    private readonly IReadOnlyList<IAgentQuotaProbe>? _quotaProbes;
     private readonly QuotaRouterOptions _auditQuotaOptions;
     private readonly QuotaGatePolicy _auditQuotaGatePolicy;
     private readonly IWorkItemQuestionStore? _questionStore;
@@ -402,8 +404,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // Null intentionally disables durable audit-progress history for narrow
         // test fixtures; production DI wires this dependency explicitly.
         _auditProgress = auditProgress;
-        _quotaProbesByKind = auditQuotaProbes is null ? null
-            : AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(auditQuotaProbes);
+        _quotaProbes = auditQuotaProbes is null ? null
+            : AgentQuotaProbeCatalog.BuildSubscriptionProbes(auditQuotaProbes);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _auditQuotaGatePolicy = new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
@@ -1976,7 +1978,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 detection.Kind,
                 QuotaFailureMessage(
                     detection.Kind,
-                    $"Agent {runner.Kind} reported quota failure during planning: {result.Summary}"),
+                    $"Agent {runner.Kind} reported quota failure during planning",
+                    SanitizedAgentDetail.FromRaw(result.Summary)),
                 detection.ResetAt);
         }
 
@@ -4662,7 +4665,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 quotaRejectedCount++;
 
                 DateTimeOffset? resetAt = null;
-                if (_quotaProbesByKind is not null && _quotaProbesByKind.TryGetValue(candidate.Kind, out var probe))
+                if (ResolveQuotaProbe(quotaMember).Probe is { } probe)
                 {
                     try
                     {
@@ -5749,7 +5752,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     throw new TerminalQuotaError(quotaKind,
                         QuotaFailureMessage(
                             quotaKind,
-                            $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}"),
+                            $"Agent {runner.Kind} reported quota failure",
+                            SanitizedAgentDetail.FromRaw(agentResult.Summary)),
                         detection?.ResetAt,
                         providerSurfaceMatch: quotaClassification.ProviderSurfaceMatch);
                 }
@@ -9585,10 +9589,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     private static string RedactAndTruncateAgentDetail(string s)
-    {
-        const int MaxOutputBytes = 4096;
-        return RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(s), MaxOutputBytes);
-    }
+        => SanitizedAgentDetail.FromRaw(s).Value;
 
     private async Task<AgentFailureClassification?> RecordAvailabilityOutcomeAsync(
         IAgentAvailabilityRegistry registry,
@@ -9985,7 +9986,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         throw new TerminalQuotaError(noChangeQuota.Kind,
             QuotaFailureMessage(
                 noChangeQuota.Kind,
-                $"Agent {agent} reported quota failure on clean-exit/no-diff rework from {evidenceSource}: {RedactAndTruncateAgentDetail(stderr ?? stdout ?? string.Empty)}"),
+                $"Agent {agent} reported quota failure on clean-exit/no-diff rework from {evidenceSource}",
+                SanitizedAgentDetail.FromRaw(stderr ?? stdout)),
             noChangeQuota.ResetAt,
             providerSurfaceMatch: evidenceTrust != NoDiffQuotaEvidenceTrust.RequiresQuotaProbe);
     }
@@ -9999,13 +10001,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (project is null
-            || _quotaProbesByKind is null
-            || !_quotaProbesByKind.TryGetValue(agent, out var probe))
+            || _quotaProbes is null)
         {
             return false;
         }
 
         var member = BuildNoDiffQuotaProbeMember(item, project, agent, observedModelId);
+        var probe = ResolveQuotaProbe(member).Probe;
+        if (probe is null)
+        {
+            return false;
+        }
+
         try
         {
             var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
@@ -10077,7 +10084,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentMembership? preferredMember = null,
         string? requireCapability = null)
     {
-        if (_quotaProbesByKind is null || _classRouter is null)
+        if (_quotaProbes is null || _classRouter is null)
             return false;
 
         var effectiveProject = project ?? new Project
@@ -10091,7 +10098,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (preferredMember is not null
             && !IsRouterCachedExhausted(item.Id, preferredMember)
             && !await IsAgentPausedAsync(preferredMember.Agent, ct).ConfigureAwait(false)
-            && _quotaProbesByKind.TryGetValue(preferredMember.Agent, out var preferredProbe))
+            && ResolveQuotaProbe(preferredMember).Probe is { } preferredProbe)
         {
             try
             {
@@ -10131,7 +10138,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (requireCapability is not null
                 && !MemberHasClassCapability(classId, candidate, requireCapability))
                 continue;
-            if (!_quotaProbesByKind.TryGetValue(candidate.Agent, out var probe))
+            if (ResolveQuotaProbe(candidate).Probe is not { } probe)
                 continue;
 
             // A member the router already marked exhausted from a real
@@ -10177,7 +10184,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         CancellationToken ct)
     {
-        if (_quotaProbesByKind is null)
+        if (_quotaProbes is null)
             return false;
 
         var agent = item.Agent;
@@ -10188,33 +10195,36 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var probeSpeaksForPhase = string.Equals(phase, "work", StringComparison.Ordinal)
             || string.Equals(phase, "rework", StringComparison.Ordinal);
         if (probeSpeaksForPhase
-            && agent is { } agentKind && _quotaProbesByKind.TryGetValue(agentKind, out var probe)
-            && !await IsAgentPausedAsync(agentKind, ct).ConfigureAwait(false))
+            && agent is { } agentKind)
         {
             var member = BuildQuotaProbeMember(item, project, agentKind, item.ModelId);
-            // Same staleness rule as the candidate walk below: a member with
-            // a live router-cache exhaustion entry was rejected for real in
-            // this episode — its lagging healthy snapshot must not veto the
-            // park.
-            if (!IsRouterCachedExhausted(item.Id, member))
+            if (ResolveQuotaProbe(member).Probe is { } probe
+                && !await IsAgentPausedAsync(agentKind, ct).ConfigureAwait(false))
             {
-                try
+                // Same staleness rule as the candidate walk below: a member with
+                // a live router-cache exhaustion entry was rejected for real in
+                // this episode — its lagging healthy snapshot must not veto the
+                // park.
+                if (!IsRouterCachedExhausted(item.Id, member))
                 {
-                    var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
-                    var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
-                    if (quota.IsKnown)
+                    try
                     {
-                        var nowUtc = _opts.TimeProvider.GetUtcNow();
-                        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
-                        if (gate.Allow)
+                        var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+                        var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+                        if (quota.IsKnown)
                         {
-                            return true;
+                            var nowUtc = _opts.TimeProvider.GetUtcNow();
+                            var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
+                            if (gate.Allow)
+                            {
+                                return true;
+                            }
                         }
                     }
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _log.LogDebug(ex, "Probe check in TransitionWaitingForQuotaResetAsync failed for agent {Agent}", agentKind.Value);
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _log.LogDebug(ex, "Probe check in TransitionWaitingForQuotaResetAsync failed for agent {Agent}", agentKind.Value);
+                    }
                 }
             }
         }
@@ -13067,7 +13077,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     ctx,
                                     ct);
                             }
-                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException and not AuditorIdleTimeoutException)
+                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException and not AuditorIdleTimeoutException && !SandboxDeferralGuard.IsDeferral(ex))
                             {
                                 throw new AuditUnavailableException(
                                     $"could-not-verify: isolated audit repository setup failed for {auditor.Name}: {SingleLineSummary(ex.Message)}",
@@ -13148,7 +13158,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         declaredShortCircuitBlocking,
                         IncompleteVerdict: true,
                         CompletedAuditors: completedAuditors.ToList(),
-                        IncompleteAuditors: [$"{ex.AuditorName} ({ex.AgentKind.Value})"],
+                        IncompleteAuditors: [AuditBudgetOrdering.FormatBudgetedAuditorLabel(ex.AuditorName, ex.AgentKind.Value, ex.BudgetPath, ex.Timeout)],
                         PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
                         BuildTestGateFailed: buildTestGateFailed);
                 }
@@ -13521,7 +13531,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         if (firstExhaustion is null && inner is AgentClassExhaustedException exhaustion)
                             firstExhaustion = exhaustion;
                         else if (inner is AuditorIdleTimeoutException timeout)
-                            incompleteAuditors.Add($"{timeout.AuditorName} ({timeout.AgentKind.Value})");
+                            incompleteAuditors.Add(AuditBudgetOrdering.FormatBudgetedAuditorLabel(timeout.AuditorName, timeout.AgentKind.Value, timeout.BudgetPath, timeout.Timeout));
                         else if (firstExhaustion is null && firstOtherException is null)
                             firstOtherException = ExceptionDispatchInfo.Capture(inner);
                     }
@@ -14017,12 +14027,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         CancellationToken ct)
     {
-        var timeout = EffectiveAuditorIdleTimeout(auditor);
-        if (timeout <= TimeSpan.Zero)
+        var idleTimeout = EffectiveAuditorIdleTimeout(auditor);
+        var absoluteTimeout = _pipelineTuning.Current.AuditorAbsoluteTimeout;
+        if (idleTimeout <= TimeSpan.Zero && absoluteTimeout <= TimeSpan.Zero)
             return await auditor.RunAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var lastActivityTicks = Stopwatch.GetTimestamp();
+        var startTicks = Stopwatch.GetTimestamp();
+        var lastActivityTicks = startTicks;
         void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
 
         var originalCallback = context.StdoutChunkCallback;
@@ -14037,47 +14049,45 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         var watchedSandbox = new ActivityTrackingSandbox(sandbox, Touch);
         var auditorTask = auditor.RunAsync(watchedSandbox, workingDirectory, watchedContext, linkedCts.Token);
-        var timeoutTask = WaitForAuditorIdleTimeoutAsync(
-            linkedCts.Token,
-            () => Volatile.Read(ref lastActivityTicks),
-            () => EffectiveAuditorIdleTimeout(auditor));
 
         try
         {
-            var completed = await Task.WhenAny(auditorTask, timeoutTask).ConfigureAwait(false);
-            if (completed == timeoutTask)
-            {
-                var timedOutAfter = await timeoutTask.ConfigureAwait(false);
-                if (timedOutAfter is not null)
-                {
-                    await CancelAndTearDownAfterIdleTimeoutAsync(
-                        linkedCts,
-                        auditorTask,
-                        sandbox,
-                        "auditor",
-                        auditor.Name,
-                        agent,
-                        item,
-                        project,
-                        context.Iteration).ConfigureAwait(false);
-                    throw new AuditorIdleTimeoutException(auditor.Name, agent, timedOutAfter.Value);
-                }
-
-                ct.ThrowIfCancellationRequested();
-            }
-
-            var result = await auditorTask.ConfigureAwait(false);
+            var result = await AuditorIdleGuard.WaitAsync(
+                auditorTask,
+                auditor.Name,
+                agent,
+                () => watchedSandbox.HasActiveExecs,
+                () => (EffectiveAuditorIdleTimeout(auditor), _pipelineTuning.Current.AuditorAbsoluteTimeout),
+                () => Volatile.Read(ref lastActivityTicks),
+                startTicks,
+                Touch,
+                // Poll well below test-scale idle windows so a genuinely hung
+                // run is detected promptly; matches the legacy adaptive-delay
+                // floor (100 ms) this guard replaced.
+                TimeSpan.FromMilliseconds(100),
+                linkedCts.Token).ConfigureAwait(false);
             Touch();
             ct.ThrowIfCancellationRequested();
             return result;
+        }
+        catch (AuditorIdleTimeoutException)
+        {
+            await CancelAndTearDownAfterIdleTimeoutAsync(
+                linkedCts,
+                auditorTask,
+                sandbox,
+                "auditor",
+                auditor.Name,
+                agent,
+                item,
+                project,
+                context.Iteration).ConfigureAwait(false);
+            throw;
         }
         finally
         {
             try { await linkedCts.CancelAsync().ConfigureAwait(false); }
             catch (ObjectDisposedException) { }
-
-            try { await timeoutTask.ConfigureAwait(false); }
-            catch (OperationCanceledException) { }
         }
     }
 
@@ -14587,7 +14597,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     quotaDetection.Kind,
                     QuotaFailureMessage(
                         quotaDetection.Kind,
-                        $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}"),
+                        $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}",
+                        SanitizedAgentDetail.FromRaw(run.Result.AgentSummary ?? "agent failed")),
                     quotaDetection.ResetAt,
                     providerSurfaceMatch: auditQuotaClassification.ProviderSurfaceMatch);
             }
@@ -14635,7 +14646,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     terminalQuota!.Kind,
                     QuotaFailureMessage(
                         terminalQuota.Kind,
-                        $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}"),
+                        $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}",
+                        SanitizedAgentDetail.FromRaw(run.Result.AgentTerminalDiagnostic)),
                     terminalQuota.ResetAt,
                     providerSurfaceMatch: true);
             }
@@ -15754,8 +15766,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return (false, "budget provider error (fail-closed)");
         var budgetPct = budget?.AvailablePct ?? -1;
 
-        if (_quotaProbesByKind is null || !_quotaProbesByKind.TryGetValue(kind, out var probe))
+        var resolution = ResolveQuotaProbe(member);
+        if (resolution is not { Probe: { } probe, Conflict: null })
         {
+            if (resolution.Conflict is not null)
+            {
+                // Equally specific probes claim this member (already logged at
+                // Error by the catalog): fail closed rather than reading from an
+                // arbitrary winner or falling through to the probe-less path.
+                return (false, "conflicting quota probes (fail-closed)");
+            }
+
             // No real probe. A healthy configured budget supplies a concrete
             // available percentage; otherwise preserve the prior probe-less
             // "allow" semantics.
@@ -16395,7 +16416,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 detection.Kind,
                 QuotaFailureMessage(
                     detection.Kind,
-                    $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}"),
+                    $"Agent {runner.Kind} reported quota failure after exhausting session resume",
+                    SanitizedAgentDetail.FromRaw(last.Summary)),
                 detection.ResetAt,
                 providerSurfaceMatch: classification.ProviderSurfaceMatch);
         }
@@ -16560,8 +16582,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // Mark the member exhausted in the router and the probe so the
                 // next pickup (or the rest of this pipeline) skips it.
                 _classRouter.MarkExhausted(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset);
-                if (_quotaProbesByKind is not null
-                    && _quotaProbesByKind.TryGetValue(currentMember.Agent, out var probe))
+                if (ResolveQuotaProbe(currentMember).Probe is { } probe)
                 {
                     try
                     {
@@ -17094,14 +17115,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// own backoff, an exhausted cap needs capacity or a new window — so the
     /// <c>LastError</c> parked on the work item must not conflate them.
     ///
+    /// <para>The agent-controlled tail is accepted only as a
+    /// <see cref="SanitizedAgentDetail"/> (see
+    /// <see cref="SanitizedAgentDetail.FromRaw"/>), never as a raw string, so
+    /// a future call site cannot bypass redaction and truncation by
+    /// interpolating agent output directly. The <paramref name="prefix"/>
+    /// carries only orchestrator-owned text (agent kind, phase, auditor name,
+    /// evidence source).</para>
+    ///
     /// <para>Only the <see cref="QuotaFailureKind.RateLimitExceeded"/> wording
-    /// changes; every other kind returns <paramref name="exhaustedMessage"/>
-    /// byte-identical. The rate-limit rewrite targets the single
+    /// changes; every other kind returns the composed message byte-identical.
+    /// The rate-limit rewrite targets the single
     /// <c>"reported quota failure"</c> marker: messages that do not carry it
     /// are returned unchanged rather than guessed at.</para>
     /// </summary>
-    internal static string QuotaFailureMessage(QuotaFailureKind kind, string exhaustedMessage)
+    internal static string QuotaFailureMessage(QuotaFailureKind kind, string prefix, SanitizedAgentDetail detail)
     {
+        var exhaustedMessage = $"{prefix}: {detail.Value}";
         if (kind != QuotaFailureKind.RateLimitExceeded)
             return exhaustedMessage;
         const string marker = "reported quota failure";
@@ -17669,7 +17699,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         detection.Kind,
                         QuotaFailureMessage(
                             detection.Kind,
-                            $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {classificationResult.Summary}"),
+                            $"Merge agent {chosenMergeRunner.Kind} reported quota failure",
+                            SanitizedAgentDetail.FromRaw(classificationResult.Summary)),
                         detection.ResetAt);
                 }
 
@@ -20943,7 +20974,14 @@ Original merge-phase failure (JSON string, for context only):
                 phase);
             return;
         }
-
+        // NOTE: do not compare current.State against the RunAsync entry
+        // snapshot (item.State): the pipeline legitimately advances
+        // Queued -> Working -> ... -> Auditing before a cancel arrives, so a
+        // snapshot comparison would suppress every genuine mid-flight cancel
+        // (e.g. CancelDuringAudit). The recovered-before-read race is already
+        // covered by IsRecoveredResumeStateForCancelledPhase above when the
+        // phase is known, and by the guarded TryUpdateIfStateAsync write below
+        // otherwise.
         var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
             WorkItemCancellationReason.OperatorRequested,
             cancellationSource: CancellationSources.Operator);
@@ -21308,6 +21346,13 @@ Original merge-phase failure (JSON string, for context only):
         bool quotaEvidenceTrusted = false)
     {
         var ct = CancellationToken.None;
+        // Sink guard: LastError is persisted and API-served, and agent output
+        // is untrusted. Sanitize here as well so any present or future
+        // TerminalQuotaError / AgentClassExhausted message that bypassed the
+        // construction-time helper is still redacted and truncated before it
+        // reaches the store, webhooks, or audit events. Idempotent for
+        // already-sanitized messages.
+        var safeError = SanitizedAgentDetail.FromRaw(error).Value;
         var current = await _store.GetAsync(item.Id, ct) ?? item;
 
         // A park that contradicts a fresh, known-healthy probe reading is
@@ -21332,7 +21377,7 @@ Original merge-phase failure (JSON string, for context only):
         var next = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(
             current.With(
                 WorkItemState.WaitingForQuotaReset,
-                error,
+                safeError,
                 failureKind: "quota",
                 quotaResetAt: effectiveResetAt)) with
         {
@@ -21375,8 +21420,22 @@ Original merge-phase failure (JSON string, for context only):
                 FromModel: item.ModelId,
                 ToAgent: null,
                 ToModel: null,
-                Reason: error),
+                Reason: safeError),
         }, ct);
+    }
+
+    /// <summary>
+    /// Resolves the quota probe serving <paramref name="member"/> by member key.
+    /// A probe that does not handle the member is never returned; an empty
+    /// resolution means no probe claims the member (legacy probe-less path), and
+    /// a conflict (already logged at Error by the catalog) means the caller must
+    /// fail closed for that member.
+    /// </summary>
+    private QuotaProbeResolution ResolveQuotaProbe(AgentMembership member)
+    {
+        if (_quotaProbes is null)
+            return new QuotaProbeResolution(null, null);
+        return AgentQuotaProbeCatalog.ResolveSubscriptionProbe(_quotaProbes, member, _log);
     }
 
     private async Task RecordDirectQuotaParkAsync(
@@ -21392,8 +21451,7 @@ Original merge-phase failure (JSON string, for context only):
         if (member is null)
             return;
 
-        if (_quotaProbesByKind is not null
-            && _quotaProbesByKind.TryGetValue(member.Agent, out var probe))
+        if (ResolveQuotaProbe(member).Probe is { } probe)
         {
             try
             {
@@ -21986,6 +22044,7 @@ Original merge-phase failure (JSON string, for context only):
     {
         private readonly ISandbox _inner;
         private readonly Action _touch;
+        private int _activeExecs;
 
         public ActivityTrackingSandbox(ISandbox inner, Action touch)
         {
@@ -21997,28 +22056,45 @@ Original merge-phase failure (JSON string, for context only):
 
         public string Id => _inner.Id;
 
+        /// <summary>
+        /// True while at least one <see cref="ExecAsync"/> call made through
+        /// this wrapper is still in flight. The auditor idle guard reads this
+        /// as process-activity evidence: a quiet run that still holds live
+        /// sandbox work (e.g. a test suite emitting nothing until the final
+        /// result) is progressing, not idle.
+        /// </summary>
+        public bool HasActiveExecs => Volatile.Read(ref _activeExecs) > 0;
+
         public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
         public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
         public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
 
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            var originalStdout = exec.StdoutChunkCallback;
-            var originalStderr = exec.StderrChunkCallback;
-            var watchedExec = exec with
+            Interlocked.Increment(ref _activeExecs);
+            try
             {
-                StdoutChunkCallback = chunk =>
+                var originalStdout = exec.StdoutChunkCallback;
+                var originalStderr = exec.StderrChunkCallback;
+                var watchedExec = exec with
                 {
-                    _touch();
-                    originalStdout?.Invoke(chunk);
-                },
-                StderrChunkCallback = chunk =>
-                {
-                    _touch();
-                    originalStderr?.Invoke(chunk);
-                },
-            };
-            return _inner.ExecAsync(watchedExec, ct);
+                    StdoutChunkCallback = chunk =>
+                    {
+                        _touch();
+                        originalStdout?.Invoke(chunk);
+                    },
+                    StderrChunkCallback = chunk =>
+                    {
+                        _touch();
+                        originalStderr?.Invoke(chunk);
+                    },
+                };
+                return await _inner.ExecAsync(watchedExec, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeExecs);
+            }
         }
 
         public Task KillActiveExecsAsync(CancellationToken ct = default)
@@ -22080,19 +22156,54 @@ internal sealed class AuditHistoryPersistenceFailedException : Exception
         : base(message, innerException) { }
 }
 
-internal sealed class AuditorIdleTimeoutException : TimeoutException
+internal class AuditorIdleTimeoutException : TimeoutException
 {
-    public AuditorIdleTimeoutException(string auditorName, AgentKind agentKind, TimeSpan timeout)
-        : base($"auditor '{auditorName}' (agent: {agentKind.Value}) produced no output or verdict within {timeout}")
+    public AuditorIdleTimeoutException(
+        string auditorName,
+        AgentKind agentKind,
+        TimeSpan timeout,
+        string? budgetPath = null)
+        : base($"auditor '{auditorName}' (agent: {agentKind.Value}) exceeded budget {(budgetPath ?? AuditBudgetOrdering.AuditorIdleTimeoutPath)}={timeout}: produced no output or verdict within {timeout}")
     {
         AuditorName = auditorName;
         AgentKind = agentKind;
         Timeout = timeout;
+        BudgetPath = budgetPath ?? AuditBudgetOrdering.AuditorIdleTimeoutPath;
     }
 
     public string AuditorName { get; }
     public AgentKind AgentKind { get; }
     public TimeSpan Timeout { get; }
+
+    /// <summary>
+    /// Config path of the budget that was exceeded, recorded so a
+    /// budget-exceeded termination is reported distinctly from an auditor
+    /// that ran and produced findings.
+    /// </summary>
+    public string BudgetPath { get; }
+}
+
+/// <summary>
+/// A single auditor run outlived the absolute per-auditor wall-clock bound
+/// (<c>CodeyBox:PipelineTuning:AuditorAbsoluteTimeout</c>), measured from run
+/// start regardless of output or sandbox activity. Derives from
+/// <see cref="AuditorIdleTimeoutException"/> so every existing idle-timeout
+/// handling site (incomplete-verdict capture, timeout involvement outcome,
+/// the LLM single-retry path) treats it as a budget termination rather than
+/// an ordinary infrastructure failure; the <see cref="BudgetPath"/>
+/// distinguishes which budget was exceeded and the message carries its
+/// configured value.
+/// </summary>
+internal sealed class AuditorAbsoluteTimeoutException(
+    string auditorName,
+    AgentKind agentKind,
+    TimeSpan timeout)
+    : AuditorIdleTimeoutException(
+        auditorName,
+        agentKind,
+        timeout,
+        "CodeyBox:PipelineTuning:AuditorAbsoluteTimeout")
+{
 }
 
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException

@@ -197,6 +197,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
         AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
         SessionResumeOptions.SetMaxResumeAttempts(initial.PipelineTuning.AgentSessionResumeMaxAttempts);
+        OauthCredentialRefresherBounds.SetMaxRefreshBodyBytes(initial.QuotaRouter.OauthRefreshMaxBodyBytes);
+        OauthCredentialRefresherBounds.SetMaxCliOutputChars(initial.QuotaRouter.OauthRefreshMaxCliOutputChars);
         await ApplyConfiguredAgentPausesAtStartupAsync(initial, cancellationToken);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
@@ -400,6 +402,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             // constructor-bound; paused-probe cadence and resilience knobs are
             // read through live delegates and update here.
             QuotaRouterConfigMapper.ApplyHotReload(_quotaRouterOptions, opts.QuotaRouter);
+            OauthCredentialRefresherBounds.SetMaxRefreshBodyBytes(opts.QuotaRouter.OauthRefreshMaxBodyBytes);
+            OauthCredentialRefresherBounds.SetMaxCliOutputChars(opts.QuotaRouter.OauthRefreshMaxCliOutputChars);
 
             _lastQuotaRouter = next;
             AuditLog.ConfigReloaded("QuotaRouter", prev, next);
@@ -1056,6 +1060,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                         kv.Value.CadenceAnchor,
                     }),
                 IntraKindRoutingPolicy = opts.IntraKindRoutingPolicy.ToString(),
+                opts.OauthRefreshMaxBodyBytes,
+                opts.OauthRefreshMaxCliOutputChars,
             },
             JsonOpts);
     }

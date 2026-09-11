@@ -407,6 +407,12 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
 // CodeyBox:ConfigValidation:UnboundKeys:Mode="warn".
 builder.Services.AddHostedService<UnboundConfigKeyHostedValidator>();
 
+// Audit-budget ordering startup check. Rejects auditor-idle >= per-iteration,
+// per-iteration >= item-stale, and item-stale >= sandbox wall clock with the
+// offending config paths named, so a misordered budget fails startup instead
+// of silently killing healthy long runs at audit time.
+builder.Services.AddHostedService<AuditBudgetOrderingStartupValidator>();
+
 // Rejects ProjectsOptions reloads that remove a project still holding
 // non-terminal work items. Adding new projects passes cleanly.
 builder.Services.AddSingleton<IValidateOptions<ProjectsOptions>, ProjectsOptionsRemovalValidator>();
@@ -1108,7 +1114,8 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClaudeAgentRunner(
 // Copilot: subscription mode by default; setting CodeyBox:Copilot:Provider:BaseUrl switches inference
 // to an OpenAI-compatible endpoint (BYOK). The credential for that endpoint arrives through the
 // credential chain as COPILOT_PROVIDER_API_KEY, never from this configuration section.
-builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner
+builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>())
 {
     Options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Copilot,
 });
@@ -1863,11 +1870,11 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 
-// opencode: no verified usage endpoint at integration time. The probe ships
-// as Unknown-only so the router falls onto its QuotaUnknownPolicy
-// (UseObservedFailures) for opencode members. Replace with a real
-// HTTP-backed probe once an endpoint is confirmed.
-builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapQuotaProbe(new OpencodeQuotaProbe(), sp));
+// opencode: metered out-of-tree by the codeybox.opencode-go-quota plugin,
+// which claims opencode-go members (and zen-backed copilot members) through
+// IAgentQuotaProbe.Handles. No in-tree probe is registered here so two probes
+// can never claim the same member; without the plugin loaded, opencode
+// members fall through to the NullQuotaProbe unknown path exactly as before.
 // Crock: pay-per-token Anthropic API key (with ~50% batch discount applied at
 // billing time). Anthropic exposes no per-key remaining-credit endpoint, so the
 // probe hits the token-free `GET /v1/models` to validate the key and surfaces
@@ -1962,6 +1969,10 @@ static string? ReadAntigravityTokenFile(string? path)
 }
 
 // --- Agent class router ------------------------------------------------------
+builder.Services.AddSingleton<QuotaReservationLedger>(sp =>
+    new QuotaReservationLedger(
+        sp.GetRequiredService<QuotaRouterOptions>(),
+        TimeProvider.System));
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1996,7 +2007,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         configuredSmokeTarget,
         sp.GetService<IAgentDispatchAvailability>(),
         sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
-        sp.GetService<AgentCircuitBreaker>());
+        sp.GetService<AgentCircuitBreaker>(),
+        sp.GetRequiredService<QuotaReservationLedger>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -3702,7 +3714,10 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
     quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>(),
     failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>(),
-    repoReaper: sp.GetRequiredService<WorkItemRepoReaper>()));
+    repoReaper: sp.GetRequiredService<WorkItemRepoReaper>(),
+    reservationLedger: sp.GetRequiredService<QuotaReservationLedger>(),
+    costStore: sp.GetService<IWorkItemCostStore>(),
+    burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -6808,6 +6823,41 @@ namespace CodeyBox.Api
         public IntraKindRoutingPolicy IntraKindRoutingPolicy { get; set; } =
             IntraKindRoutingPolicy.MostQuotaFirst;
         /// <summary>
+        /// Estimated quota cost of one dispatch, in quota-percentage points.
+        /// The reservation ledger escrows this per authorised dispatch so
+        /// concurrent workers sharing one cached probe reading cannot jointly
+        /// overshoot the floor. Cold-start default 5.0; set near the typical
+        /// per-item burn for the fleet. Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationEstimatePct { get; set; } = 5.0;
+        /// <summary>
+        /// Per-agent override for <see cref="DispatchReservationEstimatePct"/>,
+        /// keyed by agent kind value. Non-positive entries are ignored.
+        /// Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, double> DispatchReservationEstimatePctByAgent { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Lower bound for any reservation estimate, in quota-percentage
+        /// points. A missing, zero, or negative estimate resolves to at least
+        /// this — a dispatch must never silently reserve nothing. Default 0.5.
+        /// Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationMinPct { get; set; } = 0.5;
+        /// <summary>
+        /// Upper bound for any single reservation, in quota-percentage points.
+        /// Guards against a misconfigured estimate pinning the pool. Default
+        /// 25. Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationMaxPct { get; set; } = 25.0;
+        /// <summary>
+        /// Maximum age in seconds of a quota reservation before the orphan
+        /// sweep reaps it. Backstop only — prompt release flows through the
+        /// worker-slot lifecycle. Must exceed the longest legitimate phase.
+        /// Default 21600 (6 hours). Hot-reloadable.
+        /// </summary>
+        public int QuotaReservationMaxAgeSeconds { get; set; } = 6 * 60 * 60;
+        /// <summary>
         /// Additional retries on a transient probe failure (network error / timeout / 5xx)
         /// before recording the failure. Total attempts = 1 + this value. Default 2.
         /// Hot-reloadable.
@@ -6834,6 +6884,24 @@ namespace CodeyBox.Api
         /// Hot-reloadable.
         /// </summary>
         public int ProbeMaxStalenessSeconds { get; set; } = 300;
+        /// <summary>
+        /// Maximum OAuth refresh response body accepted by the subscription
+        /// quota-token refreshers (Claude/Codex/Gemini), in bytes. The shared
+        /// refresh reader enforces this <i>before</i> buffering by streaming
+        /// under <c>HttpCompletionOption.ResponseHeadersRead</c>; oversize
+        /// bodies fail the refresh (probe maps to "unknown") instead of being
+        /// buffered or parsed. Default 8192 — a legitimate refresh payload is
+        /// a few hundred bytes of JSON. Hot-reloadable.
+        /// </summary>
+        public int OauthRefreshMaxBodyBytes { get; set; } = CodeyBox.Agents.OauthCredentialRefresherBounds.DefaultMaxRefreshBodyBytes;
+        /// <summary>
+        /// Per-stream cap (stdout/stderr), in chars, for agent-CLI child-process
+        /// output captured during OAuth token refresh. Output beyond the cap is
+        /// discarded while the pipes are still drained, so a chatty child can
+        /// neither exhaust memory nor block on a full buffer. Only the exit code
+        /// is observed. Default 1048576 (1 MiB). Hot-reloadable.
+        /// </summary>
+        public int OauthRefreshMaxCliOutputChars { get; set; } = CodeyBox.Agents.OauthCredentialRefresherBounds.DefaultMaxCliOutputChars;
     }
 
     /// <summary>

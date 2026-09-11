@@ -21,8 +21,17 @@ namespace CodeyBox.Agents.Copilot;
 /// exceed it and surface as exit 126 from the sandbox wrapper's exec. There is no CLI affordance to work
 /// around this today.</para>
 /// </summary>
-public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentRunner
+public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentRunner, IAgentDefaultModelProvider
 {
+    private readonly AgentDefaultsSnapshot? _defaults;
+
+    public CopilotAgentRunner() : this(defaults: null) { }
+
+    public CopilotAgentRunner(AgentDefaultsSnapshot? defaults)
+    {
+        _defaults = defaults;
+    }
+
     public override AgentKind Kind => AgentKind.Copilot;
 
     /// <summary>Default copilot binary name on the sandbox PATH. The in-VM smoke probe pins to this so the probe and runner can never drift.</summary>
@@ -55,6 +64,13 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
     public static readonly IReadOnlyList<string> DefaultByokExcludedTools = ["apply_patch"];
 
     public string Binary { get; init; } = DefaultBinary;
+
+    /// <summary>
+    /// Default model passed to <c>--model</c> when no per-item override is
+    /// provided. Sourced live from <see cref="AgentDefaultsSnapshot"/> so
+    /// operator edits take effect on the next dispatched run without restart.
+    /// </summary>
+    public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
     /// <summary>Operator configuration. Defaults to subscription mode with no BYOK provider.</summary>
     public CopilotOptions Options { get; init; } = new();
@@ -103,7 +119,10 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
         if (ReferenceEquals(effective, Options.Provider))
             return this;
 
-        return new CopilotAgentRunner
+        // The bound runner must carry this instance's defaults snapshot: DefaultModelId
+        // is sourced from it, and a member-scoped BYOK provider has no usable built-in
+        // default, so dropping it makes every bound dispatch fail for want of a model.
+        return new CopilotAgentRunner(_defaults)
         {
             Binary = Binary,
             SessionIdGenerator = SessionIdGenerator,
@@ -300,11 +319,21 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
         // --model selects the model actually sent on the wire, including under BYOK, where it must name
         // a model the configured endpoint serves. Verified against v1.0.82: the COPILOT_MODEL /
         // COPILOT_PROVIDER_WIRE_MODEL environment variables do NOT change the wire model in -p mode,
-        // so the id travels here and only here.
-        if (!string.IsNullOrWhiteSpace(modelId))
+        // so the id travels here and only here. Falls back to the config-sourced default
+        // (CodeyBox:AgentDefaults:copilot) when the caller passes no explicit model, mirroring the
+        // peer runners. Under BYOK there is no usable built-in default, so a missing id fails here
+        // with a diagnosable message instead of invoking the CLI to surface its raw
+        // "BYOK providers require an explicit model" exit.
+        var effectiveModel = modelId ?? DefaultModelId;
+        if (Options.Provider.IsConfigured && string.IsNullOrWhiteSpace(effectiveModel))
+            throw new InvalidOperationException(
+                "Copilot BYOK provider is configured (CodeyBox:Copilot:Provider:BaseUrl) but no model id is "
+                + "available: no explicit modelId was supplied and CodeyBox:AgentDefaults:copilot has no default. "
+                + "Set CodeyBox:AgentDefaults:copilot or supply an explicit modelId; BYOK providers require an explicit model.");
+        if (!string.IsNullOrWhiteSpace(effectiveModel))
         {
             argv.Add("--model");
-            argv.Add(modelId);
+            argv.Add(effectiveModel);
         }
 
         // Repeatable flag: Copilot takes one tool per occurrence rather than a list.

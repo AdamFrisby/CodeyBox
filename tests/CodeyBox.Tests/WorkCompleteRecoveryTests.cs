@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Http.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -376,10 +377,28 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
     [Fact]
     public async Task Retry_StaleWorkerHeldItem_FencesAndRetries()
     {
-        using var factory = new WorkItemApiFactory();
+        // Pin a short stale window explicitly: the shipped ItemStaleTimeout
+        // default moves for operational reasons (audit-budget ordering keeps
+        // it above the per-iteration audit budget), so a 2 h-frozen fixture
+        // must declare the window it is stale against. ProgressTimeout moves
+        // with it to preserve the required per-turn < item-stale ordering.
+        using var factory = new WorkItemApiFactory
+        {
+            WorkerProgressTimeoutOverride = TimeSpan.FromMinutes(10),
+            ItemStaleTimeoutOverride = TimeSpan.FromMinutes(30),
+        };
         var client = factory.CreateClient();
         try
         {
+            // Freeze the item past the host's effective item-stale window
+            // (plus margin) rather than a fixed age: the shipped
+            // ItemStaleTimeout default moves to satisfy the audit-budget
+            // ordering, and a hardcoded age rots into a non-stale item
+            // (expected Accepted, got Conflict) whenever it lands below it.
+            var staleTimeout = factory.Services
+                .GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue
+                .WorkerProgressWatchdog.ResolveItemStaleTimeout(agent: null);
+            var frozenAt = DateTimeOffset.UtcNow - staleTimeout - TimeSpan.FromMinutes(5);
             var item = new WorkItem
             {
                 Id = WorkItemId.New(),
@@ -387,8 +406,11 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 Title = "wedged work",
                 Prompt = "p",
                 State = WorkItemState.Working,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
-                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                // Frozen past the effective item-stale window (see frozenAt
+                // above): the retry fence gates on UpdatedAt vs the configured
+                // window, so the fixture must stay stale under it.
+                StartedAt = frozenAt,
+                UpdatedAt = frozenAt,
             };
             await factory.Store.CreateAsync(item);
 

@@ -46,6 +46,13 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCache
 
     public AgentKind Kind => _inner.Kind;
 
+    /// <summary>
+    /// Forwards to the wrapped probe so member-key resolution sees through this
+    /// decorator: a narrowed inner probe keeps its narrowed claim, and a
+    /// kind-wide inner probe keeps its kind-wide claim.
+    /// </summary>
+    public bool Handles(AgentQuotaMemberKey key) => _inner.Handles(key);
+
     public LastKnownGoodQuotaProbe(
         IAgentQuotaProbe inner,
         Func<LastKnownGoodQuotaOptions> optionsProvider,

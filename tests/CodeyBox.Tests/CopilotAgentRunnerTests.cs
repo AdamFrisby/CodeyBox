@@ -61,11 +61,56 @@ public sealed class CopilotAgentRunnerTests
     }
 
     [Fact]
+    public void Argv_FallsBackToConfiguredDefaultModel()
+    {
+        // CodeyBox:AgentDefaults:copilot supplies --model when the dispatch carries no explicit modelId.
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?> { [AgentKind.Copilot.Value] = "default-m" });
+
+        var argv = Argv(new CopilotAgentRunner(defaults));
+
+        var idx = argv.ToList().IndexOf("--model");
+        Assert.True(idx >= 0, "expected --model in argv");
+        Assert.Equal("default-m", argv[idx + 1]);
+    }
+
+    [Fact]
+    public void Argv_ExplicitModelId_TakesPrecedenceOverDefault()
+    {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?> { [AgentKind.Copilot.Value] = "default-m" });
+
+        // Under BYOK too: the explicit id is what reaches --model, and its presence keeps the
+        // missing-model guard from firing.
+        var argv = Argv(new CopilotAgentRunner(defaults) { Options = Byok() }, modelId: "explicit-m");
+
+        var idx = argv.ToList().IndexOf("--model");
+        Assert.True(idx >= 0, "expected --model in argv");
+        Assert.Equal("explicit-m", argv[idx + 1]);
+    }
+
+    [Fact]
+    public void RunAsync_ByokWithoutAnyModel_FailsBeforeInvokingCli()
+    {
+        // Under BYOK the CLI exits non-zero with "BYOK providers require an explicit model" when
+        // --model is absent, so the runner must fail diagnosably instead of launching it.
+        var runner = new CopilotAgentRunner { Options = Byok() };
+        var sandbox = new CapturingSandbox();
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            runner.RunAsync(sandbox, "/work", "do the thing", credential: null).GetAwaiter().GetResult());
+
+        Assert.Contains("CodeyBox:AgentDefaults:copilot", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(sandbox.Execs);
+    }
+
+    [Fact]
     public void Argv_UnderByok_ExcludesApplyPatchByDefault()
     {
         // apply_patch is offered as an OpenAI *custom* tool with a Lark grammar; a server implementing
         // only function tools rejects the entire tools array and no turn can start.
-        var argv = Argv(new CopilotAgentRunner { Options = Byok() });
+        // (BYOK now requires a model, so the probe invocation carries one.)
+        var argv = Argv(new CopilotAgentRunner { Options = Byok() }, modelId: "test-model");
 
         var idx = argv.ToList().IndexOf("--excluded-tools");
         Assert.True(idx >= 0, "expected --excluded-tools under BYOK");
@@ -86,7 +131,8 @@ public sealed class CopilotAgentRunnerTests
         var options = Byok();
         options.ExcludedTools = [];
 
-        Assert.DoesNotContain("--excluded-tools", Argv(new CopilotAgentRunner { Options = options }));
+        // (BYOK now requires a model, so the probe invocation carries one.)
+        Assert.DoesNotContain("--excluded-tools", Argv(new CopilotAgentRunner { Options = options }, modelId: "test-model"));
     }
 
     [Fact]
@@ -171,7 +217,8 @@ public sealed class CopilotAgentRunnerTests
     private static IReadOnlyDictionary<string, string> RunEnv(CopilotAgentRunner runner)
     {
         var sandbox = new CapturingSandbox();
-        runner.RunAsync(sandbox, "/work", "do the thing", credential: null)
+        // BYOK invocations require a model id, so header probes carry one.
+        runner.RunAsync(sandbox, "/work", "do the thing", credential: null, modelId: "test-model")
             .GetAwaiter().GetResult();
         return sandbox.CapturedExec!.ExtraEnvironment!;
     }

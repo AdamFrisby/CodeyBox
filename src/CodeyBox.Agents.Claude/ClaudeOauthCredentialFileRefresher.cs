@@ -89,12 +89,11 @@ public sealed class ClaudeOauthCredentialFileRefresher
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
-        using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
-        if (resp.StatusCode != HttpStatusCode.OK)
+        var bounded = await SendBoundedRefreshAsync(http, req, ct).ConfigureAwait(false);
+        if (bounded.StatusCode != HttpStatusCode.OK || bounded.BodyTooLarge || bounded.Body is null)
             return new RefreshResult(null, null, TimeSpan.Zero);
 
-        var respBody = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        using var doc = JsonDocument.Parse(respBody);
+        using var doc = JsonDocument.Parse(bounded.Body);
         var newAccess = doc.RootElement.TryGetProperty("access_token", out var at) && at.ValueKind == JsonValueKind.String
             ? at.GetString() : null;
         var newRefresh = doc.RootElement.TryGetProperty("refresh_token", out var rt) && rt.ValueKind == JsonValueKind.String

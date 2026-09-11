@@ -14,7 +14,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
     private readonly ConcurrentDictionary<AgentQuotaMemberKey, TrackedRecoveryProbe> _tracked = new();
     private readonly IAgentQuotaAvailabilityObservationSource _observations;
     private readonly IAgentQuotaAvailabilityPublisher _publisher;
-    private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe> _probesByKind;
+    private readonly IReadOnlyList<IAgentQuotaProbe> _subscriptionProbes;
     private readonly IAgentQuotaGate _quotaGate;
     private readonly QuotaRouterOptions _options;
     private readonly ILogger<AgentQuotaRecoveryProbeMonitor> _log;
@@ -37,7 +37,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
     {
         _observations = observations;
         _publisher = publisher;
-        _probesByKind = AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(probes);
+        _subscriptionProbes = AgentQuotaProbeCatalog.BuildSubscriptionProbes(probes);
         _quotaGate = quotaGate;
         _options = options;
         _log = log;
@@ -92,12 +92,24 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
             if (tracked.NextProbeAt > nowUtc)
                 continue;
 
-            if (member.Billing != AgentBilling.Subscription
-                || !_probesByKind.TryGetValue(member.Agent, out var probe))
+            if (member.Billing != AgentBilling.Subscription)
             {
                 _tracked.TryRemove(key, out _);
                 continue;
             }
+
+            var resolution = AgentQuotaProbeCatalog.ResolveSubscriptionProbe(_subscriptionProbes, member, _log);
+            if (resolution.Conflict is not null || resolution.Probe is null)
+            {
+                // Conflict already logged at Error by the catalog; a conflicted
+                // member stays tracked but is never probed (fail closed), while
+                // a member no probe claims has nothing to recover through.
+                if (resolution.Probe is null && resolution.Conflict is null)
+                    _tracked.TryRemove(key, out _);
+                continue;
+            }
+
+            var probe = resolution.Probe;
 
             if (eligibleParkedWorkBuckets is not null
                 && !eligibleParkedWorkBuckets.Contains(QuotaRetryAdmissionPoolKey.FromMembership(member)))

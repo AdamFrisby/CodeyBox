@@ -293,7 +293,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !SandboxDeferralGuard.IsDeferral(ex))
         {
             return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
@@ -319,7 +319,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 MaxDotnetMarkerPathsPerBranch,
                 ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException && ex is not NotSupportedException)
+        catch (Exception ex) when (ex is not OperationCanceledException && ex is not NotSupportedException && !SandboxDeferralGuard.IsDeferral(ex))
         {
             throw new InvalidOperationException(
                 $"failed to inspect branch '{branch}' for .NET build markers: {SingleLineSummary(ex.Message)}",
@@ -447,8 +447,12 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             // incident it guards against.
             throw;
         }
-        catch (SandboxProvisioningDeferredException)
+        catch (Exception ex) when (SandboxDeferralGuard.IsDeferral(ex))
         {
+            // Host-side sandbox provisioning exhausted a transient retry
+            // budget. Filtered through the shared guard (not a restated type
+            // name) so this boundary cannot drift from the isolated audit
+            // repository setup boundary in PipelineRunner.
             throw;
         }
         catch (Exception ex)
@@ -478,7 +482,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             return await _gitHost.CreateIsolatedRepositoryCloneAsync(repositoryId, workItemId, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !SandboxDeferralGuard.IsDeferral(ex))
         {
             throw new InvalidOperationException(
                 $"could not create isolated build repository: {SingleLineSummary(ex.Message)}",

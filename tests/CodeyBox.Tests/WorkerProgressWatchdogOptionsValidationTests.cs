@@ -201,10 +201,11 @@ public sealed class WorkerProgressWatchdogOptionsValidationTests
     public void Defaults_IncludeItemStaleFields()
     {
         // Spec: detection threshold and recovery cap are config-driven; defaults
-        // are comfortably above a normal phase duration but tighter than the
-        // ~90-minute production incident window.
+        // sit above the 120 min per-iteration audit budget (see
+        // AuditBudgetOrdering: idle < per-iteration < item-stale < wall clock)
+        // and below the 6 h sandbox wall clock.
         var opts = new WorkerProgressWatchdogOptions();
-        Assert.Equal(TimeSpan.FromMinutes(75), opts.ItemStaleTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(150), opts.ItemStaleTimeout);
         Assert.Equal(TimeSpan.FromMinutes(5), opts.ItemStaleCheckInterval);
         Assert.Equal(3, opts.ItemStaleMaxRecoveryAttempts);
         opts.Validate();

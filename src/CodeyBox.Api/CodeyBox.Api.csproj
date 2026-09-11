@@ -5,6 +5,7 @@
     <ProjectReference Include="..\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Process\CodeyBox.Sandbox.Process.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Copilot\CodeyBox.Agents.Copilot.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Codex\CodeyBox.Agents.Codex.csproj" />

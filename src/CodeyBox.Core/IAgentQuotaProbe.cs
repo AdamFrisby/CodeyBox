@@ -18,6 +18,32 @@ public interface IAgentQuotaProbe
     /// <summary>The agent kind this probe covers.</summary>
     AgentKind Kind { get; }
 
+    /// <summary>
+    /// Whether this probe serves quota for <paramref name="key"/>. The router
+    /// resolves probes by member key (<see cref="AgentQuotaMemberKey"/>) through
+    /// this capability: the probe whose <c>Handles</c> returns true is consulted
+    /// for the member, and a probe that returns false for a key is never
+    /// consulted for it.
+    ///
+    /// <para>
+    /// The default implementation returns true for every member of
+    /// <see cref="Kind"/> (reproducing the historical per-kind resolution
+    /// exactly), so existing probes compile and behave identically with no edit.
+    /// Overriding it narrows or redirects which members a probe serves — e.g. a
+    /// plugin can claim a single <c>(Agent, ModelId)</c> pair so two members of
+    /// the same agent are metered by different accounts. Quota is a property of
+    /// the account/plan, not of the harness or the model; keying on the member
+    /// keeps those axes independent.
+    /// </para>
+    ///
+    /// <para>
+    /// Implementations MUST be pure and cheap (no I/O, no throwing): the router
+    /// may call it for every candidate on the hot path and may additionally
+    /// probe it with synthetic sibling keys to rank claim specificity.
+    /// </para>
+    /// </summary>
+    bool Handles(AgentQuotaMemberKey key) => key.Agent == Kind;
+
     /// <summary>Returns a quota snapshot, possibly from an in-process cache.</summary>
     Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct);
 

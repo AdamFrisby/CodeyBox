@@ -37,7 +37,10 @@ public sealed class CopilotMemberProviderTests
     private static async Task<IReadOnlyDictionary<string, string>> InvocationEnvAsync(
         IAgentRunner runner, CapturingSandbox sandbox)
     {
-        await runner.RunAsync(sandbox, "/work", "do the thing", credential: null);
+        // A model id is required whenever a BYOK provider is configured: the runner fails fast
+        // rather than letting the CLI surface its own "BYOK providers require an explicit model"
+        // exit. These cases assert provider selection, so any non-empty id serves.
+        await runner.RunAsync(sandbox, "/work", "do the thing", credential: null, modelId: "test-model");
         Assert.NotNull(sandbox.CapturedExec);
         return sandbox.CapturedExec!.ExtraEnvironment ?? new Dictionary<string, string>();
     }

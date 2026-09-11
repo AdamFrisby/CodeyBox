@@ -2422,10 +2422,27 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     public async Task AuditorNoOutputIgnoringCancellation_IsKilledWithinIdleBoundAndFailsCleanly()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var auditor = new SandboxProcessAuditor("quality");
+        // Genuinely hung auditor: no output, NO live sandbox execs, and the
+        // cancellation token ignored. The liveness-aware idle guard declares
+        // a run idle only when there is no output AND no process activity, so
+        // this run (nothing in flight) must still be terminated within the
+        // idle bound. A quiet run that still holds live sandbox work keeps
+        // its slot instead — see
+        // AuditorNoOutputButProcessRunning_IsNotClassifiedIncomplete.
+        var calls = 0;
+        var auditor = new DelegateAuditor("quality", "llm", (_, _, _) =>
+        {
+            calls++;
+            return Task.Delay(TimeSpan.FromSeconds(30)).ContinueWith(
+                _ => new AuditResult(true, []),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        });
+        var idle = TimeSpan.FromMilliseconds(100);
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
-            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+            AuditorIdleTimeout = idle,
         });
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -2445,10 +2462,42 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("did not reach a complete verdict", final.LastError);
-        Assert.Equal(2, auditor.CallCount);
-        Assert.Equal(2, auditor.CompletedExecCount);
+        Assert.Contains(AuditBudgetOrdering.AuditorIdleTimeoutPath, final.LastError);
+        Assert.Contains(idle.ToString(), final.LastError);
+        Assert.Equal(2, calls);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), $"auditor timeout took {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task AuditorNoOutputButProcessRunning_IsNotClassifiedIncomplete()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Quiet-but-alive auditor: no stdout chunks for longer than the idle
+        // window while its sandbox exec is demonstrably still running. The
+        // liveness-aware guard must let it finish instead of recording it
+        // incomplete.
+        var auditor = new SandboxProcessAuditor("quality", sleepSeconds: 2);
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
+            maxAuditIterations: 1,
+            pipelineTuning: tuning);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, auditor.CallCount);
+        Assert.Equal(1, auditor.CompletedExecCount);
         Assert.Equal(1, auditor.MaxConcurrentExecs);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"auditor timeout took {sw.Elapsed}");
     }
 
     [Fact]
@@ -3055,7 +3104,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             => _body(sandbox, context, ct);
     }
 
-    private sealed class SandboxProcessAuditor(string name) : IAuditor
+    private sealed class SandboxProcessAuditor(string name, int sleepSeconds = 30) : IAuditor
     {
         private int _activeExecs;
         private int _maxConcurrentExecs;
@@ -3082,7 +3131,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             {
                 await sandbox.ExecAsync(new SandboxExec
                 {
-                    Argv = ["sh", "-c", "sleep 30"],
+                    Argv = ["sh", "-c", $"sleep {sleepSeconds}"],
                     WorkingDirectory = workingDirectory,
                 }, CancellationToken.None);
                 CompletedExecCount++;
