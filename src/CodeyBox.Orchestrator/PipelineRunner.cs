@@ -14501,7 +14501,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     QuotaFailureMessage(
                         terminalQuota.Kind,
                         $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}"),
-                    terminalQuota.ResetAt);
+                    terminalQuota.ResetAt,
+                    providerSurfaceMatch: true);
             }
         }
 
@@ -16238,7 +16239,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 QuotaFailureMessage(
                     detection.Kind,
                     $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}"),
-                detection.ResetAt);
+                detection.ResetAt,
+                providerSurfaceMatch: classification.ProviderSurfaceMatch);
         }
 
         TerminalTransientNetworkError? TryConvertResumeExhaustionToTransient(

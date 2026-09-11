@@ -231,6 +231,41 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task Codex_ExhaustsSessionResumeWithAgentAuthoredQuotaMarkersAndHealthyProbe_DoesNotParkWaitingForQuotaReset()
+    {
+        // The resume-exhaustion quota conversion must carry the same
+        // evidence-trust corroboration as the work path: the LastResult's
+        // quota markers live only in agent-quotable stdout (the agent was
+        // discussing rate-limit handling) while the live probe reports a
+        // known healthy 80%. Parking this as quota-exhausted contradicts a
+        // fresh, known reading and is always wrong — it must surface as an
+        // ordinary retryable failure instead.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            useClassRouter: false,
+            codexQuotaSnapshot: new AgentQuotaSnapshot { AvailablePct = 80.0 });
+
+        fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+            AgentKind.Codex,
+            maxResumeAttempts: 2,
+            new AgentResult(
+                false,
+                "agent exited 1",
+                "discussing the rate_limit_exceeded retry policy in this diff",
+                "agent exited 1")));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, finalItem!.State);
+        Assert.NotEqual("quota", finalItem.FailureKind);
+    }
+
+    [Fact]
     public async Task Codex_ExhaustsSessionResumeWithQuotaLastResult_FallsBackAsQuotaAndRecordsObservedFailure()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
