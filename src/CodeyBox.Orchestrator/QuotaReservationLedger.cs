@@ -22,10 +22,13 @@ namespace CodeyBox.Orchestrator;
 /// </para>
 ///
 /// <para>
-/// Keying is per-agent today (<see cref="DefaultReservationKey"/> returns the
-/// member's <see cref="AgentMembership.RouteKey"/>) and replaceable via the
-/// constructor's <c>keyProvider</c> so a later pool-identity change re-keys
-/// without touching the accounting logic.
+/// Keying is pool-aware: members of a configured quota pool share one ledger
+/// account (<see cref="QuotaReservationLedger.PoolReservationKey"/>) so
+/// concurrent workers drawing on one subscription cannot jointly overshoot
+/// its floor; members with no pool keep the legacy per-agent key
+/// (<see cref="QuotaReservationLedger.DefaultReservationKey"/> returns the
+/// member's <see cref="AgentMembership.RouteKey"/>). The constructor's
+/// <c>keyProvider</c> only applies to the legacy path.
 /// </para>
 /// </summary>
 public sealed class QuotaReservationLedger
@@ -71,6 +74,33 @@ public sealed class QuotaReservationLedger
     {
         ArgumentNullException.ThrowIfNull(member);
         return member.RouteKey;
+    }
+
+    /// <summary>
+    /// Canonical ledger key for a quota pool. All members of the pool share
+    /// this key, so one member's authorised dispatch is visible to the gate
+    /// evaluating another. Pure.
+    /// </summary>
+    public static string PoolReservationKey(string poolName)
+    {
+        ArgumentNullException.ThrowIfNull(poolName);
+        return "pool:" + poolName.Trim().ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Resolves the ledger account key for <paramref name="member"/>: the
+    /// pool key when the member belongs to a configured pool, otherwise the
+    /// constructor's <c>keyProvider</c> (legacy per-agent keying). Reads the
+    /// live shared options so hot-reloaded pool membership applies without a
+    /// restart. Pure apart from the options read.
+    /// </summary>
+    private string ResolveKey(AgentMembership member)
+    {
+        ArgumentNullException.ThrowIfNull(member);
+        if (QuotaPoolResolver.TryResolvePool(_options, member, out var poolName, out _, out _)
+            && poolName is not null)
+            return PoolReservationKey(poolName);
+        return _keyProvider(member);
     }
 
     /// <summary>
@@ -147,7 +177,7 @@ public sealed class QuotaReservationLedger
         if (availablePct < 0)
             return new QuotaReservationAttempt(true, null, 0, availablePct, null);
 
-        var key = _keyProvider(member);
+        var key = ResolveKey(member);
         var estimate = ResolveEstimateFor(member, estimatePctOverride);
         lock (_sync)
         {
@@ -183,7 +213,7 @@ public sealed class QuotaReservationLedger
     public double GetOutstandingPct(AgentMembership member)
     {
         ArgumentNullException.ThrowIfNull(member);
-        return GetOutstandingPct(_keyProvider(member));
+        return GetOutstandingPct(ResolveKey(member));
     }
 
     /// <summary>Current escrowed total for a raw account <paramref name="key"/>.</summary>
@@ -200,7 +230,7 @@ public sealed class QuotaReservationLedger
     public int GetReservationCount(AgentMembership member)
     {
         ArgumentNullException.ThrowIfNull(member);
-        var key = _keyProvider(member);
+        var key = ResolveKey(member);
         lock (_sync)
         {
             var count = 0;
@@ -310,7 +340,7 @@ public sealed class QuotaReservationLedger
     public void NoteProbeReading(AgentMembership member, double availablePct, DateTimeOffset observedAt)
     {
         ArgumentNullException.ThrowIfNull(member);
-        NoteProbeReading(_keyProvider(member), availablePct, observedAt);
+        NoteProbeReading(ResolveKey(member), availablePct, observedAt);
     }
 
     /// <summary>
@@ -364,6 +394,32 @@ public sealed class QuotaReservationLedger
 
     private double ResolveEstimateFor(AgentMembership member, double? estimateOverride)
     {
+        if (QuotaPoolResolver.TryResolvePool(_options, member, out _, out var pool, out _)
+            && pool is not null)
+        {
+            var poolRaw = estimateOverride is { } poolOverride
+                && double.IsFinite(poolOverride)
+                && poolOverride > 0
+                ? poolOverride
+                : pool.ReservationEstimate;
+            if (pool.Kind == QuotaPoolKind.DepletingBalance)
+            {
+                // Absolute balance scales vary per provider, so the
+                // percentage-denominated min/max clamps are meaningless here:
+                // enforce positivity only. A missing/non-positive estimate
+                // falls back to the global estimate interpreted in the pool's
+                // native unit — balance pools should set ReservationEstimate
+                // explicitly in absolute units.
+                var candidate = poolRaw is { } r && double.IsFinite(r) && r > 0
+                    ? r
+                    : _options.DispatchReservationEstimatePct;
+                return double.IsFinite(candidate) && candidate > 0 ? candidate : 0;
+            }
+            if (poolRaw is { } pct && double.IsFinite(pct) && pct > 0)
+                return ResolveEstimatePct(pct, _options.DispatchReservationEstimatePct,
+                    _options.DispatchReservationMinPct, _options.DispatchReservationMaxPct);
+        }
+
         if (estimateOverride is { } raw
             && double.IsFinite(raw)
             && raw > 0)
@@ -408,7 +464,7 @@ public sealed class QuotaReservationLedger
     public QuotaReservationSettlementStats GetSettlementStats(AgentMembership member)
     {
         ArgumentNullException.ThrowIfNull(member);
-        return GetSettlementStats(_keyProvider(member));
+        return GetSettlementStats(ResolveKey(member));
     }
 
     /// <summary>Settlement counters for a raw pool account <paramref name="key"/>.</summary>

@@ -208,6 +208,24 @@ public sealed record AgentQuotaSnapshot
     public IReadOnlyList<WindowQuota> Windows { get; init; } = Array.Empty<WindowQuota>();
 
     /// <summary>
+    /// Absolute remaining prepaid balance in the provider's native unit (e.g.
+    /// credits), for accounts metered as a depleting balance rather than a
+    /// resetting window. Null for resetting-window providers. Probes for
+    /// balance-metered providers set this; all other probes leave it null
+    /// (no change to how any existing probe obtains its reading). The quota
+    /// gate keys depleting-balance pools off this field and ignores
+    /// <see cref="AvailablePct"/> for them.
+    /// </summary>
+    public double? BalanceRemaining { get; init; }
+
+    /// <summary>
+    /// Human-readable unit for <see cref="BalanceRemaining"/> (e.g.
+    /// <c>"credits"</c>). Null when <see cref="BalanceRemaining"/> is null.
+    /// Informational only; the gate compares raw magnitudes.
+    /// </summary>
+    public string? BalanceUnit { get; init; }
+
+    /// <summary>
     /// Number of banked manual quota resets the account can still spend, when
     /// the provider exposes it (Codex's top-level
     /// <c>rate_limit_reset_credits.available_count</c>). Null when the provider
