@@ -18,7 +18,7 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
     }
 
     [Fact]
-    public async Task FailOpen_AllowsUnknownQuota()
+    public async Task FailOpen_AllowsUnknownQuotaWhenNoFloorInForce()
     {
         var decision = await Build(QuotaUnknownPolicy.FailOpen).ResolveAsync(Item(), null, CancellationToken.None);
         Assert.Equal(AgentKind.Claude, decision.Chosen!.Agent);
@@ -33,7 +33,7 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
     }
 
     [Fact]
-    public async Task UseObservedFailures_AllowsUnknownWhenNoRecentFailure()
+    public async Task UseObservedFailures_AllowsUnknownWhenNoRecentFailureAndNoFloorInForce()
     {
         var decision = await Build(QuotaUnknownPolicy.UseObservedFailures).ResolveAsync(Item(), null, CancellationToken.None);
         Assert.Equal(AgentKind.Claude, decision.Chosen!.Agent);
@@ -45,6 +45,41 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
         await _failures.RecordAsync(AgentKind.Claude, "claude-opus-4-7", QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
 
         var decision = await Build(QuotaUnknownPolicy.UseObservedFailures).ResolveAsync(Item(), null, CancellationToken.None);
+        Assert.True(decision.ShouldWait);
+        Assert.Null(decision.Chosen);
+    }
+
+    [Fact]
+    public async Task FailOpen_BlocksUnknownQuotaWhenGlobalDefaultFloorInForce()
+    {
+        // End-to-end pin of the effective-floor fail-closed: the same FailOpen
+        // policy refuses an unknown reading when the global default floor is
+        // non-zero, even with no per-agent override entry.
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    ModelId = "claude-opus-4-7",
+                    QualityScore = 100,
+                },
+            ],
+        };
+
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(AgentKind.Claude, -1)],
+            new QuotaRouterOptions { MinQuotaPct = 10, UnknownPolicy = QuotaUnknownPolicy.FailOpen },
+            NullLogger<AgentClassRouter>.Instance,
+            quotaFailures: _failures);
+
+        var decision = await router.ResolveAsync(Item(), null, CancellationToken.None);
+
         Assert.True(decision.ShouldWait);
         Assert.Null(decision.Chosen);
     }
@@ -70,7 +105,16 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
         return new AgentClassRouter(
             [cls],
             [new FakeProbe(AgentKind.Claude, -1)],
-            new QuotaRouterOptions { MinQuotaPct = 10, UnknownPolicy = policy },
+            // Zero floors so the unknown branch reaches UnknownPolicy: these
+            // tests pin the policy/failure-store branching, not the reserve
+            // floor (a non-zero floor fails closed before the policy applies).
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
+                UnknownPolicy = policy,
+            },
             NullLogger<AgentClassRouter>.Instance,
             quotaFailures: _failures);
     }

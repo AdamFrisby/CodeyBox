@@ -30,7 +30,12 @@ public sealed class QuotaGateAvailabilityAsyncTests
         new QuotaGateAvailability(
             new QuotaGatePolicy(new QuotaRouterOptions
             {
-                MinQuotaPct = 10,
+                // Zero floors so the unknown branch reaches UnknownPolicy:
+                // these tests pin the failure-store consultation semantics,
+                // not the reserve floor (a non-zero floor fails closed first).
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
                 UnknownPolicy = unknownPolicy,
             }),
             failureStore,
@@ -114,7 +119,10 @@ public sealed class QuotaGateAvailabilityAsyncTests
         var now = DateTimeOffset.UtcNow;
         var gate = new QuotaGateAvailability(new QuotaGatePolicy(new QuotaRouterOptions
         {
-            MinQuotaPct = 10,
+            // Zero floors so the unknown branch reaches UnknownPolicy (see above).
+            MinQuotaPct = 0,
+            StartFloorPct = 0,
+            EndFloorPct = 0,
             UnknownPolicy = QuotaUnknownPolicy.UseObservedFailures,
         }));
 
@@ -131,7 +139,10 @@ public sealed class QuotaGateAvailabilityAsyncTests
         var gate = new QuotaGateAvailability(
             new QuotaGatePolicy(new QuotaRouterOptions
             {
-                MinQuotaPct = 10,
+                // Zero floors so the unknown branch reaches UnknownPolicy (see above).
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
                 UnknownPolicy = QuotaUnknownPolicy.UseObservedFailures,
             }),
             new ThrowingFailureStore(),

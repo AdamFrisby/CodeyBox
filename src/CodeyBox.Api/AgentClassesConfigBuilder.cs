@@ -1,4 +1,5 @@
 using CodeyBox.Agents.Antigravity;
+using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -29,7 +30,8 @@ public static class AgentClassesConfigBuilder
     public static IReadOnlyList<AgentClass> Build(
         List<AgentClassOptions> options,
         List<AgentInstanceOptions> instances,
-        ILogger log)
+        ILogger log,
+        IReadOnlyDictionary<string, CopilotProviderOptions>? copilotProviders = null)
     {
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<AgentClass>();
@@ -102,12 +104,17 @@ public static class AgentClassesConfigBuilder
                         capabilities.Add(tag);
                 }
                 var credentialReference = BuildCredentialReference(m, configuredInstance);
+                var providerReference = BuildProviderReference(m, configuredInstance);
+                if (providerReference is not null)
+                    ValidateProviderReference(classOpts.Id, m.Agent, agentKind, providerReference, copilotProviders);
                 var member = new AgentMembership
                 {
                     Agent = agentKind,
                     Billing = billing,
                     InstanceId = instanceId,
+                    Pool = string.IsNullOrWhiteSpace(m.Pool) ? null : m.Pool.Trim(),
                     CredentialReference = credentialReference,
+                    ProviderReference = providerReference,
                     ModelId = m.ModelId,
                     QualityScore = score,
                     ReasoningMode = m.ReasoningMode,
@@ -196,6 +203,35 @@ public static class AgentClassesConfigBuilder
             SandboxEnvironmentVariable = TrimToNull(member.SandboxEnvironmentVariable) ?? TrimToNull(configuredInstance?.SandboxEnvironmentVariable),
         };
         return reference.HasAnyReference ? reference : null;
+    }
+
+    private static AgentProviderReference? BuildProviderReference(
+        AgentMembershipOptions member,
+        AgentInstanceOptions? configuredInstance)
+    {
+        var name = TrimToNull(member.Provider) ?? TrimToNull(configuredInstance?.Provider);
+        if (name is null)
+            return null;
+        return new AgentProviderReference { Name = name };
+    }
+
+    private static void ValidateProviderReference(
+        string classId,
+        string memberAgent,
+        AgentKind agentKind,
+        AgentProviderReference reference,
+        IReadOnlyDictionary<string, CopilotProviderOptions>? copilotProviders)
+    {
+        var name = reference.Name!.Trim();
+        if (agentKind != AgentKind.Copilot)
+            throw new InvalidOperationException(
+                $"AgentClass '{classId}': member '{memberAgent}' names provider '{name}' but per-member " +
+                $"providers are only supported for 'copilot' members. Remove the Provider reference.");
+        if (!CopilotProviderResolver.TryFind(copilotProviders, name, out _))
+            throw new InvalidOperationException(
+                $"AgentClass '{classId}': member '{memberAgent}' names Copilot provider '{name}' which is not " +
+                $"configured. Add it under CodeyBox:Copilot:Providers:{name} or remove the member's Provider " +
+                $"reference. The member is NOT silently falling back to another backend.");
     }
 
     private static string? TrimToNull(string? value) =>

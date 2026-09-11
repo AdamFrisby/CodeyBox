@@ -503,14 +503,30 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
-    public async Task UnknownAvailablePct_TreatedAsAvailable_FailOpen()
+    public async Task UnknownAvailablePct_BlockedWhenFloorInForce_AllowedWhenNoFloor()
     {
+        // Unknown with the default floors in force fails closed (no dispatch).
         var cls = FrontierClass(Sub(Claude));
-        var router = BuildRouter([cls], [new FakeProbe(Claude, -1.0)]);
-        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        var refused = await BuildRouter([cls], [new FakeProbe(Claude, -1.0)])
+            .ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
-        Assert.Equal(Claude, decision.Chosen!.Agent);
-        Assert.False(decision.ShouldWait);
+        Assert.Null(refused.Chosen);
+        Assert.True(refused.ShouldWait);
+
+        // The same unknown with no floor in force follows UnknownPolicy
+        // (UseObservedFailures with no failure store allows).
+        var zeroFloorOpts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 0,
+            StartFloorPct = 0,
+            EndFloorPct = 0,
+            QuotaRecheckInterval = TimeSpan.FromMinutes(5),
+        };
+        var allowed = await BuildRouter([cls], [new FakeProbe(Claude, -1.0)], zeroFloorOpts)
+            .ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Claude, allowed.Chosen!.Agent);
+        Assert.False(allowed.ShouldWait);
     }
 
     // ── Threshold gate ───────────────────────────────────────────────────────
@@ -575,13 +591,36 @@ public sealed class AgentClassRouterTests
         Assert.False(decision.ShouldWait);
     }
 
-    // ── No probe registered → unknown policy ────────────────────────────────
+    // ── No probe registered → unknown, gated by the effective floor ─────────
 
     [Fact]
-    public async Task NoProbeRegistered_ForSubscriptionMember_TreatedAsAvailable()
+    public async Task NoProbeRegistered_ForSubscriptionMember_BlockedWhenFloorInForce()
     {
+        // No Claude probe registered → NullQuotaProbe unknown. With the
+        // default floors in force the gate fails closed instead of treating
+        // the member as available.
         var cls = FrontierClass(Sub(Claude));
         var router = BuildRouter([cls], []);   // no Claude probe registered
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+    }
+
+    [Fact]
+    public async Task NoProbeRegistered_ForSubscriptionMember_TreatedAsAvailableWhenNoFloor()
+    {
+        // Same probe-less member with no floor in force follows UnknownPolicy
+        // (UseObservedFailures with no failure store allows).
+        var cls = FrontierClass(Sub(Claude));
+        var zeroFloorOpts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 0,
+            StartFloorPct = 0,
+            EndFloorPct = 0,
+            QuotaRecheckInterval = TimeSpan.FromMinutes(5),
+        };
+        var router = BuildRouter([cls], [], zeroFloorOpts);   // no Claude probe registered
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
 
         Assert.Equal(Claude, decision.Chosen!.Agent);

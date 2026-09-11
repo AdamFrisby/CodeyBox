@@ -2087,12 +2087,23 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         // loop converts into ~7s of phantom manual time (observed 21.7s
         // against the 15s cap). Stopping the clock at the cap measures the
         // timeout itself rather than teardown scheduling lag.
+        //
+        // The 20ms step (same 25s manual coverage as 100ms x 250) keeps the
+        // pump from outrunning the pipeline's real-time scheduling: each
+        // iteration yields ~10ms real for the fallback chain's continuations
+        // (delay expiry, failure classification, probe write-back, router
+        // selection, invocation) to run. With 100ms steps the
+        // 15s absolute cap is reachable in ~1.5s real, so a CPU-starved
+        // stretch can fire the cap before Gemini's invocation is scheduled
+        // and the pipeline completes without the final fallback attempt ever
+        // starting. Finer steps give the chain 5x more real-time windows per
+        // manual second without changing any manual-time assertion below.
         await RunWithAdvancingTimeUntilAsync(
             geminiReworkStarted,
             pipelineTask,
             time,
-            step: TimeSpan.FromMilliseconds(100),
-            maxSteps: 250);
+            step: TimeSpan.FromMilliseconds(20),
+            maxSteps: 1250);
         await AdvanceManualTimeToElapsedAsync(
             time,
             TimeSpan.FromSeconds(15),
@@ -2304,7 +2315,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             time,
             step: TimeSpan.FromMilliseconds(100),
             maxSteps: 200);
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
+        // The hard real-time wait after the claude fallback has started must
+        // tolerate the highly-parallel audit environment: a 10 s ceiling
+        // flaked under load even though the pipeline completes in well
+        // under a few seconds locally. Lift to 60 s so a true regression still
+        // fails the test but a heavily-loaded run does not.
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(60));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);

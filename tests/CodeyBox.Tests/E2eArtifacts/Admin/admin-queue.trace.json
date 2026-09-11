@@ -1,0 +1,230 @@
+{
+  "traceFormatVersion": "1.0",
+  "modality": "web-graphical",
+  "startedAt": "2026-09-01T12:00:00.0000000\u002B00:00",
+  "endedAt": "2026-09-01T12:00:00.0000000\u002B00:00",
+  "entries": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-09-01T12:00:00.0000000\u002B00:00",
+      "action": {
+        "inputEvents": [
+          {
+            "type": 0,
+            "x": 110,
+            "y": 74
+          }
+        ],
+        "kind": "click",
+        "targetDescriptor": {
+          "accessibility": {
+            "role": "textbox",
+            "name": "Queue filter",
+            "bounds": {
+              "x": 10,
+              "y": 60,
+              "width": 200,
+              "height": 28
+            }
+          },
+          "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Work Queue\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:200,\u0022height\u0022:30}},{\u0022role\u0022:\u0022textbox\u0022,\u0022name\u0022:\u0022Queue filter\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:200,\u0022height\u0022:28}},{\u0022role\u0022:\u0022button\u0022,\u0022name\u0022:\u0022All\u0022,\u0022bounds\u0022:{\u0022x\u0022:220,\u0022y\u0022:60,\u0022width\u0022:60,\u0022height\u0022:28}}]}",
+          "visual": {
+            "region": {
+              "x": 60,
+              "y": 24,
+              "width": 101,
+              "height": 101
+            },
+            "clickOffsetX": 50,
+            "clickOffsetY": 50,
+            "sourceScreenshotPng": "iVBORwECAwQ="
+          }
+        },
+        "isGlobalInput": false
+      },
+      "observation": {
+        "screenshotPng": "iVBORwECAwQ=",
+        "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Work Queue\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:200,\u0022height\u0022:30}},{\u0022role\u0022:\u0022textbox\u0022,\u0022name\u0022:\u0022Queue filter\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:200,\u0022height\u0022:28}},{\u0022role\u0022:\u0022button\u0022,\u0022name\u0022:\u0022All\u0022,\u0022bounds\u0022:{\u0022x\u0022:220,\u0022y\u0022:60,\u0022width\u0022:60,\u0022height\u0022:28}}]}",
+        "capturedAt": "2026-09-01T12:00:00.0000000\u002B00:00"
+      }
+    },
+    {
+      "sequence": 2,
+      "timestamp": "2026-09-01T12:00:00.0000000\u002B00:00",
+      "action": {
+        "inputEvents": [
+          {
+            "type": 4,
+            "text": "auditing"
+          }
+        ],
+        "kind": "type",
+        "targetDescriptor": {
+          "accessibility": {
+            "role": "textbox",
+            "name": "Queue filter",
+            "bounds": {
+              "x": 10,
+              "y": 60,
+              "width": 200,
+              "height": 28
+            }
+          },
+          "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Work Queue\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:200,\u0022height\u0022:30}},{\u0022role\u0022:\u0022textbox\u0022,\u0022name\u0022:\u0022Queue filter\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:200,\u0022height\u0022:28}},{\u0022role\u0022:\u0022button\u0022,\u0022name\u0022:\u0022All\u0022,\u0022bounds\u0022:{\u0022x\u0022:220,\u0022y\u0022:60,\u0022width\u0022:60,\u0022height\u0022:28}}]}",
+          "visual": {
+            "region": {
+              "x": 60,
+              "y": 24,
+              "width": 101,
+              "height": 101
+            },
+            "clickOffsetX": 50,
+            "clickOffsetY": 50,
+            "sourceScreenshotPng": "iVBORwECAwQ="
+          }
+        },
+        "isGlobalInput": false
+      },
+      "observation": {
+        "screenshotPng": "iVBORwECAwQ=",
+        "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Work Queue\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:200,\u0022height\u0022:30}},{\u0022role\u0022:\u0022textbox\u0022,\u0022name\u0022:\u0022Queue filter\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:200,\u0022height\u0022:28}},{\u0022role\u0022:\u0022button\u0022,\u0022name\u0022:\u0022All\u0022,\u0022bounds\u0022:{\u0022x\u0022:220,\u0022y\u0022:60,\u0022width\u0022:60,\u0022height\u0022:28}}]}",
+        "capturedAt": "2026-09-01T12:00:00.0000000\u002B00:00"
+      }
+    },
+    {
+      "sequence": 3,
+      "timestamp": "2026-09-01T12:00:00.0000000\u002B00:00",
+      "action": {
+        "inputEvents": [
+          {
+            "type": 0,
+            "x": 250,
+            "y": 74
+          }
+        ],
+        "kind": "click",
+        "targetDescriptor": {
+          "accessibility": {
+            "role": "button",
+            "name": "All",
+            "bounds": {
+              "x": 220,
+              "y": 60,
+              "width": 60,
+              "height": 28
+            }
+          },
+          "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Work Queue\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:200,\u0022height\u0022:30}},{\u0022role\u0022:\u0022textbox\u0022,\u0022name\u0022:\u0022Queue filter\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:200,\u0022height\u0022:28}},{\u0022role\u0022:\u0022button\u0022,\u0022name\u0022:\u0022All\u0022,\u0022bounds\u0022:{\u0022x\u0022:220,\u0022y\u0022:60,\u0022width\u0022:60,\u0022height\u0022:28}}]}",
+          "visual": {
+            "region": {
+              "x": 200,
+              "y": 24,
+              "width": 101,
+              "height": 101
+            },
+            "clickOffsetX": 50,
+            "clickOffsetY": 50,
+            "sourceScreenshotPng": "iVBORwECAwQ="
+          }
+        },
+        "isGlobalInput": false
+      },
+      "observation": {
+        "screenshotPng": "iVBORwECAwQ=",
+        "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Work Queue\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:200,\u0022height\u0022:30}},{\u0022role\u0022:\u0022link\u0022,\u0022name\u0022:\u0022Seeded Working item 01\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:150,\u0022width\u0022:300,\u0022height\u0022:24}}]}",
+        "capturedAt": "2026-09-01T12:00:00.0000000\u002B00:00"
+      }
+    },
+    {
+      "sequence": 4,
+      "timestamp": "2026-09-01T12:00:00.0000000\u002B00:00",
+      "action": {
+        "inputEvents": [
+          {
+            "type": 0,
+            "x": 160,
+            "y": 162
+          }
+        ],
+        "kind": "click",
+        "targetDescriptor": {
+          "accessibility": {
+            "role": "link",
+            "name": "Seeded Working item 01",
+            "bounds": {
+              "x": 10,
+              "y": 150,
+              "width": 300,
+              "height": 24
+            }
+          },
+          "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Work Queue\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:200,\u0022height\u0022:30}},{\u0022role\u0022:\u0022link\u0022,\u0022name\u0022:\u0022Seeded Working item 01\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:150,\u0022width\u0022:300,\u0022height\u0022:24}}]}",
+          "visual": {
+            "region": {
+              "x": 110,
+              "y": 112,
+              "width": 101,
+              "height": 101
+            },
+            "clickOffsetX": 50,
+            "clickOffsetY": 50,
+            "sourceScreenshotPng": "iVBORwECAwQ="
+          }
+        },
+        "isGlobalInput": false
+      },
+      "observation": {
+        "screenshotPng": "iVBORwECAwQ=",
+        "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Seeded Working item 01\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:260,\u0022height\u0022:30}},{\u0022role\u0022:\u0022button\u0022,\u0022name\u0022:\u0022Quota\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:80,\u0022height\u0022:28}}]}",
+        "capturedAt": "2026-09-01T12:00:00.0000000\u002B00:00"
+      }
+    },
+    {
+      "sequence": 5,
+      "timestamp": "2026-09-01T12:00:00.0000000\u002B00:00",
+      "action": {
+        "inputEvents": [
+          {
+            "type": 0,
+            "x": 50,
+            "y": 74
+          }
+        ],
+        "kind": "click",
+        "targetDescriptor": {
+          "accessibility": {
+            "role": "button",
+            "name": "Quota",
+            "bounds": {
+              "x": 10,
+              "y": 60,
+              "width": 80,
+              "height": 28
+            }
+          },
+          "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Seeded Working item 01\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:260,\u0022height\u0022:30}},{\u0022role\u0022:\u0022button\u0022,\u0022name\u0022:\u0022Quota\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:80,\u0022height\u0022:28}}]}",
+          "visual": {
+            "region": {
+              "x": 0,
+              "y": 24,
+              "width": 101,
+              "height": 101
+            },
+            "clickOffsetX": 50,
+            "clickOffsetY": 50,
+            "sourceScreenshotPng": "iVBORwECAwQ="
+          }
+        },
+        "isGlobalInput": false
+      },
+      "observation": {
+        "screenshotPng": "iVBORwECAwQ=",
+        "accessibilitySnapshotJson": "{\u0022nodes\u0022:[{\u0022role\u0022:\u0022heading\u0022,\u0022name\u0022:\u0022Quota\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:10,\u0022width\u0022:120,\u0022height\u0022:30}},{\u0022role\u0022:\u0022text\u0022,\u0022name\u0022:\u0022seeded-fake\u0022,\u0022bounds\u0022:{\u0022x\u0022:10,\u0022y\u0022:60,\u0022width\u0022:120,\u0022height\u0022:20}}]}",
+        "capturedAt": "2026-09-01T12:00:00.0000000\u002B00:00"
+      }
+    }
+  ],
+  "targetName": "codeybox-admin",
+  "entryUrl": "http://localhost:5070",
+  "readinessScreenshotPng": "iVBORwECAwQ="
+}

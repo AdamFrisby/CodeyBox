@@ -24,6 +24,16 @@ public sealed class AgentClassRouterFallbackTests
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance);
 
+    // Probe-less ordering/exhaustion tests pin score and in-process gating,
+    // not the reserve floor. Zero floors so the unknown branch reaches
+    // UnknownPolicy (a non-zero floor fails closed before the policy applies).
+    private static AgentClassRouter BuildNoFloor(AgentClass cls, params IAgentQuotaProbe[] probes) =>
+        new(
+            [cls],
+            probes,
+            new QuotaRouterOptions { MinQuotaPct = 0, StartFloorPct = 0, EndFloorPct = 0 },
+            NullLogger<AgentClassRouter>.Instance);
+
     private static AgentClassRouter BuildWithOptions(
         AgentClass cls,
         QuotaRouterOptions options,
@@ -65,7 +75,7 @@ public sealed class AgentClassRouterFallbackTests
     public async Task OrderedFallbackCandidates_ReturnsByEffectiveScore_HighestFirst()
     {
         var cls = Frontier(Sub(Codex, score: 100), Sub(Claude, score: 100), Sub(Gemini, score: 95));
-        var router = Build(cls);
+        var router = BuildNoFloor(cls);
 
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
@@ -77,7 +87,7 @@ public sealed class AgentClassRouterFallbackTests
     public async Task OrderedFallbackCandidates_FiltersByMinModelScore()
     {
         var cls = Frontier(Sub(Codex, score: 100), Sub(Gemini, score: 70));
-        var router = Build(cls);
+        var router = BuildNoFloor(cls);
 
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(minScore: 95), project: null, CancellationToken.None);
 
@@ -89,7 +99,7 @@ public sealed class AgentClassRouterFallbackTests
     public async Task MarkExhausted_DropsMember_FromSubsequentOrdering()
     {
         var cls = Frontier(Sub(Codex), Sub(Claude), Sub(Gemini, score: 95));
-        var router = Build(cls);
+        var router = BuildNoFloor(cls);
 
         router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30));
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
@@ -101,7 +111,7 @@ public sealed class AgentClassRouterFallbackTests
     public async Task MarkExhausted_IgnoresPastResetAt()
     {
         var cls = Frontier(Sub(Codex), Sub(Claude));
-        var router = Build(cls);
+        var router = BuildNoFloor(cls);
 
         // Reset hints are parsed from less-trusted runtime output. A past hint
         // must not clear the in-process exhaustion gate.
@@ -117,7 +127,7 @@ public sealed class AgentClassRouterFallbackTests
         var cls = Frontier(
             Sub(Claude, modelId: "claude-opus-4-7"),
             Sub(Claude, modelId: "claude-sonnet-4-6"));
-        var router = Build(cls);
+        var router = BuildNoFloor(cls);
 
         router.MarkExhausted(Sub(Claude, modelId: "claude-opus-4-7"), TimeSpan.FromMinutes(30));
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);

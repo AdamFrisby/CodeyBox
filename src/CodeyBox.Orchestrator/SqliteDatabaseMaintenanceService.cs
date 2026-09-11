@@ -144,7 +144,7 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
             if (await ReadFreelistCountAsync(ct).ConfigureAwait(false) < options.FreelistPageThreshold)
                 return MaintenanceOutcome.NoAction;
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+        catch (SqliteException ex) when (ex.SqliteErrorCode is SqliteDefaults.SqliteBusy or SqliteDefaults.SqliteLocked)
         {
         }
 
@@ -204,7 +204,7 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
                 pageCountAfter);
             return MaintenanceOutcome.Vacuumed;
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+        catch (SqliteException ex) when (ex.SqliteErrorCode is SqliteDefaults.SqliteBusy or SqliteDefaults.SqliteLocked)
         {
             _log.LogWarning(ex, "SQLite maintenance deferred: database is locked; retrying at the next check");
             return MaintenanceOutcome.DeferredContention;
@@ -223,7 +223,8 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
             await conn.OpenAsync(ct).ConfigureAwait(false);
             using (var pragma = conn.CreateCommand())
             {
-                pragma.CommandText = "PRAGMA busy_timeout=30000;";
+                // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- PRAGMA takes no parameters; the interpolated value is the shared compile-time busy-timeout constant, not caller input
+                pragma.CommandText = $"PRAGMA busy_timeout={SqliteDefaults.BusyTimeoutMilliseconds};";
                 await pragma.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
 

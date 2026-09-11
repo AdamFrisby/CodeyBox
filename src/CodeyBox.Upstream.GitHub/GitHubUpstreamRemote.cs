@@ -463,9 +463,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private async Task<PrDescriptionResult> BuildDescriptionAsync(UpstreamCompletionRequest request, CancellationToken ct)
     {
         var staticBody = request.Description ?? string.Empty;
+        var workItemId = request.WorkItemId.ToString();
 
         if (_descriptionGenerator is null || !_opts.PrDescription.Enabled)
-            return new PrDescriptionResult(staticBody + BuildFooter(request), Generated: false);
+            return new PrDescriptionResult(
+                PrDescriptionBody.BuildStaticBody(workItemId, request.DiffStat, staticBody) + BuildFooter(request),
+                Generated: false);
 
         try
         {
@@ -483,6 +486,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             // Truncate prompt using UTF-8 byte count to honour the documented 2 KB cap.
             var redactedPrompt = RawOutputRedactor.Redact(
                 RawOutputRedactor.TruncateToBytes(request.WorkItemPrompt ?? string.Empty, 2048));
+            var commitMessages = await ResolveCommitMessagesAsync(request, ct).ConfigureAwait(false);
 
             var genRequest = new PullRequestDescriptionRequest
             {
@@ -491,15 +495,24 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 Title = request.Title,
                 Prompt = redactedPrompt,
                 AddressedFindings = request.AddressedFindings,
+                CommitMessages = commitMessages,
                 AgentReasoningTail = agentTail,
             };
 
             var generationTask = _descriptionGenerator.GenerateAsync(genRequest, genCts.Token);
-            var generated = await generationTask.WaitAsync(_opts.PrDescription.Timeout, ct);
+            var generated = await generationTask.WaitAsync(_opts.PrDescription.Timeout, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(generated))
+                throw new InvalidOperationException("PR description generator returned no output");
             // Redact the generated body — the LLM may echo secrets from the diff.
             generated = RawOutputRedactor.Redact(generated);
             _log.LogInformation("LLM-generated PR description produced ({Chars} chars)", generated.Length);
-            return new PrDescriptionResult(generated + BuildFooter(request), Generated: true);
+            // The generated prose never stands alone: deterministic facts (work
+            // item id, changed-file list) stay adjacent and the generated
+            // section is marked as machine-generated. The same generated body
+            // feeds the squash commit message, so the merge commit carries
+            // real content rather than a static fallback.
+            var body = PrDescriptionBody.BuildGeneratedBody(workItemId, redactedStat, generated);
+            return new PrDescriptionResult(body + BuildFooter(request), Generated: true);
         }
         catch (TimeoutException)
         {
@@ -520,7 +533,47 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _log.LogWarning("PR description generation failed ({Message}); using static template", ex.Message);
         }
 
-        return new PrDescriptionResult(staticBody + BuildFooter(request), Generated: false);
+        return new PrDescriptionResult(
+            PrDescriptionBody.BuildStaticBody(workItemId, request.DiffStat, staticBody) + BuildFooter(request),
+            Generated: false);
+    }
+
+    /// <summary>
+    /// Best-effort agent commit messages for the generation prompt: prefers the
+    /// messages the orchestrator attached to the request, otherwise reads them
+    /// from the host git repo. Each entry is redacted and capped at 2 KB with
+    /// at most 20 entries. Never throws — failures yield an empty list and the
+    /// generator falls back to the diff alone.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> ResolveCommitMessagesAsync(
+        UpstreamCompletionRequest request, CancellationToken ct)
+    {
+        const int maxMessages = 20;
+        const int maxMessageBytes = 2048;
+
+        IReadOnlyList<string> messages = request.CommitMessages;
+        if (messages.Count == 0)
+        {
+            try
+            {
+                messages = await _gitHost.GetCommitMessagesAsync(
+                    request.RepositoryId, request.BaseBranch, request.WorkBranch, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogDebug("Could not read commit messages for PR description: {Message}", ex.Message);
+                return [];
+            }
+        }
+
+        var capped = new List<string>(Math.Min(messages.Count, maxMessages));
+        foreach (var message in messages.Take(maxMessages))
+        {
+            if (string.IsNullOrWhiteSpace(message)) continue;
+            capped.Add(RawOutputRedactor.Redact(
+                RawOutputRedactor.TruncateToBytes(message, maxMessageBytes)));
+        }
+        return capped;
     }
 
     private sealed record PrDescriptionResult(string Body, bool Generated);
@@ -539,12 +592,29 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         if (strippedBody.Length == 0)
             return false;
 
+        // Generated bodies carry the machine-generated marker alongside the
+        // deterministic facts — they are never static, even though they share
+        // the "Automated via CodeyBox" header.
+        if (strippedBody.Contains(PrDescriptionBody.MachineGeneratedMarker, StringComparison.Ordinal))
+            return false;
+
         if (!string.IsNullOrWhiteSpace(staticDescription) &&
-            string.Equals(strippedBody, StripPrFooter(staticDescription), StringComparison.Ordinal))
+            string.Equals(StripChangedFilesSection(strippedBody), StripPrFooter(staticDescription), StringComparison.Ordinal))
             return true;
 
         return strippedBody.StartsWith("Automated via CodeyBox", StringComparison.Ordinal) ||
             strippedBody.Contains("Untrusted agent output", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Removes the deterministic "Changed files" section the static renderer
+    /// appends, so a static body still compares equal to the template it was
+    /// built from when deciding whether an existing PR body is generated.
+    /// </summary>
+    private static string StripChangedFilesSection(string text)
+    {
+        var index = text.IndexOf("\nChanged files:\n", StringComparison.Ordinal);
+        return index < 0 ? text : text[..index].TrimEnd();
     }
 
     private static string StripPrFooter(string? text)
@@ -974,7 +1044,32 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static string CleanProseForCommitMessage(string? text)
-        => FormatCommitBody(ExtractCleanParagraphs(text, stopAtPrFooter: true));
+        => FormatCommitBody(ExtractCleanParagraphs(StripDeterministicScaffolding(text), stopAtPrFooter: true));
+
+    /// <summary>
+    /// Removes deterministic PR-body scaffolding (the work item header and the
+    /// changed-files caption) before extracting commit-message prose, so merge
+    /// commits carry the narrative rather than template lines. Fenced file
+    /// lists and the machine-generated notice are already skipped by paragraph
+    /// extraction (fence tracking, blockquote lines); only the caption lines
+    /// need explicit removal here.
+    /// </summary>
+    private static string? StripDeterministicScaffolding(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return text;
+        var kept = new List<string>();
+        foreach (var line in text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("Automated via CodeyBox", StringComparison.Ordinal))
+                continue;
+            if (trimmed.Equals("Changed files:", StringComparison.Ordinal))
+                continue;
+            kept.Add(line);
+        }
+        return string.Join("\n", kept);
+    }
 
     private static IEnumerable<string> ExtractCleanParagraphs(string? text, bool stopAtPrFooter)
     {

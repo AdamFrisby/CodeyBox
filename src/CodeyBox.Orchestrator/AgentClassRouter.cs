@@ -58,6 +58,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // gate: a member is dispatchable only when BOTH this breaker and
     // QuotaGatePolicy allow. Null keeps legacy behaviour (no breaker gating).
     private readonly AgentCircuitBreaker? _circuitBreaker;
+    // In-flight quota escrow. Null keeps legacy behaviour (gate on the raw
+    // probe reading). When wired, the gate evaluates the escrow-adjusted
+    // availability and the dispatch-commit point atomically escrows the
+    // estimated cost; the caller owns the returned lease and must release it
+    // on the same lifecycle that releases the worker slot.
+    private readonly QuotaReservationLedger? _reservationLedger;
     private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
     private readonly AgentQuotaAvailabilityBroadcaster? _localQuotaAvailability;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
@@ -107,7 +113,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         InVmSmokeSandboxTarget? configuredSmokeTarget = null,
         IAgentDispatchAvailability? dispatchAvailability = null,
         IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null,
-        AgentCircuitBreaker? circuitBreaker = null)
+        AgentCircuitBreaker? circuitBreaker = null,
+        QuotaReservationLedger? reservationLedger = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -128,6 +135,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _configuredSmokeTarget = configuredSmokeTarget;
         _dispatchAvailability = dispatchAvailability;
         _circuitBreaker = circuitBreaker;
+        _reservationLedger = reservationLedger;
         _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
         if (quotaAvailabilityPublisher is not IAgentQuotaAvailabilitySignal)
             _localQuotaAvailability = new AgentQuotaAvailabilityBroadcaster();
@@ -181,6 +189,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private async Task<BudgetAdjustedQuota> ApplyBudgetAsync(
         AgentMembership member, EffectiveQuota probeQuota, CancellationToken ct)
     {
+        // Operator budgets are percentage-denominated spend caps; they do not
+        // combine with absolute balance readings (different unit, different
+        // meaning). Balance pools gate purely on the pool balance.
+        if (probeQuota.PoolKind == QuotaPoolKind.DepletingBalance)
+            return new BudgetAdjustedQuota(probeQuota, false, null, false);
+
         if (_budgetProvider is null) return new BudgetAdjustedQuota(probeQuota, false, null, false);
 
         AgentQuotaSnapshot? budget;
@@ -303,7 +317,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (decision.Chosen is { } chosen)
             return AgentRoutingReadiness.Available(chosen.Agent, decision.Reason);
 
-        if (decision.NoEligibleMembers || decision.ShouldWait)
+        if (decision.NoEligibleMembers || decision.ShouldWait || decision.TerminalQuotaExhausted)
             return AgentRoutingReadiness.Unavailable(decision.Reason);
 
         return AgentRoutingReadiness.NotApplicable(decision.Reason);
@@ -343,11 +357,21 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (decision.Chosen is { } chosen)
             RecordQuotaRetryAdmission(item, chosen, requiredCapability);
 
+        // Admission checks do not dispatch: the actual run re-resolves through
+        // the normal pickup path and escrows its own lease there. Releasing
+        // here keeps the check from pinning headroom until its TTL.
+        if (decision.QuotaReservation is { } admissionLease)
+        {
+            _reservationLedger?.Release(admissionLease);
+            decision = decision with { QuotaReservation = null };
+        }
+
         return new QuotaRetryRoutingDecision(
             decision.ShouldWait,
             decision.NoEligibleMembers,
             decision.Reason,
-            decision.WaitingForPausedAgent);
+            decision.WaitingForPausedAgent,
+            decision.TerminalQuotaExhausted);
     }
 
     private async Task<QuotaRetryRoutingDecision> ResolveDirectQuotaRetryAsync(
@@ -365,7 +389,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var nowUtc = _time.GetUtcNow();
         var snapshot = await ProbeOrUnknownAsync(member, ct).ConfigureAwait(false);
-        var quota = ResolveMemberQuota(snapshot, member);
+        var quota = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
         quota = (await ApplyBudgetAsync(member, quota, ct).ConfigureAwait(false)).Quota;
         RecordObservedAvailability(member, quota);
 
@@ -457,6 +481,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         // Step 2: compute effective scores (base + TOD modifier).
         var nowUtc = _time.GetUtcNow();
+        // Opportunistic orphan sweep: reservations whose worker died without
+        // releasing age out here so a dead worker cannot pin headroom until
+        // the next dispatch on its own account happens to supersede them.
+        _reservationLedger?.SweepExpired(nowUtc);
         PruneExpiredQuotaRetryAdmissions(nowUtc);
         var scored = eligible.Select(x => new ScoredMember(
             Member: x.Member,
@@ -472,11 +500,16 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             .ThenBy(x => x.ConfigIndex)
             .ToList();
         var precomputedQuotas = new Dictionary<AgentQuotaMemberKey, PrecomputedQuota>();
+        // Pool-shared probe readings for this dispatch pass: the first member
+        // evaluated for a pool performs the probe; later members of the same
+        // pool reuse the identical snapshot so pool-mates gate on one reading.
+        var poolSnapshots = new Dictionary<string, AgentQuotaSnapshot>(StringComparer.OrdinalIgnoreCase);
         var ordered = await ApplyIntraKindPolicyAsync(
             classId,
             item,
             sorted,
             precomputedQuotas,
+            poolSnapshots,
             commitDispatchSideEffects,
             ct);
         var quotaRetryAdmission = bypassRecentFailurePrecheck && bypassInProcessExhaustion
@@ -512,6 +545,19 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var subscriptionTotal = ordered.Count(x => x.Member.Billing == AgentBilling.Subscription);
         var subscriptionSmokeExcluded = 0;
         var subscriptionExhaustionCacheExcluded = 0;
+        // Terminal quota refusals (depleting-balance pool at or below its
+        // floor — no reset will ever clear them). When EVERY eligible
+        // subscription member refuses terminally, the router fails terminally
+        // instead of asking the caller to wait for a reset that never arrives.
+        // Any member that falls out before the gate (smoke, breaker, cap,
+        // pause, non-terminal quota) keeps the count below the total, so the
+        // terminal path only fires when nothing else could unblock dispatch.
+        var subscriptionTerminalRefusals = 0;
+        string? terminalQuotaReason = null;
+        // Fail-closed pool refusals (members naming an unconfigured pool) are
+        // config errors, not ordinary below-floor waits: surfaced verbatim in
+        // the wait reason so the operator sees the member and pool to fix.
+        var poolRefusalReasons = new List<string>();
         DateTimeOffset? earliestExhaustionCacheExpiry = null;
         // Every member the availability gate benched (in-VM smoke / fast-fail /
         // missing-probe), regardless of billing. The PayPerApi-only fallback below
@@ -694,11 +740,18 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             }
             else
             {
-                snapshot = await ProbeOrUnknownAsync(member, ct);
-                var resolved = ResolveMemberQuota(snapshot, member);
+                snapshot = await ProbePoolMemberAsync(member, poolSnapshots, ct);
+                var resolved = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
                 budgeted = await ApplyBudgetAsync(member, resolved, ct);
             }
             var quota = budgeted.Quota;
+
+            // A newer probe reading may already reflect consumption the ledger
+            // still escrows as reconciled estimates; retiring those entries
+            // here keeps the gate from double-counting actuals. Balance pools
+            // retire against the absolute reading (their percentage is not a
+            // quantity).
+            _reservationLedger?.NoteProbeReading(member, NativeProbeReading(member, snapshot), nowUtc);
 
             if (member.Billing == AgentBilling.PayPerApi && budgeted.BudgetExhausted)
             {
@@ -714,6 +767,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             RefreshExhaustionFromProbe(member, quota, knownQuotaUsable, nowUtc);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
+            if (!gate.Allow && gate.Terminal && member.Billing == AgentBilling.Subscription)
+            {
+                subscriptionTerminalRefusals++;
+                terminalQuotaReason ??= gate.Reason;
+            }
+            if (!gate.Allow
+                && !QuotaPoolResolver.TryResolvePool(_opts, member, out _, out _, out var poolFailure)
+                && poolFailure is not null)
+                poolRefusalReasons.Add(gate.Reason);
             if (commitDispatchSideEffects)
                 RecordAvailabilityAndMaybeNotify(member, quota, gate, publishRecoverySignal: true);
             else
@@ -747,6 +809,41 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     continue;
                 }
 
+                // Atomically escrow the estimated dispatch cost BEFORE consuming
+                // the breaker trial: the check and the reservation happen under
+                // one ledger lock, so concurrent workers sharing a cached probe
+                // reading authorise only as many dispatches as the headroom
+                // covers. A deny releases the just-reserved slot and spills to
+                // the next member. Committing paths only — readiness checks
+                // stay advisory and escrow nothing. PayPerApi members never
+                // escrow (their probe is a constant 100 with no pool behind
+                // it); unknown readings escrow nothing (no baseline).
+                QuotaReservationLease? quotaLease = null;
+                if (commitDispatchSideEffects
+                    && _reservationLedger is not null
+                    && member.Billing == AgentBilling.Subscription
+                    && (quota.IsKnown || quota.IsBalanceKnown))
+                {
+                    var reserveBaseline = ResolveReserveBaseline(member, quota);
+                    if (reserveBaseline is { } baseline)
+                    {
+                        var attempt = _reservationLedger.TryReserve(member, baseline.Available, baseline.Floor);
+                        if (!attempt.Allowed)
+                        {
+                            slotGate?.Release(member);
+                            var reservationReason = attempt.DenyReason ?? "quota reservation exhausted";
+                            if (commitDispatchSideEffects)
+                            {
+                                _log.LogInformation("Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
+                                    item.Id, member.Agent, member.ModelId ?? "(default)", reservationReason);
+                            }
+                            rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reservationReason));
+                            continue;
+                        }
+                        quotaLease = attempt.Lease;
+                    }
+                }
+
                 // Commit the half-open trial / Open→HalfOpen transition for the
                 // circuit breaker now that quota AND the slot are both secured.
                 // The earlier peek already excluded a fully-open breaker; this
@@ -760,6 +857,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     && !_circuitBreaker.TryBeginDispatch(member, nowUtc))
                 {
                     slotGate?.Release(member);
+                    if (quotaLease is not null)
+                        _reservationLedger?.Release(quotaLease);
                     var breakerReason = "circuit breaker open (repeated dispatch failures)";
                     LogMemberExcluded(item.Id, member, breakerReason);
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, breakerReason));
@@ -802,6 +901,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 {
                     Chosen = member,
                     SlotReserved = slotGate is not null,
+                    QuotaReservation = quotaLease,
                     Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {quota.AvailablePct:F1}% available",
                 };
             }
@@ -870,6 +970,29 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var anyAtCap = atCapAgents.Count > 0;
         if (hasSubscription || anyAtCap)
         {
+            // Terminal balance exhaustion short-circuits every wait: when
+            // every eligible subscription member refused terminally (its
+            // depleting-balance pool is at or below its floor), no reset will
+            // ever clear the block — the caller must fail the item, never
+            // park it waiting for a quota reset.
+            if (subscriptionTotal > 0 && subscriptionTerminalRefusals == subscriptionTotal)
+            {
+                var terminalReason =
+                    $"all subscription members of class '{classId}' are terminally quota-exhausted " +
+                    $"(no reset will replenish them): {terminalQuotaReason}";
+                if (commitDispatchSideEffects)
+                    _log.LogWarning("Work item {Id}: {Reason}", item.Id, terminalReason);
+                return new AgentRoutingDecision
+                {
+                    ShouldWait = false,
+                    TerminalQuotaExhausted = true,
+                    Reason = terminalReason,
+                    PausedAgents = pausedRejected
+                        .Select(p => p.Agent)
+                        .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase)
+                        .ToList(),
+                };
+            }
             // When a member was blocked only by per-agent cap (not quota), a
             // slot frees up far sooner than a quota window resets, so the
             // soonest of cap-retry vs quota-recheck is surfaced — the operator
@@ -924,6 +1047,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                          $"(global ramp {_opts.StartFloorPct:F1}%→{_opts.EndFloorPct:F1}%, fallback {_opts.MinQuotaPct:F1}%; per-agent overrides may apply)";
                 suggested = _opts.QuotaRecheckInterval;
             }
+            if (poolRefusalReasons.Count > 0)
+                reason += "; quota pool refusals: " + string.Join("; ", poolRefusalReasons.Distinct(StringComparer.Ordinal));
             if (pausedSuffix is not null)
                 reason += pausedSuffix;
             if (commitDispatchSideEffects)
@@ -1281,6 +1406,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return snap;
     }
 
+    /// <inheritdoc />
+    public IReadOnlyList<(string InstanceId, AgentKind Agent, string? ModelId, string? Pool)> SnapshotQuotaPools()
+    {
+        var snap = new List<(string, AgentKind, string?, string?)>(_lastEffectiveQuota.Count);
+        foreach (var kv in _lastEffectiveQuota)
+            snap.Add((kv.Key.RouteKey, kv.Key.Agent, kv.Key.ModelId.Length == 0 ? null : kv.Key.ModelId, kv.Value.PoolId));
+        return snap;
+    }
+
     /// <summary>
     /// Returns the eligible class members for <paramref name="item"/> in the
     /// router's preferred order, *minus* members that this process has marked
@@ -1389,7 +1523,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 };
             }
 
-            var quota = ResolveMemberQuota(snapshot, member);
+            var quota = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
             quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
             RecordObservedAvailability(member, quota);
 
@@ -1815,11 +1949,71 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
     }
 
+    /// <summary>
+    /// Probes quota for <paramref name="member"/>, sharing one reading across
+    /// pool-mates within a dispatch pass: the first member evaluated for a
+    /// pool performs the probe and later members reuse the identical snapshot
+    /// from <paramref name="poolCache"/>. Members with no (or an unresolvable)
+    /// pool always probe directly. The probe itself is unchanged — only the
+    /// redundant call is skipped.
+    /// </summary>
+    private async Task<AgentQuotaSnapshot> ProbePoolMemberAsync(
+        AgentMembership member,
+        Dictionary<string, AgentQuotaSnapshot> poolCache,
+        CancellationToken ct)
+    {
+        if (QuotaPoolResolver.TryResolvePool(_opts, member, out var poolName, out _, out _)
+            && poolName is not null
+            && poolCache.TryGetValue(poolName, out var cached))
+            return cached;
+        var snapshot = await ProbeOrUnknownAsync(member, ct);
+        if (poolName is not null)
+            poolCache[poolName] = snapshot;
+        return snapshot;
+    }
+
+    /// <summary>
+    /// The ledger-facing reading for a probe snapshot in the member's native
+    /// pool unit: the absolute balance for depleting-balance pools (their
+    /// percentage is not a quantity), the percentage otherwise. Pure.
+    /// </summary>
+    private double NativeProbeReading(AgentMembership member, AgentQuotaSnapshot snapshot)
+    {
+        if (QuotaPoolResolver.TryResolvePool(_opts, member, out _, out var pool, out _)
+            && pool?.Kind == QuotaPoolKind.DepletingBalance)
+            return snapshot.BalanceRemaining ?? -1;
+        return snapshot.AvailablePct;
+    }
+
+    /// <summary>
+    /// The atomic reserve baseline (available, floor) in the member's native
+    /// pool unit, or null when the quota carries no usable baseline to escrow
+    /// against. Pure apart from the options read.
+    /// </summary>
+    private (double Available, double Floor)? ResolveReserveBaseline(
+        AgentMembership member,
+        EffectiveQuota quota)
+    {
+        if (quota.PoolKind == QuotaPoolKind.DepletingBalance)
+        {
+            if (!quota.IsBalanceKnown)
+                return null;
+            var poolName = quota.PoolId ?? QuotaPoolResolver.NormalizePoolName(member.Pool);
+            if (poolName is null)
+                return null;
+            return (quota.BalanceRemaining!.Value, QuotaGatePolicy.ResolveBalanceFloor(_opts, poolName));
+        }
+        if (!quota.IsKnown)
+            return null;
+        return (quota.AvailablePct, QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, _time.GetUtcNow()));
+    }
+
     private async Task<List<ScoredMember>> ApplyIntraKindPolicyAsync(
         string classId,
         WorkItem item,
         List<ScoredMember> sorted,
         Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
+        Dictionary<string, AgentQuotaSnapshot> poolSnapshots,
         bool commitDispatchSideEffects,
         CancellationToken ct)
     {
@@ -1828,9 +2022,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var policy = _opts.IntraKindRoutingPolicy;
         if (policy == IntraKindRoutingPolicy.MostQuotaFirst)
-            await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, includeSingleMemberGroups: false, ct);
+            await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, poolSnapshots, includeSingleMemberGroups: false, ct);
         else if (policy == IntraKindRoutingPolicy.DeadlineAwareDrain)
-            await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, includeSingleMemberGroups: true, ct);
+            await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, poolSnapshots, includeSingleMemberGroups: true, ct);
 
         if (policy == IntraKindRoutingPolicy.DeadlineAwareDrain)
             return OrderDeadlineAwareDrain(sorted, precomputedQuotas, _time.GetUtcNow());
@@ -1863,6 +2057,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private async Task PrecomputeQuotaForPolicyAsync(
         List<ScoredMember> sorted,
         Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
+        Dictionary<string, AgentQuotaSnapshot> poolSnapshots,
         bool includeSingleMemberGroups,
         CancellationToken ct)
     {
@@ -1877,8 +2072,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 if (precomputedQuotas.ContainsKey(key))
                     continue;
 
-                var snapshot = await ProbeOrUnknownAsync(member, ct);
-                var resolved = ResolveMemberQuota(snapshot, member);
+                var snapshot = await ProbePoolMemberAsync(member, poolSnapshots, ct);
+                var resolved = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
                 var budgeted = await ApplyBudgetAsync(member, resolved, ct);
                 precomputedQuotas[key] = new PrecomputedQuota(snapshot, budgeted);
                 RecordObservedAvailability(member, budgeted.Quota);
@@ -2062,7 +2257,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 continue;
             }
 
-            var quota = ResolveMemberQuota(snapshot, member);
+            var quota = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
             var budgeted = await ApplyBudgetAsync(member, quota, ct);
             quota = budgeted.Quota;
             // Skip unknown (probe failed / no data) and members above their
@@ -2094,17 +2289,25 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         DateTimeOffset nowUtc,
         CancellationToken ct)
     {
+        // A known absolute balance is authoritative: the probe just measured
+        // the account, so stale observed-failure state must not override it,
+        // and the percentage-based rate-aware gate has no meaning for it.
         var recentObservedFailureReason = !quota.IsKnown
+            && !quota.IsBalanceKnown
             && _opts.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures
             ? await ResolveRecentObservedFailureReasonAsync(member, ct)
             : null;
+        var outstanding = _reservationLedger?.GetOutstandingPct(member) ?? 0;
         var gate = _quotaGatePolicy.Evaluate(
             member,
             quota,
             nowUtc,
+            outstanding,
             recentObservedFailure: recentObservedFailureReason is not null,
             observedFailureReason: recentObservedFailureReason);
         if (!gate.Allow || !quota.IsKnown)
+            return gate;
+        if (quota.PoolKind == QuotaPoolKind.DepletingBalance)
             return gate;
 
         var rateAware = await EvaluateRateAwareGateAsync(member, quota.AvailablePct, ct);
@@ -2161,12 +2364,29 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private bool KnownQuotaMeetsFloor(AgentMembership member, EffectiveQuota quota, DateTimeOffset nowUtc)
     {
+        // Balance pools gate on the absolute reading with strict headroom
+        // above the floor (mirroring the gate: at-or-below is exhausted).
+        // The percentage is not a quantity for these pools, so resolve the
+        // pool kind from both the enriched quota and the member declaration
+        // (the quota may be unenriched in tests or legacy paths).
+        if (quota.PoolKind == QuotaPoolKind.DepletingBalance
+            || (QuotaPoolResolver.TryResolvePool(_opts, member, out _, out var resolvedPool, out _)
+                && resolvedPool?.Kind == QuotaPoolKind.DepletingBalance))
+        {
+            if (!quota.IsBalanceKnown)
+                return false;
+            var poolName = quota.PoolId ?? QuotaPoolResolver.NormalizePoolName(member.Pool);
+            if (poolName is null)
+                return false;
+            return quota.BalanceRemaining!.Value > QuotaGatePolicy.ResolveBalanceFloor(_opts, poolName);
+        }
+
         var availablePct = quota.AvailablePct;
         if (!quota.IsKnown)
             return false;
 
         var floor = member.Billing == AgentBilling.Subscription
-            ? _quotaGatePolicy.ComputeEffectiveFloorPct(member.Agent, quota, nowUtc)
+            ? QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc)
             : _opts.MinQuotaPct;
         if (availablePct < floor)
             return false;
@@ -2223,6 +2443,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return DeadlineDrainSignal.None;
 
         var quota = precomputed.Budgeted.Quota;
+        // A depleting-balance pool has no reset instant and its percentage is
+        // not a quantity, so there is no deadline headroom to drain against.
+        if (quota.PoolKind == QuotaPoolKind.DepletingBalance)
+            return DeadlineDrainSignal.None;
+        if (QuotaPoolResolver.TryResolvePool(_opts, member, out _, out var resolvedPool, out _)
+            && resolvedPool?.Kind == QuotaPoolKind.DepletingBalance)
+            return DeadlineDrainSignal.None;
         if (!quota.IsKnown)
             return DeadlineDrainSignal.None;
 
@@ -2235,7 +2462,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (hoursToReset <= 0 || double.IsNaN(hoursToReset) || double.IsInfinity(hoursToReset))
             return DeadlineDrainSignal.None;
 
-        var floor = _quotaGatePolicy.ComputeEffectiveFloorPct(member.Agent, quota, nowUtc);
+        var floor = QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc);
         var headroom = Math.Max(0.0, quota.AvailablePct - floor);
         if (headroom <= 0)
             return DeadlineDrainSignal.None;
@@ -2546,7 +2773,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             AgentQuotaSnapshot snapshot;
             try { snapshot = await ProbeAsync(member, ct); }
             catch { continue; }
-            var quota = ResolveMemberQuota(snapshot, member);
+            var quota = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
             quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
 
             AgentBurnEstimate est;
@@ -2804,10 +3031,21 @@ public sealed record EffectiveQuota(
     DateTimeOffset? ResetAt,
     string? Window,
     IReadOnlyList<WindowQuota>? Windows = null,
-    QuotaUnknownReason? Unknown = null)
+    QuotaUnknownReason? Unknown = null,
+    string? PoolId = null,
+    QuotaPoolKind? PoolKind = null,
+    double? BalanceRemaining = null)
 {
     /// <summary>True when this is a real reading (mirrors AgentQuotaSnapshot.IsKnown).</summary>
     public bool IsKnown => Unknown is null && AvailablePct >= 0;
+
+    /// <summary>
+    /// True when this carries a real absolute-balance reading for a
+    /// depleting-balance pool. Balance gating keys off this, never off
+    /// <see cref="IsKnown"/> (a balance pool's percentage is not a reading).
+    /// </summary>
+    public bool IsBalanceKnown =>
+        BalanceRemaining is { } b && double.IsFinite(b) && b >= 0;
 }
 
 /// <summary>
@@ -2878,6 +3116,15 @@ public sealed record AgentRoutingDecision
     public bool NoEligibleMembers { get; init; }
 
     /// <summary>
+    /// True when the router refused dispatch because every eligible
+    /// subscription member is terminally exhausted (depleting-balance pool at
+    /// or below its floor). Unlike <see cref="ShouldWait"/>, no reset will
+    /// ever clear this: the caller must fail the item (never park it waiting
+    /// for a quota reset) until the account is topped up.
+    /// </summary>
+    public bool TerminalQuotaExhausted { get; init; }
+
+    /// <summary>
     /// True when the router invoked the caller's per-agent slot reservation
     /// callback for the chosen member and it succeeded — the caller does NOT
     /// need to (and must not) re-reserve, and must release the slot on every
@@ -2885,6 +3132,18 @@ public sealed record AgentRoutingDecision
     /// reservation callback was supplied.
     /// </summary>
     public bool SlotReserved { get; init; }
+
+    /// <summary>
+    /// Escrow handle for the estimated dispatch cost, committed atomically with
+    /// the gate decision. Non-null only when a reservation ledger is wired, the
+    /// chosen member is subscription-billed with a known reading, and this is
+    /// the committing dispatch path. The caller owns the lease: reconcile it
+    /// against observed usage and release it on the same lifecycle that
+    /// releases the worker slot, so a success, failure, cancellation, or dead
+    /// worker cannot leak the escrow. Null everywhere else (including
+    /// PayPerApi fallthrough and readiness checks).
+    /// </summary>
+    public QuotaReservationLease? QuotaReservation { get; init; }
 
     /// <summary>
     /// True when at least one quota-passing member was blocked by its
@@ -2997,6 +3256,35 @@ public sealed class QuotaRouterOptions
         = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Operator-declared quota pools, keyed by pool name (case-insensitive).
+    /// Each pool names one underlying account or subscription; class members
+    /// join a pool via their pool reference. Members of one pool share a
+    /// single reading, a single floor, and a single reservation escrow.
+    /// Empty (the default) keeps legacy per-agent keying for every member.
+    /// Hot-reloadable.
+    /// </summary>
+    public Dictionary<string, QuotaPoolOptions> Pools { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Per-pool floor overrides keyed by pool name (case-insensitive), sitting
+    /// alongside <see cref="FloorByAgent"/>.
+    /// Resolution order for a pool member's effective floor: the pool entry
+    /// here (when the pool has one) and the member's agent entry in
+    /// <see cref="FloorByAgent"/> (when the agent has one) are each resolved
+    /// against the globals, and the HIGHER of the two wins so neither reserve
+    /// can be undercut; with only one present it applies directly; with
+    /// neither, the globals apply. Configuration carrying only
+    /// <see cref="FloorByAgent"/> therefore produces exactly the floors it
+    /// produces today. For depleting-balance pools the entry carries
+    /// <see cref="QuotaPoolFloorOptions.MinBalance"/> (absolute units);
+    /// for resetting-window pools it carries the percentage fields.
+    /// Hot-reloadable.
+    /// </summary>
+    public Dictionary<string, QuotaPoolFloorOptions> FloorByPool { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Default length of the quota window used to compute the time-based
     /// floor ramp when the probe surfaces a <c>ResetAt</c>. The fraction-
     /// elapsed is <c>1 - timeUntilReset / RampWindow</c>. Default 7 days
@@ -3080,6 +3368,48 @@ public sealed class QuotaRouterOptions
     /// long enough not to busy-loop. Default 15s.
     /// </summary>
     public TimeSpan CapRetryRecheckInterval { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Estimated quota cost of one dispatch, in quota-percentage points. The
+    /// reservation ledger escrows this per authorised dispatch so concurrent
+    /// workers sharing one cached probe reading cannot jointly overshoot the
+    /// floor. Cold-start default 5.0; operators with measured burns should set
+    /// this near their typical per-item burn (see
+    /// <see cref="DispatchReservationEstimatePctByAgent"/>). Hot-reloadable.
+    /// </summary>
+    public double DispatchReservationEstimatePct { get; set; } = 5.0;
+
+    /// <summary>
+    /// Per-agent override for <see cref="DispatchReservationEstimatePct"/>,
+    /// keyed by <see cref="AgentKind.Value"/>. Non-positive entries are ignored
+    /// (the global estimate applies). Hot-reloadable.
+    /// </summary>
+    public Dictionary<string, double> DispatchReservationEstimatePctByAgent { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Lower bound for any reservation estimate, in quota-percentage points.
+    /// A missing, zero, or negative estimate resolves to at least this — a
+    /// dispatch must never silently reserve nothing. Default 0.5.
+    /// Hot-reloadable.
+    /// </summary>
+    public double DispatchReservationMinPct { get; set; } = 0.5;
+
+    /// <summary>
+    /// Upper bound for any single reservation, in quota-percentage points.
+    /// Guards against a misconfigured estimate pinning the whole pool.
+    /// Default 25. Hot-reloadable.
+    /// </summary>
+    public double DispatchReservationMaxPct { get; set; } = 25.0;
+
+    /// <summary>
+    /// Maximum age of a reservation before <see cref="QuotaReservationLedger.SweepExpired"/>
+    /// reaps it. Backstop only: prompt release flows through the worker-slot
+    /// lifecycle and the recovery reaper. Must comfortably exceed the longest
+    /// legitimate phase (see work timeouts, default 240 min). Default 6 hours.
+    /// Hot-reloadable.
+    /// </summary>
+    public TimeSpan QuotaReservationMaxAge { get; set; } = QuotaRouterDefaults.DefaultQuotaReservationMaxAge;
 
     /// <summary>
     /// Default "how many concurrent burns fit in the remaining quota window"

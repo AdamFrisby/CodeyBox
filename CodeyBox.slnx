@@ -11,6 +11,7 @@
     <Project Path="src/CodeyBox.Agents.Antigravity/CodeyBox.Agents.Antigravity.csproj" />
     <Project Path="src/CodeyBox.Agents.Crock/CodeyBox.Agents.Crock.csproj" />
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
+    <Project Path="src/CodeyBox.AdminSeed/CodeyBox.AdminSeed.csproj" />
     <Project Path="src/CodeyBox.Api/CodeyBox.Api.csproj" />
     <Project Path="src/CodeyBox.Audit.Llm/CodeyBox.Audit.Llm.csproj" />
     <Project Path="src/CodeyBox.Audit.Presets/CodeyBox.Audit.Presets.csproj" />
@@ -18,6 +19,7 @@
     <Project Path="src/CodeyBox.Audit/CodeyBox.Audit.csproj" />
     <Project Path="src/CodeyBox.Core/CodeyBox.Core.csproj" />
     <Project Path="src/CodeyBox.Deployment/CodeyBox.Deployment.csproj" />
+    <Project Path="src/CodeyBox.Executor/CodeyBox.Executor.csproj" />
     <Project Path="src/CodeyBox.ExploratoryTesting/CodeyBox.ExploratoryTesting.csproj" />
     <Project Path="src/CodeyBox.Git/CodeyBox.Git.csproj" />
     <Project Path="src/CodeyBox.Orchestrator/CodeyBox.Orchestrator.csproj" />

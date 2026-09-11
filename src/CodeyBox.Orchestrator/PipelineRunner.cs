@@ -341,7 +341,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // Optional best-effort exporter that propagates a completed item's test
         // cases to JobTrack. Null disables propagation; when wired it self-gates
         // on each project's JobTrackExport.Enabled opt-in.
-        IJobTrackTestCaseExporter? jobTrackExporter = null)
+        IJobTrackTestCaseExporter? jobTrackExporter = null,
+        // Toolchain-fault classification for gate subprocess results. Null
+        // falls back to the built-in platform-agnostic signatures; the record
+        // store defaults to an in-memory bounded store. The composition root
+        // wires the hot-reloadable snapshot-backed classifier and the shared
+        // store so a config-only signature takes effect without restart.
+        IToolchainFaultClassifier? toolchainFaultClassifier = null,
+        IToolchainFaultRecordStore? toolchainFaultRecords = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -482,7 +489,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _claudeSessionOptions = sessionDispatchOptions ?? new AgentSessionDispatchOptions();
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
-            _auditReports is null ? null : PersistAuditReportAsync);
+            _auditReports is null ? null : PersistAuditReportAsync,
+            toolchainFaultClassifier ?? new ToolchainFaultClassifier(snapshot: null),
+            toolchainFaultRecords ?? new InMemoryToolchainFaultRecordStore());
     }
 
     private readonly RequiredBuildGate _requiredBuildGate;
@@ -1779,6 +1788,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
+        runner = BindMemberRunner(runner, TryResolveSelectedMember(runner.Kind, project, item));
         var credential = await ResolveAgentCredentialForInvocationAsync(runner, project, item, ct);
         string? isolatedRepoPath = null;
         ISandbox? sandbox = null;
@@ -3272,6 +3282,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item.Id, ex.Message);
             await TransitionWaitingForQuotaResetAsync(item, ex, project);
         }
+        catch (ToolchainFaultTransientException ex)
+        {
+            // A gate subprocess failed with a retryable toolchain-fault
+            // signature: the tool failed, not the diff. Re-run the same
+            // commit through the existing bounded WaitingForTransientRetry
+            // path (attempts + jitter owned by the retry scheduler) instead
+            // of recording a finding against the diff. Deliberately distinct
+            // from flake attribution, which consults the base branch.
+            _log.LogWarning(
+                "Work item {Id} hit toolchain fault '{FaultClass}' (signature {Signature}) in phase {Phase}; parking for transient retry",
+                item.Id,
+                ex.Classification.FaultClass,
+                ex.Classification.MatchedSignature,
+                ex.Phase ?? "(unknown)");
+            await TransitionWaitingForTransientRetryAsync(item, ex.Message, project, ex.Phase, item.Agent);
+        }
         catch (RequiredBuildFailedException ex)
         {
             _log.LogWarning("Work item {Id} failed required build gate: {Error}", item.Id, ex.Message);
@@ -4681,7 +4707,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             var credential = await ResolveAgentCredentialAsync(quotaMember, project, token);
             collected.Add(new AgenticConflictResolverCandidate(
-                candidate,
+                BindMemberRunner(candidate, quotaMember),
                 credential,
                 modelId,
                 reasoningMode,
@@ -8063,6 +8089,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         WorkItem item, Project project, IAgentRunner agentRunner,
         string repoId, string baseBranch, string prompt, CancellationToken ct)
     {
+        agentRunner = BindMemberRunner(agentRunner, TryResolveSelectedMember(agentRunner.Kind, project, item));
         var credential = await ResolveAgentCredentialAsync(agentRunner.Kind, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
@@ -8654,6 +8681,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         WorkItem item, Project project, IAgentRunner agentRunner,
         string repoId, string workBranch, string prompt, int iteration, CancellationToken ct)
     {
+        agentRunner = BindMemberRunner(agentRunner, TryResolveSelectedMember(agentRunner.Kind, project, item));
         var credential = await ResolveAgentCredentialAsync(agentRunner.Kind, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
@@ -13074,7 +13102,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     ctx,
                                     ct);
                             }
-                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException and not AuditorIdleTimeoutException)
+                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException and not AuditorIdleTimeoutException && !SandboxDeferralGuard.IsDeferral(ex))
                             {
                                 throw new AuditUnavailableException(
                                     $"could-not-verify: isolated audit repository setup failed for {auditor.Name}: {SingleLineSummary(ex.Message)}",
@@ -14852,6 +14880,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// </summary>
     private sealed record AuditAgentSelection(IAgentRunner Runner, AgentMembership? Member);
 
+    /// <summary>
+    /// Builds an audit-agent selection with the runner bound to the selected
+    /// member's configuration (e.g. a Copilot member's BYOK provider), so
+    /// audit turns run against the same backend the member's work turns use.
+    /// </summary>
+    private static AuditAgentSelection SelectAuditAgent(IAgentRunner runner, AgentMembership? member)
+        => new(BindMemberRunner(runner, member), member);
+
     private async Task<AuditAgentSelection> ResolveAuditAgentRunnerAsync(
         WorkItem item,
         Project project,
@@ -14952,7 +14988,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
                             item.Id, workRunner.Kind, workProbeMember, ct);
                         if (workOk)
-                            return new AuditAgentSelection(workRunner, workMember);
+                            return SelectAuditAgent(workRunner, workMember);
                         _log.LogInformation(
                             "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
                             workRunner.Kind.Value, workReason, auditorName);
@@ -15067,7 +15103,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
         }
         if (!preferredCachedExhausted && preferredPauseReason is null && preferredAvailable && preferredOk)
-            return new AuditAgentSelection(preferredRunner, preferredMember);
+            return SelectAuditAgent(preferredRunner, preferredMember);
 
         if (!preferredCachedExhausted && preferredPauseReason is null)
         {
@@ -15171,7 +15207,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // walk, naming workRunner — incorrect when the chain picks a
             // different member.
             AuditLog.QuotaAuditFallthrough(preferredKind.Value, member.Agent, auditorName);
-            return new AuditAgentSelection(memberRunner, member);
+            return SelectAuditAgent(memberRunner, member);
         }
 
         // The work agent is one of the class members (the work-phase router
@@ -15251,7 +15287,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var pauseReason = GetAgentPausedReason(workRunner.Kind);
         if (pauseReason is null)
-            return new AuditAgentSelection(workRunner, TryResolveSelectedMember(workRunner.Kind, project, item));
+            return SelectAuditAgent(workRunner, TryResolveSelectedMember(workRunner.Kind, project, item));
 
         _log.LogWarning(
             "LLM auditor '{Auditor}' waiting: work agent '{Agent}' is {Reason}",
@@ -15337,7 +15373,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     var (workOk, workReason) = await EvaluateAuditCandidateQuotaAsync(
                         item.Id, workRunner.Kind, workProbeMember, ct);
                     if (workOk)
-                        return new AuditAgentSelection(workRunner, workMember);
+                        return SelectAuditAgent(workRunner, workMember);
                     _log.LogInformation(
                         "Audit-capable work agent '{WorkKind}' rejected ({Reason}) for auditor '{Auditor}'; spilling to audit pool",
                         workRunner.Kind.Value, workReason, auditorName);
@@ -15469,7 +15505,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogInformation(
                 "Routing auditor '{Auditor}' to class member '{Member}'",
                 auditorName, member.Agent.Value);
-            return new AuditAgentSelection(memberRunner, member);
+            return SelectAuditAgent(memberRunner, member);
         }
         // LlmAuditorParkedQuota names "quota" — only emit when at least one
         // candidate was actually quota-rejected. When the pool is empty or
@@ -16069,6 +16105,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
+    /// Binds a runner to a class member's configuration (today: Copilot's
+    /// per-member BYOK provider override). Runners without member-scoped
+    /// configuration pass through untouched, as do members of a different
+    /// kind — so every existing invocation behaves exactly as before.
+    /// </summary>
+    private static IAgentRunner BindMemberRunner(IAgentRunner runner, AgentMembership? member)
+    {
+        ArgumentNullException.ThrowIfNull(runner);
+        if (member is null || member.Agent != runner.Kind || runner is not IMemberScopedAgentRunner scoped)
+            return runner;
+        return scoped.ForMember(member);
+    }
+
+    /// <summary>
     /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
     /// if the invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>
     /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase),
@@ -16523,6 +16573,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 Billing = AgentBilling.Subscription,
                 QualityScore = 100,
             };
+        // Bind the runner to this attempt's member: a member-scoped runner
+        // (e.g. Copilot with a per-member BYOK provider) must render every
+        // invocation — work, rework, audit, merge — from the member's
+        // effective configuration, not the agent-global one.
+        // Non-member-scoped runners pass through untouched.
+        currentRunner = BindMemberRunner(currentRunner, currentMember);
 
         static string TriedMemberKey(AgentMembership member) =>
             $"{member.RouteKey}\0{member.ModelId ?? string.Empty}";
@@ -16842,6 +16898,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             currentMember = nextMember;
             currentRunner = nextRunner;
             currentItem = trialItem;
+            // The fallback member brings its own configuration (e.g. a
+            // different Copilot BYOK provider or the native subscription), so
+            // the retry must run bound to the NEW member, not the exhausted one.
+            currentRunner = BindMemberRunner(currentRunner, currentMember);
         }
 
         while (true)
@@ -18431,6 +18491,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }
             }
 
+            // Best-effort: read the agent's own commit messages for LLM-generated
+            // PR descriptions. Failures here are non-fatal — the field defaults
+            // to an empty list and the generator falls back to the diff alone.
+            IReadOnlyList<string> commitMessages = [];
+            try
+            {
+                commitMessages = await _gitHost.GetCommitMessagesAsync(repoId, baseBranch, workBranch, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogDebug("Could not read commit messages for PR description: {Message}", ex.Message);
+            }
+
             var request = new UpstreamCompletionRequest
             {
                 RepositoryId = repoId,
@@ -18445,6 +18518,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 FullDiff = fullDiff,
                 WorkItemPrompt = item.Prompt,
                 AddressedFindings = addressedFindings,
+                CommitMessages = commitMessages,
                 AgentStdout = agentStdout,
                 PromptRevision = item.PromptRevision,
                 Initiator = item.Initiator,
@@ -19306,6 +19380,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
+        runner = BindMemberRunner(runner, TryResolveSelectedMember(runner.Kind, project, item));
         // The conflict-rework iteration uses an isolated bare repo clone so a
         // destructive agent action (rebase --abort, reset --hard, etc.) cannot
         // damage the durable host bare repo. The caller still verifies prior

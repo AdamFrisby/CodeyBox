@@ -150,7 +150,7 @@ internal static class IncusBaselineNaming
         }
         var canonical = new
         {
-            version = 4,
+            version = 5,
             profile = profileName,
             flavor = flavor.ToString(),
             image = options.DefaultImage,
@@ -167,6 +167,12 @@ internal static class IncusBaselineNaming
             guestUserId = options.GuestUserId,
             guestGroupId = options.GuestGroupId,
             guestHome = options.GuestHome,
+            // Version 5 serves NuGet-targeted seeds as fallback folders
+            // (read-only mounts for full-launch VMs, baked fallback content
+            // for baselines) instead of copying them into the writable
+            // package root, so the layout inputs must join the hash.
+            nugetFallbackPath = options.NuGetFallbackGuestPath,
+            shareNuGetSeeds = options.ShareNuGetPackageSeedsAsFallback,
             packageCacheSeeds = options.PackageCacheSeeds.Select(static seed => new
             {
                 seed.HostSourcePath,

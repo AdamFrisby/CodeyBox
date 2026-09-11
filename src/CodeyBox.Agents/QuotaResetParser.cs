@@ -23,7 +23,11 @@ public static class QuotaResetParser
     // match; the surrounding code rejects the all-zero case.
     // Compact duration tokens only (5h23m, 21h41m24s). Word forms such as
     // "5 hours 23 minutes" are intentionally excluded so prompt-injectable
-    // prose in agent output cannot widen the quota-reset pause window.
+    // prose in agent output cannot widen the quota-reset pause window. The
+    // one gated exception is OpencodeQuotaResetParser, which honours word
+    // forms only when the same source carries the subscription-limit anchor
+    // ("usage limit reached"); unanchored prose is rejected there exactly as
+    // it is here, so both parsers share one threat model.
     private static readonly Regex ResetAfterRegex = new(
         @"(?:reset(?:s|ting)?(?:\s+will\s+reset)?\s+after|reset(?:s|ting)?\s+in|retry\s+after|try\s+again\s+after|available\s+(?:in|after))\s+(?:(\d+)\s*h(?![a-zA-Z]))?\s*(?:(\d+)\s*m(?![a-zA-Z]))?\s*(?:(\d+)\s*s(?![a-zA-Z]))?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);

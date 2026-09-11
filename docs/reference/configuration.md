@@ -160,9 +160,29 @@ Hot-reloadable today:
   `TransitionHealthOptionsSnapshot`; controls the `/fleet/transition-health`
   endpoint's rolling window and "last N transitions" cap.
   See [`transition-health.md`](../operating/pipeline-metrics.md).
+- `ToolchainFaults:<name>.{FaultClass,Disposition,ExitCodes,ExitCodeAbove,StdoutContains,StderrContains,OutputContains,StdoutRegex,StderrRegex,OutputRegex}`
+  — hot-reloaded through `ToolchainFaultSnapshot`; each entry declares a match,
+  the fault class it denotes, and its disposition (`Retry`, `Fail`, `Escalate`)
+  over gate subprocess results. A retryable match re-runs the same commit via
+  the existing bounded `WaitingForTransientRetry` path without recording a
+  finding against the diff. Platform-agnostic built-ins (signal termination
+  above exit 128, OOM kill 137, disk exhaustion, .NET runtime crash
+  `0x80131506`) always apply, so a new language signature is a config-only
+  addition. Every matched classification is recorded with its signature,
+  command, and exit code; per-fault-class frequencies are queryable from
+  `IToolchainFaultRecordStore` and the `codeybox.toolchain.faults` counter.
+  Kept distinct from `TestFailureAttribution`, which consults the base branch.
 - `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
   invocation; changes affect the next work/rework/audit/merge/check-and-act
   prompt.
+- `Changelog.GeneratorBaseUrl` / `GeneratorModelId` / `GeneratorApiKey` /
+  `GeneratorWireApi` / `GeneratorAnthropicVersion` — re-read on every changelog
+  generation call.
+- `CheckAndActCompletion.*` (provider order, models, endpoint URLs, keys,
+  timeouts, custom providers) — re-read on every check-and-act completion
+  attempt.
+- `Completion.{RequestTimeoutSeconds,MaxResponseBytes,MaxPromptChars,HttpClientName}` —
+  re-read on every completion-client call.
 - `AgentStreams.{MaxFileSizeMb,RetainedDays,MaxTotalSizeMb}` — the
   `AgentStreamStore` reads options live via `IOptionsMonitor`, so per-file caps,
   the retention window, and the total-size backstop all take effect on the next
@@ -185,7 +205,6 @@ Not hot-reloadable (consumer captures the value at construction; restart require
 - `WebhookEventBus.RingBufferCapacity` — sized into the in-memory ring buffer.
 - `Webhooks[*]` — `HttpWebhookDispatcher` builds its endpoint set at startup;
   rebuilding the dispatcher mid-flight would drop pending retries.
-- `Changelog.*` — `ClaudeChangelogGenerator` snapshots its config at construction.
 - `AuditLog.Path` / `AuditLog.AuditPath` / `AuditLog.MaxFileSizeBytes` — bound
   into Serilog rolling-file sinks at startup.
 - `AgentStreamAnalysis.*` — bound into the `AgentStreamParserOptions` singleton
@@ -297,6 +316,8 @@ snapshot before using a pin.
   "InterruptedExecRecoveryRetryAttempts": 3,
   "InterruptedExecRecoveryRetryDelay": "00:00:01",
   "PackageCacheSeeds": [],
+  "NuGetFallbackGuestPath": "/opt/codeybox/nuget-fallback-packages",
+  "ShareNuGetPackageSeedsAsFallback": true,
   "ExecutableProvisions": []
 }
 ```
@@ -312,7 +333,9 @@ snapshot before using a pin.
 | `UseBaselineImages` | bool | `true` | Lazily bake baselines and create sandboxes with COW `incus copy` clones. Set false to use the full-launch path. |
 | `SecureBoot` | bool | `true` | Enable UEFI Secure Boot for newly initialized VMs. Disable only when the host firmware cannot boot an otherwise-valid signed guest image. |
 | `ExtraRuncmd` | string[] | `[]` | Incus-specific first-boot/baseline provisioning commands. At most 256 commands are accepted; each command is limited to 64 KiB of UTF-8 and the aggregate to 1 MiB. Multipass provisioning settings are never inherited. |
-| `PackageCacheSeeds` | object[] | `[]` | Incus-specific host package-cache files or directories copied while provisioning a baked baseline or a full-launch VM. Each entry has `HostSourcePath`, a normalized absolute non-root canonical guest destination directory in `VmDestPath`, and optional finite positive `MaxSizeMB` in MiB (1,048,576 bytes). Directory contents land beneath that destination; a file lands at `VmDestPath/<source basename>`. Guest aliases and paths under `/dev`, `/proc`, `/run`, or `/sys` are rejected. Maximum 32 entries. Multipass seeds are never inherited. |
+| `PackageCacheSeeds` | object[] | `[]` | Incus-specific host package-cache files or directories copied while provisioning a baked baseline or a full-launch VM. Each entry has `HostSourcePath`, a normalized absolute non-root canonical guest destination directory in `VmDestPath`, and optional finite positive `MaxSizeMB` in MiB (1,048,576 bytes). Directory contents land beneath that destination; a file lands at `VmDestPath/<source basename>`. Seeds destined for the guest NuGet home (`{GuestHome}/.nuget/...`) are instead served as read-only shared fallback folders — see `NuGetFallbackGuestPath` — so the multi-gigabyte package cache is transferred once per host, not once per sandbox. Guest aliases and paths under `/dev`, `/proc`, `/run`, or `/sys` are rejected. Maximum 32 entries. Multipass seeds are never inherited. |
+| `NuGetFallbackGuestPath` | string | `/opt/codeybox/nuget-fallback-packages` | Hot-reloadable guest path of the shared read-only NuGet fallback folder. NuGet-targeted package seeds are exposed here (full-launch VMs mount the host directory read-only via virtiofs; baselines bake the content into the image so clones inherit it) and advertised to restore through `NUGET_FALLBACK_PACKAGES`, while the per-sandbox writable package root stays per-VM for packages the cache does not carry. Additional seeds map to `{path}-2`, `{path}-3`, and so on. Must be an absolute non-root path outside the guest home and provider-owned control paths. Seed copy archives for providers that cannot share a host directory are cached once per host under `{StagingDirectory}/shared-package-archives` (mode `0700`). |
+| `ShareNuGetPackageSeedsAsFallback` | bool | `true` | Hot-reloadable switch for the read-only fallback behavior above. Disable to keep the legacy per-VM copy of every seed into the writable package root. Seeds whose host source is a file, is missing, or sits outside `AllowedHostMountRoots`/staging always keep the copy path (missing sources are skipped with a warning and restore fetches those packages). |
 | `ExecutableProvisions` | object[] | `[]` | Incus-specific host executables installed while provisioning a baked baseline or a full-launch VM. Each entry has `HostSourcePath`, normalized absolute non-root canonical guest `VmDestPath`, optional `VmSymlinks` (at most 32 normalized absolute canonical guest paths), and optional `Label`. Guest aliases and paths under `/dev`, `/proc`, `/run`, or `/sys` are rejected. Maximum 64 provisions. Multipass provisions are never inherited. |
 | `ExtraCloudInit` | string or null | null | Incus-specific additional top-level cloud-init YAML sent through `user.user-data`. Multipass cloud-init settings are never inherited. Do not put secrets here. |
 | `StagingDirectory` | string or null | `<StateDatabasePath directory>/incus-staging` | Restart-only persistent absolute host directory for isolation snapshots and mount staging. Its canonical, non-symlink parent must already exist; normally leave the root absent so CodeyBox creates it with mode `0700` and its ownership marker. An existing root is accepted only when owned by the service UID/GID with exact mode `0700` and an exact provider-owned `.codeybox-incus-staging-v1` marker (mode `0600`). Set an explicit path to place staging on a separate filesystem. The filesystem root, commas, and control characters are rejected because this path is included in the project's restricted disk-path list. |
@@ -667,6 +690,8 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `EndFloorPct` | `3` | Global late-window ramp floor as reset approaches. |
 | `RampWindowSeconds` | `604800` | Global quota-window length used for the ramp calculation. |
 | `FloorByAgent` | `{}` | Optional per-agent overrides keyed by agent kind, e.g. `codex` or `claude`. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted fields inherit global values, and omitted agents use the global ramp. |
+| `Pools` | `{}` | Optional quota pools keyed by pool name. Each pool names one underlying account or subscription; class members join via their `Pool` reference and share one reading, one floor, and one reservation escrow. Each entry sets `Kind` (`ResettingWindow` or `DepletingBalance`), optional `BalanceUnit`, and optional `ReservationEstimate` (native units). Hot-reloadable. See `docs/operating/quota.md`. |
+| `FloorByPool` | `{}` | Optional per-pool floor overrides keyed by pool name, alongside `FloorByAgent`. For a pool member the higher of the pool-resolved and agent-resolved floors wins. Resetting-window pools use the percentage fields (`MinQuotaPct`, `StartFloorPct`, `EndFloorPct`, `RampWindowSeconds`); depleting-balance pools use absolute `MinBalance`. Mixing units is rejected at load. Hot-reloadable. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
 | `PausedQuotaCacheTtlSeconds` | `3600` | Seconds to cache quota snapshots while an agent is operator-paused. Active/routable agents keep using `QuotaCacheTtlSeconds`. Hot-reloadable. |

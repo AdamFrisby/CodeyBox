@@ -24,6 +24,12 @@ internal static class WorkerRegistryEndpoints
             startedAt = w.StartedAt,
             lastHeartbeatAt = w.LastHeartbeatAt,
             currentWorkItemId = w.CurrentWorkItemId,
+            executorHostId = w.ExecutorHostId,
+            maxConcurrentSandboxes = w.MaxConcurrentSandboxes,
+            executorNetworkProfiles = w.ExecutorNetworkProfiles,
+            executorCredentials = w.ExecutorCredentials,
+            cordoned = w.Cordoned,
+            healthy = w.Healthy,
         }));
     }
 }

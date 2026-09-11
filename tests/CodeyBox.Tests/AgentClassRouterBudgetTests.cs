@@ -230,7 +230,16 @@ public sealed class AgentClassRouterBudgetTests
         var router = new AgentClassRouter(
             [cls],
             [new ThrowingProbe(Claude)],
-            new QuotaRouterOptions { MinQuotaPct = 10.0, UnknownPolicy = policy },
+            // Zero floors so the unknown branch reaches UnknownPolicy: this
+            // theory pins the policy branching, not the reserve floor (a
+            // non-zero floor fails closed before the policy applies).
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
+                UnknownPolicy = policy,
+            },
             NullLogger<AgentClassRouter>.Instance);
 
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), null, CancellationToken.None);

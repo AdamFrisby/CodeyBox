@@ -28,6 +28,14 @@ public interface IAgentQuotaAvailabilitySnapshot
         SnapshotQuotaAvailability()
             .Select(row => (row.Agent.Value, row.Agent, row.ModelId, row.AvailablePct))
             .ToList();
+
+    /// <summary>
+    /// Pool identity for members with a recently observed quota reading:
+    /// which route keys currently share a meter. Members with no pool report
+    /// a null pool. Implementations without pool tracking return an empty list.
+    /// </summary>
+    IReadOnlyList<(string InstanceId, AgentKind Agent, string? ModelId, string? Pool)> SnapshotQuotaPools() =>
+        [];
 }
 
 /// <summary>

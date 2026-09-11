@@ -144,6 +144,14 @@ public sealed record UpstreamCompletionRequest
     /// <summary>Raw agent stdout. Used for AgentReasoningTail in LLM-generated descriptions. Null for legacy callers.</summary>
     public string? AgentStdout { get; init; }
     /// <summary>
+    /// Full commit messages produced on the work branch (subjects plus bodies,
+    /// oldest first), each pre-truncated to at most 2 KB with at most 20 entries.
+    /// Forwarded to the description generator so both strategies see the agent's
+    /// own per-commit summaries. Empty when unavailable; the upstream remote
+    /// falls back to reading them from the host git repo.
+    /// </summary>
+    public IReadOnlyList<string> CommitMessages { get; init; } = [];
+    /// <summary>
     /// Current work-item prompt revision at upstream time. Used only as a
     /// fallback for generated squash-merge trailers when the branch commits
     /// cannot be read from the forge.

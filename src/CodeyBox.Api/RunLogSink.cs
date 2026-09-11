@@ -16,14 +16,28 @@ namespace CodeyBox.Api;
 /// <item>Every line carries a full-date UTC timestamp
 /// (<c>yyyy-MM-ddTHH:mm:ss.fffZ</c>), so a time-based grep never matches lines
 /// from an earlier day.</item>
+/// <item>One physical line per record. The rendered message and exception
+/// text carry agent stdout, provider error bodies, branch names and
+/// repository content, so control characters (CR, LF, the ANSI escape
+/// introducer and other C0/C1 controls) are backslash-escaped before the
+/// line is written. An embedded newline can therefore never split a record
+/// or defeat the one-line-per-record framing, and terminal escape sequences
+/// cannot reach an operator tailing the file.</item>
 /// <item>Size-based rotation with a retained-file count. Both knobs
 /// (<see cref="ConsoleLogOptions.MaxFileSizeBytes"/>,
 /// <see cref="ConsoleLogOptions.RetainedFileCountLimit"/>) are re-read from
 /// the supplied accessor on every write, so operator edits hot-reload without
-/// a restart. Total on-disk footprint is bounded by
-/// <c>RetainedFileCountLimit x MaxFileSizeBytes</c> (plus at most one
-/// in-flight over-long line, which is always written whole rather than lost)
-/// regardless of write rate.</item>
+/// a restart. No single record can exceed
+/// <see cref="ConsoleLogOptions.MaxFileSizeBytes"/>: a record that would not
+/// fit is truncated to the cap (with a <c>[truncated]</c> marker) before it is
+/// written, so every file the sink creates is at most
+/// <c>MaxFileSizeBytes</c> long and the total on-disk footprint stays bounded
+/// by <c>RetainedFileCountLimit x MaxFileSizeBytes</c> regardless of write
+/// rate. Retention evicts the oldest sealed segments first, by file count and
+/// by bytes, so lowering the knobs (or inheriting oversized segments written
+/// under older settings) converges back under the bound as segments age out;
+/// a pre-existing oversized active file is sealed on the next write and then
+/// ages out by the same rules.</item>
 /// <item>Rotation happens under a lock while the file is held open for append
 /// (<c>FileShare.Read</c> so <c>tail</c>/<c>grep</c> work concurrently). Lines
 /// are flushed before any rename, so rotation neither loses nor duplicates
@@ -35,9 +49,11 @@ namespace CodeyBox.Api;
 /// <c>codeybox-console-20260908.log</c> is the active file and
 /// <c>codeybox-console-20260908_001.log</c>, <c>_002</c>, … are the sealed
 /// size segments for that day. A new UTC day opens a new dated active file.
-/// Retention is enforced across all dates and segments: only the newest
-/// <c>RetainedFileCountLimit - 1</c> sealed files are kept next to the active
-/// one. Emit never throws; I/O failures are reported to Serilog's SelfLog and
+/// Retention is enforced across all dates and segments: the newest sealed
+/// files are kept next to the active one while they fit both the file-count
+/// budget (<c>RetainedFileCountLimit - 1</c> files) and the byte budget
+/// (<c>(RetainedFileCountLimit - 1) x MaxFileSizeBytes</c> bytes). Emit never
+/// throws; I/O failures are reported to Serilog's SelfLog and
 /// retried on the next event.
 /// </summary>
 internal sealed class RunLogSink : ILogEventSink, IDisposable
@@ -100,12 +116,16 @@ internal sealed class RunLogSink : ILogEventSink, IDisposable
                 if (_disposed) return;
                 var options = ReadClampedOptions();
                 var today = _utcNow().UtcDateTime.ToString(DateFormat, CultureInfo.InvariantCulture);
-                if (!EnsureActive(today, options.RetainedCount)) return;
+                if (!EnsureActive(today, options.RetainedCount, options.MaxSizeBytes)) return;
 
-                var line = FormatLine(logEvent);
+                // Derive the per-line byte budget from the live size knob
+                // BEFORE assembling the line, so an over-long message is
+                // truncated during rendering and can never materialize as an
+                // unbounded string or an oversized file segment.
+                var line = FormatLine(logEvent, options.MaxSizeBytes);
                 var bytes = Encoding.UTF8.GetByteCount(line);
                 if (_activeSize > 0 && _activeSize + bytes > options.MaxSizeBytes)
-                    RollSize(today, options.RetainedCount);
+                    RollSize(today, options.RetainedCount, options.MaxSizeBytes);
 
                 // RollSize re-opens the active file; if the disk went away in
                 // between, drop this line and retry on the next event.
@@ -139,7 +159,7 @@ internal sealed class RunLogSink : ILogEventSink, IDisposable
             Math.Max(1, options.RetainedFileCountLimit));
     }
 
-    private bool EnsureActive(string today, int retainedCount)
+    private bool EnsureActive(string today, int retainedCount, long maxSizeBytes)
     {
         if (_writer is not null && string.Equals(_activeDate, today, StringComparison.Ordinal))
             return true;
@@ -174,11 +194,11 @@ internal sealed class RunLogSink : ILogEventSink, IDisposable
             return false;
         }
 
-        EnforceRetention(retainedCount);
+        EnforceRetention(retainedCount, maxSizeBytes);
         return true;
     }
 
-    private void RollSize(string today, int retainedCount)
+    private void RollSize(string today, int retainedCount, long maxSizeBytes)
     {
         CloseActive();
         var segment = SegmentPathFor(today, _nextSequence);
@@ -230,10 +250,10 @@ internal sealed class RunLogSink : ILogEventSink, IDisposable
             return;
         }
 
-        EnforceRetention(retainedCount);
+        EnforceRetention(retainedCount, maxSizeBytes);
     }
 
-    private void EnforceRetention(int retainedCount)
+    private void EnforceRetention(int retainedCount, long maxSizeBytes)
     {
         string? active = _activePath;
         List<string> sealedFiles;
@@ -253,12 +273,48 @@ internal sealed class RunLogSink : ILogEventSink, IDisposable
             return;
         }
 
-        // Oldest first; keep only the newest (retainedCount - 1) sealed files
-        // next to the active one so the total stays bounded even when size
-        // rolling produces many segments per day.
-        var excess = sealedFiles.Count - (retainedCount - 1);
-        for (var i = 0; i < excess; i++)
+        // Oldest first. Keep only the newest sealed files that fit both the
+        // file-count budget (retainedCount - 1 next to the active file) and
+        // the byte budget ((retainedCount - 1) x maxSizeBytes). The count rule
+        // alone would retain oversized segments written under older settings
+        // (or before a knob shrink) without bound; the byte rule evicts those
+        // first so the total footprint converges back under the documented
+        // ceiling. Segments written under the current settings never exceed
+        // maxSizeBytes (records are truncated to the cap before writing), so
+        // the byte rule is a no-op for them.
+        var maxSealedCount = retainedCount - 1;
+        var maxSealedBytes = maxSealedCount <= 0
+            ? 0
+            : maxSizeBytes > long.MaxValue / maxSealedCount
+                ? long.MaxValue
+                : (long)maxSealedCount * maxSizeBytes;
+        var keep = new bool[sealedFiles.Count];
+        var keptBytes = 0L;
+        var keptCount = 0;
+        for (var i = sealedFiles.Count - 1; i >= 0; i--)
         {
+            long size;
+            try
+            {
+                size = new FileInfo(sealedFiles[i]).Length;
+            }
+            catch (Exception ex)
+            {
+                SelfLog.WriteLine("RunLogSink: cannot stat run-log file '{0}': {1}", sealedFiles[i], ex.Message);
+                size = 0;
+            }
+
+            if (keptCount < maxSealedCount && size <= maxSealedBytes - keptBytes)
+            {
+                keep[i] = true;
+                keptCount++;
+                keptBytes += size;
+            }
+        }
+
+        for (var i = 0; i < sealedFiles.Count; i++)
+        {
+            if (keep[i]) continue;
             try
             {
                 File.Delete(sealedFiles[i]);
@@ -322,17 +378,123 @@ internal sealed class RunLogSink : ILogEventSink, IDisposable
         _activeSize = 0;
     }
 
-    private string FormatLine(LogEvent logEvent)
+    /// <summary>
+    /// Renders one log event as a single physical line whose UTF-8 encoding is
+    /// at most <paramref name="maxLineBytes"/> long, including the trailing LF.
+    /// CR, LF, the ANSI escape introducer and every other C0/C1 control (plus
+    /// DEL) in the message and exception text are backslash-escaped, so one
+    /// record always occupies one line and terminal escapes cannot reach a
+    /// tailing terminal. Payload beyond the budget is dropped and replaced
+    /// with a <c>[truncated]</c> marker when there is room for one; the output
+    /// is therefore byte-exact within budget even for multi-byte text.
+    /// </summary>
+    private string FormatLine(LogEvent logEvent, long maxLineBytes)
     {
+        // int.MaxValue keeps the builder/byte accounting well clear of long
+        // overflow and bounds transient memory by the configured cap.
+        var budget = Math.Min(Math.Max(1, maxLineBytes), int.MaxValue);
+        var capacity = budget - 1; // reserve one byte for the trailing LF
         var timestamp = logEvent.Timestamp.UtcDateTime.ToString(TimestampFormat, CultureInfo.InvariantCulture);
-        var builder = new StringBuilder();
-        builder.Append('[').Append(timestamp).Append('Z').Append(' ')
-            .Append(LevelToken(logEvent.Level)).Append("] ")
-            .Append(logEvent.RenderMessage(CultureInfo.InvariantCulture))
-            .AppendLine();
-        if (logEvent.Exception is not null)
-            builder.Append(logEvent.Exception).AppendLine();
-        return builder.ToString();
+        // Timestamp and level tokens are sink-generated from fixed alphabets,
+        // so they need truncating against the budget but no sanitizing.
+        var prefix = $"[{timestamp}Z {LevelToken(logEvent.Level)}] ";
+        var message = logEvent.RenderMessage(CultureInfo.InvariantCulture);
+        var exceptionText = logEvent.Exception?.ToString();
+
+        var (body, truncated) = BuildBody(prefix, message, exceptionText, capacity);
+        if (truncated && capacity > TruncationMarker.Length)
+        {
+            (body, _) = BuildBody(prefix, message, exceptionText, capacity - TruncationMarker.Length);
+            body += TruncationMarker;
+        }
+
+        return body + "\n";
+    }
+
+    private const string TruncationMarker = "[truncated]";
+    private const string ExceptionSeparator = " | ";
+
+    private static (string Body, bool Truncated) BuildBody(
+        string prefix, string message, string? exceptionText, long capacity)
+    {
+        var builder = new StringBuilder((int)Math.Min(Math.Max(capacity, 0), 512));
+        var used = AppendRaw(builder, prefix, capacity, 0);
+        var truncated = (long)prefix.Length > used;
+        (used, var messageTruncated) = AppendSanitized(builder, message, capacity, used);
+        truncated |= messageTruncated;
+
+        if (exceptionText is { Length: > 0 })
+        {
+            if (used + ExceptionSeparator.Length <= capacity)
+            {
+                builder.Append(ExceptionSeparator);
+                used += ExceptionSeparator.Length;
+                (used, var exceptionTruncated) = AppendSanitized(builder, exceptionText, capacity, used);
+                truncated |= exceptionTruncated;
+            }
+            else
+            {
+                truncated = true;
+            }
+        }
+
+        return (builder.ToString(), truncated);
+    }
+
+    private static long AppendRaw(StringBuilder builder, string chunk, long limit, long used)
+    {
+        var room = limit - used;
+        if (room <= 0 || chunk.Length == 0) return used;
+        var take = (int)Math.Min(chunk.Length, room);
+        builder.Append(chunk, 0, take);
+        return used + take;
+    }
+
+    private static (long Used, bool Truncated) AppendSanitized(
+        StringBuilder builder, string source, long limit, long used)
+    {
+        foreach (var rune in source.EnumerateRunes())
+        {
+            string? escaped;
+            long bytes;
+            if (rune.Value == '\r')
+            {
+                escaped = "\\r";
+                bytes = escaped.Length;
+            }
+            else if (rune.Value == '\n')
+            {
+                escaped = "\\n";
+                bytes = escaped.Length;
+            }
+            else if (rune.Value == '\t')
+            {
+                escaped = "\\t";
+                bytes = escaped.Length;
+            }
+            else if (rune.Value is < 0x20 or 0x7F or (>= 0x80 and <= 0x9F))
+            {
+                escaped = $"\\u{rune.Value:x4}";
+                bytes = escaped.Length;
+            }
+            else
+            {
+                escaped = null;
+                bytes = rune.Utf8SequenceLength;
+            }
+
+            if (used + bytes > limit)
+                return (used, true);
+            if (escaped is not null)
+                builder.Append(escaped);
+            else if (rune.IsBmp)
+                builder.Append((char)rune.Value);
+            else
+                builder.Append(rune.ToString());
+            used += bytes;
+        }
+
+        return (used, false);
     }
 
     private static string LevelToken(LogEventLevel level) => level switch

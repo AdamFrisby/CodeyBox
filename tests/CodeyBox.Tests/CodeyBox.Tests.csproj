@@ -29,6 +29,7 @@
 
   <ItemGroup>
     <Content Include="Fixtures\**\*.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="E2eArtifacts\Admin\*.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.jsonl" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.txt" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.html" CopyToOutputDirectory="PreserveNewest" />
@@ -82,6 +83,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.MultipassRemote\CodeyBox.Sandbox.MultipassRemote.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Sprites\CodeyBox.Sandbox.Sprites.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.AdminSeed\CodeyBox.AdminSeed.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.ExploratoryTesting\CodeyBox.ExploratoryTesting.csproj" />
     <ProjectReference Include="..\..\tools\CodeyBox.Harness\CodeyBox.Harness.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />

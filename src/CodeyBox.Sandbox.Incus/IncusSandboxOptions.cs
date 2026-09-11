@@ -112,6 +112,23 @@ public sealed record IncusSandboxOptions
     /// <summary>Bounded host package-cache trees copied into a baseline or full-launch VM.</summary>
     public IReadOnlyList<BaselinePackageCacheSeed> PackageCacheSeeds { get; init; } = [];
 
+    /// <summary>
+    /// Guest path of the shared NuGet fallback folder. NuGet-targeted package
+    /// seeds (destined for <c>{GuestHome}/.nuget/...</c>) are served from here
+    /// as a read-only fallback folder instead of being copied into the
+    /// per-sandbox writable package root. Additional NuGet seeds map to
+    /// <c>{path}-2</c>, <c>{path}-3</c>, and so on.
+    /// </summary>
+    public string NuGetFallbackGuestPath { get; init; } = NuGetFallbackCache.DefaultGuestFallbackPath;
+
+    /// <summary>
+    /// Serves NuGet-targeted package seeds as read-only fallback mounts
+    /// (full-launch VMs) or baked fallback folders (baselines) instead of
+    /// copying them into the writable package root. Disable to keep the
+    /// legacy per-VM copy for every seed.
+    /// </summary>
+    public bool ShareNuGetPackageSeedsAsFallback { get; init; } = true;
+
     /// <summary>Host executable files installed into a baseline or full-launch VM.</summary>
     public IReadOnlyList<BaselineExecutableProvision> ExecutableProvisions { get; init; } = [];
 
@@ -455,6 +472,7 @@ public sealed record IncusSandboxOptions
                 errors.Add($"{nameof(ExtraRuncmd)} exceeds 1 MiB in aggregate.");
         }
         ValidateBaselineProvisioning(options, errors);
+        ValidateNuGetFallback(options, errors);
         var validateExtraCloudInit = true;
         if (options.ExtraCloudInit is { } cloudInit
             && !TryGetBoundedUtf8ByteCount(
@@ -678,6 +696,71 @@ public sealed record IncusSandboxOptions
             }
             if (aggregateBytes > MaximumAggregateVerificationTextUtf8Bytes)
                 errors.Add($"{nameof(BaselineVerificationCommands)} exceeds 256 KiB in aggregate.");
+        }
+    }
+
+    private static void ValidateNuGetFallback(
+        IncusSandboxOptions options,
+        ICollection<string> errors)
+    {
+        var path = options.NuGetFallbackGuestPath;
+        ValidateProvisioningText(path, nameof(NuGetFallbackGuestPath), errors);
+        if (path is null || !IsAbsoluteGuestPath(path) || path == "/")
+        {
+            errors.Add($"{nameof(NuGetFallbackGuestPath)} must be a normalized absolute non-root guest path.");
+            return;
+        }
+        if (IncusCloudInit.OverlapsProviderOwnedPath(path))
+            errors.Add($"{nameof(NuGetFallbackGuestPath)} overlaps an Incus provider-owned guest control path.");
+        if (IncusGuestPaths.IsVolatileOrPseudoFilesystemPath(path))
+            errors.Add($"{nameof(NuGetFallbackGuestPath)} must not use a volatile or pseudo-filesystem guest path.");
+        if (IncusGuestPaths.Overlap(path, options.GuestHome))
+        {
+            errors.Add(
+                $"{nameof(NuGetFallbackGuestPath)} must not overlap {nameof(GuestHome)}; " +
+                "the shared fallback folder lives outside the guest home so home provisioning never touches it.");
+        }
+        if (!options.ShareNuGetPackageSeedsAsFallback)
+            return;
+        // Root provisioning must never write into the read-only fallback
+        // tree: every seed destination overlapping any fallback folder is
+        // rejected, whether or not the seed itself is NuGet-targeted. Only
+        // the first MaximumFallbackPaths positions have fallback folders;
+        // further NuGet seeds keep the copy path.
+        var fallbackPaths = new List<string>(Math.Min(options.PackageCacheSeeds.Count, NuGetFallbackCache.MaximumFallbackPaths));
+        for (var position = 0; position < fallbackPaths.Capacity; position++)
+            fallbackPaths.Add(NuGetFallbackCache.GuestFallbackPathForSeed(path, position));
+        for (var i = 0; i < options.PackageCacheSeeds.Count; i++)
+        {
+            var destination = options.PackageCacheSeeds[i]?.VmDestPath;
+            if (destination is null || !IsAbsoluteGuestPath(destination) || destination == "/")
+                continue;
+            foreach (var fallback in fallbackPaths)
+            {
+                if (IncusGuestPaths.Overlap(fallback, destination))
+                {
+                    errors.Add(
+                        $"{nameof(PackageCacheSeeds)}[{i}].VmDestPath overlaps the shared " +
+                        $"fallback folder '{fallback}'; root provisioning must not write into the read-only cache.");
+                    break;
+                }
+            }
+        }
+        foreach (var provision in options.ExecutableProvisions)
+        {
+            if (provision is null)
+                continue;
+            if (provision.VmDestPath is not null
+                && IsAbsoluteGuestPath(provision.VmDestPath)
+                && IncusGuestPaths.Overlap(path, provision.VmDestPath))
+                errors.Add($"{nameof(NuGetFallbackGuestPath)} overlaps an executable provisioning destination; root provisioning must not write into the read-only cache.");
+            foreach (var symlink in provision.VmSymlinks)
+            {
+                if (symlink is not null
+                    && IsAbsoluteGuestPath(symlink)
+                    && IncusGuestPaths.Overlap(path, symlink))
+                    errors.Add($"{nameof(NuGetFallbackGuestPath)} overlaps an executable symlink; root provisioning must not write into the read-only cache.");
+            }
         }
     }
 

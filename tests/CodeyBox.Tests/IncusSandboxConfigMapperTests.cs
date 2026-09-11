@@ -526,6 +526,27 @@ public sealed class IncusSandboxConfigMapperTests
         Incus = new IncusSandboxConfig(),
     };
 
+    [Fact]
+    public void Build_MapsNuGetFallbackKnobsWithDefaults()
+    {
+        var mapped = IncusSandboxConfigMapper.Build(CreateOptions());
+        Assert.Equal(
+            NuGetFallbackCache.DefaultGuestFallbackPath,
+            mapped.NuGetFallbackGuestPath);
+        Assert.True(mapped.ShareNuGetPackageSeedsAsFallback);
+    }
+
+    [Fact]
+    public void Build_MapsExplicitNuGetFallbackKnobs()
+    {
+        var options = CreateOptions();
+        options.Incus.NuGetFallbackGuestPath = "/opt/custom-fallback";
+        options.Incus.ShareNuGetPackageSeedsAsFallback = false;
+        var mapped = IncusSandboxConfigMapper.Build(options);
+        Assert.Equal("/opt/custom-fallback", mapped.NuGetFallbackGuestPath);
+        Assert.False(mapped.ShareNuGetPackageSeedsAsFallback);
+    }
+
     private sealed class DeceptiveReadOnlyCollection<T>(
         int reportedCount,
         IEnumerable<T> values) : IReadOnlyCollection<T>

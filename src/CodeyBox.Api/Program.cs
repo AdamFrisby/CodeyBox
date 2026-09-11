@@ -14,6 +14,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Opencode;
+using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
 using CodeyBox.Audit;
@@ -1145,6 +1146,16 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 {
     SandboxOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,
 });
+// Seeded fake-agent run mode for the admin E2E/demo instance (see
+// docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
+// when disabled nothing here registers and production routing is untouched.
+builder.Services.AddOptions<SeededFakeAgentOptions>()
+    .Bind(builder.Configuration.GetSection(SeededFakeServiceExtensions.ConfigSectionPath));
+if (builder.Configuration.GetValue<bool>(
+    $"{SeededFakeServiceExtensions.ConfigSectionPath}:Enabled"))
+{
+    builder.Services.AddSeededFakeAgents();
+}
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
@@ -1664,8 +1675,10 @@ builder.Services.AddSingleton<IAgentInvolvementStore>(sp =>
 // sources with provider-specific refresh logic so an expired access_token is
 // re-minted via the provider's OAuth refresh endpoint before the probe sends
 // it. Without this, an expired token would 401, the snapshot would become
-// AvailablePct=-1, and the router's default UnknownPolicy=UseObservedFailures
-// would fall open onto an agent that immediately 429s. See
+// AvailablePct=-1, and dispatch would risk landing on an agent that
+// immediately 429s (refused outright while a reserve floor is in force, or
+// admitted by the router's default UnknownPolicy=UseObservedFailures when no
+// floor applies). See
 // CodeyBox.Agents/OauthCredentialFileRefresher.cs for the provider-neutral
 // refresh contracts; each concrete refresher lives in its own
 // CodeyBox.Agents.* project.
@@ -1969,6 +1982,10 @@ static string? ReadAntigravityTokenFile(string? path)
 }
 
 // --- Agent class router ------------------------------------------------------
+builder.Services.AddSingleton<QuotaReservationLedger>(sp =>
+    new QuotaReservationLedger(
+        sp.GetRequiredService<QuotaRouterOptions>(),
+        TimeProvider.System));
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1976,7 +1993,7 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
 
     // Build and validate the catalog. Shared with AgentConfigHotReload so a
     // reload of CodeyBox:AgentClasses runs the same validation rules.
-    var catalog = AgentClassesConfigBuilder.Build(cbOpts.AgentClasses, cbOpts.AgentInstances, startupLog);
+    var catalog = AgentClassesConfigBuilder.Build(cbOpts.AgentClasses, cbOpts.AgentInstances, startupLog, cbOpts.Copilot.Providers);
     var subscriptionMembers = catalog.Sum(c => c.Members.Count(m => m.Billing == AgentBilling.Subscription));
     startupLog.LogInformation("Quota gate enabled for {Count} subscription members", subscriptionMembers);
 
@@ -2003,7 +2020,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         configuredSmokeTarget,
         sp.GetService<IAgentDispatchAvailability>(),
         sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
-        sp.GetService<AgentCircuitBreaker>());
+        sp.GetService<AgentCircuitBreaker>(),
+        sp.GetRequiredService<QuotaReservationLedger>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -2077,6 +2095,22 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentNetworkToleranceSnapshot>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new CodeyBox.Core.AgentNetworkToleranceSnapshot(opts.AgentNetworkTolerance);
 });
+
+// ToolchainFaultSnapshot — keyed toolchain-fault signatures over gate
+// subprocess results, swappable by the hot-reload coordinator. Every gate
+// reads through this same instance so an operator edit to
+// CodeyBox:ToolchainFaults takes effect on the next gate run without a
+// process restart. A new signature for an unseen language is a config-only
+// addition.
+builder.Services.AddSingleton<CodeyBox.Core.ToolchainFaultSnapshot>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new CodeyBox.Core.ToolchainFaultSnapshot(opts.ToolchainFaults);
+});
+builder.Services.AddSingleton<CodeyBox.Core.IToolchainFaultClassifier>(sp =>
+    new CodeyBox.Core.ToolchainFaultClassifier(
+        sp.GetRequiredService<CodeyBox.Core.ToolchainFaultSnapshot>()));
+builder.Services.AddSingleton<CodeyBox.Core.IToolchainFaultRecordStore, CodeyBox.Core.InMemoryToolchainFaultRecordStore>();
 
 // ClaudeThinkingBlockSanitizerConfig — hot-reloadable toggle gating the
 // thinking-block transcript sanitiser + reactive retry path.
@@ -2779,11 +2813,11 @@ builder.Services.AddSingleton<IPullRequestEnumerator>(sp =>
 
 builder.Services.AddSingleton<IChangelogGenerator>(sp =>
 {
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Changelog;
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     return new ClaudeChangelogGenerator(
-        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ICompletionClient>(),
         sp.GetRequiredService<ILogger<ClaudeChangelogGenerator>>(),
-        opts);
+        () => monitor.CurrentValue.Changelog);
 });
 
 // Changelog webhook HMAC secret — mirrors the SandboxProvider enforcement pattern.
@@ -3366,19 +3400,21 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IAuditProgressStore>()));
 
-builder.Services.AddSingleton(sp =>
-{
-    var options = new CheckAndActCompletionOptions();
-    sp.GetRequiredService<IConfiguration>()
-        .GetSection("CodeyBox:CheckAndActCompletion")
-        .Bind(options);
-    return options;
-});
+builder.Services.AddOptions<CheckAndActCompletionOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:CheckAndActCompletion"));
+builder.Services.AddOptions<CompletionClientOptions>()
+    .Bind(builder.Configuration.GetSection(CompletionClientOptions.SectionName));
+builder.Services.AddSingleton<ICompletionClient>(sp =>
+    new CompletionClient(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<IOptionsMonitor<CompletionClientOptions>>(),
+        sp.GetRequiredService<ILogger<CompletionClient>>()));
 builder.Services.AddSingleton<ICheckAndActCompletionRunner>(sp =>
     new DefaultCheckAndActCompletionRunner(
         sp.GetRequiredService<IHttpClientFactory>(),
-        sp.GetRequiredService<CheckAndActCompletionOptions>(),
-        sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>()));
+        sp.GetRequiredService<IOptionsMonitor<CheckAndActCompletionOptions>>(),
+        sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>(),
+        sp.GetRequiredService<ICompletionClient>()));
 
 builder.Services.AddSingleton<WorkItemTerminalTransition>(sp => new WorkItemTerminalTransition(
     sp.GetRequiredService<IWorkItemStore>(),
@@ -3437,6 +3473,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
+    toolchainFaultClassifier: sp.GetRequiredService<IToolchainFaultClassifier>(),
+    toolchainFaultRecords: sp.GetRequiredService<IToolchainFaultRecordStore>(),
     dispatchAvailability: sp.GetService<IAgentDispatchAvailability>(),
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
@@ -3709,7 +3747,10 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
     quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>(),
     failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>(),
-    repoReaper: sp.GetRequiredService<WorkItemRepoReaper>()));
+    repoReaper: sp.GetRequiredService<WorkItemRepoReaper>(),
+    reservationLedger: sp.GetRequiredService<QuotaReservationLedger>(),
+    costStore: sp.GetService<IWorkItemCostStore>(),
+    burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -3839,6 +3880,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
         testFailureAttribution: sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
+        toolchainFaults: sp.GetRequiredService<CodeyBox.Core.ToolchainFaultSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
@@ -4123,6 +4165,7 @@ ChangelogEndpoints.Map(app);
 FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
+ExecutorEndpoints.Map(app);
 AgentSupervisionEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 SandboxResourceUsageEndpoints.Map(app);
@@ -4186,6 +4229,17 @@ app.MapGet("/quota", async (
 
         representedProbeKeys.Add((member.Agent, member.ModelId));
         var snapshot = await probe.GetAvailabilityAsync(member, ct);
+        var poolName = QuotaPoolResolver.NormalizePoolName(member.Pool);
+        string? poolKind = null;
+        if (poolName is not null
+            && options.Pools.TryGetValue(poolName, out var poolOpts)
+            && poolOpts is not null)
+            poolKind = poolOpts.Kind.ToString();
+        // A depleting-balance pool is never reported with a reset instant,
+        // even if the probe echoed one.
+        var latestSnapshot = poolKind == nameof(QuotaPoolKind.DepletingBalance)
+            ? QuotaPoolMasks.WithoutResetInstants(snapshot)
+            : snapshot;
         var recentFailuresForProbe = failures
             .Where(f => f.Agent == member.Agent && f.ObservedAt >= now - options.ObservedFailureWindow)
             .ToList();
@@ -4213,7 +4267,9 @@ app.MapGet("/quota", async (
             classDisplayName,
             billing = member.Billing.ToString(),
             modelId = member.ModelId,
-            latestSnapshot = snapshot,
+            pool = poolName,
+            poolKind,
+            latestSnapshot,
             observedFailuresLast60m = failures
                 .Where(f => f.Agent == member.Agent)
                 .GroupBy(f => new { f.ProjectId, f.ModelId, f.FailureKind })
@@ -4667,6 +4723,12 @@ namespace CodeyBox.Api
 
         /// <summary>Host package-cache files or directories copied during Incus baseline or full-launch provisioning.</summary>
         public List<PackageCacheSeedConfig> PackageCacheSeeds { get; set; } = [];
+
+        /// <summary>Guest path of the shared NuGet fallback folder served read-only instead of copied into the writable package root.</summary>
+        public string NuGetFallbackGuestPath { get; set; } = Defaults.NuGetFallbackGuestPath;
+
+        /// <summary>Serve NuGet-targeted package seeds as read-only fallback folders; disable to keep the legacy per-VM copy for every seed.</summary>
+        public bool ShareNuGetPackageSeedsAsFallback { get; set; } = Defaults.ShareNuGetPackageSeedsAsFallback;
 
         /// <summary>Host-staged executables copied during Incus baseline or full-launch provisioning.</summary>
         public List<ExecutableProvisionConfig> ExecutableProvisions { get; set; } = [];
@@ -5294,6 +5356,20 @@ namespace CodeyBox.Api
         /// </summary>
         public Dictionary<string, AgentNetworkToleranceOptions?> AgentNetworkTolerance { get; set; } =
             AgentNetworkToleranceOptions.DefaultByAgent();
+
+        /// <summary>
+        /// Toolchain-fault signatures over gate subprocess results. Keyed by
+        /// signature name (case-insensitive); each entry declares its match,
+        /// the fault class it denotes, and its disposition (retry, fail, or
+        /// escalate). A new signature for a language the repository has never
+        /// built requires no code change — add an entry here. Edits hot-reload
+        /// via <see cref="Core.ToolchainFaultSnapshot"/> and take effect on the
+        /// next gate run. Platform-agnostic built-ins (signal termination,
+        /// OOM kill, disk exhaustion, .NET runtime crash) always apply even
+        /// when this dictionary is empty.
+        /// </summary>
+        public Dictionary<string, ToolchainFaultSignatureOptions?> ToolchainFaults { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Operator-configured per-agent pauses. Keyed by agent kind value.
@@ -6411,6 +6487,29 @@ namespace CodeyBox.Api
         public string? GeneratorModelId { get; set; }
 
         /// <summary>
+        /// Completion endpoint for the generator LLM call. Configured default for the
+        /// previously hardcoded endpoint. Default "https://api.anthropic.com/v1/messages".
+        /// </summary>
+        public string GeneratorBaseUrl { get; set; } = "https://api.anthropic.com/v1/messages";
+
+        /// <summary>
+        /// Wire protocol for the generator LLM call. Default AnthropicMessages.
+        /// </summary>
+        public CodeyBox.Core.CompletionWireApi GeneratorWireApi { get; set; } = CodeyBox.Core.CompletionWireApi.AnthropicMessages;
+
+        /// <summary>
+        /// Optional API key for the generator LLM call. When unset, falls back to the
+        /// CODEYBOX_CLAUDE_API_KEY environment variable.
+        /// </summary>
+        public string? GeneratorApiKey { get; set; }
+
+        /// <summary>
+        /// Anthropic API version header value sent when <see cref="GeneratorWireApi"/>
+        /// is AnthropicMessages. Default "2023-06-01".
+        /// </summary>
+        public string GeneratorAnthropicVersion { get; set; } = "2023-06-01";
+
+        /// <summary>
         /// Path to CHANGELOG.md within the project repo. Default "CHANGELOG.md".
         /// </summary>
         public string ChangelogPath { get; set; } = "CHANGELOG.md";
@@ -6613,6 +6712,13 @@ namespace CodeyBox.Api
 
         /// <summary>Optional override for the sandbox env var used for token injection.</summary>
         public string? SandboxEnvironmentVariable { get; set; }
+
+        /// <summary>
+        /// Optional named provider entry for this instance (today: a
+        /// <c>CodeyBox:Copilot:Providers</c> entry for copilot instances).
+        /// Null means the agent-global provider configuration.
+        /// </summary>
+        public string? Provider { get; set; }
     }
 
     /// <summary>Config binding for one member of an agent class.</summary>
@@ -6622,6 +6728,13 @@ namespace CodeyBox.Api
         public string Agent { get; set; } = string.Empty;
         /// <summary>Optional instance id or route key. Null means the default per-kind instance.</summary>
         public string? InstanceId { get; set; }
+        /// <summary>
+        /// Optional quota pool this member draws from (must name an entry in
+        /// <c>CodeyBox:QuotaRouter:Pools</c>). Members of one pool share a
+        /// single reading, floor, and reservation escrow. Null keeps legacy
+        /// per-agent keying. An unknown name fails closed at dispatch.
+        /// </summary>
+        public string? Pool { get; set; }
         /// <summary>"Subscription" or "PayPerApi".</summary>
         public string Billing { get; set; } = "Subscription";
         /// <summary>Optional model override, e.g. "claude-opus-4-7".</summary>
@@ -6638,6 +6751,12 @@ namespace CodeyBox.Api
         public string? DestinationPath { get; set; }
         /// <summary>Inline override for the sandbox env var used for token injection.</summary>
         public string? SandboxEnvironmentVariable { get; set; }
+        /// <summary>
+        /// Inline named provider entry for this member instance (today: a
+        /// <c>CodeyBox:Copilot:Providers</c> entry for copilot members).
+        /// Null means the agent-global provider configuration.
+        /// </summary>
+        public string? Provider { get; set; }
         /// <summary>
         /// Operator-curated capability score (0–200). Required; no silent default.
         /// See docs/concepts/agent-classes.md for recommended seed values.
@@ -6729,6 +6848,28 @@ namespace CodeyBox.Api
         /// </summary>
         public Dictionary<string, QuotaRouterFloorConfig> FloorByAgent { get; set; }
             = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Operator-declared quota pools, keyed by pool name
+        /// (case-insensitive). Each pool names one underlying account or
+        /// subscription; class members join a pool via their <c>Pool</c>
+        /// reference and then share one reading, one floor, and one
+        /// reservation escrow. Membership is operator-declared here — never
+        /// derived from credential material. Empty (the default) keeps legacy
+        /// per-agent keying. Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, QuotaPoolConfig> Pools { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Per-pool floor overrides keyed by pool name (case-insensitive),
+        /// alongside <see cref="FloorByAgent"/>. For a pool member the higher
+        /// of the pool-resolved and agent-resolved floors wins; with only one
+        /// present it applies directly. Resetting-window pools use the
+        /// percentage fields; depleting-balance pools use <c>MinBalance</c>
+        /// (absolute units) — mixing units is rejected at load.
+        /// Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, QuotaPoolFloorConfig> FloorByPool { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
         /// <summary>
@@ -6803,6 +6944,41 @@ namespace CodeyBox.Api
         public IntraKindRoutingPolicy IntraKindRoutingPolicy { get; set; } =
             IntraKindRoutingPolicy.MostQuotaFirst;
         /// <summary>
+        /// Estimated quota cost of one dispatch, in quota-percentage points.
+        /// The reservation ledger escrows this per authorised dispatch so
+        /// concurrent workers sharing one cached probe reading cannot jointly
+        /// overshoot the floor. Cold-start default 5.0; set near the typical
+        /// per-item burn for the fleet. Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationEstimatePct { get; set; } = 5.0;
+        /// <summary>
+        /// Per-agent override for <see cref="DispatchReservationEstimatePct"/>,
+        /// keyed by agent kind value. Non-positive entries are ignored.
+        /// Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, double> DispatchReservationEstimatePctByAgent { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Lower bound for any reservation estimate, in quota-percentage
+        /// points. A missing, zero, or negative estimate resolves to at least
+        /// this — a dispatch must never silently reserve nothing. Default 0.5.
+        /// Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationMinPct { get; set; } = 0.5;
+        /// <summary>
+        /// Upper bound for any single reservation, in quota-percentage points.
+        /// Guards against a misconfigured estimate pinning the pool. Default
+        /// 25. Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationMaxPct { get; set; } = 25.0;
+        /// <summary>
+        /// Maximum age in seconds of a quota reservation before the orphan
+        /// sweep reaps it. Backstop only — prompt release flows through the
+        /// worker-slot lifecycle. Must exceed the longest legitimate phase.
+        /// Default 21600 (6 hours). Hot-reloadable.
+        /// </summary>
+        public int QuotaReservationMaxAgeSeconds { get; set; } = 6 * 60 * 60;
+        /// <summary>
         /// Additional retries on a transient probe failure (network error / timeout / 5xx)
         /// before recording the failure. Total attempts = 1 + this value. Default 2.
         /// Hot-reloadable.
@@ -6866,6 +7042,64 @@ namespace CodeyBox.Api
 
         /// <summary>Optional ramp-window length in seconds for this agent.</summary>
         public int? RampWindowSeconds { get; set; }
+    }
+
+    /// <summary>
+    /// Operator-declared quota pool: one underlying account or subscription.
+    /// Bound from <c>CodeyBox:QuotaRouter:Pools:&lt;name&gt;</c>.
+    /// </summary>
+    public sealed class QuotaPoolConfig
+    {
+        /// <summary>
+        /// Replenishment kind: <c>ResettingWindow</c> (subscription allowance
+        /// that returns to full; readings and floors are percentages) or
+        /// <c>DepletingBalance</c> (prepaid credit that never resets; readings
+        /// and floors are absolute values). Case-insensitive. Default
+        /// <c>ResettingWindow</c>.
+        /// </summary>
+        public string Kind { get; set; } = "ResettingWindow";
+
+        /// <summary>
+        /// Human-readable unit for absolute balances on a depleting-balance
+        /// pool (e.g. <c>"credits"</c>). Informational only.
+        /// </summary>
+        public string? BalanceUnit { get; set; }
+
+        /// <summary>
+        /// Estimated cost of one dispatch in the pool's native unit
+        /// (percentage points for resetting-window pools, absolute balance
+        /// units for depleting-balance pools). Null falls back to the global
+        /// reservation estimate. Set explicitly for balance pools.
+        /// </summary>
+        public double? ReservationEstimate { get; set; }
+    }
+
+    /// <summary>
+    /// Per-pool quota floor override. Which fields are legal depends on the
+    /// pool's kind: resetting-window pools use the percentage fields,
+    /// depleting-balance pools use <see cref="MinBalance"/>. Mixing units is
+    /// rejected at configuration load.
+    /// </summary>
+    public sealed class QuotaPoolFloorConfig
+    {
+        /// <summary>Fallback percentage floor (resetting-window pools).</summary>
+        public double? MinQuotaPct { get; set; }
+
+        /// <summary>Early-window ramp percentage floor (resetting-window pools).</summary>
+        public double? StartFloorPct { get; set; }
+
+        /// <summary>Late-window ramp percentage floor (resetting-window pools).</summary>
+        public double? EndFloorPct { get; set; }
+
+        /// <summary>Optional ramp-window length in seconds (resetting-window pools).</summary>
+        public int? RampWindowSeconds { get; set; }
+
+        /// <summary>
+        /// Absolute floor in the pool's balance units (depleting-balance
+        /// pools). Dispatch is refused terminally at or below this value.
+        /// Defaults to 0 when unset.
+        /// </summary>
+        public double? MinBalance { get; set; }
     }
 
     /// <summary>
@@ -7086,14 +7320,19 @@ namespace CodeyBox.Api
         /// size rolling produces several segments in a single day, and so the
         /// total footprint stays bounded at
         /// <c>RetainedFileCountLimit x MaxFileSizeBytes</c> regardless of write
-        /// rate. Must be >= 1. Default: 14. Hot-reloadable.
+        /// rate. Retention also evicts by bytes, so oversized segments
+        /// inherited from older settings age out until the bound holds again.
+        /// Must be >= 1. Default: 14. Hot-reloadable.
         /// </summary>
         public int RetainedFileCountLimit { get; set; } = 14;
 
         /// <summary>
         /// Per-file size cap before rolling to a new segment. Combined with
         /// the day boundary, this is what actually keeps individual files
-        /// readable with tail / less. Must be >= 1 MiB. Default: 100 MiB.
+        /// readable with tail / less. It also caps each individual log record:
+        /// a record that would not fit is truncated (with a marker) rather
+        /// than written whole, which is what keeps the total footprint bound
+        /// exact. Must be >= 1 MiB. Default: 100 MiB.
         /// Hot-reloadable.
         /// </summary>
         public long MaxFileSizeBytes { get; set; } = 100 * 1024 * 1024;

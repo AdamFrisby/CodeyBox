@@ -1,9 +1,9 @@
-using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Orchestrator;
 
@@ -64,6 +64,32 @@ public sealed class CheckAndActCompletionOptions
     public int CacheTtlSeconds { get; set; } = 300;
     public int MaxResponseChars { get; set; } = 512 * 1024;
 
+    /// <summary>Per-call timeout in seconds for every provider. Default 60.</summary>
+    public int RequestTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>Maximum prompt size in chars; larger prompts fail without an HTTP call. Default 200000.</summary>
+    public int MaxPromptChars { get; set; } = 200_000;
+
+    /// <summary>Configured default for the Gemini OAuth endpoint (was a literal). Default is the legacy endpoint.</summary>
+    public string GeminiOAuthEndpointUrl { get; set; } = DefaultCheckAndActCompletionRunner.GeminiOAuthEndpoint;
+
+    /// <summary>Base URL for Gemini API-key calls; the model path is appended. Default is the legacy host.</summary>
+    public string GeminiApiKeyBaseUrl { get; set; } = "https://generativelanguage.googleapis.com";
+
+    /// <summary>Configured default for the OpenAI endpoint (was a literal).</summary>
+    public string OpenAiEndpointUrl { get; set; } = "https://api.openai.com/v1/chat/completions";
+
+    /// <summary>Configured default for the Anthropic endpoint (was a literal).</summary>
+    public string AnthropicEndpointUrl { get; set; } = "https://api.anthropic.com/v1/messages";
+
+    /// <summary>Anthropic API version header value. Default "2023-06-01".</summary>
+    public string AnthropicVersion { get; set; } = "2023-06-01";
+
+    /// <summary>Operator-defined extra destinations. Entries are matched by
+    /// <see cref="CustomCompletionProviderConfig.Name"/> against <see cref="ProviderOrder"/>
+    /// after the built-in providers, so a new destination is config-only.</summary>
+    public List<CustomCompletionProviderConfig> CustomProviders { get; set; } = [];
+
     public string? GeminiApiKey { get; set; }
     public string? OpenAiApiKey { get; set; }
     public string? AnthropicApiKey { get; set; }
@@ -92,12 +118,31 @@ public static class CheckAndActCompletionProviders
     public const string AnthropicApiKey = "anthropic-api-key";
 }
 
+/// <summary>
+/// An operator-defined completion destination matched by name against
+/// <see cref="CheckAndActCompletionOptions.ProviderOrder"/>. Only OpenAI-compatible
+/// wire shapes are expected here, but any <see cref="CompletionWireApi"/> may be set.
+/// </summary>
+public sealed class CustomCompletionProviderConfig
+{
+    public string Name { get; set; } = "";
+    public string Endpoint { get; set; } = "";
+    public string Model { get; set; } = "";
+    public CompletionWireApi WireApi { get; set; } = CompletionWireApi.OpenAiChatCompletions;
+    public string? ApiKey { get; set; }
+    public List<string> ApiKeyEnvVars { get; set; } = [];
+    public Dictionary<string, string> ExtraHeaders { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public bool UseBearerAuth { get; set; } = true;
+    public string AgentKind { get; set; } = "codex";
+    public int MaxOutputTokens { get; set; }
+}
+
 public sealed class DefaultCheckAndActCompletionRunner : ICheckAndActCompletionRunner
 {
     internal const string GeminiOAuthEndpoint = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
 
-    private readonly IHttpClientFactory _httpClientFactory;
-    private readonly CheckAndActCompletionOptions _options;
+    private readonly Func<CheckAndActCompletionOptions> _options;
+    private readonly ICompletionClient _completionClient;
     private readonly ILogger<DefaultCheckAndActCompletionRunner> _log;
     private readonly Dictionary<string, DateTimeOffset> _prefixCache = new(StringComparer.Ordinal);
     private readonly object _cacheLock = new();
@@ -106,20 +151,48 @@ public sealed class DefaultCheckAndActCompletionRunner : ICheckAndActCompletionR
         IHttpClientFactory httpClientFactory,
         CheckAndActCompletionOptions options,
         ILogger<DefaultCheckAndActCompletionRunner> log)
+        : this(httpClientFactory, () => options, log, completionClient: null)
     {
-        _httpClientFactory = httpClientFactory;
+    }
+
+    public DefaultCheckAndActCompletionRunner(
+        IHttpClientFactory httpClientFactory,
+        IOptionsMonitor<CheckAndActCompletionOptions> options,
+        ILogger<DefaultCheckAndActCompletionRunner> log,
+        ICompletionClient? completionClient = null)
+        : this(httpClientFactory, () => options.CurrentValue, log, completionClient)
+    {
+    }
+
+    public DefaultCheckAndActCompletionRunner(
+        IHttpClientFactory httpClientFactory,
+        Func<CheckAndActCompletionOptions> options,
+        ILogger<DefaultCheckAndActCompletionRunner> log,
+        ICompletionClient? completionClient = null)
+    {
         _options = options;
         _log = log;
+        _completionClient = completionClient
+            ?? new CompletionClient(httpClientFactory, () => ToClientOptions(_options()), NullLogger<CompletionClient>.Instance);
     }
+
+    private static CompletionClientOptions ToClientOptions(CheckAndActCompletionOptions options) => new()
+    {
+        HttpClientName = options.HttpClientName,
+        RequestTimeoutSeconds = options.RequestTimeoutSeconds,
+        MaxResponseBytes = options.MaxResponseChars,
+        MaxPromptChars = options.MaxPromptChars,
+    };
 
     public async Task<CheckAndActCompletionResult?> TryCompleteAsync(
         CheckAndActCompletionRequest request,
         CancellationToken ct = default)
     {
-        if (!_options.Enabled)
+        var options = _options();
+        if (!options.Enabled)
             return null;
 
-        foreach (var rawProvider in _options.ProviderOrder)
+        foreach (var rawProvider in options.ProviderOrder)
         {
             var provider = NormaliseProvider(rawProvider);
             switch (provider)
@@ -127,68 +200,98 @@ public sealed class DefaultCheckAndActCompletionRunner : ICheckAndActCompletionR
                 case CheckAndActCompletionProviders.GeminiOAuth:
                     if (!TryGetGeminiOAuthAccessToken(request.Credentials.Gemini, out var oauthToken))
                         continue;
-                    return await SendGeminiAsync(
-                        request,
-                        provider,
-                        AgentKind.Gemini,
-                        _options.GeminiModel,
-                        oauthToken,
-                        isOAuth: true,
-                        ct);
+                    {
+                        var result = await SendGeminiAsync(
+                            request,
+                            provider,
+                            AgentKind.Gemini,
+                            options.GeminiModel,
+                            oauthToken,
+                            isOAuth: true,
+                            ct);
+                        if (result is not null)
+                            return result;
+                        continue;
+                    }
 
                 case CheckAndActCompletionProviders.GeminiApiKey:
                     if (!TryGetApiKey(
                             request.Credentials.Gemini,
                             "GEMINI_API_KEY",
-                            _options.GeminiApiKey,
-                            _options.GeminiApiKeyEnvVars,
+                            options.GeminiApiKey,
+                            options.GeminiApiKeyEnvVars,
                             out var geminiApiKey))
                     {
                         continue;
                     }
-                    return await SendGeminiAsync(
-                        request,
-                        provider,
-                        AgentKind.Gemini,
-                        _options.GeminiModel,
-                        geminiApiKey,
-                        isOAuth: false,
-                        ct);
+                    {
+                        var result = await SendGeminiAsync(
+                            request,
+                            provider,
+                            AgentKind.Gemini,
+                            options.GeminiModel,
+                            geminiApiKey,
+                            isOAuth: false,
+                            ct);
+                        if (result is not null)
+                            return result;
+                        continue;
+                    }
 
                 case CheckAndActCompletionProviders.OpenAiApiKey:
                     if (!TryGetApiKey(
                             request.Credentials.Codex,
                             "OPENAI_API_KEY",
-                            _options.OpenAiApiKey,
-                            _options.OpenAiApiKeyEnvVars,
+                            options.OpenAiApiKey,
+                            options.OpenAiApiKeyEnvVars,
                             out var openAiKey))
                     {
                         continue;
                     }
-                    return await SendOpenAiAsync(request, openAiKey, ct);
+                    {
+                        var result = await SendOpenAiAsync(request, openAiKey, ct);
+                        if (result is not null)
+                            return result;
+                        continue;
+                    }
 
                 case CheckAndActCompletionProviders.AnthropicApiKey:
                     if (!TryGetApiKey(
                             request.Credentials.Claude,
                             "ANTHROPIC_API_KEY",
-                            _options.AnthropicApiKey,
-                            _options.AnthropicApiKeyEnvVars,
+                            options.AnthropicApiKey,
+                            options.AnthropicApiKeyEnvVars,
                             out var anthropicKey))
                     {
                         continue;
                     }
-                    return await SendAnthropicAsync(request, anthropicKey, ct);
+                    {
+                        var result = await SendAnthropicAsync(request, anthropicKey, ct);
+                        if (result is not null)
+                            return result;
+                        continue;
+                    }
 
                 default:
-                    _log.LogWarning("Ignoring unknown check-and-act completion provider '{Provider}'", rawProvider);
-                    break;
+                    {
+                        var custom = FindCustomProvider(options, provider);
+                        if (custom is null)
+                        {
+                            _log.LogWarning("Ignoring unknown check-and-act completion provider '{Provider}'", rawProvider);
+                            break;
+                        }
+                        var result = await SendCustomAsync(request, provider, custom, ct);
+                        if (result is not null)
+                            return result;
+                        continue;
+                    }
             }
         }
 
         return null;
     }
 
-    private async Task<CheckAndActCompletionResult> SendGeminiAsync(
+    private async Task<CheckAndActCompletionResult?> SendGeminiAsync(
         CheckAndActCompletionRequest request,
         string provider,
         AgentKind agentKind,
@@ -197,134 +300,160 @@ public sealed class DefaultCheckAndActCompletionRunner : ICheckAndActCompletionR
         bool isOAuth,
         CancellationToken ct)
     {
-        var client = _httpClientFactory.CreateClient(_options.HttpClientName);
-        var prompt = request.Blocks.Render();
-        object body = isOAuth
-            ? new
-            {
-                model = $"models/{model}",
-                request = new
-                {
-                    contents = new[] { UserContent(prompt) },
-                    generationConfig = new { maxOutputTokens = _options.MaxOutputTokens, temperature = 0 },
-                },
-            }
-            : new
-            {
-                contents = new[] { UserContent(prompt) },
-                generationConfig = new { maxOutputTokens = _options.MaxOutputTokens, temperature = 0 },
-            };
-
-        using var httpRequest = new HttpRequestMessage(
-            HttpMethod.Post,
-            isOAuth
-                ? GeminiOAuthEndpoint
-                : $"https://generativelanguage.googleapis.com/v1beta/models/{Uri.EscapeDataString(model)}:generateContent")
+        var options = _options();
+        var endpoint = isOAuth
+            ? options.GeminiOAuthEndpointUrl
+            : $"{options.GeminiApiKeyBaseUrl.TrimEnd('/')}/v1beta/models/{Uri.EscapeDataString(model)}:generateContent";
+        var completion = new CompletionRequest
         {
-            Content = JsonContent(body),
+            Endpoint = endpoint,
+            Model = model,
+            Messages = [new CompletionMessage("user", request.Blocks.Render())],
+            WireApi = CompletionWireApi.GeminiGenerateContent,
+            BearerToken = isOAuth ? credential : null,
+            ExtraHeaders = isOAuth
+                ? null
+                : new Dictionary<string, string> { ["x-goog-api-key"] = credential },
+            MaxOutputTokens = options.MaxOutputTokens,
+            GeminiOAuthEnvelope = isOAuth,
         };
-        if (isOAuth)
-            httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credential);
-        else
-            httpRequest.Headers.Add("x-goog-api-key", credential);
-
-        using var response = await client.SendAsync(httpRequest, ct).ConfigureAwait(false);
-        var responseText = await ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"check-and-act completion provider {provider} failed: HTTP {(int)response.StatusCode}: {responseText}");
-
-        var output = ExtractGeminiText(responseText);
-        var usage = ExtractGeminiUsage(responseText);
-        return BuildResult(request, provider, agentKind, model, output, usage);
+        var result = await _completionClient.CompleteAsync(completion, ct).ConfigureAwait(false);
+        return MapCompletion(request, provider, agentKind, model, result);
     }
 
-    private async Task<CheckAndActCompletionResult> SendOpenAiAsync(
+    private async Task<CheckAndActCompletionResult?> SendOpenAiAsync(
         CheckAndActCompletionRequest request,
         string apiKey,
         CancellationToken ct)
     {
-        var client = _httpClientFactory.CreateClient(_options.HttpClientName);
-        var body = new
+        var options = _options();
+        var completion = new CompletionRequest
         {
-            model = _options.OpenAiModel,
-            messages = new object[]
-            {
-                new { role = "system", content = request.Blocks.SystemBlock },
-                new { role = "user", content = request.Blocks.ReviewBlock },
-                new { role = "user", content = request.Blocks.QuestionBlock },
-            },
-            temperature = 0,
-            max_tokens = _options.MaxOutputTokens,
+            Endpoint = options.OpenAiEndpointUrl,
+            Model = options.OpenAiModel,
+            Messages = OpenAiMessages(request),
+            WireApi = CompletionWireApi.OpenAiChatCompletions,
+            BearerToken = apiKey,
+            MaxOutputTokens = options.MaxOutputTokens,
         };
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "https://api.openai.com/v1/chat/completions")
-        {
-            Content = JsonContent(body),
-        };
-        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-
-        using var response = await client.SendAsync(httpRequest, ct).ConfigureAwait(false);
-        var responseText = await ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"check-and-act completion provider openai-api-key failed: HTTP {(int)response.StatusCode}: {responseText}");
-
-        var output = ExtractOpenAiText(responseText);
-        var usage = ExtractOpenAiUsage(responseText);
-        return BuildResult(request, CheckAndActCompletionProviders.OpenAiApiKey, AgentKind.Codex, _options.OpenAiModel, output, usage);
+        var result = await _completionClient.CompleteAsync(completion, ct).ConfigureAwait(false);
+        return MapCompletion(request, CheckAndActCompletionProviders.OpenAiApiKey, AgentKind.Codex, options.OpenAiModel, result);
     }
 
-    private async Task<CheckAndActCompletionResult> SendAnthropicAsync(
+    private async Task<CheckAndActCompletionResult?> SendAnthropicAsync(
         CheckAndActCompletionRequest request,
         string apiKey,
         CancellationToken ct)
     {
-        var client = _httpClientFactory.CreateClient(_options.HttpClientName);
-        var body = new
+        var options = _options();
+        var completion = new CompletionRequest
         {
-            model = _options.AnthropicModel,
-            max_tokens = _options.MaxOutputTokens,
-            temperature = 0,
-            system = new object[]
+            Endpoint = options.AnthropicEndpointUrl,
+            Model = options.AnthropicModel,
+            Messages =
+            [
+                new CompletionMessage("system", request.Blocks.SystemBlock),
+                new CompletionMessage("user", $"{request.Blocks.ReviewBlock}\n\n{request.Blocks.QuestionBlock}"),
+            ],
+            WireApi = CompletionWireApi.AnthropicMessages,
+            ExtraHeaders = new Dictionary<string, string>
             {
-                new
-                {
-                    type = "text",
-                    text = request.Blocks.SystemBlock,
-                    cache_control = new { type = "ephemeral" },
-                },
+                ["x-api-key"] = apiKey,
+                ["anthropic-version"] = options.AnthropicVersion,
             },
-            messages = new object[]
-            {
-                new
-                {
-                    role = "user",
-                    content = new object[]
-                    {
-                        new
-                        {
-                            type = "text",
-                            text = request.Blocks.ReviewBlock,
-                            cache_control = new { type = "ephemeral" },
-                        },
-                        new { type = "text", text = request.Blocks.QuestionBlock },
-                    },
-                },
-            },
+            MaxOutputTokens = options.MaxOutputTokens,
         };
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages")
+        var result = await _completionClient.CompleteAsync(completion, ct).ConfigureAwait(false);
+        return MapCompletion(request, CheckAndActCompletionProviders.AnthropicApiKey, AgentKind.Claude, options.AnthropicModel, result);
+    }
+
+    private async Task<CheckAndActCompletionResult?> SendCustomAsync(
+        CheckAndActCompletionRequest request,
+        string provider,
+        CustomCompletionProviderConfig custom,
+        CancellationToken ct)
+    {
+        var options = _options();
+        if (!TryGetApiKey(null, "", custom.ApiKey, custom.ApiKeyEnvVars, out var apiKey))
         {
-            Content = JsonContent(body),
+            if (custom.UseBearerAuth)
+                return null;
+            apiKey = "";
+        }
+        List<CompletionMessage> messages = custom.WireApi switch
+        {
+            CompletionWireApi.AnthropicMessages =>
+            [
+                new CompletionMessage("system", request.Blocks.SystemBlock),
+                new CompletionMessage("user", $"{request.Blocks.ReviewBlock}\n\n{request.Blocks.QuestionBlock}"),
+            ],
+            CompletionWireApi.GeminiGenerateContent =>
+                [new CompletionMessage("user", request.Blocks.Render())],
+            _ => OpenAiMessages(request),
         };
-        httpRequest.Headers.Add("x-api-key", apiKey);
-        httpRequest.Headers.Add("anthropic-version", "2023-06-01");
+        var completion = new CompletionRequest
+        {
+            Endpoint = custom.Endpoint,
+            Model = string.IsNullOrWhiteSpace(custom.Model) ? request.ModelId ?? "" : custom.Model,
+            Messages = messages,
+            WireApi = custom.WireApi,
+            BearerToken = custom.UseBearerAuth && !string.IsNullOrEmpty(apiKey) ? apiKey : null,
+            ExtraHeaders = custom.ExtraHeaders.Count == 0 && string.IsNullOrEmpty(apiKey)
+                ? null
+                : MergeApiKey(custom.ExtraHeaders, custom.UseBearerAuth ? null : apiKey),
+            MaxOutputTokens = custom.MaxOutputTokens > 0 ? custom.MaxOutputTokens : options.MaxOutputTokens,
+        };
+        var result = await _completionClient.CompleteAsync(completion, ct).ConfigureAwait(false);
+        return MapCompletion(request, provider, new AgentKind(custom.AgentKind), completion.Model, result);
+    }
 
-        using var response = await client.SendAsync(httpRequest, ct).ConfigureAwait(false);
-        var responseText = await ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"check-and-act completion provider anthropic-api-key failed: HTTP {(int)response.StatusCode}: {responseText}");
+    private static List<CompletionMessage> OpenAiMessages(CheckAndActCompletionRequest request) =>
+    [
+        new CompletionMessage("system", request.Blocks.SystemBlock),
+        new CompletionMessage("user", request.Blocks.ReviewBlock),
+        new CompletionMessage("user", request.Blocks.QuestionBlock),
+    ];
 
-        var output = ExtractAnthropicText(responseText);
-        var usage = ExtractAnthropicUsage(responseText);
-        return BuildResult(request, CheckAndActCompletionProviders.AnthropicApiKey, AgentKind.Claude, _options.AnthropicModel, output, usage);
+    private static Dictionary<string, string>? MergeApiKey(
+        Dictionary<string, string> extra, string? apiKeyHeaderValue)
+    {
+        if (string.IsNullOrEmpty(apiKeyHeaderValue))
+            return extra.Count == 0 ? null : new Dictionary<string, string>(extra);
+        var merged = new Dictionary<string, string>(extra, StringComparer.OrdinalIgnoreCase);
+        merged["x-api-key"] = apiKeyHeaderValue;
+        return merged;
+    }
+
+    private static CustomCompletionProviderConfig? FindCustomProvider(CheckAndActCompletionOptions options, string provider)
+    {
+        foreach (var custom in options.CustomProviders)
+        {
+            if (string.IsNullOrWhiteSpace(custom.Name) || string.IsNullOrWhiteSpace(custom.Endpoint))
+                continue;
+            if (string.Equals(NormaliseProvider(custom.Name), provider, StringComparison.Ordinal))
+                return custom;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Maps a client result onto a pipeline result. Any non-success becomes null
+    /// (logged without secrets) so the caller falls back to the next provider or
+    /// the agentic path — failures never escape as exceptions into a pipeline phase.
+    /// </summary>
+    private CheckAndActCompletionResult? MapCompletion(
+        CheckAndActCompletionRequest request,
+        string provider,
+        AgentKind agentKind,
+        string? model,
+        CompletionResult result)
+    {
+        if (result.IsSuccess)
+            return BuildResult(request, provider, agentKind, model, result.Text, result.Usage);
+        _log.LogWarning(
+            "Check-and-act completion provider {Provider} returned {Status}: {Detail}",
+            provider, result.Status, result.ErrorDetail ?? "");
+        return null;
     }
 
     private CheckAndActCompletionResult BuildResult(
@@ -333,13 +462,13 @@ public sealed class DefaultCheckAndActCompletionRunner : ICheckAndActCompletionR
         AgentKind agentKind,
         string? model,
         string output,
-        RawUsage? rawUsage)
+        CompletionUsage? rawUsage)
     {
         var now = DateTimeOffset.UtcNow;
         var prefixKey = ComputePrefixCacheKey(request.Blocks.CacheablePrefix);
         var prefixTokens = EstimateTokens(request.Blocks.CacheablePrefix);
-        var totalPromptTokens = rawUsage?.PromptTokens ?? EstimateTokens(request.Blocks.Render());
-        var rawCached = rawUsage?.CachedPromptTokens ?? 0;
+        var totalPromptTokens = rawUsage?.InputTokens ?? EstimateTokens(request.Blocks.Render());
+        var rawCached = rawUsage?.CachedInputTokens ?? 0;
         var cacheHit = rawCached > 0 || WasPrefixRecentlySeen(prefixKey, now);
         RememberPrefix(prefixKey, now);
 
@@ -376,7 +505,7 @@ public sealed class DefaultCheckAndActCompletionRunner : ICheckAndActCompletionR
     {
         lock (_cacheLock)
         {
-            _prefixCache[prefixKey] = now.AddSeconds(Math.Max(1, _options.CacheTtlSeconds));
+            _prefixCache[prefixKey] = now.AddSeconds(Math.Max(1, _options().CacheTtlSeconds));
         }
     }
 
@@ -438,149 +567,10 @@ public sealed class DefaultCheckAndActCompletionRunner : ICheckAndActCompletionR
         return false;
     }
 
-    private StringContent JsonContent(object body)
-        => new(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-
-    private static object UserContent(string text) => new
-    {
-        role = "user",
-        parts = new[] { new { text } },
-    };
-
-    private async Task<string> ReadCappedAsync(HttpContent content, CancellationToken ct)
-    {
-        await using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-        var buffer = new char[_options.MaxResponseChars + 1];
-        var totalRead = 0;
-        while (totalRead < buffer.Length)
-        {
-            var read = await reader.ReadAsync(buffer.AsMemory(totalRead, buffer.Length - totalRead), ct).ConfigureAwait(false);
-            if (read == 0)
-                break;
-            totalRead += read;
-        }
-        if (totalRead > _options.MaxResponseChars)
-            throw new InvalidOperationException("check-and-act completion response exceeded the configured size cap");
-        return new string(buffer, 0, totalRead);
-    }
-
-    private static string ExtractGeminiText(string responseText)
-    {
-        using var doc = JsonDocument.Parse(responseText);
-        var root = UnwrapGeminiResponse(doc.RootElement);
-        if (!root.TryGetProperty("candidates", out var candidates) || candidates.ValueKind != JsonValueKind.Array)
-            return "";
-
-        var sb = new StringBuilder();
-        foreach (var candidate in candidates.EnumerateArray())
-        {
-            if (!candidate.TryGetProperty("content", out var content)
-                || !content.TryGetProperty("parts", out var parts)
-                || parts.ValueKind != JsonValueKind.Array)
-            {
-                continue;
-            }
-            foreach (var part in parts.EnumerateArray())
-            {
-                if (part.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String)
-                    sb.Append(text.GetString());
-            }
-        }
-        return sb.ToString();
-    }
-
-    private static RawUsage? ExtractGeminiUsage(string responseText)
-    {
-        using var doc = JsonDocument.Parse(responseText);
-        var root = UnwrapGeminiResponse(doc.RootElement);
-        if (!root.TryGetProperty("usageMetadata", out var usage) || usage.ValueKind != JsonValueKind.Object)
-            return null;
-        var prompt = TryGetInt(usage, "promptTokenCount");
-        var cached = TryGetInt(usage, "cachedContentTokenCount")
-            ?? TryGetInt(usage, "cachedInputTokenCount")
-            ?? 0;
-        var output = TryGetInt(usage, "candidatesTokenCount") ?? 0;
-        return new RawUsage(prompt ?? 0, cached, output);
-    }
-
-    private static JsonElement UnwrapGeminiResponse(JsonElement root)
-        => root.ValueKind == JsonValueKind.Object
-            && root.TryGetProperty("response", out var wrapped)
-            && wrapped.ValueKind == JsonValueKind.Object
-                ? wrapped
-                : root;
-
-    private static string ExtractOpenAiText(string responseText)
-    {
-        using var doc = JsonDocument.Parse(responseText);
-        if (!doc.RootElement.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array)
-            return "";
-        var first = choices.EnumerateArray().FirstOrDefault();
-        if (first.ValueKind == JsonValueKind.Undefined)
-            return "";
-        if (first.TryGetProperty("message", out var message)
-            && message.TryGetProperty("content", out var content)
-            && content.ValueKind == JsonValueKind.String)
-        {
-            return content.GetString() ?? "";
-        }
-        return "";
-    }
-
-    private static RawUsage? ExtractOpenAiUsage(string responseText)
-    {
-        using var doc = JsonDocument.Parse(responseText);
-        if (!doc.RootElement.TryGetProperty("usage", out var usage) || usage.ValueKind != JsonValueKind.Object)
-            return null;
-        var prompt = TryGetInt(usage, "prompt_tokens") ?? 0;
-        var output = TryGetInt(usage, "completion_tokens") ?? 0;
-        var cached = 0;
-        if (usage.TryGetProperty("prompt_tokens_details", out var details) && details.ValueKind == JsonValueKind.Object)
-            cached = TryGetInt(details, "cached_tokens") ?? 0;
-        return new RawUsage(prompt, cached, output);
-    }
-
-    private static string ExtractAnthropicText(string responseText)
-    {
-        using var doc = JsonDocument.Parse(responseText);
-        if (!doc.RootElement.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.Array)
-            return "";
-        var sb = new StringBuilder();
-        foreach (var part in content.EnumerateArray())
-        {
-            if (part.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String)
-                sb.Append(text.GetString());
-        }
-        return sb.ToString();
-    }
-
-    private static RawUsage? ExtractAnthropicUsage(string responseText)
-    {
-        using var doc = JsonDocument.Parse(responseText);
-        if (!doc.RootElement.TryGetProperty("usage", out var usage) || usage.ValueKind != JsonValueKind.Object)
-            return null;
-        var input = TryGetInt(usage, "input_tokens") ?? 0;
-        var cacheRead = TryGetInt(usage, "cache_read_input_tokens") ?? 0;
-        var output = TryGetInt(usage, "output_tokens") ?? 0;
-        return new RawUsage(input + cacheRead, cacheRead, output);
-    }
-
-    private static int? TryGetInt(JsonElement element, string property)
-    {
-        if (!element.TryGetProperty(property, out var value))
-            return null;
-        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var intValue))
-            return Math.Max(0, intValue);
-        return null;
-    }
-
     private static int EstimateTokens(string? text)
     {
         if (string.IsNullOrEmpty(text))
             return 0;
         return Math.Max(1, (int)Math.Ceiling(text.Length / 4.0));
     }
-
-    private sealed record RawUsage(int PromptTokens, int CachedPromptTokens, int OutputTokens);
 }

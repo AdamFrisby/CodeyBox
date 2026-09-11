@@ -22,16 +22,11 @@ public sealed class SqliteWorkItemStore :
     {
         Converters = { new JsonStringEnumConverter() },
     };
-    /// <summary>
-    /// Lock-wait budget applied to every connection opened by this store,
-    /// writer and readers alike. busy_timeout is per-connection SQLite state
-    /// (default 0 = fail immediately); a single shared constant keeps the
-    /// writer and all reader connections on the same retry window so routine
-    /// WAL lock contention waits out the brief hold instead of surfacing as
-    /// SQLITE_BUSY. Operational default, not a hot knob: changing it requires
-    /// a restart so every pooled connection picks it up consistently.
-    /// </summary>
-    private const int BusyTimeoutMilliseconds = 30000;
+    // Lock-wait budget for every connection opened by this store, writer and
+    // readers alike, is the shared SqliteDefaults value also applied by the
+    // worker registry and the maintenance service, so all connections to the
+    // state database share one retry window and routine WAL lock contention
+    // waits out the brief hold instead of surfacing as SQLITE_BUSY.
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
     private readonly string _dbPath;
@@ -81,7 +76,7 @@ public sealed class SqliteWorkItemStore :
             using (var walCmd = _conn.CreateCommand())
             {
                 // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- PRAGMA takes no parameters; the interpolated value is a compile-time constant, not caller input
-                walCmd.CommandText = $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={BusyTimeoutMilliseconds}; PRAGMA foreign_keys=ON;";
+                walCmd.CommandText = $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={SqliteDefaults.BusyTimeoutMilliseconds}; PRAGMA foreign_keys=ON;";
                 walCmd.ExecuteNonQuery();
             }
 
@@ -4716,6 +4711,19 @@ public sealed class SqliteWorkItemStore :
         return result;
     }
 
+    private static void RegisterIfNotBusy(SqliteConnection conn, Action<SqliteConnection> register)
+    {
+        try
+        {
+            register(conn);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteDefaults.SqliteBusy)
+        {
+            // Pooled handle already defines the function and has an active
+            // statement using it; the existing identical definition serves.
+        }
+    }
+
     private async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -4726,13 +4734,18 @@ public sealed class SqliteWorkItemStore :
         // writer: dispatch/restore-retry reads moved off the write gate still
         // evaluate codeybox_* predicates. Functions are per-connection state
         // in Microsoft.Data.Sqlite, so every new connection registers them.
-        RegisterQuotaRetryPhaseFunctions(conn);
-        RegisterAgentInvolvementFailureFunction(conn);
-        RegisterRestoreRetryEligibilityFunction(conn);
+        // The pool may hand back a handle that already defines them while
+        // another reader still runs a statement using one (e.g. a polling
+        // GetAsync racing the quota scheduler); redefining then fails with
+        // SQLITE_BUSY (error 5). The pooled definition is identical (same
+        // static delegates), so keep it instead of failing the read.
+        RegisterIfNotBusy(conn, RegisterQuotaRetryPhaseFunctions);
+        RegisterIfNotBusy(conn, RegisterAgentInvolvementFailureFunction);
+        RegisterIfNotBusy(conn, RegisterRestoreRetryEligibilityFunction);
 
         using var pragma = conn.CreateCommand();
         // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- PRAGMA takes no parameters; the interpolated value is a compile-time constant, not caller input
-        pragma.CommandText = $"PRAGMA busy_timeout={BusyTimeoutMilliseconds}; PRAGMA foreign_keys=ON;";
+        pragma.CommandText = $"PRAGMA busy_timeout={SqliteDefaults.BusyTimeoutMilliseconds}; PRAGMA foreign_keys=ON;";
         await pragma.ExecuteNonQueryAsync(ct);
         return conn;
     }

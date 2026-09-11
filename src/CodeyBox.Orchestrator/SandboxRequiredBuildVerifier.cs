@@ -293,7 +293,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !SandboxDeferralGuard.IsDeferral(ex))
         {
             return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
@@ -319,7 +319,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 MaxDotnetMarkerPathsPerBranch,
                 ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException && ex is not NotSupportedException)
+        catch (Exception ex) when (ex is not OperationCanceledException && ex is not NotSupportedException && !SandboxDeferralGuard.IsDeferral(ex))
         {
             throw new InvalidOperationException(
                 $"failed to inspect branch '{branch}' for .NET build markers: {SingleLineSummary(ex.Message)}",
@@ -412,7 +412,21 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             var redactedOutput = TruncateOutput(rawOutput);
 
             if (build.Success)
-                return RequiredBuildVerificationResult.Passed(build.ExitCode, redactedOutput);
+            {
+                // Best-effort shared-cache diagnostic appended to the passed
+                // output: how many restored packages the NuGet fallback cache
+                // served versus fetched from the network. A null means
+                // coverage could not be determined; the gate result never
+                // depends on it.
+                var coverageNote = await NuGetFallbackCoverageReporter.TryReportAsync(
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    buildCt).ConfigureAwait(false);
+                var output = string.IsNullOrEmpty(coverageNote)
+                    ? redactedOutput
+                    : $"{redactedOutput}\n{coverageNote}";
+                return RequiredBuildVerificationResult.Passed(build.ExitCode, output);
+            }
 
             if (build.ExitCode == DotnetCommandNotFoundExitCode
                 && rawOutput.Contains("dotnet is not available in the sandbox PATH", StringComparison.OrdinalIgnoreCase))
@@ -447,8 +461,12 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             // incident it guards against.
             throw;
         }
-        catch (SandboxProvisioningDeferredException)
+        catch (Exception ex) when (SandboxDeferralGuard.IsDeferral(ex))
         {
+            // Host-side sandbox provisioning exhausted a transient retry
+            // budget. Filtered through the shared guard (not a restated type
+            // name) so this boundary cannot drift from the isolated audit
+            // repository setup boundary in PipelineRunner.
             throw;
         }
         catch (Exception ex)
@@ -478,7 +496,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             return await _gitHost.CreateIsolatedRepositoryCloneAsync(repositoryId, workItemId, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !SandboxDeferralGuard.IsDeferral(ex))
         {
             throw new InvalidOperationException(
                 $"could not create isolated build repository: {SingleLineSummary(ex.Message)}",

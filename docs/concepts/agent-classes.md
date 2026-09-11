@@ -102,6 +102,42 @@ For simple single-credential deployments, omit `InstanceId` and
 `AgentInstances`; the route key remains the bare kind (`claude`, `codex`, …)
 and behavior is unchanged.
 
+### Per-member Copilot providers
+
+A copilot member can name a `Provider` entry from `CodeyBox:Copilot:Providers`
+instead of using the agent-global `CodeyBox:Copilot:Provider`. This lets one
+CLI serve as two independently-routed members — a BYOK execution harness and
+a native GitHub Copilot subscription — distinguished by `InstanceId` so their
+route keys, quota buckets, pauses, and cost rows stay separate:
+
+```json
+{
+  "CodeyBox": {
+    "Copilot": {
+      "Providers": {
+        "byok": { "BaseUrl": "https://opencode.ai/zen/go/v1", "Type": "openai", "WireApi": "responses" }
+      }
+    },
+    "AgentClasses": [
+      {
+        "Id": "frontier-coding",
+        "Members": [
+          { "Agent": "copilot", "InstanceId": "harness", "Provider": "byok", "Billing": "Subscription", "QualityScore": 100 },
+          { "Agent": "copilot", "InstanceId": "sub", "Billing": "Subscription", "QualityScore": 99 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`copilot/harness` infers against the `byok` endpoint; `copilot/sub` inherits
+the agent-global provider (native subscription auth when it configures no
+base URL). Members without a `Provider` behave exactly as before. A member
+naming a provider with no catalog entry — or any non-copilot member naming
+one — fails configuration validation at startup instead of silently running
+against another backend.
+
 ### Claude session opt-in
 
 Class-routed Claude work items use the resumable session worker only when the
@@ -222,6 +258,7 @@ AgentClass 'frontier-coding' resolved members: [claude/claude-opus-4-7(Subscript
 |-------|----------|-------------|
 | `Agent` | yes | Agent kind value: `claude`, `codex`, `copilot`, `gemini`, or any custom kind. |
 | `InstanceId` | no | Stable instance id for pooling multiple credentials of the same kind. `acct-a` resolves to route key `agent/acct-a`; a full `agent/acct-a` route key is also accepted when its prefix matches `Agent`. |
+| `Pool` | no | Quota pool this member draws from (must name a `CodeyBox:QuotaRouter:Pools` entry). Members of one pool share a single reading, floor, and reservation escrow. Null keeps legacy per-agent keying. See `docs/operating/quota.md` ("Quota pools"). |
 | `Billing` | yes | `Subscription` or `PayPerApi` (see below). |
 | `ModelId` | no | Optional model override passed to the agent CLI as `--model`. |
 | `CredentialFilePath` | no | Inline host OAuth/auth JSON file for this member instance. |
@@ -230,6 +267,7 @@ AgentClass 'frontier-coding' resolved members: [claude/claude-opus-4-7(Subscript
 | `SettingsFilePath` | no | Optional companion settings file, currently used by Gemini OAuth. |
 | `DestinationPath` | no | Optional sandbox destination path for file-materializing runners. |
 | `SandboxEnvironmentVariable` | no | Optional override for the sandbox environment variable used for token injection. |
+| `Provider` | no | Named provider entry for this member instance (today: a `CodeyBox:Copilot:Providers` entry for copilot members). Null means the agent-global provider configuration. |
 | `QualityScore` | **yes** | Operator-curated capability score on a 0–200 scale. No silent default; startup rejects missing scores with a migration message. |
 | `ReasoningMode` | no* | Agent CLI reasoning knob, e.g. `"high"`. *Required for Gemini members with `QualityScore` ≥ 90. |
 | `Capabilities` | no | List of clearance/trust tags this member is allowed to handle (e.g. `["sensitive", "architectural"]`). Default empty — a member with no tags can only run work items that require no tags. See [Capability gate](#capability-gate) below. |
@@ -451,8 +489,10 @@ On every pickup attempt for a work item with an `AgentClassId`:
      instance, cache result for `QuotaCacheTtl` (default 60 s).
    - If `ModelId` is set and the snapshot includes `PerModel[ModelId]`, gate
      on the model bucket instead of the overall quota.
-   - Unknown (`AvailablePct < 0`) follows `UnknownPolicy` (`UseObservedFailures`
-     by default).
+   - Unknown (`AvailablePct < 0`) fails closed while the agent's effective
+     floor is non-zero (the reserve must be protected when the probe cannot
+     produce a reading); with a zero effective floor it follows `UnknownPolicy`
+     (`UseObservedFailures` by default).
    - Pick the first member that the quota gate allows.
 6. If no member qualifies (all exhausted):
    - Class has at least one Subscription member → `ShouldWait = true`,
@@ -495,8 +535,10 @@ Both probes return `AvailablePct = -1` on:
 - Unrecognised JSON shape
 - Token not configured
 
-`AvailablePct = -1` follows `UnknownPolicy`. The default is
-`UseObservedFailures`, not blind fail-open.
+`AvailablePct = -1` fails closed while the agent's effective floor is non-zero
+(the default floors are non-zero, so unknowns are refused and the reserve is
+protected). With a zero effective floor it follows `UnknownPolicy`. The
+default is `UseObservedFailures`, not blind fail-open.
 
 ## Quota router tuning
 
@@ -549,7 +591,7 @@ Configured under `CodeyBox:QuotaRouter`:
 | `FloorByAgent` | `{}` | Optional per-agent floor overrides keyed by agent kind. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted agents and omitted fields use the global values. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a probe result. Keeps the pickup loop cheap under load. |
-| `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
+| `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses when no effective floor is in force: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. A non-zero effective floor fails closed before this policy applies. |
 | `IntraKindRoutingPolicy` | `MostQuotaFirst` | How to order quality-eligible members: `MostQuotaFirst`, `RoundRobin`, `Sticky`, or `DeadlineAwareDrain`. Hot-reloadable. |
 | `DrainAggressiveness` | `1.0` | Multiplier used by `DeadlineAwareDrain` to run ahead of even per-cycle pacing. Higher values bias toward burning the full rate-window allowance before the deadline. |
 | `ExpectedResets` | `{}` | Optional per-agent expected free/manual reset declarations. The policy uses the sooner of live probe reset and next expected reset. |

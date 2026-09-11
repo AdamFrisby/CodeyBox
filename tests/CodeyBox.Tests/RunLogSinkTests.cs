@@ -198,11 +198,111 @@ public sealed class RunLogSinkTests : IDisposable
 
         var files = Directory.GetFiles(dir, "run-*.log");
         Assert.Single(files);
-        // Retained count clamps to 1, so only the active file (with the
-        // newest line) survives — still bounded, nothing throws.
-        var surviving = ReadAllLines(dir, "run-*.log");
-        Assert.Single(surviving);
-        Assert.Contains("seq=4", surviving[0], StringComparison.Ordinal);
+        // Retained count clamps to 1, so only the active file survives, and
+        // the size knob clamps to 1 byte per record: records that cannot fit
+        // are truncated rather than written whole, so the footprint still
+        // honors the (degenerate) bound and nothing throws. Content cannot
+        // survive a 1-byte cap — that truncation is the documented contract.
+        var totalBytes = files.Sum(f => new FileInfo(f).Length);
+        Assert.True(totalBytes <= 1 * 1, $"Footprint {totalBytes} exceeds ceiling 1");
+    }
+
+    [Fact]
+    public void ControlCharacters_ProduceExactlyOnePhysicalLine()
+    {
+        var dir = NewDirectory();
+        var options = new ConsoleLogOptions { MaxFileSizeBytes = 1024 * 1024, RetainedFileCountLimit = 3 };
+        using var sink = new RunLogSink(Path.Combine(dir, "run-.log"), () => options);
+        using (var log = NewLogger(sink))
+        {
+            log.Information("line one\r\nline two\nline three\rmarker seq={Seq}", 1);
+        }
+
+        var text = File.ReadAllText(Directory.GetFiles(dir, "run-*.log").Single());
+        Assert.DoesNotContain("\r", text, StringComparison.Ordinal);
+        var physicalLines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Single(physicalLines);
+        Assert.Matches(LinePattern, physicalLines[0]);
+        Assert.Contains("line one", physicalLines[0], StringComparison.Ordinal);
+        Assert.Contains("line two", physicalLines[0], StringComparison.Ordinal);
+        Assert.Contains("marker seq=1", physicalLines[0], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnsiEscapeSequences_AreNeutralised()
+    {
+        var dir = NewDirectory();
+        var options = new ConsoleLogOptions { MaxFileSizeBytes = 1024 * 1024, RetainedFileCountLimit = 3 };
+        using var sink = new RunLogSink(Path.Combine(dir, "run-.log"), () => options);
+        using (var log = NewLogger(sink))
+        {
+            log.Information("\u001b[31mred alert\u001b[0m seq={Seq}", 5);
+            log.Error(new InvalidOperationException("boom\n\u001b[1mescaped"), "agent run failed");
+        }
+
+        var text = File.ReadAllText(Directory.GetFiles(dir, "run-*.log").Single());
+        Assert.DoesNotContain("\u001b", text, StringComparison.Ordinal);
+        Assert.Contains("red alert", text, StringComparison.Ordinal);
+        Assert.Contains("seq=5", text, StringComparison.Ordinal);
+        Assert.Contains("agent run failed", text, StringComparison.Ordinal);
+        Assert.Contains("System.InvalidOperationException: boom", text, StringComparison.Ordinal);
+        // The multi-line exception stack is folded into its record: one record
+        // per physical line, every line still timestamped and greppable.
+        var physicalLines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, physicalLines.Length);
+        Assert.All(physicalLines, l => Assert.Matches(LinePattern, l));
+    }
+
+    [Fact]
+    public void OversizedLine_CannotExceedDocumentedBound()
+    {
+        var dir = NewDirectory();
+        const long maxSize = 1024;
+        const int retained = 3;
+        var options = new ConsoleLogOptions { MaxFileSizeBytes = maxSize, RetainedFileCountLimit = retained };
+        using var sink = new RunLogSink(Path.Combine(dir, "run-.log"), () => options);
+        using (var log = NewLogger(sink))
+        {
+            log.Information(new string('A', 10_000) + " seq={Seq}", 1);
+        }
+
+        var files = Directory.GetFiles(dir, "run-*.log");
+        Assert.All(files, f => Assert.True(
+            new FileInfo(f).Length <= maxSize,
+            $"{f} exceeds MaxFileSizeBytes"));
+        var totalBytes = files.Sum(f => new FileInfo(f).Length);
+        Assert.True(totalBytes <= retained * maxSize, $"Footprint {totalBytes} exceeds ceiling {retained * maxSize}");
+        var text = File.ReadAllText(files.Single());
+        Assert.Contains("[truncated]", text, StringComparison.Ordinal);
+        Assert.Single(text.Split('\n', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    [Fact]
+    public void SustainedOversizedWrites_StayWithinDocumentedBound()
+    {
+        var dir = NewDirectory();
+        const long maxSize = 1024;
+        const int retained = 3;
+        var options = new ConsoleLogOptions { MaxFileSizeBytes = maxSize, RetainedFileCountLimit = retained };
+        using var sink = new RunLogSink(Path.Combine(dir, "run-.log"), () => options);
+        var payload = new string('B', 5000);
+        using (var log = NewLogger(sink))
+        {
+            for (var i = 0; i < 500; i++)
+                log.Information("{Payload} seq={Seq}", payload, i);
+        }
+
+        var files = Directory.GetFiles(dir, "run-*.log");
+        Assert.True(files.Length <= retained, $"Expected at most {retained} files, found {files.Length}");
+        var totalBytes = files.Sum(f => new FileInfo(f).Length);
+        Assert.True(totalBytes <= retained * maxSize, $"Footprint {totalBytes} exceeds ceiling {retained * maxSize}");
+        Assert.All(files, f => Assert.True(
+            new FileInfo(f).Length <= maxSize,
+            $"{f} exceeds MaxFileSizeBytes"));
+        // Truncated records still occupy exactly one physical line each.
+        Assert.All(
+            ReadAllLines(dir, "run-*.log"),
+            l => Assert.Matches(LinePattern, l));
     }
 
     [Fact]

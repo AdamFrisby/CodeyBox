@@ -320,7 +320,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
                 await Task.Delay(backoff, _timeProvider, ct);
             }
 
-            last = await ProbeOnceAsync(token, ct);
+            last = await ProbeOnceAsync(token, ct, opts.MaxRetryDelay);
             if (last.Outcome is ProbeOutcome.Success or ProbeOutcome.PermanentFailure
                 or ProbeOutcome.RateLimited)
             {
@@ -338,7 +338,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
         return Unknown(QuotaUnknownReason.Transient, last.Reason ?? "network error");
     }
 
-    private async Task<ProbeAttemptResult> ProbeOnceAsync(string token, CancellationToken ct)
+    private async Task<ProbeAttemptResult> ProbeOnceAsync(string token, CancellationToken ct, TimeSpan maxRetryDelay)
     {
         try
         {
@@ -361,7 +361,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
                 // escape. Record a cooldown instead and stop this call's retry loop.
                 if (response.StatusCode == HttpStatusCode.TooManyRequests)
                 {
-                    var until = ResolveRateLimitCooldownUntil(response);
+                    var until = ResolveRateLimitCooldownUntil(response, maxRetryDelay);
                     SetRateLimitedUntil(until);
                     _log.LogInformation(
                         "Claude quota endpoint rate-limited; suppressing probes until {Until:O}", until);
@@ -456,13 +456,22 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
     /// <summary>
     /// When to resume probing after a 429: the provider's <c>Retry-After</c> when it supplies a usable
     /// one (delta-seconds or HTTP-date), else <see cref="DefaultRateLimitCooldown"/>. A provider
-    /// value is not shortened: probing before that time can prolong its rate limit.
+    /// value is honoured up to <paramref name="maxRetryDelay"/> (falling back to
+    /// <see cref="ClaudeQuotaProbeResilienceOptions.DefaultMaxRetryDelay"/> when non-positive)
+    /// so a large server value cannot wedge the probe; only the provider-supplied value is
+    /// capped, the <see cref="DefaultRateLimitCooldown"/> fallback is not.
     /// </summary>
-    private DateTimeOffset ResolveRateLimitCooldownUntil(HttpResponseMessage response)
+    private DateTimeOffset ResolveRateLimitCooldownUntil(HttpResponseMessage response, TimeSpan maxRetryDelay)
     {
         var now = _timeProvider.GetUtcNow();
-        var cooldown = HttpQuotaRetryPolicy.TryGetRetryAfterDelay(response.Headers, now)
-            ?? DefaultRateLimitCooldown;
+        var serverDelay = HttpQuotaRetryPolicy.TryGetRetryAfterDelay(response.Headers, now);
+        if (serverDelay is null)
+            return now + DefaultRateLimitCooldown;
+
+        var cap = maxRetryDelay > TimeSpan.Zero
+            ? maxRetryDelay
+            : ClaudeQuotaProbeResilienceOptions.DefaultMaxRetryDelay;
+        var cooldown = serverDelay.Value > cap ? cap : serverDelay.Value;
         return now + cooldown;
     }
 

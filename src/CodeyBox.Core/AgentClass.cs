@@ -45,10 +45,29 @@ public sealed record AgentMembership
     public string? InstanceId { get; init; }
 
     /// <summary>
+    /// Optional quota pool this member draws from. A pool names one underlying
+    /// account or subscription; members that share a pool are metered as one
+    /// quantity (one reading, one floor, one reservation escrow). Null means
+    /// legacy per-agent keying. Must name an entry in the quota router's
+    /// configured pools; an unknown name fails closed at dispatch (the member
+    /// is refused and the reason names the member and the pool).
+    /// Operator-declared in configuration; never derived from credentials.
+    /// </summary>
+    public string? Pool { get; init; }
+
+    /// <summary>
     /// Per-instance credential source. When null, the legacy per-kind
     /// credential chain is used.
     /// </summary>
     public AgentCredentialReference? CredentialReference { get; init; }
+
+    /// <summary>
+    /// Per-instance provider source. When null, the agent-global provider
+    /// configuration is used. Only agents with a named provider catalog
+    /// honour this (today: Copilot via <c>CodeyBox:Copilot:Providers</c>);
+    /// any other agent naming a provider fails configuration validation.
+    /// </summary>
+    public AgentProviderReference? ProviderReference { get; init; }
 
     /// <summary>
     /// Stable routing/accounting key for this member. Default legacy members
@@ -192,6 +211,22 @@ public sealed record AgentCredentialReference
         || !string.IsNullOrWhiteSpace(SettingsFilePath)
         || !string.IsNullOrWhiteSpace(DestinationPath)
         || !string.IsNullOrWhiteSpace(SandboxEnvironmentVariable);
+}
+
+/// <summary>
+/// A named provider entry for one routable agent instance. The name resolves
+/// against the agent's provider catalog (for Copilot:
+/// <c>CodeyBox:Copilot:Providers</c>); exactly how the resolved entry is
+/// materialized is agent-specific. A name that resolves to no catalog entry
+/// fails configuration validation — the member must never silently fall back
+/// to a different backend than the operator named.
+/// </summary>
+public sealed record AgentProviderReference
+{
+    /// <summary>Provider catalog entry name, e.g. <c>byok</c>.</summary>
+    public string? Name { get; init; }
+
+    public bool HasAnyReference => !string.IsNullOrWhiteSpace(Name);
 }
 
 /// <summary>Helpers for stable agent instance route keys.</summary>
