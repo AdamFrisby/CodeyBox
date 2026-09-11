@@ -136,6 +136,16 @@ public sealed class PipelineTuningOptions
     public double SandboxPressureThreshold { get; set; } = 0.85;
 
     /// <summary>
+    /// How long a worker may wait for a sandbox admission permit before the
+    /// gate logs a warning naming the waiting work item and phase. Normal
+    /// acquisition takes seconds; a wait past this threshold means the pool's
+    /// sandbox ceiling is saturated and dispatch may be stalling (the
+    /// 2026-09-11 incident was silent for hours). Default 5 minutes. Zero
+    /// disables the warning.
+    /// </summary>
+    public TimeSpan SandboxPermitWaitWarningThreshold { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
     /// When true, auditors declaring
     /// <see cref="CodeyBox.Core.IAuditor.CanShortCircuitOnBlockingFinding"/> run before
     /// the remaining auditors and a blocking gate result skips the rest of the
@@ -325,6 +335,12 @@ public sealed class PipelineTuningOptions
             throw new ArgumentOutOfRangeException(
                 nameof(EmptyReworkEscalationRetries),
                 "EmptyReworkEscalationRetries must be non-negative");
+        }
+        if (SandboxPermitWaitWarningThreshold < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(SandboxPermitWaitWarningThreshold),
+                "SandboxPermitWaitWarningThreshold must be non-negative (zero disables the slow-permit warning)");
         }
     }
 }

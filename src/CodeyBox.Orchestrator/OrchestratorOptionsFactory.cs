@@ -61,6 +61,19 @@ public static class OrchestratorOptionsFactory
         if (maxConcurrentSandboxes < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConcurrentSandboxes must be >= 1");
+        // A worker may transiently hold its phase sandbox while acquiring the
+        // next phase's sandbox (work -> audit, audit -> merge handoffs), so one
+        // worker can hold 2 sandbox permits at once. The ceiling must therefore
+        // cover 2 permits per worker slot, or every worker can end up holding
+        // one permit while waiting for another that never frees (2026-09-11
+        // dispatch stall: 6 workers / 6 permits, zero progress for hours).
+        var minimumSandboxes = checked(2 * maxConcurrent);
+        if (maxConcurrentSandboxes < minimumSandboxes)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerPool:MaxConcurrentSandboxes ({maxConcurrentSandboxes}) must be at least " +
+                $"2x CodeyBox:WorkerPool:MaxConcurrentWorkers ({maxConcurrent}); " +
+                $"minimum required value is {minimumSandboxes} because a worker can hold its phase sandbox " +
+                "while acquiring the next phase's sandbox. Raise MaxConcurrentSandboxes or lower MaxConcurrentWorkers.");
         if (wp.MinSpawnInterval < TimeSpan.Zero)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
@@ -102,13 +115,18 @@ public static class OrchestratorOptionsFactory
         };
     }
 
+    /// <summary>
+    /// Default <c>MaxConcurrentSandboxes</c> for a given worker count: 2 permits
+    /// per worker, matching the startup validation bound (a worker can hold its
+    /// phase sandbox while acquiring the next phase's sandbox).
+    /// </summary>
     public static int DeriveDefaultMaxConcurrentSandboxes(int maxConcurrentWorkers)
     {
         if (maxConcurrentWorkers < 1)
             throw new ArgumentOutOfRangeException(
                 nameof(maxConcurrentWorkers),
                 "MaxConcurrentWorkers must be >= 1");
-        return Math.Max(1, (maxConcurrentWorkers * 3 + 1) / 2);
+        return checked(2 * maxConcurrentWorkers);
     }
 
     public static OrchestratorOptions Build(

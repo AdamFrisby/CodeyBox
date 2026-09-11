@@ -12,7 +12,7 @@ Three independent knobs control worker admission and sandbox pressure:
 | Config key | Type | Default | Purpose |
 |---|---|---|---|
 | `CodeyBox:WorkerPool:MaxConcurrentWorkers` | `int` | `1` | Hard cap on simultaneous in-flight work items |
-| `CodeyBox:WorkerPool:MaxConcurrentSandboxes` | `int` | `ceil(MaxConcurrentWorkers * 1.5)` | Global cap on live sandboxes/VMs across every phase |
+| `CodeyBox:WorkerPool:MaxConcurrentSandboxes` | `int` | `2 * MaxConcurrentWorkers` | Global cap on live sandboxes/VMs across every phase |
 | `CodeyBox:WorkerPool:MinSpawnInterval` | `string` (TimeSpan) | `"00:00:00"` (none) | Minimum wall-clock gap between consecutive spawns |
 | `CodeyBox:WorkerPool:DispatchGateAcquisitionBackoff` | `string` (TimeSpan) | `"00:00:01"` | Backoff between dispatch pickups after a SQLite write-gate acquisition timeout |
 | `CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `int` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit) |
@@ -52,9 +52,9 @@ handle. The provider therefore never has more than this many concurrently-live
 sandboxes from this orchestrator process, even when several worker items enter audit or
 merge at the same time.
 
-When unset, the default is `ceil(MaxConcurrentWorkers * 1.5)`: enough headroom
-for routine audit/merge overlap without making `MaxConcurrentWorkers` and
-per-item audit fan-out multiply into the host VM count. Set it explicitly on
+When unset, the default is `2 * MaxConcurrentWorkers`: every worker can hold
+its phase sandbox while acquiring the next phase's sandbox (work → audit,
+audit → merge handoffs) without deadlocking the pool. Set it explicitly on
 hosts with a known VM capacity. This is a startup-captured value because the
 live admission queue is not resized in place; restart CodeyBox to apply changes.
 
@@ -75,15 +75,26 @@ MaxConcurrentWorkers * MaxLlmAuditorParallelism
 
 #### Deadlock safety
 
-Worker, audit, merge, smoke, and verification phases use `await using` sandbox
-handles, so a phase releases its token when that sandbox is disposed before the
-next phase fans out. Auditor creation is cancellable and queued FIFO at the
-provider boundary. If `MaxConcurrentSandboxes` is smaller than
-`MaxConcurrentWorkers * MaxLlmAuditorParallelism`, excess auditors wait without
-holding tokens; as active auditors finish and dispose their sandboxes, the gate
-admits the next queued create. No worker keeps its work-phase sandbox token
-while waiting for audit tokens, so the queue can drain rather than forming a
-permanent cycle.
+A worker may transiently hold its phase sandbox while acquiring the next
+phase's sandbox (work → audit, audit → merge handoffs), so one worker can
+hold 2 permits at once. Startup validation therefore rejects any
+`MaxConcurrentSandboxes` below `2 * MaxConcurrentWorkers` with an error
+naming both keys and the minimum — the 2026-09-11 incident ran 6 workers
+against 6 permits, and every worker ended up holding one permit while
+waiting for another that never freed.
+
+Beyond that structural bound, the pipeline surrenders its work-phase reusable
+sandbox before phases that provision their own sandboxes (audit fan-out,
+merge, conflict rework), so a worker never idles on a permit wait while
+holding its work permit. Phase sandbox handles are still `await using`, so a
+phase releases its token when its sandbox is disposed.
+
+A permit wait that outlasts
+`CodeyBox:PipelineTuning:SandboxPermitWaitWarningThreshold` (default 5
+minutes) logs a Warning naming the waiting work item and phase with the
+current admitted/max counts, so a saturated ceiling is diagnosable instead
+of silent. Auditor creation remains cancellable and queued FIFO at the
+provider boundary.
 
 ### MinSpawnInterval
 

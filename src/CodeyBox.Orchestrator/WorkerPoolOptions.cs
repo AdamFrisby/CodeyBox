@@ -16,10 +16,11 @@ public sealed class WorkerPoolOptions
 
     /// <summary>
     /// Maximum number of live sandbox instances this process may hold at once.
-    /// When unset, defaults to <c>ceil(MaxConcurrentWorkers * 1.5)</c> so the
-    /// worker pool has a small audit/merge headroom without letting per-item
-    /// fan-out multiply into an unbounded VM count. Captured at startup; restart
-    /// CodeyBox to resize the live admission gate.
+    /// When unset, defaults to <c>2 * MaxConcurrentWorkers</c> so every worker
+    /// can hold its phase sandbox while acquiring the next phase's sandbox
+    /// (work -&gt; audit, audit -&gt; merge handoffs) without deadlocking the pool.
+    /// Values below <c>2 * MaxConcurrentWorkers</c> are rejected at startup.
+    /// Captured at startup; restart CodeyBox to resize the live admission gate.
     /// </summary>
     public int? MaxConcurrentSandboxes { get; set; }
 

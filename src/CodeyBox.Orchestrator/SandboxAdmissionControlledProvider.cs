@@ -56,12 +56,16 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         _hostPoolSnapshot = inner as ISandboxHostPoolSnapshot;
     }
 
-    public static ISandboxProvider Wrap(ISandboxProvider inner, int maxConcurrentSandboxes, ILogger log)
+    public static ISandboxProvider Wrap(
+        ISandboxProvider inner,
+        int maxConcurrentSandboxes,
+        ILogger log,
+        Func<TimeSpan>? waitWarningThresholdProvider = null)
     {
         ArgumentNullException.ThrowIfNull(inner);
         ArgumentNullException.ThrowIfNull(log);
 
-        var gate = new SandboxAdmissionGate(maxConcurrentSandboxes);
+        var gate = new SandboxAdmissionGate(maxConcurrentSandboxes, log, waitWarningThresholdProvider);
         var capabilities = ProviderCapabilities.None;
         if (inner is IActiveSandboxProvider) capabilities |= ProviderCapabilities.Active;
         if (inner is ISuspendingSandboxProvider) capabilities |= ProviderCapabilities.Suspending;
@@ -1002,16 +1006,30 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
 internal sealed class SandboxAdmissionGate
 {
+    /// <summary>
+    /// Fallback slow-permit warning threshold for gates constructed without an
+    /// explicit provider (tests, non-hosted use). Hosted gates read the
+    /// hot-reloadable <c>PipelineTuning:SandboxPermitWaitWarningThreshold</c>.
+    /// </summary>
+    internal static readonly TimeSpan DefaultWaitWarningThreshold = TimeSpan.FromMinutes(5);
+
     private readonly object _sync = new();
     private readonly Queue<Waiter> _waiters = new();
+    private readonly ILogger? _log;
+    private readonly Func<TimeSpan>? _waitWarningThresholdProvider;
     private int _available;
 
-    public SandboxAdmissionGate(int maxConcurrent)
+    public SandboxAdmissionGate(
+        int maxConcurrent,
+        ILogger? log = null,
+        Func<TimeSpan>? waitWarningThresholdProvider = null)
     {
         if (maxConcurrent < 1)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrent), "Max concurrent sandboxes must be >= 1");
         MaxConcurrent = maxConcurrent;
         _available = maxConcurrent;
+        _log = log;
+        _waitWarningThresholdProvider = waitWarningThresholdProvider;
     }
 
     public int MaxConcurrent { get; }
@@ -1027,6 +1045,7 @@ internal sealed class SandboxAdmissionGate
 
     public ValueTask<SandboxAdmissionLease> AcquireAsync(CancellationToken ct = default)
     {
+        Waiter waiter;
         lock (_sync)
         {
             if (ct.IsCancellationRequested)
@@ -1038,10 +1057,53 @@ internal sealed class SandboxAdmissionGate
                 return ValueTask.FromResult(new SandboxAdmissionLease(this));
             }
 
-            var waiter = new Waiter(this, ct);
+            waiter = new Waiter(this, ct);
             _waiters.Enqueue(waiter);
             waiter.RegisterCancellation();
-            return new ValueTask<SandboxAdmissionLease>(waiter.Task);
+        }
+
+        return SlowAcquireAsync(waiter, ct);
+    }
+
+    private async ValueTask<SandboxAdmissionLease> SlowAcquireAsync(Waiter waiter, CancellationToken ct)
+    {
+        var threshold = _waitWarningThresholdProvider?.Invoke() ?? DefaultWaitWarningThreshold;
+        var waiterTask = waiter.Task;
+        if (_log is null || threshold <= TimeSpan.Zero)
+            return await waiterTask.ConfigureAwait(false);
+
+        var completed = await Task.WhenAny(waiterTask, Task.Delay(threshold, ct)).ConfigureAwait(false);
+        if (completed == waiterTask || waiterTask.IsCompleted)
+            return await waiterTask.ConfigureAwait(false);
+        if (!ct.IsCancellationRequested)
+            LogSlowWait(threshold);
+        return await waiterTask.ConfigureAwait(false);
+    }
+
+    private void LogSlowWait(TimeSpan threshold)
+    {
+        var log = _log;
+        if (log is null)
+            return;
+        int current;
+        lock (_sync)
+            current = MaxConcurrent - _available;
+        var scope = SandboxPermitWaitScope.Current;
+        if (scope is null)
+        {
+            log.LogWarning(
+                "Sandbox permit wait exceeded {ThresholdSeconds}s with {Current}/{Max} permits admitted; " +
+                "a worker is blocked waiting for a sandbox permit. " +
+                "Raise CodeyBox:WorkerPool:MaxConcurrentSandboxes or lower CodeyBox:WorkerPool:MaxConcurrentWorkers.",
+                threshold.TotalSeconds, current, MaxConcurrent);
+        }
+        else
+        {
+            log.LogWarning(
+                "Work item {WorkItemId} waited over {ThresholdSeconds}s for a sandbox permit in phase {Phase} " +
+                "with {Current}/{Max} permits admitted; the worker is blocked and the pool may be undersized. " +
+                "Raise CodeyBox:WorkerPool:MaxConcurrentSandboxes or lower CodeyBox:WorkerPool:MaxConcurrentWorkers.",
+                scope.WorkItemId, threshold.TotalSeconds, scope.Phase, current, MaxConcurrent);
         }
     }
 

@@ -140,4 +140,28 @@ public sealed class PipelineTuningOptionsValidationTests
 
         opts.Validate();
     }
+
+    [Fact]
+    public void Validate_NegativeSandboxPermitWaitWarningThreshold_Throws()
+    {
+        var opts = new PipelineTuningOptions
+        {
+            SandboxPermitWaitWarningThreshold = TimeSpan.FromSeconds(-1),
+        };
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(opts.Validate);
+        Assert.Equal(nameof(PipelineTuningOptions.SandboxPermitWaitWarningThreshold), ex.ParamName);
+    }
+
+    [Fact]
+    public void Validate_ZeroSandboxPermitWaitWarningThreshold_Allowed()
+    {
+        // Zero disables the slow-permit warning.
+        var opts = new PipelineTuningOptions
+        {
+            SandboxPermitWaitWarningThreshold = TimeSpan.Zero,
+        };
+
+        opts.Validate();
+    }
 }

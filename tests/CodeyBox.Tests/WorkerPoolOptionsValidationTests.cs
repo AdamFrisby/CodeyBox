@@ -75,10 +75,10 @@ public sealed class WorkerPoolOptionsValidationTests
 
     [Theory]
     [InlineData(1, 2)]
-    [InlineData(2, 3)]
-    [InlineData(3, 5)]
-    [InlineData(4, 6)]
-    public void MaxConcurrentSandboxes_DefaultsToCeilingOfWorkerHeadroom(int workers, int expectedSandboxes)
+    [InlineData(2, 4)]
+    [InlineData(3, 6)]
+    [InlineData(4, 8)]
+    public void MaxConcurrentSandboxes_DefaultsToTwiceWorkerCount(int workers, int expectedSandboxes)
     {
         var opts = Build(new WorkerPoolOptions { MaxConcurrentWorkers = workers });
 
@@ -91,10 +91,47 @@ public sealed class WorkerPoolOptionsValidationTests
         var opts = Build(new WorkerPoolOptions
         {
             MaxConcurrentWorkers = 4,
-            MaxConcurrentSandboxes = 3,
+            MaxConcurrentSandboxes = 9,
         });
 
-        Assert.Equal(3, opts.MaxConcurrentSandboxes);
+        Assert.Equal(9, opts.MaxConcurrentSandboxes);
+    }
+
+    [Fact]
+    public void MaxConcurrentSandboxes_AtMinimumTwiceWorkers_IsAccepted()
+    {
+        var opts = Build(new WorkerPoolOptions
+        {
+            MaxConcurrentWorkers = 6,
+            MaxConcurrentSandboxes = 12,
+        });
+
+        Assert.Equal(12, opts.MaxConcurrentSandboxes);
+    }
+
+    [Theory]
+    // The 2026-09-11 incident ran 6 workers against 6 permits: every worker
+    // held one sandbox while waiting for another and dispatch stalled for
+    // hours. Any ratio at or below 1:1 — and anything below 2:1 — must fail
+    // fast at startup with a message naming both keys and the minimum.
+    [InlineData(6, 6)]
+    [InlineData(6, 5)]
+    [InlineData(6, 11)]
+    [InlineData(1, 1)]
+    [InlineData(2, 3)]
+    public void MaxConcurrentSandboxes_BelowTwiceWorkers_ThrowsNamingBothKeysAndMinimum(
+        int workers, int sandboxes)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            Build(new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = workers,
+                MaxConcurrentSandboxes = sandboxes,
+            }));
+
+        Assert.Contains("CodeyBox:WorkerPool:MaxConcurrentSandboxes", ex.Message);
+        Assert.Contains("CodeyBox:WorkerPool:MaxConcurrentWorkers", ex.Message);
+        Assert.Contains((2 * workers).ToString(), ex.Message);
     }
 
     [Fact]

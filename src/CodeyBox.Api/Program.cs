@@ -544,10 +544,12 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         orchestratorOptions.MaxConcurrentSandboxes);
     if (inner is ISandboxHostPoolSnapshot hostPool)
         RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
+    var pipelineTuning = sp.GetRequiredService<PipelineTuningSnapshot>();
     return SandboxAdmissionControlledProvider.Wrap(
         inner,
         orchestratorOptions.MaxConcurrentSandboxes,
-        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>(),
+        waitWarningThresholdProvider: () => pipelineTuning.Current.SandboxPermitWaitWarningThreshold);
 }
 
 static ReloadableSandboxProvider BuildReloadableSandboxProvider(
