@@ -35,6 +35,8 @@ namespace CodeyBox.Api;
 ///   so the new windows take effect on the next gate/visibility read).</item>
 /// <item><c>CodeyBox:AgentDefaults</c> → <see cref="AgentDefaultsSnapshot.Replace"/>.</item>
 /// <item><c>CodeyBox:AgentNetworkTolerance</c> → <see cref="AgentNetworkToleranceSnapshot.Replace"/>.</item>
+/// <item><c>CodeyBox:ToolchainFaults</c> → <see cref="ToolchainFaultSnapshot.Replace"/>
+/// so a new language signature takes effect without restart or code change.</item>
 /// <item><c>CodeyBox:AgentPauses</c> → <see cref="IAgentPauseController"/> config-owned
 ///   pause/resume reconciliation.</item>
 /// <item><c>CodeyBox:Smoke</c> → <see cref="SmokeOptionsSnapshot.Replace"/>
@@ -80,6 +82,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
     private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttribution;
+    private readonly ToolchainFaultSnapshot? _toolchainFaults;
     private readonly TransitionHealthOptionsSnapshot? _transitionHealth;
     private readonly IAgentPauseController? _pauses;
     private readonly IAgentRegistry? _agents;
@@ -105,6 +108,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastCircuitBreaker = "";
     private string _lastSmoke = "";
     private string _lastTestFailureAttribution = "";
+    private string _lastToolchainFaults = "";
     private string _lastTransitionHealth = "";
     private string _lastAgentPauses = "";
     private string _lastNetworkTolerance = "";
@@ -132,6 +136,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         IInVmSmokeCoveragePolicy? coverage = null,
         SmokeOptionsSnapshot? smokeOptions = null,
         TestFailureAttributionOptionsSnapshot? testFailureAttribution = null,
+        ToolchainFaultSnapshot? toolchainFaults = null,
         IAgentPauseController? pauses = null,
         IAgentRegistry? agents = null,
         TransitionHealthOptionsSnapshot? transitionHealth = null,
@@ -162,6 +167,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _coverage = coverage;
         _smokeOptions = smokeOptions;
         _testFailureAttribution = testFailureAttribution;
+        _toolchainFaults = toolchainFaults;
         _transitionHealth = transitionHealth;
         _pauses = pauses;
         _agents = agents;
@@ -191,6 +197,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastCircuitBreaker = SerializeCircuitBreaker(initial.AgentCircuitBreaker);
         _lastSmoke = SerializeSmoke(initial.Smoke);
         _lastTestFailureAttribution = SerializeTestFailureAttribution(initial.TestFailureAttribution);
+        _lastToolchainFaults = SerializeToolchainFaults(initial.ToolchainFaults);
         _lastTransitionHealth = SerializeTransitionHealth(initial.TransitionHealth);
         _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
         _lastHostPoolCapacity = SerializeHostPoolCapacity(initial);
@@ -228,6 +235,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyConcurrencyIfChanged(opts);
             ApplySmokeIfChanged(opts);
             ApplyTestFailureAttributionIfChanged(opts);
+            ApplyToolchainFaultsIfChanged(opts);
             ApplyTransitionHealthIfChanged(opts);
             ApplyRouterIfChanged(opts);
             ApplyBurnIfChanged(opts);
@@ -1271,6 +1279,58 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.Enabled,
             },
             JsonOpts);
+
+    private void ApplyToolchainFaultsIfChanged(CodeyBoxOptions opts)
+    {
+        if (_toolchainFaults is null) return;
+
+        var next = SerializeToolchainFaults(opts.ToolchainFaults);
+        if (string.Equals(_lastToolchainFaults, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastToolchainFaults;
+        try
+        {
+            _toolchainFaults.Replace(opts.ToolchainFaults);
+            _lastToolchainFaults = next;
+            AuditLog.ConfigReloaded("ToolchainFaults", prev, next);
+            _log.LogInformation("Hot-reloaded ToolchainFaults: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of ToolchainFaults rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    private static string SerializeToolchainFaults(Dictionary<string, ToolchainFaultSignatureOptions?> signatures) =>
+        JsonSerializer.Serialize(
+            (signatures ?? new Dictionary<string, ToolchainFaultSignatureOptions?>())
+                .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    kv => kv.Key,
+                    kv => SerializeToolchainFaultSignature(kv.Value),
+                    StringComparer.OrdinalIgnoreCase),
+            JsonOpts);
+
+    private static object? SerializeToolchainFaultSignature(ToolchainFaultSignatureOptions? value) =>
+        value is null
+            ? null
+            : new
+            {
+                value.FaultClass,
+                Disposition = value.Disposition.ToString(),
+                value.ExitCodes,
+                value.ExitCodeAbove,
+                value.StdoutContains,
+                value.StderrContains,
+                value.OutputContains,
+                value.StdoutRegex,
+                value.StderrRegex,
+                value.OutputRegex,
+            };
 
     private static string SerializeSmoke(SmokeConfig opts) =>
         JsonSerializer.Serialize(

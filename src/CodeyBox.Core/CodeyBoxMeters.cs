@@ -197,6 +197,15 @@ public static class CodeyBoxMeters
         PipelineMeter.CreateCounter<long>("codeybox.webhook.deliveries", unit: "{delivery}");
 
     /// <summary>
+    /// One increment per toolchain-fault classification of a gate subprocess
+    /// result. Tags: <c>fault_class</c>, <c>signature</c>, <c>disposition</c>.
+    /// Lets operators count fault-class frequency; the per-class totals are
+    /// also queryable from <c>IToolchainFaultRecordStore</c>.
+    /// </summary>
+    public static readonly Counter<long> ToolchainFaults =
+        PipelineMeter.CreateCounter<long>("codeybox.toolchain.faults", unit: "{fault}");
+
+    /// <summary>
     /// Registers an observable gauge on the <c>CodeyBox.Pipeline</c> meter. The
     /// returned instrument must be kept alive by the caller (the SDK holds only a
     /// weak reference); store it in a long-lived field. The callback runs only

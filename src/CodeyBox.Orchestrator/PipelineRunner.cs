@@ -341,7 +341,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // Optional best-effort exporter that propagates a completed item's test
         // cases to JobTrack. Null disables propagation; when wired it self-gates
         // on each project's JobTrackExport.Enabled opt-in.
-        IJobTrackTestCaseExporter? jobTrackExporter = null)
+        IJobTrackTestCaseExporter? jobTrackExporter = null,
+        // Toolchain-fault classification for gate subprocess results. Null
+        // falls back to the built-in platform-agnostic signatures; the record
+        // store defaults to an in-memory bounded store. The composition root
+        // wires the hot-reloadable snapshot-backed classifier and the shared
+        // store so a config-only signature takes effect without restart.
+        IToolchainFaultClassifier? toolchainFaultClassifier = null,
+        IToolchainFaultRecordStore? toolchainFaultRecords = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -482,7 +489,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _claudeSessionOptions = sessionDispatchOptions ?? new AgentSessionDispatchOptions();
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
-            _auditReports is null ? null : PersistAuditReportAsync);
+            _auditReports is null ? null : PersistAuditReportAsync,
+            toolchainFaultClassifier ?? new ToolchainFaultClassifier(snapshot: null),
+            toolchainFaultRecords ?? new InMemoryToolchainFaultRecordStore());
     }
 
     private readonly RequiredBuildGate _requiredBuildGate;
@@ -3271,6 +3280,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Work item {Id} parking in WaitingForQuotaReset: {Reason}",
                 item.Id, ex.Message);
             await TransitionWaitingForQuotaResetAsync(item, ex, project);
+        }
+        catch (ToolchainFaultTransientException ex)
+        {
+            // A gate subprocess failed with a retryable toolchain-fault
+            // signature: the tool failed, not the diff. Re-run the same
+            // commit through the existing bounded WaitingForTransientRetry
+            // path (attempts + jitter owned by the retry scheduler) instead
+            // of recording a finding against the diff. Deliberately distinct
+            // from flake attribution, which consults the base branch.
+            _log.LogWarning(
+                "Work item {Id} hit toolchain fault '{FaultClass}' (signature {Signature}) in phase {Phase}; parking for transient retry",
+                item.Id,
+                ex.Classification.FaultClass,
+                ex.Classification.MatchedSignature,
+                ex.Phase ?? "(unknown)");
+            await TransitionWaitingForTransientRetryAsync(item, ex.Message, project, ex.Phase, item.Agent);
         }
         catch (RequiredBuildFailedException ex)
         {

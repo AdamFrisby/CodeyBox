@@ -2083,6 +2083,22 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentNetworkToleranceSnapshot>(sp =>
     return new CodeyBox.Core.AgentNetworkToleranceSnapshot(opts.AgentNetworkTolerance);
 });
 
+// ToolchainFaultSnapshot — keyed toolchain-fault signatures over gate
+// subprocess results, swappable by the hot-reload coordinator. Every gate
+// reads through this same instance so an operator edit to
+// CodeyBox:ToolchainFaults takes effect on the next gate run without a
+// process restart. A new signature for an unseen language is a config-only
+// addition.
+builder.Services.AddSingleton<CodeyBox.Core.ToolchainFaultSnapshot>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new CodeyBox.Core.ToolchainFaultSnapshot(opts.ToolchainFaults);
+});
+builder.Services.AddSingleton<CodeyBox.Core.IToolchainFaultClassifier>(sp =>
+    new CodeyBox.Core.ToolchainFaultClassifier(
+        sp.GetRequiredService<CodeyBox.Core.ToolchainFaultSnapshot>()));
+builder.Services.AddSingleton<CodeyBox.Core.IToolchainFaultRecordStore, CodeyBox.Core.InMemoryToolchainFaultRecordStore>();
+
 // ClaudeThinkingBlockSanitizerConfig — hot-reloadable toggle gating the
 // thinking-block transcript sanitiser + reactive retry path.
 builder.Services.AddSingleton<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>(sp =>
@@ -3442,6 +3458,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
+    toolchainFaultClassifier: sp.GetRequiredService<IToolchainFaultClassifier>(),
+    toolchainFaultRecords: sp.GetRequiredService<IToolchainFaultRecordStore>(),
     dispatchAvailability: sp.GetService<IAgentDispatchAvailability>(),
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
@@ -3847,6 +3865,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
         testFailureAttribution: sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
+        toolchainFaults: sp.GetRequiredService<CodeyBox.Core.ToolchainFaultSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
@@ -5301,6 +5320,20 @@ namespace CodeyBox.Api
         /// </summary>
         public Dictionary<string, AgentNetworkToleranceOptions?> AgentNetworkTolerance { get; set; } =
             AgentNetworkToleranceOptions.DefaultByAgent();
+
+        /// <summary>
+        /// Toolchain-fault signatures over gate subprocess results. Keyed by
+        /// signature name (case-insensitive); each entry declares its match,
+        /// the fault class it denotes, and its disposition (retry, fail, or
+        /// escalate). A new signature for a language the repository has never
+        /// built requires no code change — add an entry here. Edits hot-reload
+        /// via <see cref="Core.ToolchainFaultSnapshot"/> and take effect on the
+        /// next gate run. Platform-agnostic built-ins (signal termination,
+        /// OOM kill, disk exhaustion, .NET runtime crash) always apply even
+        /// when this dictionary is empty.
+        /// </summary>
+        public Dictionary<string, ToolchainFaultSignatureOptions?> ToolchainFaults { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Operator-configured per-agent pauses. Keyed by agent kind value.
