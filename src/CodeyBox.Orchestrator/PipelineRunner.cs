@@ -10081,7 +10081,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentMembership? preferredMember = null,
         string? requireCapability = null)
     {
-        if (_quotaProbesByKind is null || _classRouter is null)
+        if (_quotaProbes is null || _classRouter is null)
             return false;
 
         var effectiveProject = project ?? new Project
@@ -10095,7 +10095,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (preferredMember is not null
             && !IsRouterCachedExhausted(item.Id, preferredMember)
             && !await IsAgentPausedAsync(preferredMember.Agent, ct).ConfigureAwait(false)
-            && _quotaProbesByKind.TryGetValue(preferredMember.Agent, out var preferredProbe))
+            && ResolveQuotaProbe(preferredMember).Probe is { } preferredProbe)
         {
             try
             {
@@ -10135,7 +10135,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (requireCapability is not null
                 && !MemberHasClassCapability(classId, candidate, requireCapability))
                 continue;
-            if (!_quotaProbesByKind.TryGetValue(candidate.Agent, out var probe))
+            if (ResolveQuotaProbe(candidate).Probe is not { } probe)
                 continue;
 
             // A member the router already marked exhausted from a real
@@ -10181,7 +10181,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         CancellationToken ct)
     {
-        if (_quotaProbesByKind is null)
+        if (_quotaProbes is null)
             return false;
 
         var agent = item.Agent;
@@ -10192,33 +10192,36 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var probeSpeaksForPhase = string.Equals(phase, "work", StringComparison.Ordinal)
             || string.Equals(phase, "rework", StringComparison.Ordinal);
         if (probeSpeaksForPhase
-            && agent is { } agentKind && _quotaProbesByKind.TryGetValue(agentKind, out var probe)
-            && !await IsAgentPausedAsync(agentKind, ct).ConfigureAwait(false))
+            && agent is { } agentKind)
         {
             var member = BuildQuotaProbeMember(item, project, agentKind, item.ModelId);
-            // Same staleness rule as the candidate walk below: a member with
-            // a live router-cache exhaustion entry was rejected for real in
-            // this episode — its lagging healthy snapshot must not veto the
-            // park.
-            if (!IsRouterCachedExhausted(item.Id, member))
+            if (ResolveQuotaProbe(member).Probe is { } probe
+                && !await IsAgentPausedAsync(agentKind, ct).ConfigureAwait(false))
             {
-                try
+                // Same staleness rule as the candidate walk below: a member with
+                // a live router-cache exhaustion entry was rejected for real in
+                // this episode — its lagging healthy snapshot must not veto the
+                // park.
+                if (!IsRouterCachedExhausted(item.Id, member))
                 {
-                    var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
-                    var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
-                    if (quota.IsKnown)
+                    try
                     {
-                        var nowUtc = _opts.TimeProvider.GetUtcNow();
-                        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
-                        if (gate.Allow)
+                        var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+                        var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+                        if (quota.IsKnown)
                         {
-                            return true;
+                            var nowUtc = _opts.TimeProvider.GetUtcNow();
+                            var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
+                            if (gate.Allow)
+                            {
+                                return true;
+                            }
                         }
                     }
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _log.LogDebug(ex, "Probe check in TransitionWaitingForQuotaResetAsync failed for agent {Agent}", agentKind.Value);
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _log.LogDebug(ex, "Probe check in TransitionWaitingForQuotaResetAsync failed for agent {Agent}", agentKind.Value);
+                    }
                 }
             }
         }
