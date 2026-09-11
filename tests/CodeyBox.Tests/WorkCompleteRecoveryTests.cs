@@ -387,8 +387,11 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 Title = "wedged work",
                 Prompt = "p",
                 State = WorkItemState.Working,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
-                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                // Frozen past the default ItemStaleTimeout (150m since the
+                // audit-budget ordering change, previously 75m) so the retry
+                // fence treats the worker-held item as stale.
+                StartedAt = DateTimeOffset.UtcNow.AddHours(-3),
+                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-3),
             };
             await factory.Store.CreateAsync(item);
 
@@ -398,7 +401,7 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 WorkerId = "wedged-http-worker",
                 HostName = "host",
                 ProcessId = 4242,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                StartedAt = DateTimeOffset.UtcNow.AddHours(-3),
                 LastHeartbeatAt = DateTimeOffset.UtcNow,
                 CurrentWorkItemId = item.Id.ToString(),
             });
