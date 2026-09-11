@@ -1977,7 +1977,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 detection.Kind,
                 QuotaFailureMessage(
                     detection.Kind,
-                    $"Agent {runner.Kind} reported quota failure during planning: {result.Summary}"),
+                    $"Agent {runner.Kind} reported quota failure during planning",
+                    SanitizedAgentDetail.FromRaw(result.Summary)),
                 detection.ResetAt);
         }
 
@@ -5750,7 +5751,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     throw new TerminalQuotaError(quotaKind,
                         QuotaFailureMessage(
                             quotaKind,
-                            $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}"),
+                            $"Agent {runner.Kind} reported quota failure",
+                            SanitizedAgentDetail.FromRaw(agentResult.Summary)),
                         detection?.ResetAt,
                         providerSurfaceMatch: quotaClassification.ProviderSurfaceMatch);
                 }
@@ -9584,10 +9586,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     private static string RedactAndTruncateAgentDetail(string s)
-    {
-        const int MaxOutputBytes = 4096;
-        return RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(s), MaxOutputBytes);
-    }
+        => SanitizedAgentDetail.FromRaw(s).Value;
 
     private async Task<AgentFailureClassification?> RecordAvailabilityOutcomeAsync(
         IAgentAvailabilityRegistry registry,
@@ -9984,7 +9983,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         throw new TerminalQuotaError(noChangeQuota.Kind,
             QuotaFailureMessage(
                 noChangeQuota.Kind,
-                $"Agent {agent} reported quota failure on clean-exit/no-diff rework from {evidenceSource}: {RedactAndTruncateAgentDetail(stderr ?? stdout ?? string.Empty)}"),
+                $"Agent {agent} reported quota failure on clean-exit/no-diff rework from {evidenceSource}",
+                SanitizedAgentDetail.FromRaw(stderr ?? stdout)),
             noChangeQuota.ResetAt,
             providerSurfaceMatch: evidenceTrust != NoDiffQuotaEvidenceTrust.RequiresQuotaProbe);
     }
@@ -14594,7 +14594,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     quotaDetection.Kind,
                     QuotaFailureMessage(
                         quotaDetection.Kind,
-                        $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}"),
+                        $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}",
+                        SanitizedAgentDetail.FromRaw(run.Result.AgentSummary ?? "agent failed")),
                     quotaDetection.ResetAt,
                     providerSurfaceMatch: auditQuotaClassification.ProviderSurfaceMatch);
             }
@@ -14642,7 +14643,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     terminalQuota!.Kind,
                     QuotaFailureMessage(
                         terminalQuota.Kind,
-                        $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}"),
+                        $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}",
+                        SanitizedAgentDetail.FromRaw(run.Result.AgentTerminalDiagnostic)),
                     terminalQuota.ResetAt,
                     providerSurfaceMatch: true);
             }
@@ -16389,7 +16391,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 detection.Kind,
                 QuotaFailureMessage(
                     detection.Kind,
-                    $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}"),
+                    $"Agent {runner.Kind} reported quota failure after exhausting session resume",
+                    SanitizedAgentDetail.FromRaw(last.Summary)),
                 detection.ResetAt,
                 providerSurfaceMatch: classification.ProviderSurfaceMatch);
         }
@@ -17077,14 +17080,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// own backoff, an exhausted cap needs capacity or a new window — so the
     /// <c>LastError</c> parked on the work item must not conflate them.
     ///
+    /// <para>The agent-controlled tail is accepted only as a
+    /// <see cref="SanitizedAgentDetail"/> (see
+    /// <see cref="SanitizedAgentDetail.FromRaw"/>), never as a raw string, so
+    /// a future call site cannot bypass redaction and truncation by
+    /// interpolating agent output directly. The <paramref name="prefix"/>
+    /// carries only orchestrator-owned text (agent kind, phase, auditor name,
+    /// evidence source).</para>
+    ///
     /// <para>Only the <see cref="QuotaFailureKind.RateLimitExceeded"/> wording
-    /// changes; every other kind returns <paramref name="exhaustedMessage"/>
-    /// byte-identical. The rate-limit rewrite targets the single
+    /// changes; every other kind returns the composed message byte-identical.
+    /// The rate-limit rewrite targets the single
     /// <c>"reported quota failure"</c> marker: messages that do not carry it
     /// are returned unchanged rather than guessed at.</para>
     /// </summary>
-    internal static string QuotaFailureMessage(QuotaFailureKind kind, string exhaustedMessage)
+    internal static string QuotaFailureMessage(QuotaFailureKind kind, string prefix, SanitizedAgentDetail detail)
     {
+        var exhaustedMessage = $"{prefix}: {detail.Value}";
         if (kind != QuotaFailureKind.RateLimitExceeded)
             return exhaustedMessage;
         const string marker = "reported quota failure";
@@ -17652,7 +17664,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         detection.Kind,
                         QuotaFailureMessage(
                             detection.Kind,
-                            $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {classificationResult.Summary}"),
+                            $"Merge agent {chosenMergeRunner.Kind} reported quota failure",
+                            SanitizedAgentDetail.FromRaw(classificationResult.Summary)),
                         detection.ResetAt);
                 }
 
@@ -21290,6 +21303,13 @@ Original merge-phase failure (JSON string, for context only):
         bool quotaEvidenceTrusted = false)
     {
         var ct = CancellationToken.None;
+        // Sink guard: LastError is persisted and API-served, and agent output
+        // is untrusted. Sanitize here as well so any present or future
+        // TerminalQuotaError / AgentClassExhausted message that bypassed the
+        // construction-time helper is still redacted and truncated before it
+        // reaches the store, webhooks, or audit events. Idempotent for
+        // already-sanitized messages.
+        var safeError = SanitizedAgentDetail.FromRaw(error).Value;
         var current = await _store.GetAsync(item.Id, ct) ?? item;
 
         // A park that contradicts a fresh, known-healthy probe reading is
@@ -21314,7 +21334,7 @@ Original merge-phase failure (JSON string, for context only):
         var next = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(
             current.With(
                 WorkItemState.WaitingForQuotaReset,
-                error,
+                safeError,
                 failureKind: "quota",
                 quotaResetAt: effectiveResetAt)) with
         {
@@ -21357,7 +21377,7 @@ Original merge-phase failure (JSON string, for context only):
                 FromModel: item.ModelId,
                 ToAgent: null,
                 ToModel: null,
-                Reason: error),
+                Reason: safeError),
         }, ct);
     }
 

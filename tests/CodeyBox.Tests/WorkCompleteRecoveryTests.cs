@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Http.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -380,6 +381,15 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
         var client = factory.CreateClient();
         try
         {
+            // Freeze the item past the host's effective item-stale window
+            // (plus margin) rather than a fixed age: the shipped
+            // ItemStaleTimeout default moves to satisfy the audit-budget
+            // ordering, and a hardcoded age rots into a non-stale item
+            // (expected Accepted, got Conflict) whenever it lands below it.
+            var staleTimeout = factory.Services
+                .GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue
+                .WorkerProgressWatchdog.ResolveItemStaleTimeout(agent: null);
+            var frozenAt = DateTimeOffset.UtcNow - staleTimeout - TimeSpan.FromMinutes(5);
             var item = new WorkItem
             {
                 Id = WorkItemId.New(),
@@ -387,8 +397,8 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 Title = "wedged work",
                 Prompt = "p",
                 State = WorkItemState.Working,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
-                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                StartedAt = frozenAt,
+                UpdatedAt = frozenAt,
             };
             await factory.Store.CreateAsync(item);
 

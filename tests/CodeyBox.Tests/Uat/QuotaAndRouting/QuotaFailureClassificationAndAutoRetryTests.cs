@@ -386,14 +386,14 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     }
 
     [Theory]
-    [InlineData(QuotaFailureKind.RateLimitExceeded, "Agent copilot reported quota failure: agent exited 1", "Agent copilot rate-limited by provider (transient rate limit; retrying after backoff): agent exited 1")]
-    [InlineData(QuotaFailureKind.LimitReached, "Agent copilot reported quota failure: agent exited 1", "Agent copilot reported quota failure: agent exited 1")]
-    [InlineData(QuotaFailureKind.Unauthorized, "Agent copilot reported quota failure: agent exited 1", "Agent copilot reported quota failure: agent exited 1")]
-    [InlineData(QuotaFailureKind.RateLimitExceeded, "unrelated message without the marker", "unrelated message without the marker")]
+    [InlineData(QuotaFailureKind.RateLimitExceeded, "Agent copilot reported quota failure", "agent exited 1", "Agent copilot rate-limited by provider (transient rate limit; retrying after backoff): agent exited 1")]
+    [InlineData(QuotaFailureKind.LimitReached, "Agent copilot reported quota failure", "agent exited 1", "Agent copilot reported quota failure: agent exited 1")]
+    [InlineData(QuotaFailureKind.Unauthorized, "Agent copilot reported quota failure", "agent exited 1", "Agent copilot reported quota failure: agent exited 1")]
+    [InlineData(QuotaFailureKind.RateLimitExceeded, "unrelated message without the marker", "detail", "unrelated message without the marker: detail")]
     public void QuotaFailureMessage_DistinguishesRateLimitFromExhaustion(
-        QuotaFailureKind kind, string exhaustedMessage, string expected)
+        QuotaFailureKind kind, string prefix, string rawDetail, string expected)
     {
-        Assert.Equal(expected, PipelineRunner.QuotaFailureMessage(kind, exhaustedMessage));
+        Assert.Equal(expected, PipelineRunner.QuotaFailureMessage(kind, prefix, SanitizedAgentDetail.FromRaw(rawDetail)));
     }
 
     /// <summary>
