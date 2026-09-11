@@ -1108,7 +1108,8 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClaudeAgentRunner(
 // Copilot: subscription mode by default; setting CodeyBox:Copilot:Provider:BaseUrl switches inference
 // to an OpenAI-compatible endpoint (BYOK). The credential for that endpoint arrives through the
 // credential chain as COPILOT_PROVIDER_API_KEY, never from this configuration section.
-builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner
+builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>())
 {
     Options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Copilot,
 });
