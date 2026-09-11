@@ -68,26 +68,28 @@ public sealed class HostShutdownTimeoutWiringTests
         // SandboxTeardownMode is hot-reloadable at shutdown time, while
         // HostOptions.ShutdownTimeout is captured at startup. A suspend-capable
         // provider therefore keeps the conservative suspend ceiling even when
-        // startup config says Stop.
+        // startup config says Stop. 32 workers default to 64 sandbox slots:
+        // eight sequential 30-min waves at the 8-suspend batch cap, plus grace.
         var timeout = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Stop, maxWorkers: 32, graceSeconds: 45),
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromMinutes(180) + TimeSpan.FromSeconds(45), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(240) + TimeSpan.FromSeconds(45), timeout);
     }
 
     [Fact]
     public void DisposeMode_StillReservesSuspendCeiling_ForSuspendingProvider()
     {
         // Dispose itself does not write RAM snapshots, but a hot reload to
-        // Suspend before graceful shutdown would need the RAM-scaled budget.
+        // Suspend before graceful shutdown would need the RAM-scaled budget:
+        // 32 workers default to 64 slots, i.e. eight 30-min waves, plus grace.
         var timeout = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Dispose, maxWorkers: 32, graceSeconds: 45),
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromMinutes(180) + TimeSpan.FromSeconds(45), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(240) + TimeSpan.FromSeconds(45), timeout);
     }
 
     [Fact]
@@ -107,8 +109,9 @@ public sealed class HostShutdownTimeoutWiringTests
     [Fact]
     public void SuspendingProvider_ScalesByWaveCount_FromSandboxBudget()
     {
-        // 16 workers default to 24 sandbox slots. With an 8-suspend batch cap,
-        // that is three sequential waves → 90 min,
+        // 16 workers default to 32 sandbox slots (2 per worker, matching the
+        // startup validation bound). With an 8-suspend batch cap,
+        // that is four sequential waves → 120 min,
         // plus the 60s drain grace. This is the exact undersizing the wave-scaling
         // fix targets: a single-wave ceiling would SIGKILL the host before wave 2
         // finished its snapshot.
@@ -117,7 +120,7 @@ public sealed class HostShutdownTimeoutWiringTests
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromMinutes(90) + TimeSpan.FromSeconds(60), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(120) + TimeSpan.FromSeconds(60), timeout);
     }
 
     [Fact]
@@ -125,12 +128,12 @@ public sealed class HostShutdownTimeoutWiringTests
     {
         // The ceiling must size off the SAME sandbox count the admission gate
         // uses. Legacy CodeyBox:Concurrency still feeds the derived default when
-        // WorkerPool is unset (16 workers → 24 sandboxes → 3 waves → 90 min + 60s grace)...
+        // WorkerPool is unset (16 workers → 32 sandboxes → 4 waves → 120 min + 60s grace)...
         var legacyOnly = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Suspend, concurrency: 16, maxWorkers: null),
             providerSupportsSuspend: true,
             NullLogger.Instance);
-        Assert.Equal(TimeSpan.FromMinutes(90) + TimeSpan.FromSeconds(60), legacyOnly);
+        Assert.Equal(TimeSpan.FromMinutes(120) + TimeSpan.FromSeconds(60), legacyOnly);
 
         // ...and WorkerPool:MaxConcurrentWorkers wins when both are set, so a stale
         // legacy value cannot inflate (or here, would not shrink) the ceiling. 1
@@ -146,6 +149,11 @@ public sealed class HostShutdownTimeoutWiringTests
     [Fact]
     public void ExplicitMaxConcurrentSandboxes_ControlsSuspendReserve()
     {
+        // An explicit sandbox count sizes the reserve directly (16 slots at an
+        // 8-suspend batch cap → two 30-min waves + 60s grace). The ceiling
+        // computation deliberately skips the startup range rejection so any
+        // stored config still yields a reserve; startup itself fails fast via
+        // OrchestratorOptionsFactory.Build.
         var timeout = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Suspend, maxWorkers: 16, maxSandboxes: 16),
             providerSupportsSuspend: true,

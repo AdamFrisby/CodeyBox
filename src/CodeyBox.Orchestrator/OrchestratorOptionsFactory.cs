@@ -24,40 +24,12 @@ public static class OrchestratorOptionsFactory
     /// <exception cref="InvalidOperationException">Thrown when any option value is out of range.</exception>
     public static OrchestratorOptions Build(int? legacyConcurrency, WorkerPoolOptions workerPool, ILogger log)
     {
+        var (maxConcurrent, maxConcurrentSandboxes) = ResolveSandboxCounts(legacyConcurrency, workerPool, log);
         var wp = workerPool;
-        int maxConcurrent;
-
-        if (wp.MaxConcurrentWorkers is { } workerPoolMax)
-        {
-            maxConcurrent = workerPoolMax;
-            if (legacyConcurrency is { } legacyValue)
-            {
-                log.LogWarning(
-                    "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
-                    "Deprecated value ({LegacyValue}) is set but overridden by " +
-                    "CodeyBox:WorkerPool:MaxConcurrentWorkers={WorkerPoolMax}; remove the deprecated key.",
-                    legacyValue, workerPoolMax);
-            }
-        }
-        else if (legacyConcurrency is { } legacyValue)
-        {
-            log.LogWarning(
-                "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
-                "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
-                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
-                legacyValue);
-            maxConcurrent = legacyValue;
-        }
-        else
-        {
-            maxConcurrent = 1;
-        }
 
         if (maxConcurrent < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
-        var maxConcurrentSandboxes = wp.MaxConcurrentSandboxes
-            ?? DeriveDefaultMaxConcurrentSandboxes(maxConcurrent);
         if (maxConcurrentSandboxes < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConcurrentSandboxes must be >= 1");
@@ -113,6 +85,53 @@ public static class OrchestratorOptionsFactory
             NoProgressBackoffMax = wp.NoProgressBackoffMax,
             MaxNoProgressRedispatches = wp.MaxNoProgressRedispatches,
         };
+    }
+
+    /// <summary>
+    /// Resolves the (workers, sandboxes) counts with the same
+    /// legacy-<c>CodeyBox:Concurrency</c> precedence and defaulting that
+    /// <see cref="Build(int?, WorkerPoolOptions, ILogger)"/> validates, but
+    /// without the range rejection. The host-shutdown ceiling
+    /// (<c>Program.ComputeHostShutdownTimeout</c>) sizes off this so a stored
+    /// config that startup would reject still yields a computable ceiling;
+    /// the startup DI path keeps calling <see cref="Build(int?, WorkerPoolOptions, ILogger)"/>
+    /// and fails fast there.
+    /// </summary>
+    public static (int MaxConcurrentWorkers, int MaxConcurrentSandboxes) ResolveSandboxCounts(
+        int? legacyConcurrency, WorkerPoolOptions workerPool, ILogger log)
+    {
+        var wp = workerPool;
+        int maxConcurrent;
+
+        if (wp.MaxConcurrentWorkers is { } workerPoolMax)
+        {
+            maxConcurrent = workerPoolMax;
+            if (legacyConcurrency is { } legacyValue)
+            {
+                log.LogWarning(
+                    "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
+                    "Deprecated value ({LegacyValue}) is set but overridden by " +
+                    "CodeyBox:WorkerPool:MaxConcurrentWorkers={WorkerPoolMax}; remove the deprecated key.",
+                    legacyValue, workerPoolMax);
+            }
+        }
+        else if (legacyConcurrency is { } legacyValue)
+        {
+            log.LogWarning(
+                "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
+                "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
+                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
+                legacyValue);
+            maxConcurrent = legacyValue;
+        }
+        else
+        {
+            maxConcurrent = 1;
+        }
+
+        var maxConcurrentSandboxes = wp.MaxConcurrentSandboxes
+            ?? (maxConcurrent >= 1 ? DeriveDefaultMaxConcurrentSandboxes(maxConcurrent) : 1);
+        return (maxConcurrent, maxConcurrentSandboxes);
     }
 
     /// <summary>
