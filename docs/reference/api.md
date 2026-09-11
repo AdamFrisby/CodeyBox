@@ -1210,14 +1210,58 @@ Response: `200 OK` with a JSON array:
 
 | Field | Description |
 |---|---|
-| `workerId` | GUID unique to this process start |
+| `workerId` | GUID unique to this process start (remote executor rows use `executor:{hostId}`, stable across restarts) |
 | `hostName` | Hostname of the machine running the worker |
 | `processId` | OS process ID |
 | `startedAt` | When this worker slot registered |
 | `lastHeartbeatAt` | When the heartbeat last fired (updated every `HeartbeatInterval`, default 15 s) |
 | `currentWorkItemId` | UUID of the work item being processed, or `null` if none |
+| `executorHostId` | Stable executor host id, or `null` for in-process worker rows |
+| `maxConcurrentSandboxes` | Declared host-local sandbox capacity (`null` = uncapped / non-executor row) |
+| `executorNetworkProfiles` | Declared network profiles the executor accepts (empty = all; `null` for non-executor rows) |
+| `executorCredentials` | Names of the agent credential sets the executor holds (`null` for non-executor rows) |
+| `cordoned` | Draining flag: registers and heartbeats but is never selected for new placements |
+| `healthy` | Operator health gate: `false` routes new placements away without removing the registration |
 
 An empty array means no workers are currently registered. A row with a stale `lastHeartbeatAt` means the worker process has crashed and the dead-worker reaper will recover it on the next sweep (or has already done so and the row wasn't cleaned up). See [`recovery.md`](../operating/recovery.md) for the full reaper design.
+
+### `POST /executors/register`
+
+Register (or re-register) a remote executor host. Executors connect outbound to the orchestrator and never expose an inbound port, so they can sit behind NAT or a host firewall. Registration is the executor's assertion of what it can run; the orchestrator decides placement. The row is upserted into the worker registry keyed by the stable `executor:{hostId}` id, and liveness reuses the existing dead-worker reaper path — there is no second liveness scheme.
+
+Request (`application/json`):
+
+```json
+{
+  "hostId": "exec-1",
+  "maxConcurrentSandboxes": 2,
+  "allowedNetworkProfiles": ["restricted"],
+  "declaredCredentials": ["claude"],
+  "cordoned": false,
+  "healthy": true,
+  "processId": 12345
+}
+```
+
+| Field | Description |
+|---|---|
+| `hostId` | **Required.** Stable host id, 1–128 chars, no control characters |
+| `maxConcurrentSandboxes` | Host-local sandbox capacity, 0–100000. `0` registers the executor but leaves it never selected; omit for uncapped |
+| `allowedNetworkProfiles` | At most 64 entries; empty (or `"*"`) accepts every profile |
+| `declaredCredentials` | At most 64 opaque credential-set names, matched by exact equality |
+| `cordoned` | Draining flag: registers and heartbeats but is never selected for new placements |
+| `healthy` | Health gate, default `true` |
+| `processId` | Executor OS process id, informational only |
+
+Response: `200 OK` with `{ "workerId": "executor:exec-1", "hostId": "exec-1", "heartbeatIntervalSeconds": 15 }`. `400` on any validation failure.
+
+### `POST /executors/{hostId}/heartbeat`
+
+Heartbeat a registered executor into the worker registry. Request body is `{ "currentWorkItemId": "<uuid>" }` (or empty when idle). Response: `200 OK`. `404` when no executor is registered for the host id. Ceasing heartbeats lets the row go stale, at which point the existing dead-worker reaper reclaims it exactly like a dead in-process worker.
+
+### `POST /executors/{hostId}/deregister`
+
+Remove an executor registration (clean shutdown). Response: `200 OK` with `{ "hostId": "exec-1" }`.
 
 ### `GET /sandboxes/leaked`
 

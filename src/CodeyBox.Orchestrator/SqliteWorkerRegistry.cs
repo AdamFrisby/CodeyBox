@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
+using System.Text.Json;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -78,11 +79,18 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     process_id           INTEGER NOT NULL,
                     started_at           TEXT NOT NULL,
                     last_heartbeat_at    TEXT NOT NULL,
-                    current_work_item_id TEXT
+                    current_work_item_id TEXT,
+                    executor_host_id     TEXT,
+                    max_concurrent_sandboxes INTEGER,
+                    executor_network_profiles TEXT,
+                    executor_credentials TEXT,
+                    cordoned             INTEGER NOT NULL DEFAULT 0,
+                    healthy              INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS idx_worker_heartbeat ON worker_registry(last_heartbeat_at);
                 """;
             cmd.ExecuteNonQuery();
+            EnsureExecutorColumns(_conn);
             initialized = true;
         }
         finally
@@ -106,14 +114,20 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id)
-                VALUES ($id, $host, $pid, $started, $hb, $item)
+                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id, executor_host_id, max_concurrent_sandboxes, executor_network_profiles, executor_credentials, cordoned, healthy)
+                VALUES ($id, $host, $pid, $started, $hb, $item, $exhost, $cap, $profiles, $creds, $cordoned, $healthy)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     host_name = excluded.host_name,
                     process_id = excluded.process_id,
                     started_at = excluded.started_at,
                     last_heartbeat_at = excluded.last_heartbeat_at,
-                    current_work_item_id = excluded.current_work_item_id;
+                    current_work_item_id = excluded.current_work_item_id,
+                    executor_host_id = excluded.executor_host_id,
+                    max_concurrent_sandboxes = excluded.max_concurrent_sandboxes,
+                    executor_network_profiles = excluded.executor_network_profiles,
+                    executor_credentials = excluded.executor_credentials,
+                    cordoned = excluded.cordoned,
+                    healthy = excluded.healthy;
                 """;
             Bind(cmd, reg);
             cmd.ExecuteNonQuery();
@@ -382,6 +396,12 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         cmd.Parameters.AddWithValue("$started", reg.StartedAt.ToString("O"));
         cmd.Parameters.AddWithValue("$hb", reg.LastHeartbeatAt.ToString("O"));
         cmd.Parameters.AddWithValue("$item", (object?)reg.CurrentWorkItemId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$exhost", (object?)reg.ExecutorHostId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$cap", (object?)reg.MaxConcurrentSandboxes ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$profiles", (object?)SerializeStringList(reg.ExecutorNetworkProfiles) ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$creds", (object?)SerializeStringList(reg.ExecutorCredentials) ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$cordoned", reg.Cordoned ? 1 : 0);
+        cmd.Parameters.AddWithValue("$healthy", reg.Healthy ? 1 : 0);
     }
 
     private static WorkerRegistration Read(SqliteDataReader r) => new()
@@ -392,7 +412,67 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         StartedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("started_at")), System.Globalization.CultureInfo.InvariantCulture),
         LastHeartbeatAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("last_heartbeat_at")), System.Globalization.CultureInfo.InvariantCulture),
         CurrentWorkItemId = r.IsDBNull(r.GetOrdinal("current_work_item_id")) ? null : r.GetString(r.GetOrdinal("current_work_item_id")),
+        ExecutorHostId = r.IsDBNull(r.GetOrdinal("executor_host_id")) ? null : r.GetString(r.GetOrdinal("executor_host_id")),
+        MaxConcurrentSandboxes = r.IsDBNull(r.GetOrdinal("max_concurrent_sandboxes")) ? null : r.GetInt32(r.GetOrdinal("max_concurrent_sandboxes")),
+        ExecutorNetworkProfiles = r.IsDBNull(r.GetOrdinal("executor_network_profiles")) ? null : DeserializeStringList(r.GetString(r.GetOrdinal("executor_network_profiles"))),
+        ExecutorCredentials = r.IsDBNull(r.GetOrdinal("executor_credentials")) ? null : DeserializeStringList(r.GetString(r.GetOrdinal("executor_credentials"))),
+        Cordoned = r.GetInt32(r.GetOrdinal("cordoned")) != 0,
+        Healthy = r.GetInt32(r.GetOrdinal("healthy")) != 0,
     };
+
+    /// <summary>
+    /// Adds the executor-attribute columns to a <c>worker_registry</c> table
+    /// created by an older build. Fresh databases already carry the columns
+    /// via <c>CREATE TABLE</c>; this keeps pre-existing state files loading
+    /// instead of failing on the wider reads. Column definitions are source
+    /// literals, never caller input.
+    /// </summary>
+    private static void EnsureExecutorColumns(SqliteConnection conn)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA table_info(worker_registry);";
+            using var reader = pragma.ExecuteReader();
+            while (reader.Read())
+                existing.Add(reader.GetString(1));
+        }
+
+        foreach (var (column, definition) in ExecutorColumnDefinitions)
+        {
+            if (existing.Contains(column))
+                continue;
+            using var alter = conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- both fragments come from the source-literal ExecutorColumnDefinitions table, not caller input
+            alter.CommandText = $"ALTER TABLE worker_registry ADD COLUMN {definition};";
+            alter.ExecuteNonQuery();
+        }
+    }
+
+    private static readonly (string Column, string Definition)[] ExecutorColumnDefinitions =
+    [
+        ("executor_host_id", "executor_host_id TEXT"),
+        ("max_concurrent_sandboxes", "max_concurrent_sandboxes INTEGER"),
+        ("executor_network_profiles", "executor_network_profiles TEXT"),
+        ("executor_credentials", "executor_credentials TEXT"),
+        ("cordoned", "cordoned INTEGER NOT NULL DEFAULT 0"),
+        ("healthy", "healthy INTEGER NOT NULL DEFAULT 1"),
+    ];
+
+    private static string? SerializeStringList(IReadOnlyList<string>? values) =>
+        values is null ? null : JsonSerializer.Serialize(values);
+
+    private static IReadOnlyList<string>? DeserializeStringList(string json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<List<string>>(json);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 
     private static bool IsTransientHeartbeatStorageFailure(Exception ex) =>
         ex is SqliteWriteGateAcquisitionTimeoutException
