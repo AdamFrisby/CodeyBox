@@ -620,6 +620,107 @@ internal static class IncusBaselineProvisioning
         }
     }
 
+    /// <summary>
+    /// Computes the content fingerprint of a package-cache seed for the
+    /// shared host archive cache: SHA-256 over the resolved source path, the
+    /// applicable byte/entry limits, and the sorted source metadata (relative
+    /// paths, entry kinds, file lengths, write timestamps, symlink targets).
+    /// Reads metadata only, so it is cheap relative to archiving the content.
+    /// Symlinks are recorded, never followed, and the same traversal bounds
+    /// as <see cref="CreatePackageArchive"/> apply, so anything archivable is
+    /// fingerprintable and anything rejected there is rejected here too.
+    /// </summary>
+    internal static string ComputePackageSeedFingerprint(
+        IncusSandboxOptions options,
+        BaselinePackageCacheSeed seed,
+        Func<string, string?> environmentVariableReader,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(seed);
+        ArgumentNullException.ThrowIfNull(environmentVariableReader);
+        var perSeedLimit = ResolvePackageSeedByteLimit(options, seed);
+        var sourcePath = ResolveHostSourcePath(seed.HostSourcePath, environmentVariableReader);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        void AppendLine(string value)
+        {
+            hash.AppendData(Encoding.UTF8.GetBytes(value));
+            hash.AppendData([(byte)'\n']);
+        }
+        AppendLine($"source:{sourcePath}");
+        AppendLine($"perSeedLimit:{perSeedLimit}");
+        AppendLine($"maxEntries:{options.MaxPackageCacheSeedEntries}");
+        var entries = new List<string>();
+        if (Directory.Exists(sourcePath))
+        {
+            using var directory = IncusSafeFile.PinDirectoryNoFollow(sourcePath);
+            CollectSeedFingerprintEntries(
+                directory,
+                prefix: string.Empty,
+                depth: 0,
+                entries,
+                options.MaxPackageCacheSeedEntries,
+                ct);
+        }
+        else
+        {
+            var name = Path.GetFileName(sourcePath);
+            using var source = OpenRegularFileNoFollow(sourcePath);
+            entries.Add($"f|{name}|{source.Length}|{File.GetLastWriteTimeUtc(source.SafeFileHandle!).Ticks}");
+        }
+        entries.Sort(StringComparer.Ordinal);
+        foreach (var entry in entries)
+            AppendLine(entry);
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+    }
+
+    private static void CollectSeedFingerprintEntries(
+        IncusPinnedDirectory directory,
+        string prefix,
+        int depth,
+        List<string> entries,
+        int maximumEntries,
+        CancellationToken ct)
+    {
+        if (depth > MaximumDirectoryDepth)
+            throw new IOException("Package cache seed exceeds the 512-directory-depth safety bound.");
+        foreach (var name in IncusSafeFile.EnumerateChildNames(directory))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (entries.Count >= maximumEntries)
+                throw new IOException("Package cache seed exceeds the configured entry bound.");
+            var relative = prefix.Length == 0 ? name : $"{prefix}/{name}";
+            var metadata = IncusSafeFile.InspectChildNoFollow(directory, name);
+            switch (metadata.Kind)
+            {
+                case IncusDirectoryEntryKind.Directory:
+                    entries.Add($"d|{relative}");
+                    using (var child = IncusSafeFile.OpenChildDirectoryNoFollow(directory, name))
+                    {
+                        CollectSeedFingerprintEntries(child, relative, depth + 1, entries, maximumEntries, ct);
+                    }
+                    break;
+                case IncusDirectoryEntryKind.RegularFile:
+                    using (var source = IncusSafeFile.OpenChildFileReadNoFollow(directory, name))
+                    {
+                        entries.Add($"f|{relative}|{source.Length}|{File.GetLastWriteTimeUtc(source.SafeFileHandle!).Ticks}");
+                    }
+                    break;
+                case IncusDirectoryEntryKind.SymbolicLink:
+                    var target = IncusSafeFile.ReadChildSymbolicLinkNoFollow(directory, name);
+                    _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+                        target,
+                        MaximumLinkTargetUtf8Bytes,
+                        nameof(target),
+                        "Package cache symbolic-link target");
+                    entries.Add($"l|{relative}|{target}");
+                    break;
+                default:
+                    throw new IOException("Package cache seeds reject sockets, devices, FIFOs, and other special files.");
+            }
+        }
+    }
+
     private static void WriteDirectoryChildren(
         TarWriter writer,
         IncusPinnedDirectory directory,

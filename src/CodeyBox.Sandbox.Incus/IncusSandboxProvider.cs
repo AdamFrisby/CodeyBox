@@ -92,6 +92,7 @@ public sealed class IncusSandboxProvider :
     private readonly SemaphoreSlim _hostPreflightLock = new(1, 1);
     private readonly SemaphoreSlim _hostProvisioningInputGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _baselineLocks = new(StringComparer.Ordinal);
+    private readonly IncusSharedPackageArchiveCache _sharedPackageArchives = new();
     // Boot gate: staggers concurrent VM boots (incus start + guest-agent wait)
     // so a boot storm does not starve incusd/host and blow the readiness window.
     // Hot-reloadable: the semaphore is recreated when MaxConcurrentBoots changes.
@@ -180,6 +181,33 @@ public sealed class IncusSandboxProvider :
         spec = SandboxConventions.WithTimingEnvironment(spec);
         IncusSandbox.ValidateEnvironment(spec.Environment, nameof(spec));
         var options = ReadOptions();
+        // Decide the provisioning path before fallback enrichment: the
+        // decision depends only on image/profile/flavor inputs, which the
+        // read-only cache mounts and environment entry never change.
+        var provisioningPath = IncusProvisioningDecision.Decide(options, spec, baselineExists: true);
+        FullLaunchFallbackPlan? launchFallbackPlan = null;
+        IReadOnlyList<string> unmountedFallbackPaths = [];
+        if (provisioningPath == IncusProvisioningPath.FullLaunch)
+        {
+            launchFallbackPlan = IncusNuGetFallback.PlanFullLaunch(
+                options,
+                ResolveStagingRootPath(options),
+                _environmentVariableReader);
+            foreach (var warning in launchFallbackPlan.Warnings)
+                _log.LogWarning("Incus NuGet fallback: {Warning}", warning);
+            spec = IncusNuGetFallback.ApplyToSpec(
+                spec,
+                launchFallbackPlan.FallbackMounts,
+                launchFallbackPlan.FallbackGuestPaths);
+        }
+        else if (IncusNuGetFallback.IsSharingEnabled(options))
+        {
+            // Baseline clones inherit baked fallback content with the image,
+            // so they need the environment entry but no host mounts.
+            var guestPaths = IncusNuGetFallback.PlanGuestPaths(options);
+            unmountedFallbackPaths = guestPaths;
+            spec = IncusNuGetFallback.ApplyToSpec(spec, [], guestPaths);
+        }
         IncusHostIdentity.ValidateHostMountIdentity(options, spec.Mounts);
         ValidateProvisioningMountSeparation(options, spec.Mounts);
         await EnsureHostPreflightAsync(options, ct).ConfigureAwait(false);
@@ -222,8 +250,7 @@ public sealed class IncusSandboxProvider :
                 spec.Mounts,
                 spec.Limits.DiskBytes ?? SandboxResourceLimits.Default.DiskBytes ?? options.BaselineDiskBytes,
                 ct);
-            var canUseBaseline = IncusProvisioningDecision.Decide(options, spec, baselineExists: true)
-                == IncusProvisioningPath.CowCopy;
+            var canUseBaseline = provisioningPath == IncusProvisioningPath.CowCopy;
             if (spec.BaselineImageRef is not null && !canUseBaseline)
                 throw new InvalidOperationException("A pinned Incus baseline cannot be used with a custom image or profileless sandbox.");
 
@@ -323,16 +350,20 @@ public sealed class IncusSandboxProvider :
             if (!canUseBaseline)
             {
                 await RunExtraRuncmdAsync(options, name, ct).ConfigureAwait(false);
+                var launchSteps = launchFallbackPlan?.Steps
+                    ?? throw new InvalidOperationException("A full-launch Incus VM requires a fallback provisioning plan.");
                 await RunProvisioningWithPrivateWorkspaceAsync(
                     options,
                     name,
                     expectedExecutableContentSha256: null,
+                    launchSteps,
                     mountGuestPaths: requestedMountPaths,
                     ct)
                     .ConfigureAwait(false);
             }
             await ApplyGuestLocalMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
             await WaitForMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
+            await EnsureNuGetFallbackDirectoriesAsync(options, name, unmountedFallbackPaths, ct).ConfigureAwait(false);
             await CreateGuestLinksAsync(options, name, mountPlan.GuestLinks, ct).ConfigureAwait(false);
             foreach (var executableLink in IncusRecoveryAuthorization.SnapshotExecutableLinks(options))
             {
@@ -1157,6 +1188,7 @@ public sealed class IncusSandboxProvider :
                     options,
                     candidateName,
                     executableFingerprints,
+                    IncusNuGetFallback.PlanBakeSteps(options),
                     mountGuestPaths: [],
                     ct).ConfigureAwait(false);
                 // A copied VM receives a fresh cloud-init instance ID. Replacing user-data
@@ -1646,12 +1678,13 @@ public sealed class IncusSandboxProvider :
         IncusSandboxOptions options,
         string name,
         IReadOnlyList<string>? expectedExecutableContentSha256,
+        IReadOnlyList<SeedProvisioningStep> seedSteps,
         IReadOnlyList<string> mountGuestPaths,
         CancellationToken ct)
     {
         if (options.ExecutableProvisions.Count == 0
             && options.BaselineVerificationCommands.Count == 0
-            && options.PackageCacheSeeds.Count == 0)
+            && seedSteps.All(static step => step.Mode is NuGetSeedProvisioning.MountedShare or NuGetSeedProvisioning.SkippedMissing))
         {
             return;
         }
@@ -1694,6 +1727,7 @@ public sealed class IncusSandboxProvider :
                 options,
                 name,
                 workspace,
+                seedSteps,
                 mountGuestPaths,
                 provisioningCt).ConfigureAwait(false);
         }
@@ -1742,6 +1776,7 @@ public sealed class IncusSandboxProvider :
         IncusSandboxOptions options,
         string name,
         IncusProvisioningWorkspace workspace,
+        IReadOnlyList<SeedProvisioningStep> seedSteps,
         IReadOnlyList<string> mountGuestPaths,
         CancellationToken ct)
     {
@@ -1750,7 +1785,9 @@ public sealed class IncusSandboxProvider :
             name,
             mountGuestPaths,
             ct).ConfigureAwait(false);
-        var needsGuestStage = workspace.Executables.Count > 0 || options.PackageCacheSeeds.Count > 0;
+        var stagingRoot = ResolveStagingRoot(options);
+        var needsGuestStage = workspace.Executables.Count > 0
+            || seedSteps.Any(static step => step.Mode is NuGetSeedProvisioning.CopyToVmDest or NuGetSeedProvisioning.CopyToFallback);
         var guestStageRoot = $"{IncusCloudInit.ControlDirectory}/provision-{NextGuid("guest provisioning directory"):N}";
         var guestStageCreated = false;
         Exception? primaryFailure = null;
@@ -1769,7 +1806,7 @@ public sealed class IncusSandboxProvider :
 
             await ProvisionExecutablesAsync(options, name, workspace, guestStageRoot, ct).ConfigureAwait(false);
             await VerifyProvisioningCommandsAsync(options, name, ct).ConfigureAwait(false);
-            await SeedPackageCachesAsync(options, name, workspace, guestStageRoot, ct).ConfigureAwait(false);
+            await SeedPackageCachesAsync(options, name, stagingRoot, seedSteps, guestStageRoot, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -1910,36 +1947,42 @@ public sealed class IncusSandboxProvider :
     private async Task SeedPackageCachesAsync(
         IncusSandboxOptions options,
         string name,
-        IncusProvisioningWorkspace workspace,
+        string stagingRoot,
+        IReadOnlyList<SeedProvisioningStep> seedSteps,
         string guestStageRoot,
         CancellationToken ct)
     {
         var aggregateBytes = 0L;
-        for (var i = 0; i < options.PackageCacheSeeds.Count; i++)
+        foreach (var step in seedSteps)
         {
             ct.ThrowIfCancellationRequested();
-            var seed = options.PackageCacheSeeds[i];
-            EnsureProvisioningDestinationAllowed(seed.VmDestPath);
-            string archivePath;
-            await _hostProvisioningInputGate.WaitAsync(ct).ConfigureAwait(false);
-            try
+            if (step.Mode is NuGetSeedProvisioning.MountedShare or NuGetSeedProvisioning.SkippedMissing)
+                continue;
+            if (step.Mode is not (NuGetSeedProvisioning.CopyToVmDest or NuGetSeedProvisioning.CopyToFallback))
             {
-                archivePath = workspace.CreatePackageArchive(
-                    options,
-                    seed,
-                    i,
-                    _environmentVariableReader,
-                    ref aggregateBytes,
-                    ct);
+                throw new InvalidOperationException($"Unknown NuGet seed provisioning mode '{step.Mode}'.");
             }
-            finally
+            var seed = step.Seed;
+            var destination = step.EffectiveVmDestPath ?? seed.VmDestPath;
+            EnsureProvisioningDestinationAllowed(destination);
+            var archivePath = await ObtainCachedPackageArchiveAsync(
+                options,
+                stagingRoot,
+                step,
+                ct).ConfigureAwait(false);
+            // The archive transfer still moves these bytes into this VM, so
+            // the per-operation aggregate cap is accounted here even when the
+            // host-side build was served from the shared cache.
+            aggregateBytes = checked(aggregateBytes + new FileInfo(archivePath).Length);
+            if (aggregateBytes > options.MaxAggregatePackageCacheSeedBytes)
             {
-                _hostProvisioningInputGate.Release();
+                throw new IOException(
+                    "Incus package-cache seeding exceeds the configured aggregate byte limit.");
             }
-            var guestArchivePath = $"{guestStageRoot}/package-cache-{i:D3}.tar";
+            var guestArchivePath = $"{guestStageRoot}/package-cache-{step.Index:D3}.tar";
             _log.LogInformation(
                 "Seeding Incus VM package cache at {GuestDestination}",
-                seed.VmDestPath);
+                destination);
             await _cli.RunCheckedAsync(
                 "push staged package cache",
                 options,
@@ -1950,7 +1993,7 @@ public sealed class IncusSandboxProvider :
             await PrepareGuestDirectoryAsync(
                 options,
                 name,
-                seed.VmDestPath,
+                destination,
                 "prepare package cache destination",
                 ct).ConfigureAwait(false);
             await RunRootCommandAsync(
@@ -1961,7 +2004,7 @@ public sealed class IncusSandboxProvider :
                     "tar",
                     "--extract",
                     "--file", guestArchivePath,
-                    "--directory", seed.VmDestPath,
+                    "--directory", destination,
                     "--no-same-owner",
                     "--no-same-permissions",
                 ],
@@ -1976,7 +2019,7 @@ public sealed class IncusSandboxProvider :
                     "-R",
                     $"{options.GuestUserId.ToString(CultureInfo.InvariantCulture)}:{options.GuestGroupId.ToString(CultureInfo.InvariantCulture)}",
                     "--",
-                    seed.VmDestPath,
+                    destination,
                 ],
                 ct,
                 options.ImageProvisioningTimeout).ConfigureAwait(false);
@@ -1987,8 +2030,10 @@ public sealed class IncusSandboxProvider :
             // packages leaf alone leaves NuGet unable to create
             // $HOME/.nuget/NuGet. Fix the parent directory inode (not -R —
             // packages was already reassigned) when the seed lands there.
+            // (Fallback destinations live outside the guest home, so this
+            // branch never fires for them.)
             var nugetHome = NuGetPackageCacheGuestPaths.TryGetNuGetHomeDirectory(
-                seed.VmDestPath,
+                destination,
                 options.GuestHome);
             if (nugetHome is not null)
             {
@@ -2008,6 +2053,34 @@ public sealed class IncusSandboxProvider :
         }
     }
 
+    private async Task<string> ObtainCachedPackageArchiveAsync(
+        IncusSandboxOptions options,
+        string stagingRoot,
+        SeedProvisioningStep step,
+        CancellationToken ct)
+    {
+        // Serialize host-side archive builds with the provisioning input
+        // gate so a burst of sandboxes performs at most one heavy seed read
+        // at a time; the store's own per-key gate makes concurrent ensures
+        // for the same seed collapse onto a single populate.
+        await _hostProvisioningInputGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await _sharedPackageArchives.ObtainAsync(
+                options,
+                stagingRoot,
+                step.Seed,
+                step.Index,
+                _environmentVariableReader,
+                failure => _log.LogWarning("Incus shared package archive eviction: {Failure}", failure),
+                ct: ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _hostProvisioningInputGate.Release();
+        }
+    }
+
     private async Task RunRootCommandAsync(
         IncusSandboxOptions options,
         string name,
@@ -2023,6 +2096,42 @@ public sealed class IncusSandboxProvider :
             timeout ?? options.OperationTimeout,
             ct,
             heavyOperation: false).ConfigureAwait(false);
+
+    /// <summary>
+    /// Ensures fallback folders that have no host mount in this sandbox
+    /// exist as guest-owned directories. Those come from the baked image on
+    /// the clone path, so this is normally a no-op; it only materializes an
+    /// empty, correctly-owned folder when the image predates fallback
+    /// sharing (for example a pinned baseline baked by an older version).
+    /// An empty fallback folder is always safe: restore simply fetches every
+    /// package from the network.
+    /// </summary>
+    private async Task EnsureNuGetFallbackDirectoriesAsync(
+        IncusSandboxOptions options,
+        string name,
+        IReadOnlyList<string> fallbackGuestPaths,
+        CancellationToken ct)
+    {
+        foreach (var fallbackPath in fallbackGuestPaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            IncusInputValidation.ValidateAbsoluteGuestPath(fallbackPath, nameof(fallbackGuestPaths));
+            await RunRootCommandAsync(
+                options,
+                name,
+                "ensure NuGet fallback directory",
+                [
+                    "install",
+                    "-d",
+                    "-m", "0755",
+                    "-o", options.GuestUserId.ToString(CultureInfo.InvariantCulture),
+                    "-g", options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
+                    "--",
+                    fallbackPath,
+                ],
+                ct).ConfigureAwait(false);
+        }
+    }
 
     private async Task PrepareGuestDirectoryAsync(
         IncusSandboxOptions options,
