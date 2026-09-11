@@ -13723,7 +13723,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 () => Volatile.Read(ref lastActivityTicks),
                 startTicks,
                 Touch,
-                TimeSpan.FromSeconds(1),
+                // Poll well below test-scale idle windows so a genuinely hung
+                // run is detected promptly; matches the legacy adaptive-delay
+                // floor (100 ms) this guard replaced.
+                TimeSpan.FromMilliseconds(100),
                 linkedCts.Token).ConfigureAwait(false);
             Touch();
             ct.ThrowIfCancellationRequested();
