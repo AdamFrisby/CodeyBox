@@ -10,6 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.AdminSeed\CodeyBox.AdminSeed.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.ExploratoryTesting\CodeyBox.ExploratoryTesting.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.7" />

@@ -1,0 +1,78 @@
+{
+  "name": "admin-queue-flow",
+  "readiness": {
+    "url": "http://localhost:5070/healthz",
+    "argv": [],
+    "maxAttempts": 30,
+    "delayMs": 250
+  },
+  "steps": [
+    {
+      "action": "navigate",
+      "selector": null,
+      "target": "http://localhost:5070",
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": null
+    },
+    {
+      "action": "click",
+      "selector": "role=textbox[name=\u0022Queue filter\u0022]",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": null
+    },
+    {
+      "action": "fill",
+      "selector": "role=textbox[name=\u0022Queue filter\u0022]",
+      "target": null,
+      "value": "auditing",
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": null
+    },
+    {
+      "action": "click",
+      "selector": "role=button[name=\u0022All\u0022]",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": null
+    },
+    {
+      "action": "click",
+      "selector": "role=link[name=\u0022Seeded Working item 01\u0022]",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": null
+    },
+    {
+      "action": "click",
+      "selector": "role=button[name=\u0022Quota\u0022]",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": null
+    }
+  ],
+  "assertions": []
+}

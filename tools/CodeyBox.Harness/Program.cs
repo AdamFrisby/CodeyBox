@@ -29,6 +29,7 @@ public static class Program
         return args[0] switch
         {
             "jobtrack" => await RunJobTrackAsync(args[1..], output, error),
+            "admin-seeded" => await RunAdminSeededAsync(args[1..], output, error),
             _ => UnknownCommand(args[0], error),
         };
     }
@@ -174,6 +175,24 @@ public static class Program
         return 0;
     }
 
+    private static async Task<int> RunAdminSeededAsync(string[] args, TextWriter output, TextWriter error)
+    {
+        var parsed = AdminSeededCommand.Parse(args);
+        switch (parsed.Status)
+        {
+            case AdminSeededCommand.ParseStatus.Usage:
+                if (!string.IsNullOrEmpty(parsed.Error))
+                    error.WriteLine(parsed.Error);
+                AdminSeededCommand.PrintUsage(error);
+                return ExitUsage;
+            case AdminSeededCommand.ParseStatus.Invalid:
+                error.WriteLine(parsed.Error);
+                return ExitLaunchFailed;
+            default:
+                return await AdminSeededCommand.RunAsync(parsed, output, error).ConfigureAwait(false);
+        }
+    }
+
     private static MultipassSandboxOptions ResolveMultipassOptions()
     {
         var bridge = Environment.GetEnvironmentVariable("CODEYBOX_GRAPHICAL_BRIDGE");
@@ -214,6 +233,8 @@ public static class Program
 
             Usage:
               codeybox-harness jobtrack launch --source <path> [options]
+              codeybox-harness admin-seeded seed --seed 42 --db /tmp/seed/admin.db
+              codeybox-harness admin-seeded serve --seed 42 --db /tmp/seed/admin.db
 
             Environment:
               JOBTRACK_SOURCE              Default --source when flag omitted
