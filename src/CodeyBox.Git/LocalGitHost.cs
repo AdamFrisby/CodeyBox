@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -694,14 +695,14 @@ public sealed class LocalGitHost : IGitHost
         CancellationToken ct = default)
     {
         const int maxMessages = 20;
-        const int maxMessageChars = 2048;
+        const int maxMessageBytes = 2048;
 
         try
         {
             Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
             Validation.ValidateBranchName(workBranch, nameof(workBranch));
         }
-        catch
+        catch (ArgumentException)
         {
             return [];
         }
@@ -713,8 +714,9 @@ public sealed class LocalGitHost : IGitHost
         // Two-dot range lists commits reachable from work but not base.
         // %B is the raw subject+body; %x1e terminates each message with an
         // ASCII record separator so multi-line bodies survive the split.
+        // --reverse emits oldest first, matching the documented contract.
         // `--` guards against branch names parsing as paths.
-        var rc = await RunGitAsync(path, ct, "log", "--format=%B%x1e", "-n", "20", $"{baseBranch}..{workBranch}", "--");
+        var rc = await RunGitAsync(path, ct, "log", "--format=%B%x1e", "--reverse", "-n", maxMessages.ToString(CultureInfo.InvariantCulture), $"{baseBranch}..{workBranch}", "--");
         if (rc.ExitCode != 0)
             return [];
 
@@ -724,7 +726,7 @@ public sealed class LocalGitHost : IGitHost
             var message = raw.Trim();
             if (string.IsNullOrEmpty(message))
                 continue;
-            messages.Add(message.Length <= maxMessageChars ? message : message[..maxMessageChars]);
+            messages.Add(RawOutputRedactor.TruncateToBytes(message, maxMessageBytes));
             if (messages.Count >= maxMessages)
                 break;
         }

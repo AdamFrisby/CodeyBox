@@ -600,6 +600,9 @@ public sealed class PullRequestDescriptionStrategyTests : IDisposable
             await File.WriteAllTextAsync(Path.Combine(work, "feat.txt"), "feat\n");
             await RunGit(work, "add", ".");
             await RunGit(work, "commit", "-m", "feat: agent did the thing\n\nBody of the agent commit.");
+            await File.WriteAllTextAsync(Path.Combine(work, "feat2.txt"), "feat2\n");
+            await RunGit(work, "add", ".");
+            await RunGit(work, "commit", "-m", "fix: follow-up polish");
             await RunGit(work, "push", "-u", "origin", "work");
 
             var host = new LocalGitHost(
@@ -609,7 +612,13 @@ public sealed class PullRequestDescriptionStrategyTests : IDisposable
 
             var joined = string.Join("\n", messages);
             Assert.Contains("feat: agent did the thing", joined);
+            Assert.Contains("fix: follow-up polish", joined);
             Assert.DoesNotContain("base commit", joined);
+            // Documented contract is oldest first: the first work-branch
+            // commit must precede the follow-up.
+            Assert.Equal(2, messages.Count);
+            Assert.StartsWith("feat: agent did the thing", messages[0]);
+            Assert.StartsWith("fix: follow-up polish", messages[1]);
         }
         finally
         {
