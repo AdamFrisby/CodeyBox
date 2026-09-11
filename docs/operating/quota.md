@@ -127,13 +127,20 @@ there is no per-probe retention code.
 ### Unknown policy
 
 `CodeyBox:QuotaRouter:UnknownPolicy` controls snapshots that are still unknown
-after the last-known-good layer:
+after the last-known-good layer — but only when no effective floor is in force
+for the agent. Whenever the agent's effective floor (global defaults,
+`MinQuotaPct` fallback, `FloorByAgent` overrides, and the time-based ramp) is
+non-zero at evaluation time, an unknown reading fails closed to protect the
+reserve, regardless of `UnknownPolicy`. An effective floor of zero keeps the
+policy behaviour below:
 
 - `UseObservedFailures` default. Allow unknown only when this agent/model has no
   recent quota-shaped failure.
 - `FailCautious`. Treat unknown as exhausted.
 - `FailOpen`. Unknown is treated as available. Opt in only when a broken
-  probe blocking dispatch is worse than overrunning the provider's cap.
+  probe blocking dispatch is worse than overrunning the provider's cap. Note
+  this only admits unknowns once the ramp has decayed to zero (or floors are
+  configured to zero) — with the default floors, unknowns fail closed.
 
 ## Rate-aware burn gate
 

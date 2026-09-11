@@ -101,7 +101,10 @@ public sealed class QuotaGatePolicy
         var availablePct = quota.AvailablePct;
         var escrowed = Math.Max(0, outstandingPct);
         var effectivePct = availablePct - escrowed;
-        if (effectivePct >= floor)
+        // The floor comparison only admits real readings: an unknown snapshot
+        // (AvailablePct < 0) must always fall through to the unknown branch
+        // below, even if a misconfigured floor sits below zero.
+        if (availablePct >= 0 && effectivePct >= floor)
         {
             if (member.Billing == AgentBilling.Subscription
                 && quota.Windows is { Count: > 0 } windows)
@@ -132,16 +135,18 @@ public sealed class QuotaGatePolicy
             return new QuotaGateDecision(false, reason, floor);
         }
 
-        // Safety: an operator-configured per-agent reserve floor (FloorByAgent)
-        // is explicit intent that must not be silently bypassed when the probe
-        // cannot produce a reading. Fail CLOSED to protect the reserve rather
-        // than letting the UnknownPolicy fail open and dispatch below the
-        // reserve. Agents WITHOUT an explicit reserve keep the existing
-        // UnknownPolicy behaviour.
-        if (HasExplicitReserveFloor(options, member.Agent))
+        // Safety: when the probe cannot produce a reading, fail CLOSED whenever
+        // an effective reserve floor is in force for this agent at evaluation
+        // time (global defaults, MinQuotaPct fallback, per-agent overrides,
+        // and the time-based ramp all feed ComputeFloorPct above). A non-zero
+        // floor is explicit operator intent to keep headroom and must not be
+        // silently bypassed via the UnknownPolicy fail-open path. An effective
+        // floor of zero means no reserve to protect, so the existing
+        // UnknownPolicy behaviour applies.
+        if (floor > 0)
             return new QuotaGateDecision(
                 false,
-                "quota unknown; agent has an explicit reserve floor; fail-closed to protect the reserve",
+                $"quota unknown; effective floor {floor:F1}% in force; fail-closed to protect the reserve",
                 floor);
 
         return options.UnknownPolicy switch
@@ -151,16 +156,6 @@ public sealed class QuotaGatePolicy
             _ => new QuotaGateDecision(true, "quota unknown; no recent observed failure", floor),
         };
     }
-
-    /// <summary>
-    /// True when the operator has configured an explicit per-agent reserve
-    /// floor (<see cref="QuotaRouterOptions.FloorByAgent"/>) for this agent.
-    /// The presence of the override entry is the explicit-intent signal — the
-    /// reserve exists to guarantee headroom and must not evaporate when the
-    /// probe is unreadable.
-    /// </summary>
-    private static bool HasExplicitReserveFloor(QuotaRouterOptions options, AgentKind agent) =>
-        TryGetFloorOverride(options, agent, out var perAgent) && perAgent is not null;
 
     public static double ComputeEffectiveFloorPct(
         QuotaRouterOptions options,

@@ -1664,8 +1664,10 @@ builder.Services.AddSingleton<IAgentInvolvementStore>(sp =>
 // sources with provider-specific refresh logic so an expired access_token is
 // re-minted via the provider's OAuth refresh endpoint before the probe sends
 // it. Without this, an expired token would 401, the snapshot would become
-// AvailablePct=-1, and the router's default UnknownPolicy=UseObservedFailures
-// would fall open onto an agent that immediately 429s. See
+// AvailablePct=-1, and dispatch would risk landing on an agent that
+// immediately 429s (refused outright while a reserve floor is in force, or
+// admitted by the router's default UnknownPolicy=UseObservedFailures when no
+// floor applies). See
 // CodeyBox.Agents/OauthCredentialFileRefresher.cs for the provider-neutral
 // refresh contracts; each concrete refresher lives in its own
 // CodeyBox.Agents.* project.

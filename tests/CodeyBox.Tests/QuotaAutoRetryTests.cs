@@ -3000,7 +3000,13 @@ public sealed class QuotaAutoRetryTests : IDisposable
     {
         var options = new QuotaRouterOptions
         {
-            MinQuotaPct = 10,
+            // Zero floors so the unknown branch reaches UnknownPolicy: this
+            // test pins that the monitor delegates the unknown decision to
+            // the gate, not the reserve floor (a non-zero floor fails closed
+            // before the policy applies).
+            MinQuotaPct = 0,
+            StartFloorPct = 0,
+            EndFloorPct = 0,
             UnknownPolicy = QuotaUnknownPolicy.FailOpen,
         };
         var quotaSignal = new AgentQuotaAvailabilityBroadcaster(

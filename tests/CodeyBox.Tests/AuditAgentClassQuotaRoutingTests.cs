@@ -417,7 +417,16 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         using var fix = BuildFixture(seed, auditor,
             classMembers: [AgentKind.Gemini, AgentKind.Codex],
             throwingProbes: [AgentKind.Gemini],
-            unknownPolicy: QuotaUnknownPolicy.FailOpen);
+            unknownPolicy: QuotaUnknownPolicy.FailOpen,
+            // Zero floors so the unknown branch reaches UnknownPolicy: this
+            // test pins the FailOpen policy branching, not the reserve floor
+            // (a non-zero floor fails closed before the policy applies).
+            quotaOptions: new QuotaRouterOptions
+            {
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
+            });
         fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
 
         var item = NewItem(AgentKind.Codex);
@@ -469,7 +478,14 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 [AgentKind.Gemini] = -1.0,
                 [AgentKind.Codex] = 80.0,
             },
-            unknownPolicy: QuotaUnknownPolicy.FailOpen);
+            unknownPolicy: QuotaUnknownPolicy.FailOpen,
+            // Zero floors so the unknown branch reaches UnknownPolicy (see above).
+            quotaOptions: new QuotaRouterOptions
+            {
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
+            });
         fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
 
         var item = NewItem(AgentKind.Codex);
