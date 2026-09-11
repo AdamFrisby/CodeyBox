@@ -150,6 +150,36 @@ public sealed class CopilotMemberProviderTests
     }
 
     [Fact]
+    public async Task BoundRunner_PreservesInjectedSessionIdGenerator()
+    {
+        // ForMember rebinds only the provider: an injected deterministic
+        // session-id generator must survive onto the bound runner, otherwise
+        // per-member invocations silently revert to random UUIDs (and lose
+        // test determinism) whenever a member names an override.
+        var options = GlobalByok("https://global.example/v1");
+        options.Providers["byok"] = new CopilotProviderOptions
+        {
+            BaseUrl = "https://opencode.ai/zen/go/v1",
+            Headers = [$"x-opencode-session: {CopilotAgentRunner.ProviderSessionIdPlaceholder}"],
+        };
+        var runner = new CopilotAgentRunner
+        {
+            Options = options,
+            SessionIdGenerator = () => "11111111-2222-3333-4444-555555555555",
+        };
+
+        var bound = ((IMemberScopedAgentRunner)runner).ForMember(CopilotMember("harness", "byok"));
+        var env = await InvocationEnvAsync(bound, new CapturingSandbox());
+
+        Assert.Equal(
+            "x-opencode-session: 11111111-2222-3333-4444-555555555555",
+            env["COPILOT_PROVIDER_HEADERS"]);
+        Assert.Equal(
+            "11111111-2222-3333-4444-555555555555",
+            env[CopilotAgentRunner.ProviderSessionIdEnvironmentVariable]);
+    }
+
+    [Fact]
     public void TryFind_MatchesCaseInsensitively()
     {
         var catalog = CatalogWith(("BYOK", "https://a.example/v1"));

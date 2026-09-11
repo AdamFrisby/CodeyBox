@@ -92,7 +92,9 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
     /// existing single-provider deployments allocate nothing and behave
     /// identically. The bound runner is a fresh immutable instance, so two
     /// members — e.g. a BYOK harness and a native subscription — dispatch
-    /// concurrently without observing each other's configuration.
+    /// concurrently without observing each other's configuration. The bound
+    /// runner keeps this instance's binary and session-id generator: only the
+    /// provider selection changes.
     /// </summary>
     public IAgentRunner ForMember(AgentMembership member)
     {
@@ -104,6 +106,7 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
         return new CopilotAgentRunner
         {
             Binary = Binary,
+            SessionIdGenerator = SessionIdGenerator,
             Options = new CopilotOptions
             {
                 Provider = effective,
