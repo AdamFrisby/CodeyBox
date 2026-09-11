@@ -3842,7 +3842,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
-        hostPoolSnapshot: sp.GetService<ISandboxProvider>() as ISandboxHostPoolSnapshot);
+        hostPoolSnapshot: sp.GetService<ISandboxProvider>() as ISandboxHostPoolSnapshot,
+        sandboxAdmission: sp.GetService<ISandboxProvider>() as SandboxAdmissionControlledProvider);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -5171,7 +5172,8 @@ namespace CodeyBox.Api
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
     ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
     ///   <c>AgentBurnEstimator</c>, <c>AgentPauses</c>, <c>AgentPricing</c>, <c>SqliteWriteGate</c>,
-    ///   <c>Smoke.Enabled</c>, <c>DeadWorker</c>
+    ///   <c>WorkerPool.MaxConcurrentWorkers</c>, <c>WorkerPool.MaxConcurrentSandboxes</c>,
+    ///   <c>WorkerPool.MinSpawnInterval</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>Shutdown.SandboxResumeMode</c>,
     ///   <c>Shutdown.SandboxResumeTimeout</c>,
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
@@ -5190,7 +5192,6 @@ namespace CodeyBox.Api
     ///   <c>GitRootDirectory</c>, <c>GitCommandMaxOutputBytes</c>,
     ///   <c>Incus.ProjectName</c>, effective
     ///   <c>Incus.StagingDirectory</c>, <c>AgentStreams.Path</c>,
-    ///   <c>WorkerPool.MaxConcurrentSandboxes</c>,
     ///   <c>EnableSharedUpstreamMirror</c>, and
     ///   <c>SharedUpstreamMirrorDirectory</c>. The retaining
     ///   options-monitor cache keeps the startup value visible to consumers

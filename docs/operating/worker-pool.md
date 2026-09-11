@@ -67,8 +67,16 @@ merge at the same time.
 When unset, the default is `2 * MaxConcurrentWorkers`: every worker can hold
 its phase sandbox while acquiring the next phase's sandbox (work → audit,
 audit → merge handoffs) without deadlocking the pool. Set it explicitly on
-hosts with a known VM capacity. This is a startup-captured value because the
-live admission queue is not resized in place; restart CodeyBox to apply changes.
+hosts with a known VM capacity. Values below `2 * MaxConcurrentWorkers` are
+rejected at startup and on hot-reload.
+
+This value is hot-reloadable: editing `MaxConcurrentSandboxes` resizes the
+live admission gate without restarting CodeyBox. Raising it admits queued
+sandbox creations immediately; lowering it never aborts in-flight sandboxes —
+new admissions above the new target stay blocked until holders dispose and the
+count converges down. Every change is logged as
+`Hot-reloaded WorkerPool:MaxConcurrentSandboxes: <old> → <new>
+(admitted=<in-flight>)` so operators can confirm the effective VM ceiling.
 
 `MaxLlmAuditorParallelism` remains a per-project audit policy. It bounds how
 many LLM auditors one item may try to run concurrently, but those auditor
@@ -120,6 +128,20 @@ the quota immediately; pacing them spreads the API calls out over time so
 each agent actually gets useful work done before hitting a limit.
 
 The value is a .NET `TimeSpan` string, e.g. `"00:00:30"` for 30 seconds.
+It is hot-reloadable: the new floor applies to the next worker spawn (a spawn
+already waiting out the old interval keeps the bound it started with).
+
+### Hot reload vs restart
+
+`MaxConcurrentWorkers`, `MaxConcurrentSandboxes`, and `MinSpawnInterval` are
+re-bound live by `AgentConfigHotReload` — no restart needed, and in-flight
+work is never aborted by a resize. The remaining `WorkerPool` knobs
+(`DispatchGateAcquisitionBackoff`,
+`MaxConsecutiveDispatchGateTimeoutsBeforeEscalation`, `NoProgressBackoffBase`,
+`NoProgressBackoffMax`, `MaxNoProgressRedispatches`) are captured into the
+orchestrator's startup options snapshot and still require a restart, because
+no live reload bridge re-binds them yet. The exact split is codified in
+`WorkerPoolHotReloadPolicy` next to `WorkerPoolOptions`.
 
 ### How spawning works
 

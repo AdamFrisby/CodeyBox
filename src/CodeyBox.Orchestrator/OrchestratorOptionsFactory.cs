@@ -46,6 +46,10 @@ public static class OrchestratorOptionsFactory
                 $"2x CodeyBox:WorkerPool:MaxConcurrentWorkers ({maxConcurrent}); " +
                 $"minimum required value is {minimumSandboxes} because a worker can hold its phase sandbox " +
                 "while acquiring the next phase's sandbox. Raise MaxConcurrentSandboxes or lower MaxConcurrentWorkers.");
+        // The hot-reload coordinator re-validates the same trio through
+        // ValidateWorkerPoolReload before mutating any live gate; run the
+        // cold-start values through it too so both paths enforce one set of bounds.
+        ValidateWorkerPoolReload(maxConcurrent, maxConcurrentSandboxes, wp.MinSpawnInterval);
         if (wp.MinSpawnInterval < TimeSpan.Zero)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
@@ -191,6 +195,45 @@ public static class OrchestratorOptionsFactory
                 + $"({workerPool.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation})); a permitted maintenance hold must fit inside the window "
                 + "so routine maintenance cannot push dispatch into stuck-holder escalation. Raise the window or lower VacuumTimeout.");
         }
+    }
+
+    /// <summary>
+    /// Validates the hot-reloadable <c>WorkerPool</c> trio with the same bounds
+    /// as the cold-start path in <see cref="Build(int?, WorkerPoolOptions, ILogger)"/>.
+    /// The hot-reload coordinator calls this <i>before</i> mutating any live
+    /// gate so a rejected candidate leaves every prior value in effect
+    /// (no partial commit across the worker, sandbox, and pacing knobs).
+    /// This includes the deadlock-safety floor: a worker can transiently hold
+    /// 2 sandbox permits at once, so the ceiling must cover
+    /// <c>2 * maxConcurrentWorkers</c>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when any value is out of range, naming the offending config key.
+    /// </exception>
+    public static void ValidateWorkerPoolReload(
+        int maxConcurrentWorkers,
+        int maxConcurrentSandboxes,
+        TimeSpan minSpawnInterval)
+    {
+        if (maxConcurrentWorkers < 1)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
+        if (maxConcurrentSandboxes < 1)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MaxConcurrentSandboxes must be >= 1");
+        var minimumSandboxes = checked(2 * maxConcurrentWorkers);
+        if (maxConcurrentSandboxes < minimumSandboxes)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerPool:MaxConcurrentSandboxes ({maxConcurrentSandboxes}) must be at least " +
+                $"2x CodeyBox:WorkerPool:MaxConcurrentWorkers ({maxConcurrentWorkers}); " +
+                $"minimum required value is {minimumSandboxes} because a worker can hold its phase sandbox " +
+                "while acquiring the next phase's sandbox. Raise MaxConcurrentSandboxes or lower MaxConcurrentWorkers.");
+        if (minSpawnInterval < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
+        if (minSpawnInterval >= TimeSpan.FromHours(1))
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MinSpawnInterval must be < 1 hour (values >= 1h are almost certainly a configuration error)");
     }
 
     public static OrchestratorOptions Build(

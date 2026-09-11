@@ -395,10 +395,13 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
             // ItemStaleTimeout default moves to satisfy the audit-budget
             // ordering, and a hardcoded age rots into a non-stale item
             // (expected Accepted, got Conflict) whenever it lands below it.
+            // The retry fence only admits items whose UpdatedAt has not
+            // advanced inside the window, so the fixture is derived from the
+            // effective configured timeout (not a hardcoded age).
             var staleTimeout = factory.Services
                 .GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue
                 .WorkerProgressWatchdog.ResolveItemStaleTimeout(agent: null);
-            var frozenAt = DateTimeOffset.UtcNow - staleTimeout - TimeSpan.FromMinutes(5);
+            var frozenAt = DateTimeOffset.UtcNow - staleTimeout - TimeSpan.FromMinutes(30);
             var item = new WorkItem
             {
                 Id = WorkItemId.New(),
@@ -420,7 +423,7 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 WorkerId = "wedged-http-worker",
                 HostName = "host",
                 ProcessId = 4242,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                StartedAt = frozenAt,
                 LastHeartbeatAt = DateTimeOffset.UtcNow,
                 CurrentWorkItemId = item.Id.ToString(),
             });

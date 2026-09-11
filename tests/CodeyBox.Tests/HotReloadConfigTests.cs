@@ -418,8 +418,11 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
-    public void ImmutableCodeyBoxOptionsValidator_RejectsMaxConcurrentSandboxesChange()
+    public void ImmutableCodeyBoxOptionsValidator_AcceptsMaxConcurrentSandboxesChange()
     {
+        // MaxConcurrentSandboxes is hot-reloadable (resized live by
+        // AgentConfigHotReload via SandboxAdmissionControlledProvider), so the
+        // immutable-options validator must NOT reject it.
         var startup = new CodeyBoxOptions();
         startup.WorkerPool.MaxConcurrentSandboxes = 3;
         var validator = new ImmutableCodeyBoxOptionsValidator(startup);
@@ -428,8 +431,7 @@ public sealed class HotReloadConfigTests
         candidate.WorkerPool.MaxConcurrentSandboxes = 4;
         var result = validator.Validate(name: null, candidate);
 
-        Assert.True(result.Failed);
-        Assert.Contains("WorkerPool:MaxConcurrentSandboxes", result.FailureMessage);
+        Assert.True(result.Succeeded);
     }
 
     [Fact]
