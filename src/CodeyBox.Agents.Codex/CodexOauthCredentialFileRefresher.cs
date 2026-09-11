@@ -110,12 +110,11 @@ public sealed class CodexOauthCredentialFileRefresher
             new KeyValuePair<string, string>("scope", "openid profile email"),
         });
         using var req = new HttpRequestMessage(HttpMethod.Post, _refreshEndpoint) { Content = form };
-        using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
-        if (resp.StatusCode != HttpStatusCode.OK)
+        var bounded = await SendBoundedRefreshAsync(http, req, ct).ConfigureAwait(false);
+        if (bounded.StatusCode != HttpStatusCode.OK || bounded.BodyTooLarge || bounded.Body is null)
             return new RefreshResult(null, null, TimeSpan.Zero);
 
-        var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        using var doc = JsonDocument.Parse(body);
+        using var doc = JsonDocument.Parse(bounded.Body);
         var newAccess = doc.RootElement.TryGetProperty("access_token", out var at) && at.ValueKind == JsonValueKind.String
             ? at.GetString() : null;
         var newRefresh = doc.RootElement.TryGetProperty("refresh_token", out var rt) && rt.ValueKind == JsonValueKind.String

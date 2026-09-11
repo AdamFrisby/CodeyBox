@@ -6828,6 +6828,24 @@ namespace CodeyBox.Api
         /// Hot-reloadable.
         /// </summary>
         public int ProbeMaxStalenessSeconds { get; set; } = 300;
+        /// <summary>
+        /// Maximum OAuth refresh response body accepted by the subscription
+        /// quota-token refreshers (Claude/Codex/Gemini), in bytes. The shared
+        /// refresh reader enforces this <i>before</i> buffering by streaming
+        /// under <c>HttpCompletionOption.ResponseHeadersRead</c>; oversize
+        /// bodies fail the refresh (probe maps to "unknown") instead of being
+        /// buffered or parsed. Default 8192 — a legitimate refresh payload is
+        /// a few hundred bytes of JSON. Hot-reloadable.
+        /// </summary>
+        public int OauthRefreshMaxBodyBytes { get; set; } = CodeyBox.Agents.OauthCredentialRefresherBounds.DefaultMaxRefreshBodyBytes;
+        /// <summary>
+        /// Per-stream cap (stdout/stderr), in chars, for agent-CLI child-process
+        /// output captured during OAuth token refresh. Output beyond the cap is
+        /// discarded while the pipes are still drained, so a chatty child can
+        /// neither exhaust memory nor block on a full buffer. Only the exit code
+        /// is observed. Default 1048576 (1 MiB). Hot-reloadable.
+        /// </summary>
+        public int OauthRefreshMaxCliOutputChars { get; set; } = CodeyBox.Agents.OauthCredentialRefresherBounds.DefaultMaxCliOutputChars;
     }
 
     /// <summary>

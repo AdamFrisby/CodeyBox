@@ -298,6 +298,20 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:MaxSandboxReuses must be >= 1");
         }
+        if (options.QuotaRouter.OauthRefreshMaxBodyBytes
+            is < CodeyBox.Agents.OauthCredentialRefresherBounds.MinMaxRefreshBodyBytes
+            or > CodeyBox.Agents.OauthCredentialRefresherBounds.MaxMaxRefreshBodyBytes)
+        {
+            failures.Add(
+                $"CodeyBox:QuotaRouter:OauthRefreshMaxBodyBytes must be between {CodeyBox.Agents.OauthCredentialRefresherBounds.MinMaxRefreshBodyBytes} and {CodeyBox.Agents.OauthCredentialRefresherBounds.MaxMaxRefreshBodyBytes}");
+        }
+        if (options.QuotaRouter.OauthRefreshMaxCliOutputChars
+            is < CodeyBox.Agents.OauthCredentialRefresherBounds.MinMaxCliOutputChars
+            or > CodeyBox.Agents.OauthCredentialRefresherBounds.MaxMaxCliOutputChars)
+        {
+            failures.Add(
+                $"CodeyBox:QuotaRouter:OauthRefreshMaxCliOutputChars must be between {CodeyBox.Agents.OauthCredentialRefresherBounds.MinMaxCliOutputChars} and {CodeyBox.Agents.OauthCredentialRefresherBounds.MaxMaxCliOutputChars}");
+        }
         if (options.PipelineTuning.MaxRetainedAgentTurnSandboxes is < 1 or > 256)
         {
             failures.Add(

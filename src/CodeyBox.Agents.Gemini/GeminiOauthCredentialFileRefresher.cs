@@ -45,9 +45,6 @@ public sealed class GeminiOauthCredentialFileRefresher
     /// <summary>Fallback token lifetime used when the CLI-refreshed file carries no expiry.</summary>
     internal static readonly TimeSpan FallbackTokenLifetime = TimeSpan.FromHours(1);
 
-    /// <summary>Maximum response body size in bytes accepted from the OAuth refresh endpoint.</summary>
-    internal const int MaxRefreshBodyBytes = 8192;
-
     private readonly string _refreshEndpoint;
     private readonly string? _fallbackClientId;
     private readonly string? _fallbackClientSecret;
@@ -133,15 +130,11 @@ public sealed class GeminiOauthCredentialFileRefresher
             new KeyValuePair<string, string>("client_secret", clientSecret),
         });
         using var req = new HttpRequestMessage(HttpMethod.Post, _refreshEndpoint) { Content = form };
-        using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
-        if (resp.StatusCode != HttpStatusCode.OK)
+        var bounded = await SendBoundedRefreshAsync(http, req, ct).ConfigureAwait(false);
+        if (bounded.StatusCode != HttpStatusCode.OK || bounded.BodyTooLarge || bounded.Body is null)
             return new RefreshResult(null, null, TimeSpan.Zero);
 
-        var bodyBytes = await resp.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
-        if (bodyBytes.Length > MaxRefreshBodyBytes)
-            return new RefreshResult(null, null, TimeSpan.Zero);
-        var body = System.Text.Encoding.UTF8.GetString(bodyBytes);
-        using var doc = JsonDocument.Parse(body);
+        using var doc = JsonDocument.Parse(bounded.Body);
         var newAccess = TryString(doc.RootElement, "access_token");
         var newRefresh = TryString(doc.RootElement, "refresh_token");
         var seconds = doc.RootElement.TryGetProperty("expires_in", out var ex) && ex.ValueKind == JsonValueKind.Number
