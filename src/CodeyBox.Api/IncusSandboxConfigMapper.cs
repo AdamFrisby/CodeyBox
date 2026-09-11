@@ -48,6 +48,8 @@ internal static class IncusSandboxConfigMapper
             // intentionally remains empty during a side-by-side cutover.
             ExtraRuncmd = SnapshotExtraRuncmd(incus.ExtraRuncmd),
             PackageCacheSeeds = SnapshotPackageCacheSeeds(incus.PackageCacheSeeds),
+            NuGetFallbackGuestPath = SnapshotFallbackGuestPath(incus.NuGetFallbackGuestPath),
+            ShareNuGetPackageSeedsAsFallback = incus.ShareNuGetPackageSeedsAsFallback,
             ExecutableProvisions = SnapshotExecutableProvisions(incus.ExecutableProvisions),
             BaselineVerificationCommands = SnapshotBaselineVerificationCommands(verificationCommands),
             ExtraCloudInit = incus.ExtraCloudInit,
@@ -175,6 +177,17 @@ internal static class IncusSandboxConfigMapper
         BaselineProvisioningConfigSnapshot.SnapshotPackageCacheSeeds(
             seeds,
             "CodeyBox:Incus:PackageCacheSeeds");
+
+    internal static string SnapshotFallbackGuestPath(string? configured)
+    {
+        if (string.IsNullOrWhiteSpace(configured))
+            return NuGetFallbackCache.DefaultGuestFallbackPath;
+        ConfigurationInputBounds.EnsureCharacterBound(
+            configured,
+            NuGetFallbackCache.MaximumFallbackPathUtf8Bytes,
+            "Incus:NuGetFallbackGuestPath");
+        return configured;
+    }
 
     internal static IReadOnlyList<BaselineExecutableProvision> SnapshotExecutableProvisions(
         IEnumerable<ExecutableProvisionConfig>? provisions) =>

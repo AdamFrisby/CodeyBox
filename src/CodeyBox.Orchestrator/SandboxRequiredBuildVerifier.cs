@@ -412,7 +412,21 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             var redactedOutput = TruncateOutput(rawOutput);
 
             if (build.Success)
-                return RequiredBuildVerificationResult.Passed(build.ExitCode, redactedOutput);
+            {
+                // Best-effort shared-cache diagnostic appended to the passed
+                // output: how many restored packages the NuGet fallback cache
+                // served versus fetched from the network. A null means
+                // coverage could not be determined; the gate result never
+                // depends on it.
+                var coverageNote = await NuGetFallbackCoverageReporter.TryReportAsync(
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    buildCt).ConfigureAwait(false);
+                var output = string.IsNullOrEmpty(coverageNote)
+                    ? redactedOutput
+                    : $"{redactedOutput}\n{coverageNote}";
+                return RequiredBuildVerificationResult.Passed(build.ExitCode, output);
+            }
 
             if (build.ExitCode == DotnetCommandNotFoundExitCode
                 && rawOutput.Contains("dotnet is not available in the sandbox PATH", StringComparison.OrdinalIgnoreCase))

@@ -66,6 +66,21 @@ under `/dev`, `/proc`, `/run`, or `/sys` are rejected. Missing files, traversal
 beyond the entry limit, and byte-limit breaches
 fail provisioning instead of producing a partially seeded VM.
 
+Seeds destined for the guest NuGet home (`{GuestHome}/.nuget/...`, for example
+`/home/ubuntu/.nuget/packages`) are served as a read-only shared fallback
+folder instead of being copied into the per-sandbox writable package root, so a
+multi-gigabyte package cache is transferred once per host rather than once per
+sandbox. Full-launch VMs mount the host directory read-only and advertise it
+through `NUGET_FALLBACK_PACKAGES`; baselines bake the content into the image so
+clones inherit it, and seeds that cannot be shared (file sources, sources
+outside the allowed host mount roots) keep the copy path — served from a
+once-per-host archive cache under the staging directory. Restore writes only
+packages the cache does not carry into the writable root, and the required
+build gate reports the shared-versus-fetched split after a passing build.
+Tune the folder with `CodeyBox:Incus:NuGetFallbackGuestPath`, or set
+`CodeyBox:Incus:ShareNuGetPackageSeedsAsFallback` to `false` to keep the legacy
+per-VM copy for every seed.
+
 ## Polyglot Sandbox
 
 ```json
