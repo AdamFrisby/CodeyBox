@@ -1,16 +1,16 @@
-using System.Net.Http.Headers;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Api;
 
 /// <summary>
-/// Generates a CHANGELOG.md section by calling the Anthropic Messages API
-/// with a structured summary of merged pull requests.
+/// Generates a CHANGELOG.md section by calling a configured completion endpoint
+/// (Anthropic Messages shape by default) with a structured summary of merged
+/// pull requests.
 ///
 /// Handles batching: if the combined PR title+body payload would exceed 100 KB,
 /// the PRs are split into batches, each batch summarised independently, and the
@@ -25,22 +25,30 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
     private const int MaxPerPrBodyBytes = 4 * 1024;
     private const int MaxResponseTokens = 4096;
 
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    };
-
-    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ICompletionClient _completionClient;
     private readonly ILogger<ClaudeChangelogGenerator> _log;
-    private readonly ChangelogOptions _opts;
+    private readonly Func<ChangelogOptions> _opts;
 
     public ClaudeChangelogGenerator(
         IHttpClientFactory httpClientFactory,
         ILogger<ClaudeChangelogGenerator> log,
         ChangelogOptions opts)
+        : this(
+            new CompletionClient(
+                httpClientFactory,
+                () => new CompletionClientOptions { HttpClientName = "changelog-claude" },
+                NullLogger<CompletionClient>.Instance),
+            log,
+            () => opts)
     {
-        _httpClientFactory = httpClientFactory;
+    }
+
+    public ClaudeChangelogGenerator(
+        ICompletionClient completionClient,
+        ILogger<ClaudeChangelogGenerator> log,
+        Func<ChangelogOptions> opts)
+    {
+        _completionClient = completionClient;
         _log = log;
         _opts = opts;
     }
@@ -107,75 +115,58 @@ public sealed class ClaudeChangelogGenerator : IChangelogGenerator
 
     private async Task<string> CallLlmAsync(string userPrompt, CancellationToken ct)
     {
-        var token = Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY");
+        var opts = _opts();
+        var token = string.IsNullOrWhiteSpace(opts.GeneratorApiKey)
+            ? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")
+            : opts.GeneratorApiKey;
         if (string.IsNullOrEmpty(token))
         {
             _log.LogWarning("CODEYBOX_CLAUDE_API_KEY is not set; cannot generate changelog");
             throw new InvalidOperationException("CODEYBOX_CLAUDE_API_KEY is not set");
         }
 
-        var model = _opts.GeneratorModelId ?? "claude-opus-4-7";
-        var requestBody = new
+        var model = opts.GeneratorModelId ?? "claude-opus-4-7";
+        var wireApi = opts.GeneratorWireApi;
+        var completion = new CompletionRequest
         {
-            model,
-            max_tokens = MaxResponseTokens,
-            messages = new[]
-            {
-                new { role = "user", content = userPrompt },
-            },
+            Endpoint = opts.GeneratorBaseUrl,
+            Model = model,
+            Messages = [new CompletionMessage("user", userPrompt)],
+            WireApi = wireApi,
+            BearerToken = wireApi == CompletionWireApi.AnthropicMessages ? null : token,
+            ExtraHeaders = wireApi == CompletionWireApi.AnthropicMessages
+                ? new Dictionary<string, string>
+                {
+                    ["x-api-key"] = token,
+                    ["anthropic-version"] = opts.GeneratorAnthropicVersion,
+                }
+                : null,
+            MaxOutputTokens = MaxResponseTokens,
         };
 
-        var json = JsonSerializer.Serialize(requestBody, JsonOpts);
-        using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
-        req.Headers.Add("x-api-key", token);
-        req.Headers.Add("anthropic-version", "2023-06-01");
-        req.Content = new StringContent(json, Encoding.UTF8, "application/json");
-
-        var client = _httpClientFactory.CreateClient("changelog-claude");
-        using var response = await client.SendAsync(req, ct);
-
-        if (!response.IsSuccessStatusCode)
+        var result = await _completionClient.CompleteAsync(completion, ct).ConfigureAwait(false);
+        if (result.IsSuccess)
         {
-            var err = await response.Content.ReadAsStringAsync(ct);
-            _log.LogWarning(
-                "Anthropic API returned {Status} for changelog generation: {Error}",
-                (int)response.StatusCode, err.Length > 200 ? err[..200] : err);
-            throw new HttpRequestException(
-                $"Anthropic API returned {(int)response.StatusCode} for changelog generation");
-        }
-
-        var body = await response.Content.ReadAsStringAsync(ct);
-        return ExtractTextFromAnthropicResponse(body);
-    }
-
-    private string ExtractTextFromAnthropicResponse(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("content", out var content))
+            if (string.IsNullOrWhiteSpace(result.Text))
             {
-                foreach (var block in content.EnumerateArray())
-                {
-                    if (block.TryGetProperty("type", out var typeEl) &&
-                        typeEl.GetString() == "text" &&
-                        block.TryGetProperty("text", out var textEl))
-                    {
-                        return textEl.GetString() ?? "";
-                    }
-                }
+                _log.LogWarning("Changelog completion returned no text (model {Model})", model);
+                return "*(changelog generation failed: unexpected response shape)*";
             }
+            return result.Text;
         }
-        catch (JsonException ex)
+        if (result.Status is CompletionStatus.EmptyCompletion or CompletionStatus.Refused)
         {
-            _log.LogWarning(ex, "Failed to parse Anthropic API response");
+            _log.LogWarning("Changelog completion returned no usable text (model {Model}, status {Status})", model, result.Status);
+            return "*(changelog generation failed: unexpected response shape)*";
         }
-        return "*(changelog generation failed: unexpected response shape)*";
+
+        _log.LogWarning("Changelog completion failed with {Status} for model {Model}", result.Status, model);
+        throw new HttpRequestException($"Changelog completion failed with {result.Status} for model {model}");
     }
 
     private string FormatSectionHeader(string tag, DateOnly date, string? formatOverride = null)
     {
-        var format = formatOverride ?? _opts.SectionHeaderFormat;
+        var format = formatOverride ?? _opts().SectionHeaderFormat;
         return format
             .Replace("{tag}", tag, StringComparison.Ordinal)
             .Replace("{date:yyyy-MM-dd}", date.ToString("yyyy-MM-dd"), StringComparison.Ordinal);

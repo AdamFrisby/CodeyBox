@@ -2784,11 +2784,11 @@ builder.Services.AddSingleton<IPullRequestEnumerator>(sp =>
 
 builder.Services.AddSingleton<IChangelogGenerator>(sp =>
 {
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Changelog;
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     return new ClaudeChangelogGenerator(
-        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ICompletionClient>(),
         sp.GetRequiredService<ILogger<ClaudeChangelogGenerator>>(),
-        opts);
+        () => monitor.CurrentValue.Changelog);
 });
 
 // Changelog webhook HMAC secret — mirrors the SandboxProvider enforcement pattern.
@@ -3371,19 +3371,21 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IAuditProgressStore>()));
 
-builder.Services.AddSingleton(sp =>
-{
-    var options = new CheckAndActCompletionOptions();
-    sp.GetRequiredService<IConfiguration>()
-        .GetSection("CodeyBox:CheckAndActCompletion")
-        .Bind(options);
-    return options;
-});
+builder.Services.AddOptions<CheckAndActCompletionOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:CheckAndActCompletion"));
+builder.Services.AddOptions<CompletionClientOptions>()
+    .Bind(builder.Configuration.GetSection(CompletionClientOptions.SectionName));
+builder.Services.AddSingleton<ICompletionClient>(sp =>
+    new CompletionClient(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<IOptionsMonitor<CompletionClientOptions>>(),
+        sp.GetRequiredService<ILogger<CompletionClient>>()));
 builder.Services.AddSingleton<ICheckAndActCompletionRunner>(sp =>
     new DefaultCheckAndActCompletionRunner(
         sp.GetRequiredService<IHttpClientFactory>(),
-        sp.GetRequiredService<CheckAndActCompletionOptions>(),
-        sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>()));
+        sp.GetRequiredService<IOptionsMonitor<CheckAndActCompletionOptions>>(),
+        sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>(),
+        sp.GetRequiredService<ICompletionClient>()));
 
 builder.Services.AddSingleton<WorkItemTerminalTransition>(sp => new WorkItemTerminalTransition(
     sp.GetRequiredService<IWorkItemStore>(),
@@ -6416,6 +6418,29 @@ namespace CodeyBox.Api
         /// Defaults to "claude-opus-4-7".
         /// </summary>
         public string? GeneratorModelId { get; set; }
+
+        /// <summary>
+        /// Completion endpoint for the generator LLM call. Configured default for the
+        /// previously hardcoded endpoint. Default "https://api.anthropic.com/v1/messages".
+        /// </summary>
+        public string GeneratorBaseUrl { get; set; } = "https://api.anthropic.com/v1/messages";
+
+        /// <summary>
+        /// Wire protocol for the generator LLM call. Default AnthropicMessages.
+        /// </summary>
+        public CodeyBox.Core.CompletionWireApi GeneratorWireApi { get; set; } = CodeyBox.Core.CompletionWireApi.AnthropicMessages;
+
+        /// <summary>
+        /// Optional API key for the generator LLM call. When unset, falls back to the
+        /// CODEYBOX_CLAUDE_API_KEY environment variable.
+        /// </summary>
+        public string? GeneratorApiKey { get; set; }
+
+        /// <summary>
+        /// Anthropic API version header value sent when <see cref="GeneratorWireApi"/>
+        /// is AnthropicMessages. Default "2023-06-01".
+        /// </summary>
+        public string GeneratorAnthropicVersion { get; set; } = "2023-06-01";
 
         /// <summary>
         /// Path to CHANGELOG.md within the project repo. Default "CHANGELOG.md".

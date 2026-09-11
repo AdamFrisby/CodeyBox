@@ -151,6 +151,14 @@ Hot-reloadable today:
 - `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
   invocation; changes affect the next work/rework/audit/merge/check-and-act
   prompt.
+- `Changelog.GeneratorBaseUrl` / `GeneratorModelId` / `GeneratorApiKey` /
+  `GeneratorWireApi` / `GeneratorAnthropicVersion` — re-read on every changelog
+  generation call.
+- `CheckAndActCompletion.*` (provider order, models, endpoint URLs, keys,
+  timeouts, custom providers) — re-read on every check-and-act completion
+  attempt.
+- `Completion.{RequestTimeoutSeconds,MaxResponseBytes,MaxPromptChars,HttpClientName}` —
+  re-read on every completion-client call.
 - `AgentStreams.{MaxFileSizeMb,RetainedDays,MaxTotalSizeMb}` — the
   `AgentStreamStore` reads options live via `IOptionsMonitor`, so per-file caps,
   the retention window, and the total-size backstop all take effect on the next
@@ -173,7 +181,6 @@ Not hot-reloadable (consumer captures the value at construction; restart require
 - `WebhookEventBus.RingBufferCapacity` — sized into the in-memory ring buffer.
 - `Webhooks[*]` — `HttpWebhookDispatcher` builds its endpoint set at startup;
   rebuilding the dispatcher mid-flight would drop pending retries.
-- `Changelog.*` — `ClaudeChangelogGenerator` snapshots its config at construction.
 - `AuditLog.Path` / `AuditLog.AuditPath` / `AuditLog.MaxFileSizeBytes` — bound
   into Serilog rolling-file sinks at startup.
 - `AgentStreamAnalysis.*` — bound into the `AgentStreamParserOptions` singleton
