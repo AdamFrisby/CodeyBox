@@ -376,7 +376,16 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
     [Fact]
     public async Task Retry_StaleWorkerHeldItem_FencesAndRetries()
     {
-        using var factory = new WorkItemApiFactory();
+        // Pin a short stale window explicitly: the shipped ItemStaleTimeout
+        // default moves for operational reasons (audit-budget ordering keeps
+        // it above the per-iteration audit budget), so a 2 h-frozen fixture
+        // must declare the window it is stale against. ProgressTimeout moves
+        // with it to preserve the required per-turn < item-stale ordering.
+        using var factory = new WorkItemApiFactory
+        {
+            WorkerProgressTimeoutOverride = TimeSpan.FromMinutes(10),
+            ItemStaleTimeoutOverride = TimeSpan.FromMinutes(30),
+        };
         var client = factory.CreateClient();
         try
         {
