@@ -17,8 +17,6 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 {
-    private const int SqliteBusy = 5;
-    private const int SqliteLocked = 6;
     private const int HeartbeatMaxAttempts = 5;
     private static readonly TimeSpan HeartbeatInitialRetryDelay = TimeSpan.FromMilliseconds(50);
 
@@ -35,7 +33,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     public SqliteWorkerRegistry(
         string path,
         ILogger<SqliteWorkerRegistry>? logger = null,
-        int busyTimeoutMilliseconds = 30000,
+        int busyTimeoutMilliseconds = SqliteDefaults.BusyTimeoutMilliseconds,
         SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         // busy_timeout is per-connection SQLite state with a default of 0
@@ -398,5 +396,5 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     private static bool IsTransientHeartbeatStorageFailure(Exception ex) =>
         ex is SqliteWriteGateAcquisitionTimeoutException
-        || ex is SqliteException { SqliteErrorCode: SqliteBusy or SqliteLocked };
+        || ex is SqliteException { SqliteErrorCode: SqliteDefaults.SqliteBusy or SqliteDefaults.SqliteLocked };
 }

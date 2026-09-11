@@ -8,8 +8,6 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 internal static class SqliteConnectionDisposal
 {
-    private const int SqliteBusy = 5;
-
     /// <summary>
     /// Disposes a connection, tolerating the internal teardown-race exceptions
     /// that <c>Microsoft.Data.Sqlite.SqliteConnection.Close()</c> has been
@@ -66,6 +64,6 @@ internal static class SqliteConnectionDisposal
     }
 
     private static bool IsBusySqliteTeardownRace(SqliteException ex)
-        => ex.SqliteErrorCode == SqliteBusy
+        => ex.SqliteErrorCode == SqliteDefaults.SqliteBusy
             && IsSqliteTeardownRace(ex);
 }
