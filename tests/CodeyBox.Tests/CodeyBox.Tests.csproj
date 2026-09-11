@@ -48,6 +48,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--
