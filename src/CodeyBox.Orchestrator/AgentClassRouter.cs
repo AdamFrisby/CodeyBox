@@ -2366,7 +2366,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     {
         // Balance pools gate on the absolute reading with strict headroom
         // above the floor (mirroring the gate: at-or-below is exhausted).
-        if (quota.PoolKind == QuotaPoolKind.DepletingBalance)
+        // The percentage is not a quantity for these pools, so resolve the
+        // pool kind from both the enriched quota and the member declaration
+        // (the quota may be unenriched in tests or legacy paths).
+        if (quota.PoolKind == QuotaPoolKind.DepletingBalance
+            || (QuotaPoolResolver.TryResolvePool(_opts, member, out _, out var resolvedPool, out _)
+                && resolvedPool?.Kind == QuotaPoolKind.DepletingBalance))
         {
             if (!quota.IsBalanceKnown)
                 return false;
@@ -2381,7 +2386,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return false;
 
         var floor = member.Billing == AgentBilling.Subscription
-            ? _quotaGatePolicy.ComputeEffectiveFloorPct(member.Agent, quota, nowUtc)
+            ? QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc)
             : _opts.MinQuotaPct;
         if (availablePct < floor)
             return false;
@@ -2438,6 +2443,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return DeadlineDrainSignal.None;
 
         var quota = precomputed.Budgeted.Quota;
+        // A depleting-balance pool has no reset instant and its percentage is
+        // not a quantity, so there is no deadline headroom to drain against.
+        if (quota.PoolKind == QuotaPoolKind.DepletingBalance)
+            return DeadlineDrainSignal.None;
+        if (QuotaPoolResolver.TryResolvePool(_opts, member, out _, out var resolvedPool, out _)
+            && resolvedPool?.Kind == QuotaPoolKind.DepletingBalance)
+            return DeadlineDrainSignal.None;
         if (!quota.IsKnown)
             return DeadlineDrainSignal.None;
 
@@ -2450,7 +2462,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (hoursToReset <= 0 || double.IsNaN(hoursToReset) || double.IsInfinity(hoursToReset))
             return DeadlineDrainSignal.None;
 
-        var floor = _quotaGatePolicy.ComputeEffectiveFloorPct(member.Agent, quota, nowUtc);
+        var floor = QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc);
         var headroom = Math.Max(0.0, quota.AvailablePct - floor);
         if (headroom <= 0)
             return DeadlineDrainSignal.None;
