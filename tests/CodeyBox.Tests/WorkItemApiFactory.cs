@@ -25,6 +25,27 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
     public List<IKnob> AdditionalKnobs { get; } = new();
     public string? TemplateDirectory { get; set; }
     public int? MaxTemplateChecks { get; set; }
+
+    /// <summary>
+    /// Optional override for the worker-progress watchdog's per-turn progress
+    /// budget (<c>CodeyBox:WorkerProgressWatchdog:ProgressTimeout</c>). Set
+    /// alongside <see cref="ItemStaleTimeoutOverride"/> when a test needs a
+    /// shorter-than-default stale window: the shipped ordering validation
+    /// requires the item-stale window to stay above the per-turn budget, so
+    /// both must move together. Null (default) leaves the configured value
+    /// untouched.
+    /// </summary>
+    public TimeSpan? WorkerProgressTimeoutOverride { get; set; }
+
+    /// <summary>
+    /// Optional override for the item-stale window
+    /// (<c>CodeyBox:WorkerProgressWatchdog:ItemStaleTimeout</c>). Tests that
+    /// exercise the stale-worker retry fence must pin this explicitly rather
+    /// than relying on the shipped default, which moves for operational
+    /// reasons (e.g. audit-budget ordering). Null (default) leaves the
+    /// configured value untouched.
+    /// </summary>
+    public TimeSpan? ItemStaleTimeoutOverride { get; set; }
     public Func<SqliteWorkItemStore, IWorkItemStore>? WorkItemStoreDecorator { get; set; }
 
     public WorkItemApiFactory(string? dbPath = null, params Project[] projects)
@@ -72,6 +93,10 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
             };
             if (MaxTemplateChecks is { } maxTemplateChecks)
                 values["CodeyBox:MaxTemplateChecks"] = maxTemplateChecks.ToString();
+            if (WorkerProgressTimeoutOverride is { } progressTimeout)
+                values["CodeyBox:WorkerProgressWatchdog:ProgressTimeout"] = progressTimeout.ToString();
+            if (ItemStaleTimeoutOverride is { } itemStaleTimeout)
+                values["CodeyBox:WorkerProgressWatchdog:ItemStaleTimeout"] = itemStaleTimeout.ToString();
             cfg.AddInMemoryCollection(values);
         });
         builder.ConfigureTestServices(services =>

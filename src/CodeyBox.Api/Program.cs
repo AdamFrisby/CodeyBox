@@ -1870,11 +1870,11 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 
-// opencode: no verified usage endpoint at integration time. The probe ships
-// as Unknown-only so the router falls onto its QuotaUnknownPolicy
-// (UseObservedFailures) for opencode members. Replace with a real
-// HTTP-backed probe once an endpoint is confirmed.
-builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapQuotaProbe(new OpencodeQuotaProbe(), sp));
+// opencode: metered out-of-tree by the codeybox.opencode-go-quota plugin,
+// which claims opencode-go members (and zen-backed copilot members) through
+// IAgentQuotaProbe.Handles. No in-tree probe is registered here so two probes
+// can never claim the same member; without the plugin loaded, opencode
+// members fall through to the NullQuotaProbe unknown path exactly as before.
 // Crock: pay-per-token Anthropic API key (with ~50% batch discount applied at
 // billing time). Anthropic exposes no per-key remaining-credit endpoint, so the
 // probe hits the token-free `GET /v1/models` to validate the key and surfaces
