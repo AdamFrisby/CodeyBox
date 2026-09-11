@@ -230,6 +230,48 @@ public static class WorkItemRecoveryPolicy
         }, recoveryAttempts, item.State);
 
     /// <summary>
+    /// Marks a checkpoint-less <see cref="WorkItemState.Working"/> item Failed
+    /// with an incremented recovery attempt. This is intentionally narrow:
+    /// its only caller is the startup sandbox-resume path, where a resume of
+    /// the item's suspended VM was attempted and failed (VM gone, provider
+    /// error, timeout) so the suspended state itself is unrecoverable — a
+    /// genuine failure of the resume, not a plain worker loss. Plain worker
+    /// death without a checkpoint is infrastructure and must use
+    /// <see cref="BuildInfrastructureRequeueWithoutCheckpoint"/> instead.
+    /// Returns false (leaving <paramref name="failed"/> equal to
+    /// <paramref name="item"/>) for rerunnable CheckAndAct / AgentControl
+    /// loops, checkpointed turns, and non-Working states, which keep their
+    /// own recovery builders.
+    /// </summary>
+    public static bool TryBuildWorkingWithoutPreemptFailure(
+        WorkItem item,
+        string lastError,
+        out WorkItem failed)
+    {
+        if (IsRerunnableCheckAndActWithoutPreempt(item)
+            || IsRerunnableAgentControlWithoutPreempt(item)
+            || item.State != WorkItemState.Working
+            || item.HasAgentTurnRecoveryBoundary)
+        {
+            failed = item;
+            return false;
+        }
+
+        failed = WithRecoveryAttempt(item with
+        {
+            State = WorkItemState.Failed,
+            LastError = lastError,
+            StartedAt = null,
+            PreemptedAt = null,
+            PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        }, item.RecoveryAttempts + 1, item.State);
+        return true;
+    }
+
+    /// <summary>
     /// Requeues a regular work-phase item whose worker died without leaving a
     /// preempt checkpoint. Losing the worker is an infrastructure event, not a
     /// work-item failure: there is no durable evidence the item itself is at

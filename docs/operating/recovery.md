@@ -76,7 +76,7 @@ The mechanics, the retained-VM fallback for Incus, and the attempt caps are in
 
 | State when worker died | Recovered to | Why |
 |---|---|---|
-| `Working` | `Queued` preserving the work branch (`PreserveWorkBranchOnQueuedPickup`), or `Working` with the preempt checkpoint when one exists | No durable mid-turn evidence means the worker loss is purely infrastructure: requeue for a fresh run **without consuming `RecoveryAttempts`** and never `Failed`. A preempt checkpoint resumes the exact interrupted turn. |
+| `Working` | `Queued` preserving the work branch (`PreserveWorkBranchOnQueuedPickup`), or `Working` with the preempt checkpoint when one exists | No durable mid-turn evidence means the worker loss is purely infrastructure: requeue for a fresh run **without consuming `RecoveryAttempts`** and never `Failed`. A preempt checkpoint resumes the exact interrupted turn. The one exception is a suspended sandbox whose resume was attempted and failed (VM gone, provider error, timeout): the suspended state itself is unrecoverable, so that item is marked `Failed` — a genuine resume failure, not a worker loss. |
 | `Planning` | `Queued` | Planning edits are discarded; rerun the planning-only turn from a clean sandbox |
 | `PlanReview` | `PlanReview` | A plan artifact already exists; rerun the auditor-backed plan-review loop, including plan rework if reviewers still block |
 | `PlanApproved` | `PlanApproved` | Re-dispatch implementation from the approved-plan boundary and count the recovery handoff |

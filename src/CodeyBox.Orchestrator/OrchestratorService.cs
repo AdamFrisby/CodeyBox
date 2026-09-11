@@ -2470,6 +2470,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         "Work item {Id} has been abandoned after {Max} recovery attempts; operator intervention required",
                         item.Id, _opts.MaxRecoveryAttempts);
                 }
+                else if (recovered.State == WorkItemState.Failed)
+                {
+                    // Safety net: no current recovery builder returns Failed,
+                    // but a terminal failure must persist without re-entering
+                    // the dispatch queue if one ever does.
+                    await _store.UpdateAsync(recovered, ct);
+                    _log.LogWarning(
+                        "Work item {Id} recovered to Failed during startup replay; persisted without re-dispatch",
+                        item.Id);
+                }
                 else if (recovered.State == WorkItemState.Done)
                 {
                     await _store.UpdateAsync(recovered, ct);

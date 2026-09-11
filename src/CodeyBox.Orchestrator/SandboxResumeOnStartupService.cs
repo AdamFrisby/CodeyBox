@@ -464,14 +464,14 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 UpdatedAt = _time.GetUtcNow(),
             };
             if (!resumeSucceeded
-                && WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
+                && WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(
                     updatedItem,
-                    $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}; re-queued for a fresh run",
-                    _time.GetUtcNow()) is { } requeued)
+                    $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
+                    out var failedItem))
             {
-                updatedItem = requeued;
+                updatedItem = failedItem;
                 _log.LogWarning(
-                    "Startup resume re-queued work item {WorkItemId} for a fresh run after sandbox {VmName} could not be resumed: {Error}",
+                    "Startup resume marked work item {WorkItemId} Failed after sandbox {VmName} could not be resumed: {Error}",
                     item.Id, vmName, resumeError ?? "unknown error");
             }
             if (promotedCheckpointRef is not null)
