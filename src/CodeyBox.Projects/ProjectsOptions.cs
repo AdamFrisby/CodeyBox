@@ -199,6 +199,14 @@ public sealed class ProjectUpstreamConfig
 
 public sealed class ProjectAuditConfig
 {
+    /// <summary>
+    /// Fallback per-iteration audit timeout (minutes) when neither the project
+    /// nor <c>Defaults:Audit</c> sets <see cref="PerIterationTimeoutMinutes"/>.
+    /// Shared with the audit-budget ordering check so config load and the
+    /// merge agree on the effective value.
+    /// </summary>
+    public const int DefaultPerIterationTimeoutMinutes = 120;
+
     public string? Profile { get; set; }
     public Dictionary<string, ProjectAuditConfig>? Profiles { get; set; }
     public int? MaxIterations { get; set; }

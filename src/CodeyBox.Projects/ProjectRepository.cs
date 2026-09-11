@@ -623,7 +623,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             defaults?.ComplexityIterationBudgets,
             project?.ComplexityIterationBudgets);
         var mergedSeverity = AuditSeverityParser.Parse(project?.FailingSeverity ?? defaults?.FailingSeverity);
-        var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 120;
+        var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? ProjectAuditConfig.DefaultPerIterationTimeoutMinutes;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
         var mergedBuildScriptRequired = project?.BuildScriptRequired ?? defaults?.BuildScriptRequired ?? false;
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;

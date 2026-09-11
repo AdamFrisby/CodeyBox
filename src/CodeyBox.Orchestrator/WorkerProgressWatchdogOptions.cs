@@ -110,15 +110,17 @@ public sealed class WorkerProgressWatchdogOptions
     ///
     /// <para>
     /// Set this comfortably above a normal phase duration so a long but
-    /// legitimately-running phase is not interrupted. Default 75 min — above
-    /// the default 60 min <see cref="ProgressTimeout"/> so the worker-progress
-    /// path catches recoverable cases first, but tight enough to free a wedged
-    /// slot before the ~90 min cases observed in production. Set to
+    /// legitimately-running phase is not interrupted. Default 150 min (2.5 h):
+    /// above the default 120 min per-iteration audit budget so a healthy long
+    /// audit iteration is not parked as stale before its own budget expires
+    /// (see <see cref="AuditBudgetOrdering"/>: auditor-idle &lt;
+    /// per-iteration &lt; item-stale &lt; sandbox wall clock), and below the
+    /// 6 h sandbox wall-clock backstop. Set to
     /// <see cref="TimeSpan.Zero"/> to disable the item-stale
     /// detector while keeping the worker-progress watchdog. Hot-reloadable.
     /// </para>
     /// </summary>
-    public TimeSpan ItemStaleTimeout { get; set; } = TimeSpan.FromMinutes(75);
+    public TimeSpan ItemStaleTimeout { get; set; } = TimeSpan.FromMinutes(150);
 
     /// <summary>
     /// How often the per-item stale-updatedAt sweep runs. The sweep walks

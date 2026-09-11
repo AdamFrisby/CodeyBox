@@ -164,6 +164,20 @@ public sealed class PipelineTuningOptions
     public TimeSpan AuditorIdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Absolute per-auditor wall-clock bound for a single auditor run,
+    /// measured from run start regardless of output or sandbox activity. The
+    /// idle guard (<see cref="AuditorIdleTimeout"/>) is liveness-aware: a run
+    /// that keeps producing output or holding live sandbox execs keeps its
+    /// slot past the quiet window. Without a second bound such a run could
+    /// live forever when it never goes quiet enough to trip idle yet never
+    /// finishes; this cap terminates it. Must be kept below the per-iteration
+    /// audit timeout (see <see cref="AuditBudgetOrdering"/>) so a single
+    /// auditor cannot outlive its iteration. Zero disables the absolute leg
+    /// (not recommended). Default 30 minutes.
+    /// </summary>
+    public TimeSpan AuditorAbsoluteTimeout { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
     /// Whether audit sandboxes prepend a lightweight <c>dotnet</c> shim that
     /// turns redundant auditor-initiated <c>dotnet build</c> and
     /// <c>dotnet test</c> invocations into an immediate successful no-op.
@@ -311,6 +325,10 @@ public sealed class PipelineTuningOptions
         if (AuditorIdleTimeout < TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(AuditorIdleTimeout), "AuditorIdleTimeout must be non-negative");
+        }
+        if (AuditorAbsoluteTimeout < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(AuditorAbsoluteTimeout), "AuditorAbsoluteTimeout must be non-negative");
         }
         if (CSharpTestPassAuditorIdleTimeout is { } idle && idle < TimeSpan.Zero)
         {
