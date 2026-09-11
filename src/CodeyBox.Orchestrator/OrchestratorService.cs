@@ -678,7 +678,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     /// <summary>
     /// Ends one quota escrow: swaps the reservation estimate for this run's
-    /// observed usage (reconcile) or drops it when nothing measurable ran.
+    /// observed usage (reconcile) when the run produced extracted token usage,
+    /// retains the estimate when the run produced only unmeasured
+    /// (elapsed-fallback) cost rows, or drops it when nothing ran at all.
     /// Only cost rows started at or after <paramref name="runStartedAt"/> count
     /// toward this dispatch — earlier rows belong to prior runs. Best-effort:
     /// every failure path still releases the lease so accounting can never
@@ -694,11 +696,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (ledger is null) return;
 
         // The reconcile read can throw OperationCanceledException (the cost
-        // store honors cancellation); the escrow must still be released, so
+        // store honors cancellation); the escrow must still be settled, so
         // the Complete call lives in the finally. Cancellation here only
         // means "no usable observation" — the estimate is released outright.
-        // Best-effort throughout: accounting must never fail a worker exit.
+        // A run with cost rows but no extracted token usage really consumed
+        // quota, so the estimate is retained as the settled cost rather than
+        // released as if the run were free. Best-effort throughout:
+        // accounting must never fail a worker exit.
         double? observed = null;
+        var hasObservedUsage = false;
+        var hasRunRows = false;
         try
         {
             try
@@ -707,10 +714,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     var rows = await _costStore.GetByWorkItemAsync(id.ToString(), ct);
                     var runRows = rows.Where(r => r.StartedAt >= runStartedAt).ToList();
-                    var summary = WorkItemUsageAggregator.Summarise(runRows);
-                    var budget = 0L;
-                    _burnEstimatorOptions?.WindowTokenBudget.TryGetValue(lease.Agent.Value, out budget);
-                    observed = QuotaReservationLedger.ToObservedPct(summary?.Total, budget);
+                    hasRunRows = runRows.Count > 0;
+                    hasObservedUsage = runRows.Any(r => r.HasExtractedTokenUsage);
+                    if (hasObservedUsage)
+                    {
+                        var summary = WorkItemUsageAggregator.Summarise(runRows);
+                        var budget = 0L;
+                        _burnEstimatorOptions?.WindowTokenBudget.TryGetValue(lease.Agent.Value, out budget);
+                        observed = QuotaReservationLedger.ToObservedPct(summary?.Total, budget);
+                    }
                 }
             }
             catch (Exception ex)
@@ -722,7 +734,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             try
             {
-                ledger.Complete(lease, observed);
+                // No cost rows (or no cost store / failed read) releases the
+                // estimate outright — nothing measurable ran. Rows without
+                // extracted usage retain the estimate; rows with extracted
+                // usage reconcile against the observed cost.
+                if (!hasRunRows)
+                    ledger.Complete(lease, observed);
+                else
+                    ledger.Complete(lease, observed, hasObservedUsage);
             }
             catch (Exception ex)
             {
@@ -3172,12 +3191,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 ReleaseRoute(releaseRoute);
             }
 
-            // Reconcile the quota escrow against this run's observed usage and
-            // release it, on the same lifecycle as the slot above: success,
-            // failure, cancellation, and deferral all converge here. Unknown
-            // or zero observed usage releases the estimate outright; a positive
-            // observation stays escrowed until a newer probe reading supersedes
-            // it. Best-effort — accounting must never fail a worker exit.
+            // Reconcile the quota escrow against this run's observed usage,
+            // on the same lifecycle as the slot above: success, failure,
+            // cancellation, and deferral all converge here. Unknown or zero
+            // observed usage with no cost rows releases the estimate outright;
+            // cost rows without extracted token usage retain the estimate as
+            // the settled cost; a positive observation stays escrowed until a
+            // newer probe reading supersedes it. Best-effort — accounting
+            // must never fail a worker exit.
             if (quotaReservation is not null)
             {
                 _quotaReservationsByWorkItem.TryRemove(id.ToString(), out _);

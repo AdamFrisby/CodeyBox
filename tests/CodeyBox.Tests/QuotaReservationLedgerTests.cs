@@ -237,6 +237,139 @@ public sealed class QuotaReservationLedgerTests
         Assert.Equal(2.0, ledger.GetOutstandingPct(member), precision: 5);
     }
 
+    // ── Settlement without extracted usage retains the estimate ──
+
+    [Fact]
+    public void Complete_WithoutExtractedUsage_RetainsEstimate()
+    {
+        // A phase whose cost row has has_extracted_token_usage = 0 and zero
+        // tokens settles at the reserved estimate, not at zero.
+        var clock = new FakeTimeProvider(T0);
+        var ledger = new QuotaReservationLedger(ReservationOptions(), clock);
+        var member = Sub(AgentKind.Copilot);
+
+        var attempt = ledger.TryReserve(member, 20.0, 10.0);
+        Assert.True(attempt.Allowed);
+        Assert.NotNull(attempt.Lease);
+        Assert.True(ledger.Complete(attempt.Lease, observedPct: 0, hasObservedUsage: false));
+        Assert.Equal(4.0, ledger.GetOutstandingPct(member), precision: 5);
+        Assert.Equal(1, ledger.GetReservationCount(member));
+
+        var stats = ledger.GetSettlementStats(member);
+        Assert.Equal(0, stats.SettledFromActuals);
+        Assert.Equal(1, stats.RetainedAtEstimate);
+        Assert.Equal(4.0, stats.RetainedAtEstimatePct, precision: 5);
+        Assert.Equal(0.0, stats.SettledFromActualsPct, precision: 5);
+    }
+
+    [Fact]
+    public void Complete_WithExtractedUsage_SettlesAtObserved()
+    {
+        var clock = new FakeTimeProvider(T0);
+        var ledger = new QuotaReservationLedger(ReservationOptions(), clock);
+        var member = Sub(AgentKind.Claude);
+
+        var attempt = ledger.TryReserve(member, 20.0, 10.0);
+        Assert.True(attempt.Allowed);
+        Assert.True(ledger.Complete(attempt.Lease, observedPct: 1.5, hasObservedUsage: true));
+        Assert.Equal(1.5, ledger.GetOutstandingPct(member), precision: 5);
+
+        var stats = ledger.GetSettlementStats(member);
+        Assert.Equal(1, stats.SettledFromActuals);
+        Assert.Equal(0, stats.RetainedAtEstimate);
+        Assert.Equal(1.5, stats.SettledFromActualsPct, precision: 5);
+    }
+
+    [Fact]
+    public void Complete_RetainedEstimate_SupersededByNewerProbeReading()
+    {
+        // A retained estimate is still-unobserved consumption: a newer probe
+        // reading retires it exactly like a reconciled tail.
+        var clock = new FakeTimeProvider(T0);
+        var ledger = new QuotaReservationLedger(ReservationOptions(), clock);
+        var member = Sub(AgentKind.Copilot);
+
+        var attempt = ledger.TryReserve(member, 20.0, 10.0);
+        Assert.True(attempt.Allowed);
+        clock.Advance(TimeSpan.FromMinutes(2));
+        Assert.True(ledger.Complete(attempt.Lease, observedPct: null, hasObservedUsage: false));
+        Assert.Equal(4.0, ledger.GetOutstandingPct(member), precision: 5);
+
+        ledger.NoteProbeReading(member, 16.0, T0 + TimeSpan.FromMinutes(3));
+        Assert.Equal(0.0, ledger.GetOutstandingPct(member), precision: 5);
+    }
+
+    [Fact]
+    public void Complete_MixedSequence_SettlesAtLeastReleasingEverything()
+    {
+        // Over a sequence mixing measured and unmeasured runs, the cumulative
+        // settled cost (retained estimates plus observed reconciliations) is
+        // never less than releasing every reservation — the pre-fix outcome
+        // for unmeasured runs, which recorded real runs as free.
+        var clock = new FakeTimeProvider(T0);
+        var ledger = new QuotaReservationLedger(ReservationOptions(estimate: 4.0), clock);
+        var member = Sub(AgentKind.Copilot);
+
+        const int measured = 3;
+        const int unmeasured = 4;
+        for (var i = 0; i < measured; i++)
+        {
+            var attempt = ledger.TryReserve(member, 100.0, 0.0);
+            Assert.True(attempt.Allowed);
+            Assert.True(ledger.Complete(attempt.Lease, observedPct: 1.5, hasObservedUsage: true));
+        }
+        for (var i = 0; i < unmeasured; i++)
+        {
+            var attempt = ledger.TryReserve(member, 100.0, 0.0);
+            Assert.True(attempt.Allowed);
+            Assert.NotNull(attempt.Lease);
+            Assert.Equal(4.0, attempt.Lease!.ReservedPct, precision: 5);
+            Assert.True(ledger.Complete(attempt.Lease, observedPct: 0, hasObservedUsage: false));
+        }
+
+        var expected = (measured * 1.5) + (unmeasured * 4.0);
+        Assert.Equal(expected, ledger.GetOutstandingPct(member), precision: 5);
+        Assert.True(expected >= measured * 1.5);
+
+        var stats = ledger.GetSettlementStats(member);
+        Assert.Equal(measured, stats.SettledFromActuals);
+        Assert.Equal(unmeasured, stats.RetainedAtEstimate);
+        Assert.Equal(measured * 1.5, stats.SettledFromActualsPct, precision: 5);
+        Assert.Equal(unmeasured * 4.0, stats.RetainedAtEstimatePct, precision: 5);
+    }
+
+    [Fact]
+    public void SettlementStats_ArePerPool()
+    {
+        var clock = new FakeTimeProvider(T0);
+        var ledger = new QuotaReservationLedger(ReservationOptions(), clock);
+        var claude = Sub(AgentKind.Claude);
+        var copilot = Sub(AgentKind.Copilot);
+
+        var a = ledger.TryReserve(claude, 100.0, 0.0);
+        Assert.True(a.Allowed);
+        Assert.True(ledger.Complete(a.Lease, observedPct: 1.5, hasObservedUsage: true));
+        var b = ledger.TryReserve(copilot, 100.0, 0.0);
+        Assert.True(b.Allowed);
+        Assert.True(ledger.Complete(b.Lease, observedPct: 0, hasObservedUsage: false));
+        var c = ledger.TryReserve(copilot, 100.0, 0.0);
+        Assert.True(c.Allowed);
+        Assert.True(ledger.Complete(c.Lease, observedPct: null, hasObservedUsage: false));
+
+        var claudeStats = ledger.GetSettlementStats(claude);
+        Assert.Equal(1, claudeStats.SettledFromActuals);
+        Assert.Equal(0, claudeStats.RetainedAtEstimate);
+
+        var copilotStats = ledger.GetSettlementStats("copilot");
+        Assert.Equal(0, copilotStats.SettledFromActuals);
+        Assert.Equal(2, copilotStats.RetainedAtEstimate);
+
+        var all = ledger.GetAllSettlementStats();
+        Assert.Equal(2, all.Count);
+        Assert.Equal(1, all["claude"].SettledFromActuals);
+        Assert.Equal(2, all["copilot"].RetainedAtEstimate);
+    }
+
     // ── Estimate bounds: missing/zero never silently reserves nothing ──
 
     [Theory]
