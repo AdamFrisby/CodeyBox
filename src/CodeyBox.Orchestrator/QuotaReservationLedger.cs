@@ -33,6 +33,7 @@ public sealed class QuotaReservationLedger
     private readonly object _sync = new();
     private readonly Dictionary<Guid, ReservationEntry> _entries = new();
     private readonly Dictionary<string, ProbeMark> _lastReading = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SettlementCounters> _settlements = new(StringComparer.Ordinal);
     private readonly Func<AgentMembership, string> _keyProvider;
     private readonly QuotaRouterOptions _options;
     private readonly TimeProvider _time;
@@ -236,6 +237,12 @@ public sealed class QuotaReservationLedger
     /// escrowed until a newer probe reading supersedes it); a missing, zero,
     /// negative, or non-finite observation releases the entry — there is no
     /// measured consumption left to protect. Idempotent; unknown ids return false.
+    /// This overload is for callers that cannot say whether the observation
+    /// came from extracted token usage; prefer
+    /// <see cref="Complete(QuotaReservationLease?, double?, bool)"/> and pass
+    /// <c>false</c> for <c>hasObservedUsage</c> when the run produced cost rows
+    /// without extracted token usage so the estimate is retained instead of
+    /// released.
     /// </summary>
     public bool Complete(QuotaReservationLease? lease, double? observedPct) =>
         lease is not null && Complete(lease.Id, observedPct);
@@ -244,11 +251,39 @@ public sealed class QuotaReservationLedger
     /// Reconciles the estimate for <paramref name="reservationId"/>; see
     /// <see cref="Complete(QuotaReservationLease?, double?)"/>.
     /// </summary>
-    public bool Complete(Guid reservationId, double? observedPct)
+    public bool Complete(Guid reservationId, double? observedPct) =>
+        Complete(reservationId, observedPct, hasObservedUsage: true);
+
+    /// <summary>
+    /// Settles the reservation for <paramref name="lease"/> against observed
+    /// usage only when <paramref name="hasObservedUsage"/> is set — i.e. at
+    /// least one cost row for the run carries extracted token usage
+    /// (<c>has_extracted_token_usage</c>). When it is not set the run really
+    /// consumed quota but nothing measured how much, so the original estimate
+    /// is retained as the settled cost (marked completed so a newer probe
+    /// reading can still supersede it) instead of releasing the whole
+    /// reservation as if the run were free. Never releases more quota than was
+    /// reserved. Idempotent; unknown ids return false.
+    /// </summary>
+    public bool Complete(QuotaReservationLease? lease, double? observedPct, bool hasObservedUsage) =>
+        lease is not null && Complete(lease.Id, observedPct, hasObservedUsage);
+
+    /// <summary>
+    /// Settles the reservation for <paramref name="reservationId"/>; see
+    /// <see cref="Complete(QuotaReservationLease?, double?, bool)"/>.
+    /// </summary>
+    public bool Complete(Guid reservationId, double? observedPct, bool hasObservedUsage)
     {
         lock (_sync)
         {
             if (!_entries.TryGetValue(reservationId, out var entry)) return false;
+            if (!hasObservedUsage)
+            {
+                entry.CompletedAt = _time.GetUtcNow();
+                RecordSettlementLocked(entry, fromActuals: false);
+                return true;
+            }
+
             if (observedPct is not { } observed
                 || !double.IsFinite(observed)
                 || observed <= 0)
@@ -259,6 +294,7 @@ public sealed class QuotaReservationLedger
 
             entry.ReservedPct = observed;
             entry.CompletedAt = _time.GetUtcNow();
+            RecordSettlementLocked(entry, fromActuals: true, settledPct: observed);
             return true;
         }
     }
@@ -353,6 +389,93 @@ public sealed class QuotaReservationLedger
         return total;
     }
 
+    /// <summary>
+    /// Settlement outcome for one pool account: how many reservations settled
+    /// from measured usage versus how many were retained at the reserved
+    /// estimate because no extracted token usage existed, plus the settled
+    /// quota-percentage totals behind each count so the proportion of
+    /// unmeasured spend is visible rather than silent. Pure snapshot.
+    /// </summary>
+    public sealed record QuotaReservationSettlementStats(
+        long SettledFromActuals,
+        long RetainedAtEstimate,
+        double SettledFromActualsPct,
+        double RetainedAtEstimatePct);
+
+    /// <summary>
+    /// Settlement counters for <paramref name="member"/>'s pool account.
+    /// </summary>
+    public QuotaReservationSettlementStats GetSettlementStats(AgentMembership member)
+    {
+        ArgumentNullException.ThrowIfNull(member);
+        return GetSettlementStats(_keyProvider(member));
+    }
+
+    /// <summary>Settlement counters for a raw pool account <paramref name="key"/>.</summary>
+    public QuotaReservationSettlementStats GetSettlementStats(string key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        lock (_sync)
+        {
+            return SnapshotStatsLocked(key);
+        }
+    }
+
+    /// <summary>
+    /// Settlement counters for every pool account that has settled at least
+    /// one reservation. Read-only snapshot.
+    /// </summary>
+    public IReadOnlyDictionary<string, QuotaReservationSettlementStats> GetAllSettlementStats()
+    {
+        lock (_sync)
+        {
+            var snapshot = new Dictionary<string, QuotaReservationSettlementStats>(
+                _settlements.Count, StringComparer.Ordinal);
+            foreach (var key in _settlements.Keys)
+                snapshot[key] = SnapshotStatsLocked(key);
+            return snapshot;
+        }
+    }
+
+    private QuotaReservationSettlementStats SnapshotStatsLocked(string key) =>
+        _settlements.TryGetValue(key, out var counters)
+            ? new QuotaReservationSettlementStats(
+                counters.SettledFromActuals,
+                counters.RetainedAtEstimate,
+                counters.SettledFromActualsPct,
+                counters.RetainedAtEstimatePct)
+            : new QuotaReservationSettlementStats(0, 0, 0, 0);
+
+    private void RecordSettlementLocked(ReservationEntry entry, bool fromActuals, double settledPct = 0)
+    {
+        if (entry.SettlementRecorded) return;
+        entry.SettlementRecorded = true;
+        if (!_settlements.TryGetValue(entry.Key, out var counters))
+        {
+            counters = new SettlementCounters();
+            _settlements[entry.Key] = counters;
+        }
+
+        if (fromActuals)
+        {
+            counters.SettledFromActuals++;
+            counters.SettledFromActualsPct += settledPct;
+        }
+        else
+        {
+            counters.RetainedAtEstimate++;
+            counters.RetainedAtEstimatePct += entry.ReservedPct;
+        }
+    }
+
+    private sealed class SettlementCounters
+    {
+        public long SettledFromActuals { get; set; }
+        public long RetainedAtEstimate { get; set; }
+        public double SettledFromActualsPct { get; set; }
+        public double RetainedAtEstimatePct { get; set; }
+    }
+
     private sealed class ReservationEntry
     {
         public Guid Id { get; set; }
@@ -360,6 +483,7 @@ public sealed class QuotaReservationLedger
         public double ReservedPct { get; set; }
         public DateTimeOffset CreatedAt { get; set; }
         public DateTimeOffset? CompletedAt { get; set; }
+        public bool SettlementRecorded { get; set; }
     }
 
     private readonly record struct ProbeMark(double AvailablePct, DateTimeOffset ObservedAt);

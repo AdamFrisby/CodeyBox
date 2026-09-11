@@ -2083,6 +2083,22 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentNetworkToleranceSnapshot>(sp =>
     return new CodeyBox.Core.AgentNetworkToleranceSnapshot(opts.AgentNetworkTolerance);
 });
 
+// ToolchainFaultSnapshot — keyed toolchain-fault signatures over gate
+// subprocess results, swappable by the hot-reload coordinator. Every gate
+// reads through this same instance so an operator edit to
+// CodeyBox:ToolchainFaults takes effect on the next gate run without a
+// process restart. A new signature for an unseen language is a config-only
+// addition.
+builder.Services.AddSingleton<CodeyBox.Core.ToolchainFaultSnapshot>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new CodeyBox.Core.ToolchainFaultSnapshot(opts.ToolchainFaults);
+});
+builder.Services.AddSingleton<CodeyBox.Core.IToolchainFaultClassifier>(sp =>
+    new CodeyBox.Core.ToolchainFaultClassifier(
+        sp.GetRequiredService<CodeyBox.Core.ToolchainFaultSnapshot>()));
+builder.Services.AddSingleton<CodeyBox.Core.IToolchainFaultRecordStore, CodeyBox.Core.InMemoryToolchainFaultRecordStore>();
+
 // ClaudeThinkingBlockSanitizerConfig — hot-reloadable toggle gating the
 // thinking-block transcript sanitiser + reactive retry path.
 builder.Services.AddSingleton<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>(sp =>
@@ -2784,11 +2800,11 @@ builder.Services.AddSingleton<IPullRequestEnumerator>(sp =>
 
 builder.Services.AddSingleton<IChangelogGenerator>(sp =>
 {
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Changelog;
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     return new ClaudeChangelogGenerator(
-        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ICompletionClient>(),
         sp.GetRequiredService<ILogger<ClaudeChangelogGenerator>>(),
-        opts);
+        () => monitor.CurrentValue.Changelog);
 });
 
 // Changelog webhook HMAC secret — mirrors the SandboxProvider enforcement pattern.
@@ -3371,19 +3387,21 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IAuditProgressStore>()));
 
-builder.Services.AddSingleton(sp =>
-{
-    var options = new CheckAndActCompletionOptions();
-    sp.GetRequiredService<IConfiguration>()
-        .GetSection("CodeyBox:CheckAndActCompletion")
-        .Bind(options);
-    return options;
-});
+builder.Services.AddOptions<CheckAndActCompletionOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:CheckAndActCompletion"));
+builder.Services.AddOptions<CompletionClientOptions>()
+    .Bind(builder.Configuration.GetSection(CompletionClientOptions.SectionName));
+builder.Services.AddSingleton<ICompletionClient>(sp =>
+    new CompletionClient(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<IOptionsMonitor<CompletionClientOptions>>(),
+        sp.GetRequiredService<ILogger<CompletionClient>>()));
 builder.Services.AddSingleton<ICheckAndActCompletionRunner>(sp =>
     new DefaultCheckAndActCompletionRunner(
         sp.GetRequiredService<IHttpClientFactory>(),
-        sp.GetRequiredService<CheckAndActCompletionOptions>(),
-        sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>()));
+        sp.GetRequiredService<IOptionsMonitor<CheckAndActCompletionOptions>>(),
+        sp.GetRequiredService<ILogger<DefaultCheckAndActCompletionRunner>>(),
+        sp.GetRequiredService<ICompletionClient>()));
 
 builder.Services.AddSingleton<WorkItemTerminalTransition>(sp => new WorkItemTerminalTransition(
     sp.GetRequiredService<IWorkItemStore>(),
@@ -3442,6 +3460,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
+    toolchainFaultClassifier: sp.GetRequiredService<IToolchainFaultClassifier>(),
+    toolchainFaultRecords: sp.GetRequiredService<IToolchainFaultRecordStore>(),
     dispatchAvailability: sp.GetService<IAgentDispatchAvailability>(),
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
@@ -3847,6 +3867,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
         testFailureAttribution: sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
+        toolchainFaults: sp.GetRequiredService<CodeyBox.Core.ToolchainFaultSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
@@ -5303,6 +5324,20 @@ namespace CodeyBox.Api
             AgentNetworkToleranceOptions.DefaultByAgent();
 
         /// <summary>
+        /// Toolchain-fault signatures over gate subprocess results. Keyed by
+        /// signature name (case-insensitive); each entry declares its match,
+        /// the fault class it denotes, and its disposition (retry, fail, or
+        /// escalate). A new signature for a language the repository has never
+        /// built requires no code change — add an entry here. Edits hot-reload
+        /// via <see cref="Core.ToolchainFaultSnapshot"/> and take effect on the
+        /// next gate run. Platform-agnostic built-ins (signal termination,
+        /// OOM kill, disk exhaustion, .NET runtime crash) always apply even
+        /// when this dictionary is empty.
+        /// </summary>
+        public Dictionary<string, ToolchainFaultSignatureOptions?> ToolchainFaults { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
         /// Operator-configured per-agent pauses. Keyed by agent kind value.
         /// Applied at startup and hot-reloaded by <see cref="AgentConfigHotReload"/>.
         /// Runtime API/work-item pauses remain persisted in SQLite separately;
@@ -6416,6 +6451,29 @@ namespace CodeyBox.Api
         /// Defaults to "claude-opus-4-7".
         /// </summary>
         public string? GeneratorModelId { get; set; }
+
+        /// <summary>
+        /// Completion endpoint for the generator LLM call. Configured default for the
+        /// previously hardcoded endpoint. Default "https://api.anthropic.com/v1/messages".
+        /// </summary>
+        public string GeneratorBaseUrl { get; set; } = "https://api.anthropic.com/v1/messages";
+
+        /// <summary>
+        /// Wire protocol for the generator LLM call. Default AnthropicMessages.
+        /// </summary>
+        public CodeyBox.Core.CompletionWireApi GeneratorWireApi { get; set; } = CodeyBox.Core.CompletionWireApi.AnthropicMessages;
+
+        /// <summary>
+        /// Optional API key for the generator LLM call. When unset, falls back to the
+        /// CODEYBOX_CLAUDE_API_KEY environment variable.
+        /// </summary>
+        public string? GeneratorApiKey { get; set; }
+
+        /// <summary>
+        /// Anthropic API version header value sent when <see cref="GeneratorWireApi"/>
+        /// is AnthropicMessages. Default "2023-06-01".
+        /// </summary>
+        public string GeneratorAnthropicVersion { get; set; } = "2023-06-01";
 
         /// <summary>
         /// Path to CHANGELOG.md within the project repo. Default "CHANGELOG.md".

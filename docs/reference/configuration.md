@@ -148,9 +148,29 @@ Hot-reloadable today:
   `TransitionHealthOptionsSnapshot`; controls the `/fleet/transition-health`
   endpoint's rolling window and "last N transitions" cap.
   See [`transition-health.md`](../operating/pipeline-metrics.md).
+- `ToolchainFaults:<name>.{FaultClass,Disposition,ExitCodes,ExitCodeAbove,StdoutContains,StderrContains,OutputContains,StdoutRegex,StderrRegex,OutputRegex}`
+  — hot-reloaded through `ToolchainFaultSnapshot`; each entry declares a match,
+  the fault class it denotes, and its disposition (`Retry`, `Fail`, `Escalate`)
+  over gate subprocess results. A retryable match re-runs the same commit via
+  the existing bounded `WaitingForTransientRetry` path without recording a
+  finding against the diff. Platform-agnostic built-ins (signal termination
+  above exit 128, OOM kill 137, disk exhaustion, .NET runtime crash
+  `0x80131506`) always apply, so a new language signature is a config-only
+  addition. Every matched classification is recorded with its signature,
+  command, and exit code; per-fault-class frequencies are queryable from
+  `IToolchainFaultRecordStore` and the `codeybox.toolchain.faults` counter.
+  Kept distinct from `TestFailureAttribution`, which consults the base branch.
 - `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
   invocation; changes affect the next work/rework/audit/merge/check-and-act
   prompt.
+- `Changelog.GeneratorBaseUrl` / `GeneratorModelId` / `GeneratorApiKey` /
+  `GeneratorWireApi` / `GeneratorAnthropicVersion` — re-read on every changelog
+  generation call.
+- `CheckAndActCompletion.*` (provider order, models, endpoint URLs, keys,
+  timeouts, custom providers) — re-read on every check-and-act completion
+  attempt.
+- `Completion.{RequestTimeoutSeconds,MaxResponseBytes,MaxPromptChars,HttpClientName}` —
+  re-read on every completion-client call.
 - `AgentStreams.{MaxFileSizeMb,RetainedDays,MaxTotalSizeMb}` — the
   `AgentStreamStore` reads options live via `IOptionsMonitor`, so per-file caps,
   the retention window, and the total-size backstop all take effect on the next
@@ -173,7 +193,6 @@ Not hot-reloadable (consumer captures the value at construction; restart require
 - `WebhookEventBus.RingBufferCapacity` — sized into the in-memory ring buffer.
 - `Webhooks[*]` — `HttpWebhookDispatcher` builds its endpoint set at startup;
   rebuilding the dispatcher mid-flight would drop pending retries.
-- `Changelog.*` — `ClaudeChangelogGenerator` snapshots its config at construction.
 - `AuditLog.Path` / `AuditLog.AuditPath` / `AuditLog.MaxFileSizeBytes` — bound
   into Serilog rolling-file sinks at startup.
 - `AgentStreamAnalysis.*` — bound into the `AgentStreamParserOptions` singleton

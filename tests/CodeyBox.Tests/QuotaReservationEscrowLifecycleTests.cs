@@ -184,6 +184,73 @@ public sealed class QuotaReservationEscrowLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task PhaseWithoutExtractedUsage_RetainsEstimateViaWorkerLifecycle()
+    {
+        // The copilot-shaped defect: the run produced a cost row with zero
+        // tokens and has_extracted_token_usage = 0. Settling must retain the
+        // reserved estimate instead of releasing the run as free.
+        var item = EscrowItem();
+        await _store.CreateAsync(item);
+
+        var opts = EscrowOptions();
+        var ledger = new QuotaReservationLedger(opts);
+        var costs = new InMemoryCostStore();
+        var pipeline = new EscrowPipeline(_store, async (run, ct) =>
+        {
+            var row = CostRow(item.Id, input: 0, output: 0, DateTimeOffset.UtcNow) with
+            {
+                HasExtractedTokenUsage = false,
+            };
+            await costs.RecordAsync(row, ct);
+            await _store.UpdateAsync(run.With(WorkItemState.Done), ct);
+        });
+        var router = new AgentClassRouter(
+            [FrontierClass()],
+            [new EscrowProbe(AgentKind.Claude, 20.0)],
+            opts,
+            NullLogger<AgentClassRouter>.Instance,
+            reservationLedger: ledger);
+        var queue = new InMemoryTaskQueue();
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            reservationLedger: ledger,
+            costStore: costs,
+            burnEstimatorOptions: BurnOptions());
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.EnqueueAsync(item.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(item.Id, DispatchTimeout));
+        Assert.True(
+            await WaitUntilAsync(
+                () => Math.Abs(ledger.GetOutstandingPct("claude") - 4.0) < 1e-5, SettleTimeout),
+            "Authorising the dispatch must escrow the 4-point estimate via the worker path.");
+        Assert.True(await pipeline.WaitForExitedAsync(item.Id, DispatchTimeout));
+
+        // The unmeasured run consumed quota: the worker-exit settle retains
+        // the estimate (still escrowed, counted as retained) instead of
+        // releasing it. Without the extraction gate this drops to zero.
+        Assert.True(
+            await WaitUntilAsync(
+                () => ledger.GetSettlementStats("claude").RetainedAtEstimate == 1, SettleTimeout),
+            "Phase without extracted usage must retain the estimate via the worker-exit settle.");
+        Assert.Equal(4.0, ledger.GetOutstandingPct("claude"), precision: 5);
+        Assert.Equal(1, ledger.GetReservationCount(new AgentMembership
+        {
+            Agent = AgentKind.Claude,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        }));
+        Assert.Equal(0, ledger.GetSettlementStats("claude").SettledFromActuals);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task PhaseFailure_ReleasesReservationViaWorkerLifecycle()
     {
         var item = EscrowItem();
