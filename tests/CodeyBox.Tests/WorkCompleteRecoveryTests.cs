@@ -380,6 +380,13 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
         var client = factory.CreateClient();
         try
         {
+            // Freeze the item past the default item-stale window: the retry
+            // fence only admits items whose UpdatedAt has not advanced inside
+            // WorkerProgressWatchdogOptions.ItemStaleTimeout, so the fixture
+            // is derived from that default (plus margin) instead of a
+            // hardcoded age that rots when the default moves.
+            var staleWindow = new WorkerProgressWatchdogOptions().ItemStaleTimeout;
+            var frozenAt = DateTimeOffset.UtcNow - staleWindow - TimeSpan.FromMinutes(30);
             var item = new WorkItem
             {
                 Id = WorkItemId.New(),
@@ -387,8 +394,8 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 Title = "wedged work",
                 Prompt = "p",
                 State = WorkItemState.Working,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
-                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                StartedAt = frozenAt,
+                UpdatedAt = frozenAt,
             };
             await factory.Store.CreateAsync(item);
 
@@ -398,7 +405,7 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 WorkerId = "wedged-http-worker",
                 HostName = "host",
                 ProcessId = 4242,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                StartedAt = frozenAt,
                 LastHeartbeatAt = DateTimeOffset.UtcNow,
                 CurrentWorkItemId = item.Id.ToString(),
             });
