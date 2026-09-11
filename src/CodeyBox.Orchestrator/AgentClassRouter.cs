@@ -35,7 +35,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // takes one Volatile.Read into a local at method start to keep a
     // dispatch's view consistent if a reload races mid-call.
     private RoutingConfig _routingConfig;
-    private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe> _probesByKind;
+    private readonly IReadOnlyList<IAgentQuotaProbe> _subscriptionProbes;
     private readonly IAgentQuotaProbe _payPerApiProbe;
     private readonly IAgentQuotaProbe _nullProbe;
     private readonly QuotaRouterOptions _opts;
@@ -113,7 +113,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
             todModifiers ?? []);
         var probeList = probes.ToList();
-        _probesByKind = AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(probeList);
+        _subscriptionProbes = AgentQuotaProbeCatalog.BuildSubscriptionProbes(probeList);
         _payPerApiProbe = probeList.OfType<PayPerApiQuotaProbe>().FirstOrDefault() ?? new PayPerApiQuotaProbe();
         _nullProbe = probeList.OfType<NullQuotaProbe>().FirstOrDefault() ?? new NullQuotaProbe();
         _opts = opts;
@@ -1789,8 +1789,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     {
         if (member.Billing == AgentBilling.PayPerApi)
             return _payPerApiProbe.GetAvailabilityAsync(member, ct);
-        if (_probesByKind.TryGetValue(member.Agent, out var probe))
-            return probe.GetAvailabilityAsync(member, ct);
+        var resolution = AgentQuotaProbeCatalog.ResolveSubscriptionProbe(_subscriptionProbes, member, _log);
+        if (resolution.Conflict is not null)
+            return Task.FromResult(AgentQuotaProbeCatalog.ConflictUnknownSnapshot(resolution.Conflict));
+        if (resolution.Probe is not null)
+            return resolution.Probe.GetAvailabilityAsync(member, ct);
         return _nullProbe.GetAvailabilityAsync(member, ct);
     }
 

@@ -155,9 +155,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // routing utilities (not real quota sources) and intentionally excluded.
     // Used by both ResolveAuditAgentRunnerAsync (audit-agent quota gate) and
     // InvokeAgentWithQuotaFallbackAsync (work-agent mid-iteration probe write-back) —
-    // a single probe set serves both because the production wiring registers one
-    // IAgentQuotaProbe singleton per agent kind regardless of caller.
-    private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _quotaProbesByKind;
+    // a single probe set serves both. Probes are resolved by member key
+    // (see AgentQuotaProbeCatalog): one probe per agent kind is the common case,
+    // but several probes may share a kind when each narrows Handles to the
+    // members it meters.
+    private readonly IReadOnlyList<IAgentQuotaProbe>? _quotaProbes;
     private readonly QuotaRouterOptions _auditQuotaOptions;
     private readonly QuotaGatePolicy _auditQuotaGatePolicy;
     private readonly IWorkItemQuestionStore? _questionStore;
@@ -402,8 +404,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // Null intentionally disables durable audit-progress history for narrow
         // test fixtures; production DI wires this dependency explicitly.
         _auditProgress = auditProgress;
-        _quotaProbesByKind = auditQuotaProbes is null ? null
-            : AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(auditQuotaProbes);
+        _quotaProbes = auditQuotaProbes is null ? null
+            : AgentQuotaProbeCatalog.BuildSubscriptionProbes(auditQuotaProbes);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _auditQuotaGatePolicy = new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
@@ -4661,7 +4663,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 quotaRejectedCount++;
 
                 DateTimeOffset? resetAt = null;
-                if (_quotaProbesByKind is not null && _quotaProbesByKind.TryGetValue(candidate.Kind, out var probe))
+                if (ResolveQuotaProbe(quotaMember).Probe is { } probe)
                 {
                     try
                     {
@@ -9996,13 +9998,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (project is null
-            || _quotaProbesByKind is null
-            || !_quotaProbesByKind.TryGetValue(agent, out var probe))
+            || _quotaProbes is null)
         {
             return false;
         }
 
         var member = BuildNoDiffQuotaProbeMember(item, project, agent, observedModelId);
+        var probe = ResolveQuotaProbe(member).Probe;
+        if (probe is null)
+        {
+            return false;
+        }
+
         try
         {
             var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
@@ -10074,7 +10081,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentMembership? preferredMember = null,
         string? requireCapability = null)
     {
-        if (_quotaProbesByKind is null || _classRouter is null)
+        if (_quotaProbes is null || _classRouter is null)
             return false;
 
         var effectiveProject = project ?? new Project
@@ -10088,7 +10095,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (preferredMember is not null
             && !IsRouterCachedExhausted(item.Id, preferredMember)
             && !await IsAgentPausedAsync(preferredMember.Agent, ct).ConfigureAwait(false)
-            && _quotaProbesByKind.TryGetValue(preferredMember.Agent, out var preferredProbe))
+            && ResolveQuotaProbe(preferredMember).Probe is { } preferredProbe)
         {
             try
             {
@@ -10128,7 +10135,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (requireCapability is not null
                 && !MemberHasClassCapability(classId, candidate, requireCapability))
                 continue;
-            if (!_quotaProbesByKind.TryGetValue(candidate.Agent, out var probe))
+            if (ResolveQuotaProbe(candidate).Probe is not { } probe)
                 continue;
 
             // A member the router already marked exhausted from a real
@@ -10174,7 +10181,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         CancellationToken ct)
     {
-        if (_quotaProbesByKind is null)
+        if (_quotaProbes is null)
             return false;
 
         var agent = item.Agent;
@@ -10185,33 +10192,36 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var probeSpeaksForPhase = string.Equals(phase, "work", StringComparison.Ordinal)
             || string.Equals(phase, "rework", StringComparison.Ordinal);
         if (probeSpeaksForPhase
-            && agent is { } agentKind && _quotaProbesByKind.TryGetValue(agentKind, out var probe)
-            && !await IsAgentPausedAsync(agentKind, ct).ConfigureAwait(false))
+            && agent is { } agentKind)
         {
             var member = BuildQuotaProbeMember(item, project, agentKind, item.ModelId);
-            // Same staleness rule as the candidate walk below: a member with
-            // a live router-cache exhaustion entry was rejected for real in
-            // this episode — its lagging healthy snapshot must not veto the
-            // park.
-            if (!IsRouterCachedExhausted(item.Id, member))
+            if (ResolveQuotaProbe(member).Probe is { } probe
+                && !await IsAgentPausedAsync(agentKind, ct).ConfigureAwait(false))
             {
-                try
+                // Same staleness rule as the candidate walk below: a member with
+                // a live router-cache exhaustion entry was rejected for real in
+                // this episode — its lagging healthy snapshot must not veto the
+                // park.
+                if (!IsRouterCachedExhausted(item.Id, member))
                 {
-                    var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
-                    var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
-                    if (quota.IsKnown)
+                    try
                     {
-                        var nowUtc = _opts.TimeProvider.GetUtcNow();
-                        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
-                        if (gate.Allow)
+                        var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+                        var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+                        if (quota.IsKnown)
                         {
-                            return true;
+                            var nowUtc = _opts.TimeProvider.GetUtcNow();
+                            var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
+                            if (gate.Allow)
+                            {
+                                return true;
+                            }
                         }
                     }
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _log.LogDebug(ex, "Probe check in TransitionWaitingForQuotaResetAsync failed for agent {Agent}", agentKind.Value);
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _log.LogDebug(ex, "Probe check in TransitionWaitingForQuotaResetAsync failed for agent {Agent}", agentKind.Value);
+                    }
                 }
             }
         }
@@ -15743,8 +15753,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return (false, "budget provider error (fail-closed)");
         var budgetPct = budget?.AvailablePct ?? -1;
 
-        if (_quotaProbesByKind is null || !_quotaProbesByKind.TryGetValue(kind, out var probe))
+        var resolution = ResolveQuotaProbe(member);
+        if (resolution is not { Probe: { } probe, Conflict: null })
         {
+            if (resolution.Conflict is not null)
+            {
+                // Equally specific probes claim this member (already logged at
+                // Error by the catalog): fail closed rather than reading from an
+                // arbitrary winner or falling through to the probe-less path.
+                return (false, "conflicting quota probes (fail-closed)");
+            }
+
             // No real probe. A healthy configured budget supplies a concrete
             // available percentage; otherwise preserve the prior probe-less
             // "allow" semantics.
@@ -16529,8 +16548,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // Mark the member exhausted in the router and the probe so the
                 // next pickup (or the rest of this pipeline) skips it.
                 _classRouter.MarkExhausted(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset);
-                if (_quotaProbesByKind is not null
-                    && _quotaProbesByKind.TryGetValue(currentMember.Agent, out var probe))
+                if (ResolveQuotaProbe(currentMember).Probe is { } probe)
                 {
                     try
                     {
@@ -21343,6 +21361,20 @@ Original merge-phase failure (JSON string, for context only):
         }, ct);
     }
 
+    /// <summary>
+    /// Resolves the quota probe serving <paramref name="member"/> by member key.
+    /// A probe that does not handle the member is never returned; an empty
+    /// resolution means no probe claims the member (legacy probe-less path), and
+    /// a conflict (already logged at Error by the catalog) means the caller must
+    /// fail closed for that member.
+    /// </summary>
+    private QuotaProbeResolution ResolveQuotaProbe(AgentMembership member)
+    {
+        if (_quotaProbes is null)
+            return new QuotaProbeResolution(null, null);
+        return AgentQuotaProbeCatalog.ResolveSubscriptionProbe(_quotaProbes, member, _log);
+    }
+
     private async Task RecordDirectQuotaParkAsync(
         WorkItem item,
         Project? project,
@@ -21356,8 +21388,7 @@ Original merge-phase failure (JSON string, for context only):
         if (member is null)
             return;
 
-        if (_quotaProbesByKind is not null
-            && _quotaProbesByKind.TryGetValue(member.Agent, out var probe))
+        if (ResolveQuotaProbe(member).Probe is { } probe)
         {
             try
             {
