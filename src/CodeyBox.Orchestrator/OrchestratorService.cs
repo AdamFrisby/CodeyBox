@@ -3335,17 +3335,34 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
         // A durable turn checkpoint is bound to the exact runner instance and
         // model that emitted its native session id. Re-routing a resumed
-        // Reworking item here would reserve one class member while the pipeline
-        // restores another member's transcript, defeating both quota accounting
-        // and same-session continuation. The direct-slot path below still
-        // applies the original member's concurrency/pause gates.
+        // Working/Reworking item here would reserve one class member while the
+        // pipeline restores another member's transcript, defeating both quota
+        // accounting and same-session continuation. The direct-slot path below
+        // still applies the original member's concurrency/pause gates.
+        //
+        // Recovery re-pickups re-resolve like first pickups: ModelId and
+        // ReasoningMode are runtime-only routing selections with no work_items
+        // columns, so anything that skips this gate dispatches with a null
+        // model (a silent downgrade to the agent default, or an outright
+        // dispatch failure where the agent has no default-model fallback).
+        // Working, Auditing, and Merging are included because a dead-worker or
+        // restart recovery can requeue an item into them (or a pickup can race
+        // recovery and observe them directly) and the pipeline may dispatch an
+        // agent turn from each: a fresh work turn from Working, a rework turn
+        // after the audit phase from Auditing, and an agentic merge-resolution
+        // turn from Merging. Resolving here also emits the quota_router.scored
+        // audit event so the recovery route stays observable. Merged and
+        // UpstreamPushing dispatch no agent turns, so they stay unrouted.
         => !item.HasAgentTurnRecoveryBoundary
         && item.State is (WorkItemState.Queued
             or WorkItemState.Planning
             or WorkItemState.PlanReview
             or WorkItemState.PlanApproved
+            or WorkItemState.Working
             or WorkItemState.WorkComplete
+            or WorkItemState.Auditing
             or WorkItemState.AuditPassed
+            or WorkItemState.Merging
             or WorkItemState.Reworking
             or WorkItemState.ReworkingForConflict);
 
