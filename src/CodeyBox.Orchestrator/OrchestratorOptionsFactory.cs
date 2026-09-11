@@ -111,6 +111,51 @@ public static class OrchestratorOptionsFactory
         return Math.Max(1, (maxConcurrentWorkers * 3 + 1) / 2);
     }
 
+    /// <summary>
+    /// Validates that the longest maintenance gate-hold the configuration
+    /// permits fits inside the dispatch loop's stuck-holder escalation window.
+    /// A permitted hold longer than
+    /// <c>AcquisitionTimeout x MaxConsecutiveDispatchGateTimeoutsBeforeEscalation</c>
+    /// means routine maintenance alone can push dispatch past escalation, so
+    /// the combination fails startup with every offending config path named.
+    /// Disabled maintenance holds no gate and is exempt.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when any option value is out of range, or when an enabled
+    /// maintenance <c>VacuumTimeout</c> exceeds the dispatch escalation window.
+    /// </exception>
+    public static void ValidateMaintenanceHoldAgainstDispatchWindow(
+        SqliteMaintenanceOptions maintenance,
+        SqliteWriteGateOptions writeGate,
+        WorkerPoolOptions workerPool)
+    {
+        ArgumentNullException.ThrowIfNull(maintenance);
+        ArgumentNullException.ThrowIfNull(writeGate);
+        ArgumentNullException.ThrowIfNull(workerPool);
+
+        if (!maintenance.Enabled)
+            return;
+
+        maintenance.Validate();
+        writeGate.Validate();
+        if (workerPool.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation < 1)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation must be >= 1");
+
+        var windowSeconds = writeGate.AcquisitionTimeout.TotalSeconds
+            * workerPool.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation;
+        if (maintenance.VacuumTimeout.TotalSeconds > windowSeconds)
+        {
+            var window = TimeSpan.FromSeconds(windowSeconds);
+            throw new InvalidOperationException(
+                $"CodeyBox:SqliteMaintenance:VacuumTimeout ({maintenance.VacuumTimeout}) exceeds the dispatch escalation window ({window} = "
+                + "CodeyBox:SqliteWriteGate:AcquisitionTimeout "
+                + $"({writeGate.AcquisitionTimeout}) x CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation "
+                + $"({workerPool.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation})); a permitted maintenance hold must fit inside the window "
+                + "so routine maintenance cannot push dispatch into stuck-holder escalation. Raise the window or lower VacuumTimeout.");
+        }
+    }
+
     public static OrchestratorOptions Build(
         int? legacyConcurrency,
         WorkerPoolOptions workerPool,

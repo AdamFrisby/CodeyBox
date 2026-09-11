@@ -76,7 +76,15 @@ Hot-reloadable today:
 - `SqliteMaintenance.{Enabled,CheckInterval,FreelistPageThreshold,VacuumTimeout}`
   — sampled on every maintenance iteration (default every 6 hours). A VACUUM
   runs only when freelist pages reach `FreelistPageThreshold` (default 100,000),
-  bounding state-database file growth from deleted/updated rows.
+  bounding state-database file growth from deleted/updated rows. `VacuumTimeout`
+  (default 45 seconds) bounds the VACUUM statement and the announced
+  maintenance gate-hold budget: while maintenance holds the write gate inside
+  that budget, dispatch pickup waits are absorbed as backoff instead of
+  counting toward stuck-holder escalation, and the hold watchdog stays quiet.
+  Startup validation rejects a `VacuumTimeout` that exceeds
+  `SqliteWriteGate:AcquisitionTimeout` x
+  `WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` — raising
+  `VacuumTimeout` for a larger database requires widening that window to match.
 - `WorkerProgressWatchdog.ProgressTimeout`,
   `WorkerProgressWatchdog.AutoRecover`,
   `WorkerProgressWatchdog.MaxRecoveryAttempts`,
@@ -386,7 +394,7 @@ Controls worker concurrency and spawn pacing.
 | `MaxConcurrentSandboxes` | `ceil(MaxConcurrentWorkers * 1.5)` | Global cap on concurrently live sandboxes/VMs across work, audit, merge, smoke, and verifier phases. Every `ISandboxProvider.CreateAsync` path shares this budget. |
 | `MinSpawnIntervalMs` | `0` | Minimum milliseconds between successive worker spawns. |
 | `DispatchGateAcquisitionBackoff` | `"00:00:01"` | Backoff between dispatch pickups after a SQLite write-gate acquisition timeout. |
-| `MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit). |
+| `MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit). Waits caused by a planned SQLite maintenance hold inside its announced budget do not count toward this threshold; a hold past its budget counts normally. |
 
 `MaxConcurrentWorkers` limits concurrent work items. It does not include
 additional sandboxes created inside an item for audit, merge/rebase, security

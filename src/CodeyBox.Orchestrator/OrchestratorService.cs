@@ -1684,6 +1684,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// kick. A sustained run of consecutive failures escalates with
     /// <see cref="SqliteWriteGatePersistentlyUnavailableException"/>, which is
     /// fatal and stops the host (non-zero exit) rather than looping silently.
+    /// Timeouts caused by a planned SQLite maintenance hold that is still
+    /// inside its announced budget are expected backoff, not stuck-holder
+    /// evidence: they are absorbed the same way but never counted toward
+    /// escalation, so a VACUUM cannot stop the host no matter how long the
+    /// configured window is. A maintenance hold past its budget — or any other
+    /// holder — still counts and escalates normally.
     /// </summary>
     internal async Task<WorkItemId?> PickNextEligibleResilientAsync(CancellationToken ct)
     {
@@ -1697,6 +1703,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             or SqliteWriteGateWaitQueueFullException
             or SqliteReadConcurrencyLimitExceededException)
         {
+            if (ex is SqliteWriteGateAcquisitionTimeoutException gateTimeout
+                && gateTimeout.IsExpectedMaintenanceHold)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Dispatch pickup deferred by expected SQLite maintenance hold (holder: {CurrentHolder}); backing off {Backoff} and retrying on the next dispatch turn.",
+                    gateTimeout.CurrentHolder ?? "unknown",
+                    _opts.DispatchGateAcquisitionBackoff);
+                await Task.Delay(_opts.DispatchGateAcquisitionBackoff, _time, ct).ConfigureAwait(false);
+                return null;
+            }
+
             var consecutive = Interlocked.Increment(ref _consecutiveDispatchGateTimeouts);
             var (waitingHolder, currentHolder) = DescribeGateWaiter(ex);
             _log.LogWarning(

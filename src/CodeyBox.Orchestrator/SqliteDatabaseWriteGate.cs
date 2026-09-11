@@ -6,6 +6,20 @@ using Microsoft.Extensions.Logging;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
+/// Classifies a SQLite write-gate holder so waiters can tell an expected,
+/// policy-bounded maintenance hold apart from a genuinely stuck writer.
+/// Maintenance holds announce their expected duration up front; while the
+/// holder is inside that budget, waiter-side escalation (dispatch host-stop,
+/// overlong-hold diagnostics) stays quiet. Past the budget the hold is
+/// treated exactly like any other stuck holder.
+/// </summary>
+internal enum WriteGateHolderKind
+{
+    Normal,
+    Maintenance,
+}
+
+/// <summary>
 /// Shared in-process write gate for a SQLite database file. SQLite WAL still
 /// permits only one writer at a time, so all stores that point at the same file
 /// must coordinate before issuing write commands on their separate connections.
@@ -111,6 +125,36 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         return new WriteGateAcquisition(WaitCoreAsync(entry, holderIdentity, ct));
     }
 
+    /// <summary>
+    /// Acquires the gate for a planned maintenance hold (e.g. a SQLite VACUUM)
+    /// whose expected duration is announced up front via
+    /// <paramref name="expectedHoldDuration"/>. Waiters observe the announced
+    /// budget through <see cref="SqliteWriteGateAcquisitionTimeoutException"/>
+    /// and suppress escalation while the holder stays inside it; the lease
+    /// watchdog likewise stays quiet until the budget is exceeded.
+    /// </summary>
+    /// <param name="expectedHoldDuration">
+    /// Maximum gate-hold the maintenance operation plans for (statement
+    /// timeout plus local overhead). Must be positive.
+    /// </param>
+    public WriteGateAcquisition WaitForMaintenanceAsync(
+        TimeSpan expectedHoldDuration,
+        CancellationToken ct = default,
+        [CallerMemberName] string memberName = "",
+        [CallerFilePath] string sourceFilePath = "")
+    {
+        if (expectedHoldDuration <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(
+                nameof(expectedHoldDuration),
+                "The expected maintenance hold duration must be positive.");
+
+        var entry = Current;
+        var holderIdentity = FormatHolderIdentity(sourceFilePath, memberName);
+        ThrowIfReentrant(entry, holderIdentity);
+        return new WriteGateAcquisition(
+            WaitCoreAsync(entry, holderIdentity, ct, WriteGateHolderKind.Maintenance, expectedHoldDuration));
+    }
+
     public void Release()
     {
         var entry = Current;
@@ -144,9 +188,14 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
     private async Task<HolderLease> WaitCoreAsync(
         Entry entry,
         string holderIdentity,
-        CancellationToken ct)
+        CancellationToken ct,
+        WriteGateHolderKind holderKind = WriteGateHolderKind.Normal,
+        TimeSpan? expectedHoldDuration = null)
     {
         var settings = _factory.GetSettings();
+        var watchdogThreshold = holderKind == WriteGateHolderKind.Maintenance && expectedHoldDuration.HasValue
+            ? expectedHoldDuration.Value
+            : settings.MaxHoldDuration;
         var sw = Stopwatch.StartNew();
         try
         {
@@ -163,7 +212,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
                     {
                         await entry.Semaphore.WaitAsync(linked.Token).ConfigureAwait(false);
                         RecordWait(sw, "acquired");
-                        return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
+                        return CreateLeaseFailureAtomic(entry, holderIdentity, settings, holderKind, watchdogThreshold);
                     }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
                     {
@@ -178,7 +227,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             }
 
             RecordWait(sw, "acquired");
-            return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
+            return CreateLeaseFailureAtomic(entry, holderIdentity, settings, holderKind, watchdogThreshold);
         }
         catch (OperationCanceledException)
         {
@@ -195,7 +244,9 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
     private HolderLease CreateLeaseFailureAtomic(
         Entry entry,
         string holderIdentity,
-        SqliteWriteGateSettings settings)
+        SqliteWriteGateSettings settings,
+        WriteGateHolderKind holderKind = WriteGateHolderKind.Normal,
+        TimeSpan? watchdogThreshold = null)
     {
         HolderLease? lease = null;
         try
@@ -203,9 +254,10 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             lease = new HolderLease(
                 entry,
                 holderIdentity,
-                settings.MaxHoldDuration,
+                watchdogThreshold ?? settings.MaxHoldDuration,
                 _factory.TimeProvider,
-                _factory.Logger);
+                _factory.Logger,
+                holderKind);
             var prior = Interlocked.CompareExchange(ref entry.Holder, lease, null);
             if (prior is null)
             {
@@ -260,7 +312,11 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         string waitingHolderIdentity,
         TimeSpan timeout)
     {
-        var currentHolder = Volatile.Read(ref entry.Holder)?.Identity;
+        var currentLease = Volatile.Read(ref entry.Holder);
+        var currentHolder = currentLease?.Identity;
+        var currentHolderKind = currentLease?.Kind ?? WriteGateHolderKind.Normal;
+        var currentHolderWithinExpectedHold = currentLease is not null
+            && currentLease.IsWithinExpectedHold(_factory.TimeProvider.GetUtcNow());
         if (Interlocked.Exchange(ref entry.TimeoutDiagnosticQueued, 1) == 0)
         {
             ThreadPool.QueueUserWorkItem<TimeoutDiagnostic>(
@@ -281,7 +337,9 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         return new SqliteWriteGateAcquisitionTimeoutException(
             waitingHolderIdentity,
             currentHolder,
-            timeout);
+            timeout,
+            currentHolderKind,
+            currentHolderWithinExpectedHold);
     }
 
     private static void ThrowIfReentrant(
@@ -362,7 +420,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         private readonly Entry _entry;
         private readonly TimeProvider _timeProvider;
         private readonly ILogger _logger;
-        private readonly TimeSpan _maxHoldDuration;
+        private readonly TimeSpan _watchdogThreshold;
         private readonly DateTimeOffset _acquiredAt;
         private ITimer? _watchdog;
         private OwnershipScope? _scope;
@@ -372,13 +430,20 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         internal HolderLease(
             Entry entry,
             string identity,
-            TimeSpan maxHoldDuration,
+            TimeSpan watchdogThreshold,
             TimeProvider timeProvider,
-            ILogger logger)
+            ILogger logger,
+            WriteGateHolderKind kind = WriteGateHolderKind.Normal)
         {
+            if (watchdogThreshold <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(
+                    nameof(watchdogThreshold),
+                    "The watchdog threshold must be positive.");
+
             _entry = entry;
             Identity = identity;
-            _maxHoldDuration = maxHoldDuration;
+            Kind = kind;
+            _watchdogThreshold = watchdogThreshold;
             _timeProvider = timeProvider;
             _logger = logger;
             _acquiredAt = timeProvider.GetUtcNow();
@@ -386,12 +451,16 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
 
         public string Identity { get; }
 
+        public WriteGateHolderKind Kind { get; }
+
+        public bool IsWithinExpectedHold(DateTimeOffset now) => now - _acquiredAt < _watchdogThreshold;
+
         public void ArmWatchdog()
         {
             _watchdog = _timeProvider.CreateTimer(
                 static state => ((HolderLease)state!).ReportOverlongHold(),
                 this,
-                _maxHoldDuration,
+                _watchdogThreshold,
                 Timeout.InfiniteTimeSpan);
         }
 
@@ -468,7 +537,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         private void ReportOverlongHoldIfNeeded()
         {
             var elapsed = _timeProvider.GetUtcNow() - _acquiredAt;
-            if (elapsed < _maxHoldDuration || Interlocked.Exchange(ref _overlongReported, 1) != 0)
+            if (elapsed < _watchdogThreshold || Interlocked.Exchange(ref _overlongReported, 1) != 0)
                 return;
 
             try
@@ -476,7 +545,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
                 _logger.LogError(
                     "SQLite write gate holder {HolderIdentity} exceeded the configured maximum hold duration {MaxHoldDuration}; held for {Elapsed}",
                     Identity,
-                    _maxHoldDuration,
+                    _watchdogThreshold,
                     elapsed);
             }
             catch
@@ -532,17 +601,44 @@ internal sealed class SqliteWriteGateAcquisitionTimeoutException : TimeoutExcept
     public SqliteWriteGateAcquisitionTimeoutException(
         string waitingHolder,
         string? currentHolder,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        WriteGateHolderKind currentHolderKind = WriteGateHolderKind.Normal,
+        bool currentHolderWithinExpectedHold = false)
         : base($"SQLite write gate acquisition by '{waitingHolder}' timed out after {timeout}; current holder: '{currentHolder ?? "unknown"}'.")
     {
         WaitingHolder = waitingHolder;
         CurrentHolder = currentHolder;
         Timeout = timeout;
+        CurrentHolderKind = currentHolderKind;
+        CurrentHolderWithinExpectedHold = currentHolderWithinExpectedHold;
     }
 
     public string WaitingHolder { get; }
     public string? CurrentHolder { get; }
     public TimeSpan Timeout { get; }
+
+    /// <summary>
+    /// Classifies the holder that was blocking the gate when the wait timed
+    /// out. A <see cref="WriteGateHolderKind.Maintenance"/> holder still inside
+    /// its announced budget is an expected, policy-bounded stall — not evidence
+    /// of a stuck writer.
+    /// </summary>
+    public WriteGateHolderKind CurrentHolderKind { get; }
+
+    /// <summary>
+    /// Whether the blocking holder was still inside its announced hold budget
+    /// when the wait timed out. Only meaningful together with
+    /// <see cref="CurrentHolderKind"/>.
+    /// </summary>
+    public bool CurrentHolderWithinExpectedHold { get; }
+
+    /// <summary>
+    /// True when the timeout was caused by a planned maintenance hold that is
+    /// still within its announced budget. Such timeouts must be absorbed with
+    /// a backoff, never counted toward stuck-holder escalation.
+    /// </summary>
+    public bool IsExpectedMaintenanceHold =>
+        CurrentHolderKind == WriteGateHolderKind.Maintenance && CurrentHolderWithinExpectedHold;
 }
 
 internal sealed class SqliteWriteGateReentrancyException : InvalidOperationException

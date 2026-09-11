@@ -16,8 +16,17 @@ namespace CodeyBox.Orchestrator;
 /// per-database write gate (which excludes every in-process writer on the
 /// same file). Reader connections are short-lived; a read racing the VACUUM
 /// fails with SQLITE_LOCKED and is deferred to the next interval rather than
-/// blocking maintenance. Lock contention surfaces as a Warning, never as a
-/// host fault.
+/// blocking maintenance.
+/// Lock contention surfaces as a Warning, never as a host fault, in both
+/// directions. When maintenance cannot ACQUIRE the gate it defers to the next
+/// interval. When maintenance HOLDS the gate while dispatch pickup waits, the
+/// hold is announced up front as a maintenance hold with an expected budget
+/// derived from <see cref="SqliteMaintenanceOptions.VacuumTimeout"/>: dispatch
+/// absorbs those waits as backoff without counting them toward stuck-holder
+/// escalation, and the lease watchdog stays quiet while the hold stays inside
+/// budget. A hold that outlives its budget — or a gate held by anyone else —
+/// escalates exactly like a stuck writer, so a wedged VACUUM still stops the
+/// host instead of stalling dispatch silently forever.
 /// </remarks>
 public sealed class SqliteDatabaseMaintenanceService : BackgroundService
 {
@@ -26,6 +35,30 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
     private readonly SqliteDatabaseWriteGateFactory _writeGateFactory;
     private readonly TimeProvider _time;
     private readonly ILogger<SqliteDatabaseMaintenanceService> _log;
+
+    /// <summary>
+    /// Extra gate-hold budget beyond
+    /// <see cref="SqliteMaintenanceOptions.VacuumTimeout"/> covering connection
+    /// setup and freelist inspection round-trips around the VACUUM statement
+    /// itself (the statement alone is bounded by <c>VacuumTimeout</c> via
+    /// <c>CommandTimeout</c>). Generous on purpose: outliving the announced
+    /// budget re-arms dispatch escalation and the hold watchdog, so the
+    /// allowance must cover pathological disks, not typical ones.
+    /// </summary>
+    internal static readonly TimeSpan HoldBudgetInspectionAllowance = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Announced gate-hold budget for a maintenance run: the VACUUM statement
+    /// timeout plus <see cref="HoldBudgetInspectionAllowance"/>, saturating
+    /// instead of overflowing on aberrant configured timeouts.
+    /// </summary>
+    internal static TimeSpan ExpectedHoldDuration(SqliteMaintenanceOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return options.VacuumTimeout > TimeSpan.MaxValue - HoldBudgetInspectionAllowance
+            ? TimeSpan.MaxValue
+            : options.VacuumTimeout + HoldBudgetInspectionAllowance;
+    }
 
     /// <param name="dbPath">State database file to maintain.</param>
     /// <param name="optionsAccessor">
@@ -102,10 +135,23 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
         if (!options.Enabled)
             return MaintenanceOutcome.Disabled;
 
+        // Fast path without the gate: freelist inspection is read-only, so a
+        // database with nothing reclaimable never contends with writers at
+        // all. A locked read falls through to the gated path and is decided
+        // under the gate instead of on a racy snapshot.
+        try
+        {
+            if (await ReadFreelistCountAsync(ct).ConfigureAwait(false) < options.FreelistPageThreshold)
+                return MaintenanceOutcome.NoAction;
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+        {
+        }
+
         using var gate = _writeGateFactory.ForPath(_dbPath);
         try
         {
-            await gate.WaitAsync(ct).ConfigureAwait(false);
+            await gate.WaitForMaintenanceAsync(ExpectedHoldDuration(options), ct).ConfigureAwait(false);
         }
         catch (SqliteWriteGateAcquisitionTimeoutException ex)
         {
@@ -118,13 +164,7 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
 
         try
         {
-            using var conn = new SqliteConnection($"Data Source={_dbPath}");
-            await conn.OpenAsync(ct).ConfigureAwait(false);
-            using (var pragma = conn.CreateCommand())
-            {
-                pragma.CommandText = "PRAGMA busy_timeout=30000;";
-                await pragma.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            }
+            using var conn = await OpenMaintenanceConnectionAsync(ct).ConfigureAwait(false);
 
             var (pageSize, pageCount, freelistCount, autoVacuum) = await InspectAsync(conn, ct).ConfigureAwait(false);
             if (freelistCount < options.FreelistPageThreshold)
@@ -173,6 +213,34 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
         {
             gate.Release();
         }
+    }
+
+    private async Task<SqliteConnection> OpenMaintenanceConnectionAsync(CancellationToken ct)
+    {
+        var conn = new SqliteConnection($"Data Source={_dbPath}");
+        try
+        {
+            await conn.OpenAsync(ct).ConfigureAwait(false);
+            using (var pragma = conn.CreateCommand())
+            {
+                pragma.CommandText = "PRAGMA busy_timeout=30000;";
+                await pragma.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            return conn;
+        }
+        catch
+        {
+            conn.Dispose();
+            throw;
+        }
+    }
+
+    private async Task<long> ReadFreelistCountAsync(CancellationToken ct)
+    {
+        using var conn = await OpenMaintenanceConnectionAsync(ct).ConfigureAwait(false);
+        var (_, _, freelistCount, _) = await InspectAsync(conn, ct).ConfigureAwait(false);
+        return freelistCount;
     }
 
     private static async Task<(long PageSize, long PageCount, long FreelistCount, long AutoVacuum)> InspectAsync(
