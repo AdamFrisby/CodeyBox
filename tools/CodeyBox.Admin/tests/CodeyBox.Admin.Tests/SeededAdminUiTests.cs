@@ -358,8 +358,9 @@ public sealed class SeededAdminUiTests : BunitContext
 
         cut.FindAll("button").First(b => b.TextContent == "dismiss").Click();
 
+        Assert.Contains("seed-sugg-1", fake.DismissedSuggestionIds);
         Assert.DoesNotContain("error-banner", cut.Markup);
-        Assert.Contains("Seeded follow-up", cut.Markup);
+        Assert.DoesNotContain("Seeded follow-up", cut.Markup);
     }
 
     // ── Work-item detail actions ──────────────────────────────────────────

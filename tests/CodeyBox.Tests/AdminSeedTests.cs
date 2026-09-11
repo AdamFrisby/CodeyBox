@@ -11,8 +11,10 @@ namespace CodeyBox.Tests;
 /// Coverage for the seeded admin-instance harness: fake-runner behavior
 /// selection and outcomes, seed-data determinism, real-store round-trips,
 /// the admin recipe shape, and the harness CLI surface. The live
-/// API+Admin.Web serving path is exercised by the E2E replay suite; these
-/// tests pin everything around it without needing a VM.
+/// API+Admin.Web serving path is currently unverified without a VM: the E2E
+/// replay suite uses an in-memory sandbox stub, and no test starts real
+/// processes or contacts servers; these tests pin everything around that
+/// gap without needing a VM.
 /// </summary>
 public sealed class AdminSeedTests
 {
@@ -30,7 +32,13 @@ public sealed class AdminSeedTests
         public StubOptionsMonitor(T value) => _value = value;
         public T CurrentValue => _value;
         public T Get(string? name) => _value;
-        public IDisposable? OnChange(Action<T, string?> listener) => null;
+        public IDisposable? OnChange(Action<T, string?> listener) => NullDisposable.Instance;
+
+        private sealed class NullDisposable : IDisposable
+        {
+            public static readonly NullDisposable Instance = new();
+            public void Dispose() { }
+        }
     }
 
     private sealed class StubSandbox : ISandbox
@@ -105,7 +113,7 @@ public sealed class AdminSeedTests
         Assert.True(result.Success);
         Assert.Contains("seeded-fake", result.Summary);
         var staged = Assert.Single(sandbox.Execs);
-        Assert.Equal(["tee", "seeded-fake-change.md"], staged.Argv);
+        Assert.Equal(["tee", "--", "seeded-fake-change.md"], staged.Argv);
         Assert.Equal("/work/repo", staged.WorkingDirectory);
         Assert.Contains("seed 42", staged.Stdin);
         Assert.NotEmpty(chunks);
@@ -211,6 +219,9 @@ public sealed class AdminSeedTests
     [InlineData("..")]
     [InlineData("sub/dir.md")]
     [InlineData("")]
+    [InlineData("-a")]
+    [InlineData("--help")]
+    [InlineData("-")]
     public void ValidateArtifactFileName_RejectsNonBareNames(string fileName)
     {
         Assert.Throws<ArgumentException>(() => SeededFakeAgentRunner.ValidateArtifactFileName(fileName));
@@ -231,16 +242,7 @@ public sealed class AdminSeedTests
         var items = AdminSeedData.BuildWorkItems(new AdminSeedSpec { Seed = 42, Now = FixedNow });
 
         var states = items.Select(i => i.State).ToHashSet();
-        foreach (var state in new[]
-        {
-            WorkItemState.Queued, WorkItemState.Working, WorkItemState.WorkComplete,
-            WorkItemState.Auditing, WorkItemState.Reworking, WorkItemState.AuditPassed,
-            WorkItemState.Merging, WorkItemState.Merged, WorkItemState.UpstreamPushing,
-            WorkItemState.Done, WorkItemState.Failed, WorkItemState.Cancelled,
-            WorkItemState.AuditFailed, WorkItemState.WaitingForQuotaReset,
-            WorkItemState.WaitingForAgentResume, WorkItemState.WaitingForTransientRetry,
-            WorkItemState.NeedsOperatorInput,
-        })
+        foreach (var state in Enum.GetValues<WorkItemState>())
         {
             Assert.Contains(state, states);
         }
@@ -307,7 +309,7 @@ public sealed class AdminSeedTests
         var seeder = new AdminSeeder();
         var summary = await seeder.SeedAsync(db, root, new AdminSeedSpec { Seed = 42, Now = FixedNow });
 
-        Assert.Equal(17, summary.WorkItemCount);
+        Assert.Equal(Enum.GetValues<WorkItemState>().Length, summary.WorkItemCount);
         Assert.True(summary.AuditReportCount > 0);
         Assert.Equal(2, summary.ReleaseCount);
         Assert.Equal(1, summary.SuggestionCount);

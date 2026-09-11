@@ -29,8 +29,9 @@ public sealed class SeededFakeQuotaProbe : IAgentQuotaProbe
     {
         ArgumentNullException.ThrowIfNull(member);
         var seed = _options.CurrentValue.Seed;
+        var successBuckets = Math.Clamp(_options.CurrentValue.DefaultSuccessBuckets, 0, 100);
         var bucket = SeededFakeBehaviorSelector.Fnv1a32($"{seed}:{member.RouteKey}") % 100;
-        var healthy = bucket < 70;
+        var healthy = bucket < successBuckets;
         var snapshot = healthy
             ? new AgentQuotaSnapshot
             {

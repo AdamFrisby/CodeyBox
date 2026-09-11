@@ -82,7 +82,7 @@ public sealed class SeededFakeAgentRunner : IAgentRunner
         {
             staged = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["tee", fileName],
+                Argv = ["tee", "--", fileName],
                 WorkingDirectory = workingDirectory,
                 Stdin = content,
                 MaxStdoutBytes = 4096,
@@ -167,6 +167,7 @@ public sealed class SeededFakeAgentRunner : IAgentRunner
             || trimmed.Contains('/') || trimmed.Contains('\\')
             || trimmed is "." or ".."
             || trimmed.Contains("..", StringComparison.Ordinal)
+            || trimmed.StartsWith('-')
             || Path.IsPathRooted(trimmed))
         {
             throw new ArgumentException(

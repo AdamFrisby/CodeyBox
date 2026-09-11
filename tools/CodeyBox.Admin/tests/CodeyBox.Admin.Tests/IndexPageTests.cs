@@ -501,9 +501,15 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult(SuggestionsOverride.FirstOrDefault(s => s.Id == id));
 
+    public List<string> DismissedSuggestionIds { get; } = [];
+
     public Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null,
         CancellationToken ct = default)
-        => Task.FromResult<SuggestionDto?>(null);
+    {
+        DismissedSuggestionIds.Add(id);
+        SuggestionsOverride.RemoveAll(s => s.Id == id);
+        return Task.FromResult<SuggestionDto?>(null);
+    }
 
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,

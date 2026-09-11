@@ -20,10 +20,12 @@ public static class SeededFakeServiceExtensions
         ArgumentNullException.ThrowIfNull(services);
         services.AddSingleton<IAgentRunner>(sp =>
             new SeededFakeAgentRunner(
-                sp.GetRequiredService<IOptionsMonitor<SeededFakeAgentOptions>>()));
+                sp.GetRequiredService<IOptionsMonitor<SeededFakeAgentOptions>>(),
+                sp.GetService<TimeProvider>() ?? TimeProvider.System));
         services.AddSingleton<IAgentQuotaProbe>(sp =>
             new SeededFakeQuotaProbe(
-                sp.GetRequiredService<IOptionsMonitor<SeededFakeAgentOptions>>()));
+                sp.GetRequiredService<IOptionsMonitor<SeededFakeAgentOptions>>(),
+                sp.GetService<TimeProvider>() ?? TimeProvider.System));
         return services;
     }
 }

@@ -47,9 +47,11 @@ public static class AdminSeedData
                 UpdatedAt = created.AddMinutes(15),
                 QueuePosition = state == WorkItemState.Queued ? i + 1 : 0,
                 WorkBranch = state is WorkItemState.Queued or WorkItemState.Failed
+                    or WorkItemState.Planning or WorkItemState.PlanReview or WorkItemState.PlanApproved
                     ? null
                     : $"seeded/work-{i:00}",
                 LastError = state is WorkItemState.Failed or WorkItemState.AuditFailed
+                    or WorkItemState.MergeConflictResolutionFailed or WorkItemState.AbandonedAfterRecoveryAttempts
                     ? "seeded failure: see audit timeline"
                     : null,
                 FailureKind = state == WorkItemState.Failed ? "normal" : null,
@@ -72,6 +74,8 @@ public static class AdminSeedData
                 continue;
             }
             var worst = item.State == WorkItemState.AuditFailed ? "blocking" : "info";
+            var auditStartedAt = item.UpdatedAt;
+            var auditEndedAt = auditStartedAt.AddMinutes(2);
             reports.Add(new AuditReport
             {
                 Id = $"seed-{spec.Seed}-{item.Id}-audit-1",
@@ -81,9 +85,9 @@ public static class AdminSeedData
                 AuditorName = "seeded-build-auditor",
                 AuditorKind = "build",
                 WorstSeverity = worst,
-                StartedAt = item.UpdatedAt,
-                EndedAt = item.UpdatedAt.AddMinutes(2),
-                DurationMs = 120_000,
+                StartedAt = auditStartedAt,
+                EndedAt = auditEndedAt,
+                DurationMs = (int)(auditEndedAt - auditStartedAt).TotalMilliseconds,
                 Findings = worst == "blocking"
                     ? [new AuditReportFinding("seed-f1", "blocking", "Seeded blocking finding", "Deterministic seeded finding.", ["seeded.cs"], [1])]
                     : [new AuditReportFinding("seed-f2", "info", "Seeded info finding", "Deterministic seeded note.", ["seeded.cs"], [2])],
@@ -164,13 +168,25 @@ public static class AdminSeedData
         WorkItemState.WaitingForAgentResume,
         WorkItemState.WaitingForTransientRetry,
         WorkItemState.NeedsOperatorInput,
+        WorkItemState.Planning,
+        WorkItemState.PlanReview,
+        WorkItemState.PlanApproved,
+        WorkItemState.ReworkingForConflict,
+        WorkItemState.MergeConflictResolutionFailed,
+        WorkItemState.AbandonedAfterRecoveryAttempts,
     ];
 
     private static string SeedPromptFor(WorkItemState state, int index) => state switch
     {
         WorkItemState.Failed => $"Seeded prompt {index:00} [seeded-fake:fail]",
+        WorkItemState.MergeConflictResolutionFailed => $"Seeded prompt {index:00} [seeded-fake:fail]",
+        WorkItemState.AbandonedAfterRecoveryAttempts => $"Seeded prompt {index:00} [seeded-fake:fail]",
         WorkItemState.WaitingForQuotaReset => $"Seeded prompt {index:00} [seeded-fake:quota]",
         WorkItemState.NeedsOperatorInput => $"Seeded prompt {index:00}: awaiting operator decision",
+        WorkItemState.Planning => $"Seeded prompt {index:00}: draft reviewable plan",
+        WorkItemState.PlanReview => $"Seeded prompt {index:00}: plan under review",
+        WorkItemState.PlanApproved => $"Seeded prompt {index:00}: plan approved, ready for work",
+        WorkItemState.ReworkingForConflict => $"Seeded prompt {index:00}: resolve merge conflict on seeded branch",
         _ => $"Seeded prompt {index:00}: implement seeded change {index:00}",
     };
 
