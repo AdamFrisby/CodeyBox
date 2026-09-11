@@ -3,6 +3,7 @@ using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
 
@@ -392,32 +393,33 @@ internal static class WorkItemEndpoints
     /// runner gates each phase by entry state, so earlier phases are
     /// skipped (their output — branch / merged base — is still in the bare
     /// repo from the prior run).
+    ///
+    /// <para>
+    /// A worker-occupied item (any <see cref="WorkItemRecoveryPolicy.WorkerOccupiedStates"/>
+    /// state, including the phase-boundary states <c>WorkComplete</c> /
+    /// <c>AuditPassed</c> / <c>Merged</c> / <c>PlanApproved</c>) whose
+    /// <c>UpdatedAt</c> has not advanced inside the item-stale window while a
+    /// worker row still binds it is also retryable: the retry first fences the
+    /// wedged worker through the same recovery the
+    /// <see cref="ItemStaleProgressWatchdog"/> sweep uses (registry-row claim,
+    /// pool-slot release, pipeline cancellation so phase finally blocks tear
+    /// down the sandbox), then resumes from the requested phase. Without this
+    /// the operator has no route back for a heartbeating-but-frozen worker
+    /// short of deleting the sandbox or restarting the orchestrator.
+    /// </para>
     /// </summary>
     private static async Task<IResult> RetryAsync(
         string id,
         RetryWorkItemRequest? body,
         IWorkItemStore store,
         WorkItemRetrier retrier,
+        IWorkerRegistry registry,
+        ItemStaleProgressWatchdog staleWatchdog,
+        IOptionsMonitor<CodeyBoxOptions> options,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
-
-        // Only resume from terminal-failed states or parked states
-        // (NeedsOperatorInput for operator triage, WaitingForQuotaReset /
-        // WaitingForTransientRetry for operator override of the schedulers,
-        // WaitingForAgentResume for operator override of per-agent runtime
-        // pause controls).
-        // Done items have nothing to retry; other non-terminal states would
-        // race the pipeline.
-        if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
-            or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
-            or WorkItemState.AbandonedAfterRecoveryAttempts
-            or WorkItemState.NeedsOperatorInput
-            or WorkItemState.WaitingForQuotaReset
-            or WorkItemState.WaitingForAgentResume
-            or WorkItemState.WaitingForTransientRetry))
-            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
 
         // Pass body.From through verbatim (including null) so the retrier can
         // auto-pick when the operator didn't specify a phase — defaulting at
@@ -428,6 +430,33 @@ internal static class WorkItemEndpoints
         var requestedFrom = string.IsNullOrWhiteSpace(body?.From)
             ? null
             : body!.From!.Trim().ToLowerInvariant();
+
+        // Only resume from terminal-failed states or parked states
+        // (NeedsOperatorInput for operator triage, WaitingForQuotaReset /
+        // WaitingForTransientRetry for operator override of the schedulers,
+        // WaitingForAgentResume for operator override of per-agent runtime
+        // pause controls).
+        // Done items have nothing to retry; other non-terminal states would
+        // race the pipeline — except a stale worker-held item, which is
+        // fenced first (see below).
+        if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
+            or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
+            or WorkItemState.AbandonedAfterRecoveryAttempts
+            or WorkItemState.NeedsOperatorInput
+            or WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForAgentResume
+            or WorkItemState.WaitingForTransientRetry))
+        {
+            var fenceError = await TryFenceStaleWorkerItemForRetryAsync(
+                item!, requestedFrom, registry, staleWatchdog, options, ct);
+            if (fenceError is not null)
+                return fenceError;
+            var fenced = await store.GetAsync(item.Id, ct);
+            if (fenced is null)
+                return Results.Conflict(new { error = "work item no longer exists" });
+            item = fenced;
+        }
+
         var (success, error, resumeState, actualFrom, openQuestions) = await retrier.RetryAsync(
             item,
             requestedFrom,
@@ -448,6 +477,79 @@ internal static class WorkItemEndpoints
         return Results.Accepted(
             $"/workitems/{item.Id}",
             new { id = item.Id.ToString(), from = requestedFrom ?? "auto", actualFrom = actualFrom!, state = resumeState!.Value.ToString() });
+    }
+
+    /// <summary>
+    /// Pure eligibility gate for operator retry of a worker-occupied item:
+    /// the item must sit in a worker-occupiable state and its
+    /// <c>UpdatedAt</c> must be frozen past the item-stale window. A zero or
+    /// negative timeout disables the gate (matches the watchdog sweep's
+    /// per-agent opt-out semantics: no window, no staleness verdict).
+    /// </summary>
+    internal static bool IsStaleWorkerRetryEligible(WorkItem item, DateTimeOffset now, TimeSpan staleTimeout)
+        => WorkItemRecoveryPolicy.IsItemStaleWatchedState(item.State)
+            && staleTimeout > TimeSpan.Zero
+            && item.UpdatedAt <= now - staleTimeout;
+
+    /// <summary>
+    /// Fences a stale worker-held item so an operator retry cannot race the
+    /// wedged pipeline. Returns null when the retry may proceed (fence
+    /// succeeded); otherwise the 409 result to return. Refuses with the
+    /// legacy message when the item is not stale-worker-held at all, and
+    /// with the recovery error when fencing fails closed (unfenceable
+    /// dispatch claim, concurrent advance, attempt budget exhausted into a
+    /// park that itself failed to write).
+    /// </summary>
+    private static async Task<IResult?> TryFenceStaleWorkerItemForRetryAsync(
+        WorkItem item,
+        string? requestedFrom,
+        IWorkerRegistry registry,
+        ItemStaleProgressWatchdog staleWatchdog,
+        IOptionsMonitor<CodeyBoxOptions> options,
+        CancellationToken ct)
+    {
+        var staleTimeout = options.CurrentValue.WorkerProgressWatchdog.ResolveItemStaleTimeout(item.Agent);
+        if (!IsStaleWorkerRetryEligible(item, DateTimeOffset.UtcNow, staleTimeout))
+        {
+            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
+        }
+
+        var idStr = item.Id.ToString();
+        var bound = false;
+        try
+        {
+            var workers = await registry.ListAsync(ct);
+            foreach (var worker in workers)
+            {
+                if (string.Equals(worker.CurrentWorkItemId, idStr, StringComparison.OrdinalIgnoreCase))
+                {
+                    bound = true;
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            return Results.Conflict(new { error = $"cannot retry stale worker-held item {item.Id}: failed to inspect worker bindings: {ex.Message}" });
+        }
+
+        if (!bound)
+        {
+            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
+        }
+
+        var sinceProgressSeconds = (long)(DateTimeOffset.UtcNow - item.UpdatedAt).TotalSeconds;
+        var recovery = await staleWatchdog.RecoverItemAsync(
+            item,
+            $"operator retry from '{requestedFrom ?? "auto"}' fenced stale worker-held item in {item.State} with no progress for {sinceProgressSeconds}s",
+            ct);
+        if (!recovery.Recovered)
+        {
+            return Results.Conflict(new { error = $"cannot retry stale worker-held item {item.Id}: {recovery.Error ?? "recovery did not transition the work item"}" });
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -1063,10 +1165,13 @@ internal static class WorkItemEndpoints
     /// <see cref="WorkItemState.NeedsOperatorInput"/> instead of looping.
     ///
     /// <para>
-    /// Refuses anything that is not in an active in-flight state (Working /
-    /// Reworking / Auditing / Merging / ReworkingForConflict /
-    /// UpstreamPushing). Use POST /workitems/{id}/retry for terminal-failed
-    /// or operator-parked items; use POST /workitems/{id}/resume for the
+    /// Refuses anything that is not in an active in-flight state (any
+    /// <see cref="WorkItemRecoveryPolicy.WorkerOccupiedStates"/> state,
+    /// including the phase-boundary states <c>WorkComplete</c> /
+    /// <c>AuditPassed</c> / <c>Merged</c> / <c>PlanApproved</c>). Use POST
+    /// /workitems/{id}/retry for terminal-failed, operator-parked, or
+    /// stale-but-worker-held items (the retry endpoint fences the wedged
+    /// worker first); use POST /workitems/{id}/resume for the
     /// operator-cancel resume path.
     /// </para>
     /// </summary>

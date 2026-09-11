@@ -1,8 +1,16 @@
+using System.Collections.Frozen;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-internal static class WorkItemRecoveryPolicy
+/// <summary>
+/// Pure recovery-state policy shared by the watchdogs, the dead-worker
+/// reaper, and the API retry/recover endpoints. Public (not internal) so the
+/// API layer gates on the same watched-state set the watchdogs enforce; the
+/// members are pure functions over Core types, so this widens no
+/// infrastructure surface.
+/// </summary>
+public static class WorkItemRecoveryPolicy
 {
     public static int NextRecoveryAttempt(WorkItem item) => item.RecoveryAttempts + 1;
 
@@ -347,7 +355,58 @@ internal static class WorkItemRecoveryPolicy
     }
 
     public static bool HandlesRecoveryState(WorkItemState state)
-        => state == WorkItemState.Working || MapToRecoveryState(state) is not null;
+        => WorkerOccupiedStates.Contains(state);
+
+    /// <summary>
+    /// Single source of truth for every <see cref="WorkItemState"/> a worker
+    /// can occupy while holding its registry row and pool slot. The worker
+    /// task owns the item for the whole pipeline run — planning, work, audit
+    /// (with rework iterations), merge, conflict rework, and upstream push —
+    /// so the phase-boundary states (<c>PlanApproved</c>, <c>WorkComplete</c>,
+    /// <c>AuditPassed</c>, <c>Merged</c>) are worker-occupied too: the
+    /// pipeline transitions through them mid-run while still holding the slot.
+    /// A worker wedged exactly on a boundary (committed work but never started
+    /// the audit loop, merged but never started the push) holds its slot
+    /// forever unless these states are watched, and heartbeating keeps every
+    /// liveness check green while it does.
+    ///
+    /// <para>
+    /// States NOT in this set are never worker-held: <c>Queued</c> is
+    /// dispatcher-owned; terminal states (<c>Done</c>, <c>Failed</c>,
+    /// <c>Cancelled</c>, <c>AuditFailed</c>,
+    /// <c>MergeConflictResolutionFailed</c>,
+    /// <c>AbandonedAfterRecoveryAttempts</c>) have no owner; parked states
+    /// (<c>NeedsOperatorInput</c>, <c>WaitingForQuotaReset</c>,
+    /// <c>WaitingForAgentResume</c>, <c>WaitingForTransientRetry</c>) wait on
+    /// an operator or scheduler, not a worker.
+    /// </para>
+    ///
+    /// <para>
+    /// Both watchdog watched-state predicates
+    /// (<see cref="WorkerProgressWatchdog.IsWatchedState"/> and
+    /// <see cref="IsItemStaleWatchedState"/>) and
+    /// <see cref="HandlesRecoveryState"/> derive from this set so the lists
+    /// cannot drift. <see cref="MapToRecoveryState"/> covers exactly the
+    /// non-<c>Working</c> members (<c>Working</c> is recovered to
+    /// <c>Queued</c> by the callers), so this set and the recovery mapping
+    /// agree on every worker-occupiable state.
+    /// </para>
+    /// </summary>
+    internal static readonly FrozenSet<WorkItemState> WorkerOccupiedStates =
+        FrozenSet.ToFrozenSet([
+            WorkItemState.Planning,
+            WorkItemState.PlanReview,
+            WorkItemState.PlanApproved,
+            WorkItemState.Working,
+            WorkItemState.Reworking,
+            WorkItemState.WorkComplete,
+            WorkItemState.Auditing,
+            WorkItemState.AuditPassed,
+            WorkItemState.Merging,
+            WorkItemState.ReworkingForConflict,
+            WorkItemState.Merged,
+            WorkItemState.UpstreamPushing,
+        ]);
 
     /// <summary>
     /// Active in-flight states a per-item stale-updatedAt detector watches.
@@ -357,18 +416,8 @@ internal static class WorkItemRecoveryPolicy
     /// stuck in a transport reconnect loop, or may have been orphaned by an
     /// orchestrator restart.
     /// </summary>
-    public static bool IsItemStaleWatchedState(WorkItemState state) => state switch
-    {
-        WorkItemState.Working => true,
-        WorkItemState.Planning => true,
-        WorkItemState.PlanReview => true,
-        WorkItemState.Reworking => true,
-        WorkItemState.Auditing => true,
-        WorkItemState.Merging => true,
-        WorkItemState.ReworkingForConflict => true,
-        WorkItemState.UpstreamPushing => true,
-        _ => false,
-    };
+    public static bool IsItemStaleWatchedState(WorkItemState state)
+        => WorkerOccupiedStates.Contains(state);
 
     /// <summary>
     /// Builds the next state for an item whose UpdatedAt has been frozen past
@@ -546,7 +595,7 @@ internal static class WorkItemRecoveryPolicy
     };
 }
 
-internal enum RecoveryProgressEvent
+public enum RecoveryProgressEvent
 {
     AuditVerdictProduced,
     AuditReworkCompleted,

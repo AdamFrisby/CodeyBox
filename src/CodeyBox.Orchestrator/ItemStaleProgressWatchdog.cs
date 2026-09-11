@@ -395,10 +395,19 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
 
         var fromState = current.State;
         var toState = recovered.State;
+        // The branch survives whenever the recovered row still points at the
+        // same branch the wedged run produced. That covers both the
+        // preserve-on-requeue path (Working → Queued with
+        // PreserveWorkBranchOnQueuedPickup) and the same-state phase-boundary
+        // recoveries (WorkComplete / AuditPassed / Merged / PlanReview /
+        // PlanApproved map to themselves, so the branch trivially rides
+        // through into the re-entered phase). Comparing against the pre-write
+        // snapshot is exact: a recovery that regenerates or clears the branch
+        // (Working without a branch, watchdog Working → Queued) reports false.
         var branchPreserved =
-            toState == WorkItemState.Queued
-            && recovered.PreserveWorkBranchOnQueuedPickup
-            && !string.IsNullOrWhiteSpace(recovered.WorkBranch);
+            !string.IsNullOrWhiteSpace(recovered.WorkBranch)
+            && string.Equals(recovered.WorkBranch, current.WorkBranch, StringComparison.Ordinal)
+            && (toState != WorkItemState.Queued || recovered.PreserveWorkBranchOnQueuedPickup);
 
         try
         {

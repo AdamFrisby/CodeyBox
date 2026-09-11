@@ -708,21 +708,19 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
     /// <summary>
     /// Worker-owned states for which lack of progress indicates a wedge.
-    /// Mirrors <see cref="DeadWorkerReaper.HandlesRecoveryState"/> but excludes
-    /// the durable phase-boundary resting states (WorkComplete / AuditPassed /
-    /// Merged) — those are queue-tail states that legitimately sit idle while
-    /// the dispatcher gets around to picking them up.
+    /// Derives from <see cref="WorkItemRecoveryPolicy.WorkerOccupiedStates"/>
+    /// — the single source of truth — so this list cannot drift from the
+    /// per-item stale detector's. The phase-boundary states
+    /// (<c>PlanApproved</c> / <c>WorkComplete</c> / <c>AuditPassed</c> /
+    /// <c>Merged</c>) are included deliberately: the pipeline transitions
+    /// through them mid-run while still holding its worker row and pool slot,
+    /// so a worker wedged exactly on a boundary (e.g. work committed but the
+    /// audit loop never started) would otherwise pin its slot forever while
+    /// heartbeating normally. Queue-tail safety comes from the caller: this
+    /// watchdog only acts on items with a live bound worker row, so a
+    /// dispatcher-owned item resting at a boundary without a worker is never
+    /// touched here.
     /// </summary>
-    internal static bool IsWatchedState(WorkItemState state) => state switch
-    {
-        WorkItemState.Planning => true,
-        WorkItemState.PlanReview => true,
-        WorkItemState.Working => true,
-        WorkItemState.Reworking => true,
-        WorkItemState.Auditing => true,
-        WorkItemState.Merging => true,
-        WorkItemState.ReworkingForConflict => true,
-        WorkItemState.UpstreamPushing => true,
-        _ => false,
-    };
+    internal static bool IsWatchedState(WorkItemState state)
+        => WorkItemRecoveryPolicy.IsItemStaleWatchedState(state);
 }
