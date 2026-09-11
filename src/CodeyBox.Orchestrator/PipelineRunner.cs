@@ -5978,8 +5978,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // mode whose signature isn't recognised yet. After N consecutive
                 // DISTINCT work items the agent is excluded; the same item
                 // retried doesn't advance the counter. Suppressed for rework
-                // passes that had zero blocking findings: with nothing to fix,
-                // an empty diff is the correct outcome, not a silent failure.
+                // passes driven by zero blocking findings or by a verdict that
+                // never completed: with nothing (finished) to fix, an empty
+                // diff is the correct outcome, not a silent failure.
                 if (!suppressNoChangesBreaker)
                     await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
 
@@ -10640,7 +10641,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     startingWorkBranchTip,
                     AuditProgressStatuses.InProgress,
                     scheduledAuditorNames,
-                    []),
+                    [],
+                    _opts.TimeProvider.GetUtcNow()),
                 ct);
 
             IReadOnlyList<AuditFinding> findings;
@@ -10722,7 +10724,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                 partialTip,
                                 AuditProgressStatuses.InProgress,
                                 scheduledAuditorNames,
-                                partialCompletedAuditors),
+                                partialCompletedAuditors,
+                                _opts.TimeProvider.GetUtcNow()),
                             progressCt).ConfigureAwait(false);
                     };
 
@@ -10811,7 +10814,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         incompleteTip,
                         AuditProgressStatuses.Incomplete,
                         scheduledAuditorNames,
-                        completedAuditors),
+                        completedAuditors,
+                        _opts.TimeProvider.GetUtcNow()),
                     ct);
                 throw new AuditUnavailableException(
                     $"audit iteration {iteration} did not reach a complete verdict before any auditor produced findings; incomplete auditor(s): {incompleteList}");
@@ -10852,7 +10856,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 workBranchTip,
                 incompleteVerdict ? AuditProgressStatuses.Incomplete : AuditProgressStatuses.Complete,
                 scheduledAuditorNames,
-                completedAuditors);
+                completedAuditors,
+                _opts.TimeProvider.GetUtcNow());
             auditHistory.Add(progressSnapshot);
             await PersistAuditProgressAsync(item, currentWorkAttemptStartedAt, progressSnapshot, ct);
 
@@ -10981,7 +10986,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item, project, runner, repoId, baseBranch, workBranch,
                 findings, iteration, reworkIterationNumber, maxIterations,
                 auditHistory, ct, hostShutdownToken,
-                auditHasBlockingFindings: blocking.Count > 0);
+                // An incomplete verdict is not a finished verdict: its findings
+                // may be partial (interrupted auditors), so an empty rework
+                // against them is not a silent-failure signal.
+                auditHasBlockingFindings: blocking.Count > 0 && !incompleteVerdict);
             if (parked) return true;
         }
         return false;
@@ -11135,7 +11143,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
             item, project, runner, repoId, baseBranch, workBranch,
             findings, last.Iteration, startIteration, maxIterations,
             auditHistory, ct, hostShutdownToken,
-            auditHasBlockingFindings: last.BlockingFindings > 0);
+            // Persisted history reaching this point is complete-only
+            // (interrupted rows are superseded on load), so IsComplete is
+            // checked defensively: a rework driven by anything less than a
+            // finished verdict must not feed the no-changes breaker.
+            auditHasBlockingFindings: last.BlockingFindings > 0 && last.IsComplete);
     }
 
     private async Task<bool> HasCompletedAuditReworkAsync(
@@ -11250,7 +11262,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             // With zero blocking findings there is nothing for
                             // the agent to change, so an empty diff is the
                             // correct outcome — not a silent-failure signal for
-                            // the no-changes circuit breaker.
+                            // the no-changes circuit breaker. The same holds
+                            // when the driving verdict never completed: its
+                            // findings may be partial.
                             suppressNoChangesBreaker: !auditHasBlockingFindings),
                         workToken: attemptCt),
                 ct,
@@ -11364,9 +11378,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         // With zero blocking findings there was nothing for the agent to
         // change, so the empty pass is a correct no-op — not a silent-failure
-        // signal. Refund the no-changes outcome the dispatch recorded so this
-        // pass does not count toward the no-changes circuit breaker.
-        if (auditHistory[^1].BlockingFindings == 0)
+        // signal. Likewise, a rework driven by a superseded (non-complete)
+        // verdict was dispatched against findings that were never finished,
+        // so its empty pass says nothing about the agent's health either.
+        // Refund the no-changes outcome the dispatch recorded so neither pass
+        // counts toward the no-changes circuit breaker.
+        if (auditHistory[^1].BlockingFindings == 0 || !auditHistory[^1].IsComplete)
             _availability?.RefundNoChangesOutcome(emptyEx.Agent, item.Id);
 
         var converging = HasAuditConvergenceProgress(auditHistory);
@@ -11561,7 +11578,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item.Id, last.Iteration, last.MaxIterations, auditLogReason);
             AuditLog.WorkItemTransitioned(
                 item.Id,
-                $"NeedsOperatorInput ({auditLogReason})");
+                $"NeedsOperatorInput ({auditLogReason}; {PipelineRunner.AuditVerdictLineage(last, _opts.TimeProvider.GetUtcNow())})");
             CodeyBoxMeters.PipelineTransitions.Add(1,
                 new KeyValuePair<string, object?>("to_state", WorkItemState.NeedsOperatorInput.ToString()));
 
@@ -11587,7 +11604,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? workBranchTip,
         string status = AuditProgressStatuses.Complete,
         IReadOnlyList<string>? scheduledAuditors = null,
-        IReadOnlyList<string>? completedAuditors = null)
+        IReadOnlyList<string>? completedAuditors = null,
+        DateTimeOffset? recordedAt = null)
     {
         return new AuditProgressSnapshot(
             iteration,
@@ -11600,7 +11618,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             workBranchTip,
             status,
             scheduledAuditors,
-            completedAuditors);
+            completedAuditors,
+            recordedAt);
     }
 
     private static AuditProgressSnapshot ToAuditProgressSnapshot(AuditProgressRecord record)
@@ -11615,7 +11634,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             record.WorkBranchTip,
             record.Status,
             record.ScheduledAuditors,
-            record.CompletedAuditors);
+            record.CompletedAuditors,
+            record.RecordedAt);
 
     private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
         => BuildAuditProgressSignals(history).Count > 0;
@@ -11689,12 +11709,41 @@ public sealed partial class PipelineRunner : IPipelineRunner
             .Select(ToAuditProgressSnapshot)
             .ToList();
 
-        if (snapshots is [.., { IsComplete: false, Findings.Count: 0 }])
-        {
-            snapshots.RemoveAt(snapshots.Count - 1);
-        }
+        // Rows that never reached a complete verdict were left behind by an
+        // interrupted run (host restart, cancellation, shutdown drain). They
+        // are superseded here — re-audited from the current work branch —
+        // never read as the current verdict. Without this, an in_progress row
+        // frozen by a host restart is treated as authoritative history: the
+        // loop skips its iteration and a downstream rework is dispatched
+        // against findings that may no longer exist.
+        var (kept, superseded) = DropSupersededAuditVerdicts(snapshots);
+        if (superseded > 0)
+            _log.LogInformation(
+                "Superseded {Count} non-complete audit-progress row(s) for work item {Id}; re-auditing from the current work branch",
+                superseded,
+                item.Id);
 
-        return snapshots;
+        return kept;
+    }
+
+    /// <summary>
+    /// Pure core of the interrupted-history reconciliation: drops snapshots
+    /// that never reached a complete verdict, preserving iteration order.
+    /// Returns the surviving complete verdicts plus the superseded count.
+    /// </summary>
+    internal static (IReadOnlyList<AuditProgressSnapshot> Kept, int Superseded) DropSupersededAuditVerdicts(
+        IEnumerable<AuditProgressSnapshot> snapshots)
+    {
+        var kept = new List<AuditProgressSnapshot>();
+        var superseded = 0;
+        foreach (var snapshot in snapshots)
+        {
+            if (snapshot.IsComplete)
+                kept.Add(snapshot);
+            else
+                superseded++;
+        }
+        return (kept, superseded);
     }
 
     private async Task PersistAuditProgressAsync(
@@ -11708,6 +11757,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         try
         {
+            // The snapshot's stamp is the verdict's recorded time; fall back to
+            // the injected clock only for snapshots built without one so the
+            // stored row and the in-memory history agree on the verdict's age.
+            var recordedAt = progress.RecordedAt ?? _opts.TimeProvider.GetUtcNow();
             await _auditProgress.RecordAuditProgressAsync(
                 item.Id,
                 currentWorkAttemptStartedAt,
@@ -11722,8 +11775,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     progress.WorkBranchTip,
                     progress.Status,
                     progress.ScheduledAuditors,
-                    progress.CompletedAuditors),
-                DateTimeOffset.UtcNow,
+                    progress.CompletedAuditors,
+                    recordedAt),
+                recordedAt,
                 ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -11733,6 +11787,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex);
         }
     }
+
+    /// <summary>
+    /// Pure core of the merge-gate verdict selection: the latest COMPLETE
+    /// record for the highest iteration. Rows left in_progress/incomplete by
+    /// an interrupted run are superseded — never authoritative — so the gate
+    /// ignores them instead of blocking the merge on a frozen partial verdict
+    /// or, worse, accepting one.
+    /// </summary>
+    internal static AuditProgressRecord? SelectMergeGateVerdict(IReadOnlyList<AuditProgressRecord> records)
+        => records
+            .Select((Record, Index) => (Record, Index))
+            .Where(r => r.Record.Iteration > 0 && AuditProgressStatuses.IsComplete(r.Record.Status))
+            .OrderByDescending(r => r.Record.Iteration)
+            .ThenByDescending(r => r.Index)
+            .Select(r => r.Record)
+            .FirstOrDefault();
 
     private async Task EnsureCurrentRealAuditPassBeforeMergeAsync(
         WorkItem item,
@@ -11765,31 +11835,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex);
         }
 
-        // Select the record for the highest iteration in this work-attempt
-        // partition. On a resume that discards a passing/escaped prior verdict,
+        // Select the latest COMPLETE record for the highest iteration in this
+        // work-attempt partition. Rows left in_progress/incomplete by an
+        // interrupted run (host restart, cancellation) are superseded — never
+        // authoritative — so the gate ignores them instead of blocking the
+        // merge on a frozen partial verdict or, worse, accepting one.
+        // On a resume that discards a passing/escaped prior verdict,
         // RunAuditLoopAsync purges the stale prior-run rows before the fresh
         // audit restarts at iteration 1, so the highest surviving iteration is
         // always this pickup's audit — max-iteration and "most recent" agree.
         // The store's UNIQUE(work_item_id, work_attempt_started_at, iteration)
         // key means at most one row per iteration; the Index tiebreaker is a
         // defensive no-op kept only to make the ordering total.
-        var latest = records
-            .Select((Record, Index) => (Record, Index))
-            .Where(r => r.Record.Iteration > 0)
-            .OrderByDescending(r => r.Record.Iteration)
-            .ThenByDescending(r => r.Index)
-            .Select(r => r.Record)
-            .FirstOrDefault();
+        var latest = SelectMergeGateVerdict(records);
         if (latest is null)
         {
             throw new AuditUnavailableException(
                 $"work item {item.Id} cannot merge because no completed audit progress record exists for this pickup");
-        }
-
-        if (!AuditProgressStatuses.IsComplete(latest.Status))
-        {
-            throw new AuditUnavailableException(
-                $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} is {latest.Status}");
         }
 
         if (latest.BlockingFindings > 0)
@@ -12028,7 +12090,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             : value[..AuditEscalationFindingDescriptionLimit] + "...";
 
     internal static string BuildAuditMaxIterationEscalationMessage(
-        IReadOnlyList<AuditProgressSnapshot> history)
+        IReadOnlyList<AuditProgressSnapshot> history,
+        DateTimeOffset? now = null)
     {
         var last = history[^1];
         var remaining = BuildBlockingFindingSummary(last);
@@ -12036,7 +12099,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return
             $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
             $"{remaining.Count} blocking finding(s) remain ({last.NonBlockingFindings} non-blocking advisory finding(s) also recorded)" +
-            (remaining.Count == 0 ? "." : $": {remaining.Summary}");
+            (remaining.Count == 0 ? "." : $": {remaining.Summary}") +
+            $" {FormatAuditVerdictProvenance(last, now)}";
     }
 
     internal static string BuildEmptyReworkEscalationMessage(
@@ -12044,7 +12108,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentKind agent,
         int reworkIterationNumber,
         int attempts,
-        bool converging)
+        bool converging,
+        DateTimeOffset? now = null)
     {
         var last = history[^1];
         var remaining = BuildBlockingFindingSummary(last);
@@ -12059,7 +12124,39 @@ public sealed partial class PipelineRunner : IPipelineRunner
             $"Rework agent {agent.Value} produced no changes on rework iteration {reworkIterationNumber} {retrySummary}; " +
             $"{progressSummary}. Parked for operator review instead of hard-failing on a blank in-budget rework pass. " +
             $"{remaining.Count} blocking finding(s) remain after audit iteration {last.Iteration}/{last.MaxIterations} ({last.NonBlockingFindings} non-blocking advisory finding(s) also recorded)" +
-            (remaining.Count == 0 ? "." : $": {remaining.Summary}");
+            (remaining.Count == 0 ? "." : $": {remaining.Summary}") +
+            $" {FormatAuditVerdictProvenance(last, now)}";
+    }
+
+    /// <summary>
+    /// Provenance suffix for park reasons: the driving verdict's iteration,
+    /// status, and age, so a stale verdict is distinguishable from a current
+    /// one without querying the database. Age is omitted when the snapshot
+    /// predates recorded-at tracking rather than reported as zero.
+    /// </summary>
+    internal static string FormatAuditVerdictProvenance(AuditProgressSnapshot snapshot, DateTimeOffset? now = null)
+        => $"({AuditVerdictLineage(snapshot, now)})";
+
+    internal static string AuditVerdictLineage(AuditProgressSnapshot snapshot, DateTimeOffset? now = null)
+    {
+        var lineage = $"audit iteration {snapshot.Iteration}/{snapshot.MaxIterations}, status {snapshot.Status}";
+        if (snapshot.RecordedAt is not { } recordedAt)
+            return lineage;
+        var reference = now ?? DateTimeOffset.UtcNow;
+        return $"{lineage}, recorded {FormatVerdictAge(reference - recordedAt)} ago";
+    }
+
+    internal static string FormatVerdictAge(TimeSpan age)
+    {
+        if (age < TimeSpan.Zero)
+            return "0s";
+        if (age.TotalSeconds < 60)
+            return $"{(int)age.TotalSeconds}s";
+        if (age.TotalMinutes < 60)
+            return $"{(int)age.TotalMinutes}m";
+        if (age.TotalHours < 24)
+            return $"{(int)age.TotalHours}h";
+        return $"{(int)age.TotalDays}d";
     }
 
     internal static (int Count, string Summary) BuildBlockingFindingSummary(
@@ -12093,6 +12190,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 .Select(ToEscalationWebhookFinding)
                 .ToList(),
             ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
+            VerdictStatus = last.Status,
+            VerdictRecordedAt = last.RecordedAt,
         };
     }
 
@@ -12104,6 +12203,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 Iteration = h.Iteration,
                 BlockingFindings = h.BlockingFindings,
                 NonBlockingFindings = h.NonBlockingFindings,
+                Status = h.Status,
+                RecordedAt = h.RecordedAt,
                 BlockingFindingsDetails = h.BlockingFindingsDetails
                     .Take(AuditEscalationFindingsPerIterationLimit)
                     .Select(ToEscalationWebhookFinding)
@@ -21741,7 +21842,12 @@ internal sealed record AuditProgressSnapshot(
     string? WorkBranchTip,
     string Status = AuditProgressStatuses.Complete,
     IReadOnlyList<string>? ScheduledAuditors = null,
-    IReadOnlyList<string>? CompletedAuditors = null)
+    IReadOnlyList<string>? CompletedAuditors = null,
+    // When this verdict was recorded. Stamped at build time for live-loop
+    // snapshots and echoed from the store for loaded history, so park reasons
+    // can report the verdict's age and status without a database query. Null
+    // when unknown (e.g. test fixtures that predate the field).
+    DateTimeOffset? RecordedAt = null)
 {
     public bool IsComplete => AuditProgressStatuses.IsComplete(Status);
 }

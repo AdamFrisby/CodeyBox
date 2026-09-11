@@ -535,7 +535,43 @@ public sealed class WorkItemRetrier
         }
 
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
+        await InvalidatePriorAuditProgressAsync(item.Id, ct);
         return new WorkItemRetryResult(true, null, resumeState, actualFrom, null);
+    }
+
+    /// <summary>
+    /// Best-effort invalidation of the item's prior audit-progress rows when it
+    /// returns to a runnable state. A retry must re-evaluate the current work
+    /// branch from scratch: without this, the next audit pickup reuses a stale
+    /// verdict (possibly days old, or recorded by a since-fixed auditor) from
+    /// the same work-attempt partition, and a no-change rework driven by that
+    /// stale verdict feeds the no-changes circuit breaker. Failures here never
+    /// fail the retry itself — the next audit still supersedes non-complete
+    /// rows and the merge gate only accepts complete verdicts — but they are
+    /// logged so a stuck stale row is visible.
+    /// </summary>
+    private async Task InvalidatePriorAuditProgressAsync(WorkItemId workItemId, CancellationToken ct)
+    {
+        if (_auditProgress is null)
+            return;
+
+        try
+        {
+            var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(workItemId, ct);
+            var purged = await _auditProgress.PurgeAuditProgressAsync(workItemId, currentWorkAttemptStartedAt, ct);
+            if (purged > 0)
+                _log.LogInformation(
+                    "Invalidated {Count} prior audit-progress row(s) for retried work item {Id}; next audit re-evaluates from the current work branch",
+                    purged,
+                    workItemId);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Failed to invalidate prior audit progress for retried work item {Id}; next audit proceeds against stale rows with supersede guards",
+                workItemId);
+        }
     }
 
     private static bool TryGetUsableAgentTurnCheckpoint(
@@ -905,18 +941,21 @@ public sealed class WorkItemRetrier
         }
 
         // from=rework / from=audit / from=merge bypass the work phase, so the existing
-        // commits on the work branch must already have durable workflow-owned
-        // audit progress. Audit reports are diagnostic rows and may be
+        // commits on the work branch must already have a durable COMPLETE
+        // workflow-owned audit verdict. Rows left in_progress/incomplete by an
+        // interrupted run are superseded, not verdicts: accepting them here
+        // would resume the pipeline against findings that were never finished.
+        // Audit reports are diagnostic rows and may be
         // retention-swept, so they are deliberately not used as a resume
         // precondition.
         if (!resumingBeforeWork && resumeState != WorkItemState.Queued && _auditProgress is not null)
         {
             var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
             var progress = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
-            if (progress.Count == 0)
+            if (!progress.Any(p => p.Iteration > 0 && AuditProgressStatuses.IsComplete(p.Status)))
                 return new ResumeOutcome(
                     ResumeStatus.Conflict,
-                    $"cannot resume from '{requestedFrom}': work branch has no durable audit progress. Use from=work to produce an auditable rework iteration first.",
+                    $"cannot resume from '{requestedFrom}': work branch has no durable completed audit verdict. Use from=work to produce an auditable rework iteration first.",
                     null,
                     null);
         }

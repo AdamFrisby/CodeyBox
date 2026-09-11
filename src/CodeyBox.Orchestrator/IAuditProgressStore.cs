@@ -87,7 +87,12 @@ public sealed record AuditProgressRecord(
     string? WorkBranchTip,
     string Status = AuditProgressStatuses.Complete,
     IReadOnlyList<string>? ScheduledAuditors = null,
-    IReadOnlyList<string>? CompletedAuditors = null);
+    IReadOnlyList<string>? CompletedAuditors = null,
+    // Echo of the row's recorded_at. Populated on store reads so a verdict's
+    // age is visible without a second query; null for in-memory builds that
+    // have not been persisted yet and for rows written before this field
+    // existed. Never part of the row's identity.
+    DateTimeOffset? RecordedAt = null);
 
 public static class AuditProgressStatuses
 {
