@@ -7205,14 +7205,19 @@ namespace CodeyBox.Api
         /// size rolling produces several segments in a single day, and so the
         /// total footprint stays bounded at
         /// <c>RetainedFileCountLimit x MaxFileSizeBytes</c> regardless of write
-        /// rate. Must be >= 1. Default: 14. Hot-reloadable.
+        /// rate. Retention also evicts by bytes, so oversized segments
+        /// inherited from older settings age out until the bound holds again.
+        /// Must be >= 1. Default: 14. Hot-reloadable.
         /// </summary>
         public int RetainedFileCountLimit { get; set; } = 14;
 
         /// <summary>
         /// Per-file size cap before rolling to a new segment. Combined with
         /// the day boundary, this is what actually keeps individual files
-        /// readable with tail / less. Must be >= 1 MiB. Default: 100 MiB.
+        /// readable with tail / less. It also caps each individual log record:
+        /// a record that would not fit is truncated (with a marker) rather
+        /// than written whole, which is what keeps the total footprint bound
+        /// exact. Must be >= 1 MiB. Default: 100 MiB.
         /// Hot-reloadable.
         /// </summary>
         public long MaxFileSizeBytes { get; set; } = 100 * 1024 * 1024;
