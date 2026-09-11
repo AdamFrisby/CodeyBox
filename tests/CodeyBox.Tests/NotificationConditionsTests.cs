@@ -308,7 +308,7 @@ public sealed class NotificationConditionsTests
     }
 
     [Fact]
-    public async Task AllQuotasExhausted_AvailablePctNegative_ShortCircuitsFalse()
+    public async Task AllQuotasExhausted_UnknownWithFloorInForce_CountsAsDenied()
     {
         var probes = new IAgentQuotaProbe[]
         {
@@ -320,7 +320,35 @@ public sealed class NotificationConditionsTests
             probes, QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
-        // claude probe returns -1 (unknown) — short-circuits to false.
+        // claude probe returns -1 (unknown) with a 10% floor in force — the
+        // gate fails closed, so unknown counts as denied; codex at 3% is
+        // below the floor too. All denied → true.
+        Assert.True(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_UnknownWithZeroFloor_ShortCircuitsFalse()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), -1),
+            new StubQuotaProbe(new AgentKind("codex"), 3),
+        };
+        var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes,
+            QuotaGate(new QuotaRouterOptions
+            {
+                // Zero floors so the unknown branch reaches UnknownPolicy
+                // (UseObservedFailures with no failure store allows).
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
+            }),
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        // claude probe returns -1 (unknown) with no floor in force — the gate
+        // allows it, so quotas are not all exhausted.
         Assert.False(await condition.EvaluateAsync(CancellationToken.None));
     }
 

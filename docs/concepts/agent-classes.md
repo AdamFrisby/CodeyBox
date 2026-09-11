@@ -451,8 +451,10 @@ On every pickup attempt for a work item with an `AgentClassId`:
      instance, cache result for `QuotaCacheTtl` (default 60 s).
    - If `ModelId` is set and the snapshot includes `PerModel[ModelId]`, gate
      on the model bucket instead of the overall quota.
-   - Unknown (`AvailablePct < 0`) follows `UnknownPolicy` (`UseObservedFailures`
-     by default).
+   - Unknown (`AvailablePct < 0`) fails closed while the agent's effective
+     floor is non-zero (the reserve must be protected when the probe cannot
+     produce a reading); with a zero effective floor it follows `UnknownPolicy`
+     (`UseObservedFailures` by default).
    - Pick the first member that the quota gate allows.
 6. If no member qualifies (all exhausted):
    - Class has at least one Subscription member → `ShouldWait = true`,
@@ -495,8 +497,10 @@ Both probes return `AvailablePct = -1` on:
 - Unrecognised JSON shape
 - Token not configured
 
-`AvailablePct = -1` follows `UnknownPolicy`. The default is
-`UseObservedFailures`, not blind fail-open.
+`AvailablePct = -1` fails closed while the agent's effective floor is non-zero
+(the default floors are non-zero, so unknowns are refused and the reserve is
+protected). With a zero effective floor it follows `UnknownPolicy`. The
+default is `UseObservedFailures`, not blind fail-open.
 
 ## Quota router tuning
 
@@ -549,7 +553,7 @@ Configured under `CodeyBox:QuotaRouter`:
 | `FloorByAgent` | `{}` | Optional per-agent floor overrides keyed by agent kind. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted agents and omitted fields use the global values. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a probe result. Keeps the pickup loop cheap under load. |
-| `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
+| `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses when no effective floor is in force: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. A non-zero effective floor fails closed before this policy applies. |
 | `IntraKindRoutingPolicy` | `MostQuotaFirst` | How to order quality-eligible members: `MostQuotaFirst`, `RoundRobin`, `Sticky`, or `DeadlineAwareDrain`. Hot-reloadable. |
 | `DrainAggressiveness` | `1.0` | Multiplier used by `DeadlineAwareDrain` to run ahead of even per-cycle pacing. Higher values bias toward burning the full rate-window allowance before the deadline. |
 | `ExpectedResets` | `{}` | Optional per-agent expected free/manual reset declarations. The policy uses the sooner of live probe reset and next expected reset. |

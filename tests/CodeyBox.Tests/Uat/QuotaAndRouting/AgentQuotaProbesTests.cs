@@ -254,7 +254,13 @@ public sealed class AgentQuotaProbesTests
             probes: [new StaticQuotaProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = -42, Notes = "negative availability" })],
             options: new QuotaRouterOptions
             {
-                MinQuotaPct = 10,
+                // Zero floors so the unknown branch reaches UnknownPolicy:
+                // this test pins that a malformed reading is treated as
+                // unknown, not the reserve floor (a non-zero floor fails
+                // closed before the policy applies).
+                MinQuotaPct = 0,
+                StartFloorPct = 0,
+                EndFloorPct = 0,
                 UnknownPolicy = QuotaUnknownPolicy.FailOpen,
             });
 
