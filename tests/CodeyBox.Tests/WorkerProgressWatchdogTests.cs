@@ -57,10 +57,21 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     [Theory]
     [InlineData(WorkItemState.Planning, true)]
     [InlineData(WorkItemState.PlanReview, true)]
-    [InlineData(WorkItemState.PlanApproved, false)]
+    [InlineData(WorkItemState.PlanApproved, true)]
     [InlineData(WorkItemState.Working, true)]
-    [InlineData(WorkItemState.WorkComplete, false)]
-    public void IsWatchedState_IncludesActivePlanningStates(WorkItemState state, bool expected)
+    [InlineData(WorkItemState.Reworking, true)]
+    [InlineData(WorkItemState.WorkComplete, true)]
+    [InlineData(WorkItemState.Auditing, true)]
+    [InlineData(WorkItemState.AuditPassed, true)]
+    [InlineData(WorkItemState.Merging, true)]
+    [InlineData(WorkItemState.ReworkingForConflict, true)]
+    [InlineData(WorkItemState.Merged, true)]
+    [InlineData(WorkItemState.UpstreamPushing, true)]
+    [InlineData(WorkItemState.Queued, false)]
+    [InlineData(WorkItemState.Done, false)]
+    [InlineData(WorkItemState.Failed, false)]
+    [InlineData(WorkItemState.NeedsOperatorInput, false)]
+    public void IsWatchedState_CoversAllWorkerOccupiedStates(WorkItemState state, bool expected)
     {
         Assert.Equal(expected, WorkerProgressWatchdog.IsWatchedState(state));
     }
@@ -1288,8 +1299,6 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     [InlineData(WorkItemState.Cancelled)]
     [InlineData(WorkItemState.AuditFailed)]
     [InlineData(WorkItemState.Queued)]
-    [InlineData(WorkItemState.WorkComplete)]
-    [InlineData(WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.WaitingForQuotaReset)]
     public async Task Watchdog_NonWatchedStates_TakesNoActionEvenIfStale(WorkItemState state)
     {

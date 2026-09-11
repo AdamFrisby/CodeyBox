@@ -703,11 +703,17 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
     // ── Watched-state coverage ──────────────────────────────────────────────
 
     [Theory]
+    [InlineData(WorkItemState.Planning)]
+    [InlineData(WorkItemState.PlanReview)]
+    [InlineData(WorkItemState.PlanApproved)]
     [InlineData(WorkItemState.Working)]
     [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.Merging)]
     [InlineData(WorkItemState.ReworkingForConflict)]
+    [InlineData(WorkItemState.Merged)]
     [InlineData(WorkItemState.UpstreamPushing)]
     public async Task Sweep_EveryActiveInFlightState_IsWatched(WorkItemState state)
     {
@@ -717,25 +723,32 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         await _watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        // The exact target depends on the state's MapToRecoveryState mapping,
-        // but it must have left the in-flight state.
-        Assert.NotEqual(state, after!.State);
+        Assert.NotNull(after);
+        // Phase-boundary states (PlanReview / PlanApproved / WorkComplete /
+        // AuditPassed / Merged) map to themselves, so recovery is proven by
+        // the consumed attempt + refreshed stamp, not by a state change.
+        Assert.Equal(1, after!.RecoveryAttempts);
+        Assert.Contains("item-stale", after.LastError);
+        Assert.Equal(1, _queue.Count);
     }
 
     [Theory]
     [InlineData(WorkItemState.Queued)]
-    [InlineData(WorkItemState.WorkComplete)]
-    [InlineData(WorkItemState.AuditPassed)]
-    [InlineData(WorkItemState.Merged)]
     [InlineData(WorkItemState.Done)]
     [InlineData(WorkItemState.Failed)]
+    [InlineData(WorkItemState.Cancelled)]
+    [InlineData(WorkItemState.AuditFailed)]
+    [InlineData(WorkItemState.MergeConflictResolutionFailed)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts)]
     [InlineData(WorkItemState.NeedsOperatorInput)]
     [InlineData(WorkItemState.WaitingForQuotaReset)]
+    [InlineData(WorkItemState.WaitingForAgentResume)]
+    [InlineData(WorkItemState.WaitingForTransientRetry)]
     public async Task Sweep_NonWatchedState_IsLeftAlone(WorkItemState state)
     {
-        // Phase-boundary resting states and terminal/parked states are
-        // dispatcher- or operator-owned; the per-item watchdog must not
-        // re-recover them even if UpdatedAt is ancient.
+        // Terminal, parked, and dispatcher-owned states are never
+        // worker-held; the per-item watchdog must not re-recover them even if
+        // UpdatedAt is ancient.
         var item = MakeItem(state, updatedAt: _time.GetUtcNow().AddMinutes(-100));
         await _store.CreateAsync(item);
 
@@ -743,6 +756,7 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(state, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
     }
 
     // ── Independent of pool-level spawn health ──────────────────────────────
