@@ -46,44 +46,37 @@ public sealed class OpencodeQuotaFailureDetector : IAgentQuotaFailureDetector
         new(@"\busage limit reached\b[\s\S]*?opencode\.ai/workspace/", RegexOptions.IgnoreCase | RegexOptions.Compiled),
     ];
 
-    private static readonly (string Pattern, QuotaFailureKind Kind)[] Patterns =
+    private static readonly QuotaFailurePattern[] Patterns =
     [
         // Transient provider refusals relayed verbatim by the CLI when the
         // backing endpoint (subscription or BYOK) throughput-limits the
-        // request, e.g. "429 Error from provider (Console Go): Upstream
-        // request failed: [rate_limit_exceeded] Rate limit exceeded." These
-        // clear on their own, so they park on the rate-limit backoff rather
-        // than terminating the item as a generic agent failure. Numeric 429
-        // rows stay anchored with companion text so bare "429" mentions in
-        // code under review do not trip a false positive.
-        ("rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded),
-        ("rate limit exceeded", QuotaFailureKind.RateLimitExceeded),
-        ("429 Too Many Requests", QuotaFailureKind.RateLimitExceeded),
-        ("429 Error", QuotaFailureKind.RateLimitExceeded),
-        ("HTTP 429", QuotaFailureKind.RateLimitExceeded),
-        ("status 429", QuotaFailureKind.RateLimitExceeded),
-        ("API Error: 429", QuotaFailureKind.RateLimitExceeded),
-        ("too many requests", QuotaFailureKind.RateLimitExceeded),
+        // request — owned by SharedRateLimitPatterns so Copilot and opencode
+        // stay in step. Checked before the hard-quota rows so a refusal
+        // carrying both shapes parks on the rate-limit backoff rather than
+        // terminating the item as a generic agent failure. Numeric 429 rows
+        // stay anchored with companion text so bare "429" mentions in code
+        // under review do not trip a false positive.
+        .. Agents.SharedRateLimitPatterns.ProviderRateLimitPatterns,
         // HTTP 402 = "Payment Required". opencode surfaces this when the
         // subscription has been billed up to its hard cap. Anchor with the
         // HTTP prefix or full status text so bare "402" mentions in code
         // under review (line numbers, enum values, error catalogues) don't
         // trip a false positive.
-        ("HTTP 402", QuotaFailureKind.LimitReached),
-        ("402 Payment Required", QuotaFailureKind.LimitReached),
-        ("insufficient credits", QuotaFailureKind.LimitReached),
-        ("limit reached", QuotaFailureKind.LimitReached),
+        new("HTTP 402", QuotaFailureKind.LimitReached),
+        new("402 Payment Required", QuotaFailureKind.LimitReached),
+        new("insufficient credits", QuotaFailureKind.LimitReached),
+        new("limit reached", QuotaFailureKind.LimitReached),
         // "quota" alone matches reviewing-quota-code text; require a verb
         // that conveys exhaustion. Add more shapes reactively as real
         // opencode failures are observed.
-        ("quota exceeded", QuotaFailureKind.LimitReached),
-        ("quota exhausted", QuotaFailureKind.LimitReached),
-        ("quota reached", QuotaFailureKind.LimitReached),
-        ("monthly quota", QuotaFailureKind.LimitReached),
+        new("quota exceeded", QuotaFailureKind.LimitReached),
+        new("quota exhausted", QuotaFailureKind.LimitReached),
+        new("quota reached", QuotaFailureKind.LimitReached),
+        new("monthly quota", QuotaFailureKind.LimitReached),
         // Anchor with the HTTP status so the bare word "Unauthorized" in
         // model output (e.g. discussing access-control code) doesn't trigger.
-        ("401 Unauthorized", QuotaFailureKind.Unauthorized),
-        ("API Error: 401", QuotaFailureKind.Unauthorized),
+        new("401 Unauthorized", QuotaFailureKind.Unauthorized),
+        new("API Error: 401", QuotaFailureKind.Unauthorized),
     ];
 
     public QuotaDetection? Detect(string? stderr, string? stdout)

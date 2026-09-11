@@ -22,35 +22,29 @@ namespace CodeyBox.Agents.Copilot;
 /// <c>429 Too Many Requests</c>, <c>429 Error</c>) rather than matching a bare
 /// <c>429</c>, so model output that merely cites the number (retry counts,
 /// code under review) is not misclassified as a provider refusal. Quota nouns
-/// likewise require a verb of exhaustion.</para>
+/// likewise require a verb of exhaustion. The rate-limit rows themselves live
+/// in <see cref="Agents.SharedRateLimitPatterns"/> — shared with the opencode
+/// detector — so only the hard-quota rows below are Copilot-specific.</para>
 /// </summary>
 public sealed class CopilotQuotaFailureDetector : IAgentQuotaFailureDetector
 {
     public AgentKind Kind => AgentKind.Copilot;
 
-    private static readonly (string Pattern, QuotaFailureKind Kind)[] Patterns =
+    private static readonly QuotaFailurePattern[] Patterns =
     [
-        // Transient provider refusals: short-window throughput / concurrency
-        // limits that clear on their own. Checked before the hard-quota rows
-        // so a refusal carrying both shapes parks on the rate-limit backoff.
-        ("rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded),
-        ("rate limit exceeded", QuotaFailureKind.RateLimitExceeded),
-        ("429 Too Many Requests", QuotaFailureKind.RateLimitExceeded),
-        ("429 Error", QuotaFailureKind.RateLimitExceeded),
-        ("HTTP 429", QuotaFailureKind.RateLimitExceeded),
-        ("status 429", QuotaFailureKind.RateLimitExceeded),
-        ("API Error: 429", QuotaFailureKind.RateLimitExceeded),
-        ("too many requests", QuotaFailureKind.RateLimitExceeded),
+        // Transient provider refusals relayed verbatim by the CLI — owned by
+        // SharedRateLimitPatterns so Copilot and opencode stay in step.
+        .. SharedRateLimitPatterns.ProviderRateLimitPatterns,
         // Hard account caps: subscription quota actually spent. The spaced
         // "usage limit" prose form is deliberately absent — "usage_limit"
         // (machine shape) plus "limit reached" (exhaustion verb) cover the
         // realistic CLI shapes without flagging model output that merely
         // discusses usage limits.
-        ("quota exceeded", QuotaFailureKind.LimitReached),
-        ("quota exhausted", QuotaFailureKind.LimitReached),
-        ("usage_limit", QuotaFailureKind.LimitReached),
-        ("limit reached", QuotaFailureKind.LimitReached),
-        ("insufficient credits", QuotaFailureKind.LimitReached),
+        new("quota exceeded", QuotaFailureKind.LimitReached),
+        new("quota exhausted", QuotaFailureKind.LimitReached),
+        new("usage_limit", QuotaFailureKind.LimitReached),
+        new("limit reached", QuotaFailureKind.LimitReached),
+        new("insufficient credits", QuotaFailureKind.LimitReached),
     ];
 
     public QuotaDetection? Detect(string? stderr, string? stdout)
