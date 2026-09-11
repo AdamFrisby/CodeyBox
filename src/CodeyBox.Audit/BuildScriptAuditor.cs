@@ -93,7 +93,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!SandboxDeferralGuard.IsDeferral(ex))
         {
             throw new AuditUnavailableException(
                 $"could-not-verify: build.sh could not execute: {SingleLineSummary(ex.Message)}",
@@ -156,7 +156,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!SandboxDeferralGuard.IsDeferral(ex))
         {
             throw new AuditUnavailableException(
                 $"could-not-verify: {operation} failed: {SingleLineSummary(ex.Message)}",
