@@ -258,6 +258,7 @@ AgentClass 'frontier-coding' resolved members: [claude/claude-opus-4-7(Subscript
 |-------|----------|-------------|
 | `Agent` | yes | Agent kind value: `claude`, `codex`, `copilot`, `gemini`, or any custom kind. |
 | `InstanceId` | no | Stable instance id for pooling multiple credentials of the same kind. `acct-a` resolves to route key `agent/acct-a`; a full `agent/acct-a` route key is also accepted when its prefix matches `Agent`. |
+| `Pool` | no | Quota pool this member draws from (must name a `CodeyBox:QuotaRouter:Pools` entry). Members of one pool share a single reading, floor, and reservation escrow. Null keeps legacy per-agent keying. See `docs/operating/quota.md` ("Quota pools"). |
 | `Billing` | yes | `Subscription` or `PayPerApi` (see below). |
 | `ModelId` | no | Optional model override passed to the agent CLI as `--model`. |
 | `CredentialFilePath` | no | Inline host OAuth/auth JSON file for this member instance. |

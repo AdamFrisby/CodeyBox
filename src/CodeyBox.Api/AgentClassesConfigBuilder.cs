@@ -112,6 +112,7 @@ public static class AgentClassesConfigBuilder
                     Agent = agentKind,
                     Billing = billing,
                     InstanceId = instanceId,
+                    Pool = string.IsNullOrWhiteSpace(m.Pool) ? null : m.Pool.Trim(),
                     CredentialReference = credentialReference,
                     ProviderReference = providerReference,
                     ModelId = m.ModelId,

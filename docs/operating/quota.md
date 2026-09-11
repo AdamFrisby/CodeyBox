@@ -78,6 +78,78 @@ applies to Subscription members only — PayPerApi members fall back to the fixe
 local budget, not an agent quota window. Unknown windows (no `ResetAt`)
 also fall back to `MinQuotaPct`.
 
+## Quota pools: metering one account, not one agent kind
+
+Quota readings, floors, and reservation escrows are keyed by agent kind by
+default. That keying is wrong in both directions when the mapping between
+agent kinds and accounts is not one-to-one: two class members backed by the
+same subscription are metered as two independent quantities (so a reserve
+can be consumed twice over), and one agent kind backed by two distinct
+accounts cannot express two independent floors.
+
+A quota pool names one underlying account or subscription. Membership is
+operator-declared in configuration — never derived by fingerprinting
+credential material:
+
+```json
+"QuotaRouter": {
+  "Pools": {
+    "team-sub": { "Kind": "ResettingWindow" },
+    "prepaid": { "Kind": "DepletingBalance", "BalanceUnit": "credits", "ReservationEstimate": 50 }
+  },
+  "FloorByPool": {
+    "team-sub": { "StartFloorPct": 20, "EndFloorPct": 5, "MinQuotaPct": 5 },
+    "prepaid": { "MinBalance": 500 }
+  }
+}
+```
+
+```json
+"AgentClasses": [
+  { "Id": "frontier", "Members": [
+    { "Agent": "claude", "InstanceId": "acct-a", "Pool": "team-sub" },
+    { "Agent": "codex", "InstanceId": "acct-b", "Pool": "team-sub" },
+    { "Agent": "codex", "InstanceId": "metered", "Pool": "prepaid" }
+  ] }
+]
+```
+
+Members of one pool share a single probe reading, a single floor, and a
+single reservation escrow within a dispatch pass. `FloorByPool` sits
+alongside `FloorByAgent`, with a documented resolution order: for a pool
+member the pool-resolved and agent-resolved floors are each computed against
+the globals and the HIGHER wins, so neither reserve can be undercut; with
+only one present it applies directly; with neither, the globals apply.
+Configuration carrying only `FloorByAgent` behaves exactly as before.
+
+A member that names an unconfigured pool fails closed at dispatch: it is
+refused (never dispatched on an unkeyed reading) and the reason names the
+member and the unresolved pool. `/quota` reports each member's `pool` and
+`poolKind` so operators can see which members share a meter.
+
+## Replenishment kinds: resetting windows vs depleting balances
+
+Two kinds of allowance are in use and they are not interchangeable:
+
+- `ResettingWindow` — a subscription allowance that returns to full at a
+  known instant. Its reading is a proportion, its floor is a percentage,
+  and its reset time is meaningful.
+- `DepletingBalance` — prepaid credit that never resets and may be topped
+  up by an arbitrary amount at any time. Its meaningful quantity is the
+  absolute remaining value; a proportional floor is not interpretable
+  against a balance (the denominator is whatever was last paid in), so a
+  balance pool's floor must be expressed in the same absolute unit as its
+  reading (`MinBalance`).
+
+Unit mismatches are rejected at configuration load: a percentage floor on a
+balance pool, or an absolute `MinBalance` on a resetting-window pool, fails
+with an error naming the pool and the expected unit.
+
+A balance pool at zero is exhausted, not awaiting replenishment: dispatch
+refuses it terminally and the item fails with a top-up pointer — it is
+never parked waiting for a reset that will never arrive, and a balance pool
+is never reported with a reset instant.
+
 All knobs are hot-reloadable via the `CodeyBox:QuotaRouter` config block —
 edits to `~/codeybox-extra.json` take effect on the next gate decision.
 `IntraKindRoutingPolicy` controls how eligible class members are ordered after

@@ -4214,6 +4214,17 @@ app.MapGet("/quota", async (
 
         representedProbeKeys.Add((member.Agent, member.ModelId));
         var snapshot = await probe.GetAvailabilityAsync(member, ct);
+        var poolName = QuotaPoolResolver.NormalizePoolName(member.Pool);
+        string? poolKind = null;
+        if (poolName is not null
+            && options.Pools.TryGetValue(poolName, out var poolOpts)
+            && poolOpts is not null)
+            poolKind = poolOpts.Kind.ToString();
+        // A depleting-balance pool is never reported with a reset instant,
+        // even if the probe echoed one.
+        var latestSnapshot = poolKind == nameof(QuotaPoolKind.DepletingBalance)
+            ? QuotaPoolMasks.WithoutResetInstants(snapshot)
+            : snapshot;
         var recentFailuresForProbe = failures
             .Where(f => f.Agent == member.Agent && f.ObservedAt >= now - options.ObservedFailureWindow)
             .ToList();
@@ -4241,7 +4252,9 @@ app.MapGet("/quota", async (
             classDisplayName,
             billing = member.Billing.ToString(),
             modelId = member.ModelId,
-            latestSnapshot = snapshot,
+            pool = poolName,
+            poolKind,
+            latestSnapshot,
             observedFailuresLast60m = failures
                 .Where(f => f.Agent == member.Agent)
                 .GroupBy(f => new { f.ProjectId, f.ModelId, f.FailureKind })
@@ -6700,6 +6713,13 @@ namespace CodeyBox.Api
         public string Agent { get; set; } = string.Empty;
         /// <summary>Optional instance id or route key. Null means the default per-kind instance.</summary>
         public string? InstanceId { get; set; }
+        /// <summary>
+        /// Optional quota pool this member draws from (must name an entry in
+        /// <c>CodeyBox:QuotaRouter:Pools</c>). Members of one pool share a
+        /// single reading, floor, and reservation escrow. Null keeps legacy
+        /// per-agent keying. An unknown name fails closed at dispatch.
+        /// </summary>
+        public string? Pool { get; set; }
         /// <summary>"Subscription" or "PayPerApi".</summary>
         public string Billing { get; set; } = "Subscription";
         /// <summary>Optional model override, e.g. "claude-opus-4-7".</summary>
@@ -6812,6 +6832,28 @@ namespace CodeyBox.Api
         /// agents on the global reserve. Hot-reloadable.
         /// </summary>
         public Dictionary<string, QuotaRouterFloorConfig> FloorByAgent { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Operator-declared quota pools, keyed by pool name
+        /// (case-insensitive). Each pool names one underlying account or
+        /// subscription; class members join a pool via their <c>Pool</c>
+        /// reference and then share one reading, one floor, and one
+        /// reservation escrow. Membership is operator-declared here — never
+        /// derived from credential material. Empty (the default) keeps legacy
+        /// per-agent keying. Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, QuotaPoolConfig> Pools { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Per-pool floor overrides keyed by pool name (case-insensitive),
+        /// alongside <see cref="FloorByAgent"/>. For a pool member the higher
+        /// of the pool-resolved and agent-resolved floors wins; with only one
+        /// present it applies directly. Resetting-window pools use the
+        /// percentage fields; depleting-balance pools use <c>MinBalance</c>
+        /// (absolute units) — mixing units is rejected at load.
+        /// Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, QuotaPoolFloorConfig> FloorByPool { get; set; }
             = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
@@ -6985,6 +7027,64 @@ namespace CodeyBox.Api
 
         /// <summary>Optional ramp-window length in seconds for this agent.</summary>
         public int? RampWindowSeconds { get; set; }
+    }
+
+    /// <summary>
+    /// Operator-declared quota pool: one underlying account or subscription.
+    /// Bound from <c>CodeyBox:QuotaRouter:Pools:&lt;name&gt;</c>.
+    /// </summary>
+    public sealed class QuotaPoolConfig
+    {
+        /// <summary>
+        /// Replenishment kind: <c>ResettingWindow</c> (subscription allowance
+        /// that returns to full; readings and floors are percentages) or
+        /// <c>DepletingBalance</c> (prepaid credit that never resets; readings
+        /// and floors are absolute values). Case-insensitive. Default
+        /// <c>ResettingWindow</c>.
+        /// </summary>
+        public string Kind { get; set; } = "ResettingWindow";
+
+        /// <summary>
+        /// Human-readable unit for absolute balances on a depleting-balance
+        /// pool (e.g. <c>"credits"</c>). Informational only.
+        /// </summary>
+        public string? BalanceUnit { get; set; }
+
+        /// <summary>
+        /// Estimated cost of one dispatch in the pool's native unit
+        /// (percentage points for resetting-window pools, absolute balance
+        /// units for depleting-balance pools). Null falls back to the global
+        /// reservation estimate. Set explicitly for balance pools.
+        /// </summary>
+        public double? ReservationEstimate { get; set; }
+    }
+
+    /// <summary>
+    /// Per-pool quota floor override. Which fields are legal depends on the
+    /// pool's kind: resetting-window pools use the percentage fields,
+    /// depleting-balance pools use <see cref="MinBalance"/>. Mixing units is
+    /// rejected at configuration load.
+    /// </summary>
+    public sealed class QuotaPoolFloorConfig
+    {
+        /// <summary>Fallback percentage floor (resetting-window pools).</summary>
+        public double? MinQuotaPct { get; set; }
+
+        /// <summary>Early-window ramp percentage floor (resetting-window pools).</summary>
+        public double? StartFloorPct { get; set; }
+
+        /// <summary>Late-window ramp percentage floor (resetting-window pools).</summary>
+        public double? EndFloorPct { get; set; }
+
+        /// <summary>Optional ramp-window length in seconds (resetting-window pools).</summary>
+        public int? RampWindowSeconds { get; set; }
+
+        /// <summary>
+        /// Absolute floor in the pool's balance units (depleting-balance
+        /// pools). Dispatch is refused terminally at or below this value.
+        /// Defaults to 0 when unset.
+        /// </summary>
+        public double? MinBalance { get; set; }
     }
 
     /// <summary>
