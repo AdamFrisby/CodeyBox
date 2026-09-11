@@ -4164,6 +4164,7 @@ ChangelogEndpoints.Map(app);
 FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
+ExecutorEndpoints.Map(app);
 AgentSupervisionEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 SandboxResourceUsageEndpoints.Map(app);
