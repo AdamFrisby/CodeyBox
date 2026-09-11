@@ -4716,6 +4716,19 @@ public sealed class SqliteWorkItemStore :
         return result;
     }
 
+    private static void RegisterIfNotBusy(SqliteConnection conn, Action<SqliteConnection> register)
+    {
+        try
+        {
+            register(conn);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 5)
+        {
+            // Pooled handle already defines the function and has an active
+            // statement using it; the existing identical definition serves.
+        }
+    }
+
     private async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -4726,9 +4739,14 @@ public sealed class SqliteWorkItemStore :
         // writer: dispatch/restore-retry reads moved off the write gate still
         // evaluate codeybox_* predicates. Functions are per-connection state
         // in Microsoft.Data.Sqlite, so every new connection registers them.
-        RegisterQuotaRetryPhaseFunctions(conn);
-        RegisterAgentInvolvementFailureFunction(conn);
-        RegisterRestoreRetryEligibilityFunction(conn);
+        // The pool may hand back a handle that already defines them while
+        // another reader still runs a statement using one (e.g. a polling
+        // GetAsync racing the quota scheduler); redefining then fails with
+        // SQLITE_BUSY (error 5). The pooled definition is identical (same
+        // static delegates), so keep it instead of failing the read.
+        RegisterIfNotBusy(conn, RegisterQuotaRetryPhaseFunctions);
+        RegisterIfNotBusy(conn, RegisterAgentInvolvementFailureFunction);
+        RegisterIfNotBusy(conn, RegisterRestoreRetryEligibilityFunction);
 
         using var pragma = conn.CreateCommand();
         // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- PRAGMA takes no parameters; the interpolated value is a compile-time constant, not caller input
