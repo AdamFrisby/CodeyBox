@@ -544,10 +544,12 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         orchestratorOptions.MaxConcurrentSandboxes);
     if (inner is ISandboxHostPoolSnapshot hostPool)
         RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
+    var pipelineTuning = sp.GetRequiredService<PipelineTuningSnapshot>();
     return SandboxAdmissionControlledProvider.Wrap(
         inner,
         orchestratorOptions.MaxConcurrentSandboxes,
-        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>(),
+        waitWarningThresholdProvider: () => pipelineTuning.Current.SandboxPermitWaitWarningThreshold);
 }
 
 static ReloadableSandboxProvider BuildReloadableSandboxProvider(
@@ -7099,10 +7101,12 @@ public partial class Program
     /// StoppingAsync completes, so raising it only affects the suspend case.
     ///
     /// <para>The concurrent-sandbox bound is resolved through
-    /// <see cref="OrchestratorOptionsFactory"/> — the same validation/defaulting
-    /// path the admission-control decorator uses for
+    /// <see cref="OrchestratorOptionsFactory.ResolveSandboxCounts"/> — the same
+    /// precedence/defaulting path the admission-control decorator uses for
     /// <c>WorkerPool:MaxConcurrentSandboxes</c> — so the shutdown reserve matches
-    /// the actual live-VM ceiling. All VMs are provisioned at
+    /// the actual live-VM ceiling. It deliberately skips the startup range
+    /// rejection: the ceiling must stay computable for any stored config, while
+    /// the startup DI path still fails fast on unsatisfiable values. All VMs are provisioned at
     /// <see cref="SandboxResourceLimits.Default"/> (no per-VM RAM override is
     /// wired through SandboxSpec today), so the default profile RAM is the
     /// largest per-VM suspend budget the host must cover.</para>
@@ -7112,7 +7116,7 @@ public partial class Program
     {
         var grace = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
         var maxConcurrent = OrchestratorOptionsFactory
-            .Build(cbOpts.Concurrency, cbOpts.WorkerPool, log)
+            .ResolveSandboxCounts(cbOpts.Concurrency, cbOpts.WorkerPool, log)
             .MaxConcurrentSandboxes;
         return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
             providerSupportsSuspend, grace, maxConcurrent);

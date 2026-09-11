@@ -391,7 +391,7 @@ Controls worker concurrency and spawn pacing.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `MaxConcurrentWorkers` | `1` | Hard cap on simultaneously active pipelines. |
-| `MaxConcurrentSandboxes` | `ceil(MaxConcurrentWorkers * 1.5)` | Global cap on concurrently live sandboxes/VMs across work, audit, merge, smoke, and verifier phases. Every `ISandboxProvider.CreateAsync` path shares this budget. |
+| `MaxConcurrentSandboxes` | `2 * MaxConcurrentWorkers` | Global cap on concurrently live sandboxes/VMs across work, audit, merge, smoke, and verifier phases. Every `ISandboxProvider.CreateAsync` path shares this budget. Values below `2 * MaxConcurrentWorkers` are rejected at startup. |
 | `MinSpawnIntervalMs` | `0` | Minimum milliseconds between successive worker spawns. |
 | `DispatchGateAcquisitionBackoff` | `"00:00:01"` | Backoff between dispatch pickups after a SQLite write-gate acquisition timeout. |
 | `MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit). Waits caused by a planned SQLite maintenance hold inside its announced budget do not count toward this threshold; a hold past its budget counts normally. |

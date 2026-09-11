@@ -1810,6 +1810,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     item.BaselineImageRef),
                 credentialRunner: runner);
 
+            using var planningWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "planning");
             sandbox = await _sandboxes.CreateAsync(spec, ct);
 
             if (credential is not null && credential.Files.Count > 0)
@@ -5084,6 +5085,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     sessionLifecycle = null;
                 }
                 var sandboxStartSw = Stopwatch.StartNew();
+                // Name this wait for the sandbox-permit diagnostic (work item +
+                // phase) so a slow admission gate is attributable instead of
+                // silent. No release here: the reusable context never holds a
+                // permit across this acquire (it disposes before recreating).
+                using var phaseWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), agentPhase);
                 sandbox = WorkSandboxContext.Current != null
                     ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
                     : await _sandboxes.CreateAsync(spec, ct);
@@ -13547,6 +13553,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
         };
     }
 
+    /// <summary>
+    /// Surrenders the ambient work-phase reusable sandbox (if any) back to the
+    /// sandbox admission gate. Phases that provision their own sandboxes
+    /// directly from the provider (audit fan-out, merge, conflict rework) call
+    /// this before acquiring, so a worker never blocks on a new permit while
+    /// holding its work-phase permit.
+    /// </summary>
+    private static Task ReleaseAmbientWorkSandboxAsync() =>
+        WorkSandboxContext.Current?.ReleaseActiveSandboxAsync() ?? Task.CompletedTask;
+
     private async Task<ISandbox> CreateAuditSandboxWithIdleTimeoutAsync(
         SandboxSpec spec,
         string auditorName,
@@ -13556,6 +13572,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         int iteration,
         CancellationToken ct)
     {
+        // Release-then-acquire: the audit phase provisions its own sandboxes
+        // straight from the provider while the work-phase reusable sandbox is
+        // still admitted. Surrender that permit first so this worker never
+        // blocks on an audit permit while holding its work permit (pool-wide
+        // deadlock when every worker does the same). Rework recreates the
+        // reusable sandbox on demand afterwards.
+        await ReleaseAmbientWorkSandboxAsync().ConfigureAwait(false);
+        using var waitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "audit");
         var timeout = _pipelineTuning.Current.AuditorIdleTimeout;
         if (timeout <= TimeSpan.Zero)
             return await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
@@ -17038,6 +17062,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     new SandboxTarget(networkProfile, SandboxProfileFlavor.Headless),
                     item.BaselineImageRef));
             var mergeSandboxStartSw = Stopwatch.StartNew();
+            // Release-then-acquire: the merge phase provisions its own sandbox
+            // while the work-phase reusable sandbox may still be admitted.
+            // Surrender that permit first so this worker never blocks on a
+            // merge permit while holding its work permit.
+            await ReleaseAmbientWorkSandboxAsync().ConfigureAwait(false);
+            using var mergeWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "merge");
             await using var sandbox = isolatedMergeRepoPath is null
                 ? await _sandboxes.CreateAsync(spec, ct)
                 : await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedMergeRepoPath, ct);
@@ -18915,6 +18945,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, conflictReworkTarget, item.BaselineImageRef),
                 credentialRunner: runner);
 
+            // Release-then-acquire (same pool-deadlock rationale as the merge
+            // phase above): conflict rework provisions its own sandbox while a
+            // prior phase's reusable sandbox may still be admitted.
+            await ReleaseAmbientWorkSandboxAsync().ConfigureAwait(false);
+            using var conflictReworkWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "conflict-rework");
             await using var sandbox = await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedRepoPath, ct);
             if (credential is not null && credential.Files.Count > 0)
                 await MaterialiseCredentialFilesAsync(sandbox, credential, ct);

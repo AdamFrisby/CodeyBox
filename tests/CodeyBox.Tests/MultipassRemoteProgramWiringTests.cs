@@ -110,7 +110,7 @@ public sealed class MultipassRemoteProgramWiringTests
         WorkerPool = new WorkerPoolOptions
         {
             MaxConcurrentWorkers = 4,
-            MaxConcurrentSandboxes = 4,
+            MaxConcurrentSandboxes = 8,
         },
         SandboxNetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -174,7 +174,7 @@ public sealed class MultipassRemoteProgramWiringTests
                     ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"multipass-remote-audit-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"multipass-remote-streams-{Guid.NewGuid():N}"),
                     ["CodeyBox:WorkerPool:MaxConcurrentWorkers"] = "4",
-                    ["CodeyBox:WorkerPool:MaxConcurrentSandboxes"] = "4",
+                    ["CodeyBox:WorkerPool:MaxConcurrentSandboxes"] = "8",
                     ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = "initial.example",
                     ["CodeyBox:MultipassRemoteSandbox:RemoteMultipassPath"] = "/snap/bin/multipass",
                     ["CodeyBox:MultipassRemoteSandbox:RemoteStagingRoot"] = "/remote/staging",

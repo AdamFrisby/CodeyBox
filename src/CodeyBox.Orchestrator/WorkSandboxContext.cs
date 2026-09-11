@@ -165,6 +165,24 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Releases the currently held reusable sandbox (if any) back to the
+    /// sandbox admission gate without ending this context. The pipeline calls
+    /// this before phases that acquire their own sandboxes directly from the
+    /// provider (audit fan-out, merge): a worker must not sit on its
+    /// work-phase permit while blocking on the next phase's permit, or the
+    /// pool can deadlock with every worker holding one permit and waiting for
+    /// another. The next <see cref="GetOrCreateSandboxAsync"/> transparently
+    /// provisions a fresh sandbox. Idempotent.
+    /// </summary>
+    public async Task ReleaseActiveSandboxAsync()
+    {
+        if (_activeSandbox is null)
+            return;
+        _log.LogDebug("Releasing active reusable sandbox before a phase that acquires its own sandbox.");
+        await DisposeActiveSandboxAsync();
+    }
+
     public async ValueTask DisposeAsync()
     {
         try

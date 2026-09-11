@@ -24,43 +24,28 @@ public static class OrchestratorOptionsFactory
     /// <exception cref="InvalidOperationException">Thrown when any option value is out of range.</exception>
     public static OrchestratorOptions Build(int? legacyConcurrency, WorkerPoolOptions workerPool, ILogger log)
     {
+        var (maxConcurrent, maxConcurrentSandboxes) = ResolveSandboxCounts(legacyConcurrency, workerPool, log);
         var wp = workerPool;
-        int maxConcurrent;
-
-        if (wp.MaxConcurrentWorkers is { } workerPoolMax)
-        {
-            maxConcurrent = workerPoolMax;
-            if (legacyConcurrency is { } legacyValue)
-            {
-                log.LogWarning(
-                    "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
-                    "Deprecated value ({LegacyValue}) is set but overridden by " +
-                    "CodeyBox:WorkerPool:MaxConcurrentWorkers={WorkerPoolMax}; remove the deprecated key.",
-                    legacyValue, workerPoolMax);
-            }
-        }
-        else if (legacyConcurrency is { } legacyValue)
-        {
-            log.LogWarning(
-                "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
-                "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
-                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
-                legacyValue);
-            maxConcurrent = legacyValue;
-        }
-        else
-        {
-            maxConcurrent = 1;
-        }
 
         if (maxConcurrent < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
-        var maxConcurrentSandboxes = wp.MaxConcurrentSandboxes
-            ?? DeriveDefaultMaxConcurrentSandboxes(maxConcurrent);
         if (maxConcurrentSandboxes < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConcurrentSandboxes must be >= 1");
+        // A worker may transiently hold its phase sandbox while acquiring the
+        // next phase's sandbox (work -> audit, audit -> merge handoffs), so one
+        // worker can hold 2 sandbox permits at once. The ceiling must therefore
+        // cover 2 permits per worker slot, or every worker can end up holding
+        // one permit while waiting for another that never frees (2026-09-11
+        // dispatch stall: 6 workers / 6 permits, zero progress for hours).
+        var minimumSandboxes = checked(2 * maxConcurrent);
+        if (maxConcurrentSandboxes < minimumSandboxes)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerPool:MaxConcurrentSandboxes ({maxConcurrentSandboxes}) must be at least " +
+                $"2x CodeyBox:WorkerPool:MaxConcurrentWorkers ({maxConcurrent}); " +
+                $"minimum required value is {minimumSandboxes} because a worker can hold its phase sandbox " +
+                "while acquiring the next phase's sandbox. Raise MaxConcurrentSandboxes or lower MaxConcurrentWorkers.");
         if (wp.MinSpawnInterval < TimeSpan.Zero)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
@@ -102,13 +87,65 @@ public static class OrchestratorOptionsFactory
         };
     }
 
+    /// <summary>
+    /// Resolves the (workers, sandboxes) counts with the same
+    /// legacy-<c>CodeyBox:Concurrency</c> precedence and defaulting that
+    /// <see cref="Build(int?, WorkerPoolOptions, ILogger)"/> validates, but
+    /// without the range rejection. The host-shutdown ceiling
+    /// (<c>Program.ComputeHostShutdownTimeout</c>) sizes off this so a stored
+    /// config that startup would reject still yields a computable ceiling;
+    /// the startup DI path keeps calling <see cref="Build(int?, WorkerPoolOptions, ILogger)"/>
+    /// and fails fast there.
+    /// </summary>
+    public static (int MaxConcurrentWorkers, int MaxConcurrentSandboxes) ResolveSandboxCounts(
+        int? legacyConcurrency, WorkerPoolOptions workerPool, ILogger log)
+    {
+        var wp = workerPool;
+        int maxConcurrent;
+
+        if (wp.MaxConcurrentWorkers is { } workerPoolMax)
+        {
+            maxConcurrent = workerPoolMax;
+            if (legacyConcurrency is { } legacyValue)
+            {
+                log.LogWarning(
+                    "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
+                    "Deprecated value ({LegacyValue}) is set but overridden by " +
+                    "CodeyBox:WorkerPool:MaxConcurrentWorkers={WorkerPoolMax}; remove the deprecated key.",
+                    legacyValue, workerPoolMax);
+            }
+        }
+        else if (legacyConcurrency is { } legacyValue)
+        {
+            log.LogWarning(
+                "CodeyBox:Concurrency is deprecated and will be removed in a future version. " +
+                "Use CodeyBox:WorkerPool:MaxConcurrentWorkers instead. " +
+                "Current value ({LegacyValue}) is being used as MaxConcurrentWorkers.",
+                legacyValue);
+            maxConcurrent = legacyValue;
+        }
+        else
+        {
+            maxConcurrent = 1;
+        }
+
+        var maxConcurrentSandboxes = wp.MaxConcurrentSandboxes
+            ?? (maxConcurrent >= 1 ? DeriveDefaultMaxConcurrentSandboxes(maxConcurrent) : 1);
+        return (maxConcurrent, maxConcurrentSandboxes);
+    }
+
+    /// <summary>
+    /// Default <c>MaxConcurrentSandboxes</c> for a given worker count: 2 permits
+    /// per worker, matching the startup validation bound (a worker can hold its
+    /// phase sandbox while acquiring the next phase's sandbox).
+    /// </summary>
     public static int DeriveDefaultMaxConcurrentSandboxes(int maxConcurrentWorkers)
     {
         if (maxConcurrentWorkers < 1)
             throw new ArgumentOutOfRangeException(
                 nameof(maxConcurrentWorkers),
                 "MaxConcurrentWorkers must be >= 1");
-        return Math.Max(1, (maxConcurrentWorkers * 3 + 1) / 2);
+        return checked(2 * maxConcurrentWorkers);
     }
 
     /// <summary>
