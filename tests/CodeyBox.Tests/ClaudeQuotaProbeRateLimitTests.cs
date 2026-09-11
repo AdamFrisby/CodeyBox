@@ -23,20 +23,24 @@ public sealed class ClaudeQuotaProbeRateLimitTests
     {
         private readonly HttpStatusCode _status;
         private readonly TimeSpan? _retryAfter;
+        private readonly DateTimeOffset? _retryAfterDate;
 
         public int Requests { get; private set; }
 
-        public CountingHandler(HttpStatusCode status, TimeSpan? retryAfter = null)
+        public CountingHandler(HttpStatusCode status, TimeSpan? retryAfter = null, DateTimeOffset? retryAfterDate = null)
         {
             _status = status;
             _retryAfter = retryAfter;
+            _retryAfterDate = retryAfterDate;
         }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             Requests++;
             var response = new HttpResponseMessage(_status) { Content = new StringContent("{}") };
-            if (_retryAfter is { } ra)
+            if (_retryAfterDate is { } date)
+                response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(date);
+            else if (_retryAfter is { } ra)
                 response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(ra);
             return Task.FromResult(response);
         }
@@ -105,26 +109,58 @@ public sealed class ClaudeQuotaProbeRateLimitTests
     }
 
     [Fact]
-    public async Task RetryAfterHeader_IsHonoured_WhenLongerThanTheDefault()
+    public async Task RetryAfterHeader_IsHonoured_UpToTheCap()
     {
-        var retryAfter = TimeSpan.FromMinutes(30);
-        var handler = new CountingHandler(HttpStatusCode.TooManyRequests, retryAfter);
+        // A provider Retry-After within the cap is honoured in full: the probe
+        // waits at least the server's value before issuing another request.
+        var handler = new CountingHandler(HttpStatusCode.TooManyRequests, TimeSpan.FromSeconds(30));
         var clock = new MutableClock(DateTimeOffset.UtcNow);
         var probe = Probe(handler, clock);
 
         await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
         var afterFirst = handler.Requests;
 
-        // Past the 15m default but still inside the provider's own 30m hint.
-        clock.Advance(TimeSpan.FromMinutes(20));
+        clock.Advance(TimeSpan.FromSeconds(20));
         await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
 
         Assert.Equal(afterFirst, handler.Requests);
+
+        clock.Advance(TimeSpan.FromSeconds(20));
+        await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.True(handler.Requests > afterFirst, "probing should resume once Retry-After elapses");
     }
 
     [Fact]
-    public async Task RetryAfterHeader_IsNeverShortenedByTheCooldownPolicy()
+    public async Task RetryAfterHttpDate_IsHonoured_UpToTheCap()
     {
+        // The HTTP-date form is honoured the same as delta-seconds.
+        var start = DateTimeOffset.UtcNow;
+        var clock = new MutableClock(start);
+        var handler = new CountingHandler(
+            HttpStatusCode.TooManyRequests, retryAfterDate: start.AddSeconds(30));
+        var probe = Probe(handler, clock);
+
+        await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+        var afterFirst = handler.Requests;
+
+        clock.Advance(TimeSpan.FromSeconds(20));
+        await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Equal(afterFirst, handler.Requests);
+
+        clock.Advance(TimeSpan.FromSeconds(20));
+        await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.True(handler.Requests > afterFirst, "probing should resume once Retry-After elapses");
+    }
+
+    [Fact]
+    public async Task RetryAfterHeader_LargeValue_IsCappedByMaxRetryDelay()
+    {
+        // A huge provider value must not wedge the probe: the 429 cooldown is
+        // capped at MaxRetryDelay (default 5 minutes), so probing resumes
+        // after the cap even though the server asked for 2 hours.
         var handler = new CountingHandler(HttpStatusCode.TooManyRequests, TimeSpan.FromHours(2));
         var clock = new MutableClock(DateTimeOffset.UtcNow);
         var probe = Probe(handler, clock);
@@ -132,10 +168,15 @@ public sealed class ClaudeQuotaProbeRateLimitTests
         await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
         var afterFirst = handler.Requests;
 
-        clock.Advance(TimeSpan.FromMinutes(90));
+        clock.Advance(TimeSpan.FromMinutes(3));
         await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
 
         Assert.Equal(afterFirst, handler.Requests);
+
+        clock.Advance(TimeSpan.FromMinutes(3));
+        await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.True(handler.Requests > afterFirst, "a capped cooldown must resume probing");
     }
 
     [Fact]
