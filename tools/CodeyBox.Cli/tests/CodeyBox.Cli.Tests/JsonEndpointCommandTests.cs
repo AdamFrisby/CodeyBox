@@ -34,7 +34,7 @@ public sealed class JsonEndpointCommandTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
         }

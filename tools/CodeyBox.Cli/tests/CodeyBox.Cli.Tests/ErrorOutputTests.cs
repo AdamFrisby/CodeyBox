@@ -112,7 +112,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -145,7 +145,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -183,7 +183,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -217,7 +217,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -266,7 +266,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -302,7 +302,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -340,7 +340,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -375,7 +375,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -407,7 +407,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -439,7 +439,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -470,7 +470,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -502,7 +502,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -532,7 +532,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -564,7 +564,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -643,7 +643,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -693,7 +693,7 @@ public sealed class ErrorOutputTests
         finally
         {
             CodeyBoxClient.SseResponseHeaderTimeout = originalTimeout;
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -747,7 +747,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -777,7 +777,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -810,7 +810,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -847,7 +847,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -879,7 +879,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", null);
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
@@ -904,7 +904,7 @@ public sealed class ErrorOutputTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            CliTestConfigIsolation.Reset();
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
         }
     }

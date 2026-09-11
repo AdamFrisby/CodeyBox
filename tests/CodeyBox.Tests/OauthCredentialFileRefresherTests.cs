@@ -1301,16 +1301,20 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
             AntigravityCreds("stale-fallback-token", "rt-1", expiredIso));
         using var source = new AntigravityCredentialFileSource(path, watch: false);
 
-        // Omit keyringReader to exercise production SecretServiceClient fallback path
+        // The keyring read must be simulated, not ambient. Omitting keyringReader runs the
+        // production SecretServiceClient against whatever keyring the host happens to have,
+        // so on a machine holding a real antigravity credential this returns that token
+        // instead of degrading, and the assertion below fails.
         using var refresher = new AntigravityOauthCredentialFileRefresher(
             source,
             new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
             NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
-            cliRunner: _ => Task.FromResult(true));
+            cliRunner: _ => Task.FromResult(true),
+            keyringReader: _ => Task.FromResult<string?>(null));
 
         var token = await refresher.GetAccessTokenAsync();
 
-        // System keyring is unreachable in test sandbox, so refresher gracefully degrades to stale token without throwing
+        // Keyring read yields nothing, so the refresher degrades to the stale token without throwing.
         Assert.Equal("stale-fallback-token", token);
     }
 
