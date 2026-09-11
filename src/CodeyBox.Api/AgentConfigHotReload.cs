@@ -1043,6 +1043,26 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                             ? checked((int)rampWindow.TotalSeconds)
                             : (int?)null,
                     }),
+                Pools = mapped.Pools
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => new
+                    {
+                        Kind = kv.Value.Kind.ToString(),
+                        kv.Value.BalanceUnit,
+                        kv.Value.ReservationEstimate,
+                    }),
+                FloorByPool = mapped.FloorByPool
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => new
+                    {
+                        kv.Value.MinQuotaPct,
+                        kv.Value.StartFloorPct,
+                        kv.Value.EndFloorPct,
+                        RampWindowSeconds = kv.Value.RampWindow is { } poolRamp
+                            ? checked((int)poolRamp.TotalSeconds)
+                            : (int?)null,
+                        kv.Value.MinBalance,
+                    }),
                 opts.QuotaRecheckIntervalSeconds,
                 opts.QuotaRecoveryProbeIntervalSeconds,
                 opts.MaxQuotaRecoveryProbeEligibilityScan,

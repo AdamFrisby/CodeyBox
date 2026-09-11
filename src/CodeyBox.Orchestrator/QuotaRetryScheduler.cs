@@ -774,6 +774,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             project,
             ct,
             QuotaRetryPhasePolicy.RequiredCapabilityForQuotaRetryCandidate(item));
+        if (decision.TerminalQuotaExhausted)
+        {
+            // Depleting-balance exhaustion: no reset will ever replenish the
+            // pool, so a parked item must fail with a top-up pointer rather
+            // than wait for a reset that never arrives.
+            _log.LogWarning("Work item {Id} terminally quota-exhausted; failing: {Reason}", item.Id, decision.Reason);
+            return await TransitionWaitingItemForTerminalQuotaAsync(item, decision.Reason, ct);
+        }
         if (decision.ShouldWait)
         {
             if (decision.WaitingForPausedAgent)
@@ -937,8 +945,46 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         return new QuotaRetryAttemptResult("moved:waiting-for-agent-resume", result.Reason);
     }
 
-    private async Task<QuotaRetryAttemptResult> TransitionWaitingItemAtRetryCapAsync(
+    /// <summary>
+    /// Fails a quota-parked item whose pool is terminally exhausted (a
+    /// depleting-balance pool at or below its floor). No reset instant is
+    /// recorded — there is none — and the targeted retry timer is cancelled
+    /// so the item does not linger waiting for a replenishment that never
+    /// arrives. The failure message names the top-up remedy.
+    /// </summary>
+    private async Task<QuotaRetryAttemptResult> TransitionWaitingItemForTerminalQuotaAsync(
         WorkItem item,
+        string? reason,
+        CancellationToken ct)
+    {
+        var failed = item.With(
+            WorkItemState.Failed,
+            reason ?? "quota pool terminally exhausted; top up the account and retry manually",
+            failureKind: "quota",
+            quotaResetAt: null) with
+        {
+            NextQuotaRetryAt = null,
+        };
+
+        var updated = await _store.TryUpdateIfStateAsync(failed, WorkItemState.WaitingForQuotaReset, ct);
+        if (updated)
+        {
+            CancelTargetedRetry(item.Id);
+            _log.LogWarning(
+                "Work item {Id} left WaitingForQuotaReset as terminally quota-exhausted",
+                item.Id);
+        }
+        else
+        {
+            _log.LogInformation(
+                "Work item {Id} terminally quota-exhausted but state changed before it could fail",
+                item.Id);
+        }
+
+        return new QuotaRetryAttemptResult("failed:terminal-quota-exhausted", reason);
+    }
+
+    private async Task<QuotaRetryAttemptResult> TransitionWaitingItemAtRetryCapAsync(        WorkItem item,
         AutoRetryOnQuotaFailureOptions retryOptions,
         CancellationToken ct)
     {

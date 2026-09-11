@@ -228,12 +228,21 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
         try
         {
+            var poolsByInstance = _quotaSnapshot.SnapshotQuotaPools()
+                .ToDictionary(row => row.InstanceId, row => row.Pool, StringComparer.Ordinal);
             return _quotaSnapshot.SnapshotQuotaAvailabilityByInstance()
-                .Select(row => new Measurement<double>(
-                    row.AvailablePct,
-                    new KeyValuePair<string, object?>("agent.kind", row.Agent.Value),
-                    new KeyValuePair<string, object?>("agent.instance", row.InstanceId),
-                    new KeyValuePair<string, object?>("model", row.ModelId ?? "(default)")))
+                .Select(row =>
+                {
+                    var tags = new List<KeyValuePair<string, object?>>
+                    {
+                        new("agent.kind", row.Agent.Value),
+                        new("agent.instance", row.InstanceId),
+                        new("model", row.ModelId ?? "(default)"),
+                    };
+                    if (poolsByInstance.TryGetValue(row.InstanceId, out var pool) && pool is not null)
+                        tags.Add(new KeyValuePair<string, object?>("quota.pool", pool));
+                    return new Measurement<double>(row.AvailablePct, tags.ToArray());
+                })
                 .ToArray();
         }
         catch (ObjectDisposedException)

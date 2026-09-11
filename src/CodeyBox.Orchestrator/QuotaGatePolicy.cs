@@ -80,6 +80,11 @@ public sealed class QuotaGatePolicy
     /// <summary>
     /// Escrow-aware static evaluation; see the instance overload for the
     /// outstanding-reservation semantics.
+    /// Pool members are gated on their pool: an unresolved pool reference
+    /// fails closed (refusal names the member and the pool); a
+    /// depleting-balance pool gates on the absolute balance (never on a
+    /// percentage, never with a reset); a resetting-window pool gates on the
+    /// shared percentage reading against the pool-resolved floor.
     /// </summary>
     public static QuotaGateDecision Evaluate(
         QuotaRouterOptions options,
@@ -90,11 +95,98 @@ public sealed class QuotaGatePolicy
         bool recentObservedFailure = false,
         string? observedFailureReason = null)
     {
+        if (QuotaPoolResolver.TryResolvePool(options, member, out var poolName, out var pool, out var poolFailure))
+        {
+            if (pool!.Kind == QuotaPoolKind.DepletingBalance)
+                return EvaluateBalance(options, poolName!, pool, quota, outstandingPct);
+            return EvaluateResetting(options, member, quota, nowUtc, outstandingPct,
+                recentObservedFailure, observedFailureReason, poolName);
+        }
+        if (poolFailure is not null)
+        {
+            return new QuotaGateDecision(
+                false,
+                $"quota pool unresolved; fail-closed: {poolFailure}",
+                PoolId: QuotaPoolResolver.NormalizePoolName(member.Pool));
+        }
+
+        return EvaluateResetting(options, member, quota, nowUtc, outstandingPct,
+            recentObservedFailure, observedFailureReason, poolName: null);
+    }
+
+    /// <summary>
+    /// Gates a member of a depleting-balance pool on the absolute remaining
+    /// balance. The percentage reading is not a quantity for these pools and
+    /// is ignored; there is no reset, so a refusal at or below the floor is
+    /// terminal (<see cref="QuotaGateDecision.Terminal"/>) — no reset will
+    /// ever replenish it. An unknown balance fails closed (non-terminally:
+    /// the next probe may still produce a reading).
+    /// </summary>
+    private static QuotaGateDecision EvaluateBalance(
+        QuotaRouterOptions options,
+        string poolName,
+        QuotaPoolOptions pool,
+        EffectiveQuota quota,
+        double outstandingAbsolute)
+    {
+        var floor = ResolveBalanceFloor(options, poolName);
+        var unit = string.IsNullOrWhiteSpace(pool.BalanceUnit) ? "units" : pool.BalanceUnit.Trim();
+        if (!quota.IsBalanceKnown)
+        {
+            return new QuotaGateDecision(
+                false,
+                $"quota balance unknown for pool '{poolName}'; fail-closed to protect the reserve",
+                PoolId: poolName,
+                BalanceFloor: floor);
+        }
+
+        var escrowed = Math.Max(0, outstandingAbsolute);
+        var effective = quota.BalanceRemaining!.Value - escrowed;
+        if (effective > floor)
+        {
+            var reason = escrowed > 0
+                ? $"quota balance available for pool '{poolName}' ({effective:F1} {unit} above floor {floor:F1} {unit}; {escrowed:F1} escrowed)"
+                : $"quota balance available for pool '{poolName}' ({effective:F1} {unit} above floor {floor:F1} {unit})";
+            return new QuotaGateDecision(true, reason, PoolId: poolName, BalanceFloor: floor);
+        }
+
+        var denyReason = escrowed > 0
+            ? $"quota balance exhausted for pool '{poolName}' ({effective:F1} {unit} <= floor {floor:F1} {unit}; {escrowed:F1} escrowed); top up the account — no reset will replenish it"
+            : $"quota balance exhausted for pool '{poolName}' ({effective:F1} {unit} <= floor {floor:F1} {unit}); top up the account — no reset will replenish it";
+        return new QuotaGateDecision(false, denyReason, PoolId: poolName, BalanceFloor: floor, Terminal: true);
+    }
+
+    /// <summary>
+    /// Absolute floor for a balance pool: the pool's configured
+    /// <c>MinBalance</c> from <see cref="QuotaRouterOptions.FloorByPool"/>,
+    /// defaulting to zero (refuse only when empty). Pure.
+    /// </summary>
+    public static double ResolveBalanceFloor(QuotaRouterOptions options, string poolName)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(poolName);
+        if (options.FloorByPool.TryGetValue(poolName, out var floor)
+            && floor?.MinBalance is { } min)
+            return min;
+        return 0.0;
+    }
+
+    private static QuotaGateDecision EvaluateResetting(
+        QuotaRouterOptions options,
+        AgentMembership member,
+        EffectiveQuota quota,
+        DateTimeOffset nowUtc,
+        double outstandingPct,
+        bool recentObservedFailure,
+        string? observedFailureReason,
+        string? poolName)
+    {
         if (recentObservedFailure)
         {
             return new QuotaGateDecision(
                 false,
-                observedFailureReason ?? "recent observed quota failure");
+                observedFailureReason ?? "recent observed quota failure",
+                PoolId: poolName);
         }
 
         var floor = ComputeFloorPct(options, member, quota, nowUtc);
@@ -119,12 +211,13 @@ public sealed class QuotaGatePolicy
                             false,
                             $"quota below window floor ({window.Name}: {window.AvailablePct:F1}% < {windowFloor:F1}%)",
                             windowFloor,
-                            window.Name);
+                            window.Name,
+                            PoolId: poolName);
                     }
                 }
             }
 
-            return new QuotaGateDecision(true, "quota available", floor);
+            return new QuotaGateDecision(true, "quota available", floor, PoolId: poolName);
         }
 
         if (availablePct >= 0)
@@ -132,7 +225,7 @@ public sealed class QuotaGatePolicy
             var reason = escrowed > 0
                 ? $"quota below floor after outstanding reservations ({effectivePct:F1}% < {floor:F1}%; {escrowed:F1}% escrowed)"
                 : $"quota below floor ({availablePct:F1}% < {floor:F1}%)";
-            return new QuotaGateDecision(false, reason, floor);
+            return new QuotaGateDecision(false, reason, floor, PoolId: poolName);
         }
 
         // Safety: when the probe cannot produce a reading, fail CLOSED whenever
@@ -140,22 +233,42 @@ public sealed class QuotaGatePolicy
         // time (global defaults, MinQuotaPct fallback, per-agent overrides,
         // and the time-based ramp all feed ComputeFloorPct above). A non-zero
         // floor is explicit operator intent to keep headroom and must not be
-        // silently bypassed via the UnknownPolicy fail-open path. An effective
-        // floor of zero means no reserve to protect, so the existing
-        // UnknownPolicy behaviour applies.
-        if (floor > 0)
+        // silently bypassed via the UnknownPolicy fail-open path. An explicit
+        // reserve entry (FloorByAgent / FloorByPool) likewise signals intent to
+        // protect the reserve even if the ramped floor is currently zero, so it
+        // also fails closed. Only when there is no reserve to protect does the
+        // existing UnknownPolicy behaviour apply.
+        if (floor > 0 || HasExplicitReserveFloor(options, member))
             return new QuotaGateDecision(
                 false,
                 $"quota unknown; effective floor {floor:F1}% in force; fail-closed to protect the reserve",
-                floor);
+                floor,
+                PoolId: poolName);
 
         return options.UnknownPolicy switch
         {
-            QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open", floor),
-            QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious", floor),
-            _ => new QuotaGateDecision(true, "quota unknown; no recent observed failure", floor),
+            QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open", floor, PoolId: poolName),
+            QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious", floor, PoolId: poolName),
+            _ => new QuotaGateDecision(true, "quota unknown; no recent observed failure", floor, PoolId: poolName),
         };
     }
+
+    /// <summary>
+    /// True when the operator has configured an explicit reserve floor for
+    /// this member: a per-agent entry in
+    /// <see cref="QuotaRouterOptions.FloorByAgent"/> or a per-pool entry in
+    /// <see cref="QuotaRouterOptions.FloorByPool"/> for the member's
+    /// resetting-window pool. The presence of the override entry is the
+    /// explicit-intent signal — the reserve exists to guarantee headroom and
+    /// must not evaporate when the probe is unreadable.
+    /// </summary>
+    private static bool HasExplicitReserveFloor(QuotaRouterOptions options, AgentMembership member) =>
+        TryGetFloorOverride(options, member.Agent, out var perAgent) && perAgent is not null
+        || QuotaPoolResolver.TryResolvePool(options, member, out var poolName, out var pool, out _)
+            && pool!.Kind == QuotaPoolKind.ResettingWindow
+            && poolName is not null
+            && options.FloorByPool.TryGetValue(poolName, out var perPool)
+            && perPool is not null;
 
     public static double ComputeEffectiveFloorPct(
         QuotaRouterOptions options,
@@ -284,6 +397,11 @@ public sealed class QuotaGatePolicy
 
     public static DateTimeOffset? ResolveResetHint(EffectiveQuota quota, QuotaGateDecision decision)
     {
+        // A depleting-balance pool never has a reset instant, and a terminal
+        // refusal (balance exhausted) will never clear by waiting — reporting
+        // a reset would park work for an event that never arrives.
+        if (quota.PoolKind == QuotaPoolKind.DepletingBalance || decision.Terminal)
+            return null;
         if (!string.IsNullOrEmpty(decision.WindowName)
             && quota.Windows is { Count: > 0 } windows)
         {
@@ -297,7 +415,45 @@ public sealed class QuotaGatePolicy
         return quota.ResetAt;
     }
 
+    /// <summary>
+    /// Options-aware quota resolution used by the router: the static
+    /// <see cref="ResolveMemberQuota(AgentQuotaSnapshot, AgentMembership)"/>
+    /// result enriched with the pool's replenishment kind, and — for
+    /// depleting-balance pools — a nulled reset (a balance pool is never
+    /// reported with a reset instant, even if a probe echoed one). Members
+    /// whose pool does not resolve keep the declared pool name with the raw
+    /// snapshot reset; the gate refuses them fail-closed.
+    /// </summary>
+    public EffectiveQuota ResolvePoolQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
+    {
+        var quota = ResolveMemberQuota(snapshot, member);
+        if (QuotaPoolResolver.TryResolvePool(_options, member, out var poolName, out var pool, out _)
+            && poolName is not null && pool is not null)
+        {
+            quota = quota with { PoolId = poolName, PoolKind = pool.Kind };
+            if (pool.Kind == QuotaPoolKind.DepletingBalance)
+                quota = quota with { ResetAt = null };
+        }
+        return quota;
+    }
+
+    /// <summary>
+    /// Resolves a member's effective quota from its snapshot and attaches pool
+    /// identity: the member's declared pool name (when any) and the snapshot's
+    /// absolute balance reading (when any). Pool-kind enrichment needs options
+    /// — see <see cref="ResolvePoolQuota"/>.
+    /// </summary>
     public static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
+    {
+        var quota = ResolveMemberQuotaCore(snapshot, member);
+        return quota with
+        {
+            PoolId = QuotaPoolResolver.NormalizePoolName(member.Pool) ?? quota.PoolId,
+            BalanceRemaining = snapshot.BalanceRemaining ?? quota.BalanceRemaining,
+        };
+    }
+
+    private static EffectiveQuota ResolveMemberQuotaCore(AgentQuotaSnapshot snapshot, AgentMembership member)
     {
         if (string.IsNullOrWhiteSpace(member.ModelId))
             return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows, snapshot.Unknown);
@@ -341,15 +497,51 @@ public sealed class QuotaGatePolicy
     /// The aggregate floor a dispatch for <paramref name="member"/> must meet.
     /// Public so the reservation ledger's atomic commit-time re-check gates on
     /// the same floor as <see cref="Evaluate"/> instead of re-implementing it.
+    /// For members of a resetting-window pool with a
+    /// <see cref="QuotaRouterOptions.FloorByPool"/> entry, the effective floor
+    /// is the higher of the pool-resolved and agent-resolved floors so neither
+    /// reserve can be undercut; with only one present it applies directly.
+    /// Throws for members of a depleting-balance pool, whose floor is absolute
+    /// (see <see cref="ResolveBalanceFloor"/>).
     /// </summary>
     public static double ComputeFloorPct(
         QuotaRouterOptions options,
         AgentMembership member,
         EffectiveQuota quota,
-        DateTimeOffset nowUtc) =>
-        member.Billing == AgentBilling.Subscription
-            ? ComputeEffectiveFloorPct(options, member.Agent, quota, nowUtc)
-            : options.MinQuotaPct;
+        DateTimeOffset nowUtc)
+    {
+        if (member.Billing != AgentBilling.Subscription)
+            return options.MinQuotaPct;
+        var agentFloor = ComputeEffectiveFloorPct(options, member.Agent, quota, nowUtc);
+        if (QuotaPoolResolver.TryResolvePool(options, member, out var poolName, out var pool, out _)
+            && poolName is not null)
+        {
+            if (pool!.Kind == QuotaPoolKind.DepletingBalance)
+                throw new InvalidOperationException(
+                    $"Quota pool '{poolName}' is a depleting-balance pool; its floor " +
+                    $"is absolute — use ResolveBalanceFloor, not a percentage floor.");
+            if (options.FloorByPool.TryGetValue(poolName, out var poolFloor) && poolFloor is not null)
+            {
+                var poolResolved = ComputeRampedFloor(
+                    ResolvePoolFloorSettings(options, poolFloor),
+                    SelectRampResetAt(quota),
+                    nowUtc);
+                return Math.Max(agentFloor, poolResolved);
+            }
+        }
+        return agentFloor;
+    }
+
+    private static AgentFloorSettings ResolvePoolFloorSettings(
+        QuotaRouterOptions options,
+        QuotaPoolFloorOptions poolFloor) =>
+        new(
+            MinQuotaPct: poolFloor.MinQuotaPct ?? options.MinQuotaPct,
+            StartFloorPct: poolFloor.StartFloorPct ?? options.StartFloorPct,
+            EndFloorPct: poolFloor.EndFloorPct ?? options.EndFloorPct,
+            RampWindow: poolFloor.RampWindow is { } ramp && ramp > TimeSpan.Zero
+                ? ramp
+                : options.RampWindow);
 
     private static AgentFloorSettings ResolveFloorSettings(QuotaRouterOptions options, AgentKind agent)
     {
@@ -468,8 +660,19 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
     }
 }
 
+/// <summary>
+/// Gate verdict. <see cref="QuotaGateDecision.FloorPct"/> is always a
+/// percentage (null for balance pools — their absolute floor travels in
+/// <see cref="QuotaGateDecision.BalanceFloor"/> so pct consumers never
+/// misread an absolute value). <see cref="QuotaGateDecision.Terminal"/> marks
+/// a refusal that will never clear by waiting (depleting-balance exhaustion:
+/// no reset will replenish it); callers must fail rather than park for reset.
+/// </summary>
 public sealed record QuotaGateDecision(
     bool Allow,
     string Reason,
     double? FloorPct = null,
-    string? WindowName = null);
+    string? WindowName = null,
+    string? PoolId = null,
+    double? BalanceFloor = null,
+    bool Terminal = false);

@@ -45,6 +45,17 @@ public sealed record AgentMembership
     public string? InstanceId { get; init; }
 
     /// <summary>
+    /// Optional quota pool this member draws from. A pool names one underlying
+    /// account or subscription; members that share a pool are metered as one
+    /// quantity (one reading, one floor, one reservation escrow). Null means
+    /// legacy per-agent keying. Must name an entry in the quota router's
+    /// configured pools; an unknown name fails closed at dispatch (the member
+    /// is refused and the reason names the member and the pool).
+    /// Operator-declared in configuration; never derived from credentials.
+    /// </summary>
+    public string? Pool { get; init; }
+
+    /// <summary>
     /// Per-instance credential source. When null, the legacy per-kind
     /// credential chain is used.
     /// </summary>
