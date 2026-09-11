@@ -955,7 +955,9 @@ public sealed class AgentConfigHotReloadTests
         var router = new AgentClassRouter(
             AgentClassesConfigBuilder.Build(validInitial, NullLogger<AgentClassRouter>.Instance),
             Array.Empty<IAgentQuotaProbe>(),
-            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            // Zero floors so the probe-less ResolveAsync below reaches UnknownPolicy:
+            // this test pins catalog retention on a rejected edit, not the reserve floor.
+            new QuotaRouterOptions { MinQuotaPct = 0, StartFloorPct = 0, EndFloorPct = 0 },
             NullLogger<AgentClassRouter>.Instance);
         using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
         var burnEstimator = new AgentBurnEstimator(
