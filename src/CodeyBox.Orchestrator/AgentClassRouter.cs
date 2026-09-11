@@ -3196,7 +3196,7 @@ public sealed class QuotaRouterOptions
     /// legitimate phase (see work timeouts, default 240 min). Default 6 hours.
     /// Hot-reloadable.
     /// </summary>
-    public TimeSpan QuotaReservationMaxAge { get; set; } = TimeSpan.FromHours(6);
+    public TimeSpan QuotaReservationMaxAge { get; set; } = QuotaRouterDefaults.DefaultQuotaReservationMaxAge;
 
     /// <summary>
     /// Default "how many concurrent burns fit in the remaining quota window"

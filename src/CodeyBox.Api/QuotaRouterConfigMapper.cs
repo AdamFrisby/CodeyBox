@@ -37,7 +37,9 @@ internal static class QuotaRouterConfigMapper
             DispatchReservationEstimatePctByAgent = new Dictionary<string, double>(qr.DispatchReservationEstimatePctByAgent, StringComparer.OrdinalIgnoreCase),
             DispatchReservationMinPct = qr.DispatchReservationMinPct,
             DispatchReservationMaxPct = qr.DispatchReservationMaxPct,
-            QuotaReservationMaxAge = TimeSpan.FromSeconds(qr.QuotaReservationMaxAgeSeconds),
+            QuotaReservationMaxAge = BuildPositiveDuration(
+                qr.QuotaReservationMaxAgeSeconds,
+                QuotaRouterDefaults.DefaultQuotaReservationMaxAge),
             ExpectedResets = BuildExpectedResetOverrides(qr.ExpectedResets),
             IntraKindRoutingPolicy = qr.IntraKindRoutingPolicy,
         };

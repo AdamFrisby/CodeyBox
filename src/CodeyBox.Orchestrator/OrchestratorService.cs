@@ -693,31 +693,41 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var ledger = _reservationLedger;
         if (ledger is null) return;
 
+        // The reconcile read can throw OperationCanceledException (the cost
+        // store honors cancellation); the escrow must still be released, so
+        // the Complete call lives in the finally. Cancellation here only
+        // means "no usable observation" — the estimate is released outright.
+        // Best-effort throughout: accounting must never fail a worker exit.
         double? observed = null;
         try
         {
-            if (_costStore is not null)
+            try
             {
-                var rows = await _costStore.GetByWorkItemAsync(id.ToString(), ct);
-                var runRows = rows.Where(r => r.StartedAt >= runStartedAt).ToList();
-                var summary = WorkItemUsageAggregator.Summarise(runRows);
-                var budget = 0L;
-                _burnEstimatorOptions?.WindowTokenBudget.TryGetValue(lease.Agent.Value, out budget);
-                observed = QuotaReservationLedger.ToObservedPct(summary?.Total, budget);
+                if (_costStore is not null)
+                {
+                    var rows = await _costStore.GetByWorkItemAsync(id.ToString(), ct);
+                    var runRows = rows.Where(r => r.StartedAt >= runStartedAt).ToList();
+                    var summary = WorkItemUsageAggregator.Summarise(runRows);
+                    var budget = 0L;
+                    _burnEstimatorOptions?.WindowTokenBudget.TryGetValue(lease.Agent.Value, out budget);
+                    observed = QuotaReservationLedger.ToObservedPct(summary?.Total, budget);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Quota escrow reconcile for {Id} failed; releasing the estimate", id);
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        finally
         {
-            _log.LogDebug(ex, "Quota escrow reconcile for {Id} failed; releasing the estimate", id);
-        }
-
-        try
-        {
-            ledger.Complete(lease, observed);
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex, "Quota escrow release for {Id} failed", id);
+            try
+            {
+                ledger.Complete(lease, observed);
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Quota escrow release for {Id} failed", id);
+            }
         }
     }
 
