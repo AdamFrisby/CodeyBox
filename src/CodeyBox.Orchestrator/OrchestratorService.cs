@@ -2936,6 +2936,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
                     return;
                 }
+                else if (decision.TerminalQuotaExhausted)
+                {
+                    // Depleting-balance exhaustion: no reset will ever
+                    // replenish the pool, so the item fails with a top-up
+                    // pointer instead of parking in WaitingForQuotaReset.
+                    _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
+                    AuditLog.WorkItemFailed(item.Id, decision.Reason);
+                    ClearPreStartRefactorDrainClaim(item);
+                    await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
+                    return;
+                }
             }
 
             // Per-agent concurrency cap reservation for items that did NOT go

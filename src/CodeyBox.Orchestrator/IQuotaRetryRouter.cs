@@ -71,7 +71,8 @@ public sealed record QuotaRetryRoutingDecision(
     bool ShouldWait,
     bool NoEligibleMembers,
     string? Reason,
-    bool WaitingForPausedAgent = false);
+    bool WaitingForPausedAgent = false,
+    bool TerminalQuotaExhausted = false);
 
 public readonly record struct QuotaRetryAdmissionPoolKey
 {

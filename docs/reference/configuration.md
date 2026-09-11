@@ -672,6 +672,8 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `EndFloorPct` | `3` | Global late-window ramp floor as reset approaches. |
 | `RampWindowSeconds` | `604800` | Global quota-window length used for the ramp calculation. |
 | `FloorByAgent` | `{}` | Optional per-agent overrides keyed by agent kind, e.g. `codex` or `claude`. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted fields inherit global values, and omitted agents use the global ramp. |
+| `Pools` | `{}` | Optional quota pools keyed by pool name. Each pool names one underlying account or subscription; class members join via their `Pool` reference and share one reading, one floor, and one reservation escrow. Each entry sets `Kind` (`ResettingWindow` or `DepletingBalance`), optional `BalanceUnit`, and optional `ReservationEstimate` (native units). Hot-reloadable. See `docs/operating/quota.md`. |
+| `FloorByPool` | `{}` | Optional per-pool floor overrides keyed by pool name, alongside `FloorByAgent`. For a pool member the higher of the pool-resolved and agent-resolved floors wins. Resetting-window pools use the percentage fields (`MinQuotaPct`, `StartFloorPct`, `EndFloorPct`, `RampWindowSeconds`); depleting-balance pools use absolute `MinBalance`. Mixing units is rejected at load. Hot-reloadable. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
 | `PausedQuotaCacheTtlSeconds` | `3600` | Seconds to cache quota snapshots while an agent is operator-paused. Active/routable agents keep using `QuotaCacheTtlSeconds`. Hot-reloadable. |
