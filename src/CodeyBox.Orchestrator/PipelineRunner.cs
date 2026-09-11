@@ -13074,7 +13074,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     ctx,
                                     ct);
                             }
-                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException and not AuditorIdleTimeoutException)
+                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException and not AuditorIdleTimeoutException && !SandboxDeferralGuard.IsDeferral(ex))
                             {
                                 throw new AuditUnavailableException(
                                     $"could-not-verify: isolated audit repository setup failed for {auditor.Name}: {SingleLineSummary(ex.Message)}",

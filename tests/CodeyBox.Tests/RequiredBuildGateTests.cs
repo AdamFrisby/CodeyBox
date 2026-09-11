@@ -376,6 +376,186 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.DoesNotContain(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
     }
 
+    [Theory]
+    [InlineData("provisioning")]
+    [InlineData("disk")]
+    public async Task BuildScriptAuditor_IsolatedSandboxDeferral_PropagatesInsteadOfCouldNotVerify(
+        string deferralKind)
+    {
+        // Regression test for the incident where a sandbox-provisioning
+        // deferral during isolated audit repository setup was wrapped into
+        // AuditUnavailableException ("could-not-verify ... terminally failed
+        // the item) instead of propagating to the defer-and-requeue path.
+        // Both deferral leaf types must propagate through the shared guard.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        SandboxProvisioningDeferredException deferred = deferralKind == "disk"
+            ? new SandboxDiskDeferredException(
+                mountPath: "incus-pool:codeybox-zfs",
+                freeBytes: 8_522_469_888,
+                thresholdBytes: 10_737_418_240,
+                recheckIn: TimeSpan.FromSeconds(42))
+            : new SandboxProvisioningDeferredException(
+                provider: "incus",
+                operation: "guest-agent readiness",
+                errorClass: "incus-liveness-timeout",
+                detail: "Incus VM did not expose its guest agent within 300 seconds",
+                recheckIn: TimeSpan.FromSeconds(42));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 })],
+            maxAuditIterations: 1,
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+            },
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            sandboxProvider: new SandboxFactoryProvisioningDeferredProvider(deferred));
+
+        var item = NewItem("feature/build-script-isolated-deferral") with
+        {
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "build.sh",
+            "#!/bin/sh\nexit 0\n",
+            "add build script");
+
+        await tp.Store.CreateAsync(item);
+        var thrown = await Assert.ThrowsAnyAsync<SandboxProvisioningDeferredException>(() =>
+            tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        if (final.LastError is not null)
+            Assert.DoesNotContain("could-not-verify", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BuildScriptAuditor_IsolatedCloneDeferral_PropagatesInsteadOfCouldNotVerify()
+    {
+        // Same deferral transparency one layer earlier: the isolated bare
+        // clone itself defers (the exact "isolated audit repository setup
+        // failed ... sandbox provisioning deferred" shape from the incident).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "incus",
+            operation: "guest-agent readiness",
+            errorClass: "incus-liveness-timeout",
+            detail: "Incus VM did not expose its guest agent within 300 seconds",
+            recheckIn: TimeSpan.FromSeconds(42));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 })],
+            maxAuditIterations: 1,
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+            },
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            gitHostDecorator: inner => new DeferredIsolatedRepositoryCloneGitHost(inner, deferred));
+
+        var item = NewItem("feature/build-script-isolated-clone-deferral") with
+        {
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "build.sh",
+            "#!/bin/sh\nexit 0\n",
+            "add build script");
+
+        await tp.Store.CreateAsync(item);
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        if (final.LastError is not null)
+            Assert.DoesNotContain("could-not-verify", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_IsolatedRepoCreationDeferral_Rethrows()
+    {
+        // The verifier's isolated-clone helper previously wrapped every
+        // failure into InvalidOperationException, which the outer boundary
+        // then flattened into Unavailable. Deferrals must survive that
+        // helper via the same shared guard the audit setup path uses.
+        // Hermetic: the marker probe is stubbed so this exercises the
+        // deferral boundary without touching host git at all.
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "incus",
+            operation: "guest-agent readiness",
+            errorClass: "incus-liveness-timeout",
+            detail: "Incus VM did not expose its guest agent",
+            recheckIn: TimeSpan.FromSeconds(42));
+        var brokenHost = new DeferredIsolatedRepositoryCloneGitHost(
+            new MarkerListingGitHost(gitHost),
+            deferred);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            brokenHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/isolated-clone-defers") with { State = WorkItemState.WorkComplete };
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            verifier.VerifyAsync(new RequiredBuildVerificationRequest
+            {
+                WorkItemId = item.Id,
+                ProjectId = item.ProjectId,
+                SandboxPolicy = new RequiredBuildSandboxPolicy(),
+                RepositoryId = "repo-hermetic",
+                BaseBranch = item.BaseBranch,
+                WorkBranch = item.WorkBranch!,
+                Phase = "audit",
+            }, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+    }
+
+    [Fact]
+    public void SandboxDeferralGuard_CoversCurrentAndFutureDeferralKinds()
+    {
+        // The shared exclusion must be stated once: both deferral leaf types
+        // match via the base type, ordinary failures do not, and cancellation
+        // is never wrapped by terminal-mapping boundaries.
+        var provisioning = new SandboxProvisioningDeferredException(
+            provider: "p", operation: "o", errorClass: "e", detail: "d",
+            recheckIn: TimeSpan.FromSeconds(1));
+        var disk = new SandboxDiskDeferredException(
+            mountPath: "m", freeBytes: 1, thresholdBytes: 2,
+            recheckIn: TimeSpan.FromSeconds(1));
+
+        Assert.True(SandboxDeferralGuard.IsDeferral(provisioning));
+        Assert.True(SandboxDeferralGuard.IsDeferral(disk));
+        Assert.False(SandboxDeferralGuard.IsDeferral(new InvalidOperationException("boom")));
+        Assert.False(SandboxDeferralGuard.IsDeferral(new OperationCanceledException()));
+
+        Assert.False(SandboxDeferralGuard.ShouldWrap(provisioning));
+        Assert.False(SandboxDeferralGuard.ShouldWrap(disk));
+        Assert.False(SandboxDeferralGuard.ShouldWrap(new OperationCanceledException()));
+        Assert.True(SandboxDeferralGuard.ShouldWrap(new InvalidOperationException("boom")));
+    }
+
     [Fact]
     public async Task RetryFromWork_DefaultCodeyBoxOwnedBranchWithBrokenBuild_ResetsAndRunsCleanWork()
     {
@@ -3539,6 +3719,31 @@ public sealed class RequiredBuildGateTests : IDisposable
             WorkItemId lifetimeId,
             CancellationToken ct = default)
             => throw new InvalidOperationException(message);
+    }
+
+    private sealed class DeferredIsolatedRepositoryCloneGitHost(IGitHost inner, SandboxProvisioningDeferredException exception) : DelegatingGitHost(inner)
+    {
+        private readonly SandboxProvisioningDeferredException _exception = exception;
+
+        public override Task<string> CreateIsolatedRepositoryCloneAsync(
+            string repositoryId,
+            WorkItemId lifetimeId,
+            CancellationToken ct = default)
+            => throw _exception;
+    }
+
+    private sealed class MarkerListingGitHost(IGitHost inner) : DelegatingGitHost(inner)
+    {
+        public override Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+            string repositoryId, string treeish, IReadOnlyList<string> filenameSuffixes,
+            int maxResults, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<string>>(["App.sln"]);
+
+        public override Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+            => Task.FromResult("main");
+
+        public override Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(string repositoryId, string fromTreeish, string toTreeish, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<GitChangedPath>>(Array.Empty<GitChangedPath>());
     }
 
     private sealed class BrokenIsolatedRepoAccessGitHost(IGitHost inner, string message) : DelegatingGitHost(inner)
