@@ -20907,6 +20907,22 @@ Original merge-phase failure (JSON string, for context only):
                 phase);
             return;
         }
+        if (current.State != item.State)
+        {
+            // The row advanced since the snapshot the cancelling attempt
+            // holds (e.g. a concurrent recovery already requeued it from
+            // Working to Queued before this handler read it). The guarded
+            // write below would still win against the advanced state, so
+            // compare against the snapshot first: never clobber a state we
+            // did not observe, and do not fire the cancellation webhook
+            // against a row that is no longer mid-flight.
+            _log.LogInformation(
+                "Work item {Id} advanced from {SnapshotState} to {CurrentState} before the operator-cancel write; leaving the advanced state intact",
+                item.Id,
+                item.State,
+                current.State);
+            return;
+        }
 
         var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
             WorkItemCancellationReason.OperatorRequested,

@@ -387,8 +387,11 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 Title = "wedged work",
                 Prompt = "p",
                 State = WorkItemState.Working,
-                StartedAt = DateTimeOffset.UtcNow.AddHours(-2),
-                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-2),
+                // Frozen past the shipped ItemStaleTimeout default (150 min):
+                // the retry fence gates on UpdatedAt vs the configured
+                // window, so the fixture must stay stale under it.
+                StartedAt = DateTimeOffset.UtcNow.AddHours(-3),
+                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-3),
             };
             await factory.Store.CreateAsync(item);
 
