@@ -501,9 +501,15 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default)
         => Task.FromResult(SuggestionsOverride.FirstOrDefault(s => s.Id == id));
 
+    public List<string> DismissedSuggestionIds { get; } = [];
+
     public Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null,
         CancellationToken ct = default)
-        => Task.FromResult<SuggestionDto?>(null);
+    {
+        DismissedSuggestionIds.Add(id);
+        SuggestionsOverride.RemoveAll(s => s.Id == id);
+        return Task.FromResult<SuggestionDto?>(null);
+    }
 
     public Task<string?> PromoteSuggestionAsync(
         string id, string? extraInstructions = null, string? agent = null,
@@ -593,8 +599,6 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<ProjectQueueStateDto?> ResumeProjectQueueAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult<ProjectQueueStateDto?>(null);
-    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
-        => Task.FromResult(new List<PluginDto>());
     public WorkItemReplaysDto? ReplaysOverride { get; set; }
 
     public Task<WorkItemDto?> ReplayWorkItemAsync(string id, ReplayWorkItemRequest req, CancellationToken ct = default)
@@ -667,4 +671,50 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Task<ReleaseDto?> ReopenReleaseAsync(string id, string reason, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
     public Task<ReleaseDto?> AbandonReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
     public Task<ReleaseDto?> TriggerReleaseAsync(string id, CancellationToken ct = default) => Task.FromResult<ReleaseDto?>(null);
+
+    // ── Seeded-instance coverage (quota / capacity / statistics / plugins) ──
+
+    public QuotaReportDto? QuotaOverride { get; set; }
+    public Exception? QuotaFailure { get; set; }
+
+    public Task<QuotaReportDto?> GetQuotaAsync(CancellationToken ct = default)
+        => QuotaFailure is not null
+            ? Task.FromException<QuotaReportDto?>(QuotaFailure)
+            : Task.FromResult(QuotaOverride);
+
+    public WorkersStatusDto? WorkersOverride { get; set; }
+
+    public Task<WorkersStatusDto?> GetWorkersStatusAsync(CancellationToken ct = default)
+        => Task.FromResult(WorkersOverride);
+
+    public ConcurrencyDto? ConcurrencyOverride { get; set; }
+
+    public Task<ConcurrencyDto?> GetConcurrencyAsync(CancellationToken ct = default)
+        => Task.FromResult(ConcurrencyOverride);
+
+    public CapacityReportDto? CapacityOverride { get; set; }
+    public Exception? CapacityFailure { get; set; }
+    public (string? Agent, int? Hours)? LastCapacityCall { get; private set; }
+
+    public Task<CapacityReportDto?> GetCapacityAsync(
+        string? agent = null,
+        string? window = null,
+        string? model = null,
+        int? hours = null,
+        bool includeIntervals = true,
+        CancellationToken ct = default)
+    {
+        LastCapacityCall = (agent, hours);
+        return CapacityFailure is not null
+            ? Task.FromException<CapacityReportDto?>(CapacityFailure)
+            : Task.FromResult(CapacityOverride);
+    }
+
+    public List<PluginDto> PluginsOverride { get; set; } = [];
+    public Exception? PluginsFailure { get; set; }
+
+    public Task<List<PluginDto>> GetAuditorPluginsAsync(CancellationToken ct = default)
+        => PluginsFailure is not null
+            ? Task.FromException<List<PluginDto>>(PluginsFailure)
+            : Task.FromResult(PluginsOverride);
 }

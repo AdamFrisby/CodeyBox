@@ -11,6 +11,7 @@
     <Project Path="src/CodeyBox.Agents.Antigravity/CodeyBox.Agents.Antigravity.csproj" />
     <Project Path="src/CodeyBox.Agents.Crock/CodeyBox.Agents.Crock.csproj" />
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
+    <Project Path="src/CodeyBox.AdminSeed/CodeyBox.AdminSeed.csproj" />
     <Project Path="src/CodeyBox.Api/CodeyBox.Api.csproj" />
     <Project Path="src/CodeyBox.Audit.Llm/CodeyBox.Audit.Llm.csproj" />
     <Project Path="src/CodeyBox.Audit.Presets/CodeyBox.Audit.Presets.csproj" />

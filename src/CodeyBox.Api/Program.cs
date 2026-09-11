@@ -14,6 +14,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Opencode;
+using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
 using CodeyBox.Audit;
@@ -1145,6 +1146,16 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 {
     SandboxOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,
 });
+// Seeded fake-agent run mode for the admin E2E/demo instance (see
+// docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
+// when disabled nothing here registers and production routing is untouched.
+builder.Services.AddOptions<SeededFakeAgentOptions>()
+    .Bind(builder.Configuration.GetSection(SeededFakeServiceExtensions.ConfigSectionPath));
+if (builder.Configuration.GetValue<bool>(
+    $"{SeededFakeServiceExtensions.ConfigSectionPath}:Enabled"))
+{
+    builder.Services.AddSeededFakeAgents();
+}
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
