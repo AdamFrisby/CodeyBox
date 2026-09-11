@@ -30,8 +30,9 @@ public sealed record ClaudeQuotaProbeResilienceOptions
     public TimeSpan RetryInitialDelay { get; init; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// Ceiling for any between-retry sleep, including provider
-    /// <c>Retry-After</c> values. Default 5 minutes.
+    /// Ceiling for any between-retry sleep and for a provider-supplied
+    /// <c>Retry-After</c> 429 cooldown, so a large server value cannot wedge
+    /// the probe. Default 5 minutes.
     /// </summary>
     public TimeSpan MaxRetryDelay { get; init; } = DefaultMaxRetryDelay;
 

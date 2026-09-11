@@ -388,8 +388,11 @@ public sealed class QuotaRouterProgramWiringTests
     }
 
     [Fact]
-    public async Task ProgramClaudeQuotaProbe_RetryAfterIsNotCappedByQuotaRouterOptions()
+    public async Task ProgramClaudeQuotaProbe_RetryAfterIsCappedByQuotaRouterOptions()
     {
+        // A large provider Retry-After must not wedge the probe: the
+        // between-retry delay is capped at ProbeRetryMaxDelaySeconds, which
+        // hot-reloads without a restart.
         var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
         var handler = new RetryAfterSequenceHandler(
             new RetryAfterResponse(HttpStatusCode.ServiceUnavailable, "", TimeSpan.FromSeconds(10)),
@@ -403,7 +406,7 @@ public sealed class QuotaRouterProgramWiringTests
 
         var first = await probe.GetAvailabilityAsync(ClaudeMember, CancellationToken.None);
         Assert.Equal(60, first.AvailablePct, precision: 5);
-        Assert.Equal(TimeSpan.FromSeconds(10), Assert.Single(time.Delays));
+        Assert.Equal(TimeSpan.FromSeconds(1), Assert.Single(time.Delays));
 
         monitor.Set(ClaudeRetryOptions(maxRetryDelaySeconds: 3));
         ((IAgentQuotaCacheInvalidator)probe).InvalidateResponseCache();
@@ -411,7 +414,7 @@ public sealed class QuotaRouterProgramWiringTests
         var second = await probe.GetAvailabilityAsync(ClaudeMember, CancellationToken.None);
         Assert.Equal(70, second.AvailablePct, precision: 5);
         Assert.Equal(2, time.Delays.Count);
-        Assert.Equal(TimeSpan.FromSeconds(10), time.Delays[1]);
+        Assert.Equal(TimeSpan.FromSeconds(3), time.Delays[1]);
         Assert.Equal(4, handler.CallCount);
     }
 

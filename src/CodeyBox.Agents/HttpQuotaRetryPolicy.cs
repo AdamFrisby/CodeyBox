@@ -37,24 +37,33 @@ public static class HttpQuotaRetryPolicy
     }
 
     /// <summary>
+    /// Default ceiling applied when <paramref name="maxDelay"/> is not positive.
+    /// Keeps a large (or malicious) provider <c>Retry-After</c> from wedging a
+    /// probe that was constructed without explicit tuning.
+    /// </summary>
+    public static TimeSpan DefaultMaxRetryDelay { get; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
     /// Returns the larger of the computed exponential backoff and the provider's
-    /// <c>Retry-After</c> delay. <paramref name="maxDelay"/> caps only the
-    /// locally-computed exponential delay: a provider's Retry-After value is
-    /// never shortened, because retrying before it expires can prolong a rate
-    /// limit. A zero or negative cap intentionally means "uncapped".
+    /// <c>Retry-After</c> delay, capped at <paramref name="maxDelay"/> so a large
+    /// server value cannot wedge the probe. The cap applies to the total delay
+    /// (not just the locally-computed exponential part): callers wait at least
+    /// the server's <c>Retry-After</c> up to the cap, then retry. A zero or
+    /// negative <paramref name="maxDelay"/> falls back to
+    /// <see cref="DefaultMaxRetryDelay"/>.
     /// </summary>
     public static TimeSpan ComputeRetryDelay(
         TimeSpan exponentialDelay,
         TimeSpan? retryAfterDelay,
         TimeSpan maxDelay)
     {
-        var cappedExponential = maxDelay > TimeSpan.Zero && exponentialDelay > maxDelay
-            ? maxDelay
-            : exponentialDelay;
+        var cap = maxDelay > TimeSpan.Zero ? maxDelay : DefaultMaxRetryDelay;
+        var cappedExponential = exponentialDelay > cap ? cap : exponentialDelay;
         var serverDelay = retryAfterDelay ?? TimeSpan.Zero;
-        var delay = cappedExponential >= serverDelay
+        var cappedServer = serverDelay > cap ? cap : serverDelay;
+        var delay = cappedExponential >= cappedServer
             ? cappedExponential
-            : serverDelay;
+            : cappedServer;
 
         if (delay <= TimeSpan.Zero)
             return TimeSpan.Zero;
