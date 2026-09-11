@@ -406,6 +406,9 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 Title = "wedged work",
                 Prompt = "p",
                 State = WorkItemState.Working,
+                // Frozen past the effective item-stale window (see frozenAt
+                // above): the retry fence gates on UpdatedAt vs the configured
+                // window, so the fixture must stay stale under it.
                 StartedAt = frozenAt,
                 UpdatedAt = frozenAt,
             };

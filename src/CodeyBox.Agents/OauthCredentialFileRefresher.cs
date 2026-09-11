@@ -433,8 +433,13 @@ public abstract class OauthCredentialFileRefresher : IDisposable
             PopulateCliRefreshEnvironment(psi);
             proc = Process.Start(psi);
             if (proc is null) return false;
-            var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
-            var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
+            // Bounded capture: the child can emit an arbitrary amount of
+            // output and only the exit code is observed, so buffer at most
+            // MaxCliOutputChars per stream while still draining both pipes
+            // (abandoning a pipe would let the child block on a full buffer).
+            var maxChars = OauthCredentialRefresherBounds.MaxCliOutputChars;
+            var stdoutTask = ReadBoundedTextAsync(proc.StandardOutput, maxChars, cts.Token);
+            var stderrTask = ReadBoundedTextAsync(proc.StandardError, maxChars, cts.Token);
             await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
             await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
             return proc.ExitCode == 0;
@@ -449,6 +454,46 @@ public abstract class OauthCredentialFileRefresher : IDisposable
         {
             proc?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Single code path for every OAuth refresh response body. Streams the
+    /// response under <see cref="OauthCredentialRefresherBounds.MaxRefreshBodyBytes"/>
+    /// — read fresh on each call so config hot-reload applies — and reports
+    /// an oversize body via <c>BodyTooLarge</c> without ever buffering it.
+    /// Callers treat a too-large body exactly like a failed refresh (no token)
+    /// rather than parsing unbounded endpoint-controlled bytes.
+    /// </summary>
+    internal static Task<BoundedHttpResponse> SendBoundedRefreshAsync(
+        HttpClient http,
+        HttpRequestMessage request,
+        CancellationToken ct)
+        => BoundedHttpResponseReader.SendAsync(
+            http, request, OauthCredentialRefresherBounds.MaxRefreshBodyBytes, ct);
+
+    /// <summary>
+    /// Drains <paramref name="reader"/> to the end but buffers at most
+    /// <paramref name="maxChars"/> characters, discarding the remainder.
+    /// Draining (rather than abandoning the stream) keeps a child process
+    /// from blocking on a full pipe buffer; discarding keeps memory bounded
+    /// no matter how much the child emits.
+    /// </summary>
+    internal static async Task<string> ReadBoundedTextAsync(TextReader reader, int maxChars, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        if (maxChars < 1) throw new ArgumentOutOfRangeException(nameof(maxChars));
+        var sb = new StringBuilder(Math.Min(maxChars, 4096));
+        var chunk = new char[4096];
+        var remaining = maxChars;
+        int read;
+        while ((read = await reader.ReadAsync(chunk.AsMemory(), ct).ConfigureAwait(false)) > 0)
+        {
+            if (remaining <= 0) continue;
+            var take = Math.Min(read, remaining);
+            sb.Append(chunk, 0, take);
+            remaining -= take;
+        }
+        return sb.ToString();
     }
 
     protected sealed record ParsedCreds(
