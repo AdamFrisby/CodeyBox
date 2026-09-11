@@ -20938,7 +20938,14 @@ Original merge-phase failure (JSON string, for context only):
                 phase);
             return;
         }
-
+        // NOTE: do not compare current.State against the RunAsync entry
+        // snapshot (item.State): the pipeline legitimately advances
+        // Queued -> Working -> ... -> Auditing before a cancel arrives, so a
+        // snapshot comparison would suppress every genuine mid-flight cancel
+        // (e.g. CancelDuringAudit). The recovered-before-read race is already
+        // covered by IsRecoveredResumeStateForCancelledPhase above when the
+        // phase is known, and by the guarded TryUpdateIfStateAsync write below
+        // otherwise.
         var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
             WorkItemCancellationReason.OperatorRequested,
             cancellationSource: CancellationSources.Operator);
