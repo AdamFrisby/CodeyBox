@@ -689,6 +689,48 @@ public sealed class LocalGitHost : IGitHost
         );
     }
 
+    public async Task<IReadOnlyList<string>> GetCommitMessagesAsync(
+        string repositoryId, string baseBranch, string workBranch,
+        CancellationToken ct = default)
+    {
+        const int maxMessages = 20;
+        const int maxMessageChars = 2048;
+
+        try
+        {
+            Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+            Validation.ValidateBranchName(workBranch, nameof(workBranch));
+        }
+        catch
+        {
+            return [];
+        }
+
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            return [];
+
+        // Two-dot range lists commits reachable from work but not base.
+        // %B is the raw subject+body; %x1e terminates each message with an
+        // ASCII record separator so multi-line bodies survive the split.
+        // `--` guards against branch names parsing as paths.
+        var rc = await RunGitAsync(path, ct, "log", "--format=%B%x1e", "-n", "20", $"{baseBranch}..{workBranch}", "--");
+        if (rc.ExitCode != 0)
+            return [];
+
+        var messages = new List<string>();
+        foreach (var raw in rc.Stdout.Split('\x1e'))
+        {
+            var message = raw.Trim();
+            if (string.IsNullOrEmpty(message))
+                continue;
+            messages.Add(message.Length <= maxMessageChars ? message : message[..maxMessageChars]);
+            if (messages.Count >= maxMessages)
+                break;
+        }
+        return messages;
+    }
+
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
 
     public string RepositoriesRootDirectory => _opts.RootDirectory;

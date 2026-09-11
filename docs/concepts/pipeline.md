@@ -219,9 +219,22 @@ any error message). The named `HttpClient "github-upstream"` carries the
 #### LLM-generated PR descriptions
 
 Step 2 generates a narrative PR body when `Upstream.PrDescription.Enabled` is
-true **and** `SandboxImageReference` names an image with the generator agent's
-CLI installed. An empty image reference disables the generator regardless of
-`Enabled`, and the static template is used. Inputs:
+true. Two strategies implement `IPullRequestDescriptionGenerator`, selected
+per project by `Upstream.PrDescription.Strategy` (default `"Completion"` —
+project configuration reloads without a restart, so switching strategies
+takes effect on the next work item):
+
+| Strategy | How it generates | Requires |
+|---|---|---|
+| `Completion` (default) | A single tool-less completion call via `ICompletionClient` against `CompletionEndpoint`. Creates no sandbox and runs no agent, so generation never contends for sandbox permits. | `CompletionEndpoint` (absolute http(s) URL) plus `CompletionModel` |
+| `Agentic` | Runs the configured agent (`GeneratorAgent`, default `"claude"`) inside a minimal sandbox over the diff. Retained as a supported option; places a sandbox acquisition on the merge critical path and executes an agent over attacker-influenceable diff content. | `SandboxImageReference` naming an image with the generator agent's CLI installed |
+
+Availability is evaluated against the selected strategy's own requirement: a
+project selecting `Completion` is not disabled by a missing
+`SandboxImageReference`, and vice versa. When the requirement is missing (or
+`Enabled` is false) the static template is used immediately with no LLM call.
+
+Inputs (both strategies):
 
 - `git diff --stat` (compact change summary)
 - Full `git diff` between base and work branches, capped at `MaxDiffBytes`
@@ -229,23 +242,32 @@ CLI installed. An empty image reference disables the generator regardless of
   the start and end are preserved and a `[… N bytes truncated …]` marker
   is inserted — so the LLM sees both the first and last diff hunks of a
   large changeset.
-- The original work-item prompt (truncated to 2 KB).
+- The original work item prompt (truncated to 2 KB).
 - Titles of audit findings addressed during rework iterations.
+- Agent commit messages from the work branch (up to 20, 2 KB each).
 - Last 2 KB of agent stdout (the agent's concluding reasoning).
 
-The generator runs the configured agent (`GeneratorAgent`, default `"claude"`)
-inside a minimal sandbox. Its output is sanitised through
-`RawOutputRedactor` before use, so accidentally-committed tokens in the
-diff or echoed back by the LLM are replaced with `***`.
+Both strategies share the same prompt shape, middle-out truncation, and
+`RawOutputRedactor` sanitisation of inputs and outputs (accidentally-committed
+tokens in the diff or echoed back by the model are replaced with `***`), via a
+shared base class — a future third strategy inherits the same safeguards.
 
-**Fallback semantics** — the generator is non-blocking:
+**Rendered body** — the generated prose never stands alone: the deterministic
+facts (work item id and changed-file list) stay in the body adjacent to the
+generated text, and the generated section carries a "Machine-generated
+summary" notice so reviewers and downstream automation do not treat model
+output over untrusted diff content as authoritative. The same generated body
+feeds the squash merge commit message (`CleanProseForCommitMessage`), with the
+template scaffolding stripped so the commit carries the narrative.
+
+**Fallback semantics** — generation never fails or delays a pull request:
 
 | Condition | Behaviour |
 |---|---|
-| `Enabled = false`, or `SandboxImageReference` empty | Static template used immediately; no LLM call |
-| Generator succeeds | LLM body used as PR description prefix |
-| Generator times out (`Timeout`, default 30 s) | Warning logged; static template used |
-| Generator throws | Warning logged; static template used |
+| `Enabled = false`, or the selected strategy's requirement missing | Static template used immediately; no LLM call |
+| Generator succeeds | Generated body used as PR description |
+| Generator times out (`Timeout`, default 30 s, the deadline for the whole round trip) | Warning logged; static template used |
+| Generator throws (transport/auth failure, sandbox provisioning failure, empty completion) | Warning logged; static template used |
 
 The standard footer (`Co-Authored-By: CodeyBox <noreply@codeybox.invalid>`
 plus a generated-with link) is appended to the PR body in all cases.
@@ -258,6 +280,9 @@ plus a generated-with link) is appended to the PR body in all cases.
   ...
   "PrDescription": {
     "Enabled": true,
+    "Strategy": "Completion",
+    "CompletionEndpoint": "https://api.openai.com/v1/chat/completions",
+    "CompletionModel": "gpt-4o-mini",
     "GeneratorAgent": "claude",
     "GeneratorModelId": null,
     "MaxDiffBytes": 32768,
@@ -267,6 +292,12 @@ plus a generated-with link) is appended to the PR body in all cases.
   }
 }
 ```
+
+`CompletionApiKey` (or the first non-empty `CompletionApiKeyEnvVars` entry,
+default `CODEYBOX_PR_DESCRIPTION_API_KEY`), `CompletionWireApi` (default
+`OpenAiChatCompletions`) and `CompletionMaxOutputTokens` (default 1024) tune
+the completion call. `SandboxImageReference` and `AgentAllowedHosts` apply
+only to the `Agentic` strategy.
 
 **Cost** — each PR description adds approximately 5 K input tokens and
 500 output tokens. This appears in the per-work-item cost report as a

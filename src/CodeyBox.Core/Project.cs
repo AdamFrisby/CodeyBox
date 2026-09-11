@@ -392,8 +392,13 @@ public sealed record ProjectUpstream
     public string? PullRequestTitleTemplate { get; init; }
 
     /// <summary>
-    /// LLM-generated PR description settings. When <see cref="ProjectPrDescription.SandboxImageReference"/>
-    /// is empty the generator is skipped and the static template is used.
+    /// LLM-generated PR description settings. Availability is evaluated against
+    /// the selected strategy's own requirement: a configured
+    /// <see cref="ProjectPrDescription.CompletionEndpoint"/> for the
+    /// <c>Completion</c> strategy, a non-empty
+    /// <see cref="ProjectPrDescription.SandboxImageReference"/> for the
+    /// <c>Agentic</c> strategy. When the requirement is missing the generator
+    /// is skipped and the static template is used.
     /// </summary>
     public ProjectPrDescription PrDescription { get; init; } = new();
 
@@ -440,11 +445,20 @@ public sealed record ProjectUpstream
 /// <summary>
 /// Per-project LLM-generated PR description configuration.
 /// See <c>docs/concepts/pipeline.md</c> for configuration guidance.
+/// All members bind from configuration and reload with the project list,
+/// so switching strategies or endpoints takes effect without a restart.
 /// </summary>
 public sealed record ProjectPrDescription
 {
     /// <summary>When false the generator is skipped entirely. Default: true.</summary>
     public bool Enabled { get; init; } = true;
+
+    /// <summary>
+    /// Selects the generation strategy. <c>Completion</c> (the default) calls a
+    /// configured completion endpoint without a sandbox; <c>Agentic</c> runs the
+    /// generator agent inside a provisioned sandbox. Default: <c>Completion</c>.
+    /// </summary>
+    public PrDescriptionStrategy Strategy { get; init; } = PrDescriptionStrategy.Completion;
 
     /// <summary>Agent kind for generation, e.g. "claude". Default: "claude".</summary>
     public string GeneratorAgent { get; init; } = "claude";
@@ -466,12 +480,47 @@ public sealed record ProjectPrDescription
 
     /// <summary>
     /// Container / VM image reference for the generator sandbox. Must have the
-    /// configured agent CLI installed. When empty the generator is disabled.
+    /// configured agent CLI installed. Required only by the <c>Agentic</c>
+    /// strategy; when empty and that strategy is selected the generator is
+    /// disabled. Ignored by the <c>Completion</c> strategy.
     /// </summary>
     public string SandboxImageReference { get; init; } = string.Empty;
 
     /// <summary>Hosts reachable from the generator sandbox. Default: Anthropic API.</summary>
     public IReadOnlyList<string> AgentAllowedHosts { get; init; } = ["api.anthropic.com"];
+
+    /// <summary>
+    /// Absolute http(s) completion endpoint for the <c>Completion</c> strategy
+    /// (e.g. an OpenAI-compatible chat-completions URL). Exactly this URL is
+    /// POSTed to. Required only by the <c>Completion</c> strategy; when empty
+    /// and that strategy is selected the generator is disabled. Ignored by the
+    /// <c>Agentic</c> strategy.
+    /// </summary>
+    public string CompletionEndpoint { get; init; } = string.Empty;
+
+    /// <summary>Model id sent in the completion request body. Required by the <c>Completion</c> strategy.</summary>
+    public string CompletionModel { get; init; } = string.Empty;
+
+    /// <summary>Wire protocol for the completion call. Default: OpenAiChatCompletions.</summary>
+    public CompletionWireApi CompletionWireApi { get; init; } = CompletionWireApi.OpenAiChatCompletions;
+
+    /// <summary>
+    /// Optional API key for the completion call. When unset, the first
+    /// non-empty <see cref="CompletionApiKeyEnvVars"/> environment variable is used.
+    /// </summary>
+    public string? CompletionApiKey { get; init; }
+
+    /// <summary>Environment variables searched (in order) for the completion API key.</summary>
+    public IReadOnlyList<string> CompletionApiKeyEnvVars { get; init; } = ["CODEYBOX_PR_DESCRIPTION_API_KEY"];
+
+    /// <summary>Provider max-output-tokens hint for the completion call. Default: 1024.</summary>
+    public int CompletionMaxOutputTokens { get; init; } = 1024;
+
+    /// <summary>
+    /// Anthropic API version header sent when <see cref="CompletionWireApi"/> is
+    /// AnthropicMessages. Default: "2023-06-01".
+    /// </summary>
+    public string CompletionAnthropicVersion { get; init; } = "2023-06-01";
 }
 
 /// <summary>
