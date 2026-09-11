@@ -11709,17 +11709,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
             .Select(ToAuditProgressSnapshot)
             .ToList();
 
-        // Rows that never reached a complete verdict were left behind by an
-        // interrupted run (host restart, cancellation, shutdown drain). They
-        // are superseded here — re-audited from the current work branch —
-        // never read as the current verdict. Without this, an in_progress row
-        // frozen by a host restart is treated as authoritative history: the
-        // loop skips its iteration and a downstream rework is dispatched
-        // against findings that may no longer exist.
+        // An interrupted run (host restart, cancellation, shutdown drain) can
+        // leave a trailing row that never reached a verdict and recorded no
+        // findings. There is nothing to rework, so it is superseded here and
+        // the next audit re-evaluates iteration 1 from the current work
+        // branch. A trailing non-complete row WITH findings is different: it
+        // is partial crash-recovery evidence from auditors that did finish,
+        // and the resume path reworks those findings before continuing the
+        // loop (see RunMissingAuditResumeReworkAsync). Days-old rows never
+        // reach this path after a retry: retrying a parked item purges its
+        // prior audit-progress partition first, so the next audit writes a
+        // fresh row. Backstops for any non-complete verdict that does drive
+        // a rework: the merge gate only accepts complete verdicts, and an
+        // empty rework driven by a non-complete verdict never feeds the
+        // no-changes breaker.
         var (kept, superseded) = DropSupersededAuditVerdicts(snapshots);
         if (superseded > 0)
             _log.LogInformation(
-                "Superseded {Count} non-complete audit-progress row(s) for work item {Id}; re-auditing from the current work branch",
+                "Superseded {Count} empty interrupted audit-progress row(s) for work item {Id}; re-auditing from the current work branch",
                 superseded,
                 item.Id);
 
@@ -11727,23 +11734,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Pure core of the interrupted-history reconciliation: drops snapshots
-    /// that never reached a complete verdict, preserving iteration order.
-    /// Returns the surviving complete verdicts plus the superseded count.
+    /// Pure core of the interrupted-history reconciliation: drops a trailing
+    /// snapshot that never reached a verdict and recorded no findings,
+    /// preserving iteration order. A trailing non-complete snapshot WITH
+    /// findings is kept as partial crash-recovery evidence for the resume
+    /// rework path; complete snapshots are always kept. Returns the surviving
+    /// snapshots plus the superseded count (0 or 1).
     /// </summary>
     internal static (IReadOnlyList<AuditProgressSnapshot> Kept, int Superseded) DropSupersededAuditVerdicts(
         IEnumerable<AuditProgressSnapshot> snapshots)
     {
-        var kept = new List<AuditProgressSnapshot>();
-        var superseded = 0;
-        foreach (var snapshot in snapshots)
+        var kept = snapshots.ToList();
+        if (kept is [.., { IsComplete: false, Findings.Count: 0 }])
         {
-            if (snapshot.IsComplete)
-                kept.Add(snapshot);
-            else
-                superseded++;
+            kept.RemoveAt(kept.Count - 1);
+            return (kept, 1);
         }
-        return (kept, superseded);
+        return (kept, 0);
     }
 
     private async Task PersistAuditProgressAsync(

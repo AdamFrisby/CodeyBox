@@ -9,10 +9,11 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Regression tests for the stale-audit-verdict cycle: a retry that returns a
 /// parked item to a runnable state must invalidate its prior audit progress, a
-/// row left in_progress/incomplete by an interrupted run must be superseded
-/// rather than read as a verdict, a no-change rework driven by such a
-/// superseded verdict must not feed the no-changes circuit breaker, and park
-/// reasons must carry the verdict's age and status.
+/// trailing row left empty by an interrupted run must be superseded rather
+/// than read as a verdict (partial rows stay as crash-recovery evidence but
+/// never gate a merge nor feed the no-changes breaker), a no-change rework
+/// driven by such a superseded verdict must not feed the no-changes circuit
+/// breaker, and park reasons must carry the verdict's age and status.
 /// </summary>
 [Collection("Pipeline integration")]
 public sealed class StaleAuditVerdictTests : IDisposable
@@ -116,21 +117,37 @@ public sealed class StaleAuditVerdictTests : IDisposable
     // ── Deliverable 2: interrupted rows are superseded, not verdicts ─────────
 
     [Fact]
-    public void DropSupersededAuditVerdicts_KeepsCompleteInOrder_DropsInterrupted()
+    public void DropSupersededAuditVerdicts_DropsTrailingEmptyInterrupted_KeepsPartialEvidence()
     {
-        IReadOnlyList<AuditProgressSnapshot> history =
+        // A trailing row interrupted before any auditor produced findings is
+        // superseded: the next audit re-evaluates from the current branch.
+        IReadOnlyList<AuditProgressSnapshot> emptyTrailing =
+        [
+            Snapshot(1, 2, 0, AuditProgressStatuses.Complete),
+            Snapshot(2, 0, 0, AuditProgressStatuses.InProgress),
+        ];
+
+        var (keptEmpty, supersededEmpty) = PipelineRunner.DropSupersededAuditVerdicts(emptyTrailing);
+
+        Assert.Equal(1, supersededEmpty);
+        Assert.Equal([1], keptEmpty.Select(s => s.Iteration));
+
+        // A trailing interrupted row WITH findings is partial crash-recovery
+        // evidence from auditors that did finish: the resume path reworks
+        // those findings before continuing the loop, so it is kept here.
+        // (Staleness across retries is handled by the retry purge, and the
+        // merge gate plus the no-changes-breaker exemption backstop it.)
+        IReadOnlyList<AuditProgressSnapshot> partialTrailing =
         [
             Snapshot(1, 2, 0, AuditProgressStatuses.Complete),
             Snapshot(2, 1, 0, AuditProgressStatuses.InProgress),
             Snapshot(3, 1, 1, AuditProgressStatuses.Incomplete),
-            Snapshot(4, 0, 0, AuditProgressStatuses.Complete),
         ];
 
-        var (kept, superseded) = PipelineRunner.DropSupersededAuditVerdicts(history);
+        var (keptPartial, supersededPartial) = PipelineRunner.DropSupersededAuditVerdicts(partialTrailing);
 
-        Assert.Equal(2, superseded);
-        Assert.Equal([1, 4], kept.Select(s => s.Iteration));
-        Assert.All(kept, s => Assert.True(s.IsComplete));
+        Assert.Equal(0, supersededPartial);
+        Assert.Equal([1, 2, 3], keptPartial.Select(s => s.Iteration));
     }
 
     [Fact]
