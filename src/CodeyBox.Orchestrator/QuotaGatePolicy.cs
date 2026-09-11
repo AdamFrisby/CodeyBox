@@ -32,6 +32,27 @@ public sealed class QuotaGatePolicy
         string? observedFailureReason = null) =>
         Evaluate(_options, member, quota, nowUtc, recentObservedFailure, observedFailureReason);
 
+    /// <summary>
+    /// Escrow-aware evaluation: gates on
+    /// <c>quota.AvailablePct - outstandingPct</c> so dispatches authorised
+    /// against the same cached probe reading but not yet observed by the next
+    /// refresh cannot carry the pool below the floor. An
+    /// <paramref name="outstandingPct"/> of zero behaves exactly like
+    /// <see cref="Evaluate(AgentMembership, EffectiveQuota, DateTimeOffset, bool, string?)"/>.
+    /// Per-window floors keep the raw window readings: the escrow is denominated
+    /// in aggregate-percentage points (the aggregate is the min across windows,
+    /// so the binding window is already covered) and subtracting it from every
+    /// window would penalise the same estimate once per window.
+    /// </summary>
+    public QuotaGateDecision Evaluate(
+        AgentMembership member,
+        EffectiveQuota quota,
+        DateTimeOffset nowUtc,
+        double outstandingPct,
+        bool recentObservedFailure = false,
+        string? observedFailureReason = null) =>
+        Evaluate(_options, member, quota, nowUtc, outstandingPct, recentObservedFailure, observedFailureReason);
+
     public double ComputeEffectiveFloorPct(
         AgentKind agent,
         DateTimeOffset? resetAt,
@@ -53,6 +74,20 @@ public sealed class QuotaGatePolicy
         EffectiveQuota quota,
         DateTimeOffset nowUtc,
         bool recentObservedFailure = false,
+        string? observedFailureReason = null) =>
+        Evaluate(options, member, quota, nowUtc, 0, recentObservedFailure, observedFailureReason);
+
+    /// <summary>
+    /// Escrow-aware static evaluation; see the instance overload for the
+    /// outstanding-reservation semantics.
+    /// </summary>
+    public static QuotaGateDecision Evaluate(
+        QuotaRouterOptions options,
+        AgentMembership member,
+        EffectiveQuota quota,
+        DateTimeOffset nowUtc,
+        double outstandingPct,
+        bool recentObservedFailure = false,
         string? observedFailureReason = null)
     {
         if (recentObservedFailure)
@@ -64,7 +99,9 @@ public sealed class QuotaGatePolicy
 
         var floor = ComputeFloorPct(options, member, quota, nowUtc);
         var availablePct = quota.AvailablePct;
-        if (availablePct >= floor)
+        var escrowed = Math.Max(0, outstandingPct);
+        var effectivePct = availablePct - escrowed;
+        if (effectivePct >= floor)
         {
             if (member.Billing == AgentBilling.Subscription
                 && quota.Windows is { Count: > 0 } windows)
@@ -88,7 +125,12 @@ public sealed class QuotaGatePolicy
         }
 
         if (availablePct >= 0)
-            return new QuotaGateDecision(false, $"quota below floor ({availablePct:F1}% < {floor:F1}%)", floor);
+        {
+            var reason = escrowed > 0
+                ? $"quota below floor after outstanding reservations ({effectivePct:F1}% < {floor:F1}%; {escrowed:F1}% escrowed)"
+                : $"quota below floor ({availablePct:F1}% < {floor:F1}%)";
+            return new QuotaGateDecision(false, reason, floor);
+        }
 
         // Safety: an operator-configured per-agent reserve floor (FloorByAgent)
         // is explicit intent that must not be silently bypassed when the probe
@@ -300,7 +342,12 @@ public sealed class QuotaGatePolicy
         return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows, snapshot.Unknown);
     }
 
-    private static double ComputeFloorPct(
+    /// <summary>
+    /// The aggregate floor a dispatch for <paramref name="member"/> must meet.
+    /// Public so the reservation ledger's atomic commit-time re-check gates on
+    /// the same floor as <see cref="Evaluate"/> instead of re-implementing it.
+    /// </summary>
+    public static double ComputeFloorPct(
         QuotaRouterOptions options,
         AgentMembership member,
         EffectiveQuota quota,

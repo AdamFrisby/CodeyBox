@@ -33,6 +33,11 @@ internal static class QuotaRouterConfigMapper
             CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
             ColdStartFitInWindow = qr.ColdStartFitInWindow,
             DrainAggressiveness = qr.DrainAggressiveness,
+            DispatchReservationEstimatePct = qr.DispatchReservationEstimatePct,
+            DispatchReservationEstimatePctByAgent = new Dictionary<string, double>(qr.DispatchReservationEstimatePctByAgent, StringComparer.OrdinalIgnoreCase),
+            DispatchReservationMinPct = qr.DispatchReservationMinPct,
+            DispatchReservationMaxPct = qr.DispatchReservationMaxPct,
+            QuotaReservationMaxAge = TimeSpan.FromSeconds(qr.QuotaReservationMaxAgeSeconds),
             ExpectedResets = BuildExpectedResetOverrides(qr.ExpectedResets),
             IntraKindRoutingPolicy = qr.IntraKindRoutingPolicy,
         };
@@ -65,6 +70,12 @@ internal static class QuotaRouterConfigMapper
         dst.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
         dst.ColdStartFitInWindow = src.ColdStartFitInWindow;
         dst.DrainAggressiveness = src.DrainAggressiveness;
+        dst.DispatchReservationEstimatePct = src.DispatchReservationEstimatePct;
+        dst.DispatchReservationEstimatePctByAgent = new Dictionary<string, double>(src.DispatchReservationEstimatePctByAgent, StringComparer.OrdinalIgnoreCase);
+        dst.DispatchReservationMinPct = src.DispatchReservationMinPct;
+        dst.DispatchReservationMaxPct = src.DispatchReservationMaxPct;
+        if (src.QuotaReservationMaxAgeSeconds > 0)
+            dst.QuotaReservationMaxAge = TimeSpan.FromSeconds(src.QuotaReservationMaxAgeSeconds);
         dst.ExpectedResets = BuildExpectedResetOverrides(src.ExpectedResets);
         dst.IntraKindRoutingPolicy = src.IntraKindRoutingPolicy;
     }

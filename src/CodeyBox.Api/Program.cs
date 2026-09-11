@@ -1969,6 +1969,10 @@ static string? ReadAntigravityTokenFile(string? path)
 }
 
 // --- Agent class router ------------------------------------------------------
+builder.Services.AddSingleton<QuotaReservationLedger>(sp =>
+    new QuotaReservationLedger(
+        sp.GetRequiredService<QuotaRouterOptions>(),
+        TimeProvider.System));
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2003,7 +2007,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         configuredSmokeTarget,
         sp.GetService<IAgentDispatchAvailability>(),
         sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
-        sp.GetService<AgentCircuitBreaker>());
+        sp.GetService<AgentCircuitBreaker>(),
+        sp.GetRequiredService<QuotaReservationLedger>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -3709,7 +3714,10 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
     quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>(),
     failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>(),
-    repoReaper: sp.GetRequiredService<WorkItemRepoReaper>()));
+    repoReaper: sp.GetRequiredService<WorkItemRepoReaper>(),
+    reservationLedger: sp.GetRequiredService<QuotaReservationLedger>(),
+    costStore: sp.GetService<IWorkItemCostStore>(),
+    burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -6801,6 +6809,41 @@ namespace CodeyBox.Api
         /// </summary>
         public IntraKindRoutingPolicy IntraKindRoutingPolicy { get; set; } =
             IntraKindRoutingPolicy.MostQuotaFirst;
+        /// <summary>
+        /// Estimated quota cost of one dispatch, in quota-percentage points.
+        /// The reservation ledger escrows this per authorised dispatch so
+        /// concurrent workers sharing one cached probe reading cannot jointly
+        /// overshoot the floor. Cold-start default 5.0; set near the typical
+        /// per-item burn for the fleet. Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationEstimatePct { get; set; } = 5.0;
+        /// <summary>
+        /// Per-agent override for <see cref="DispatchReservationEstimatePct"/>,
+        /// keyed by agent kind value. Non-positive entries are ignored.
+        /// Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, double> DispatchReservationEstimatePctByAgent { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Lower bound for any reservation estimate, in quota-percentage
+        /// points. A missing, zero, or negative estimate resolves to at least
+        /// this — a dispatch must never silently reserve nothing. Default 0.5.
+        /// Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationMinPct { get; set; } = 0.5;
+        /// <summary>
+        /// Upper bound for any single reservation, in quota-percentage points.
+        /// Guards against a misconfigured estimate pinning the pool. Default
+        /// 25. Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationMaxPct { get; set; } = 25.0;
+        /// <summary>
+        /// Maximum age in seconds of a quota reservation before the orphan
+        /// sweep reaps it. Backstop only — prompt release flows through the
+        /// worker-slot lifecycle. Must exceed the longest legitimate phase.
+        /// Default 21600 (6 hours). Hot-reloadable.
+        /// </summary>
+        public int QuotaReservationMaxAgeSeconds { get; set; } = 6 * 60 * 60;
         /// <summary>
         /// Additional retries on a transient probe failure (network error / timeout / 5xx)
         /// before recording the failure. Total attempts = 1 + this value. Default 2.

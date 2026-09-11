@@ -122,6 +122,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // rate-aware gate.
     private readonly ConcurrentDictionary<string, int> _runningPerRoute = new(StringComparer.OrdinalIgnoreCase);
 
+    // Quota escrow leases keyed by work item id string. Populated when class
+    // routing authorises a dispatch with a reservation ledger wired; the outer
+    // finally reconciles/releases on every exit path (success, failure,
+    // cancellation, deferral), and the recovery reaper releases by work item
+    // id when a worker died without running its finally. Entries are removed
+    // exactly once by whichever path runs first, so a dead worker cannot pin
+    // headroom past the ledger TTL.
+    private readonly ConcurrentDictionary<string, QuotaReservationLease> _quotaReservationsByWorkItem =
+        new(StringComparer.Ordinal);
+    private readonly QuotaReservationLedger? _reservationLedger;
+    private readonly IWorkItemCostStore? _costStore;
+    private readonly AgentBurnEstimatorOptions? _burnEstimatorOptions;
+
     // Re-pickup delay applied when a direct-agent item hits its per-agent
     // cap. Class-routed items use QuotaRouterOptions.CapRetryRecheckInterval
     // (the router surfaces it via AgentRoutingDecision.SuggestedRecheckIn).
@@ -298,7 +311,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         TimeProvider? timeProvider = null,
         Func<long>? activeSandboxCountProvider = null,
         BackgroundServiceFailureTracker? failureTracker = null,
-        WorkItemRepoReaper? repoReaper = null)
+        WorkItemRepoReaper? repoReaper = null,
+        QuotaReservationLedger? reservationLedger = null,
+        IWorkItemCostStore? costStore = null,
+        AgentBurnEstimatorOptions? burnEstimatorOptions = null)
     {
         _queue = queue;
         _store = store;
@@ -325,6 +341,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _reaper?.AttachWorkerPoolSlotReleaser(this);
         _quotaRouterOptions = quotaRouterOptions;
         _budgetDeferralRecheck = budgetDeferralRecheck;
+        _reservationLedger = reservationLedger;
+        _costStore = costStore;
+        _burnEstimatorOptions = burnEstimatorOptions;
         _time = timeProvider ?? TimeProvider.System;
         _activeSandboxCountProvider = activeSandboxCountProvider ?? (static () => SandboxLiveCounter.Active);
         _repoReaper = repoReaper;
@@ -657,6 +676,51 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
+    /// <summary>
+    /// Ends one quota escrow: swaps the reservation estimate for this run's
+    /// observed usage (reconcile) or drops it when nothing measurable ran.
+    /// Only cost rows started at or after <paramref name="runStartedAt"/> count
+    /// toward this dispatch — earlier rows belong to prior runs. Best-effort:
+    /// every failure path still releases the lease so accounting can never
+    /// wedge a worker exit or pin headroom.
+    /// </summary>
+    private async Task CompleteQuotaReservationAsync(
+        WorkItemId id,
+        QuotaReservationLease lease,
+        DateTimeOffset runStartedAt,
+        CancellationToken ct)
+    {
+        var ledger = _reservationLedger;
+        if (ledger is null) return;
+
+        double? observed = null;
+        try
+        {
+            if (_costStore is not null)
+            {
+                var rows = await _costStore.GetByWorkItemAsync(id.ToString(), ct);
+                var runRows = rows.Where(r => r.StartedAt >= runStartedAt).ToList();
+                var summary = WorkItemUsageAggregator.Summarise(runRows);
+                var budget = 0L;
+                _burnEstimatorOptions?.WindowTokenBudget.TryGetValue(lease.Agent.Value, out budget);
+                observed = QuotaReservationLedger.ToObservedPct(summary?.Total, budget);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "Quota escrow reconcile for {Id} failed; releasing the estimate", id);
+        }
+
+        try
+        {
+            ledger.Complete(lease, observed);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Quota escrow release for {Id} failed", id);
+        }
+    }
+
     /// <summary>Snapshot for the /workers/status endpoint.</summary>
     public async Task<WorkerPoolStatus> GetStatusAsync(CancellationToken ct = default)
     {
@@ -888,6 +952,23 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (!ReleaseWorkerSlotLease(lease))
             return false;
+
+        // The worker died without running its exit finally: release the quota
+        // escrow it held, if any. The ledger TTL would reap it eventually, but
+        // the reaper already knows the exact work item, so release promptly to
+        // restore headroom for the re-dispatch.
+        if (workItemId is not null
+            && _quotaReservationsByWorkItem.TryRemove(workItemId.Value.ToString(), out var orphan))
+        {
+            try
+            {
+                _reservationLedger?.Release(orphan);
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Quota escrow release for recovered worker {WorkerId} failed", workerId);
+            }
+        }
 
         _log.LogWarning(
             "Worker pool: worker {WorkerIndex} slot for work item {WorkItemId} released by recovery ({WorkerId}): {Reason}",
@@ -2605,9 +2686,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         // Per-agent slot tracking: set when the router pins the item to an agent
         // and the reservation succeeds. Cleared in the outer finally so a deferral
-        // or crash cannot leak the slot.
+        // or crash cannot leak the slot. The quota escrow lease (when the router
+        // committed one) shares exactly this lifecycle: reconciled/released in
+        // the same finally, or by the recovery reaper when the worker died.
         string? agentRouteForRelease = null;
         bool agentSlotReserved = false;
+        QuotaReservationLease? quotaReservation = null;
 
         try
         {
@@ -2805,6 +2889,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         // outer finally releases on every exit path.
                         agentRouteForRelease = chosen.RouteKey;
                         agentSlotReserved = true;
+                    }
+                    if (decision.QuotaReservation is { } quotaLease)
+                    {
+                        // Router escrowed the estimated dispatch cost — the
+                        // outer finally reconciles/releases on every exit path,
+                        // and the recovery reaper covers a dead worker.
+                        quotaReservation = quotaLease;
+                        _quotaReservationsByWorkItem[id.ToString()] = quotaLease;
                     }
                 }
                 else if (decision.NoEligibleMembers)
@@ -3068,6 +3160,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (agentSlotReserved && agentRouteForRelease is { } releaseRoute)
             {
                 ReleaseRoute(releaseRoute);
+            }
+
+            // Reconcile the quota escrow against this run's observed usage and
+            // release it, on the same lifecycle as the slot above: success,
+            // failure, cancellation, and deferral all converge here. Unknown
+            // or zero observed usage releases the estimate outright; a positive
+            // observation stays escrowed until a newer probe reading supersedes
+            // it. Best-effort — accounting must never fail a worker exit.
+            if (quotaReservation is not null)
+            {
+                _quotaReservationsByWorkItem.TryRemove(id.ToString(), out _);
+                await CompleteQuotaReservationAsync(id, quotaReservation, pickupStartedAt, CancellationToken.None);
             }
 
             // Stop the heartbeat and remove the registry row on any exit path
