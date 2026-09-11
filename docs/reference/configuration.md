@@ -148,6 +148,18 @@ Hot-reloadable today:
   `TransitionHealthOptionsSnapshot`; controls the `/fleet/transition-health`
   endpoint's rolling window and "last N transitions" cap.
   See [`transition-health.md`](../operating/pipeline-metrics.md).
+- `ToolchainFaults:<name>.{FaultClass,Disposition,ExitCodes,ExitCodeAbove,StdoutContains,StderrContains,OutputContains,StdoutRegex,StderrRegex,OutputRegex}`
+  — hot-reloaded through `ToolchainFaultSnapshot`; each entry declares a match,
+  the fault class it denotes, and its disposition (`Retry`, `Fail`, `Escalate`)
+  over gate subprocess results. A retryable match re-runs the same commit via
+  the existing bounded `WaitingForTransientRetry` path without recording a
+  finding against the diff. Platform-agnostic built-ins (signal termination
+  above exit 128, OOM kill 137, disk exhaustion, .NET runtime crash
+  `0x80131506`) always apply, so a new language signature is a config-only
+  addition. Every matched classification is recorded with its signature,
+  command, and exit code; per-fault-class frequencies are queryable from
+  `IToolchainFaultRecordStore` and the `codeybox.toolchain.faults` counter.
+  Kept distinct from `TestFailureAttribution`, which consults the base branch.
 - `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
   invocation; changes affect the next work/rework/audit/merge/check-and-act
   prompt.

@@ -70,13 +70,19 @@ internal sealed class RequiredBuildGate
 
     private readonly IRequiredBuildVerifier _verifier;
     private readonly PersistAuditReport? _persistReport;
+    private readonly IToolchainFaultClassifier? _toolchainFaultClassifier;
+    private readonly IToolchainFaultRecordStore? _toolchainFaultRecords;
 
     public RequiredBuildGate(
         IRequiredBuildVerifier verifier,
-        PersistAuditReport? persistReport)
+        PersistAuditReport? persistReport,
+        IToolchainFaultClassifier? toolchainFaultClassifier = null,
+        IToolchainFaultRecordStore? toolchainFaultRecords = null)
     {
         _verifier = verifier ?? throw new ArgumentNullException(nameof(verifier));
         _persistReport = persistReport;
+        _toolchainFaultClassifier = toolchainFaultClassifier;
+        _toolchainFaultRecords = toolchainFaultRecords;
     }
 
     /// <summary>
@@ -279,6 +285,8 @@ internal sealed class RequiredBuildGate
             sw.Stop();
         }
 
+        ThrowIfToolchainFault(result, phase);
+
         if (iteration is int iter)
         {
             await PersistReportAsync(item.Id, iter, startedAt, sw.Elapsed, result, ct);
@@ -291,6 +299,79 @@ internal sealed class RequiredBuildGate
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Classifies a failed verification result against the toolchain-fault
+    /// signatures. A retryable match throws
+    /// <see cref="ToolchainFaultTransientException"/> — routed by the outer
+    /// pipeline catch to the existing bounded
+    /// <c>WaitingForTransientRetry</c> path — before any audit report is
+    /// persisted, so the toolchain failure produces no finding against the
+    /// diff. An escalate match throws
+    /// <see cref="RequiredBuildVerificationUnavailableException"/> (infra
+    /// failure, not diff-attributable). A fail match, or no match, falls
+    /// through to the normal audit-finding path. Every matched classification
+    /// is recorded with its signature, command, and exit code. This check is
+    /// deliberately independent of <see cref="TestFailureAttribution"/>: a
+    /// toolchain fault re-runs the same commit, while flake attribution
+    /// consults the base branch.
+    /// </summary>
+    private void ThrowIfToolchainFault(RequiredBuildVerificationResult result, string phase)
+    {
+        if (result.Status != RequiredBuildVerificationStatus.Failed)
+            return;
+        if (_toolchainFaultClassifier is null)
+            return;
+
+        ToolchainFaultClassification classification;
+        try
+        {
+            classification = _toolchainFaultClassifier.Classify(new SubprocessResult(
+                RequiredBuildGateIdentity.DisplayCommand,
+                result.ExitCode,
+                result.Output,
+                Stderr: null));
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        if (classification.Disposition == ToolchainFaultDisposition.None
+            || string.IsNullOrEmpty(classification.MatchedSignature))
+            return;
+
+        try
+        {
+            _toolchainFaultRecords?.Record(new ToolchainFaultRecord(
+                DateTimeOffset.UtcNow,
+                RequiredBuildGateIdentity.DisplayCommand,
+                result.ExitCode,
+                classification.FaultClass,
+                classification.MatchedSignature,
+                classification.Disposition));
+        }
+        catch (Exception)
+        {
+        }
+
+        if (classification.Disposition == ToolchainFaultDisposition.Retry)
+        {
+            throw new ToolchainFaultTransientException(
+                classification,
+                phase,
+                $"required build hit toolchain fault '{classification.FaultClass}' " +
+                $"(signature '{classification.MatchedSignature}', exit {result.ExitCode}); " +
+                "re-running the same commit");
+        }
+
+        if (classification.Disposition == ToolchainFaultDisposition.Escalate)
+        {
+            throw new RequiredBuildVerificationUnavailableException(
+                $"required build could not complete: toolchain fault '{classification.FaultClass}' " +
+                $"(signature '{classification.MatchedSignature}', exit {result.ExitCode})");
+        }
     }
 
     private async Task PersistReportAsync(
