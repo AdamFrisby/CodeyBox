@@ -341,7 +341,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // Optional best-effort exporter that propagates a completed item's test
         // cases to JobTrack. Null disables propagation; when wired it self-gates
         // on each project's JobTrackExport.Enabled opt-in.
-        IJobTrackTestCaseExporter? jobTrackExporter = null)
+        IJobTrackTestCaseExporter? jobTrackExporter = null,
+        // Phase-execution seam. Null selects the in-process implementation
+        // (current behaviour). Tests inject a double to drive orchestration
+        // without a sandbox provider.
+        IAgentPhaseExecutor? phaseExecutor = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -417,6 +421,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _testCaseStore = testCaseStore;
         _e2eReplayGate = e2eReplayGate;
         _jobTrackExporter = jobTrackExporter;
+        _phaseExecutor = phaseExecutor ?? new AgentPhaseExecutor(this);
         _mergeScopeResolver = mergeScopeResolver ?? NullMergeScopeResolver.Instance;
         _availability = availability;
         // Prefer the DI-injected handler when supplied: keeps the registry
@@ -2670,23 +2675,31 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     {
                         workAgentStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "work", iteration: null,
                             async (runner, trialItem, attemptCt) =>
-                                await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workPhase, ct, phaseCt =>
-                                    RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                        BuildInitialWorkPrompt(
+                                await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workPhase, ct, async phaseCt =>
+                                {
+                                    var phaseResult = await PhaseExecutor.ExecuteAsync(new AgentPhaseRequest
+                                    {
+                                        Item = trialItem,
+                                        Project = project,
+                                        Phase = AgentPhaseKind.Work,
+                                        RepositoryId = repoId,
+                                        BaseBranch = baseBranch,
+                                        Branch = workBranch,
+                                        Runner = runner,
+                                        Prompt = BuildInitialWorkPrompt(
                                             trialItem.Prompt,
                                             project.AllowAgentQuestions,
                                             auditors,
                                             selfReviewChecklistEnabled,
                                             ApprovedPlanForImplementation(trialItem, planningLifecycleRequiredAtEntry)),
-                                        isInitial: true,
-                                        networkProfile: sandboxTarget.NetworkProfile,
-                                        sandboxFlavor: sandboxTarget.Flavor,
-                                        project: project,
-                                        phaseCt,
-                                        hostShutdownToken,
-                                        buildFailurePolicy: RequiredBuildPolicy.Terminal,
-                                        auditorsForPreemptiveSelfReview: auditors,
-                                        resumePreTurnCommitSha: resumePreTurnCommitSha),
+                                        NetworkProfile = sandboxTarget.NetworkProfile,
+                                        SandboxFlavor = sandboxTarget.Flavor,
+                                        BuildPolicy = AgentPhaseBuildPolicy.Terminal,
+                                        AuditorsForPreemptiveSelfReview = auditors,
+                                        ResumePreTurnCommitSha = resumePreTurnCommitSha,
+                                    }, phaseCt, hostShutdownToken);
+                                    return phaseResult.AgentStdout;
+                                },
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: workPhase,
@@ -2738,22 +2751,31 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", resumeIteration,
                             async (runner, trialItem, attemptCt) =>
                                 await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkPhase, ct,
-                                    phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                        trialItem.PreemptCheckpoint is { } checkpointRef
-                                            ? BuildInterruptedReworkResumePrompt(trialItem.Prompt, checkpointRef)
-                                            : trialItem.Prompt,
-                                        isInitial: false,
-                                        networkProfile: sandboxTarget.NetworkProfile,
-                                        sandboxFlavor: sandboxTarget.Flavor,
-                                        project: project,
-                                        phaseCt,
-                                        hostShutdownToken,
-                                        // The audit loop runs immediately after this resume-rework
-                                        // path, so a non-compiling tree is re-detected by the audit
-                                        // build gate and folded into the iteration's findings.
-                                        buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop,
-                                        iteration: resumeIteration,
-                                        resumePreTurnCommitSha: resumePreTurnCommitSha),
+                                    async phaseCt =>
+                                    {
+                                        var phaseResult = await PhaseExecutor.ExecuteAsync(new AgentPhaseRequest
+                                        {
+                                            Item = trialItem,
+                                            Project = project,
+                                            Phase = AgentPhaseKind.Rework,
+                                            RepositoryId = repoId,
+                                            BaseBranch = baseBranch,
+                                            Branch = workBranch,
+                                            Runner = runner,
+                                            Prompt = trialItem.PreemptCheckpoint is { } checkpointRef
+                                                ? BuildInterruptedReworkResumePrompt(trialItem.Prompt, checkpointRef)
+                                                : trialItem.Prompt,
+                                            NetworkProfile = sandboxTarget.NetworkProfile,
+                                            SandboxFlavor = sandboxTarget.Flavor,
+                                            // The audit loop runs immediately after this resume-rework
+                                            // path, so a non-compiling tree is re-detected by the audit
+                                            // build gate and folded into the iteration's findings.
+                                            BuildPolicy = AgentPhaseBuildPolicy.DeferToAuditLoop,
+                                            Iteration = resumeIteration,
+                                            ResumePreTurnCommitSha = resumePreTurnCommitSha,
+                                        }, phaseCt, hostShutdownToken);
+                                        return phaseResult.AgentStdout;
+                                    },
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: reworkPhase,
@@ -2924,12 +2946,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     return await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
                         async (runner, trialItem, attemptCt) =>
-                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, phaseCt, mergeCt =>
-                                RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                    networkProfile: project.NetworkProfiles.Merge,
-                                    project: project,
-                                    mergeCt,
-                                    hostShutdownToken),
+                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, phaseCt, async mergeCt =>
+                            {
+                                var phaseResult = await PhaseExecutor.ExecuteAsync(new AgentPhaseRequest
+                                {
+                                    Item = trialItem,
+                                    Project = project,
+                                    Phase = AgentPhaseKind.Merge,
+                                    RepositoryId = repoId,
+                                    BaseBranch = baseBranch,
+                                    Branch = workBranch,
+                                    Runner = runner,
+                                    NetworkProfile = project.NetworkProfiles.Merge,
+                                }, mergeCt, hostShutdownToken);
+                                return (phaseResult.ResultingCommitSha
+                                    ?? throw new InvalidOperationException("Merge phase completed without a merge commit."),
+                                    phaseResult.AgentStdout);
+                            },
                                 workToken: attemptCt),
                         phaseCt,
                         phaseCancellation: mergePhase,
@@ -4922,9 +4955,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// branch is created from <paramref name="baseBranch"/>. On rework calls
     /// the branch is checked out as-is (with the work-phase commits already
     /// on it) and the agent stacks new commits on top.
-    /// Returns the agent's stdout for post-phase processing (e.g. question parsing).
+    /// Returns the agent's stdout for post-phase processing (e.g. question parsing)
+    /// plus the captured agent-stream file name, if stream capture was enabled.
     /// </summary>
-    private async Task<string?> RunAgentPhaseAsync(
+    private async Task<(string? Stdout, string? StreamFileName)> RunAgentPhaseAsync(
         WorkItem item,
         IAgentRunner runner,
         string repoId,
@@ -5312,6 +5346,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
                 ? await BeginAgentStreamCaptureAsync(item.Id, agentPhase, iteration ?? 1, ct)
                 : null;
+            var capturedStreamFileName = streamCapture?.FileName;
             var stdoutCallback = BuildStdoutCallback(item.Id, agentPhase, streamCapture);
             var supervision = await StartAgentSupervisionSessionAsync(
                 item.Id,
@@ -5976,7 +6011,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
                     await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
                     phaseSucceeded = true;
-                    return agentResult.Stdout;
+                    return (agentResult.Stdout, capturedStreamFileName);
                 }
 
                 var buildOutcome = RequiredBuildWorkPhaseOutcome.PassedOrSkipped;
@@ -5987,7 +6022,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }
 
                 if (buildOutcome == RequiredBuildWorkPhaseOutcome.DeferredFailure)
-                    return agentResult.Stdout;
+                    return (agentResult.Stdout, capturedStreamFileName);
 
                 // Feed the no-changes circuit breaker: a clean-exit-but-no-diff
                 // outcome is the silent-failure signature an agent exhibits when
@@ -6102,7 +6137,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
 
             phaseSucceeded = true;
-            return agentResult.Stdout;
+            return (agentResult.Stdout, capturedStreamFileName);
         }
         catch (AgentResumePreparationUnavailableException ex)
         {
@@ -8602,20 +8637,29 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
                     async (workerRunner, trialItem, attemptCt) =>
                         await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
-                            phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
-                                reworkPrompt, isInitial: false,
-                                networkProfile: sandboxTarget.NetworkProfile,
-                                sandboxFlavor: sandboxTarget.Flavor,
-                                project: project,
-                                phaseCt,
-                                hostShutdownToken,
-                                // Post-act rework is followed by another check-verdict iteration,
-                                // NOT a build-gated audit iteration. A non-compiling tree here will
-                                // not be re-surfaced by any subsequent gate, so a build failure
-                                // produced by this rework must terminal-fail the item rather than
-                                // silently slip toward the merge / merged path.
-                                buildFailurePolicy: RequiredBuildPolicy.Terminal,
-                                iteration: null),
+                            async phaseCt =>
+                            {
+                                var phaseResult = await PhaseExecutor.ExecuteAsync(new AgentPhaseRequest
+                                {
+                                    Item = trialItem,
+                                    Project = project,
+                                    Phase = AgentPhaseKind.Rework,
+                                    RepositoryId = repoId,
+                                    BaseBranch = baseBranch,
+                                    Branch = workBranch,
+                                    Runner = workerRunner,
+                                    Prompt = reworkPrompt,
+                                    NetworkProfile = sandboxTarget.NetworkProfile,
+                                    SandboxFlavor = sandboxTarget.Flavor,
+                                    // Post-act rework is followed by another check-verdict iteration,
+                                    // NOT a build-gated audit iteration. A non-compiling tree here will
+                                    // not be re-surfaced by any subsequent gate, so a build failure
+                                    // produced by this rework must terminal-fail the item rather than
+                                    // silently slip toward the merge / merged path.
+                                    BuildPolicy = AgentPhaseBuildPolicy.Terminal,
+                                }, phaseCt, hostShutdownToken);
+                                return phaseResult.AgentStdout;
+                            },
                             workToken: attemptCt),
                     ct,
                     phaseCancellation: reworkPhase,
@@ -11454,27 +11498,37 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
                 async (workerRunner, trialItem, attemptCt) =>
                     await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
-                        phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
-                            prompt, isInitial: false,
-                            networkProfile: sandboxTarget.NetworkProfile,
-                            sandboxFlavor: sandboxTarget.Flavor,
-                            project: project,
-                            phaseCt,
-                            hostShutdownToken,
-                            // Audit-driven rework: the next iteration of the audit/rework loop
-                            // re-runs the build gate via RunForAuditAsync, which surfaces the
-                            // failure as a blocking finding. Terminal-failing here would defeat
-                            // the loop's purpose of converging on a fix within the audit budget.
-                            buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop,
-                            iteration: reworkIterationNumber,
-                            reworkNoDiffHandling: ReworkNoDiffHandling.AuditEmptyRework,
-                            // With zero blocking findings there is nothing for
-                            // the agent to change, so an empty diff is the
-                            // correct outcome — not a silent-failure signal for
-                            // the no-changes circuit breaker. The same holds
-                            // when the driving verdict never completed: its
-                            // findings may be partial.
-                            suppressNoChangesBreaker: !auditHasBlockingFindings),
+                        async phaseCt =>
+                        {
+                            var phaseResult = await PhaseExecutor.ExecuteAsync(new AgentPhaseRequest
+                            {
+                                Item = trialItem,
+                                Project = project,
+                                Phase = AgentPhaseKind.Rework,
+                                RepositoryId = repoId,
+                                BaseBranch = baseBranch,
+                                Branch = workBranch,
+                                Runner = workerRunner,
+                                Prompt = prompt,
+                                NetworkProfile = sandboxTarget.NetworkProfile,
+                                SandboxFlavor = sandboxTarget.Flavor,
+                                // Audit-driven rework: the next iteration of the audit/rework loop
+                                // re-runs the build gate via RunForAuditAsync, which surfaces the
+                                // failure as a blocking finding. Terminal-failing here would defeat
+                                // the loop's purpose of converging on a fix within the audit budget.
+                                BuildPolicy = AgentPhaseBuildPolicy.DeferToAuditLoop,
+                                Iteration = reworkIterationNumber,
+                                ReworkNoDiffHandling = AgentPhaseReworkNoDiffHandling.AuditEmptyRework,
+                                // With zero blocking findings there is nothing for
+                                // the agent to change, so an empty diff is the
+                                // correct outcome — not a silent-failure signal for
+                                // the no-changes circuit breaker. The same holds
+                                // when the driving verdict never completed: its
+                                // findings may be partial.
+                                SuppressNoChangesBreaker = !auditHasBlockingFindings,
+                            }, phaseCt, hostShutdownToken);
+                            return phaseResult.AgentStdout;
+                        },
                         workToken: attemptCt),
                 ct,
                 phaseCancellation: reworkPhase,
