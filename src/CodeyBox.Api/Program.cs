@@ -4696,6 +4696,12 @@ namespace CodeyBox.Api
         /// <summary>Host package-cache files or directories copied during Incus baseline or full-launch provisioning.</summary>
         public List<PackageCacheSeedConfig> PackageCacheSeeds { get; set; } = [];
 
+        /// <summary>Guest path of the shared NuGet fallback folder served read-only instead of copied into the writable package root.</summary>
+        public string NuGetFallbackGuestPath { get; set; } = Defaults.NuGetFallbackGuestPath;
+
+        /// <summary>Serve NuGet-targeted package seeds as read-only fallback folders; disable to keep the legacy per-VM copy for every seed.</summary>
+        public bool ShareNuGetPackageSeedsAsFallback { get; set; } = Defaults.ShareNuGetPackageSeedsAsFallback;
+
         /// <summary>Host-staged executables copied during Incus baseline or full-launch provisioning.</summary>
         public List<ExecutableProvisionConfig> ExecutableProvisions { get; set; } = [];
 

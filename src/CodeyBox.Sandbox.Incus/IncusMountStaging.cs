@@ -818,6 +818,57 @@ internal static class IncusMountStaging
         return canonicalSource;
     }
 
+    /// <summary>
+    /// Reports whether <paramref name="source"/> may be exposed to the guest
+    /// by reference. Anything unresolvable (a staging tree that does not
+    /// exist yet, a removed allowlist entry, a vanished source) reports false
+    /// instead of throwing: this is only the sharing-vs-copy pre-decision for
+    /// provider-managed fallback mounts, and a false simply keeps the legacy
+    /// copy path. The mount planner's <see cref="Prepare"/> authorization
+    /// remains the authoritative fail-closed gate for anything attached.
+    /// </summary>
+    internal static bool IsHostSourceAllowed(
+        IncusSandboxOptions options,
+        string stagingRoot,
+        string source)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(stagingRoot);
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        string canonicalSource;
+        try
+        {
+            canonicalSource = ResolveExistingRealPath(source);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or IOException)
+        {
+            return false;
+        }
+        string canonicalStagingRoot;
+        try
+        {
+            canonicalStagingRoot = ResolveExistingRealPath(stagingRoot);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or IOException)
+        {
+            return false;
+        }
+        var roots = new List<string>();
+        foreach (var root in options.AllowedHostMountRoots)
+        {
+            try
+            {
+                roots.Add(ResolveExistingRealPath(root));
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or IOException)
+            {
+                continue;
+            }
+        }
+        roots.Add(canonicalStagingRoot);
+        return roots.Any(root => IsContained(canonicalSource, root));
+    }
+
     internal static string ResolveExistingRealPath(string path)
     {
         var fullPath = Path.GetFullPath(path);
