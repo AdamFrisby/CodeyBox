@@ -407,6 +407,12 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
 // CodeyBox:ConfigValidation:UnboundKeys:Mode="warn".
 builder.Services.AddHostedService<UnboundConfigKeyHostedValidator>();
 
+// Audit-budget ordering startup check. Rejects auditor-idle >= per-iteration,
+// per-iteration >= item-stale, and item-stale >= sandbox wall clock with the
+// offending config paths named, so a misordered budget fails startup instead
+// of silently killing healthy long runs at audit time.
+builder.Services.AddHostedService<AuditBudgetOrderingStartupValidator>();
+
 // Rejects ProjectsOptions reloads that remove a project still holding
 // non-terminal work items. Adding new projects passes cleanly.
 builder.Services.AddSingleton<IValidateOptions<ProjectsOptions>, ProjectsOptionsRemovalValidator>();

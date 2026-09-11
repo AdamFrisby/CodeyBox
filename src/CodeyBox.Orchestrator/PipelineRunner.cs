@@ -13145,7 +13145,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         declaredShortCircuitBlocking,
                         IncompleteVerdict: true,
                         CompletedAuditors: completedAuditors.ToList(),
-                        IncompleteAuditors: [$"{ex.AuditorName} ({ex.AgentKind.Value})"],
+                        IncompleteAuditors: [AuditBudgetOrdering.FormatBudgetedAuditorLabel(ex.AuditorName, ex.AgentKind.Value, ex.BudgetPath, ex.Timeout)],
                         PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
                         BuildTestGateFailed: buildTestGateFailed);
                 }
@@ -13518,7 +13518,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         if (firstExhaustion is null && inner is AgentClassExhaustedException exhaustion)
                             firstExhaustion = exhaustion;
                         else if (inner is AuditorIdleTimeoutException timeout)
-                            incompleteAuditors.Add($"{timeout.AuditorName} ({timeout.AgentKind.Value})");
+                            incompleteAuditors.Add(AuditBudgetOrdering.FormatBudgetedAuditorLabel(timeout.AuditorName, timeout.AgentKind.Value, timeout.BudgetPath, timeout.Timeout));
                         else if (firstExhaustion is null && firstOtherException is null)
                             firstOtherException = ExceptionDispatchInfo.Capture(inner);
                     }
@@ -14014,12 +14014,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         CancellationToken ct)
     {
-        var timeout = EffectiveAuditorIdleTimeout(auditor);
-        if (timeout <= TimeSpan.Zero)
+        var idleTimeout = EffectiveAuditorIdleTimeout(auditor);
+        var absoluteTimeout = _pipelineTuning.Current.AuditorAbsoluteTimeout;
+        if (idleTimeout <= TimeSpan.Zero && absoluteTimeout <= TimeSpan.Zero)
             return await auditor.RunAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var lastActivityTicks = Stopwatch.GetTimestamp();
+        var startTicks = Stopwatch.GetTimestamp();
+        var lastActivityTicks = startTicks;
         void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
 
         var originalCallback = context.StdoutChunkCallback;
@@ -14034,47 +14036,45 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         var watchedSandbox = new ActivityTrackingSandbox(sandbox, Touch);
         var auditorTask = auditor.RunAsync(watchedSandbox, workingDirectory, watchedContext, linkedCts.Token);
-        var timeoutTask = WaitForAuditorIdleTimeoutAsync(
-            linkedCts.Token,
-            () => Volatile.Read(ref lastActivityTicks),
-            () => EffectiveAuditorIdleTimeout(auditor));
 
         try
         {
-            var completed = await Task.WhenAny(auditorTask, timeoutTask).ConfigureAwait(false);
-            if (completed == timeoutTask)
-            {
-                var timedOutAfter = await timeoutTask.ConfigureAwait(false);
-                if (timedOutAfter is not null)
-                {
-                    await CancelAndTearDownAfterIdleTimeoutAsync(
-                        linkedCts,
-                        auditorTask,
-                        sandbox,
-                        "auditor",
-                        auditor.Name,
-                        agent,
-                        item,
-                        project,
-                        context.Iteration).ConfigureAwait(false);
-                    throw new AuditorIdleTimeoutException(auditor.Name, agent, timedOutAfter.Value);
-                }
-
-                ct.ThrowIfCancellationRequested();
-            }
-
-            var result = await auditorTask.ConfigureAwait(false);
+            var result = await AuditorIdleGuard.WaitAsync(
+                auditorTask,
+                auditor.Name,
+                agent,
+                () => watchedSandbox.HasActiveExecs,
+                () => (EffectiveAuditorIdleTimeout(auditor), _pipelineTuning.Current.AuditorAbsoluteTimeout),
+                () => Volatile.Read(ref lastActivityTicks),
+                startTicks,
+                Touch,
+                // Poll well below test-scale idle windows so a genuinely hung
+                // run is detected promptly; matches the legacy adaptive-delay
+                // floor (100 ms) this guard replaced.
+                TimeSpan.FromMilliseconds(100),
+                linkedCts.Token).ConfigureAwait(false);
             Touch();
             ct.ThrowIfCancellationRequested();
             return result;
+        }
+        catch (AuditorIdleTimeoutException)
+        {
+            await CancelAndTearDownAfterIdleTimeoutAsync(
+                linkedCts,
+                auditorTask,
+                sandbox,
+                "auditor",
+                auditor.Name,
+                agent,
+                item,
+                project,
+                context.Iteration).ConfigureAwait(false);
+            throw;
         }
         finally
         {
             try { await linkedCts.CancelAsync().ConfigureAwait(false); }
             catch (ObjectDisposedException) { }
-
-            try { await timeoutTask.ConfigureAwait(false); }
-            catch (OperationCanceledException) { }
         }
     }
 
@@ -21950,6 +21950,7 @@ Original merge-phase failure (JSON string, for context only):
     {
         private readonly ISandbox _inner;
         private readonly Action _touch;
+        private int _activeExecs;
 
         public ActivityTrackingSandbox(ISandbox inner, Action touch)
         {
@@ -21961,28 +21962,45 @@ Original merge-phase failure (JSON string, for context only):
 
         public string Id => _inner.Id;
 
+        /// <summary>
+        /// True while at least one <see cref="ExecAsync"/> call made through
+        /// this wrapper is still in flight. The auditor idle guard reads this
+        /// as process-activity evidence: a quiet run that still holds live
+        /// sandbox work (e.g. a test suite emitting nothing until the final
+        /// result) is progressing, not idle.
+        /// </summary>
+        public bool HasActiveExecs => Volatile.Read(ref _activeExecs) > 0;
+
         public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
         public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
         public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
 
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            var originalStdout = exec.StdoutChunkCallback;
-            var originalStderr = exec.StderrChunkCallback;
-            var watchedExec = exec with
+            Interlocked.Increment(ref _activeExecs);
+            try
             {
-                StdoutChunkCallback = chunk =>
+                var originalStdout = exec.StdoutChunkCallback;
+                var originalStderr = exec.StderrChunkCallback;
+                var watchedExec = exec with
                 {
-                    _touch();
-                    originalStdout?.Invoke(chunk);
-                },
-                StderrChunkCallback = chunk =>
-                {
-                    _touch();
-                    originalStderr?.Invoke(chunk);
-                },
-            };
-            return _inner.ExecAsync(watchedExec, ct);
+                    StdoutChunkCallback = chunk =>
+                    {
+                        _touch();
+                        originalStdout?.Invoke(chunk);
+                    },
+                    StderrChunkCallback = chunk =>
+                    {
+                        _touch();
+                        originalStderr?.Invoke(chunk);
+                    },
+                };
+                return await _inner.ExecAsync(watchedExec, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeExecs);
+            }
         }
 
         public Task KillActiveExecsAsync(CancellationToken ct = default)
@@ -22044,19 +22062,54 @@ internal sealed class AuditHistoryPersistenceFailedException : Exception
         : base(message, innerException) { }
 }
 
-internal sealed class AuditorIdleTimeoutException : TimeoutException
+internal class AuditorIdleTimeoutException : TimeoutException
 {
-    public AuditorIdleTimeoutException(string auditorName, AgentKind agentKind, TimeSpan timeout)
-        : base($"auditor '{auditorName}' (agent: {agentKind.Value}) produced no output or verdict within {timeout}")
+    public AuditorIdleTimeoutException(
+        string auditorName,
+        AgentKind agentKind,
+        TimeSpan timeout,
+        string? budgetPath = null)
+        : base($"auditor '{auditorName}' (agent: {agentKind.Value}) exceeded budget {(budgetPath ?? AuditBudgetOrdering.AuditorIdleTimeoutPath)}={timeout}: produced no output or verdict within {timeout}")
     {
         AuditorName = auditorName;
         AgentKind = agentKind;
         Timeout = timeout;
+        BudgetPath = budgetPath ?? AuditBudgetOrdering.AuditorIdleTimeoutPath;
     }
 
     public string AuditorName { get; }
     public AgentKind AgentKind { get; }
     public TimeSpan Timeout { get; }
+
+    /// <summary>
+    /// Config path of the budget that was exceeded, recorded so a
+    /// budget-exceeded termination is reported distinctly from an auditor
+    /// that ran and produced findings.
+    /// </summary>
+    public string BudgetPath { get; }
+}
+
+/// <summary>
+/// A single auditor run outlived the absolute per-auditor wall-clock bound
+/// (<c>CodeyBox:PipelineTuning:AuditorAbsoluteTimeout</c>), measured from run
+/// start regardless of output or sandbox activity. Derives from
+/// <see cref="AuditorIdleTimeoutException"/> so every existing idle-timeout
+/// handling site (incomplete-verdict capture, timeout involvement outcome,
+/// the LLM single-retry path) treats it as a budget termination rather than
+/// an ordinary infrastructure failure; the <see cref="BudgetPath"/>
+/// distinguishes which budget was exceeded and the message carries its
+/// configured value.
+/// </summary>
+internal sealed class AuditorAbsoluteTimeoutException(
+    string auditorName,
+    AgentKind agentKind,
+    TimeSpan timeout)
+    : AuditorIdleTimeoutException(
+        auditorName,
+        agentKind,
+        timeout,
+        "CodeyBox:PipelineTuning:AuditorAbsoluteTimeout")
+{
 }
 
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
