@@ -15,7 +15,8 @@ public enum QuotaFailureClassificationKind
 
 public sealed record QuotaFailureClassification(
     QuotaFailureClassificationKind Kind,
-    QuotaDetection? Detection)
+    QuotaDetection? Detection,
+    bool ProviderSurfaceMatch = false)
 {
     public static readonly QuotaFailureClassification None =
         new(QuotaFailureClassificationKind.None, Detection: null);
@@ -23,10 +24,10 @@ public sealed record QuotaFailureClassification(
     public static readonly QuotaFailureClassification TerminalNonQuota =
         new(QuotaFailureClassificationKind.TerminalNonQuota, Detection: null);
 
-    public static QuotaFailureClassification Quota(QuotaDetection detection)
+    public static QuotaFailureClassification Quota(QuotaDetection detection, bool providerSurfaceMatch = false)
     {
         ArgumentNullException.ThrowIfNull(detection);
-        return new QuotaFailureClassification(QuotaFailureClassificationKind.Quota, detection);
+        return new QuotaFailureClassification(QuotaFailureClassificationKind.Quota, detection, providerSurfaceMatch);
     }
 }
 

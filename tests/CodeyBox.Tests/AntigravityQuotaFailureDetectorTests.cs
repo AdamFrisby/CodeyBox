@@ -200,13 +200,68 @@ public sealed class AntigravityQuotaFailureDetectorTests
     public void Detect_AbsoluteLockoutInPlainText_StillExtractsReset()
     {
         var when = DateTimeOffset.UtcNow.AddHours(48);
-        var stdout = $"agent_error: account locked until {when:o} due to weekly cap";
+        var stderr = $"agent_error: account locked until {when:o} due to weekly cap";
 
-        var detection = _detector.Detect(stderr: null, stdout);
+        var detection = _detector.Detect(stderr, stdout: null);
 
         Assert.NotNull(detection);
         Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
         Assert.NotNull(detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_AgentProseWithQuotaKeywordsInStdout_ReturnsNull()
+    {
+        // Self-referential false positive prevention: agent authoring quota code
+        // or writing git commit messages containing "quota exceeded" or "RESOURCE_EXHAUSTED"
+        // in stdout must NEVER be classified as a provider quota failure.
+        const string stdout = """
+            Antigravity agent starting...
+            Running: git commit -m "fix(quota): handle RESOURCE_EXHAUSTED and quota exceeded errors"
+            [main 1a2b3c4] fix(quota): handle RESOURCE_EXHAUSTED and quota exceeded errors
+             1 file changed, 10 insertions(+)
+            I have completed the task and verified that Resource has been exhausted error handling works.
+            """;
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+        Assert.Null(detection);
+    }
+
+    [Fact]
+    public void ScopeStdoutForQuotaDetection_FiltersUnstructuredProse_PreservesNdjsonErrors()
+    {
+        const string mixedStdout = """
+            Starting agent work...
+            git commit -m "fix quota exceeded handling"
+            {"type":"conversation","message":"I am working on RESOURCE_EXHAUSTED handling"}
+            {"event":"result","result":{"status":"ERROR","error":"Individual quota reached. Resets in 1h8m20s."}}
+            Finished commit.
+            """;
+
+        var scoped = _detector.ScopeStdoutForQuotaDetection(mixedStdout);
+        Assert.NotNull(scoped);
+        Assert.DoesNotContain("git commit", scoped!);
+        Assert.DoesNotContain("Starting agent work", scoped!);
+        Assert.DoesNotContain("Finished commit", scoped!);
+        Assert.DoesNotContain("type\":\"conversation", scoped!);
+        Assert.Contains("Individual quota reached", scoped!);
+
+        var detection = _detector.Detect(stderr: null, stdout: scoped);
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void ScopeStdoutForQuotaDetection_WhenNoNdjsonErrors_ReturnsNull()
+    {
+        const string stdout = """
+            Fixing bug in repository...
+            Running git commit -m "handle quota exceeded"
+            Done!
+            """;
+
+        var scoped = _detector.ScopeStdoutForQuotaDetection(stdout);
+        Assert.Null(scoped);
     }
 
     [Fact]

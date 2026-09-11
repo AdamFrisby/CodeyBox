@@ -130,6 +130,74 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         return false;
     }
 
+    /// <inheritdoc />
+    public string? ScopeStdoutForQuotaDetection(string? stdout)
+    {
+        if (string.IsNullOrWhiteSpace(stdout)) return null;
+
+        var errorLines = new List<string>();
+        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!line.StartsWith('{')) continue;
+            if (IsStreamJsonErrorLine(line))
+                errorLines.Add(line);
+        }
+
+        return errorLines.Count > 0 ? string.Join("\n", errorLines) : null;
+    }
+
+    internal static bool IsStreamJsonErrorLine(string line)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+
+            string? typeOrEvent = null;
+            if (root.TryGetProperty("type", out var typeProp) && typeProp.ValueKind == JsonValueKind.String)
+                typeOrEvent = typeProp.GetString();
+            else if (root.TryGetProperty("event", out var eventProp) && eventProp.ValueKind == JsonValueKind.String)
+                typeOrEvent = eventProp.GetString();
+
+            if (typeOrEvent is null) return false;
+
+            if (string.Equals(typeOrEvent, "error", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (string.Equals(typeOrEvent, "result", StringComparison.OrdinalIgnoreCase))
+            {
+                if (root.TryGetProperty("status", out var statusProp)
+                    && string.Equals(statusProp.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                if (root.TryGetProperty("is_error", out var isErr) && isErr.ValueKind == JsonValueKind.True)
+                    return true;
+
+                if (root.TryGetProperty("error", out var err)
+                    && (err.ValueKind == JsonValueKind.Object || err.ValueKind == JsonValueKind.String))
+                    return true;
+
+                if (root.TryGetProperty("result", out var res) && res.ValueKind == JsonValueKind.Object)
+                {
+                    if (res.TryGetProperty("status", out var resStatus)
+                        && string.Equals(resStatus.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                        return true;
+
+                    if (res.TryGetProperty("is_error", out var resIsErr) && resIsErr.ValueKind == JsonValueKind.True)
+                        return true;
+
+                    if (res.TryGetProperty("error", out _))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+        catch (JsonException) { return false; }
+        catch (InvalidOperationException) { return false; }
+    }
+
     public QuotaDetection? Detect(string? stderr, string? stdout)
     {
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
@@ -141,18 +209,16 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         foreach (var (pattern, kind) in Patterns)
         {
             var inStderr = !string.IsNullOrEmpty(stderr) && stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase);
-            var inStdout = !string.IsNullOrEmpty(stdout) && stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase);
             var inStream = streamMessages.Any(m => m.Contains(pattern, StringComparison.OrdinalIgnoreCase));
 
-            if (!inStderr && !inStdout && !inStream) continue;
+            if (!inStderr && !inStream) continue;
 
-            var resetSources = new List<string?>(streamMessages.Count + 2);
+            var resetSources = new List<string?>(streamMessages.Count + 1);
             resetSources.AddRange(streamMessages);
             if (!string.IsNullOrEmpty(stderr)) resetSources.Add(stderr);
-            if (!string.IsNullOrEmpty(stdout)) resetSources.Add(stdout);
             var reset = structuredReset
                 ?? TryParseAbsoluteReset(stderr)
-                ?? TryParseAbsoluteReset(stdout)
+                ?? streamMessages.Select(TryParseAbsoluteReset).FirstOrDefault(r => r is not null)
                 ?? QuotaResetParser.TryParseResetAt(resetSources);
             return new QuotaDetection(kind, reset);
         }
@@ -187,6 +253,18 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
                 {
                     reset = TryReadResetFromNode(err);
                     if (reset is not null) return reset;
+                }
+                if (root.TryGetProperty("result", out var res)
+                    && res.ValueKind == JsonValueKind.Object)
+                {
+                    reset = TryReadResetFromNode(res);
+                    if (reset is not null) return reset;
+                    if (res.TryGetProperty("error", out var resErr)
+                        && resErr.ValueKind == JsonValueKind.Object)
+                    {
+                        reset = TryReadResetFromNode(resErr);
+                        if (reset is not null) return reset;
+                    }
                 }
             }
             catch (JsonException) { }
@@ -252,11 +330,21 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
             {
                 using var doc = JsonDocument.Parse(line);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("type", out var typeProp)) continue;
-                var t = typeProp.GetString();
-                if (t != "result" && t != "error") continue;
+                if (root.ValueKind != JsonValueKind.Object) continue;
 
-                if (t == "result")
+                string? typeOrEvent = null;
+                if (root.TryGetProperty("type", out var typeProp) && typeProp.ValueKind == JsonValueKind.String)
+                    typeOrEvent = typeProp.GetString();
+                else if (root.TryGetProperty("event", out var eventProp) && eventProp.ValueKind == JsonValueKind.String)
+                    typeOrEvent = eventProp.GetString();
+
+                if (typeOrEvent is null) continue;
+
+                var isErrorType = string.Equals(typeOrEvent, "error", StringComparison.OrdinalIgnoreCase);
+                var isResultType = string.Equals(typeOrEvent, "result", StringComparison.OrdinalIgnoreCase);
+                if (!isErrorType && !isResultType) continue;
+
+                if (isResultType)
                 {
                     var isError = false;
                     if (root.TryGetProperty("status", out var statusProp)
@@ -265,15 +353,48 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
                     if (root.TryGetProperty("is_error", out var isErrorProp)
                         && isErrorProp.ValueKind == JsonValueKind.True)
                         isError = true;
+
+                    if (root.TryGetProperty("result", out var res) && res.ValueKind == JsonValueKind.Object)
+                    {
+                        if (res.TryGetProperty("status", out var resStatus)
+                            && string.Equals(resStatus.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                            isError = true;
+                        if (res.TryGetProperty("is_error", out var resIsErr)
+                            && resIsErr.ValueKind == JsonValueKind.True)
+                            isError = true;
+
+                        if (res.TryGetProperty("error", out var resError))
+                        {
+                            isError = true;
+                            if (resError.ValueKind == JsonValueKind.Object)
+                            {
+                                AddIfNonEmpty(messages, ReadString(resError, "message"));
+                                AddIfNonEmpty(messages, ReadString(resError, "error"));
+                            }
+                            else if (resError.ValueKind == JsonValueKind.String)
+                            {
+                                AddIfNonEmpty(messages, resError.GetString());
+                            }
+                        }
+
+                        AddIfNonEmpty(messages, ReadString(res, "message"));
+                        AddIfNonEmpty(messages, ReadString(res, "error"));
+                    }
+
                     if (!isError) continue;
                 }
 
                 if (root.TryGetProperty("error", out var errorProp))
                 {
                     if (errorProp.ValueKind == JsonValueKind.Object)
+                    {
                         AddIfNonEmpty(messages, ReadString(errorProp, "message"));
+                        AddIfNonEmpty(messages, ReadString(errorProp, "error"));
+                    }
                     else if (errorProp.ValueKind == JsonValueKind.String)
+                    {
                         AddIfNonEmpty(messages, errorProp.GetString());
+                    }
                 }
 
                 AddIfNonEmpty(messages, ReadString(root, "message"));
