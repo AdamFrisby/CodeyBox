@@ -223,6 +223,8 @@ public sealed class CoverageTestSelectionTests
     [Theory]
     [InlineData("Directory.Build.props", true)]
     [InlineData("src/Directory.Build.props", true)]
+    [InlineData("Directory.Solution.targets", true)]
+    [InlineData("src/CodeyBox.Api/appsettings.json", true)]
     [InlineData("CodeyBox.slnx", true)]
     [InlineData(".github/workflows/ci.yml", true)]
     [InlineData("src/Foo/Bar.cs", false)]
@@ -243,6 +245,8 @@ public sealed class CoverageTestSelectionTests
             new CoverageTestSelectionOptions { GlobalDirectoryPrefixes = ["noprefix"] }));
         Assert.False(CoverageTestSelectionOptions.IsValid(
             new CoverageTestSelectionOptions { MaxDiffBytes = 0 }));
+        Assert.False(CoverageTestSelectionOptions.IsValid(
+            new CoverageTestSelectionOptions { AlwaysFullProjects = [" "] }));
     }
 
     // ---- Project-graph selector.
@@ -287,7 +291,104 @@ public sealed class CoverageTestSelectionTests
         // Whole-file change (no line granularity).
         Assert.True(selector.Select(RequestFor(runner, StandardBaseline(),
             new TestSelectionChangedFile("src/Foo/Bar.cs", []))).Selection.IsAll);
+        // Invalid selection options.
+        var badOptions = new ProjectGraphTestSelector(() => new CoverageTestSelectionOptions { MaxDiffBytes = 0 });
+        Assert.True(badOptions.Select(RequestFor(runner, StandardBaseline(),
+            new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(1, 1)]))).Selection.IsAll);
+        // Unreadable selection options (hot-reload failure) never breaks the gate.
+        var throwingOptions = new ProjectGraphTestSelector(
+            () => throw new InvalidOperationException("options down"));
+        Assert.True(throwingOptions.Select(RequestFor(runner, StandardBaseline(),
+            new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(1, 1)]))).Selection.IsAll);
     }
+
+    [Fact]
+    public void ProjectGraph_AlwaysFullProject_FallsBackToFullSuite()
+    {
+        // A change owned by the shared core contract (a default
+        // AlwaysFullProjects entry) forces the full suite even though the
+        // baseline records affected tests for it.
+        var baseline = Baseline(
+            fileProject: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["src/CodeyBox.Core/Guard.cs"] = "src/CodeyBox.Core/CodeyBox.Core.csproj",
+            },
+            affected: new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal)
+            {
+                ["src/CodeyBox.Core/CodeyBox.Core.csproj"] = ["Ns.Core.GuardTests"],
+            },
+            tests: new Dictionary<string, BaselineTestEntry>(StringComparer.Ordinal)
+            {
+                ["Ns.Core.GuardTests"] = new BaselineTestEntry(
+                    "tests/Core.Tests/GuardTests.cs",
+                    new Dictionary<string, IReadOnlyList<int>>(StringComparer.Ordinal)),
+            });
+
+        var decision = new ProjectGraphTestSelector().Select(RequestFor(
+            NewRunner(), baseline,
+            new TestSelectionChangedFile("src/CodeyBox.Core/Guard.cs", [new ChangedLineRange(1, 1)])));
+
+        Assert.True(decision.Selection.IsAll);
+        Assert.Contains("always-full project", decision.Justification);
+    }
+
+    [Fact]
+    public void ProjectGraph_CustomAlwaysFullProject_FallsBackToFullSuite()
+    {
+        // Operators extend the trigger set with source-generator or shared-root
+        // projects via config; those changes also force the full suite.
+        var options = FreshOptions();
+        options.AlwaysFullProjects.Add("src/Foo/Foo.csproj");
+        var selector = new ProjectGraphTestSelector(() => options);
+
+        var decision = selector.Select(RequestFor(
+            NewRunner(), StandardBaseline(),
+            new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(10, 1)])));
+
+        Assert.True(decision.Selection.IsAll);
+        Assert.Contains("always-full project", decision.Justification);
+    }
+
+    [Theory]
+    [InlineData("Directory.Build.props")]
+    [InlineData("src/Directory.Build.targets")]
+    public void ProjectGraph_GlobalTarget_FallsBackToFullSuite(string path)
+    {
+        // The baseline knows these files, but global build targets always run
+        // everything — the project-graph layer enforces that itself rather
+        // than relying on the coverage layer above it.
+        var baseline = Baseline(
+            fileProject: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [path] = "root/Root.proj",
+            },
+            affected: new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal)
+            {
+                ["root/Root.proj"] = ["T"],
+            },
+            tests: new Dictionary<string, BaselineTestEntry>(StringComparer.Ordinal)
+            {
+                ["T"] = new BaselineTestEntry(
+                    "tests/T.cs",
+                    new Dictionary<string, IReadOnlyList<int>>(StringComparer.Ordinal)),
+            });
+
+        var decision = new ProjectGraphTestSelector().Select(RequestFor(
+            NewRunner(), baseline,
+            new TestSelectionChangedFile(path, [new ChangedLineRange(1, 1)])));
+
+        Assert.True(decision.Selection.IsAll);
+        Assert.Contains("global target", decision.Justification);
+    }
+
+    [Theory]
+    [InlineData("src/CodeyBox.Core/CodeyBox.Core.csproj", true)]
+    [InlineData("src/CodeyBox.Core/Other.csproj", false)]
+    [InlineData("src/codeybox.core/CodeyBox.Core.csproj", false)]
+    [InlineData("src/CodeyBox.Core/CodeyBox.Core.csproj.bak", false)]
+    [InlineData("xsrc/CodeyBox.Core/CodeyBox.Core.csproj", false)]
+    public void Options_AlwaysFullProjects_ExactMatchOnly(string project, bool expected)
+        => Assert.Equal(expected, FreshOptions().IsAlwaysFullProject(project));
 
     // ---- Coverage selector.
 

@@ -304,7 +304,7 @@ public static class TestSelectionPaths
 /// Hot-reloadable options for coverage-guided test selection, bound from the
 /// <c>Audit:TestSelection:Coverage</c> configuration section via
 /// <c>IOptionsMonitor</c>. Every operational value (baseline location, age and
-/// size caps, global targets) is a knob, not a source literal.
+/// size caps, global targets, the always-full project set) is a knob, not a source literal.
 /// </summary>
 public sealed class CoverageTestSelectionOptions
 {
@@ -353,10 +353,14 @@ public sealed class CoverageTestSelectionOptions
     {
         "Directory.Build.props",
         "Directory.Build.targets",
+        "Directory.Solution.props",
+        "Directory.Solution.targets",
         "Directory.Packages.props",
         "global.json",
         "NuGet.Config",
         "nuget.config",
+        "appsettings.json",
+        "appsettings.Development.json",
     };
 
     /// <summary>Exact repository-relative paths that are global targets.</summary>
@@ -372,6 +376,22 @@ public sealed class CoverageTestSelectionOptions
     public IList<string> GlobalDirectoryPrefixes { get; set; } = new List<string>
     {
         ".github/workflows/",
+    };
+
+    /// <summary>
+    /// Exact repository-relative <c>.csproj</c> paths whose change forces the
+    /// full suite (the ALWAYS-FULL trigger set). These are the shared/root
+    /// projects no test subset can safely exclude: the core contract assembly
+    /// every project references, the shared test-infrastructure project, and —
+    /// added by operators — any source-generator project (whose build-time
+    /// output can change every dependent assembly) or config-schema owner.
+    /// Compared by exact <see cref="StringComparison.Ordinal"/> equality after
+    /// <see cref="TestSelectionPaths.Normalize"/>; never by substring.
+    /// </summary>
+    public IList<string> AlwaysFullProjects { get; set; } = new List<string>
+    {
+        "src/CodeyBox.Core/CodeyBox.Core.csproj",
+        "tests/CodeyBox.Tests/CodeyBox.Tests.csproj",
     };
 
     /// <summary>
@@ -395,6 +415,8 @@ public sealed class CoverageTestSelectionOptions
             return false;
         if (options.GlobalDirectoryPrefixes.Any(p => string.IsNullOrWhiteSpace(p) || !p.EndsWith('/')))
             return false;
+        if (options.AlwaysFullProjects.Any(string.IsNullOrWhiteSpace))
+            return false;
         return true;
     }
 
@@ -414,4 +436,14 @@ public sealed class CoverageTestSelectionOptions
         return GlobalDirectoryPrefixes.Any(prefix =>
             normalizedPath.StartsWith(prefix, StringComparison.Ordinal));
     }
+
+    /// <summary>
+    /// True when the owning <c>.csproj</c> path is in the ALWAYS-FULL trigger
+    /// set. The caller passes the already-normalised project path from the
+    /// baseline's <c>file → project</c> map; compared by exact
+    /// <see cref="StringComparison.Ordinal"/> equality, never by substring.
+    /// </summary>
+    public bool IsAlwaysFullProject(string normalizedProjectPath)
+        => AlwaysFullProjects.Any(p =>
+            string.Equals(TestSelectionPaths.Normalize(p), normalizedProjectPath, StringComparison.Ordinal));
 }

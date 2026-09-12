@@ -195,11 +195,12 @@ public sealed class CoverageTestSelector : ITestSelector
                 $"{SelectorName}: full suite (superset selector chose the full suite: {supersetDecision.Justification})");
         }
 
-        var superset = ProjectGraphSelectorCore.SelectTests(request.ChangedFiles, request.Baseline);
+        var options = _optionsProvider();
+        var superset = ProjectGraphSelectorCore.SelectTests(request.ChangedFiles, request.Baseline, options);
         var resolved = CoverageSelectionCore.SelectTests(
             request.ChangedFiles,
             request.Baseline,
-            _optionsProvider(),
+            options,
             _clock.GetUtcNow(),
             superset);
 
