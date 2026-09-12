@@ -623,9 +623,11 @@ internal static class IncusBaselineProvisioning
     /// <summary>
     /// Computes the content fingerprint of a package-cache seed for the
     /// shared host archive cache: SHA-256 over the resolved source path, the
-    /// applicable byte/entry limits, and the sorted source metadata (relative
-    /// paths, entry kinds, file lengths, write timestamps, symlink targets).
-    /// Reads metadata only, so it is cheap relative to archiving the content.
+    /// applicable byte/entry limits, and the sorted source entries (relative
+    /// paths, entry kinds, file lengths, SHA-256 of regular-file contents,
+    /// symlink targets). File contents are streamed through the hash under
+    /// the per-seed byte limit, so same-length content changes alter the
+    /// fingerprint even when file metadata is unchanged.
     /// Symlinks are recorded, never followed, and the same traversal bounds
     /// as <see cref="CreatePackageArchive"/> apply, so anything archivable is
     /// fingerprintable and anything rejected there is rejected here too.
@@ -651,6 +653,7 @@ internal static class IncusBaselineProvisioning
         AppendLine($"perSeedLimit:{perSeedLimit}");
         AppendLine($"maxEntries:{options.MaxPackageCacheSeedEntries}");
         var entries = new List<string>();
+        var fingerprintedBytes = 0L;
         if (Directory.Exists(sourcePath))
         {
             using var directory = IncusSafeFile.PinDirectoryNoFollow(sourcePath);
@@ -660,13 +663,15 @@ internal static class IncusBaselineProvisioning
                 depth: 0,
                 entries,
                 options.MaxPackageCacheSeedEntries,
+                perSeedLimit,
+                ref fingerprintedBytes,
                 ct);
         }
         else
         {
             var name = Path.GetFileName(sourcePath);
             using var source = OpenRegularFileNoFollow(sourcePath);
-            entries.Add($"f|{name}|{source.Length}|{File.GetLastWriteTimeUtc(source.SafeFileHandle!).Ticks}");
+            entries.Add($"f|{name}|{source.Length}|{HashSeedFileContent(source, perSeedLimit, ref fingerprintedBytes, ct)}");
         }
         entries.Sort(StringComparer.Ordinal);
         foreach (var entry in entries)
@@ -680,6 +685,8 @@ internal static class IncusBaselineProvisioning
         int depth,
         List<string> entries,
         int maximumEntries,
+        long perSeedLimit,
+        ref long fingerprintedBytes,
         CancellationToken ct)
     {
         if (depth > MaximumDirectoryDepth)
@@ -697,28 +704,63 @@ internal static class IncusBaselineProvisioning
                     entries.Add($"d|{relative}");
                     using (var child = IncusSafeFile.OpenChildDirectoryNoFollow(directory, name))
                     {
-                        CollectSeedFingerprintEntries(child, relative, depth + 1, entries, maximumEntries, ct);
+                        CollectSeedFingerprintEntries(child, relative, depth + 1, entries, maximumEntries, perSeedLimit, ref fingerprintedBytes, ct);
                     }
                     break;
                 case IncusDirectoryEntryKind.RegularFile:
                     using (var source = IncusSafeFile.OpenChildFileReadNoFollow(directory, name))
                     {
-                        entries.Add($"f|{relative}|{source.Length}|{File.GetLastWriteTimeUtc(source.SafeFileHandle!).Ticks}");
+                        entries.Add($"f|{relative}|{source.Length}|{HashSeedFileContent(source, perSeedLimit, ref fingerprintedBytes, ct)}");
                     }
                     break;
                 case IncusDirectoryEntryKind.SymbolicLink:
                     var target = IncusSafeFile.ReadChildSymbolicLinkNoFollow(directory, name);
-                    _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+                    var targetBytes = IncusInputValidation.GetBoundedUtf8ByteCount(
                         target,
                         MaximumLinkTargetUtf8Bytes,
                         nameof(target),
                         "Package cache symbolic-link target");
+                    AddFingerprintBytes(targetBytes, perSeedLimit, ref fingerprintedBytes);
                     entries.Add($"l|{relative}|{target}");
                     break;
                 default:
                     throw new IOException("Package cache seeds reject sockets, devices, FIFOs, and other special files.");
             }
         }
+    }
+
+    private static string HashSeedFileContent(
+        FileStream source,
+        long perSeedLimit,
+        ref long fingerprintedBytes,
+        CancellationToken ct)
+    {
+        if (source.Length > perSeedLimit - fingerprintedBytes)
+            throw new IOException("Package cache seed exceeds its configured byte limit.");
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[CopyBufferBytes];
+        while (true)
+        {
+            var remaining = perSeedLimit - fingerprintedBytes;
+            if (remaining < 0)
+                throw new IOException("Package cache seed exceeds its configured byte limit.");
+            var request = (int)Math.Min(buffer.Length, remaining + 1);
+            var read = ReadCancellable(source, buffer.AsSpan(0, request), ct);
+            if (read == 0)
+                break;
+            if (read > remaining)
+                throw new IOException("Package cache seed exceeds its configured byte limit.");
+            hash.AppendData(buffer, 0, read);
+            fingerprintedBytes += read;
+        }
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+    }
+
+    private static void AddFingerprintBytes(int count, long perSeedLimit, ref long fingerprintedBytes)
+    {
+        if (count < 0 || count > perSeedLimit - fingerprintedBytes)
+            throw new IOException("Package cache seed exceeds its configured byte limit.");
+        fingerprintedBytes += count;
     }
 
     private static void WriteDirectoryChildren(
