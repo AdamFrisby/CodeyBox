@@ -1204,8 +1204,6 @@ builder.Services.AddSingleton<IAgentPromptPreprocessor>(sp =>
 // CodeyBox:PipelineTuning:EnableHandoffSeeding (default off) — the builder
 builder.Services.AddSingleton<ICrossAgentHandoffBriefBuilder, AgentStreamBriefBuilder>();
 builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptPreprocessor>();
-builder.Services.AddSingleton<ConvergenceBriefOptions>(sp =>
-    sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ConvergenceBrief);
 builder.Services.AddSingleton<ConvergenceBriefComposer>(sp =>
     new ConvergenceBriefComposer(
         sp.GetRequiredService<IWorkItemStore>(),

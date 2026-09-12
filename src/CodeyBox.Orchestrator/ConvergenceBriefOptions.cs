@@ -41,4 +41,10 @@ public sealed class ConvergenceBriefOptions
     /// Default 250 chars.
     /// </summary>
     public int MaxFindingTitleChars { get; set; } = 250;
+
+    /// <summary>
+    /// Upper bound on how many captured stream files are inspected for excerpts.
+    /// Default 50 files.
+    /// </summary>
+    public int MaxStreamFilesToInspect { get; set; } = 50;
 }
