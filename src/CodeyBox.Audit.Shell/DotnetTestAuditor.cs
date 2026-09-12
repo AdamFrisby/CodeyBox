@@ -82,7 +82,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         return argv;
     }
 
-    public Task<AuditResult> RunAsync(
+    public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
         AuditContext context,
@@ -90,8 +90,23 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
     {
         var shadow = _opts.Shadow;
         if (shadow is not null && IsShadowMode(shadow))
-            return RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct);
-        return RunFullAsync(sandbox, workingDirectory, context, ct);
+            return await RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+        var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+        return full with { TestSelection = TestSelectionTelemetryComputer.FullSuiteWithoutShadow(ResolveModeName(shadow)) };
+    }
+
+    private static string ResolveModeName(TestSelectionShadowConfig? shadow)
+    {
+        if (shadow is null)
+            return TestSelectionMode.All.ToString();
+        try
+        {
+            return shadow.ModeAccessor().ToString();
+        }
+        catch (Exception)
+        {
+            return TestSelectionMode.All.ToString();
+        }
     }
 
     private static bool IsShadowMode(TestSelectionShadowConfig shadow)
@@ -164,6 +179,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
 
         var record = BuildShadowRecord(
             shadow, context, decision, selectionDetail, wouldBeArgv, universe, failedTests);
+        var telemetry = TestSelectionTelemetryComputer.FromShadowRecord(record, universe.Count);
 
         try
         {
@@ -175,6 +191,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             // non-blocking finding instead of throwing or swallowing silently.
             return result with
             {
+                TestSelection = telemetry,
                 Findings = [.. result.Findings, new AuditFinding(
                     AuditorName: Name,
                     Severity: AuditSeverity.Info,
@@ -184,7 +201,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             };
         }
 
-        return result;
+        return result with { TestSelection = telemetry };
     }
 
     private static TestSelectionShadowRecord BuildShadowRecord(

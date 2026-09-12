@@ -43,7 +43,17 @@ internal static class AuditReportEndpoints
                     r.DurationMs,
                     r.Findings.Select(f => new AuditReportFindingDto(
                         f.Id, f.Severity, f.Title, f.Message, f.Files, f.LineHints)).ToList(),
-                    RawOutputAvailable: r.RawOutput is not null)).ToList();
+                    RawOutputAvailable: r.RawOutput is not null,
+                    TestSelection: r.TestSelection is null ? null : new AuditReportTestSelectionDto(
+                        r.TestSelection.Mode,
+                        r.TestSelection.Selector,
+                        r.TestSelection.Layers,
+                        r.TestSelection.SelectedCount,
+                        r.TestSelection.TotalCount,
+                        r.TestSelection.EstimatedSavedFraction,
+                        r.TestSelection.Assessment,
+                        r.TestSelection.Fallbacks,
+                        r.TestSelection.Detail))).ToList();
 
                 var allFindings = auditors.SelectMany(a => a.Findings).ToList();
                 var blockingCount = allFindings.Count(f =>
@@ -116,7 +126,25 @@ public sealed record AuditReportAuditorDto(
     string WorstSeverity,
     long DurationMs,
     IReadOnlyList<AuditReportFindingDto> Findings,
-    bool RawOutputAvailable);
+    bool RawOutputAvailable,
+    AuditReportTestSelectionDto? TestSelection = null);
+
+/// <summary>
+/// Per-run test-selection telemetry for <c>csharp:test-pass</c>, mirrored from
+/// <c>CodeyBox.Core.TestSelectionTelemetry</c> so the REST surface shows the
+/// WOULD-BE selected/total counts, the estimated saved fraction, the selector
+/// layers, and any fallbacks that fired. Null for every other auditor.
+/// </summary>
+public sealed record AuditReportTestSelectionDto(
+    string Mode,
+    string Selector,
+    IReadOnlyList<string> Layers,
+    int SelectedCount,
+    int TotalCount,
+    double EstimatedSavedFraction,
+    string Assessment,
+    IReadOnlyList<string> Fallbacks,
+    string Detail);
 
 public sealed record AuditReportFindingDto(
     string Id,

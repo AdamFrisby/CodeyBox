@@ -15026,6 +15026,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 DurationMs = (long)elapsed.TotalMilliseconds,
                 Findings = reportFindings,
                 RawOutput = rawOutput,
+                TestSelection = result.TestSelection,
             };
             await _auditReports.CreateAsync(report, ct);
         }

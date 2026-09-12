@@ -60,6 +60,7 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
             }
 
             EnsureAuditTargetColumn();
+            EnsureTestSelectionColumn();
 
             using var indexCmd = _conn.CreateCommand();
             indexCmd.CommandText = """
@@ -86,8 +87,9 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 INSERT INTO audit_reports (id, work_item_id, iteration, audit_target, auditor_name,
-                    auditor_kind, worst_severity, started_at, ended_at, duration_ms, findings_json, raw_output)
-                VALUES ($id, $wi, $iter, $target, $name, $kind, $sev, $started, $ended, $dur, $findings, $raw);
+                    auditor_kind, worst_severity, started_at, ended_at, duration_ms, findings_json, raw_output,
+                    test_selection_json)
+                VALUES ($id, $wi, $iter, $target, $name, $kind, $sev, $started, $ended, $dur, $findings, $raw, $tsel);
                 """;
             cmd.Parameters.AddWithValue("$id", report.Id);
             cmd.Parameters.AddWithValue("$wi", report.WorkItemId);
@@ -101,6 +103,9 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
             cmd.Parameters.AddWithValue("$dur", report.DurationMs);
             cmd.Parameters.AddWithValue("$findings", JsonSerializer.Serialize(report.Findings, JsonOpts));
             cmd.Parameters.AddWithValue("$raw", (object?)report.RawOutput ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$tsel", (object?)(report.TestSelection is null
+                ? null
+                : JsonSerializer.Serialize(report.TestSelection, JsonOpts)) ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct);
         }
         finally { _writeLock.Release(); }
@@ -130,14 +135,14 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
         cmd.CommandText = target is null
             ? """
               SELECT id, work_item_id, iteration, audit_target, auditor_name, auditor_kind, worst_severity,
-                     started_at, ended_at, duration_ms, findings_json, raw_output
+                     started_at, ended_at, duration_ms, findings_json, raw_output, test_selection_json
               FROM audit_reports
               WHERE work_item_id = $wi
               ORDER BY audit_target ASC, iteration ASC, auditor_name ASC;
               """
             : """
               SELECT id, work_item_id, iteration, audit_target, auditor_name, auditor_kind, worst_severity,
-                     started_at, ended_at, duration_ms, findings_json, raw_output
+                     started_at, ended_at, duration_ms, findings_json, raw_output, test_selection_json
               FROM audit_reports
               WHERE work_item_id = $wi AND audit_target = $target
               ORDER BY iteration ASC, auditor_name ASC;
@@ -240,7 +245,50 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
             DurationMs = r.GetInt64(r.GetOrdinal("duration_ms")),
             Findings = findings,
             RawOutput = r.IsDBNull(rawOrd) ? null : r.GetString(rawOrd),
+            TestSelection = ReadTestSelection(r),
         };
+    }
+
+    private static TestSelectionTelemetry? ReadTestSelection(SqliteDataReader r)
+    {
+        int ordinal;
+        try
+        {
+            ordinal = r.GetOrdinal("test_selection_json");
+        }
+        catch (IndexOutOfRangeException)
+        {
+            // Pre-telemetry rows / readers that do not project the column.
+            return null;
+        }
+        if (r.IsDBNull(ordinal))
+            return null;
+        var json = r.GetString(ordinal);
+        if (string.IsNullOrWhiteSpace(json))
+            return null;
+        try
+        {
+            return JsonSerializer.Deserialize<TestSelectionTelemetry>(json, JsonOpts);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private void EnsureTestSelectionColumn()
+    {
+        using var columns = _conn.CreateCommand();
+        columns.CommandText = "PRAGMA table_info(audit_reports);";
+        using var reader = columns.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), "test_selection_json", StringComparison.Ordinal))
+                return;
+        }
+        using var alter = _conn.CreateCommand();
+        alter.CommandText = "ALTER TABLE audit_reports ADD COLUMN test_selection_json TEXT;";
+        alter.ExecuteNonQuery();
     }
 
     private void EnsureAuditTargetColumn()

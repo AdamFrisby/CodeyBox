@@ -324,6 +324,15 @@ public sealed record AuditResult
     public IReadOnlyList<TestFailureAttributionResult> TestFailureAttributions { get; init; }
 
     /// <summary>
+    /// Test-selection telemetry for this run. Set by the <c>csharp:test-pass</c>
+    /// runner (<see cref="ITestRunnerAuditor"/>) on every invocation — shadow
+    /// and full-suite alike — so the audit report can show the WOULD-BE
+    /// selected/total counts, the estimated time saved, the selector layers,
+    /// and any fallbacks that fired. Null for every other auditor.
+    /// </summary>
+    public TestSelectionTelemetry? TestSelection { get; init; }
+
+    /// <summary>
     /// Mirrors <see cref="CodeyBox.Core.AgentResult.TerminalDiagnostic"/> for an
     /// audit-agent run: some CLIs (notably <c>agy</c>) exit <b>0</b> and write no
     /// <c>result.json</c> when a consumer-tier quota block (429) stops them,

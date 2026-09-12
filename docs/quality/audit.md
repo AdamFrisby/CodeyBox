@@ -268,17 +268,64 @@ failure signals win and the outcome stays a code finding.
 
 Capability: `None`.
 
-### Test-selection shadow (`Audit:TestSelection`)
+### Test selection (`Audit:TestSelection`)
 
-`csharp:test-pass` consults the configured `ITestSelector` only in
-`coverage-shadow` mode, and only on paper: it computes the advisory selection,
-still runs the FULL suite (the narrowed `--filter` argv is recorded, never
-executed), parses the full run's failed tests, and emits a shadow record
+`csharp:test-pass` can narrow `dotnet test` to the tests a change may affect.
+Narrowing ships **advisory/shadow only**: the selector computes the subset it
+*WOULD* run, the **full suite still runs**, and per-run telemetry plus a shadow
+record capture whether any deselected test failed. No ticket in this sequence
+skips a test.
+
+**Selection scopes (`all` | `project-graph` | `coverage`)** — the three layers,
+innermost first:
+
+- `all` (default): no selector runs; the emitted command is byte-identical to
+  the legacy path. Instant kill-switch: hot-reloading back to `all` disables
+  all selection.
+- `project-graph` (`ProjectGraphTestSelector`): maps each changed file to its
+  owning MSBuild project and selects the baseline's precomputed affected tests,
+  plus tests defined in the changed files.
+- `coverage` (`CoverageTestSelector`): refines the project-graph superset by
+  per-test coverage intersection — and ALWAYS also selects tests defined in
+  changed files, tests with NO coverage record (new/uninstrumented), and
+  everything the project-graph layer picks. Coverage only refines WITHIN that
+  superset: the result is a union, never less.
+
+The live config knob is `Audit:TestSelection:Mode` (`all` |
+`coverage-shadow`, case-insensitive, hot-reloaded via `IOptionsMonitor`; an
+unrecognised value fails fast at load). `coverage-shadow` runs the
+`project-graph` + `coverage` layers advisorially and records the verdict; `all`
+runs neither. `csharp:test-pass` consults the configured `ITestSelector` only
+in `coverage-shadow` mode, and only on paper: it computes the advisory
+selection, still runs the FULL suite (the narrowed `--filter` argv is recorded,
+never executed), parses the full run's failed tests, and emits a shadow record
 (`safe-for-this-run` / `unsafe-skips-observed` / `full-suite` /
-`unverifiable`). Any selector error, missing/stale baseline, global-target
-touch, or sink failure falls back to — or otherwise preserves — the full run.
-`all` (the default) is an instant kill-switch. The merge/release path
-(`process:required-build`) never consults the selector. Full policy, baseline
+`unverifiable`).
+
+**Fallback ladder** — running MORE tests is always safe, so ANY uncertainty
+resolves to the full suite, in this order: unknown/empty changeset → no
+baseline → invalid selection options → stale baseline (commit mismatch or older
+than `MaxBaselineAge`) → global-target touch (`Directory.Build.*`,
+`Directory.Packages.props`, `global.json`, `NuGet.Config`, `CodeyBox.slnx`,
+`.github/workflows/`) → whole-file change (no line granularity) → changed test
+file (may define unrecorded tests) → changed file no record references →
+project-graph superset already full → selector error. Each rung records its
+reason in the telemetry `fallbacks` list and the shadow record detail.
+
+**Full-suite-on-main soundness invariant** — the merge/release path
+(`IRequiredBuildVerifier` / `process:required-build`) takes NO dependency on
+the `ITestSelector` seam and always runs the full build/test surface,
+regardless of mode. Selectors are advisory for the audit loop only; the gate
+that certifies `main` cannot narrow. Enforced structurally in code (see
+`TestSelectorTests`), not by config.
+
+**Per-run telemetry** — every `csharp:test-pass` invocation records a
+`testSelection` block on its audit report (persisted in `audit_reports`, served
+by `GET /workitems/{id}/audit-reports`, rendered on the Audit Reports and
+Timeline dashboard pages): WOULD-BE `selectedCount`/`totalCount`, the
+proportional `estimatedSavedFraction` (deselected / total — the dashboard
+multiplies it by the run's `durationMs` for display), the `layers` consulted,
+the shadow `assessment`, and the `fallbacks` that fired. Full policy, baseline
 format, and staleness bound: `docs/quality/test-selection.md`.
 
 ### `process:build-script`

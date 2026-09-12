@@ -25,12 +25,14 @@ CREATE TABLE audit_reports (
     ended_at        TEXT NOT NULL,
     duration_ms     INTEGER NOT NULL,
     findings_json   TEXT NOT NULL,   -- JSON array of finding objects
-    raw_output      TEXT             -- NULL when auditor produced no output
+    raw_output      TEXT,            -- NULL when auditor produced no output
+    test_selection_json TEXT         -- NULL except on csharp:test-pass runs (see below)
 );
 ```
 
 One row is written per auditor per target-specific iteration. Rows
-created before target persistence are migrated to `code`.
+created before target persistence are migrated to `code`; rows written
+before test-selection telemetry read back with `testSelection: null`.
 
 ### Write overhead
 
@@ -90,6 +92,15 @@ stored in `raw_output` after:
 
 `raw_output` is NULL when the auditor produced no capturable output.
 
+## Test-selection telemetry
+
+`csharp:test-pass` runs carry a `testSelection` block on their report:
+WOULD-BE `selectedCount`/`totalCount`, the proportional
+`estimatedSavedFraction`, the `layers` consulted, the shadow `assessment`,
+and the `fallbacks` that fired. It is `null` for every other auditor and for
+rows written before telemetry existed. Full field semantics:
+[`test-selection.md`](./test-selection.md) ("Per-run telemetry").
+
 ## Retention
 
 Rows are deleted by `AuditReportRetentionService`, a `BackgroundService`
@@ -122,10 +133,13 @@ The **Audit Reports** page (`/work-items/{id}/audit-reports`) provides:
   operators see which defects persisted, resolved, or re-appeared.
 - **Per-iteration expandable sections** — each auditor is a `<details>`
   block showing severity, duration, and individual findings with
-  severity badges.
+  severity badges. `csharp:test-pass` auditors additionally show a
+  test-selection line (WOULD-BE selected/total, estimated time saved,
+  selector layers, shadow assessment, fallbacks that fired).
 - **Raw output** — a "raw" button per auditor lazily fetches and
   displays the full captured output.
 
 The **Timeline** page (`/work-items/{id}/timeline`) also shows findings
 inline inside each `auditor_run` entry; the raw output button is
-available there too.
+available there too, along with the `csharp:test-pass` test-selection
+summary line.

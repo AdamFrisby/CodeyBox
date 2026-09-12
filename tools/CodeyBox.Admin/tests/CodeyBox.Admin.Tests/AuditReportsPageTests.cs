@@ -243,4 +243,48 @@ public sealed class AuditReportsPageTests : BunitContext
         Assert.Contains($"/work-items/{id}", cut.Markup);
         Assert.Contains($"/work-items/{id}/timeline", cut.Markup);
     }
+
+    [Fact]
+    public void AuditReports_ShowsTestSelectionLine_WhenTelemetryPresent()
+    {
+        var id = Guid.NewGuid().ToString();
+        var auditor = MakeAuditor("csharp:test-pass");
+        auditor.DurationMs = 120_000;
+        auditor.TestSelection = new AuditReportTestSelectionDto
+        {
+            Mode = "CoverageShadow",
+            Selector = "coverage",
+            Layers = ["project-graph", "coverage"],
+            SelectedCount = 3,
+            TotalCount = 4,
+            EstimatedSavedFraction = 0.25,
+            Assessment = "safe-for-this-run",
+            Fallbacks = [],
+            Detail = "coverage: 3 test(s)",
+        };
+        var fake = new FakeApiClient([]);
+        fake.AuditReportsOverride = MakeReports(id, MakeIteration(1, auditor));
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
+
+        Assert.Contains("audit-test-selection", cut.Markup);
+        Assert.Contains("3/4", cut.Markup);
+        Assert.Contains("safe-for-this-run", cut.Markup);
+        Assert.Contains("project-graph+coverage", cut.Markup);
+    }
+
+    [Fact]
+    public void AuditReports_HidesTestSelectionLine_WhenTelemetryAbsent()
+    {
+        var id = Guid.NewGuid().ToString();
+        var fake = new FakeApiClient([]);
+        fake.AuditReportsOverride = MakeReports(id,
+            MakeIteration(1, MakeAuditor("Lint")));
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
+
+        Assert.DoesNotContain("audit-test-selection", cut.Markup);
+    }
 }

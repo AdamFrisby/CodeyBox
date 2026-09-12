@@ -96,6 +96,25 @@ and their intersection (the unsafe skips). This is the shared harness every
 selector reports through; the enforcement gate for real skipping consumes
 these records and does not exist yet.
 
+## Per-run telemetry (audit report + dashboard)
+
+Every `csharp:test-pass` invocation — shadow AND full-suite — records a
+`testSelection` block on its audit report (`audit_reports.test_selection_json`,
+served as `testSelection` on each auditor in
+`GET /workitems/{id}/audit-reports`, rendered on the Audit Reports and
+Timeline dashboard pages):
+
+| Field | Meaning |
+|-------|---------|
+| `mode` | Live selection mode (`All`, `CoverageShadow`). |
+| `selector` | Selector that decided (`coverage`, or `none` when the shadow was inactive). |
+| `layers` | Layers consulted, innermost first (`["project-graph","coverage"]` for the coverage selector, which refines the project-graph superset). |
+| `selectedCount` / `totalCount` | WOULD-BE subset / known universe size. `0/0` means the universe was unknown (no baseline) — the dashboard shows "full suite". For a full-suite fallback with a known universe, both equal the universe size. |
+| `estimatedSavedFraction` | Proportional estimate: deselected / total in [0,1]. The dashboard multiplies it by the run's `durationMs` (`est. saved 62.5% (~75s)`). Zero for full-suite runs. This is an estimate, not a measurement — the full suite always ran. |
+| `assessment` | Shadow verdict (`safe-for-this-run` \| `unsafe-skips-observed` \| `full-suite` \| `unverifiable`). |
+| `fallbacks` | Which fallback-ladder rungs fired (e.g. `no per-test coverage baseline is available`). Empty when the selector narrowed without falling back. |
+| `detail` | Operator-facing selection detail (capped at 4000 chars). |
+
 See `tests/CodeyBox.Tests/CoverageTestSelectionTests.cs` and
 `docs/coverage.md` (aggregate gate) / `docs/quality/audit.md`
 (`DotnetTestAuditor`).

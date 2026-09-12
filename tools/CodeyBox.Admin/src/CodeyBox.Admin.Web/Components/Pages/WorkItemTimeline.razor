@@ -343,6 +343,7 @@ else
                             ? nameProp.GetString() ?? "" : "";
                         var iter = entry.IterationNumber ?? 0;
                         var findings = GetFindings(iter, auditorName);
+                        var testSelection = GetTestSelection(iter, auditorName);
                         <details class="timeline-details">
                             <summary>findings @(findings is { Count: > 0 } ? $"({findings.Count})" : "")</summary>
                             @if (_auditReports is null)
@@ -365,6 +366,14 @@ else
                                         </li>
                                     }
                                 </ul>
+                            }
+                            @if (testSelection is not null)
+                            {
+                                <p class="audit-test-selection">
+                                    <span class="audit-ts-chip">@testSelection.Mode</span>
+                                    <span>@FormatTestSelection(testSelection)</span>
+                                    <span class="audit-ts-assessment">@testSelection.Assessment</span>
+                                </p>
                             }
                             @if (!string.IsNullOrEmpty(auditorName) && iter > 0)
                             {
@@ -411,6 +420,28 @@ else
         if (iter is null) return [];
         var aud = iter.Auditors.FirstOrDefault(a => a.Name == auditorName);
         return aud?.Findings ?? [];
+    }
+
+    private AuditReportTestSelectionDto? GetTestSelection(int iteration, string auditorName)
+    {
+        if (_auditReports is null) return null;
+        var iter = _auditReports.Iterations.FirstOrDefault(i =>
+            string.Equals(i.Target, "code", StringComparison.OrdinalIgnoreCase)
+            && i.Iteration == iteration);
+        return iter?.Auditors.FirstOrDefault(a => a.Name == auditorName)?.TestSelection;
+    }
+
+    private static string FormatTestSelection(AuditReportTestSelectionDto ts)
+    {
+        var counts = ts.TotalCount > 0
+            ? $"tests {ts.SelectedCount}/{ts.TotalCount} would-run"
+            : "tests full suite";
+        var via = ts.Layers.Count > 0 ? $" via {string.Join("+", ts.Layers)}" : "";
+        var saved = ts.TotalCount > 0 && ts.EstimatedSavedFraction > 0
+            ? $", est. saved {ts.EstimatedSavedFraction * 100.0:0.#}%"
+            : "";
+        var fallback = ts.Fallbacks.Count > 0 ? $", fallback: {ts.Fallbacks[0]}" : "";
+        return counts + via + saved + fallback;
     }
 
     private static string FirstParagraph(string message)
