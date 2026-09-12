@@ -625,6 +625,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var mergedSeverity = AuditSeverityParser.Parse(project?.FailingSeverity ?? defaults?.FailingSeverity);
         var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? ProjectAuditConfig.DefaultPerIterationTimeoutMinutes;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
+        var mergedDeploymentAuditEnabled = project?.DeploymentAuditEnabled ?? defaults?.DeploymentAuditEnabled ?? false;
         var mergedBuildScriptRequired = project?.BuildScriptRequired ?? defaults?.BuildScriptRequired ?? false;
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
         var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
@@ -669,6 +670,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             FailingSeverity = mergedSeverity,
             PerIterationTimeout = TimeSpan.FromMinutes(mergedTimeoutMin),
             StopOnFirstFailure = mergedStopOnFirst,
+            DeploymentAuditEnabled = mergedDeploymentAuditEnabled,
             BuildScriptRequired = mergedBuildScriptRequired,
             StuckThresholdMinutes = mergedStuck,
             AutoRetryOnStuck = mergedAutoRetry,
@@ -784,6 +786,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             FailingSeverity = audit.FailingSeverity.ToString(),
             PerIterationTimeoutMinutes = (int)audit.PerIterationTimeout.TotalMinutes,
             StopOnFirstFailure = audit.StopOnFirstFailure,
+            DeploymentAuditEnabled = audit.DeploymentAuditEnabled,
             BuildScriptRequired = audit.BuildScriptRequired,
             StuckThresholdMinutes = audit.StuckThresholdMinutes,
             AutoRetryOnStuck = audit.AutoRetryOnStuck,

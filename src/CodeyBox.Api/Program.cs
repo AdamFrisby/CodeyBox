@@ -3525,7 +3525,12 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
     quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
     e2eReplayGate: sp.GetService<WorkItemE2eReplayGate>(),
-    jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>()));
+    jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>(),
+    // Verification-deployment provisioning for the deployment stage of the
+    // audit ladder (lazy: one deployment per iteration, only after a clean
+    // code stage; always torn down; leak reaper covers restarts).
+    deploymentManager: sp.GetService<IDeploymentManager>(),
+    deploymentSubstrates: sp.GetService<IDeploymentSubstrateProvider>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -3987,13 +3992,16 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 
 // --- Verification deployment drivers + manager -------------------------------
-// Built ONLY as the deployment abstraction (chain link 1) — no pipeline/audit
-// integration yet. Drivers are DI-resolved by their Kind via
-// DeploymentDriverRegistry, so a new kind is one new IDeploymentDriver
-// registration + recipe schema entry with zero core changes (per AGENTS.md
-// declared-capability pattern). The leak reaper sweeps managed sandboxes
-// whose deployment owner no longer exists in the manager's active set
-// (orchestrator restart, aborted deploy) — sibling to SandboxLeakReaper.
+// Deployment abstraction (chain link 1) + audit-ladder integration (link 2):
+// the pipeline lazily provisions ONE deployment per audit iteration from the
+// project's recipe once the code stage passes, runs deployment-targeted
+// auditors against the live endpoint, and always tears it down. Drivers are
+// DI-resolved by their Kind via DeploymentDriverRegistry, so a new kind is
+// one new IDeploymentDriver registration + recipe schema entry with zero
+// core changes (per AGENTS.md declared-capability pattern). The leak reaper
+// sweeps managed sandboxes whose deployment owner no longer exists in the
+// manager's active set (orchestrator restart, aborted deploy) — sibling to
+// SandboxLeakReaper.
 builder.Services.AddSingleton<IDeploymentDriver, WebAppDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, DaemonDeploymentDriver>();
 builder.Services.AddSingleton<IDeploymentDriver, CliDeploymentDriver>();

@@ -45,6 +45,15 @@ public readonly record struct AuditTarget
     /// <summary>Reviews the work-phase diff (the default target).</summary>
     public static AuditTarget Code { get; } = new("code");
 
+    /// <summary>
+    /// Reviews the live verification deployment stood up from the project's
+    /// deployment recipe. Auditors with this target run only in the
+    /// deployment stage of the audit loop — after the code stage passes —
+    /// and receive the live <see cref="DeploymentEndpoint"/> on
+    /// <see cref="AuditContext.DeploymentEndpoint"/>.
+    /// </summary>
+    public static AuditTarget Deployment { get; } = new("deployment");
+
     public override string ToString() => Value;
 }
 
@@ -66,6 +75,14 @@ public static class AuditTargets
     /// <summary>An auditor that reviews both plans and code.</summary>
     public static IReadOnlySet<AuditTarget> PlanAndCode { get; } =
         FrozenSet.ToFrozenSet([AuditTarget.Plan, AuditTarget.Code]);
+
+    /// <summary>An auditor that reviews live verification deployments only.</summary>
+    public static IReadOnlySet<AuditTarget> DeploymentOnly { get; } =
+        FrozenSet.ToFrozenSet([AuditTarget.Deployment]);
+
+    /// <summary>An auditor that reviews both the work-phase diff and live deployments.</summary>
+    public static IReadOnlySet<AuditTarget> CodeAndDeployment { get; } =
+        FrozenSet.ToFrozenSet([AuditTarget.Code, AuditTarget.Deployment]);
 
     /// <summary>
     /// Builds an immutable target set from the supplied targets. Empty input is
@@ -119,6 +136,13 @@ public enum AuditReviewStrategy
 
     /// <summary>Review the work-phase diff and enforce build/test gates.</summary>
     CodeReview,
+
+    /// <summary>
+    /// Review the live verification deployment. Runs only after the code
+    /// stage passes, against the <see cref="DeploymentEndpoint"/> the audit
+    /// runner provisions lazily from the project's deployment recipe.
+    /// </summary>
+    DeploymentReview,
 }
 
 /// <summary>
@@ -136,6 +160,8 @@ public static class AuditTargetSemantics
             return AuditReviewStrategy.PlanReview;
         if (target == AuditTarget.Code)
             return AuditReviewStrategy.CodeReview;
+        if (target == AuditTarget.Deployment)
+            return AuditReviewStrategy.DeploymentReview;
 
         throw new NotSupportedException(
             $"No audit review strategy is defined for target '{target.Value}'. Add an " +
@@ -153,4 +179,12 @@ public static class AuditTargetSemantics
     /// </summary>
     public static bool IsCodeReview(AuditTarget target) =>
         Classify(target) == AuditReviewStrategy.CodeReview;
+
+    /// <summary>
+    /// True when the target reviews the live verification deployment, which
+    /// runs only after the code stage passes and receives the provisioned
+    /// <see cref="DeploymentEndpoint"/>.
+    /// </summary>
+    public static bool IsDeploymentReview(AuditTarget target) =>
+        Classify(target) == AuditReviewStrategy.DeploymentReview;
 }

@@ -191,6 +191,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // compositions/tests that don't wire it; when null, no propagation runs.
     // Gated per-project (Project.JobTrackExport.Enabled) even when wired.
     private readonly IJobTrackTestCaseExporter? _jobTrackExporter;
+    // Optional verification-deployment provisioning for the deployment stage
+    // of the audit ladder. Null in compositions/tests that don't exercise
+    // deployment-stage auditing; when null, an iteration that would otherwise
+    // provision a deployment instead records a configuration-shaped
+    // AuditUnavailableException (never a fake pass) — but only when the
+    // project actually enables the phase with a recipe and auditors.
+    private readonly IDeploymentManager? _deploymentManager;
+    private readonly IDeploymentSubstrateProvider? _deploymentSubstrates;
     private readonly IMergeScopeResolver _mergeScopeResolver;
     private readonly Func<Guid> _dispatchClaimIdFactory;
     private readonly string _disabledHostHooksPath;
@@ -348,7 +356,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // wires the hot-reloadable snapshot-backed classifier and the shared
         // store so a config-only signature takes effect without restart.
         IToolchainFaultClassifier? toolchainFaultClassifier = null,
-        IToolchainFaultRecordStore? toolchainFaultRecords = null)
+        IToolchainFaultRecordStore? toolchainFaultRecords = null,
+        // Verification-deployment provisioning for the deployment stage of
+        // the audit ladder. Null disables the physical provisioning path;
+        // composition roots that enable deployment-stage auditing wire both.
+        IDeploymentManager? deploymentManager = null,
+        IDeploymentSubstrateProvider? deploymentSubstrates = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -424,6 +437,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _testCaseStore = testCaseStore;
         _e2eReplayGate = e2eReplayGate;
         _jobTrackExporter = jobTrackExporter;
+        _deploymentManager = deploymentManager;
+        _deploymentSubstrates = deploymentSubstrates;
         _mergeScopeResolver = mergeScopeResolver ?? NullMergeScopeResolver.Instance;
         _availability = availability;
         // Prefer the DI-injected handler when supplied: keeps the registry
@@ -10889,10 +10904,47 @@ public sealed partial class PipelineRunner : IPipelineRunner
             IReadOnlyList<string> completedAuditors;
             IReadOnlyList<string> incompleteAuditors;
             AuditFinding? requiredBuildFinding;
+            int? revisionForCtx = null;
+            List<AuditFinding>? priorBlockingFindings = null;
+            // Hoisted so the deployment stage (below, outside the code-stage
+            // try) reuses the same progress prefix: partial deployment-stage
+            // progress snapshots carry the required-build pre-collections.
+            var preCollectedFindings = new List<AuditFinding>();
+            var preCompletedAuditors = new List<string>();
+            Func<AuditProgressUpdate, CancellationToken, Task> progressUpdateWithPreCollected =
+                async (progress, progressCt) =>
+                {
+                    IReadOnlyList<AuditFinding> partialFindings = progress.Operation == AuditProgressUpdateOperation.Replace
+                        ? progress.Findings
+                        : [.. preCollectedFindings, .. progress.Findings];
+                    IReadOnlyList<string> partialCompletedAuditors = progress.Operation == AuditProgressUpdateOperation.Replace
+                        ? progress.CompletedAuditors
+                        : [.. preCompletedAuditors, .. progress.CompletedAuditors];
+                    var partialBlocking = partialFindings
+                        .Where(f => f.Severity >= project.Audit.FailingSeverity)
+                        .ToList();
+                    var partialTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, progressCt)
+                        .ConfigureAwait(false);
+                    await PersistAuditProgressAsync(
+                        item,
+                        currentWorkAttemptStartedAt,
+                        BuildAuditProgressSnapshot(
+                            iteration,
+                            maxIterations,
+                            partialFindings,
+                            partialBlocking,
+                            partialFindings.Count - partialBlocking.Count,
+                            partialTip,
+                            AuditProgressStatuses.InProgress,
+                            scheduledAuditorNames,
+                            partialCompletedAuditors,
+                            _opts.TimeProvider.GetUtcNow()),
+                        progressCt).ConfigureAwait(false);
+                };
             try
             {
-                var revisionForCtx = await TryLookupIterationRevisionAsync(item.Id, iteration, ct);
-                var priorBlockingFindings = auditHistory
+                revisionForCtx = await TryLookupIterationRevisionAsync(item.Id, iteration, ct);
+                priorBlockingFindings = auditHistory
                     .Where(h => h.Iteration < iteration && h.IsComplete)
                     .OrderByDescending(h => h.Iteration)
                     .Select(h => h.BlockingFindingsDetails)
@@ -10916,8 +10968,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     // "no plan to check" and passes as a no-op.
                     PlanArtifact: item.PlanArtifact,
                     PriorBlockingFindings: priorBlockingFindings);
-                var preCollectedFindings = new List<AuditFinding>();
-                var preCompletedAuditors = new List<string>();
                 var prePassedBuildTestGateEvidence = BuildTestGateEvidence.None;
                 var auditorsForCollection = scheduledAuditors;
                 if (scheduledAuditors.Any(RequiresPassedBuildTestGate))
@@ -10934,37 +10984,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             .ToList();
                     }
                 }
-
-                Func<AuditProgressUpdate, CancellationToken, Task> progressUpdateWithPreCollected =
-                    async (progress, progressCt) =>
-                    {
-                        IReadOnlyList<AuditFinding> partialFindings = progress.Operation == AuditProgressUpdateOperation.Replace
-                            ? progress.Findings
-                            : [.. preCollectedFindings, .. progress.Findings];
-                        IReadOnlyList<string> partialCompletedAuditors = progress.Operation == AuditProgressUpdateOperation.Replace
-                            ? progress.CompletedAuditors
-                            : [.. preCompletedAuditors, .. progress.CompletedAuditors];
-                        var partialBlocking = partialFindings
-                            .Where(f => f.Severity >= project.Audit.FailingSeverity)
-                            .ToList();
-                        var partialTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, progressCt)
-                            .ConfigureAwait(false);
-                        await PersistAuditProgressAsync(
-                            item,
-                            currentWorkAttemptStartedAt,
-                            BuildAuditProgressSnapshot(
-                                iteration,
-                                maxIterations,
-                                partialFindings,
-                                partialBlocking,
-                                partialFindings.Count - partialBlocking.Count,
-                                partialTip,
-                                AuditProgressStatuses.InProgress,
-                                scheduledAuditorNames,
-                                partialCompletedAuditors,
-                                _opts.TimeProvider.GetUtcNow()),
-                            progressCt).ConfigureAwait(false);
-                    };
 
                 var collectTask = CollectFindingsAsync(
                     item,
@@ -11033,6 +11052,54 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 itemWasPlanned,
                 pipelineTuning.PlannedItemAuditRebalanceEnabled,
                 pipelineTuning.PlannedItemAdvisoryAuditors).ToList();
+
+            // Cost-ordered ladder rung 2: deployment stage (lazy).
+            // Runs only when the code stage above reached a complete verdict
+            // with zero blocking findings. Provisions exactly ONE deployment
+            // from the project's recipe, runs deployment-targeted auditors
+            // against the live endpoint, and tears the deployment down on
+            // every exit path. Findings merge into the normal rework loop
+            // below. A fresh deployment is provisioned per iteration — never
+            // reused against post-rework code. When the phase does not apply
+            // (toggle off, no recipe, no deployment auditors) nothing is
+            // provisioned and the iteration completes on the code verdict.
+            if (!incompleteVerdict && blocking.Count == 0)
+            {
+                DeploymentStageOutcome? deploymentStage;
+                try
+                {
+                    deploymentStage = await RunDeploymentStageAsync(
+                        item,
+                        project,
+                        runner,
+                        repoId,
+                        baseBranch,
+                        workBranch,
+                        iteration,
+                        revisionForCtx,
+                        priorBlockingFindings,
+                        auditShortCircuitEnabled,
+                        progressUpdateWithPreCollected,
+                        scheduledAuditorNames,
+                        codeStageClean: true,
+                        auditPhase.Token);
+                }
+                catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+                {
+                    throw auditPhase.Wrap(oce);
+                }
+
+                if (deploymentStage is not null)
+                {
+                    findings = [.. findings, .. deploymentStage.Findings];
+                    blocking = [.. blocking, .. deploymentStage.Blocking];
+                    activeAuditAgentKind ??= deploymentStage.ActiveAuditAgentKind;
+                    declaredShortCircuitBlocking |= deploymentStage.DeclaredShortCircuitBlocking;
+                    incompleteVerdict |= deploymentStage.IncompleteVerdict;
+                    completedAuditors = [.. completedAuditors, .. deploymentStage.CompletedAuditors];
+                    incompleteAuditors = [.. incompleteAuditors, .. deploymentStage.IncompleteAuditors];
+                }
+            }
             if (incompleteVerdict && findings.Count == 0)
             {
                 var incompleteList = incompleteAuditors.Count == 0
@@ -12483,6 +12550,155 @@ public sealed partial class PipelineRunner : IPipelineRunner
             signals.Add("work_branch_tip_changed");
 
         return signals;
+    }
+
+    /// <summary>
+    /// Deployment-stage outcome for one audit iteration. Null (rather than an
+    /// empty outcome) signals "phase skipped" so the caller can distinguish
+    /// "no deployment auditors" from "auditors ran clean".
+    /// </summary>
+    private sealed record DeploymentStageOutcome(
+        IReadOnlyList<AuditFinding> Findings,
+        IReadOnlyList<AuditFinding> Blocking,
+        IReadOnlyList<string> CompletedAuditors,
+        IReadOnlyList<string> IncompleteAuditors,
+        AgentKind? ActiveAuditAgentKind,
+        bool DeclaredShortCircuitBlocking,
+        bool IncompleteVerdict,
+        DeploymentEndpoint Endpoint);
+
+    /// <summary>
+    /// Runs the deployment stage of the cost-ordered audit ladder for one
+    /// iteration. The caller guarantees the code stage is clean
+    /// (<paramref name="codeStageClean"/>); this method re-checks the full
+    /// provisioning policy (toggle, recipe, auditor presence) so a skipped
+    /// phase provisions zero deployments.
+    ///
+    /// <para>On provision: exactly one deployment is stood up from the
+    /// project's recipe, deployment-targeted auditors run against its live
+    /// endpoint (cheap smoke/health probes before quota-spending exploration
+    /// via <see cref="AuditPhaseLadder.OrderDeploymentStage"/>), and the
+    /// deployment is torn down when the auditors complete — including on
+    /// abort, cancel, iteration timeout, and recipe-max-lifetime expiry.
+    /// Findings flow into the normal rework loop with full blocking
+    /// authority (deployment probes are objective gates, never demoted).</para>
+    ///
+    /// <para>Returns null when the phase does not apply. Throws
+    /// <see cref="AuditUnavailableException"/> when the phase applies but
+    /// cannot run (missing wiring, provision failure) — a loudly visible
+    /// incomplete iteration, never a fake pass. A lost handle across an
+    /// orchestrator restart is swept by the deployment leak reaper.</para>
+    /// </summary>
+    private async Task<DeploymentStageOutcome?> RunDeploymentStageAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        int iteration,
+        int? promptRevisionAtDispatch,
+        IReadOnlyList<AuditFinding>? priorBlockingFindings,
+        bool auditShortCircuitEnabled,
+        Func<AuditProgressUpdate, CancellationToken, Task> progressUpdate,
+        List<string> scheduledAuditorNames,
+        bool codeStageClean,
+        CancellationToken auditToken)
+    {
+        var deploymentAuditors = _auditorComposer.ComposeForTarget(project, runner, AuditTarget.Deployment);
+        var decision = DeploymentAuditPolicy.ShouldProvision(
+            project.Audit.DeploymentAuditEnabled,
+            project.Deployment,
+            deploymentAuditors.Count > 0,
+            codeStageClean);
+        if (!decision.Provision)
+        {
+            _log.LogInformation(
+                "Audit iteration {Iteration} for work item {WorkItemId}: skipping deployment stage ({Reason})",
+                iteration,
+                item.Id,
+                decision.Reason);
+            return null;
+        }
+
+        var recipe = project.Deployment!;
+        if (_deploymentManager is null || _deploymentSubstrates is null)
+        {
+            throw new AuditUnavailableException(
+                $"audit iteration {iteration} requires the deployment stage (enabled with " +
+                $"{deploymentAuditors.Count} deployment auditor(s) and a '{recipe.Kind}' recipe), but no " +
+                "IDeploymentManager/IDeploymentSubstrateProvider is wired into the pipeline. " +
+                "Wire deployment provisioning or disable Project.Audit.DeploymentAuditEnabled.");
+        }
+
+        var ordered = auditShortCircuitEnabled
+            ? AuditPhaseLadder.OrderDeploymentStage(deploymentAuditors)
+            : deploymentAuditors;
+        _log.LogInformation(
+            "Audit iteration {Iteration} for work item {WorkItemId}: provisioning one '{Kind}' deployment for {Count} deployment auditor(s)",
+            iteration,
+            item.Id,
+            recipe.Kind,
+            ordered.Count);
+
+        await using var deployment = await DeploymentAuditScope.ProvisionAsync(
+            _deploymentManager,
+            _deploymentSubstrates,
+            project,
+            recipe,
+            () => _opts.TimeProvider.GetUtcNow(),
+            _log,
+            auditToken).ConfigureAwait(false);
+        // Bound the deployment's life by the recipe's max lifetime on top of
+        // the iteration budget: whichever fires first cancels the auditors,
+        // and the scope disposal above still tears the deployment down.
+        using var lifetimeCts = deployment.LinkLifetime(auditToken, () => _opts.TimeProvider.GetUtcNow());
+
+        // Extend the scheduled-auditor list before running so partial and
+        // final progress snapshots account for the deployment auditors.
+        scheduledAuditorNames.AddRange(ordered.Select(a => a.Name));
+        var deploymentCtx = new AuditContext(
+            item.Id,
+            workBranch,
+            baseBranch,
+            iteration,
+            item.Prompt,
+            ModelId: item.ModelId,
+            ReasoningMode: item.ReasoningMode,
+            PromptRevisionAtDispatch: promptRevisionAtDispatch,
+            BuildScriptRequired: project.Audit.BuildScriptRequired,
+            ProjectId: project.Id.Value,
+            Target: AuditTarget.Deployment,
+            PlanArtifact: item.PlanArtifact,
+            PriorBlockingFindings: priorBlockingFindings,
+            DeploymentEndpoint: deployment.Endpoint);
+
+        var collection = await CollectFindingsAsync(
+            item,
+            project,
+            runner,
+            ordered,
+            repoId,
+            deploymentCtx,
+            auditShortCircuitEnabled,
+            BuildTestGateEvidence.None,
+            progressUpdate,
+            lifetimeCts.Token).ConfigureAwait(false);
+
+        // Deployment probes are objective gates over live behaviour: they keep
+        // full blocking authority and are never demoted to advisory.
+        var blocking = collection.Findings
+            .Where(f => f.Severity >= project.Audit.FailingSeverity)
+            .ToList();
+        return new DeploymentStageOutcome(
+            collection.Findings,
+            blocking,
+            collection.CompletedAuditors ?? [],
+            collection.IncompleteAuditors ?? [],
+            collection.ActiveAuditAgentKind,
+            collection.DeclaredShortCircuitBlocking,
+            collection.IncompleteVerdict,
+            deployment.Endpoint);
     }
 
     private async Task<AuditorBatchResult> CollectFindingsAsync(

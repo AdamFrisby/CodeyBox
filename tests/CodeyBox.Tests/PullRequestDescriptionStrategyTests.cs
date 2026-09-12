@@ -577,8 +577,7 @@ public sealed class PullRequestDescriptionStrategyTests : IDisposable
         // The ambient harness may inject GIT_CONFIG_* (e.g.
         // safe.bareRepository=explicit) that changes bare-repo discovery.
         // Snapshot and clear them so this test exercises plain git behaviour.
-        var savedGitConfigEnv = CaptureGitConfigEnv();
-        ClearGitConfigEnv();
+        using var gitConfigScope = TestSupport.AmbientGitConfigScope.Clear();
         var root = Path.Combine(Path.GetTempPath(), "prdesc-commits-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(root);
         try
@@ -622,45 +621,8 @@ public sealed class PullRequestDescriptionStrategyTests : IDisposable
         }
         finally
         {
-            RestoreGitConfigEnv(savedGitConfigEnv);
             Directory.Delete(root, recursive: true);
         }
-    }
-
-    private static List<(string Key, string? Value)> CaptureGitConfigEnv()
-    {
-        var captured = new List<(string Key, string? Value)>();
-        var count = Environment.GetEnvironmentVariable("GIT_CONFIG_COUNT");
-        captured.Add(("GIT_CONFIG_COUNT", count));
-        if (int.TryParse(count, out var n))
-        {
-            for (var i = 0; i < n; i++)
-            {
-                captured.Add(($"GIT_CONFIG_KEY_{i}", Environment.GetEnvironmentVariable($"GIT_CONFIG_KEY_{i}")));
-                captured.Add(($"GIT_CONFIG_VALUE_{i}", Environment.GetEnvironmentVariable($"GIT_CONFIG_VALUE_{i}")));
-            }
-        }
-        return captured;
-    }
-
-    private static void ClearGitConfigEnv()
-    {
-        var count = Environment.GetEnvironmentVariable("GIT_CONFIG_COUNT");
-        Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", null);
-        if (int.TryParse(count, out var n))
-        {
-            for (var i = 0; i < n; i++)
-            {
-                Environment.SetEnvironmentVariable($"GIT_CONFIG_KEY_{i}", null);
-                Environment.SetEnvironmentVariable($"GIT_CONFIG_VALUE_{i}", null);
-            }
-        }
-    }
-
-    private static void RestoreGitConfigEnv(List<(string Key, string? Value)> saved)
-    {
-        foreach (var (key, value) in saved)
-            Environment.SetEnvironmentVariable(key, value);
     }
 
     // -------------------------------------------------------------------------

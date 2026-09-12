@@ -175,11 +175,11 @@ public sealed record DeploymentRecipe
     /// to live before the orchestrator should consider its lifetime
     /// unreasonable. Defaults to 60 minutes — long enough for a thorough
     /// audit, short enough that a forgotten deployment doesn't squat on
-    /// the host overnight. Not yet enforced by an auto-teardown timer; the
-    /// pipeline integration in link 2 is expected to consume this hint to
-    /// schedule the dispose / extend the leak-reaper grace per-recipe.
-    /// Today the leak reaper only consults its own
-    /// <c>DeploymentLeakOptions.LeakAgeThreshold</c>.
+    /// the host overnight. Enforced by the deployment-stage audit scope
+    /// (the auditors for that iteration are cancelled at start + this
+    /// value and the handle is disposed); the leak reaper remains the
+    /// safety net for deployments orphaned by an orchestrator restart,
+    /// consulting its own <c>DeploymentLeakOptions.LeakAgeThreshold</c>.
     /// </summary>
     public TimeSpan MaxLifetime { get; init; } = TimeSpan.FromMinutes(60);
 

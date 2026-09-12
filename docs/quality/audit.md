@@ -157,6 +157,28 @@ The built-in `process:build-script` auditor runs a repository-owned
 `build.sh` as an ordinary tool audit only; it is not trusted build evidence
 and cannot unlock LLM review.
 
+### Deployment stage
+
+Auditors opt into the deployment stage by declaring the `deployment`
+target (`Targets: ["deployment"]` in trusted config or
+`AuditTargets.DeploymentOnly` / `CodeAndDeployment` in code). Each audit
+iteration runs the code stage first; only a clean code stage provisions
+the deployment stage: exactly one deployment from the project's recipe,
+audited against its live endpoint (handed to auditors on
+`AuditContext.DeploymentEndpoint`), then torn down on every exit path
+with a fresh deployment per iteration. Smoke/health probes (tool kind)
+run before LLM/CUA exploration (credentialed kind) within the stage, and
+findings re-enter the normal rework loop with full blocking authority.
+
+The stage requires all of: `Audit.DeploymentAuditEnabled` (per project,
+or per item through the item's audit profile), a project deployment
+recipe, and at least one enabled deployment-targeted auditor — otherwise
+the phase is skipped and nothing is provisioned. Deployments live at most
+the recipe's `MaxLifetime`. Committed E2E replays are natural
+deployment-stage content: a deployment-targeted tool auditor can execute
+them against the endpoint, but the stage never blocks on the E2E chain
+itself.
+
 ### .NET gates need a writable NuGet home
 
 `dotnet` materialises its per-user NuGet settings directory
