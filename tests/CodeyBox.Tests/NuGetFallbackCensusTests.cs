@@ -158,6 +158,10 @@ public sealed class NuGetFallbackCensusTests : IDisposable
             };
             foreach (var (key, value) in environment)
                 process.StartInfo.Environment[key] = value;
+            // The host running this test may export NUGET_FALLBACK_PACKAGES
+            // (the audit image does). ProcessStartInfo inherits the parent
+            // environment, so an "unset" case must explicitly remove it to
+            // stay hermetic.
             if (!environment.ContainsKey(NuGetFallbackCache.FallbackPackagesEnvironmentVariable))
                 process.StartInfo.Environment.Remove(NuGetFallbackCache.FallbackPackagesEnvironmentVariable);
             Assert.True(process.Start(), "failed to start sh");

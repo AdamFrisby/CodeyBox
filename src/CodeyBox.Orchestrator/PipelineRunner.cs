@@ -116,6 +116,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // Hot-reloadable quota-fallback and merge-staging retry knobs. Defaulted to
     // a private snapshot (unchanging defaults) when DI does not supply one.
     private readonly PipelineTuningSnapshot _pipelineTuning;
+    // Optional stale-base remediation router. When wired AND enabled, a
+    // stale-base conflict discovered at upstream-push time re-dispatches the
+    // item into conflict-rework instead of parking. Null preserves the
+    // historical park behaviour (unchanged for tests / legacy embedders).
+    private readonly StaleBaseConflictReworkRouter? _staleBaseReworkRouter;
     // Per-agent concurrency view used by BuildAgenticConflictCandidatesAsync to
     // deprioritize agents whose operator-configured cap is at ceiling. The cap
     // is shorthand for "this agent's API account budget is currently
@@ -361,7 +366,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // the audit ladder. Null disables the physical provisioning path;
         // composition roots that enable deployment-stage auditing wire both.
         IDeploymentManager? deploymentManager = null,
-        IDeploymentSubstrateProvider? deploymentSubstrates = null)
+        IDeploymentSubstrateProvider? deploymentSubstrates = null,
+        StaleBaseConflictReworkRouter? staleBaseReworkRouter = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -481,6 +487,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _checkCompletionRunner = checkCompletionRunner;
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
+        _staleBaseReworkRouter = staleBaseReworkRouter;
         // Wire the credential-file materialiser into the default resolver so
         // a cross-kind fallback candidate (whose file-based creds aren't yet on
         // disk in the sandbox the primary provisioned) can authenticate before
@@ -18651,6 +18658,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private sealed record MergeSecurityReviewJson(List<MergeSecurityReviewFindingJson>? Findings);
     private sealed record MergeSecurityReviewFindingJson(string? Title, string? Description, string? Location);
 
+    /// <summary>
+    /// Attempts to route a stale-base conflict discovered during the upstream
+    /// push into the conflict-rework state machine. Reads the item fresh so the
+    /// router's attempt-cap check and atomic re-dispatch operate on the current
+    /// persisted state. Returns <see cref="StaleBaseReworkOutcome.NotEnabled"/>
+    /// (caller does its historical park) when no router is wired.
+    /// </summary>
+    private async Task<StaleBaseReworkOutcome> TryRouteStaleBasePushConflictAsync(
+        WorkItem item, CancellationToken ct)
+    {
+        if (_staleBaseReworkRouter is null)
+            return StaleBaseReworkOutcome.NotEnabled;
+
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        return await _staleBaseReworkRouter.TryRouteAsync(
+            current,
+            "upstream-push-stale-base",
+            StaleBaseConflictReworkRouter.PushPathEligibleSourceStates,
+            ct);
+    }
+
     private async Task RunUpstreamPushPhaseAsync(
         WorkItem item,
         Project project,
@@ -18891,6 +18919,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             _log.LogWarning(
                                 "Auto-merge race recovery declined to retry (attempt {Attempt}): {Reason}",
                                 attempt, raceRecovery.ParkReason);
+                            // Stale-base remediation: before parking, try to route
+                            // the item into conflict-rework (rebase onto the
+                            // refreshed base + agentic resolution). CapExhausted /
+                            // NotEnabled fall through to the existing
+                            // MergeConflictResolutionFailed park below.
+                            if (await TryRouteStaleBasePushConflictAsync(item, ct) == StaleBaseReworkOutcome.Routed)
+                            {
+                                raceRecoveryParked = true;
+                                break;
+                            }
                             var failed = await _store.GetAsync(item.Id, ct) ?? item;
                             var failedWithReason = failed.With(WorkItemState.MergeConflictResolutionFailed, raceRecovery.ParkReason);
                             await _store.UpdateAsync(failedWithReason, ct);
@@ -18916,6 +18954,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             _log.LogWarning(
                                 "Work item {Id} auto-merge race recovery cap ({Cap}) exhausted after {Count} recoveries; baseBranch likely being mutated by another writer",
                                 item.Id, maxRaceRecovery, raceRecoveryCount);
+                            // Hand off to the conflict-rework machine (bounded by
+                            // its own attempt cap) before falling back to the park.
+                            if (await TryRouteStaleBasePushConflictAsync(item, ct) == StaleBaseReworkOutcome.Routed)
+                            {
+                                raceRecoveryParked = true;
+                                break;
+                            }
                             var failed = await _store.GetAsync(item.Id, ct) ?? item;
                             const string raceExhaustionMessage =
                                 "GitHub merge failed repeatedly after re-running LLM merger; baseBranch likely being mutated by another writer. Resolve manually.";
@@ -18968,6 +19013,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {
                         _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
+                        // A non-fast-forward push whose automatic single-shot
+                        // rebase/merge itself conflicts is a stale-base conflict.
+                        // Route it into conflict-rework (rebase onto refreshed
+                        // base + agentic resolution) when enabled; on cap
+                        // exhaustion park at the merge-conflict terminal (the
+                        // centralized RunAsync catch does the bookkeeping);
+                        // otherwise preserve the historical infrastructure park.
+                        var reworkOutcome = await TryRouteStaleBasePushConflictAsync(item, ct);
+                        if (reworkOutcome == StaleBaseReworkOutcome.Routed)
+                            return;
+                        if (reworkOutcome == StaleBaseReworkOutcome.CapExhausted)
+                            throw new MergeConflictResolutionFailedException(conflict.Message, ex);
                         await TransitionFailed(item, conflict.Message, ct, project, failureKind: "infrastructure");
                         break;
                     }
@@ -18992,6 +19049,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // park message (e.g., refetch failure or merge-failure) that recovery
             // already wrote — we should not overwrite that with the generic cap
             // diagnostic.
+            if (completed is null && lastIterationRaced && reRunMergePhase is not null && !raceRecoveryParked
+                && await TryRouteStaleBasePushConflictAsync(item, ct) == StaleBaseReworkOutcome.Routed)
+            {
+                // Re-dispatched into conflict-rework; skip the terminal park.
+                raceRecoveryParked = true;
+            }
+
             if (completed is null && lastIterationRaced && reRunMergePhase is not null && !raceRecoveryParked)
             {
                 var lastAttemptItem = await _store.GetAsync(item.Id, ct) ?? item;

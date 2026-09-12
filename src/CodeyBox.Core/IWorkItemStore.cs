@@ -529,6 +529,19 @@ public interface IWorkItemStore
     Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default);
 
     /// <summary>
+    /// Look up the work item that opened the forge pull request numbered
+    /// <paramref name="pullRequestNumber"/> within <paramref name="projectId"/>
+    /// (matched on <see cref="WorkItem.MergedPrNumber"/>). Returns null when no
+    /// item recorded that PR number. When more than one item somehow carries the
+    /// same number (should not happen — one PR per item), the most recently
+    /// created match is returned so the newest owner wins. Served by an index on
+    /// <c>(project_id, merged_pr_number)</c>.
+    /// </summary>
+    Task<WorkItem?> GetByMergedPrNumberAsync(ProjectId projectId, int pullRequestNumber, CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store must implement lookup by forge pull-request number.");
+
+    /// <summary>
     /// Replaces the full <see cref="WorkItem.ExternalIds"/> map for the item.
     /// Implementations enforce per-project uniqueness on each
     /// <c>(namespace, value)</c> pair and throw

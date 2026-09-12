@@ -460,6 +460,12 @@ public sealed class SqliteWorkItemStore :
                 """;
                 backfill.ExecuteNonQuery();
             }
+
+            // Stale-base rework routing looks an item up by the forge PR number
+            // it opened. Index (project_id, merged_pr_number) so the sweeper's
+            // per-conflicted-PR lookup is a point query rather than a full scan.
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_merged_pr_number ON work_items(project_id, merged_pr_number) WHERE merged_pr_number IS NOT NULL;");
+
             initialized = true;
         }
         finally
@@ -3226,6 +3232,41 @@ public sealed class SqliteWorkItemStore :
             using var reader = await cmd.ExecuteReaderAsync(ct);
             if (await reader.ReadAsync(ct) && Guid.TryParse(reader.GetString(0), out var g))
                 matched = new WorkItemId(g);
+        }
+        return matched is null ? null : await GetAsync(matched.Value, ct);
+    }
+
+    public async Task<WorkItem?> GetByMergedPrNumberAsync(
+        ProjectId projectId,
+        int pullRequestNumber,
+        CancellationToken ct = default)
+    {
+        WorkItemId? matched = null;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                // Point query on idx_work_items_merged_pr_number. ORDER BY
+                // created_at DESC so the newest owner wins in the (unexpected)
+                // event two items recorded the same PR number.
+                cmd.CommandText = """
+                    SELECT id
+                    FROM work_items
+                    WHERE project_id = $pid AND merged_pr_number = $prn
+                    ORDER BY created_at DESC
+                    LIMIT 1;
+                    """;
+                cmd.Parameters.AddWithValue("$pid", projectId.Value);
+                cmd.Parameters.AddWithValue("$prn", pullRequestNumber);
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct) && Guid.TryParse(reader.GetString(0), out var g))
+                    matched = new WorkItemId(g);
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
         }
         return matched is null ? null : await GetAsync(matched.Value, ct);
     }
