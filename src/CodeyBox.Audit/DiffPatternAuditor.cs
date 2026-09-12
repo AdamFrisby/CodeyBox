@@ -16,7 +16,7 @@ namespace CodeyBox.Audit;
 ///
 /// Tool-only auditor (no agent credentials, no network). Cheap; runs first.
 /// </summary>
-public sealed partial class DiffPatternAuditor : IAuditor
+public sealed class DiffPatternAuditor : IAuditor
 {
     private readonly DiffPatternAuditorOptions _opts;
 
@@ -69,55 +69,24 @@ public sealed partial class DiffPatternAuditor : IAuditor
         }
 
         var findings = new List<AuditFinding>();
-        string? currentFile = null;
-        var lineNumber = 0;
-        foreach (var line in diff.Stdout.Split('\n'))
+        foreach (var added in UnifiedDiffParser.ParseAddedLines(diff.Stdout))
         {
-            var rawLine = line.TrimEnd('\r');
-
-            // Track the current file from "+++ b/path/to/file" headers.
-            if (rawLine.StartsWith("+++ b/", StringComparison.Ordinal))
-            {
-                currentFile = rawLine[6..];
-                continue;
-            }
-
             // Skip auditing CodeyBox configuration files and test files that contain literal patterns.
-            if (currentFile is not null &&
-                (currentFile.StartsWith("codeybox", StringComparison.OrdinalIgnoreCase) ||
-                 currentFile.Contains("Defaults", StringComparison.OrdinalIgnoreCase) ||
-                 currentFile.Contains("tests", StringComparison.OrdinalIgnoreCase) ||
-                 currentFile.EndsWith("Tests.cs", StringComparison.OrdinalIgnoreCase)))
-            {
+            if (added.File is not null && ShouldSkipFile(added.File))
                 continue;
-            }
 
-            // Track line number from "@@ -A,B +C,D @@" hunk headers.
-            if (rawLine.StartsWith("@@", StringComparison.Ordinal))
-            {
-                var m = HunkHeader().Match(rawLine);
-                if (m.Success && int.TryParse(m.Groups[1].Value, out var ln))
-                    lineNumber = ln;
-                continue;
-            }
-            if (rawLine.StartsWith("+++", StringComparison.Ordinal)) continue;
-            if (rawLine.StartsWith("---", StringComparison.Ordinal)) continue;
-            if (!rawLine.StartsWith('+')) continue;
-
-            var addedLine = rawLine[1..];
             foreach (var pattern in _opts.Patterns)
             {
-                if (pattern.Regex.IsMatch(addedLine))
+                if (pattern.Regex.IsMatch(added.Content))
                 {
                     findings.Add(new AuditFinding(
                         AuditorName: Name,
                         Severity: pattern.Severity,
                         Title: pattern.Description,
-                        Description: addedLine.Trim(),
-                        Location: currentFile is null ? null : $"{currentFile}:{lineNumber}"));
+                        Description: added.Content.Trim(),
+                        Location: added.File is null ? null : $"{added.File}:{added.NewLine}"));
                 }
             }
-            lineNumber++;
         }
 
         return new AuditResult(findings.Count == 0, findings, RawOutput: diff.Stdout);
@@ -156,8 +125,16 @@ public sealed partial class DiffPatternAuditor : IAuditor
         return new AuditResult(findings.Count == 0, findings, RawOutput: context.PlanArtifact);
     }
 
-    [GeneratedRegex(@"\+(\d+)(?:,(\d+))? @@", RegexOptions.CultureInvariant)]
-    private static partial Regex HunkHeader();
+    /// <summary>
+    /// Repository configuration and test files legitimately contain the literal
+    /// suppression/stub markers this auditor hunts for, so they are excluded from
+    /// code-target diff scanning to avoid tautological findings.
+    /// </summary>
+    private static bool ShouldSkipFile(string file)
+        => file.StartsWith("codeybox", StringComparison.OrdinalIgnoreCase) ||
+           file.Contains("Defaults", StringComparison.OrdinalIgnoreCase) ||
+           file.Contains("tests", StringComparison.OrdinalIgnoreCase) ||
+           file.EndsWith("Tests.cs", StringComparison.OrdinalIgnoreCase);
 }
 
 public sealed record DiffPatternAuditorOptions

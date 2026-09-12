@@ -93,6 +93,7 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
             ["CodeyBox:PromptPreprocessing"] = new(typeof(AgentPromptPreprocessingOptions), AllowsExtensionKeys: false),
             ["CodeyBox:Presets"] = new(typeof(PresetCatalogOptions), AllowsExtensionKeys: false),
             ["CodeyBox:Mutation"] = new(typeof(MutationTestingAuditorOptions), AllowsExtensionKeys: false),
+            ["CodeyBox:Audit"] = new(typeof(AuditSectionOptions), AllowsExtensionKeys: false),
             ["CodeyBox:CheckAndActCompletion"] = new(typeof(CheckAndActCompletionOptions), AllowsExtensionKeys: false),
             ["CodeyBox:Plugins"] = new(typeof(PluginOptions), AllowsExtensionKeys: true),
         };

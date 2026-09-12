@@ -2643,6 +2643,23 @@ builder.Services.AddSingleton<IAuditor>(sp =>
         ratchet);
 });
 
+// Deterministic per-item coverage gate (tests:coverage). Runs the test suite
+// with coverage and blocks on executable lines CHANGED in the work item's diff
+// that no test exercised. Default mode is report-only (non-blocking) so the
+// rollout measures uncovered-line volume before it gates merges; flip
+// CodeyBox:Audit:Coverage:Mode to "blocking" after calibration. IOptionsMonitor
+// so mode/exclusions hot-reload without a restart, consistent with the rest of
+// the host. The auditor short-circuits to a pass when the tree has no .NET
+// markers or the diff changed no lines, so auto-inclusion is cheap off the
+// .NET path.
+builder.Services.Configure<AuditSectionOptions>(
+    builder.Configuration.GetSection("CodeyBox:Audit"));
+builder.Services.AddSingleton<IAuditor>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<AuditSectionOptions>>();
+    return new CoverageAuditor(() => monitor.CurrentValue.Coverage);
+});
+
 // Plan-adherence reviewer (closes the planning loop on the implementation side).
 // Hot-reloadable via CodeyBox:PlanAdherence and enabled by default; the auditor
 // self-limits to PLANNED items at run time (no plan artifact -> no-op), so

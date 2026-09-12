@@ -326,6 +326,32 @@ runner. See [`mutation-testing.md`](mutation-rigor.md) for configuration,
 runtime budget, and ratchet semantics. Disabled by default — opt in per
 project.
 
+## Per-item coverage gate
+
+The `tests:coverage` auditor is a deterministic, diff-scoped **line-coverage
+gate**. It runs the test suite with coverage collection
+(`dotnet test --collect "XPlat Code Coverage"`, Cobertura), computes the changed
+lines from `git diff <base>...HEAD` (same three-dot merge-base range the pipeline
+work diff uses), and blocks on any executable line CHANGED in the item's diff
+that no test exercised. Only diff lines gate — unchanged uncovered code is
+ignored.
+
+It is a pure function of `(diff, tests)`: **stateless / isolated per audit
+iteration** with no baseline carried across iterations, so the same input yields
+the identical complete list every run and the list shrinks monotonically as
+rework adds tests. A failed/absent coverage run is reported as *unverifiable*
+rather than a silent pass. Genuinely untestable changed lines require an explicit
+justified exclusion under `CodeyBox:Audit:Coverage:Exclusions`; every applied
+exclusion is logged.
+
+Rollout is controlled by the hot-reloadable `CodeyBox:Audit:Coverage:Mode`
+(`report-only` — the default, non-blocking `Info` findings — or `blocking`), so
+operators can measure real uncovered-line volume before it gates merges. It is a
+tool auditor (`Required = None`), auto-included by the composer like
+`tests:mutation-rigor`, and skips to a pass off the .NET path or on an empty
+diff. A project opts out via `ExcludedAuditors`. See
+[`coverage.md`](coverage.md) for the full configuration.
+
 ## Rework prompt
 
 When an audit iteration fails, `ReworkPromptBuilder` assembles a prompt
@@ -529,6 +555,10 @@ disambiguation* above for the full policy.
   into immediate successful no-ops with a notice because the deterministic
   build/test gate already ran; other `dotnet` subcommands pass through, and
   work/merge/conflict-resolution sandboxes are not modified.
+* `CodeyBox:Audit:Coverage:Mode` — global, hot-reloadable rollout mode for the
+  `tests:coverage` gate. `report-only` (default) surfaces uncovered changed
+  lines as non-blocking `Info` findings; `blocking` fails the audit on them. An
+  unrecognised value fails open to `report-only`. See [`coverage.md`](coverage.md).
 
 ## Adding a new auditor
 
