@@ -1104,10 +1104,17 @@ builder.Services.AddSingleton<IGitHost>(sp => sp.GetRequiredService<LocalGitHost
 // PreMergeVerifyArgv against it before the forge auto-merge API call. The
 // gate stays opt-in: the orchestrator skips the verifier when the project's
 // PreMergeVerifyArgv is empty, so projects that have not configured the gate
-// see no behaviour change.
-builder.Services.AddSingleton<IPreMergeVerifier>(sp => new LocalGitPreMergeVerifier(
-    sp.GetRequiredService<IGitHost>(),
-    sp.GetRequiredService<ILogger<LocalGitPreMergeVerifier>>()));
+// see no behaviour change. Test argv runs Audit:Flake:AdmissionReruns times
+// (default 3) so flaky tests block the merge; the count is read live from
+// IOptionsMonitor on every verification (hot-reload, no restart).
+builder.Services.AddSingleton<IPreMergeVerifier>(sp =>
+{
+    var flakeMonitor = sp.GetRequiredService<IOptionsMonitor<AuditSectionOptions>>();
+    return new LocalGitPreMergeVerifier(
+        sp.GetRequiredService<IGitHost>(),
+        sp.GetRequiredService<ILogger<LocalGitPreMergeVerifier>>(),
+        admissionRerunsProvider: () => flakeMonitor.CurrentValue.Flake.AdmissionReruns);
+});
 builder.Services.AddSingleton<IRequiredBuildVerifier>(sp => new SandboxRequiredBuildVerifier(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),

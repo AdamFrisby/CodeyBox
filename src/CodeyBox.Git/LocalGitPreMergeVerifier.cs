@@ -80,15 +80,40 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
     private readonly IGitHost _gitHost;
     private readonly ILogger<LocalGitPreMergeVerifier> _log;
     private readonly TimeSpan _commandTimeout;
+    private readonly Func<int> _admissionRerunsProvider;
 
     public LocalGitPreMergeVerifier(
         IGitHost gitHost,
         ILogger<LocalGitPreMergeVerifier> log,
-        TimeSpan? commandTimeout = null)
+        TimeSpan? commandTimeout = null,
+        Func<int>? admissionRerunsProvider = null)
     {
         _gitHost = gitHost;
         _log = log;
         _commandTimeout = commandTimeout ?? TimeSpan.FromMinutes(30);
+        // Hot-reloadable: read per verification (not cached at construction)
+        // so edits to Audit:Flake:AdmissionReruns take effect without restart.
+        // The composition root backs this with IOptionsMonitor.CurrentValue.
+        _admissionRerunsProvider = admissionRerunsProvider
+            ?? (static () => FlakeAdmissionOptions.DefaultAdmissionReruns);
+    }
+
+    /// <summary>
+    /// True when <paramref name="argv"/> is a <c>dotnet test</c> (or
+    /// <c>dotnet vstest</c>) invocation. Admission reruns are scoped to test
+    /// commands: rerunning a build <c>N</c> times buys no flake signal and
+    /// only burns host time.
+    /// </summary>
+    internal static bool IsTestArgv(IReadOnlyList<string> argv)
+    {
+        if (argv.Count < 2)
+            return false;
+        var fileName = Path.GetFileName(argv[0]);
+        if (!fileName.Equals("dotnet", StringComparison.OrdinalIgnoreCase)
+            && !fileName.Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return argv[1].Equals("test", StringComparison.Ordinal)
+            || argv[1].Equals("vstest", StringComparison.Ordinal);
     }
 
     public async Task<PreMergeVerifyResult> VerifyAsync(PreMergeVerifyRequest request, CancellationToken ct)
@@ -149,33 +174,39 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
             // directly with each element placed on argv — no shell, so there
             // is no opportunity for word splitting or metacharacter expansion
             // of values that arrived through configuration.
-            var verifyRun = await RunProcessAsync(
-                request.Argv[0],
-                request.Argv.Skip(1).ToArray(),
-                workdir: worktreePath,
-                ct,
-                timeout: _commandTimeout);
-
-            if (verifyRun.ExitCode == 0)
+            //
+            // Test commands run N admission times (Audit:Flake:AdmissionReruns,
+            // default 3) against this same worktree: a test that passes on
+            // some runs and fails on others is flaky and must block the
+            // merge — a single green run must never wave it through. Build
+            // commands run once (reruns are scoped to tests to bound cost).
+            if (!IsTestArgv(request.Argv))
             {
                 _log.LogInformation(
-                    "Pre-merge verify passed for work item {Id} (argv: {Argv})",
+                    "Pre-merge verify: argv is not a test command, running once without admission reruns for work item {Id} (argv: {Argv})",
                     request.WorkItemId, string.Join(' ', request.Argv));
-                return PreMergeVerifyResult.Ok();
+                return await RunSingleVerifyAsync(request, worktreePath, ct).ConfigureAwait(false);
             }
 
-            var combined = verifyRun.Stderr.Length > 0
-                ? verifyRun.Stderr
-                : verifyRun.Stdout;
-            var reason = $"{request.Argv[0]} exited {verifyRun.ExitCode}: {SummariseOutput(combined)}";
+            var admissionRuns = ResolveAdmissionReruns(request);
+            if (admissionRuns <= 1)
+            {
+                _log.LogInformation(
+                    "Pre-merge verify: admission reruns disabled (Audit:Flake:AdmissionReruns={Runs}), running once for work item {Id}",
+                    admissionRuns, request.WorkItemId);
+                return await RunSingleVerifyAsync(request, worktreePath, ct).ConfigureAwait(false);
+            }
 
-            // Build/test failure of an already-merged tree is exactly the
-            // case the gate exists to catch: this is what GitHub's
-            // mergeable=true flag misses.
-            return PreMergeVerifyResult.BuildOrTestFailed(reason);
+            return await RunAdmissionVerifyAsync(request, worktreePath, admissionRuns, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
+            // Cancellation abandons the remaining admission runs. Logged
+            // explicitly so an incomplete gate is never a silent skip; the
+            // rethrow preserves the orchestrator's cancel semantics.
+            _log.LogWarning(
+                "Pre-merge verify cancelled for work item {Id}; admission reruns did not complete",
+                request.WorkItemId);
             throw;
         }
         finally
@@ -203,6 +234,165 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
                 {
                     _log.LogWarning(ex, "Failed to clean up pre-merge verify worktree at {Path}", worktreePath);
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Single-run path: build commands and test commands with admission
+    /// reruns disabled. Preserves the gate's historical pass/fail contract.
+    /// </summary>
+    private async Task<PreMergeVerifyResult> RunSingleVerifyAsync(
+        PreMergeVerifyRequest request, string worktreePath, CancellationToken ct)
+    {
+        var verifyRun = await RunProcessAsync(
+            request.Argv[0],
+            request.Argv.Skip(1).ToArray(),
+            workdir: worktreePath,
+            ct,
+            timeout: _commandTimeout).ConfigureAwait(false);
+
+        if (verifyRun.ExitCode == 0)
+        {
+            _log.LogInformation(
+                "Pre-merge verify passed for work item {Id} (argv: {Argv})",
+                request.WorkItemId, string.Join(' ', request.Argv));
+            return PreMergeVerifyResult.Ok();
+        }
+
+        var combined = verifyRun.Stderr.Length > 0
+            ? verifyRun.Stderr
+            : verifyRun.Stdout;
+        var reason = $"{request.Argv[0]} exited {verifyRun.ExitCode}: {SummariseOutput(combined)}";
+
+        // Build/test failure of an already-merged tree is exactly the
+        // case the gate exists to catch: this is what GitHub's
+        // mergeable=true flag misses.
+        return PreMergeVerifyResult.BuildOrTestFailed(reason);
+    }
+
+    /// <summary>
+    /// Reads the hot-reloadable <c>Audit:Flake:AdmissionReruns</c> knob and
+    /// clamps it to <c>[1, <see cref="FlakeAdmissionOptions.MaxAdmissionReruns"/>]</c>.
+    /// Every clamp is logged explicitly — reruns are never silently capped.
+    /// A provider failure falls back to the default (still ≥ 1 run) with an
+    /// explicit warning rather than skipping the gate.
+    /// </summary>
+    private int ResolveAdmissionReruns(PreMergeVerifyRequest request)
+    {
+        int configured;
+        try
+        {
+            configured = _admissionRerunsProvider();
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Pre-merge verify: admission-reruns provider threw for work item {Id}; falling back to default {Default}",
+                request.WorkItemId, FlakeAdmissionOptions.DefaultAdmissionReruns);
+            return FlakeAdmissionOptions.DefaultAdmissionReruns;
+        }
+
+        var effective = Math.Clamp(configured, 1, FlakeAdmissionOptions.MaxAdmissionReruns);
+        if (effective != configured)
+        {
+            _log.LogWarning(
+                "Pre-merge verify: clamping Audit:Flake:AdmissionReruns from {Configured} to {Effective} for work item {Id}",
+                configured, effective, request.WorkItemId);
+        }
+
+        return effective;
+    }
+
+    /// <summary>
+    /// Admission path: runs the test argv <paramref name="admissionRuns"/>
+    /// times against the same worktree and compares outcomes. All-green
+    /// passes; all-red blocks as today; a mix (exit codes or per-test
+    /// failure sets differ across runs) is flaky and blocks with a finding
+    /// naming the non-deterministic tests. A run that cannot complete
+    /// (per-run timeout) fails closed with an explicit incomplete-reruns
+    /// reason — the gate refuses merge on doubt.
+    /// </summary>
+    private async Task<PreMergeVerifyResult> RunAdmissionVerifyAsync(
+        PreMergeVerifyRequest request,
+        string worktreePath,
+        int admissionRuns,
+        CancellationToken ct)
+    {
+        var runs = new List<FlakeAdmissionRunResult>(admissionRuns);
+        var firstExitCode = 0;
+        string? firstOutputSummary = null;
+
+        for (var run = 1; run <= admissionRuns; run++)
+        {
+            var verifyRun = await RunProcessAsync(
+                request.Argv[0],
+                request.Argv.Skip(1).ToArray(),
+                workdir: worktreePath,
+                ct,
+                timeout: _commandTimeout).ConfigureAwait(false);
+
+            if (verifyRun.ExitCode == 124)
+            {
+                // Per-run timeout sentinel from RunProcessAsync. Evidence is
+                // incomplete: remaining reruns are skipped, and the skip plus
+                // the timeout are both explicit in the reason and the log.
+                _log.LogWarning(
+                    "Pre-merge verify: admission run {Run}/{Total} exceeded the {Timeout} timeout for work item {Id}; skipping remaining reruns and blocking the merge",
+                    run, admissionRuns, _commandTimeout, request.WorkItemId);
+                return PreMergeVerifyResult.BuildOrTestFailed(
+                    $"admission reruns incomplete: run {run} of {admissionRuns} exceeded the " +
+                    $"{_commandTimeout.TotalMinutes:0} min timeout, so flakiness could not be ruled out " +
+                    $"({runs.Count} prior run(s) completed)");
+            }
+
+            var succeeded = verifyRun.ExitCode == 0;
+            var combinedOutput = verifyRun.Stdout + "\n" + verifyRun.Stderr;
+            var failedNames = DotnetTestFailureHeaders.ExtractNames(combinedOutput)
+                .Select(static h => h.Name)
+                .ToArray();
+            runs.Add(new FlakeAdmissionRunResult(succeeded, failedNames));
+
+            if (!succeeded && firstOutputSummary is null)
+            {
+                var combined = verifyRun.Stderr.Length > 0 ? verifyRun.Stderr : verifyRun.Stdout;
+                firstExitCode = verifyRun.ExitCode;
+                firstOutputSummary = SummariseOutput(combined);
+            }
+
+            _log.LogInformation(
+                "Pre-merge verify: admission run {Run}/{Total} for work item {Id} exited {ExitCode}",
+                run, admissionRuns, request.WorkItemId, verifyRun.ExitCode);
+        }
+
+        var (verdict, flakyNames) = FlakeAdmissionEvaluator.Evaluate(runs);
+        switch (verdict)
+        {
+            case FlakeAdmissionVerdict.Pass:
+                _log.LogInformation(
+                    "Pre-merge verify passed for work item {Id} ({Runs} green admission runs, argv: {Argv})",
+                    request.WorkItemId, admissionRuns, string.Join(' ', request.Argv));
+                return PreMergeVerifyResult.Ok();
+
+            case FlakeAdmissionVerdict.Flaky:
+            {
+                var passCount = runs.Count(static r => r.Succeeded);
+                var reason = FlakeAdmissionEvaluator.BuildFlakyReason(admissionRuns, passCount, flakyNames);
+                _log.LogWarning(
+                    "Pre-merge verify blocked work item {Id}: {Reason}",
+                    request.WorkItemId, reason);
+                var detail = firstOutputSummary is null
+                    ? reason
+                    : $"{reason}. First failure ({request.Argv[0]} exited {firstExitCode}): {firstOutputSummary}";
+                return PreMergeVerifyResult.BuildOrTestFailed(detail);
+            }
+
+            default:
+            {
+                var detail = firstOutputSummary is null
+                    ? $"{request.Argv[0]} failed all {admissionRuns} admission runs with no captured output"
+                    : $"{request.Argv[0]} exited {firstExitCode} on all {admissionRuns} admission runs: {firstOutputSummary}";
+                return PreMergeVerifyResult.BuildOrTestFailed(detail);
             }
         }
     }

@@ -627,6 +627,18 @@ upstream and find a textual conflict that the local merge phase did not
 hit.) The gate is opt-in: leaving `PreMergeVerifyArgv` empty skips it
 entirely, even though a verifier is registered.
 
+**Admission flake gate.** When `PreMergeVerifyArgv` is a `dotnet test`
+(or `dotnet vstest`) invocation, the verifier runs it
+`CodeyBox:Audit:Flake:AdmissionReruns` times (default `3`, hot-reloadable,
+clamped to 1–10 with an explicit warning) against the same worktree instead
+of once. All-green passes; all-red blocks as today; a mix — some runs pass
+and others fail, or different runs fail different tests — is flaky and
+blocks the merge with the non-deterministic test names in `LastError`, so a
+single green run can never wave a flaky test through. Reruns are scoped to
+test commands (build-only argv still runs once) to bound cost. A run that
+cannot complete (per-run timeout) fails closed with an explicit
+`admission reruns incomplete` reason.
+
 The CI-layer counterpart of this gate lives at
 `.github/workflows/pre-merge-revalidate.yml`. After every push to `main`,
 it enumerates open PRs and re-runs build + tests against the rebased tree,
