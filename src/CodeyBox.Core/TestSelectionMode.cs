@@ -10,6 +10,14 @@ public enum TestSelectionMode
 {
     /// <summary>Run the entire suite — the default; byte-identical to the legacy path.</summary>
     All,
+
+    /// <summary>
+    /// Advisory/shadow coverage selection: the coverage selector computes the
+    /// subset it WOULD run, but the full suite still runs. A shadow record
+    /// captures whether any deselected test failed this run. Real skipping is
+    /// gated on that data showing zero unsafe skips — this mode never skips.
+    /// </summary>
+    CoverageShadow,
 }
 
 /// <summary>
@@ -54,10 +62,16 @@ public static class TestSelectionModeParser
         if (string.IsNullOrWhiteSpace(value))
             return false;
 
-        switch (value.Trim().ToLowerInvariant())
+        var normalized = value.Trim().ToLowerInvariant()
+            .Replace("-", "", StringComparison.Ordinal)
+            .Replace("_", "", StringComparison.Ordinal);
+        switch (normalized)
         {
             case "all":
                 mode = TestSelectionMode.All;
+                return true;
+            case "coverageshadow":
+                mode = TestSelectionMode.CoverageShadow;
                 return true;
             default:
                 return false;
@@ -74,7 +88,7 @@ public static class TestSelectionModeParser
             ? mode
             : throw new FormatException(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Unknown {TestSelectionOptions.SectionName}:Mode value '{value}'. Valid modes: all."));
+                $"Unknown {TestSelectionOptions.SectionName}:Mode value '{value}'. Valid modes: all, coverage-shadow."));
 }
 
 /// <summary>

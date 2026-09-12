@@ -327,7 +327,18 @@ builder.Services.AddOptions<TestSelectionOptions>()
     .Bind(builder.Configuration.GetSection(TestSelectionOptions.SectionName))
     .Validate(
         static opts => TestSelectionModeParser.TryParse(opts.Mode, out _),
-        $"{TestSelectionOptions.SectionName}:Mode must be one of: all");
+        $"{TestSelectionOptions.SectionName}:Mode must be one of: all, coverage-shadow");
+// Coverage-guided selection knobs (Audit:TestSelection:Coverage). Bound through
+// AddOptions so IOptionsMonitor<CoverageTestSelectionOptions> hot-reloads the
+// baseline location, age/size caps, and global targets without a restart, with
+// a fail-fast validator rejecting a malformed section at load. Every consumer
+// treats invalid/absent values as "no baseline" and falls back to the full
+// suite — the validator only fails fast on structurally invalid config.
+builder.Services.AddOptions<CoverageTestSelectionOptions>()
+    .Bind(builder.Configuration.GetSection(CoverageTestSelectionOptions.SectionName))
+    .Validate(
+        static opts => CoverageTestSelectionOptions.IsValid(opts),
+        $"{CoverageTestSelectionOptions.SectionName} is invalid");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
@@ -2546,7 +2557,8 @@ builder.Services.AddSingleton<TestFailureAttributionOptionsSnapshot>(sp =>
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(
     sp.GetRequiredService<PresetCatalogOptions>(),
     sp.GetRequiredService<Func<TestRunOptions>>(),
-    sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>()));
+    sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
+    sp.GetRequiredService<TestSelectionShadowConfig>()));
 
 // The canonical dotnet-test runner, registered so the ITestSelector seam
 // (a separate work item) can resolve ITestRunnerAuditor from DI and enumerate
@@ -2568,19 +2580,42 @@ builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(ne
 // from IOptionsMonitor on every call (hot-reload) and dispatches to the selector
 // registered for that mode; the default 'all' maps to RunAllTestSelector, whose
 // TestSelection.All keeps the emitted dotnet-test command byte-identical to the
-// legacy path. The merge/release verification path (IRequiredBuildVerifier /
-// process:required-build) deliberately takes NO dependency on this seam: it always
-// verifies the full build/test surface regardless of Mode.
+// legacy path. 'coverage-shadow' maps to CoverageTestSelector, which refines the
+// project-graph superset by per-test coverage — ADVISORY ONLY: the per-item
+// csharp:test-pass runner computes the decision, still runs the full suite, and
+// emits a shadow record (SHADOW-BEFORE-ENFORCE). The merge/release verification
+// path (IRequiredBuildVerifier / process:required-build) deliberately takes NO
+// dependency on this seam: it always verifies the full build/test surface
+// regardless of Mode.
 builder.Services.AddSingleton<ITestSelector>(sp =>
 {
     var modeMonitor = sp.GetRequiredService<IOptionsMonitor<TestSelectionOptions>>();
+    var coverageOptionsMonitor = sp.GetRequiredService<IOptionsMonitor<CoverageTestSelectionOptions>>();
+    var projectGraph = new ProjectGraphTestSelector();
     var selectorsByMode = new Dictionary<TestSelectionMode, ITestSelector>
     {
         [TestSelectionMode.All] = new RunAllTestSelector(),
+        [TestSelectionMode.CoverageShadow] = new CoverageTestSelector(
+            projectGraph,
+            () => coverageOptionsMonitor.CurrentValue,
+            TimeProvider.System),
     };
     return new ConfiguredTestSelector(
         () => TestSelectionModeParser.Parse(modeMonitor.CurrentValue.Mode),
         selectorsByMode);
+});
+// Shadow-record sink (structured logs) and the advisory shadow configuration
+// threaded into every csharp:test-pass runner the preset catalogs build.
+// Mode=all (the default) is an instant kill-switch: the hook checks the live
+// mode on every run and skips the shadow for anything but coverage-shadow.
+builder.Services.AddSingleton<ITestSelectionShadowSink, LoggerTestSelectionShadowSink>();
+builder.Services.AddSingleton<TestSelectionShadowConfig>(sp => new TestSelectionShadowConfig
+{
+    Selector = sp.GetRequiredService<ITestSelector>(),
+    Sink = sp.GetRequiredService<ITestSelectionShadowSink>(),
+    ModeAccessor = () => TestSelectionModeParser.Parse(
+        sp.GetRequiredService<IOptionsMonitor<TestSelectionOptions>>().CurrentValue.Mode),
+    OptionsAccessor = () => sp.GetRequiredService<IOptionsMonitor<CoverageTestSelectionOptions>>().CurrentValue,
 });
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(

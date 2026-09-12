@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Text.Json;
+using CodeyBox.Audit;
 using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Shell;
@@ -86,6 +88,146 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         AuditContext context,
         CancellationToken ct = default)
     {
+        var shadow = _opts.Shadow;
+        if (shadow is not null && IsShadowMode(shadow))
+            return RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct);
+        return RunFullAsync(sandbox, workingDirectory, context, ct);
+    }
+
+    private static bool IsShadowMode(TestSelectionShadowConfig shadow)
+    {
+        try
+        {
+            return shadow.ModeAccessor() == TestSelectionMode.CoverageShadow;
+        }
+        catch (Exception)
+        {
+            // A hot-reloaded invalid mode must never break the test gate: skip
+            // the shadow (the options validator surfaces the bad value at load).
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// SHADOW-BEFORE-ENFORCE: computes the advisory selection and records the
+    /// validation verdict, but ALWAYS executes the full suite. The narrowed
+    /// <c>--filter</c> argv is computed for the record only and is never
+    /// executed by this ticket.
+    /// </summary>
+    private async Task<AuditResult> RunWithShadowAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        TestSelectionShadowConfig shadow,
+        CancellationToken ct)
+    {
+        var changedFiles = await TestSelectionShadowIO.GetChangedFilesAsync(
+            sandbox, workingDirectory, context.BaseBranch, ct).ConfigureAwait(false);
+        var baseline = await TestSelectionShadowIO.ReadBaselineAsync(
+            sandbox, workingDirectory, shadow.OptionsAccessor, ct).ConfigureAwait(false);
+
+        var selectionDetail = $"baseline: {baseline.Detail}";
+        TestSelectionDecision decision;
+        if (string.IsNullOrWhiteSpace(context.BaseBranch))
+        {
+            decision = new TestSelectionDecision(TestSelection.All, "unknown base ref");
+        }
+        else
+        {
+            try
+            {
+                decision = shadow.Selector.Select(new TestSelectionRequest(
+                    this, context.BaseBranch, changedFiles, baseline.Baseline));
+            }
+            catch (Exception ex)
+            {
+                // Fail-safe: any selector error falls back to the full run.
+                decision = new TestSelectionDecision(
+                    TestSelection.All,
+                    $"selector error ({ex.GetType().Name})");
+            }
+        }
+        selectionDetail = $"{decision.Justification} | {selectionDetail}";
+
+        // Record-only: the WOULD-BE narrowed command, proving the --filter
+        // injection shape without executing it.
+        var wouldBeArgv = string.Join(' ', BuildInvocation(decision.Selection, CurrentRunOptions));
+
+        // Structural full-suite: the executed invocation always uses
+        // TestSelection.All, regardless of the advisory decision above.
+        var result = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+
+        var failedTests = DotnetTestOutputParser.Parse(Name, result.RawOutput ?? "").FailedTestNames;
+        var universe = baseline.Baseline is null
+            ? (IReadOnlyList<string>)[]
+            : [.. baseline.Baseline.Tests.Keys];
+
+        var record = BuildShadowRecord(
+            shadow, context, decision, selectionDetail, wouldBeArgv, universe, failedTests);
+
+        try
+        {
+            shadow.Sink.Emit(record);
+        }
+        catch (Exception ex)
+        {
+            // Shadow telemetry must never fail the gate: surface visibly as a
+            // non-blocking finding instead of throwing or swallowing silently.
+            return result with
+            {
+                Findings = [.. result.Findings, new AuditFinding(
+                    AuditorName: Name,
+                    Severity: AuditSeverity.Info,
+                    Title: "test-selection shadow record not emitted",
+                    Description: $"The advisory selection ran but its record could not be emitted ({ex.GetType().Name}). " +
+                        "The full test suite still ran; no test was skipped.")],
+            };
+        }
+
+        return result;
+    }
+
+    private static TestSelectionShadowRecord BuildShadowRecord(
+        TestSelectionShadowConfig shadow,
+        AuditContext context,
+        TestSelectionDecision decision,
+        string selectionDetail,
+        string wouldBeArgv,
+        IReadOnlyList<string> universe,
+        IReadOnlyList<string> failedTests)
+    {
+        var modeName = TestSelectionMode.CoverageShadow.ToString();
+        var baseRef = string.IsNullOrWhiteSpace(context.BaseBranch) ? "unknown" : context.BaseBranch;
+        if (decision.Selection.IsAll)
+        {
+            return TestSelectionShadowEvaluator.Evaluate(
+                shadow.SelectorName, modeName, baseRef,
+                true, new HashSet<string>(StringComparer.Ordinal),
+                universe, failedTests, wouldBeArgv, selectionDetail);
+        }
+
+        if (!TestSelectionShadowEvaluator.TryResolveSelectedTests(decision, universe, out var selected))
+        {
+            return new TestSelectionShadowRecord(
+                shadow.SelectorName, modeName, baseRef,
+                false, selectionDetail + " | unresolvable raw filter expressions",
+                [], 0, [], 0,
+                failedTests, failedTests.Count, [],
+                TestSelectionShadowRecord.AssessmentUnverifiable, wouldBeArgv);
+        }
+
+        return TestSelectionShadowEvaluator.Evaluate(
+            shadow.SelectorName, modeName, baseRef,
+            false, selected,
+            universe, failedTests, wouldBeArgv, selectionDetail);
+    }
+
+    private Task<AuditResult> RunFullAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct)
+    {
         // Delegate the run to a ShellCommandAuditor built from the current
         // invocation so the tool-presence probe, missing-tool handling and
         // result classification stay identical to the generic shell path.
@@ -169,4 +311,14 @@ public sealed record DotnetTestAuditorOptions
     /// each failing test to the diff or to pre-existing state.
     /// </summary>
     public TestFailureAttributionOptionsSnapshot? TestFailureAttributionOptions { get; init; }
+
+    /// <summary>
+    /// Advisory test-selection shadow (SHADOW-BEFORE-ENFORCE). When set and the
+    /// live mode is <c>coverage-shadow</c>, each run computes the selector's
+    /// advisory decision, still executes the FULL suite, and emits a shadow
+    /// record (would-be selection plus whether any deselected test failed).
+    /// Null (the default) disables the shadow — byte-identical legacy runs.
+    /// Real skipping is never performed here.
+    /// </summary>
+    public TestSelectionShadowConfig? Shadow { get; init; }
 }

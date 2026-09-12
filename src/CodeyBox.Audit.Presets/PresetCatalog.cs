@@ -15,6 +15,7 @@ public sealed class PresetCatalog : IPresetCatalog
         new(StringComparer.OrdinalIgnoreCase);
     private readonly IReadOnlyDictionary<string, AuditTypePresetDefinition> _auditTypeDefinitions;
     private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttributionOptions;
+    private readonly TestSelectionShadowConfig? _testSelectionShadow;
 
     public PresetCatalog()
         : this(null) { }
@@ -37,9 +38,11 @@ public sealed class PresetCatalog : IPresetCatalog
     public PresetCatalog(
         PresetCatalogOptions? options,
         Func<TestRunOptions>? testRunOptions,
-        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null)
+        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null,
+        TestSelectionShadowConfig? testSelectionShadow = null)
     {
         _testFailureAttributionOptions = testFailureAttributionOptions;
+        _testSelectionShadow = testSelectionShadow;
         var snapshot = new PresetConfigLoader().Load(options);
         LlmPromptFrameTemplate = snapshot.LlmPromptFrame;
         LlmPlanPromptFrameTemplate = snapshot.LlmPlanPromptFrame;
@@ -51,7 +54,8 @@ public sealed class PresetCatalog : IPresetCatalog
             RegisterLanguage(name, _ => PresetConfigLoader.MaterialiseLanguage(
                 captured,
                 testRunOptions,
-                _testFailureAttributionOptions));
+                _testFailureAttributionOptions,
+                _testSelectionShadow));
         }
 
         AuditTypePresets.Register(this, snapshot.AuditTypes, snapshot.LlmPromptFrame, snapshot.LlmPlanPromptFrame);

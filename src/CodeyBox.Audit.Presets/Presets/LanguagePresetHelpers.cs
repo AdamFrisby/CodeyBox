@@ -17,7 +17,8 @@ internal static class LanguagePresetHelpers
         AuditSeverity? missingToolSeverity = null,
         AuditCapabilities required = AuditCapabilities.None,
         Func<TestRunOptions>? testRunOptions = null,
-        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null)
+        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null,
+        TestSelectionShadowConfig? testSelectionShadow = null)
     {
         // Any dotnet-driven language gate restores on first use, so it must
         // survive a root-owned ~/.nuget on unprivileged build hosts. Enable the
@@ -36,6 +37,7 @@ internal static class LanguagePresetHelpers
                 RunOptionsAccessor = testRunOptions,
                 SelfHealNuGetHome = selfHealNuGetHome,
                 TestFailureAttributionOptions = testFailureAttributionOptions,
+                Shadow = testSelectionShadow,
             })
             : new ShellCommandAuditor(new ShellCommandAuditorOptions
             {
