@@ -197,13 +197,19 @@ internal sealed class RequiredBuildGate
         if (result.Status == RequiredBuildVerificationStatus.Skipped)
             return new RequiredBuildAuditGateResult(Applies: false, Finding: null);
         if (result.Status != RequiredBuildVerificationStatus.Failed)
-            return new RequiredBuildAuditGateResult(Applies: true, Finding: null);
+            return new RequiredBuildAuditGateResult(
+                Applies: true,
+                Finding: null,
+                TestFailureAttributions: result.TestFailureAttributions);
 
-        return new RequiredBuildAuditGateResult(Applies: true, new AuditFinding(
-            AuditorName: RequiredBuildGateIdentity.AuditorName,
-            Severity: AuditSeverity.Error,
-            Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
-            Description: BuildFailureSummary(result)));
+        return new RequiredBuildAuditGateResult(
+            Applies: true,
+            new AuditFinding(
+                AuditorName: RequiredBuildGateIdentity.AuditorName,
+                Severity: AuditSeverity.Error,
+                Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
+                Description: BuildFailureSummary(result)),
+            TestFailureAttributions: result.TestFailureAttributions);
     }
 
     public async Task<AuditFinding?> RunForAuditAsync(
@@ -489,4 +495,7 @@ internal sealed class RequiredBuildGate
     }
 }
 
-internal sealed record RequiredBuildAuditGateResult(bool Applies, AuditFinding? Finding);
+internal sealed record RequiredBuildAuditGateResult(
+    bool Applies,
+    AuditFinding? Finding,
+    IReadOnlyList<TestFailureAttributionResult>? TestFailureAttributions = null);

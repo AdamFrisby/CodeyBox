@@ -2104,6 +2104,17 @@ builder.Services.AddSingleton<PipelineTuningSnapshot>(sp =>
     new PipelineTuningSnapshot(
         sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.PipelineTuning));
 
+// NonDeterministicTestEscalationSnapshot — hot-reloadable thresholds for the
+// NotDiffAttributable flake-escalation path (spawn-or-reuse a base-branch
+// fix item and park the parent on dependsOn). Same swappable-singleton
+// pattern: PipelineRunner reads through it, and the hot-reload coordinator
+// publishes new values on Replace so an edit to
+// CodeyBox:NonDeterministicTestEscalation takes effect on the next audit
+// iteration without a process restart.
+builder.Services.AddSingleton<NonDeterministicTestEscalationSnapshot>(sp =>
+    new NonDeterministicTestEscalationSnapshot(
+        sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.NonDeterministicTestEscalation));
+
 // BudgetDeferralRecheckSnapshot — hot-reloadable budget-cap deferral recheck
 // intervals consumed by OrchestratorService. Edits to
 // CodeyBox:BudgetDeferralRecheck take effect on the next pickup attempt
@@ -3608,8 +3619,18 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>(),
     deploymentManager: sp.GetService<IDeploymentManager>(),
     deploymentSubstrates: sp.GetService<IDeploymentSubstrateProvider>(),
-    staleBaseReworkRouter: sp.GetRequiredService<StaleBaseConflictReworkRouter>()));
+    staleBaseReworkRouter: sp.GetRequiredService<StaleBaseConflictReworkRouter>(),
+    flakeEscalation: sp.GetService<NonDeterministicTestEscalationService>(),
+    flakeEscalationOptions: sp.GetRequiredService<NonDeterministicTestEscalationSnapshot>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
+// Isolated base-branch fix-item spawner for NotDiffAttributable audit test
+// failures. Constructed lazily from the store/queue plus the hot-reloadable
+// snapshot so threshold edits apply to the next escalation without restart.
+builder.Services.AddSingleton<NonDeterministicTestEscalationService>(sp =>
+    new NonDeterministicTestEscalationService(
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetService<ITaskQueue>(),
+        sp.GetRequiredService<NonDeterministicTestEscalationSnapshot>()));
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
@@ -3974,6 +3995,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
         incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+        flakeEscalation: sp.GetRequiredService<NonDeterministicTestEscalationSnapshot>(),
         pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
         budgetDeferralRecheck: sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
         circuitBreaker: sp.GetRequiredService<AgentCircuitBreakerSnapshot>(),
@@ -5986,6 +6008,15 @@ namespace CodeyBox.Api
         /// and rarer merge-time conflicts). Off by default. Hot-reloadable.
         /// </summary>
         public IncrementalRebaseOptions IncrementalRebase { get; set; } = new();
+
+        /// <summary>
+        /// NotDiffAttributable flake-escalation thresholds. When enabled (the
+        /// default), an audit test failure that reproduces on the base branch
+        /// spawns (or reuses) an isolated base-branch fix item and parks the
+        /// parent on a dependsOn gate instead of burning rework iterations.
+        /// All thresholds are hot-reloadable.
+        /// </summary>
+        public NonDeterministicTestEscalationOptions NonDeterministicTestEscalation { get; set; } = new();
 
         /// <summary>
         /// Claude thinking-block transcript sanitizer configuration.
