@@ -52,6 +52,11 @@ public sealed class ReleaseService
     private readonly Func<TimeSpan> _deepAuditRemediationItemTimeout;
     private int _deepAuditsRunning;
 
+    private static readonly JsonSerializerOptions ConfigOverridesJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
     public ReleaseService(
         IReleaseStore releases,
         IWorkItemStore workItems,
@@ -406,17 +411,46 @@ public sealed class ReleaseService
         ReleaseConfigOverrides? overrides = null;
         if (release.ConfigJson is { Length: > 2 })
         {
-            try { overrides = JsonSerializer.Deserialize<ReleaseConfigOverrides>(release.ConfigJson); }
+            try { overrides = JsonSerializer.Deserialize<ReleaseConfigOverrides>(release.ConfigJson, ConfigOverridesJsonOptions); }
             catch (JsonException ex)
             {
                 _log.LogWarning(ex, "Release {Id}: failed to parse ConfigJson; using project defaults", release.Id);
             }
         }
 
+        // Resolve E2E regression config (per-release override takes precedence over project default).
+        var e2eRegressionConfig = overrides?.E2eRegression ?? project.ReleaseConfig.E2eRegression;
+
         // Resolve deep auditors (per-release override takes precedence over project default).
         var auditorNames = overrides?.DeepAuditors ?? project.ReleaseConfig.DeepAuditors;
+        var auditorNameSet = new HashSet<string>(auditorNames, StringComparer.OrdinalIgnoreCase);
+
+        if (overrides?.E2eRegression is { } overrideConfig)
+        {
+            if (overrideConfig.Enabled)
+            {
+                auditorNameSet.Add(E2eRegressionDeepAuditor.AuditorName);
+            }
+            else
+            {
+                auditorNameSet.Remove(E2eRegressionDeepAuditor.AuditorName);
+            }
+        }
+        else if (project.ReleaseConfig.E2eRegression.Enabled)
+        {
+            auditorNameSet.Add(E2eRegressionDeepAuditor.AuditorName);
+        }
+        else if (auditorNameSet.Contains(E2eRegressionDeepAuditor.AuditorName))
+        {
+            e2eRegressionConfig = e2eRegressionConfig with { Enabled = true };
+        }
+        else
+        {
+            auditorNameSet.Remove(E2eRegressionDeepAuditor.AuditorName);
+        }
+
         var auditors = _deepAuditors
-            .Where(a => auditorNames.Contains(a.Name, StringComparer.OrdinalIgnoreCase))
+            .Where(a => auditorNameSet.Contains(a.Name))
             .ToList();
 
         // If no deep auditors configured → immediately pass.
@@ -444,7 +478,7 @@ public sealed class ReleaseService
             IReadOnlyList<AuditFinding> findings;
             try
             {
-                findings = await RunDeepAuditIterationAsync(release, project, auditors, iteration, ct);
+                findings = await RunDeepAuditIterationAsync(release, project, auditors, iteration, e2eRegressionConfig, ct);
             }
             catch (AgentAuthRequiredException ex)
             {
@@ -539,6 +573,7 @@ public sealed class ReleaseService
         Project project,
         IReadOnlyList<IDeepAuditor> auditors,
         int iteration,
+        ReleaseE2eRegressionConfig? e2eRegressionConfig,
         CancellationToken ct)
     {
         var allFindings = new List<AuditFinding>();
@@ -689,7 +724,8 @@ public sealed class ReleaseService
                             project),
                     StdoutChunkCallback: BuildStdoutCallback(streamCapture),
                     CaptureStructuredStream: canCaptureStructuredStream,
-                    Languages: project.Audit.LanguagesConfigured ? project.Audit.Languages : null);
+                    Languages: project.Audit.LanguagesConfigured ? project.Audit.Languages : null,
+                    E2eRegressionConfig: e2eRegressionConfig);
 
                 try
                 {
@@ -1192,6 +1228,9 @@ public sealed class ReleaseService
 
         [JsonPropertyName("deepAuditMaxIterations")]
         public int? DeepAuditMaxIterations { get; init; }
+
+        [JsonPropertyName("e2eRegression")]
+        public ReleaseE2eRegressionConfig? E2eRegression { get; init; }
     }
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)

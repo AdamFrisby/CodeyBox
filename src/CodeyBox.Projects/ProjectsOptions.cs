@@ -142,6 +142,17 @@ public sealed class ProjectReleaseConfigOptions
     public int? DeepAuditMaxIterations { get; set; }
     public bool? CreateGitHubRelease { get; set; }
     public string? GitHubTagTemplate { get; set; }
+    public ReleaseE2eRegressionConfigOptions? E2eRegression { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for <see cref="CodeyBox.Core.ReleaseE2eRegressionConfig"/>.
+/// </summary>
+public sealed class ReleaseE2eRegressionConfigOptions
+{
+    public bool? Enabled { get; set; }
+    public string? Selection { get; set; }
+    public List<string>? Capabilities { get; set; }
 }
 
 /// <summary>

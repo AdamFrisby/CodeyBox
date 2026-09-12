@@ -71,6 +71,23 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
                     UNIQUE(release_id, iteration)
                 );
                 CREATE INDEX IF NOT EXISTS idx_release_audit_iter ON release_audit_iterations(release_id);
+
+                CREATE TABLE IF NOT EXISTS release_e2e_results (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    release_id          TEXT NOT NULL,
+                    iteration           INTEGER NOT NULL,
+                    test_case_id        TEXT NOT NULL,
+                    test_case_name      TEXT NOT NULL,
+                    label               TEXT,
+                    passed              INTEGER NOT NULL,
+                    status              TEXT NOT NULL,
+                    result_json         TEXT,
+                    duration_ms         INTEGER NOT NULL DEFAULT 0,
+                    failure_kind        TEXT,
+                    summary             TEXT,
+                    created_at          TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_release_e2e_results_rel ON release_e2e_results(release_id);
                 """;
             cmd.ExecuteNonQuery();
         }
@@ -287,6 +304,101 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
             });
         }
         return result;
+    }
+
+    public async Task SaveE2eReplayResultsAsync(ReleaseId releaseId, int iteration, IReadOnlyList<ReleaseE2eReplayResult> results, CancellationToken ct = default)
+    {
+        if (results.Count == 0) return;
+
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var transaction = _conn.BeginTransaction();
+            try
+            {
+                foreach (var r in results)
+                {
+                    using var cmd = _conn.CreateCommand();
+                    cmd.Transaction = transaction;
+                    cmd.CommandText = """
+                        INSERT INTO release_e2e_results (
+                            release_id, iteration, test_case_id, test_case_name, label,
+                            passed, status, result_json, duration_ms, failure_kind, summary, created_at
+                        ) VALUES (
+                            $rid, $iter, $tcid, $tcname, $label,
+                            $passed, $status, $result, $duration, $fkind, $summary, $ca
+                        );
+                        """;
+                    cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
+                    cmd.Parameters.AddWithValue("$iter", iteration);
+                    cmd.Parameters.AddWithValue("$tcid", r.TestCaseId);
+                    cmd.Parameters.AddWithValue("$tcname", r.TestCaseName);
+                    cmd.Parameters.AddWithValue("$label", (object?)r.Label ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$passed", r.Passed ? 1 : 0);
+                    cmd.Parameters.AddWithValue("$status", r.Status.ToString());
+                    cmd.Parameters.AddWithValue("$result", (object?)r.ResultJson ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$duration", r.DurationMs);
+                    cmd.Parameters.AddWithValue("$fkind", (object?)r.FailureKind ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$summary", (object?)r.Summary ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$ca", r.CreatedAt.ToString("O"));
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+                await transaction.CommitAsync(ct);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(ct);
+                throw;
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<ReleaseE2eReplayResult>> ListE2eReplayResultsAsync(ReleaseId releaseId, int? iteration = null, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT * FROM release_e2e_results
+                WHERE release_id = $rid AND ($iter IS NULL OR iteration = $iter)
+                ORDER BY id ASC;
+                """;
+            cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
+            cmd.Parameters.AddWithValue("$iter", (object?)iteration ?? DBNull.Value);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var result = new List<ReleaseE2eReplayResult>();
+            while (await reader.ReadAsync(ct))
+            {
+                var statusStr = reader.GetString(reader.GetOrdinal("status"));
+                Enum.TryParse<E2eRunStatus>(statusStr, ignoreCase: true, out var status);
+
+                result.Add(new ReleaseE2eReplayResult
+                {
+                    ReleaseId = releaseId,
+                    Iteration = reader.GetInt32(reader.GetOrdinal("iteration")),
+                    TestCaseId = reader.GetString(reader.GetOrdinal("test_case_id")),
+                    TestCaseName = reader.GetString(reader.GetOrdinal("test_case_name")),
+                    Label = Nullable(reader, "label"),
+                    Passed = reader.GetInt32(reader.GetOrdinal("passed")) != 0,
+                    Status = status,
+                    ResultJson = Nullable(reader, "result_json"),
+                    DurationMs = reader.GetInt64(reader.GetOrdinal("duration_ms")),
+                    FailureKind = Nullable(reader, "failure_kind"),
+                    Summary = Nullable(reader, "summary"),
+                    CreatedAt = DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at")), System.Globalization.CultureInfo.InvariantCulture),
+                });
+            }
+            return result;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private static readonly JsonSerializerOptions _findingsSerializerOptions = new(JsonSerializerDefaults.Web)

@@ -43,4 +43,29 @@ public interface IReleaseStore
 
     /// <summary>Returns all stored deep-audit iterations for a release, ordered by iteration number.</summary>
     Task<IReadOnlyList<ReleaseAuditIteration>> ListAuditIterationsAsync(ReleaseId releaseId, CancellationToken ct = default);
+
+    /// <summary>Persists completed E2E replay results for a release deep-audit iteration.</summary>
+    Task SaveE2eReplayResultsAsync(ReleaseId releaseId, int iteration, IReadOnlyList<ReleaseE2eReplayResult> results, CancellationToken ct = default);
+
+    /// <summary>Lists all stored E2E replay results for a release, optionally filtered by iteration.</summary>
+    Task<IReadOnlyList<ReleaseE2eReplayResult>> ListE2eReplayResultsAsync(ReleaseId releaseId, int? iteration = null, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Execution outcome of one committed E2E replay test case executed during release deep audit.
+/// </summary>
+public sealed record ReleaseE2eReplayResult
+{
+    public required ReleaseId ReleaseId { get; init; }
+    public required int Iteration { get; init; }
+    public required string TestCaseId { get; init; }
+    public required string TestCaseName { get; init; }
+    public string? Label { get; init; }
+    public required bool Passed { get; init; }
+    public required E2eRunStatus Status { get; init; }
+    public string? ResultJson { get; init; }
+    public long DurationMs { get; init; }
+    public string? FailureKind { get; init; }
+    public string? Summary { get; init; }
+    public required DateTimeOffset CreatedAt { get; init; }
 }

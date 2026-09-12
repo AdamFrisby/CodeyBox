@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -832,4 +834,36 @@ public sealed record ProjectReleaseConfig
     /// <c>{name}</c> is replaced with the release name. Default: <c>{name}</c>.
     /// </summary>
     public string GitHubTagTemplate { get; init; } = "{name}";
+
+    /// <summary>
+    /// Configuration for E2E regression testing during the in_review deep-audit phase.
+    /// </summary>
+    public ReleaseE2eRegressionConfig E2eRegression { get; init; } = new();
+}
+
+/// <summary>
+/// Configuration for the E2E regression deep-audit dimension.
+/// </summary>
+public sealed record ReleaseE2eRegressionConfig
+{
+    /// <summary>
+    /// When true, run the E2E regression suite during the deep audit.
+    /// Default: false.
+    /// </summary>
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; init; }
+
+    /// <summary>
+    /// Selection mode: "all" (run all committed e2e test cases) or
+    /// "capability-filtered" (run test cases matching <see cref="Capabilities"/>).
+    /// Default: "all".
+    /// </summary>
+    [JsonPropertyName("selection")]
+    public string Selection { get; init; } = "all";
+
+    /// <summary>
+    /// Capabilities / labels to filter by when <see cref="Selection"/> is "capability-filtered".
+    /// </summary>
+    [JsonPropertyName("capabilities")]
+    public IReadOnlyList<string> Capabilities { get; init; } = [];
 }

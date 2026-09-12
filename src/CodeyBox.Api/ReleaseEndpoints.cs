@@ -13,6 +13,7 @@ internal static class ReleaseEndpoints
         g.MapGet("/{id}", GetAsync);
         g.MapGet("/{id}/workitems", GetWorkItemsAsync);
         g.MapGet("/{id}/audit-iterations", GetAuditIterationsAsync);
+        g.MapGet("/{id}/e2e-results", GetE2eResultsAsync);
         g.MapPost("/{id}/close", CloseAsync);
         g.MapPost("/{id}/reopen", ReopenAsync);
         g.MapPost("/{id}/abandon", AbandonAsync);
@@ -188,6 +189,36 @@ internal static class ReleaseEndpoints
             }).ToList(),
             remediationWorkItemId = i.RemediationWorkItemId?.ToString(),
             createdAt = i.CreatedAt,
+        }).ToList();
+        return Results.Ok(dtos);
+    }
+
+    // ── GET /releases/{id}/e2e-results ─────────────────────────────────────
+
+    private static async Task<IResult> GetE2eResultsAsync(
+        string id,
+        int? iteration,
+        IReleaseStore releaseStore,
+        CancellationToken ct)
+    {
+        var (release, err) = await ResolveAsync(id, releaseStore, ct);
+        if (err is not null) return err;
+
+        var results = await releaseStore.ListE2eReplayResultsAsync(release!.Id, iteration, ct);
+        var dtos = results.Select(r => new
+        {
+            releaseId = r.ReleaseId.ToString(),
+            iteration = r.Iteration,
+            testCaseId = r.TestCaseId,
+            testCaseName = r.TestCaseName,
+            label = r.Label,
+            passed = r.Passed,
+            status = r.Status.ToString(),
+            resultJson = r.ResultJson,
+            durationMs = r.DurationMs,
+            failureKind = r.FailureKind,
+            summary = r.Summary,
+            createdAt = r.CreatedAt,
         }).ToList();
         return Results.Ok(dtos);
     }

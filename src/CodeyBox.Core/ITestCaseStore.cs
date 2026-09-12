@@ -47,6 +47,11 @@ public interface ITestCaseStore
     IAsyncEnumerable<TestCase> ListByWorkItemAsync(string workItemId, CancellationToken ct = default);
 
     /// <summary>
+    /// Lists all test cases linked to any work item in the specified project, ordered by CreatedAt ASC.
+    /// </summary>
+    IAsyncEnumerable<TestCase> ListByProjectAsync(ProjectId projectId, CancellationToken ct = default);
+
+    /// <summary>
     /// Physically deletes a test case from the store. Returns true if a row was affected, false
     /// if no row with the given id existed.
     /// </summary>
