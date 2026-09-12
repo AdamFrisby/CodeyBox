@@ -1010,7 +1010,7 @@ public sealed class ConvergenceBriefComposer
         for (var i = 0; i < counts.Count; i++)
         {
             if (i > 0) sb.Append(", ");
-            sb.Append(counts[i].Name).Append('×').Append(counts[i].Count);
+            sb.Append(SanitizeInlineText(counts[i].Name, MaxAuditorNameChars)).Append('×').Append(counts[i].Count);
         }
     }
 
