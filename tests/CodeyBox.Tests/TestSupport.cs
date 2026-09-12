@@ -170,7 +170,8 @@ internal static class TestSupport
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         IMergeScopeResolver? mergeScopeResolver = null,
         IReadOnlyDictionary<string, string>? projectKnobs = null,
-        Microsoft.Extensions.Logging.ILogger<PipelineRunner>? logger = null)
+        Microsoft.Extensions.Logging.ILogger<PipelineRunner>? logger = null,
+        StalePullRequestSweeperOptions? staleBaseReworkOptions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -280,6 +281,23 @@ internal static class TestSupport
             retryScheduler = new WorkItemAutoRetryScheduler(quotaRetryScheduler, transientRetryScheduler);
         }
 
+        StaleBaseConflictReworkRouter? staleBaseReworkRouter = null;
+        if (staleBaseReworkOptions is not null)
+        {
+            var staleBaseRetrier = new WorkItemRetrier(
+                pipelineStore,
+                queue,
+                gitHost,
+                NullLogger<WorkItemRetrier>.Instance,
+                projects: projects);
+            var staleBaseOptionsCapture = staleBaseReworkOptions;
+            staleBaseReworkRouter = new StaleBaseConflictReworkRouter(
+                pipelineStore,
+                staleBaseRetrier,
+                () => staleBaseOptionsCapture,
+                NullLogger<StaleBaseConflictReworkRouter>.Instance);
+        }
+
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, resolvedUpstreamFactory, composer,
@@ -347,7 +365,8 @@ internal static class TestSupport
             mechanicalFixerInputProviders: mechanicalFixerInputProviders,
             inVmSmokeGate: inVmSmokeGate,
             toolCallCounters: toolCallCounters,
-            mergeScopeResolver: mergeScopeResolver);
+            mergeScopeResolver: mergeScopeResolver,
+            staleBaseReworkRouter: staleBaseReworkRouter);
 
         return new TestPipeline(
             pipeline,
