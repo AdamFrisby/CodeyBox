@@ -156,6 +156,7 @@ public sealed class NuGetFallbackCensusTests : IDisposable
                     UseShellExecute = false,
                 },
             };
+            process.StartInfo.Environment.Remove(NuGetFallbackCache.FallbackPackagesEnvironmentVariable);
             foreach (var (key, value) in environment)
                 process.StartInfo.Environment[key] = value;
             // The host running this test may export NUGET_FALLBACK_PACKAGES

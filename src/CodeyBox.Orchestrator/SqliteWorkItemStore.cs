@@ -1955,10 +1955,8 @@ public sealed class SqliteWorkItemStore :
         WorkItem? row;
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
         using (var cmd = readConn.CreateCommand())
         {
-            cmd.Transaction = tx;
             cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
             cmd.Parameters.AddWithValue("$id", id.ToString());
             using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -1968,8 +1966,7 @@ public sealed class SqliteWorkItemStore :
         if (row is null)
             return null;
 
-        var externalIds = await LoadExternalIdsForAsync(row.Id, readConn, ct, tx);
-        tx.Commit();
+        var externalIds = await LoadExternalIdsForAsync(row.Id, readConn, ct);
         return row with { ExternalIds = externalIds };
     }
 
@@ -3007,6 +3004,9 @@ public sealed class SqliteWorkItemStore :
                 """;
             await reset.ExecuteNonQueryAsync(ct);
         }
+
+        if (skipIds.Count == 0)
+            return;
 
         using var tx = connection.BeginTransaction();
         using var insert = connection.CreateCommand();
