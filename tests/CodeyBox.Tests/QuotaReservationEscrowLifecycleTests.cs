@@ -358,7 +358,6 @@ public sealed class QuotaReservationEscrowLifecycleTests : IDisposable
     public async Task DeadWorker_ReaperReleasesOrphanedReservation()
     {
         var item = EscrowItem();
-        await _store.CreateAsync(item);
 
         var opts = EscrowOptions();
         var ledger = new QuotaReservationLedger(opts);
@@ -373,6 +372,7 @@ public sealed class QuotaReservationEscrowLifecycleTests : IDisposable
         var queue = new InMemoryTaskQueue();
         using var workerRegistry = new SqliteWorkerRegistry(_dbPath, NullLogger<SqliteWorkerRegistry>.Instance);
         using var registry = new CancellationRegistry(CancellationToken.None);
+        var recoveryBarrier = new StartupRecoveryBarrier();
         using var svc = new OrchestratorService(
             queue, _store, pipeline, registry,
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
@@ -382,9 +382,25 @@ public sealed class QuotaReservationEscrowLifecycleTests : IDisposable
             deadWorkerOpts: new DeadWorkerOptions(),
             reservationLedger: ledger,
             costStore: costs,
-            burnEstimatorOptions: BurnOptions());
+            burnEstimatorOptions: BurnOptions(),
+            startupRecoveryCompletion: recoveryBarrier);
 
         await svc.StartAsync(CancellationToken.None);
+
+        // Create the item only after startup replay has finished: items
+        // present at startup are re-enqueued by ReplayPendingAsync, so
+        // creating before StartAsync leaves two dispatch signals (replay +
+        // explicit enqueue). The parked second turn would then pick up the
+        // still-running item once the recovery release below frees the slot
+        // (Working is dispatch-eligible and the release clears the active
+        // claim), spawning a duplicate worker that re-escrows quota and
+        // flakes the final assertions.
+        var replayDone = recoveryBarrier.InitialRecoveryCompleted;
+        var replayWinner = await Task.WhenAny(replayDone, Task.Delay(DispatchTimeout));
+        Assert.True(
+            replayWinner == replayDone,
+            "Startup replay must complete before the item is created.");
+        await _store.CreateAsync(item);
         await queue.EnqueueAsync(item.Id);
 
         Assert.True(await pipeline.WaitForEnteredAsync(item.Id, DispatchTimeout));
