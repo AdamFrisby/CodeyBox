@@ -471,4 +471,28 @@ public sealed class SqliteFailureEventStoreTests : IDisposable
         Assert.Equal("still throttled", latest.ErrorMessage);
         Assert.Equal("vm-restore", latest.SandboxName);
     }
+
+    [Fact]
+    public async Task GetByWorkItemAsync_ReturnsEventsForWorkItem_OrderedAscending()
+    {
+        var dbPath = NewDbPath();
+        var id1 = WorkItemId.New();
+        var id2 = WorkItemId.New();
+        SeedWorkItemRow(dbPath, id1);
+        SeedWorkItemRow(dbPath, id2);
+
+        using var store = new SqliteFailureEventStore(dbPath);
+        var baseTime = DateTimeOffset.Parse("2026-01-01T12:00:00Z");
+
+        await store.AppendAsync(Rec(id1, "quota", baseTime.AddMinutes(10)));
+        await store.AppendAsync(Rec(id2, "transient", baseTime.AddMinutes(5)));
+        await store.AppendAsync(Rec(id1, "agent_error", baseTime.AddMinutes(1)));
+
+        var events = await store.GetByWorkItemAsync(id1);
+
+        Assert.Equal(2, events.Count);
+        Assert.Equal("agent_error", events[0].FailureKind);
+        Assert.Equal("quota", events[1].FailureKind);
+        Assert.All(events, e => Assert.Equal(id1, e.WorkItemId));
+    }
 }
