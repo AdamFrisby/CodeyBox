@@ -152,6 +152,17 @@ reworks (pushing further commits onto the same `codeybox/<id>` branch)
 and the loop reruns. On `MaxIterations` without convergence the work
 item flips to `AuditFailed`.
 
+Each iteration is a cost-ordered ladder: code-stage auditors first
+(mechanical gates, then reviewers — a blocking fail short-circuits the
+rest with zero deployment cost), then, only on a clean code stage, the
+deployment stage. When `Audit.DeploymentAuditEnabled` is on, the project
+has a deployment recipe, and deployment-targeted auditors are enabled,
+the runner lazily provisions exactly one verification deployment, hands
+its endpoint to those auditors, and tears it down on every exit path
+(pass, fail, abort, timeout — the leak reaper covers orchestrator
+restarts). The next iteration provisions a fresh deployment. Deployment
+findings re-enter the normal rework loop with full blocking authority.
+
 ## Phase 3: Merge
 
 The host computes the merge first:

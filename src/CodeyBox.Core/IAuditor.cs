@@ -34,13 +34,18 @@ public interface IAuditor
     /// auditor may target several (e.g. <c>{ Plan, Code }</c>). The composer
     /// selects auditors per phase by target — the plan-review phase composes
     /// auditors whose <see cref="Targets"/> contains <see cref="AuditTarget.Plan"/>;
-    /// the code-audit phase composes those containing <see cref="AuditTarget.Code"/>.
+    /// the code-audit phase composes those containing <see cref="AuditTarget.Code"/>;
+    /// the deployment stage composes those containing
+    /// <see cref="AuditTarget.Deployment"/> and runs them against the live
+    /// deployment endpoint after the code stage passes.
     ///
     /// <para>The default is <see cref="AuditTargets.CodeOnly"/>, so every
     /// existing and external auditor reviews code and is unaffected by the
     /// introduction of plan review. Auditors that review plans opt in by
     /// returning <see cref="AuditTargets.PlanOnly"/> or
-    /// <see cref="AuditTargets.PlanAndCode"/>.</para>
+    /// <see cref="AuditTargets.PlanAndCode"/>; auditors that probe the live
+    /// deployment opt in with <see cref="AuditTargets.DeploymentOnly"/> or
+    /// <see cref="AuditTargets.CodeAndDeployment"/>.</para>
     /// </summary>
     IReadOnlySet<AuditTarget> Targets => AuditTargets.CodeOnly;
 
@@ -248,7 +253,17 @@ public sealed record AuditContext(
     /// the effective task scope even when the original prompt otherwise limits
     /// the files that may change. Null/empty on the first audit iteration.
     /// </summary>
-    IReadOnlyList<AuditFinding>? PriorBlockingFindings = null)
+    IReadOnlyList<AuditFinding>? PriorBlockingFindings = null,
+    /// <summary>
+    /// The live verification deployment under review when
+    /// <see cref="EffectiveTarget"/> is <see cref="AuditTarget.Deployment"/>.
+    /// Provisioned lazily by the audit runner from the project's deployment
+    /// recipe only after the code stage passes. Null for code/plan audits —
+    /// a deployment reviewer treats null as "no live deployment to review".
+    /// Committed E2E replays run against this endpoint when the E2E chain
+    /// is enabled; the deployment stage itself never blocks on that chain.
+    /// </summary>
+    DeploymentEndpoint? DeploymentEndpoint = null)
 {
     /// <summary>
     /// The effective review target: <see cref="Target"/> when set, otherwise

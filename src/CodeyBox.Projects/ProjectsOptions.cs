@@ -216,6 +216,11 @@ public sealed class ProjectAuditConfig
     public int? PerIterationTimeoutMinutes { get; set; }
     public bool? StopOnFirstFailure { get; set; }
     /// <summary>
+    /// Opt into deployment-stage auditing. Null inherits; false skips the
+    /// deployment phase entirely for this project/profile.
+    /// </summary>
+    public bool? DeploymentAuditEnabled { get; set; }
+    /// <summary>
     /// Require a repo-root build.sh during audit. Null inherits; false keeps
     /// the build-script auditor skip-if-absent.
     /// </summary>

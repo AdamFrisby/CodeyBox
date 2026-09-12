@@ -573,6 +573,17 @@ public sealed record ProjectAudit
     public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(120);
     public bool StopOnFirstFailure { get; init; }
     /// <summary>
+    /// When true, the audit loop may run the deployment stage: after a clean
+    /// code stage it lazily provisions ONE verification deployment from
+    /// <see cref="Project.Deployment"/> and runs auditors declaring the
+    /// <see cref="AuditTarget.Deployment"/> target against the live endpoint.
+    /// Default false — the phase is skipped entirely (nothing provisioned, no
+    /// recipe needed). Lives on the per-profile record so a work item opts in
+    /// per item through its <c>AuditorProfile</c>. Hot-reloadable via project
+    /// config; the audit loop re-reads the resolved profile every iteration.
+    /// </summary>
+    public bool DeploymentAuditEnabled { get; init; }
+    /// <summary>
     /// When true, <c>process:build-script</c> treats a missing repo-root
     /// <c>build.sh</c> as a blocking audit finding. Default false keeps the
     /// language-agnostic build gate opt-in by script presence.

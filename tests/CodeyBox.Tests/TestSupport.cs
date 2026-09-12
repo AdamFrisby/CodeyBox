@@ -170,7 +170,10 @@ internal static class TestSupport
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         IMergeScopeResolver? mergeScopeResolver = null,
         IReadOnlyDictionary<string, string>? projectKnobs = null,
-        Microsoft.Extensions.Logging.ILogger<PipelineRunner>? logger = null)
+        Microsoft.Extensions.Logging.ILogger<PipelineRunner>? logger = null,
+        DeploymentRecipe? deploymentRecipe = null,
+        IDeploymentManager? deploymentManager = null,
+        IDeploymentSubstrateProvider? deploymentSubstrates = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -224,6 +227,7 @@ internal static class TestSupport
             NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Upstream = upstream ?? ProjectUpstream.Noop,
             Audit = audit,
+            Deployment = deploymentRecipe,
             Knobs = projectKnobs ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
         };
         var projects = projectRepository ?? new InMemoryProjectRepository(defaultProject);
@@ -347,7 +351,9 @@ internal static class TestSupport
             mechanicalFixerInputProviders: mechanicalFixerInputProviders,
             inVmSmokeGate: inVmSmokeGate,
             toolCallCounters: toolCallCounters,
-            mergeScopeResolver: mergeScopeResolver);
+            mergeScopeResolver: mergeScopeResolver,
+            deploymentManager: deploymentManager,
+            deploymentSubstrates: deploymentSubstrates);
 
         return new TestPipeline(
             pipeline,
