@@ -43,4 +43,19 @@ public static partial class FindingIdComputer
         var stripped = FileAndLineRef().Replace(lower, " ");
         return MultipleWhitespace().Replace(stripped, " ").Trim();
     }
+
+    /// <summary>
+    /// Parses a location string such as "path/to/file:42" or "path/to/file" into file paths and line hints.
+    /// </summary>
+    public static (IReadOnlyList<string> Files, IReadOnlyList<int> LineHints) ParseLocation(string? location)
+    {
+        if (string.IsNullOrWhiteSpace(location))
+            return ([], []);
+
+        var colonIdx = location.LastIndexOf(':');
+        if (colonIdx > 0 && int.TryParse(location.AsSpan(colonIdx + 1), out var line))
+            return ([location[..colonIdx]], [line]);
+
+        return ([location], []);
+    }
 }

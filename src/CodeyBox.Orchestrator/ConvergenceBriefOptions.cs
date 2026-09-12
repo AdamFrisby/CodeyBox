@@ -29,4 +29,16 @@ public sealed class ConvergenceBriefOptions
     /// Default 1,000 chars.
     /// </summary>
     public int MaxErrorMessageChars { get; set; } = 1_000;
+
+    /// <summary>
+    /// Upper bound on the work item prompt (request text) included in the brief.
+    /// Default 4,000 chars.
+    /// </summary>
+    public int MaxPromptChars { get; set; } = 4_000;
+
+    /// <summary>
+    /// Upper bound on audit finding titles included in the brief.
+    /// Default 250 chars.
+    /// </summary>
+    public int MaxFindingTitleChars { get; set; } = 250;
 }

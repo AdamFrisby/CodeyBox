@@ -1206,7 +1206,7 @@ builder.Services.AddSingleton<ICrossAgentHandoffBriefBuilder, AgentStreamBriefBu
 builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptPreprocessor>();
 builder.Services.AddSingleton<ConvergenceBriefOptions>(sp =>
     sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ConvergenceBrief);
-builder.Services.AddSingleton<IConvergenceBriefComposer>(sp =>
+builder.Services.AddSingleton<ConvergenceBriefComposer>(sp =>
     new ConvergenceBriefComposer(
         sp.GetRequiredService<IWorkItemStore>(),
         sp.GetRequiredService<IAuditProgressStore>(),
@@ -1216,7 +1216,8 @@ builder.Services.AddSingleton<IConvergenceBriefComposer>(sp =>
         sp.GetRequiredService<IAgentFallbackHistoryStore>(),
         sp.GetRequiredService<IAgentStreamSummaryStore>(),
         sp.GetService<IAgentStreamStore>(),
-        () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ConvergenceBrief));
+        () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ConvergenceBrief,
+        sp.GetService<ILogger<ConvergenceBriefComposer>>()));
 
 // --- Knob framework ----------------------------------------------------------
 // Add a new tuning knob by registering its IKnob implementation here — the
