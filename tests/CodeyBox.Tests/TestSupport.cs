@@ -94,6 +94,52 @@ internal static class TestSupport
     }
 
     /// <summary>
+    /// Clears ambient <c>GIT_CONFIG_*</c> process-environment overrides for the
+    /// scope lifetime, then restores them on dispose. The outer harness injects
+    /// e.g. <c>safe.bareRepository=explicit</c>, which changes bare-repo
+    /// discovery and breaks the <see cref="LocalGitHost"/> seed/clone plumbing
+    /// that pipeline tests run through; clearing restores plain git behaviour
+    /// so those tests are deterministic with or without the harness.
+    /// </summary>
+    public sealed class AmbientGitConfigScope : IDisposable
+    {
+        private readonly List<(string Key, string? Value)> _saved;
+
+        private AmbientGitConfigScope(List<(string Key, string? Value)> saved) => _saved = saved;
+
+        public static AmbientGitConfigScope Clear()
+        {
+            var saved = new List<(string Key, string? Value)>();
+            var count = Environment.GetEnvironmentVariable("GIT_CONFIG_COUNT");
+            saved.Add(("GIT_CONFIG_COUNT", count));
+            if (int.TryParse(count, out var n))
+            {
+                for (var i = 0; i < n; i++)
+                {
+                    saved.Add(($"GIT_CONFIG_KEY_{i}", Environment.GetEnvironmentVariable($"GIT_CONFIG_KEY_{i}")));
+                    saved.Add(($"GIT_CONFIG_VALUE_{i}", Environment.GetEnvironmentVariable($"GIT_CONFIG_VALUE_{i}")));
+                }
+            }
+            Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", null);
+            if (int.TryParse(count, out var parsed))
+            {
+                for (var i = 0; i < parsed; i++)
+                {
+                    Environment.SetEnvironmentVariable($"GIT_CONFIG_KEY_{i}", null);
+                    Environment.SetEnvironmentVariable($"GIT_CONFIG_VALUE_{i}", null);
+                }
+            }
+            return new AmbientGitConfigScope(saved);
+        }
+
+        public void Dispose()
+        {
+            foreach (var (key, value) in _saved)
+                Environment.SetEnvironmentVariable(key, value);
+        }
+    }
+
+    /// <summary>
     /// Builds a complete working pipeline using the Process sandbox. Returns
     /// the disposable resources (caller wraps in using/await using) plus the
     /// configured PipelineRunner.

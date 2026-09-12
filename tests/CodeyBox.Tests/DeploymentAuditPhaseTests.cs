@@ -16,8 +16,21 @@ namespace CodeyBox.Tests;
 public sealed class DeploymentAuditPhaseTests : IDisposable
 {
     private readonly string _workspace;
-    public DeploymentAuditPhaseTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-deploy-audit-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    private readonly TestSupport.AmbientGitConfigScope _gitConfigScope;
+    public DeploymentAuditPhaseTests()
+    {
+        _workspace = Directory.CreateTempSubdirectory("codeybox-deploy-audit-").FullName;
+        // The ambient harness may inject GIT_CONFIG_* (e.g.
+        // safe.bareRepository=explicit) that changes bare-repo discovery and
+        // breaks the LocalGitHost seed/clone plumbing these tests run through.
+        // Clear it so the tests exercise plain git behaviour.
+        _gitConfigScope = TestSupport.AmbientGitConfigScope.Clear();
+    }
+    public void Dispose()
+    {
+        _gitConfigScope.Dispose();
+        try { Directory.Delete(_workspace, recursive: true); } catch { }
+    }
 
     private sealed record Outcome(bool Passed, IReadOnlyList<AuditFinding> Findings);
 
