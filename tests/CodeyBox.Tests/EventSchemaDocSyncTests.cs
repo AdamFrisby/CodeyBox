@@ -13,7 +13,7 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class EventSchemaDocSyncTests
 {
-    private const string ExpectedCurrentSchemaVersion = "1.5";
+    private const string ExpectedCurrentSchemaVersion = "1.6";
 
     private static string FindRepoRoot()
     {
@@ -117,7 +117,7 @@ public sealed class EventSchemaDocSyncTests
     [Fact]
     public void Schema_PinsExistingEnvelopeFieldsAndEventTypesToInitialVersion()
     {
-        // Current schema is 1.5, but these fields and event names existed in
+        // Current schema is 1.6, but these fields and event names existed in
         // 1.0. This guards the compatibility metadata trackers use to decide
         // whether a payload is safe for their minimum supported schema.
         var schema = EventSchema.GetSchema();
@@ -137,6 +137,7 @@ public sealed class EventSchemaDocSyncTests
             "work_item.plan_review",
             "work_item.plan_approved",
             "audit.auditor_timed_out",
+            "quota.reset_optimal",
         };
 
         Assert.All(schema.Envelope.Values, field =>
@@ -157,6 +158,7 @@ public sealed class EventSchemaDocSyncTests
         Assert.Equal("1.5", schema.EventTypes["work_item.plan_review"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["work_item.plan_approved"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["audit.auditor_timed_out"].IntroducedIn);
+        Assert.Equal("1.6", schema.EventTypes["quota.reset_optimal"].IntroducedIn);
     }
 
     private static IReadOnlyDictionary<string, string> ParseDocEventTypeVersions(string doc)
