@@ -138,6 +138,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // Per-agent concurrency-cap gate (extracted). Owns the IsAtAgentCap /
     // GetCapSafe / GetRunningSafe cluster; PipelineRunner delegates to it.
     private readonly AgentConcurrencyGate _concurrencyGate;
+    // Intermediate webhook/event publishing (extracted). Owns the
+    // TryPublishEventAsync / Publish*Iteration/Audit/Merge cluster;
+    // PipelineRunner delegates to it.
+    private readonly PipelineWebhookPublisher _webhookPublisher;
     // In-VM agentic conflict resolver. Mid-rebase / mid-merge conflicts are
     // resolved by invoking the configured agent's normal CLI inside the same
     // sandbox via IAgentRunner.RunAsync — supersedes the old text-only LLM
@@ -471,6 +475,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _concurrencySnapshot = agentConcurrencySnapshot
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _concurrencyGate = new AgentConcurrencyGate(_agentRunningCounters, _concurrencySnapshot);
+        _webhookPublisher = new PipelineWebhookPublisher(_store, _webhooks, _gitHost, _log);
         _preMergeVerifier = preMergeVerifier;
         _requiredBuildVerifier = requiredBuildVerifier
             ?? throw new ArgumentNullException(
@@ -20836,161 +20841,45 @@ Original merge-phase failure (JSON string, for context only):
                 thresholdMinutes, phase);
     }
 
-    // ── Intermediate webhook events ──────────────────────────────────────────
+    // ── Intermediate webhook events (delegated) ─────────────────────────────
     //
-    // Fire-and-forget signals that surface intra-pipeline progress to webhook
-    // subscribers (work-item.* terminal events still cover the boundary
-    // outcomes). The publishes are best-effort: dispatcher/store failures must
-    // NEVER bubble out of the pipeline, so TryPublishEventAsync swallows them
-    // and logs at Debug. Cancellation is the exception — when the caller's
-    // token fires we rethrow so the pipeline can unwind for shutdown rather
-    // than absorbing the signal.
+    // Owned by PipelineWebhookPublisher; the one-line forwarders below keep
+    // the existing intra-pipeline call-sites unchanged. See the collaborator
+    // for the best-effort/cancellation contract.
 
-    /// <summary>Explicit map from <see cref="AuditSeverity"/> to the wire string
-    /// documented in webhooks.md. Keeps the contract stable independently of
-    /// any future enum rename.</summary>
-    private static string ToWireSeverity(AuditSeverity s) => s switch
-    {
-        AuditSeverity.Info => "Info",
-        AuditSeverity.Warning => "Warning",
-        AuditSeverity.Error => "Error",
-        _ => s.ToString(),
-    };
-
-    private async Task TryPublishEventAsync(WorkItem item, Project project, string eventName, object details, CancellationToken ct)
-    {
-        try
-        {
-            var current = await _store.GetAsync(item.Id, ct) ?? item;
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = eventName,
-                WorkItem = current,
-                Project = project,
-                Details = details,
-            }, CancellationToken.None);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex, "{Event} webhook publish failed for {Id}", eventName, item.Id);
-        }
-    }
+    private Task TryPublishEventAsync(WorkItem item, Project project, string eventName, object details, CancellationToken ct)
+        => _webhookPublisher.TryPublishEventAsync(item, project, eventName, details, ct);
 
     private Task PublishIterationStartedAsync(
         WorkItem item, Project project, string phase, int iteration, CancellationToken ct)
-    {
-        // Capture the timestamp at the call site (before the store read inside
-        // TryPublishEventAsync) so DispatchedAt is the actual dispatch moment.
-        var dispatchedAt = DateTimeOffset.UtcNow;
-        return TryPublishEventAsync(item, project, "iteration.started", new IterationStartedDetails
-        {
-            WorkItemId = item.Id.ToString(),
-            Iteration = iteration,
-            Phase = phase,
-            DispatchedAt = dispatchedAt,
-        }, ct);
-    }
+        => _webhookPublisher.PublishIterationStartedAsync(item, project, phase, iteration, ct);
 
-    private async Task PublishIterationCompletedAsync(
+    private Task PublishIterationCompletedAsync(
         WorkItem item, Project project, string phase, int iteration,
         string repoId, string workBranch, DateTimeOffset startedAt, CancellationToken ct)
-    {
-        var commitSha = await TryResolveBranchTipAsync(repoId, workBranch, ct);
-        var durationMs = (long)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-        await TryPublishEventAsync(item, project, "iteration.completed", new IterationCompletedDetails
-        {
-            WorkItemId = item.Id.ToString(),
-            Iteration = iteration,
-            Phase = phase,
-            CommitSha = commitSha,
-            DurationMs = durationMs,
-        }, ct);
-    }
+        => _webhookPublisher.PublishIterationCompletedAsync(item, project, phase, iteration, repoId, workBranch, startedAt, ct);
 
     private Task PublishAuditStartedAsync(
         WorkItem item, Project project, int iteration, IReadOnlyList<IAuditor> auditors, CancellationToken ct)
-    {
-        return TryPublishEventAsync(item, project, "audit.started", new AuditStartedDetails
-        {
-            WorkItemId = item.Id.ToString(),
-            Iteration = iteration,
-            AuditorsScheduled = auditors.Select(a => a.Name).ToList(),
-        }, ct);
-    }
+        => _webhookPublisher.PublishAuditStartedAsync(item, project, iteration, auditors, ct);
 
     private Task PublishAuditFindingsEmittedAsync(
         WorkItem item, Project project, int iteration,
         IReadOnlyList<AuditFinding> findings, int blocking, int nonBlocking, CancellationToken ct)
-    {
-        var payload = findings.Select(f => new AuditFindingPayload
-        {
-            Auditor = f.AuditorName,
-            Severity = ToWireSeverity(f.Severity),
-            Title = f.Title,
-            Location = f.Location,
-            Description = f.Description,
-        }).ToList();
-        return TryPublishEventAsync(item, project, "audit.findings.emitted", new AuditFindingsEmittedDetails
-        {
-            WorkItemId = item.Id.ToString(),
-            Iteration = iteration,
-            Findings = payload,
-            Blocking = blocking,
-            NonBlocking = nonBlocking,
-        }, ct);
-    }
+        => _webhookPublisher.PublishAuditFindingsEmittedAsync(item, project, iteration, findings, blocking, nonBlocking, ct);
 
     private Task PublishAuditCompletedAsync(
         WorkItem item, Project project, int iteration, string verdict, DateTimeOffset startedAt, CancellationToken ct)
-    {
-        var durationMs = (long)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-        return TryPublishEventAsync(item, project, "audit.completed", new AuditCompletedDetails
-        {
-            WorkItemId = item.Id.ToString(),
-            Iteration = iteration,
-            Verdict = verdict,
-            DurationMs = durationMs,
-        }, ct);
-    }
+        => _webhookPublisher.PublishAuditCompletedAsync(item, project, iteration, verdict, startedAt, ct);
 
     private Task PublishMergeStartedAsync(
         WorkItem item, Project project, string baseBranch, string workBranch, CancellationToken ct)
-    {
-        return TryPublishEventAsync(item, project, "merge.started", new MergeStartedDetails
-        {
-            WorkItemId = item.Id.ToString(),
-            BaseBranch = baseBranch,
-            WorkBranch = workBranch,
-        }, ct);
-    }
+        => _webhookPublisher.PublishMergeStartedAsync(item, project, baseBranch, workBranch, ct);
 
     private Task PublishMergeCompletedAsync(
         WorkItem item, Project project, string baseBranch, string workBranch,
         string? mergeSha, CancellationToken ct)
-    {
-        return TryPublishEventAsync(item, project, "merge.completed", new MergeCompletedDetails
-        {
-            WorkItemId = item.Id.ToString(),
-            BaseBranch = baseBranch,
-            WorkBranch = workBranch,
-            MergeSha = mergeSha,
-        }, ct);
-    }
-
-    private async Task<string?> TryResolveBranchTipAsync(string repoId, string branch, CancellationToken ct)
-    {
-        try { return await _gitHost.ResolveCommitAsync(repoId, branch, ct); }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex, "Failed to resolve commit SHA for branch {Branch} in repo {Repo}", branch, repoId);
-            return null;
-        }
-    }
+        => _webhookPublisher.PublishMergeCompletedAsync(item, project, baseBranch, workBranch, mergeSha, ct);
 
     /// <summary>
     /// Opens a per-phase trace span and records the phase wall-clock duration to
