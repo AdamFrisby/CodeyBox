@@ -218,7 +218,12 @@ public static class FlakeAdmissionEvaluator
                 $"with no parseable test names — non-deterministic outcome blocks the merge");
         }
 
-        var shown = flakyTestNames.Take(maxNames);
+        // Agent-controlled test names flow into LastError/logs and the operator
+        // terminal, so strip terminal control characters (and secret tokens)
+        // at this sink before joining, matching SummariseOutput redaction.
+        var shown = flakyTestNames
+            .Select(static name => RawOutputRedactor.Redact(name ?? string.Empty))
+            .Take(maxNames);
         var suffix = flakyTestNames.Count > maxNames
             ? string.Create(CultureInfo.InvariantCulture, $" (and {flakyTestNames.Count - maxNames} more)")
             : string.Empty;
