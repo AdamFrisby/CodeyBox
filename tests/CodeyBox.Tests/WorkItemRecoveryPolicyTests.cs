@@ -615,6 +615,100 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Theory]
+    [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.UpstreamPushing, WorkItemState.Merged)]
+    [InlineData(WorkItemState.Planning, WorkItemState.Queued)]
+    [InlineData(WorkItemState.WorkComplete, WorkItemState.WorkComplete)]
+    public void HostShutdownInterrupted_MapsToResumePoint_WithoutConsumingRecoveryAttempt(
+        WorkItemState from,
+        WorkItemState to)
+    {
+        var item = MakeItem(from) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            RecoveryAttempts = 2,
+            RecoveryAttemptSourceState = WorkItemState.Queued,
+        };
+
+        var interrupted = WorkItemRecoveryPolicy.BuildHostShutdownInterruptedState(
+            item, DateTimeOffset.UtcNow);
+
+        Assert.NotNull(interrupted);
+        Assert.Equal(to, interrupted!.State);
+        Assert.Equal(2, interrupted.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Queued, interrupted.RecoveryAttemptSourceState);
+        Assert.Contains("interrupted by host shutdown", interrupted.LastError);
+    }
+
+    [Fact]
+    public void HostShutdownInterrupted_WorkingWithoutBoundary_RequeuesFresh()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+        };
+
+        var interrupted = WorkItemRecoveryPolicy.BuildHostShutdownInterruptedState(
+            item, DateTimeOffset.UtcNow);
+
+        Assert.NotNull(interrupted);
+        Assert.Equal(WorkItemState.Queued, interrupted!.State);
+        Assert.Null(interrupted.StartedAt);
+        Assert.Equal(0, interrupted.RecoveryAttempts);
+    }
+
+    [Fact]
+    public void HostShutdownInterrupted_WorkingWithAgentTurnBoundary_KeepsCheckpointWithoutCounting()
+    {
+        var item = WithRetainedSandboxBoundary(MakeItem(WorkItemState.Working)) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+        };
+
+        var interrupted = WorkItemRecoveryPolicy.BuildHostShutdownInterruptedState(
+            item, DateTimeOffset.UtcNow);
+
+        Assert.NotNull(interrupted);
+        Assert.Equal(WorkItemState.Working, interrupted!.State);
+        Assert.NotNull(interrupted.AgentTurnResumeCheckpoint);
+        Assert.Null(interrupted.StartedAt);
+        Assert.Equal(0, interrupted.RecoveryAttempts);
+        Assert.Contains("interrupted by host shutdown", interrupted.LastError);
+    }
+
+    [Fact]
+    public void HostShutdownInterrupted_SuspendedItem_IsLeftAlone()
+    {
+        var item = MakeItem(WorkItemState.Auditing) with { SuspendedVmName = "vm-1" };
+
+        Assert.Null(WorkItemRecoveryPolicy.BuildHostShutdownInterruptedState(
+            item, DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void HostShutdownInterrupted_RerunnableCheckAndActWorking_IsLeftAlone()
+    {
+        var item = MakeItem(WorkItemState.Working) with { JobType = JobType.CheckAndAct };
+
+        Assert.Null(WorkItemRecoveryPolicy.BuildHostShutdownInterruptedState(
+            item, DateTimeOffset.UtcNow));
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Queued)]
+    [InlineData(WorkItemState.Done)]
+    [InlineData(WorkItemState.Failed)]
+    [InlineData(WorkItemState.Cancelled)]
+    [InlineData(WorkItemState.NeedsOperatorInput)]
+    public void HostShutdownInterrupted_NonInflightState_ReturnsNull(WorkItemState state)
+    {
+        Assert.Null(WorkItemRecoveryPolicy.BuildHostShutdownInterruptedState(
+            MakeItem(state), DateTimeOffset.UtcNow));
+    }
+
+    [Theory]
     [InlineData(WorkItemState.Planning, WorkItemState.Queued)]
     [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview)]
     [InlineData(WorkItemState.PlanApproved, WorkItemState.PlanApproved)]

@@ -3891,7 +3891,8 @@ builder.Services.AddHostedService(sp =>
         sp.GetRequiredService<ILogger<SandboxShutdownTeardownService>>(),
         nonSuspendTeardownTimeout: TimeSpan.FromSeconds(Math.Max(1, shutdown.GraceSeconds)),
         dispatchGate: sp.GetService<IShutdownDispatchGate>(),
-        teardownModeAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownMode);
+        teardownModeAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownMode,
+        teardownBudgetAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownTimeout);
 });
 // Startup reconciler is registered before the resume handler and runs as a
 // background sweep so Multipass recovery cannot keep Kestrel offline. It skips
@@ -6360,6 +6361,28 @@ namespace CodeyBox.Api
         /// delete-and-purge teardown.
         /// </summary>
         public SandboxTeardownMode SandboxTeardownMode { get; set; } = SandboxTeardownMode.Stop;
+
+        /// <summary>
+        /// Overall budget for the Stop/Dispose per-VM teardown fan-out during
+        /// graceful shutdown. In-flight items are checkpointed to the state DB
+        /// BEFORE any VM call, so VMs still running when this budget expires
+        /// are simply left for the next boot's startup reconciliation and
+        /// stranded-item recovery — the process exits instead of blocking past
+        /// the service manager's stop timeout (systemd SIGKILLs past
+        /// <c>TimeoutStopSec</c>, which corrupts in-flight phases). Default 20
+        /// seconds: with the default 60 second <see cref="GraceSeconds"/>
+        /// drain, worst-case shutdown stays well under a 90 second stop
+        /// timeout. Raise it only together with the stop timeout, keeping
+        /// teardown budget + drain + a few seconds of reserve under the limit.
+        /// Hot-reloadable: read when graceful shutdown begins.
+        /// Bound from <c>CodeyBox:Shutdown:SandboxTeardownTimeout</c>.
+        /// Applies to Stop/Dispose only; Suspend keeps its RAM-scaled per-VM
+        /// timeouts by design (its pre-suspend mapping already guarantees
+        /// recoverability, and aborting a snapshot early would defeat the
+        /// opt-in state-preservation contract).
+        /// </summary>
+        public TimeSpan SandboxTeardownTimeout { get; set; } =
+            SandboxShutdownTeardownService.DefaultTeardownBudget;
     }
 
     /// <summary>

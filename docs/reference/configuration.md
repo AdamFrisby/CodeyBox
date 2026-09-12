@@ -145,9 +145,10 @@ Hot-reloadable today:
   `AuditReportRetentionService` sweep. The Serilog rolling-file sink pins
   retention at startup though, so log-file retention continues to require a
   restart.
-- `Shutdown.SandboxTeardownMode` — re-read when graceful shutdown teardown
-  begins. Operators can switch between `Stop`, `Suspend`, and `Dispose` before
-  stopping the process, and that shutdown uses the updated mode.
+- `Shutdown.SandboxTeardownMode` and `Shutdown.SandboxTeardownTimeout` — re-read
+  when graceful shutdown teardown begins. Operators can switch between `Stop`,
+  `Suspend`, and `Dispose`, or adjust the Stop/Dispose teardown budget, before
+  stopping the process, and that shutdown uses the updated values.
 - `Smoke.Enabled` — hot-reloaded through `SmokeOptionsSnapshot`; disables the
   pickup credential gate, router smoke exclusions, and in-VM smoke gate.
 - `TestFailureAttribution.Enabled` — hot-reloaded through
@@ -554,7 +555,8 @@ that were suspended by the previous process.
   "SandboxResumeMode": "Background",
   "SandboxResumeTimeout": "00:10:00",
   "SandboxAdoptionDeadlineSeconds": 1800,
-  "SandboxTeardownMode": "Stop"
+  "SandboxTeardownMode": "Stop",
+  "SandboxTeardownTimeout": "00:00:20"
 }
 ```
 
@@ -565,6 +567,7 @@ that were suspended by the previous process.
 | `SandboxResumeTimeout` | `00:10:00` | Caller-side cap for each persisted VM resume call. On timeout, suspend bookkeeping is cleared and normal recovery/leak handling proceeds. |
 | `SandboxAdoptionDeadlineSeconds` | `1800` | Max wait for an adopted in-VM agent to finish after its VM resumes. |
 | `SandboxTeardownMode` | `Stop` | `Stop`, `Suspend`, or `Dispose` for in-flight worker sandboxes during graceful shutdown. `Suspend` is opt-in because it writes a RAM snapshot. |
+| `SandboxTeardownTimeout` | `00:00:20` | Overall budget for the Stop/Dispose per-VM teardown fan-out. In-flight items are checkpointed to the state DB before any VM call, so VMs still running when the budget expires are left for startup reconciliation on next boot instead of blocking past the service manager's stop timeout. Keep budget + drain (`GraceSeconds`) + reserve under `TimeoutStopSec`. Not applied to `Suspend`. |
 
 ## `AgentClasses`
 

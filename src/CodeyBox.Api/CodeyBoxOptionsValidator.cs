@@ -285,6 +285,13 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds must be > 0 and <= {(int)SandboxStartupResumePolicy.MaximumAdoptionDeadline.TotalSeconds}");
         }
 
+        if (options.Shutdown.SandboxTeardownTimeout <= TimeSpan.Zero
+            || options.Shutdown.SandboxTeardownTimeout > SandboxShutdownTeardownService.MaxTeardownBudget)
+        {
+            failures.Add(
+                $"CodeyBox:Shutdown:SandboxTeardownTimeout must be a positive TimeSpan <= {SandboxShutdownTeardownService.MaxTeardownBudget}");
+        }
+
         try
         {
             options.WorkerPoolHealthWatchdog.Validate();
