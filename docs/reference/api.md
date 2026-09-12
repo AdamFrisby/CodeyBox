@@ -483,6 +483,54 @@ such as `plan` or `code`.
 * Returns `404 Not Found` when the work item, target, iteration, or auditor row
   does not exist, or when `raw_output` is `NULL` for that row.
 
+### `GET /audit/test-selection/soundness`
+
+Read-only soundness report over the accumulated `csharp:test-pass` shadow
+telemetry — the shared validation harness every selector (project-graph,
+coverage, and later ones) reports through. Over the last N audits it answers
+(1) the **unsafe-skip count** (times the selector would have deselected a test
+that actually FAILED — must be ~0 to be safe) and (2) the **wall-clock /
+test-count that would have been saved**. Selector-agnostic: `selector` is an
+optional exact (case-insensitive) match, and `bySelector` always breaks down
+every selector present in the window.
+
+```json
+{
+  "windowSize": 100,
+  "evaluatedCount": 42,
+  "selectorFilter": null,
+  "unsafeSkipCount": 0,
+  "safeCount": 30,
+  "fullSuiteCount": 10,
+  "unverifiableCount": 2,
+  "totalTestsSaved": 360,
+  "estimatedSavedMs": 180000,
+  "bySelector": [
+    { "selector": "coverage", "runs": 42, "unsafeSkipCount": 0, "safeCount": 30, "testsSaved": 360, "estimatedSavedMs": 180000 }
+  ],
+  "gate": {
+    "maxAllowedUnsafeSkips": 0,
+    "calibrationWindowSize": 100,
+    "assessableCount": 30,
+    "readyForEnforcement": false,
+    "reason": "calibration incomplete: 30/100 assessable runs — selection must stay shadow-only"
+  }
+}
+```
+
+Query parameters: `limit` (default 100, clamped to
+`Audit:TestSelection:Soundness:MaxLimit`) selects how many of the most recent
+telemetry-carrying reports form the window; `selector` narrows evaluation to
+one selector. Only reports with a persisted `testSelection` block are
+evaluated — rows without telemetry are excluded, never counted as safe.
+
+**Enforce-readiness gate:** no layer may switch from shadow to enforcing until
+`gate.readyForEnforcement` is `true` — zero unsafe skips across
+`calibrationWindowSize` assessable (`safe` + `unsafe`) runs. `full-suite` and
+`unverifiable` runs carry no safety evidence. Branch on the boolean, not on
+prose. Full gate semantics: `docs/quality/audit.md` ("Test-selection
+soundness").
+
 ### Agent Streams
 
 Structured agent stdout streams are captured when

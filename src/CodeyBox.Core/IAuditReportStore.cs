@@ -84,4 +84,17 @@ public interface IAuditReportStore
 
     /// <summary>Deletes rows whose started_at is strictly before <paramref name="cutoff"/>.</summary>
     Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the most recent reports carrying test-selection telemetry
+    /// (the persisted shadow verdicts), newest first, capped at
+    /// <paramref name="limit"/> rows. The cap is enforced in storage so a
+    /// soundness report over audit history cannot buffer an unbounded slice.
+    /// The default implementation returns no rows; stores with telemetry
+    /// persistence override it.
+    /// </summary>
+    Task<IReadOnlyList<AuditReport>> GetRecentTestSelectionAsync(
+        int limit,
+        CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<AuditReport>>([]);
 }

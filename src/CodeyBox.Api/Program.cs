@@ -339,6 +339,14 @@ builder.Services.AddOptions<CoverageTestSelectionOptions>()
     .Validate(
         static opts => CoverageTestSelectionOptions.IsValid(opts),
         $"{CoverageTestSelectionOptions.SectionName} is invalid");
+// Soundness-report knobs (Audit:TestSelection:Soundness). Bound through
+// AddOptions so IOptionsMonitor<TestSelectionSoundnessOptions> hot-reloads
+// the calibration window and the report limit bound without a restart.
+builder.Services.AddOptions<TestSelectionSoundnessOptions>()
+    .Bind(builder.Configuration.GetSection(TestSelectionSoundnessOptions.SectionName))
+    .Validate(
+        static opts => TestSelectionSoundnessOptions.IsValid(opts),
+        $"{TestSelectionSoundnessOptions.SectionName} is invalid");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
@@ -4264,6 +4272,7 @@ ResetCreditEndpoints.Map(app);
 ResetAdviceEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 AgentPauseEndpoints.Map(app);
+TestSelectionSoundnessEndpoints.Map(app);
 
 // Prometheus scrape endpoint — registered only when the exporter is enabled
 // so the surface is invisible (route not on the table) by default. Mapped
