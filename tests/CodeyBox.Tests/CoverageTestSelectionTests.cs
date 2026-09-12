@@ -241,6 +241,8 @@ public sealed class CoverageTestSelectionTests
             new CoverageTestSelectionOptions { MaxBaselineAge = TimeSpan.Zero }));
         Assert.False(CoverageTestSelectionOptions.IsValid(
             new CoverageTestSelectionOptions { GlobalDirectoryPrefixes = ["noprefix"] }));
+        Assert.False(CoverageTestSelectionOptions.IsValid(
+            new CoverageTestSelectionOptions { MaxDiffBytes = 0 }));
     }
 
     // ---- Project-graph selector.
@@ -774,6 +776,85 @@ public sealed class CoverageTestSelectionTests
         Assert.Equal(2, file.ChangedRanges.Count);
         Assert.Equal(new ChangedLineRange(10, 2), file.ChangedRanges[0]);
         Assert.Equal(new ChangedLineRange(20, 1), file.ChangedRanges[1]);
+    }
+
+    [Fact]
+    public async Task ShadowIO_DiffExecs_AreByteCappedFromOptions()
+    {
+        var seenCaps = new List<int?>();
+        var sandbox = new FakeSandbox(exec =>
+        {
+            seenCaps.Add(exec.MaxStdoutBytes);
+            return new SandboxExecResult(0, DiffChangingLine10, "");
+        });
+        var options = new CoverageTestSelectionOptions { MaxDiffBytes = 12345 };
+
+        var files = await TestSelectionShadowIO.GetChangedFilesAsync(
+            sandbox, "/work", "main", () => options);
+
+        Assert.Single(files);
+        Assert.Single(seenCaps);
+        Assert.All(seenCaps, cap => Assert.Equal(12345, cap));
+    }
+
+    [Fact]
+    public async Task ShadowIO_FallbackDiffExec_IsAlsoCapped()
+    {
+        var seenCaps = new List<int?>();
+        var calls = 0;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            seenCaps.Add(exec.MaxStdoutBytes);
+            calls++;
+            // First (origin/...) attempt fails so the bare-branch fallback runs.
+            return calls == 1
+                ? new SandboxExecResult(1, "", "no origin")
+                : new SandboxExecResult(0, DiffChangingLine10, "");
+        });
+        var options = new CoverageTestSelectionOptions { MaxDiffBytes = 12345 };
+
+        var files = await TestSelectionShadowIO.GetChangedFilesAsync(
+            sandbox, "/work", "main", () => options);
+
+        Assert.Single(files);
+        Assert.Equal(2, seenCaps.Count);
+        Assert.All(seenCaps, cap => Assert.Equal(12345, cap));
+    }
+
+    [Fact]
+    public async Task ShadowIO_OverCapDiff_FallsBackToUnknownChangeset()
+    {
+        // Sandbox reports an over-limit diff as unsuccessful (Success is false
+        // when OutputLimitExceeded); the hook must yield no files so the
+        // selectors fall back to the full suite.
+        var sandbox = new FakeSandbox(exec =>
+            new SandboxExecResult(0, "truncated", "", StdoutLimitExceeded: true));
+        var options = new CoverageTestSelectionOptions { MaxDiffBytes = 16 };
+
+        var files = await TestSelectionShadowIO.GetChangedFilesAsync(
+            sandbox, "/work", "main", () => options);
+
+        Assert.Empty(files);
+    }
+
+    [Fact]
+    public async Task ShadowIO_ThrowingOptionsAccessor_StillCapsDiff()
+    {
+        var seenCaps = new List<int?>();
+        var sandbox = new FakeSandbox(exec =>
+        {
+            seenCaps.Add(exec.MaxStdoutBytes);
+            return new SandboxExecResult(0, DiffChangingLine10, "");
+        });
+        Func<CoverageTestSelectionOptions> throwing = () => throw new InvalidOperationException("options down");
+
+        var files = await TestSelectionShadowIO.GetChangedFilesAsync(
+            sandbox, "/work", "main", throwing);
+
+        Assert.Single(files);
+        Assert.Single(seenCaps);
+        Assert.All(seenCaps, cap => Assert.Equal(
+            (int)CoverageTestSelectionOptions.DefaultMaxDiffBytes, cap));
     }
 
     /// <summary>Minimal host booting the real composition root for DI tests.</summary>

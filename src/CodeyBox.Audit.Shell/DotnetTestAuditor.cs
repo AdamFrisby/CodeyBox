@@ -122,7 +122,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         CancellationToken ct)
     {
         var changedFiles = await TestSelectionShadowIO.GetChangedFilesAsync(
-            sandbox, workingDirectory, context.BaseBranch, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, context.BaseBranch, shadow.OptionsAccessor, ct).ConfigureAwait(false);
         var baseline = await TestSelectionShadowIO.ReadBaselineAsync(
             sandbox, workingDirectory, shadow.OptionsAccessor, ct).ConfigureAwait(false);
 

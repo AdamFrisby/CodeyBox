@@ -23,25 +23,34 @@ public static class TestSelectionShadowIO
 {
     /// <summary>
     /// Enumerates the changed files (with line ranges) for the shadow request.
-    /// A git-diff failure yields an empty list — the selectors treat that as
-    /// "changeset unknown" and fall back to the full suite (fail-safe).
+    /// A git-diff failure — including an over-cap diff, which the sandbox
+    /// reports as unsuccessful — yields an empty list. The selectors treat
+    /// that as "changeset unknown" and fall back to the full suite (fail-safe).
+    /// The diff stdout is bounded by the hot-reloadable
+    /// <c>CoverageTestSelectionOptions.MaxDiffBytes</c> cap so a huge
+    /// generated-artifact diff cannot exhaust audit-host memory.
     /// </summary>
     public static async Task<IReadOnlyList<TestSelectionChangedFile>> GetChangedFilesAsync(
         ISandbox sandbox,
         string workingDirectory,
         string baseBranch,
-        CancellationToken ct)
+        Func<CoverageTestSelectionOptions> optionsAccessor,
+        CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(workingDirectory);
+        ArgumentNullException.ThrowIfNull(optionsAccessor);
 
         if (string.IsNullOrWhiteSpace(baseBranch))
             return [];
+
+        var maxDiffBytes = ResolveMaxDiffBytes(optionsAccessor);
 
         var diff = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["git", "-C", workingDirectory, "diff", "--unified=0", "--no-color",
                     "--end-of-options", $"origin/{baseBranch}...HEAD"],
+            MaxStdoutBytes = maxDiffBytes,
         }, ct).ConfigureAwait(false);
 
         if (!diff.Success)
@@ -50,6 +59,7 @@ public static class TestSelectionShadowIO
             {
                 Argv = ["git", "-C", workingDirectory, "diff", "--unified=0", "--no-color",
                         "--end-of-options", $"{baseBranch}...HEAD"],
+                MaxStdoutBytes = maxDiffBytes,
             }, ct).ConfigureAwait(false);
         }
 
@@ -57,6 +67,22 @@ public static class TestSelectionShadowIO
             return [];
 
         return ToChangedFiles(UnifiedDiffParser.ParseAddedLines(diff.Stdout));
+    }
+
+    private static int ResolveMaxDiffBytes(Func<CoverageTestSelectionOptions> optionsAccessor)
+    {
+        try
+        {
+            var options = optionsAccessor();
+            if (options is not null && options.MaxDiffBytes > 0)
+                return (int)Math.Min(options.MaxDiffBytes, int.MaxValue);
+        }
+        catch (Exception)
+        {
+            // A hot-reloaded invalid accessor must never leave the diff
+            // unbounded: fall through to the default cap (fail-safe).
+        }
+        return (int)Math.Min(CoverageTestSelectionOptions.DefaultMaxDiffBytes, int.MaxValue);
     }
 
     /// <summary>

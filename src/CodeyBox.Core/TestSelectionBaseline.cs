@@ -336,6 +336,16 @@ public sealed class CoverageTestSelectionOptions
     public long MaxBaselineCoveredLines { get; set; } = 10_000_000;
 
     /// <summary>
+    /// Max bytes buffered from the <c>git diff</c> shadow enumeration. Bounds
+    /// the host-memory buffering of a potentially huge generated-artifact diff;
+    /// over-limit fails safe to "changeset unknown" (full suite). Default 8 MiB.
+    /// </summary>
+    public long MaxDiffBytes { get; set; } = DefaultMaxDiffBytes;
+
+    /// <summary>Default <see cref="MaxDiffBytes"/> (8 MiB).</summary>
+    public const long DefaultMaxDiffBytes = 8L * 1024 * 1024;
+
+    /// <summary>
     /// File NAMES (ordinals, case-sensitive) that are global build targets: a
     /// change to any file with one of these names falls back to the full suite.
     /// </summary>
@@ -376,6 +386,8 @@ public sealed class CoverageTestSelectionOptions
         if (options.MaxBaselineAge <= TimeSpan.Zero)
             return false;
         if (options.MaxBaselineBytes <= 0 || options.MaxBaselineTests <= 0 || options.MaxBaselineCoveredLines <= 0)
+            return false;
+        if (options.MaxDiffBytes <= 0)
             return false;
         if (options.GlobalFileNames.Any(string.IsNullOrWhiteSpace))
             return false;
