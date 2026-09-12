@@ -257,6 +257,33 @@ public sealed class SqliteTestCaseStore : ITestCaseStore, IDisposable
         foreach (var row in rows) yield return row;
     }
 
+    public async IAsyncEnumerable<TestCase> ListByProjectAsync(ProjectId projectId, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var rows = new List<TestCase>();
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT t.*, w.project_id AS project_id FROM test_cases t
+                JOIN work_items w ON t.source_work_item_id = w.id
+                WHERE w.project_id = $pid
+                ORDER BY t.created_at ASC;
+                """;
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                rows.Add(Read(reader));
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        foreach (var row in rows) yield return row;
+    }
+
     public async Task<bool> DeleteAsync(string id, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
@@ -319,12 +346,23 @@ public sealed class SqliteTestCaseStore : ITestCaseStore, IDisposable
             kind = parsed;
         }
 
+        ProjectId? projectId = null;
+        for (var i = 0; i < r.FieldCount; i++)
+        {
+            if (string.Equals(r.GetName(i), "project_id", StringComparison.OrdinalIgnoreCase) && !r.IsDBNull(i))
+            {
+                projectId = new ProjectId(r.GetString(i));
+                break;
+            }
+        }
+
         return new TestCase
         {
             Id = r.GetString(r.GetOrdinal("id")),
             Name = r.GetString(r.GetOrdinal("name")),
             Description = r.GetString(r.GetOrdinal("description")),
             SourceWorkItemId = r.GetString(r.GetOrdinal("source_work_item_id")),
+            ProjectId = projectId,
             CreatedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("created_at")), System.Globalization.CultureInfo.InvariantCulture),
             UpdatedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("updated_at")), System.Globalization.CultureInfo.InvariantCulture),
             IsArchived = r.GetInt32(r.GetOrdinal("is_archived")) != 0,

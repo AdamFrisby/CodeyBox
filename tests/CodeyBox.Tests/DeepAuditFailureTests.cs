@@ -353,5 +353,18 @@ public sealed class DeepAuditFailureTests : IDisposable
             ReleaseId releaseId,
             CancellationToken ct = default)
             => _inner.ListAuditIterationsAsync(releaseId, ct);
+
+        public Task SaveE2eReplayResultsAsync(
+            ReleaseId releaseId,
+            int iteration,
+            IReadOnlyList<ReleaseE2eReplayResult> results,
+            CancellationToken ct = default)
+            => _inner.SaveE2eReplayResultsAsync(releaseId, iteration, results, ct);
+
+        public Task<IReadOnlyList<ReleaseE2eReplayResult>> ListE2eReplayResultsAsync(
+            ReleaseId releaseId,
+            int? iteration = null,
+            CancellationToken ct = default)
+            => _inner.ListE2eReplayResultsAsync(releaseId, iteration, ct);
     }
 }

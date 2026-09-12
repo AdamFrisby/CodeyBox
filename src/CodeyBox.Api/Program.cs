@@ -2727,6 +2727,15 @@ builder.Services.AddSingleton<ProjectMechanicalFixerComposer>();
 builder.Services.AddSingleton<IDeepAuditor, OwaspAsvsDeepAuditor>();
 builder.Services.AddSingleton<IDeepAuditor, ArchCoherenceDeepAuditor>();
 builder.Services.AddSingleton<IDeepAuditor, DepsCveScanDeepAuditor>();
+builder.Services.AddSingleton<IDeepAuditor>(sp => new E2eRegressionDeepAuditor(
+    sp.GetRequiredService<ITestCaseStore>(),
+    sp.GetRequiredService<IE2eExecutionPool>(),
+    sp.GetRequiredService<IE2eReplayRuntime>(),
+    sp.GetRequiredService<IReleaseStore>(),
+    sp.GetService<IE2eRunStore>(),
+    sp.GetService<E2eReplayArtifactAdmissionValidator>(),
+    sp.GetService<TimeProvider>() ?? TimeProvider.System,
+    sp.GetService<Microsoft.Extensions.Logging.ILogger<E2eRegressionDeepAuditor>>()));
 
 // --- Webhooks ----------------------------------------------------------------
 // AllowAutoRedirect=false prevents SSRF via HTTP 3xx redirects to private

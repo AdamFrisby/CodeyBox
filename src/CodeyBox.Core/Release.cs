@@ -92,4 +92,8 @@ public sealed record DeepAuditContext(
     /// Reasoning-mode hint passed to <see cref="AuditRunner"/>. The runner maps
     /// this onto the agent CLI's effort/reasoning flag.
     /// </summary>
-    string? ReasoningMode = null);
+    string? ReasoningMode = null,
+    /// <summary>
+    /// Optional configuration override for E2E regression testing during this deep audit.
+    /// </summary>
+    ReleaseE2eRegressionConfig? E2eRegressionConfig = null);

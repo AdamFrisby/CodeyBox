@@ -338,6 +338,24 @@ internal sealed class InMemoryTestCaseStore : ITestCaseStore
         }
     }
 
+    public Dictionary<string, ProjectId> WorkItemProjects { get; } = new(StringComparer.Ordinal);
+
+    public async IAsyncEnumerable<TestCase> ListByProjectAsync(
+        ProjectId projectId,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        foreach (var tc in _byId.Values.OrderBy(c => c.CreatedAt))
+        {
+            await Task.Yield();
+            if (tc.ProjectId == projectId)
+                yield return tc;
+            else if (WorkItemProjects.TryGetValue(tc.SourceWorkItemId, out var mapped) && mapped == projectId)
+                yield return tc;
+            else if (tc.ProjectId is null && WorkItemProjects.Count == 0)
+                yield return tc;
+        }
+    }
+
     public Task<bool> DeleteAsync(string id, CancellationToken ct = default)
         => Task.FromResult(_byId.Remove(id));
 }

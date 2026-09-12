@@ -1034,6 +1034,20 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             DeepAuditMaxIterations = c.DeepAuditMaxIterations ?? defaults.DeepAuditMaxIterations,
             CreateGitHubRelease = c.CreateGitHubRelease ?? defaults.CreateGitHubRelease,
             GitHubTagTemplate = c.GitHubTagTemplate ?? defaults.GitHubTagTemplate,
+            E2eRegression = ResolveE2eRegressionConfig(c.E2eRegression, defaults.E2eRegression),
+        };
+    }
+
+    private static ReleaseE2eRegressionConfig ResolveE2eRegressionConfig(
+        ReleaseE2eRegressionConfigOptions? opt,
+        ReleaseE2eRegressionConfig defaults)
+    {
+        if (opt is null) return defaults;
+        return new ReleaseE2eRegressionConfig
+        {
+            Enabled = opt.Enabled ?? defaults.Enabled,
+            Selection = opt.Selection ?? defaults.Selection,
+            Capabilities = opt.Capabilities is not null ? [.. opt.Capabilities] : defaults.Capabilities,
         };
     }
 

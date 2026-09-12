@@ -28,6 +28,7 @@ public sealed record TestCase
     public required string Name { get; init; }
     public required string Description { get; init; }
     public required string SourceWorkItemId { get; init; }
+    public ProjectId? ProjectId { get; init; }
 
     // Audit / archived fields
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
