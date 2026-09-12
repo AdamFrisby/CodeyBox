@@ -142,6 +142,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // TryPublishEventAsync / Publish*Iteration/Audit/Merge cluster;
     // PipelineRunner delegates to it.
     private readonly PipelineWebhookPublisher _webhookPublisher;
+    // Questions parking + suggestions pickup (extracted). Owns the
+    // TryParkForQuestionsAsync / TryReadSuggestionsFileAsync /
+    // PickUpSuggestionsAsync cluster; PipelineRunner delegates to it.
+    private readonly QuestionsSuggestionsParker _questionsSuggestions;
     // In-VM agentic conflict resolver. Mid-rebase / mid-merge conflicts are
     // resolved by invoking the configured agent's normal CLI inside the same
     // sandbox via IAgentRunner.RunAsync — supersedes the old text-only LLM
@@ -493,6 +497,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         _staleBaseReworkRouter = staleBaseReworkRouter;
+        _questionsSuggestions = new QuestionsSuggestionsParker(
+            _questionStore, _suggestions, _store, _webhooks, _pipelineTuning, _log,
+            (item, state, ct, project) => Transition(item, state, ct, project));
         // Wire the credential-file materialiser into the default resolver so
         // a cross-kind fallback candidate (whose file-based creds aren't yet on
         // disk in the sandbox the primary provisioned) can authenticate before
@@ -22100,63 +22107,9 @@ Original merge-phase failure (JSON string, for context only):
     /// the work item to NeedsOperatorInput if at least one new question was created.
     /// Returns true when the work item was parked; false otherwise.
     /// </summary>
-    private async Task<bool> TryParkForQuestionsAsync(
-        WorkItem item, Project project, string agentStdout, CancellationToken ct)
-    {
-        var parsed = QuestionParser.Parse(agentStdout, _log);
-        if (parsed.Count == 0) return false;
-
-        // Count existing questions to enforce the per-work-item cap.
-        var existing = await _questionStore!.ListByWorkItemAsync(item.Id.ToString(), ct);
-        var existingCount = existing.Count;
-
-        var newQuestions = new List<WorkItemQuestion>();
-        foreach (var p in parsed)
-        {
-            if (existingCount + newQuestions.Count >= _pipelineTuning.Current.MaxQuestionsPerWorkItem)
-            {
-                _log.LogWarning(
-                    "Work item {Id}: question cap ({Max}) reached; ignoring additional <codeybox-question> blocks",
-                    item.Id, _pipelineTuning.Current.MaxQuestionsPerWorkItem);
-                break;
-            }
-
-            var question = new WorkItemQuestion
-            {
-                Id = Guid.NewGuid().ToString(),
-                WorkItemId = item.Id.ToString(),
-                QuestionId = p.QuestionId,
-                QuestionText = p.QuestionText,
-                AskedAt = DateTimeOffset.UtcNow,
-            };
-
-            var created = await _questionStore.CreateIfNotExistsAsync(question, ct);
-            if (created)
-                newQuestions.Add(question);
-        }
-
-        if (newQuestions.Count == 0) return false;
-
-        // Transition to NeedsOperatorInput and fire one webhook per new question.
-        await Transition(item, WorkItemState.NeedsOperatorInput, ct, project);
-
-        foreach (var q in newQuestions)
-        {
-            AuditLog.WorkItemTransitioned(item.Id, $"question_asked:{q.QuestionId}");
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.question_asked",
-                WorkItem = await _store.GetAsync(item.Id, CancellationToken.None) ?? item,
-                Project = project,
-                Details = new QuestionAskedDetails(item.Id.ToString(), project.Id.Value, q.QuestionId, q.QuestionText),
-            }, CancellationToken.None);
-        }
-
-        _log.LogInformation(
-            "Work item {Id} parked at NeedsOperatorInput with {Count} open question(s)",
-            item.Id, newQuestions.Count);
-        return true;
-    }
+    private Task<bool> TryParkForQuestionsAsync(
+        WorkItem item, Project project, string agentStdout, CancellationToken ct) =>
+        _questionsSuggestions.TryParkForQuestionsAsync(item, project, agentStdout, ct);
 
     // ── Suggestion pickup ────────────────────────────────────────────────────
 
@@ -22165,89 +22118,16 @@ Original merge-phase failure (JSON string, for context only):
     /// directory. Returns the raw content string when the file exists and is
     /// within the 256 KB size limit; null otherwise.
     /// </summary>
-    private async Task<string?> TryReadSuggestionsFileAsync(ISandbox sandbox, CancellationToken ct)
-    {
-        const int MaxBytes = 256 * 1024;
-        const string SuggestionsPath = SandboxConventions.WorkDir + "/.codeybox/suggestions.json";
-
-        // Read at most MaxBytes+1 bytes at the source so the sandbox provider's
-        // stdout buffer is bounded before the size check fires (prevents OOM on
-        // a multi-gigabyte file written by a compromised agent).
-        var result = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["head", "-c", (MaxBytes + 1).ToString(), SuggestionsPath],
-        }, ct);
-
-        if (!result.Success) return null;
-
-        var byteCount = System.Text.Encoding.UTF8.GetByteCount(result.Stdout);
-        if (byteCount > MaxBytes)
-        {
-            _log.LogWarning("suggestions.json exceeds 256 KB ({Bytes} bytes); skipping", byteCount);
-            return null;
-        }
-
-        return result.Stdout;
-    }
+    private Task<string?> TryReadSuggestionsFileAsync(ISandbox sandbox, CancellationToken ct) =>
+        _questionsSuggestions.TryReadSuggestionsFileAsync(sandbox, ct);
 
     /// <summary>
     /// Parses raw suggestions JSON, persists valid entries, and fires one
     /// <c>work_item.suggestion</c> webhook per suggestion.
     /// </summary>
-    private async Task PickUpSuggestionsAsync(
-        WorkItem item, Project project, string rawJson, CancellationToken ct)
-    {
-        if (_suggestions is null) return;
-
-        var entries = SuggestionsFileParser.Parse(rawJson, _log);
-        if (entries.Count == 0) return;
-
-        foreach (var entry in entries)
-        {
-            var suggestion = new Suggestion
-            {
-                Id = Guid.NewGuid().ToString(),
-                SourceWorkItemId = item.Id.ToString(),
-                ProjectId = item.ProjectId.Value,
-                Title = entry.Title,
-                Rationale = entry.Rationale,
-                Category = entry.Category,
-                Severity = entry.Severity,
-                EstimatedEffort = entry.EstimatedEffort,
-                FilesReferenced = entry.FilesReferenced,
-                CreatedAt = DateTimeOffset.UtcNow,
-            };
-
-            try
-            {
-                await _suggestions.CreateAsync(suggestion, ct);
-                AuditLog.SuggestionCreated(suggestion.Id, suggestion.SourceWorkItemId, suggestion.ProjectId);
-                _log.LogInformation(
-                    "Suggestion {SuggestionId} persisted from work item {WorkItemId}: {Title}",
-                    suggestion.Id, item.Id, suggestion.Title.ReplaceLineEndings(" "));
-
-                await _webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = "work_item.suggestion",
-                    WorkItem = item,
-                    Project = project,
-                    Details = new SuggestionWebhookDetails(
-                        suggestion.Id,
-                        suggestion.Title,
-                        suggestion.Category,
-                        suggestion.Severity,
-                        suggestion.EstimatedEffort,
-                        suggestion.FilesReferenced),
-                }, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex,
-                    "Failed to persist or dispatch suggestion '{Title}' from work item {WorkItemId}; skipping",
-                    suggestion.Title.ReplaceLineEndings(" "), item.Id);
-            }
-        }
-    }
+    private Task PickUpSuggestionsAsync(
+        WorkItem item, Project project, string rawJson, CancellationToken ct) =>
+        _questionsSuggestions.PickUpSuggestionsAsync(item, project, rawJson, ct);
 
     private sealed class ActivityTrackingSandbox : ISandbox, ISandboxDecorator
     {
