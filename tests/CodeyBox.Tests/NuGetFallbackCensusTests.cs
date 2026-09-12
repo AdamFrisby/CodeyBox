@@ -158,6 +158,8 @@ public sealed class NuGetFallbackCensusTests : IDisposable
             };
             foreach (var (key, value) in environment)
                 process.StartInfo.Environment[key] = value;
+            if (!environment.ContainsKey(NuGetFallbackCache.FallbackPackagesEnvironmentVariable))
+                process.StartInfo.Environment.Remove(NuGetFallbackCache.FallbackPackagesEnvironmentVariable);
             Assert.True(process.Start(), "failed to start sh");
             var stdout = await process.StandardOutput.ReadToEndAsync();
             var stderr = await process.StandardError.ReadToEndAsync();
