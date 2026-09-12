@@ -268,6 +268,19 @@ failure signals win and the outcome stays a code finding.
 
 Capability: `None`.
 
+### Test-selection shadow (`Audit:TestSelection`)
+
+`csharp:test-pass` consults the configured `ITestSelector` only in
+`coverage-shadow` mode, and only on paper: it computes the advisory selection,
+still runs the FULL suite (the narrowed `--filter` argv is recorded, never
+executed), parses the full run's failed tests, and emits a shadow record
+(`safe-for-this-run` / `unsafe-skips-observed` / `full-suite` /
+`unverifiable`). Any selector error, missing/stale baseline, global-target
+touch, or sink failure falls back to — or otherwise preserves — the full run.
+`all` (the default) is an instant kill-switch. The merge/release path
+(`process:required-build`) never consults the selector. Full policy, baseline
+format, and staleness bound: `docs/quality/test-selection.md`.
+
 ### `process:build-script`
 
 Runs `./build.sh` from the work-branch repository root in the credential-free

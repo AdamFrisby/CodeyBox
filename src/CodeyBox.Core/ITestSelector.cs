@@ -41,7 +41,8 @@ public sealed record TestSelectionRequest
     public TestSelectionRequest(
         ITestRunnerAuditor testRunner,
         string baseRef,
-        IReadOnlyList<TestSelectionChangedFile> changedFiles)
+        IReadOnlyList<TestSelectionChangedFile> changedFiles,
+        TestSelectionBaseline? baseline = null)
     {
         ArgumentNullException.ThrowIfNull(testRunner);
         ArgumentNullException.ThrowIfNull(changedFiles);
@@ -51,6 +52,7 @@ public sealed record TestSelectionRequest
         TestRunner = testRunner;
         BaseRef = baseRef;
         ChangedFiles = changedFiles;
+        Baseline = baseline;
     }
 
     /// <summary>The test-runner capability whose suite is being narrowed.</summary>
@@ -66,6 +68,13 @@ public sealed record TestSelectionRequest
     /// selecting nothing.
     /// </summary>
     public IReadOnlyList<TestSelectionChangedFile> ChangedFiles { get; }
+
+    /// <summary>
+    /// The per-test coverage / project-graph baseline the coverage-guided
+    /// selectors narrow against. Null means "no baseline available" — a sound
+    /// selector must then fall back to <see cref="TestSelection.All"/>.
+    /// </summary>
+    public TestSelectionBaseline? Baseline { get; }
 }
 
 /// <summary>

@@ -33,6 +33,7 @@ public sealed class ProjectAuditorComposer
     private readonly IReadOnlyDictionary<string, IAuditor> _registeredAuditorsByName;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttributionOptions;
+    private readonly TestSelectionShadowConfig? _testSelectionShadow;
     private readonly ILogger<ProjectAuditorComposer> _logger;
     private readonly IReadOnlySet<string> _requiredAuditors;
 
@@ -66,13 +67,15 @@ public sealed class ProjectAuditorComposer
         Func<TestRunOptions>? testRunOptions = null,
         Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null,
         TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null,
-        RequiredAuditorPolicy? requiredAuditorPolicy = null)
+        RequiredAuditorPolicy? requiredAuditorPolicy = null,
+        TestSelectionShadowConfig? testSelectionShadow = null)
     {
         _catalog = catalog;
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _testRunOptions = testRunOptions;
         _planAdherenceOptions = planAdherenceOptions;
         _testFailureAttributionOptions = testFailureAttributionOptions;
+        _testSelectionShadow = testSelectionShadow;
         _logger = logger;
         _requiredAuditors = new HashSet<string>(
             requiredAuditorPolicy?.Names ?? [], StringComparer.OrdinalIgnoreCase);
@@ -297,7 +300,7 @@ public sealed class ProjectAuditorComposer
         // repo-preset-root projects still source blame-hang, the test-specific
         // idle timeout, and flake-attribution behaviour through the type;
         // dropping either here would silently fall back to defaults.
-        return new PresetCatalog(options, _testRunOptions, _testFailureAttributionOptions);
+        return new PresetCatalog(options, _testRunOptions, _testFailureAttributionOptions, _testSelectionShadow);
     }
 
     private static bool HasProjectPresetOverrides(Project project)
