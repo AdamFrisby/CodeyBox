@@ -68,6 +68,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `agent.claude_session_suspend_failed` | A Claude session worker could not suspend its VM. Details: `workItemId`, `sessionId`, error |
 | `agent.claude_session_close_failed` | A Claude session worker could not close its session. Details: `workItemId`, `sessionId`, error |
 | `sandbox.provisioning_deferred` | A sandbox launch was deferred by a provider-side condition. Details: `provider`, `operation`, `errorClass`, `resumeState`, `suggestedRetryAt` |
+| `quota.reset_optimal` | Reset-optimality advisor flipped to spend for a watched agent: it is a good time to spend a banked quota-reset credit (see [Details](#quotareset_optimal-details)) |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
 
@@ -77,7 +78,7 @@ Every event is a JSON object POSTed as the request body.
 
 ```json
 {
-  "eventSchemaVersion": "1.5",
+  "eventSchemaVersion": "1.6",
   "event": "work_item.audit_passed",
   "occurredAt": "2026-04-29T12:34:56.789+00:00",
   "workItem": {
@@ -914,6 +915,49 @@ stale; that is the intended signal that the operator's most recent rebase
 attempt did not resolve the conflict. On orchestrator restart the dedup
 state resets and a still-stale PR re-fires once, so trackers should be
 idempotent on `(projectId, prNumber, headSha)`.
+
+### `quota.reset_optimal` details
+
+Fired by the quota-reset notifier plugin (`codeybox.quota-reset-notifier`)
+when the reset-optimality advisor flips to `shouldSpend=true` for a watched
+agent: the current quota window is spent, the free natural reset lands after
+the decision deadline, and spending a banked reset credit before the deadline
+captures value. Report-only — no reset is triggered. `workItem`, `project`,
+and `usage` are null on this agent-level event. Delivery is HMAC-signed when
+the endpoint configures `SecretEnvVar` (see [Signing](#signing-hmac-sha256));
+de-duplicated to one ping per optimal window per agent (plus a configurable
+cooldown), so trackers should treat repeat deliveries with the same
+`optimalUntil` as at-least-once duplicates.
+
+```json
+{
+  "details": {
+    "agent": "codex",
+    "reason": "SpendBeforeDeadline",
+    "bankedCredits": 2,
+    "optimalUntil": "2026-08-01T00:00:00+00:00",
+    "optimalFrom": "2026-07-20T10:00:00+00:00",
+    "predictedNaturalReset": "2026-08-03T06:00:00+00:00",
+    "decisionDeadline": "2026-08-01T00:00:00+00:00",
+    "nextCreditExpiresAt": "2026-08-01T00:00:00+00:00",
+    "nextCreditIsEstimated": false,
+    "usableQuotaPct": 0.5
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `agent` | string | Agent the advice was evaluated for (e.g. `codex`) |
+| `reason` | string | Machine-readable reason name (always `SpendBeforeDeadline` on this event) |
+| `bankedCredits` | int\|null | Banked reset credits observed at evaluation; null when the credit estimator was unavailable |
+| `optimalUntil` | string (ISO-8601) | Latest instant spending still captures value — spend before this moment |
+| `optimalFrom` | string (ISO-8601)\|null | Earliest sensible spend instant |
+| `predictedNaturalReset` | string (ISO-8601)\|null | Predicted next natural reset used in the re-anchor comparison |
+| `decisionDeadline` | string (ISO-8601)\|null | `min(planEndsAt, nextCreditExpiresAt)` echoed for transparency |
+| `nextCreditExpiresAt` | string (ISO-8601)\|null | Advised spend-by of the soonest banked credit |
+| `nextCreditIsEstimated` | bool | True when the spend-by is an operator estimate — do not render the deadline as precise |
+| `usableQuotaPct` | number\|null | Usable quota percentage read from the snapshot |
 
 ## Request headers
 

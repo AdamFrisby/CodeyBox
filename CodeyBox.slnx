@@ -42,6 +42,7 @@
   <Folder Name="/plugins/">
     <Project Path="plugins/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <Project Path="plugins/CodeyBox.OpencodeGoQuotaPlugin/CodeyBox.OpencodeGoQuotaPlugin.csproj" />
+    <Project Path="plugins/CodeyBox.QuotaResetNotifier/CodeyBox.QuotaResetNotifier.csproj" />
     <Project Path="plugins/CodeyBox.StatisticsPlugin/CodeyBox.StatisticsPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">

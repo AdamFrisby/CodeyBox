@@ -474,6 +474,13 @@ curl 'http://orchestrator/quota/reset-advice?agent=codex'
 estimate (not an observed grant) and must not be rendered as a precise provider
 deadline.
 
+> **Getting pinged instead of polling:** the verdict above is report-only. To
+> receive a push notification when it flips to spend, enable the quota-reset
+> notifier plugin (`codeybox.quota-reset-notifier`) — it watches this verdict
+> on a schedule and fires an HMAC-signed `quota.reset_optimal` webhook event
+> once per optimal window. See
+> [`quota-reset-notifier.md`](quota-reset-notifier.md).
+
 ## Adding further metric streams
 
 Implement `IMetricSampler` and decorate the class with `[CodeyBoxPlugin]`

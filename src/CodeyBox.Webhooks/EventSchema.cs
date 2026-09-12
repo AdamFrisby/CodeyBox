@@ -22,6 +22,7 @@ public static class EventSchema
     private const string AgentPauseVersion = "1.3";
     private const string TransientRetryVersion = "1.4";
     private const string PlanningVersion = "1.5";
+    private const string QuotaResetOptimalVersion = "1.6";
 
     /// <summary>
     /// Returns the schema document. Plain value type so it serialises cleanly
@@ -61,7 +62,7 @@ public static class EventSchema
     private static string EventTypeIntroducedIn(string name)
         => name switch
         {
-            "upstream.pr_stale_base" => UpstreamPrStaleBaseVersion,
+            "quota.reset_optimal" => QuotaResetOptimalVersion,            "upstream.pr_stale_base" => UpstreamPrStaleBaseVersion,
             "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
             "work_item.waiting_for_transient_retry" => TransientRetryVersion,
             "agent.restore_requeue_swept"
@@ -81,6 +82,8 @@ public static class EventSchema
     /// </summary>
     public static readonly IReadOnlyList<string> KnownEventTypes =
     [
+        // Quota-reset advisory (notifier plugin — report-only, no reset triggered)
+        "quota.reset_optimal",
         // Queue-level
         "queue.paused",
         "queue.resumed",

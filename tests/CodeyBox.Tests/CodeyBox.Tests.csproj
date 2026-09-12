@@ -51,6 +51,7 @@
     <ProjectReference Include="..\..\plugins\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--
       Build dependency only: ensures CodeyBox.PluginSdk.SampleTests is compiled
