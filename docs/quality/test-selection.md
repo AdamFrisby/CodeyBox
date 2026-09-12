@@ -20,8 +20,10 @@ via `IOptionsMonitor`. An unrecognised value fails fast at load.
 ## Selectors
 
 - **Project-graph** (`ProjectGraphTestSelector`): maps each changed file to
-  its owning MSBuild project and selects the baseline's precomputed affected
-  tests, plus tests defined in the changed files.
+  its owning MSBuild project (via the baseline's `file → project` map, built
+  by walking the project-reference graph) and selects the baseline's
+  precomputed affected tests, plus tests defined in the changed files.
+  A change owned by an ALWAYS-FULL project forces the full suite (see below).
 - **Coverage** (`CoverageTestSelector`): selects tests whose recorded per-test
   coverage intersects the changed lines, and ALWAYS also selects tests defined
   in changed files, tests with NO coverage record (new/uninstrumented), and
@@ -30,9 +32,14 @@ via `IOptionsMonitor`. An unrecognised value fails fast at load.
 
 Both fall back to the full suite on ANY uncertainty: no/unknown changeset, no
 baseline, stale baseline, global targets (`Directory.Build.*`,
-`Directory.Packages.props`, `global.json`, `NuGet.Config`, `CodeyBox.slnx`,
+`Directory.Solution.*`, `Directory.Packages.props`, `global.json`,
+`NuGet.Config`, `appsettings*.json`, `CodeyBox.slnx`,
 `.github/workflows/` — exact matches, plus `Audit:TestSelection:Coverage`
-knobs), whole-file changes, changed test files (which may define unrecorded
+knobs), changes owned by an ALWAYS-FULL project
+(`Audit:TestSelection:Coverage:AlwaysFullProjects` — defaults:
+`src/CodeyBox.Core/CodeyBox.Core.csproj`, `tests/CodeyBox.Tests/CodeyBox.Tests.csproj`;
+extend with source-generator projects or other shared roots), whole-file
+changes, changed test files (which may define unrecorded
 tests), or files no record references. Running more tests is always safe.
 
 ## Baseline artifact (per-test coverage map)
