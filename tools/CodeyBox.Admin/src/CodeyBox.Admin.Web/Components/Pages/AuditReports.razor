@@ -122,6 +122,27 @@ else
                                 }
                             </summary>
 
+                            @if (auditor.TestSelection is not null)
+                            {
+                                <p class="audit-test-selection">
+                                    <span class="audit-ts-chip" title="Test-selection mode">@auditor.TestSelection.Mode</span>
+                                    <span title="WOULD-BE selected / known universe total (shadow-only: the full suite ran)">
+                                        @FormatTestSelectionCounts(auditor.TestSelection)
+                                    </span>
+                                    <span title="Proportional estimate: deselected / total × this run's duration">
+                                        @FormatTestSelectionSaved(auditor.TestSelection, auditor.DurationMs)
+                                    </span>
+                                    <span title="Selector layers consulted">@FormatTestSelectionLayers(auditor.TestSelection)</span>
+                                    <span class="audit-ts-assessment" title="Shadow assessment">@auditor.TestSelection.Assessment</span>
+                                    @if (auditor.TestSelection.Fallbacks.Count > 0)
+                                    {
+                                        <span class="audit-ts-fallback" title="@string.Join(" | ", auditor.TestSelection.Fallbacks)">
+                                            fallback: @TruncateFallback(auditor.TestSelection.Fallbacks[0])@(auditor.TestSelection.Fallbacks.Count > 1 ? $" (+{auditor.TestSelection.Fallbacks.Count - 1})" : "")
+                                        </span>
+                                    }
+                                </p>
+                            }
+
                             @if (_rawOutputVisible.TryGetValue((iteration.Target, iteration.Iteration, auditor.Name), out var raw) && raw is not null)
                             {
                                 <pre class="audit-raw-output">@raw</pre>
@@ -262,6 +283,26 @@ else
         ms < 1_000 ? $"{ms}ms" :
         ms < 60_000 ? $"{ms / 1000}s" :
         $"{ms / 60_000}m {(ms % 60_000) / 1000}s";
+
+    private static string FormatTestSelectionCounts(AuditReportTestSelectionDto ts) =>
+        ts.TotalCount > 0
+            ? $"tests {ts.SelectedCount}/{ts.TotalCount} would-run"
+            : "tests full suite";
+
+    private static string FormatTestSelectionSaved(AuditReportTestSelectionDto ts, long durationMs)
+    {
+        if (ts.TotalCount <= 0 || ts.EstimatedSavedFraction <= 0)
+            return "est. saved 0%";
+        var pct = ts.EstimatedSavedFraction * 100.0;
+        var savedMs = (long)(ts.EstimatedSavedFraction * durationMs);
+        return $"est. saved {pct:0.#}% (~{FormatDuration(savedMs)})";
+    }
+
+    private static string FormatTestSelectionLayers(AuditReportTestSelectionDto ts) =>
+        ts.Layers.Count > 0 ? $"via {string.Join("+", ts.Layers)}" : $"via {ts.Selector}";
+
+    private static string TruncateFallback(string fallback) =>
+        fallback.Length <= 120 ? fallback : fallback[..117] + "...";
 
     private enum MatrixCell { Absent, Present }
 

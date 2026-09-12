@@ -27,6 +27,20 @@ public sealed class AuditReportAuditorDto
     public long DurationMs { get; set; }
     public List<AuditReportFindingDto> Findings { get; set; } = [];
     public bool RawOutputAvailable { get; set; }
+    public AuditReportTestSelectionDto? TestSelection { get; set; }
+}
+
+public sealed class AuditReportTestSelectionDto
+{
+    public string Mode { get; set; } = "";
+    public string Selector { get; set; } = "";
+    public List<string> Layers { get; set; } = [];
+    public int SelectedCount { get; set; }
+    public int TotalCount { get; set; }
+    public double EstimatedSavedFraction { get; set; }
+    public string Assessment { get; set; } = "";
+    public List<string> Fallbacks { get; set; } = [];
+    public string Detail { get; set; } = "";
 }
 
 public sealed class AuditReportFindingDto

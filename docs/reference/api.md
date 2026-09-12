@@ -435,6 +435,7 @@ schema and semantics.
           "worstSeverity": "Error",
           "durationMs": 120,
           "rawOutputAvailable": true,
+          "testSelection": null,
           "findings": [
             {
               "id": "f-a1b2c3d4",
@@ -454,7 +455,13 @@ schema and semantics.
 
 `blockingCount` counts Error-severity findings; `nonBlockingCount`
 counts all others. `rawOutputAvailable` is true when raw auditor output
-is stored; fetch it via the `/raw` endpoint below.
+is stored; fetch it via the `/raw` endpoint below. `testSelection` is the
+per-run test-selection telemetry block (WOULD-BE selected/total counts,
+estimated saved fraction, selector layers, shadow assessment, fallbacks
+that fired) on `csharp:test-pass` auditors and `null` elsewhere — see
+[`audit-reports.md`](../quality/audit-reports.md) ("Test-selection
+telemetry") and [`test-selection.md`](../quality/test-selection.md)
+("Per-run telemetry").
 
 * Returns `400 Bad Request` when `id` is not a valid UUID.
 * Returns `404 Not Found` when the work item does not exist.

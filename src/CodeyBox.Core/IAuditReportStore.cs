@@ -45,6 +45,14 @@ public sealed record AuditReport
     /// Null when the auditor produced no capturable output.
     /// </summary>
     public string? RawOutput { get; init; }
+
+    /// <summary>
+    /// Test-selection telemetry for <c>csharp:test-pass</c> runs: WOULD-BE
+    /// selected/total counts, estimated time saved, selector layers, and
+    /// fallbacks. Null for every other auditor and for rows written before
+    /// telemetry persistence (backward-read path).
+    /// </summary>
+    public TestSelectionTelemetry? TestSelection { get; init; }
 }
 
 /// <summary>
