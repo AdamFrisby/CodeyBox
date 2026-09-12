@@ -96,13 +96,20 @@ public sealed record CoverageAuditorOptions
 }
 
 /// <summary>
-/// Config shape for the <c>CodeyBox:Audit</c> section. Currently only carries the
-/// coverage gate; exists so the section binds to a typed root (and the
-/// unbound-config-key validator can walk it) rather than being an untyped blob.
+/// Config shape for the <c>CodeyBox:Audit</c> section. Carries the coverage
+/// gate and the admission flake gate; exists so the section binds to a typed
+/// root (and the unbound-config-key validator can walk it) rather than being
+/// an untyped blob.
 /// </summary>
 public sealed class AuditSectionOptions
 {
     public CoverageAuditorOptions Coverage { get; set; } = new();
+
+    /// <summary>
+    /// Merge-to-main admission flake gate (<c>CodeyBox:Audit:Flake</c>).
+    /// Controls how many times the pre-merge gate runs the affected tests.
+    /// </summary>
+    public FlakeAdmissionOptions Flake { get; set; } = new();
 }
 
 /// <summary>

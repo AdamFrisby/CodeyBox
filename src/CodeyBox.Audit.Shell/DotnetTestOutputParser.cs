@@ -7,13 +7,8 @@ namespace CodeyBox.Audit.Shell;
 internal static class DotnetTestOutputParser
 {
     private const double UnrunnableFailureThresholdMs = 50;
-    private const int MaxParsedFailureHeaders = 1_024;
     private const int MaxReportedFailureFindings = 50;
     private const int MaxFailureBodyChars = 4_000;
-    private static readonly Regex FailedTestHeaderRegex = new(
-        @"^\s*Failed\s+(?<name>.+?)\s+\[(?<duration>[^\]\r\n]+)\]\s*$",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
-        TimeSpan.FromSeconds(5));
     private static readonly Regex PostFailureBodyRegex = new(
         @"^\s*(?:Failed!|Passed!|Skipped!|Test Run |Total tests:|Results File:)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
@@ -40,8 +35,11 @@ internal static class DotnetTestOutputParser
         if (string.IsNullOrWhiteSpace(output))
             return new DotnetTestOutputParseResult([], [], 0, false, false);
 
-        var match = FailedTestHeaderRegex.Match(output);
-        if (!match.Success)
+        // Header enumeration is owned by CodeyBox.Core (single source of
+        // truth shared with the pre-merge admission gate); classification of
+        // each header's body stays here.
+        var parsed = DotnetTestFailureHeaders.Extract(output);
+        if (parsed.Headers.Count == 0)
             return new DotnetTestOutputParseResult([], [], 0, false, false);
 
         var findings = new List<AuditFinding>();
@@ -50,15 +48,15 @@ internal static class DotnetTestOutputParser
         var parsedFailureCount = 0;
         var omittedReportedFailureCount = 0;
 
-        while (match.Success && parsedFailureCount < MaxParsedFailureHeaders)
+        for (var i = 0; i < parsed.Headers.Count; i++)
         {
-            var nextMatch = match.NextMatch();
+            var header = parsed.Headers[i];
             parsedFailureCount++;
-            var testName = match.Groups["name"].Value.Trim();
-            var durationText = match.Groups["duration"].Value.Trim();
-            var bodyStart = match.Index + match.Length;
-            var bodyEnd = nextMatch.Success
-                ? nextMatch.Index
+            var testName = header.Name;
+            var durationText = header.DurationText;
+            var bodyStart = header.Index + header.Length;
+            var bodyEnd = i + 1 < parsed.Headers.Count
+                ? parsed.Headers[i + 1].Index
                 : output.Length;
             bodyEnd = FindFailureBodyEnd(output, bodyStart, bodyEnd);
             failureBodyRanges.Add((bodyStart, bodyEnd));
@@ -68,7 +66,6 @@ internal static class DotnetTestOutputParser
 
             if (IsUnrunnableFailure(durationMs, stackTrace, fullBody))
             {
-                match = nextMatch;
                 continue;
             }
 
@@ -85,14 +82,12 @@ internal static class DotnetTestOutputParser
             {
                 omittedReportedFailureCount++;
             }
-
-            match = nextMatch;
         }
 
         if (omittedReportedFailureCount > 0)
             findings.Add(BuildOmittedFailureFinding(auditorName, omittedReportedFailureCount));
 
-        if (match.Success)
+        if (parsed.HitHeaderCap)
             findings.Add(BuildUnparsedFailureOverflowFinding(auditorName));
 
         return new DotnetTestOutputParseResult(
@@ -100,7 +95,7 @@ internal static class DotnetTestOutputParser
             failedTestNames,
             parsedFailureCount,
             HasCommandFailureSignalOutsideRanges(output, failureBodyRanges),
-            match.Success);
+            parsed.HitHeaderCap);
     }
 
     private static int FindFailureBodyEnd(string output, int bodyStart, int defaultEnd)
@@ -171,7 +166,7 @@ internal static class DotnetTestOutputParser
             AuditorName: auditorName,
             Severity: AuditSeverity.Error,
             Title: "dotnet test output had too many failed-test blocks to classify safely",
-            Description: $"The parser inspected the first {MaxParsedFailureHeaders} failed-test blocks and stopped before enumerating the rest. Reduce the failing test volume or fix the reported failures, then rerun the auditor.");
+            Description: $"The parser inspected the first {DotnetTestFailureHeaders.MaxHeaders} failed-test blocks and stopped before enumerating the rest. Reduce the failing test volume or fix the reported failures, then rerun the auditor.");
 
     private static string ExtractStackTrace(string body)
     {
