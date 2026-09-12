@@ -412,6 +412,11 @@ public static class AuditLog
             .Information("Suspended sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
                 vmName, workItemId.ToString());
 
+    public static void WorkItemInterruptedByHostShutdown(WorkItemId workItemId, WorkItemState fromState, WorkItemState toState) =>
+        Audit("work_item.interrupted_by_host_shutdown")
+            .Information("Work item {WorkItemId} checkpointed {FromState} -> {ToState} on graceful shutdown before VM teardown",
+                workItemId.ToString(), fromState.ToString(), toState.ToString());
+
     public static void SandboxStoppedOnShutdown(WorkItemId workItemId, string vmName) =>
         Audit("sandbox.stopped_on_shutdown")
             .Information("Stopped sandbox {VmName} for work item {WorkItemId} on graceful shutdown",

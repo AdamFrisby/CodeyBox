@@ -311,6 +311,64 @@ public static class WorkItemRecoveryPolicy
         return WithRecoveryAttempt(recovered, attempts, item.State);
     }
 
+    /// <summary>
+    /// Pre-teardown shutdown checkpoint: move an in-flight item to its durable
+    /// resume point WITHOUT consuming a recovery attempt, so a SIGKILL at any
+    /// later point in shutdown still leaves a recoverable row. The attempt is
+    /// counted exactly once by whichever path runs next: the worker-abort
+    /// recovery when the process shuts down cleanly, or the startup
+    /// replay/reaper sweep on the next boot. Never abandons: triage must not
+    /// destroy, only the counting paths may escalate.
+    ///
+    /// <para>Mapping mirrors <see cref="BuildGracefulShutdownRecoveryState"/>
+    /// (Working without a recovery boundary restarts Queued; other mid-flight
+    /// states fall back to <see cref="MapToRecoveryState"/>; items carrying an
+    /// agent-turn recovery boundary keep their checkpoint and stay in place).
+    /// Returns null for items the checkpoint must not touch: suspend-bookkept
+    /// items (owned by the suspend/resume path), rerunnable CheckAndAct /
+    /// AgentControl loops in Working without a checkpoint (their rerun builders
+    /// own that transition at recovery time), and states with no resume
+    /// mapping (terminal, parked, or dispatcher-owned).</para>
+    /// </summary>
+    public static WorkItem? BuildHostShutdownInterruptedState(
+        WorkItem item,
+        DateTimeOffset now,
+        string reason = "interrupted by host shutdown before VM teardown")
+    {
+        if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
+            return null;
+
+        if (IsRerunnableCheckAndActWithoutPreempt(item)
+            || IsRerunnableAgentControlWithoutPreempt(item))
+            return null;
+
+        var error = $"{reason} while item was {item.State}; clean restart on next boot";
+
+        if (item.HasAgentTurnRecoveryBoundary
+            && item.State is WorkItemState.Working or WorkItemState.Reworking)
+        {
+            return ReleaseAgentTurnDispatchClaim(item) with
+            {
+                StartedAt = null,
+                LastError = error,
+                UpdatedAt = now,
+            };
+        }
+
+        var target = item.State == WorkItemState.Working
+            ? WorkItemState.Queued
+            : MapToRecoveryState(item.State);
+
+        if (target is null)
+            return null;
+
+        return ClearPlanFieldsIfQueued(item.With(target.Value, error) with
+        {
+            StartedAt = ShouldClearStartedAtForRecoveryTarget(target.Value) ? null : item.StartedAt,
+            UpdatedAt = now,
+        });
+    }
+
     public static WorkItem? BuildInfrastructureDeferredResumeState(WorkItem item, DateTimeOffset now)
     {
         if (item.HasAgentTurnRecoveryBoundary

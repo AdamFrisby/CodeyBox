@@ -781,6 +781,44 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds", result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Validate_RejectsNonPositiveSandboxTeardownTimeout(int seconds)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxTeardownTimeout = TimeSpan.FromSeconds(seconds);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxTeardownTimeout", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsOversizedSandboxTeardownTimeout()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxTeardownTimeout =
+            SandboxShutdownTeardownService.MaxTeardownBudget + TimeSpan.FromTicks(1);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxTeardownTimeout", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AcceptsMaximumSandboxTeardownTimeout()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxTeardownTimeout = SandboxShutdownTeardownService.MaxTeardownBudget;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_AcceptsMaximumStartupResumeBoundaries()
     {

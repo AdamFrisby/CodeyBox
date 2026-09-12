@@ -656,6 +656,254 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             NullLogger<SandboxShutdownTeardownService>.Instance));
     }
 
+    // ── Shutdown checkpoint-before-teardown + bounded fan-out ────────────────
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_CheckpointsAuditingItemBeforeStopping()
+    {
+        // SIGKILL-safety: an audit iteration in flight must be persisted at its
+        // durable resume point (Auditing -> WorkComplete) BEFORE the first VM
+        // call, so a force-kill at any later point in shutdown still leaves a
+        // recoverable row. The checkpoint consumes no recovery attempt — the
+        // worker-abort or startup recovery that follows counts it once.
+        var item = MakeItem(WorkItemState.Auditing);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-audit-checkpoint");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.TeardownAllAsync();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Contains("interrupted by host shutdown", after.LastError);
+        Assert.True(sandbox.StopAndPreserveCalled);
+        Assert.True(sandbox.OwnedByShutdownHandler);
+        Assert.Null(after.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_LeavesPreemptNeededWorkingItemUntouched()
+    {
+        // Working items without a recovery boundary still need PipelineRunner's
+        // preempt checkpoint, which only the worker drain can produce — the
+        // pre-teardown checkpoint must skip them, not yank them to Queued.
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-working-defer-checkpoint");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.TeardownAllAsync();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Null(after.LastError);
+        Assert.False(sandbox.StopAndPreserveCalled);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_CheckpointPersistsEvenWhenStopHangs()
+    {
+        // The incident case: multipass hangs, systemd SIGKILLs mid-teardown.
+        // The checkpoint must already be durable even though the stop never
+        // completes — and the overall budget (not the 60s per-VM timeout) must
+        // bound the wait.
+        var item = MakeItem(WorkItemState.Auditing);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var neverStopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sandbox = new OrderingFakeSandbox("vm-stop-hung-checkpoint", stopTask: neverStopped.Task);
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop,
+            teardownBudget: TimeSpan.FromMilliseconds(300));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await svc.TeardownAllAsync().WaitAsync(TimeSpan.FromSeconds(15));
+        sw.Stop();
+
+        Assert.True(sandbox.StopAndPreserveCalled, "teardown must have been attempted, not skipped");
+        Assert.False(sandbox.OwnedByShutdownHandler, "a hung stop must not claim shutdown ownership");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"teardown fan-out must be budget-bound, took {sw.Elapsed}");
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_TeardownBudgetBoundsSeveralHungVms()
+    {
+        // Several hanging VMs must not serialize past the stop timeout: every
+        // item is checkpointed first, then the fan-out gives up at the budget
+        // and leaves the VMs for startup reconciliation.
+        var provider = new OrderingFakeProvider();
+        var ids = new List<WorkItemId>();
+        for (var i = 0; i < 4; i++)
+        {
+            var item = MakeItem(WorkItemState.Auditing);
+            await _store.CreateAsync(item);
+            ids.Add(item.Id);
+            provider.Register(item.Id, new OrderingFakeSandbox(
+                $"vm-hung-{i}",
+                stopTask: new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task));
+        }
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop,
+            maxParallel: 8,
+            teardownBudget: TimeSpan.FromMilliseconds(300));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await svc.TeardownAllAsync().WaitAsync(TimeSpan.FromSeconds(15));
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"4 hung VMs must not stretch shutdown, took {sw.Elapsed}");
+        foreach (var id in ids)
+        {
+            var after = await _store.GetAsync(id);
+            Assert.Equal(WorkItemState.WorkComplete, after!.State);
+        }
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_HostCancellationReturnsPromptlyWithoutTeardown()
+    {
+        // When the host is already cancelling shutdown, the fan-out must not
+        // start VM work — but the fast DB checkpoint still runs so rows are
+        // not left mid-phase.
+        var item = MakeItem(WorkItemState.Auditing);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-cancelled");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.TeardownAllAsync(CancelledToken()).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(sandbox.StopAndPreserveCalled);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, after!.State);
+    }
+
+    private static CancellationToken CancelledToken() => new(canceled: true);
+
+    [Fact]
+    public async Task ShutdownHandler_SuspendMode_DoesNotCheckpointItemState()
+    {
+        // Suspend owns its checkpoint via the pre-suspend (work item -> VM)
+        // mapping; rewriting item state up front would fight the resume path
+        // that expects the pre-suspend state intact.
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-suspend-no-checkpoint");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend);
+
+        await svc.TeardownAllAsync();
+
+        Assert.True(sandbox.SuspendCalled);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Null(after.LastError);
+        Assert.Equal("vm-suspend-no-checkpoint", after.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_DisposeMode_CheckpointsWorkingItemBeforeDisposing()
+    {
+        // Dispose destroys the VM, so PipelineRunner will skip its checkpoint
+        // path — the item must already sit at a resume point (Working without
+        // a boundary restarts Queued) before the delete runs.
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-dispose-checkpoint");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Dispose);
+
+        await svc.TeardownAllAsync();
+
+        Assert.True(sandbox.DisposeCalled);
+        Assert.True(sandbox.OwnedByShutdownHandler);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Contains("interrupted by host shutdown", after.LastError);
+    }
+
+    [Fact]
+    public async Task ShutdownCheckpoint_RestartWhileAuditing_RecoversItemViaStartupReplay()
+    {
+        // Acceptance pair for the restart requirement: an audit iteration in
+        // flight at SIGTERM is checkpointed to WorkComplete before any VM
+        // call; the next boot's real startup replay then re-dispatches it for
+        // a clean audit rerun — never stranded mid-phase, attempt counted once.
+        var item = MakeItem(WorkItemState.Auditing);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        provider.Register(item.Id, new OrderingFakeSandbox("vm-audit-restart"));
+
+        var shutdown = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+        await shutdown.TeardownAllAsync();
+
+        // A SIGKILL anywhere after this point still leaves the checkpointed
+        // row. Simulate the next boot through the real startup replay path.
+        var queue = new InMemoryTaskQueue();
+        var boot = new OrchestratorService(
+            queue, _store,
+            new ShortCircuitPipelineRunner(),
+            new CancellationRegistry(),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+        await boot.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.True(queue.Count > 0, "recovered audit item must be re-dispatched for a clean rerun");
+    }
+
     [Fact]
     public async Task ShutdownHandler_StopMode_DisposesNonPreemptibleRecoverableSandbox()
     {

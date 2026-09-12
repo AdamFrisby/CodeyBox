@@ -35,6 +35,30 @@ public sealed class ShutdownOptionsBindingTests
         Assert.Equal(expected, options.Shutdown.SandboxTeardownMode);
     }
 
+    [Fact]
+    public void SandboxTeardownTimeout_DefaultsToServiceBudget_WhenShutdownConfigKeyAbsent()
+    {
+        var options = Bind(new Dictionary<string, string?>
+        {
+            ["CodeyBox:StateDatabasePath"] = "state.db",
+        });
+
+        Assert.Equal(
+            SandboxShutdownTeardownService.DefaultTeardownBudget,
+            options.Shutdown.SandboxTeardownTimeout);
+    }
+
+    [Fact]
+    public void SandboxTeardownTimeout_BindsConfiguredValue()
+    {
+        var options = Bind(new Dictionary<string, string?>
+        {
+            ["CodeyBox:Shutdown:SandboxTeardownTimeout"] = "00:00:45",
+        });
+
+        Assert.Equal(TimeSpan.FromSeconds(45), options.Shutdown.SandboxTeardownTimeout);
+    }
+
     private static CodeyBoxOptions Bind(Dictionary<string, string?> values)
     {
         var config = new ConfigurationBuilder()

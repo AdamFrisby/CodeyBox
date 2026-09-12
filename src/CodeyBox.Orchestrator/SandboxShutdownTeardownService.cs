@@ -85,6 +85,28 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
     /// </summary>
     public static readonly TimeSpan DefaultNonSuspendTeardownTimeout = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// Default overall budget for the Stop/Dispose per-VM teardown fan-out.
+    /// Caps the whole <see cref="TeardownAllAsync"/> VM-teardown phase (not each
+    /// VM) so shutdown completes well within the service manager's stop timeout
+    /// even when several VMs hang or the daemon is wedged: VMs still running
+    /// when the budget expires are left for the next boot's startup
+    /// reconciliation and recovery sweeps. Suspend mode is excluded by design —
+    /// its RAM-scaled per-VM timeouts and the host-shutdown ceiling already
+    /// account for long snapshots, and aborting a snapshot early would defeat
+    /// the opt-in state-preservation contract (the pre-suspend mapping still
+    /// lets the next startup resume, but the VM is left Running, not Suspended).
+    /// </summary>
+    public static readonly TimeSpan DefaultTeardownBudget = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// Upper bound for <c>ShutdownOptions.SandboxTeardownTimeout</c>. Large
+    /// enough for operators with many VMs who also raise their service
+    /// manager's stop timeout; the validator rejects anything higher so a
+    /// typo cannot silently reintroduce the SIGKILL-mid-teardown wedge.
+    /// </summary>
+    public static readonly TimeSpan MaxTeardownBudget = TimeSpan.FromMinutes(10);
+
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxShutdownTeardownService> _log;
@@ -107,6 +129,10 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
     // bookkeeping is written). Resolved at teardown time so operator config
     // hot-reload takes effect on the next graceful shutdown.
     private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
+    // Overall budget for the Stop/Dispose per-VM fan-out (see
+    // DefaultTeardownBudget). Resolved at teardown time like the mode so
+    // operator config hot-reload takes effect on the next graceful shutdown.
+    private readonly Func<TimeSpan> _teardownBudgetAccessor;
     // Drives the per-VM NonSuspend teardown timeout's CancellationTokenSource
     // timer. Defaults to TimeProvider.System in production; tests that exercise
     // the hung-stop/hung-dispose cancellation path inject a FakeTimeProvider so
@@ -127,7 +153,9 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         IShutdownDispatchGate? dispatchGate = null,
         SandboxTeardownMode? teardownMode = null,
         Func<SandboxTeardownMode>? teardownModeAccessor = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        TimeSpan? teardownBudget = null,
+        Func<TimeSpan>? teardownBudgetAccessor = null)
     {
         _provider = provider;
         _store = store;
@@ -152,6 +180,18 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
                 "Provide teardownModeAccessor from bound ShutdownOptions, or pass an explicit teardownMode for tests.",
                 nameof(teardownMode));
         }
+        if (teardownBudgetAccessor is not null)
+        {
+            _teardownBudgetAccessor = teardownBudgetAccessor;
+        }
+        else if (teardownBudget is { } fixedTeardownBudget)
+        {
+            _teardownBudgetAccessor = () => fixedTeardownBudget;
+        }
+        else
+        {
+            _teardownBudgetAccessor = () => DefaultTeardownBudget;
+        }
     }
 
     /// <summary>The dispatch-pause-was-called signal as observed by TeardownAllAsync.</summary>
@@ -169,6 +209,15 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         SuspendTimeoutPolicy.For(sandbox.MemoryBytes, _perSuspendTimeout, _perGiBSuspendBudget);
 
     internal TimeSpan NonSuspendTeardownTimeout => _nonSuspendTeardownTimeout;
+
+    internal TimeSpan TeardownBudget
+    {
+        get
+        {
+            var budget = _teardownBudgetAccessor();
+            return budget > TimeSpan.Zero ? budget : DefaultTeardownBudget;
+        }
+    }
 
     public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
@@ -198,7 +247,12 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
             // slow snapshot finishes, the (work item → VM) mapping persisted
             // before the await (SuspendOneAsync) still lets the next startup
             // resume it.
-            await TeardownAllAsync();
+            //
+            // For Stop/Dispose the token IS honoured: the per-VM fan-out runs
+            // under an overall teardown budget (see TeardownBudget) linked with
+            // this token, so neither a hung daemon nor a large VM fleet can
+            // push shutdown past the service manager's stop timeout.
+            await TeardownAllAsync(ct);
         }
         catch (Exception ex)
         {
@@ -206,7 +260,9 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         }
     }
 
-    internal async Task TeardownAllAsync()
+    internal Task TeardownAllAsync() => TeardownAllAsync(CancellationToken.None);
+
+    internal async Task TeardownAllAsync(CancellationToken hostShutdownToken)
     {
         // R8.1 (incident 2026-05-29): pause dispatch BEFORE we either snapshot
         // for Suspend/Stop/Dispose. Idempotent — a test that wires the gate but
@@ -226,6 +282,19 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         }
 
         var entries = activeProvider.SnapshotActiveSandboxes();
+
+        // Shutdown ordering (SIGKILL-safety): checkpoint every in-flight item
+        // to its durable resume point BEFORE the first VM call, so a force-kill
+        // at any later point in shutdown still leaves recoverable rows. The
+        // checkpoint consumes no recovery attempt — the worker-abort path (on a
+        // clean shutdown) or the startup replay/reaper sweep (after a SIGKILL)
+        // counts it exactly once. Suspend mode is excluded: its per-item
+        // (work item → VM) mapping, persisted before each suspend is awaited,
+        // is its checkpoint, and checkpointing state up front would fight the
+        // resume path that expects the pre-suspend state intact.
+        if (teardownMode is SandboxTeardownMode.Stop or SandboxTeardownMode.Dispose)
+            await CheckpointInflightItemsAsync(entries, teardownMode);
+
         if (entries.Count == 0)
         {
             _log.LogInformation("Shutdown teardown: no in-flight sandboxes to {Mode} before exit", teardownMode);
@@ -240,27 +309,174 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
             "Sandbox shutdown teardown ({Mode}): {Count} in-flight sandbox(es)",
             teardownMode, entries.Count);
 
+        if (teardownMode is SandboxTeardownMode.Stop or SandboxTeardownMode.Dispose)
+        {
+            await TeardownAllBoundedAsync(entries, teardownMode, hostShutdownToken);
+            return;
+        }
+
         using var gate = new SemaphoreSlim(_maxParallel, _maxParallel);
         var tasks = new List<Task>(entries.Count);
         foreach (var (workItemId, sandbox) in entries)
         {
-            await gate.WaitAsync();
+            await gate.WaitAsync(hostShutdownToken);
             tasks.Add(Task.Run(async () =>
             {
                 try
                 {
-                    await TeardownOneAsync(workItemId, sandbox, teardownMode);
+                    await TeardownOneAsync(workItemId, sandbox, teardownMode, CancellationToken.None);
                 }
                 finally
                 {
                     gate.Release();
                 }
-            }));
+            }, CancellationToken.None));
         }
         await Task.WhenAll(tasks);
     }
 
-    private Task TeardownOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox, SandboxTeardownMode teardownMode) =>
+    /// <summary>
+    /// Persist an interruption checkpoint for every snapshotted in-flight item
+    /// before any VM teardown call. Sequential single-row reads/writes against
+    /// the local store: milliseconds per item, no VM or network calls, so this
+    /// phase cannot stretch the SIGTERM-to-exit window. Items whose phase still
+    /// needs PipelineRunner's preempt checkpoint (Stop mode) are deliberately
+    /// left alone — their checkpoint is produced by the pipeline's own
+    /// host-shutdown path during the worker drain.
+    /// </summary>
+    private async Task CheckpointInflightItemsAsync(
+        IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> entries,
+        SandboxTeardownMode teardownMode)
+    {
+        var now = _timeProvider.GetUtcNow();
+        foreach (var (workItemId, sandbox) in entries)
+        {
+            try
+            {
+                // CancellationToken.None throughout: each op is a single-row
+                // local SQLite read/write that finishes in milliseconds even
+                // under shutdown pressure, and this phase must complete before
+                // any VM call so a later SIGKILL still leaves recoverable rows
+                // (same rationale as the pre-suspend bookkeeping write).
+                var item = await _store.GetAsync(workItemId, CancellationToken.None);
+                if (item is null)
+                {
+                    _log.LogDebug(
+                        "Shutdown checkpoint: work item {WorkItemId} for sandbox {SandboxId} is gone; skipping",
+                        workItemId, sandbox.Id);
+                    continue;
+                }
+                if (teardownMode == SandboxTeardownMode.Stop
+                    && WorkItemRecoveryPolicy.RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(item))
+                {
+                    _log.LogInformation(
+                        "Shutdown checkpoint: work item {WorkItemId} still needs PipelineRunner's preempt checkpoint; leaving it for the worker drain",
+                        workItemId);
+                    continue;
+                }
+                var interrupted = WorkItemRecoveryPolicy.BuildHostShutdownInterruptedState(item, now, HostShutdownCheckpointReason);
+                if (interrupted is null)
+                    continue;
+                if (await _store.TryUpdateIfStateAsync(interrupted, item.State, CancellationToken.None))
+                {
+                    _log.LogInformation(
+                        "Shutdown checkpoint: work item {WorkItemId} {FromState} -> {ToState} (interrupted; clean restart on next boot)",
+                        workItemId, item.State, interrupted.State);
+                    AuditLog.WorkItemInterruptedByHostShutdown(workItemId, item.State, interrupted.State);
+                }
+                else
+                {
+                    _log.LogDebug(
+                        "Shutdown checkpoint skipped {WorkItemId}: state changed from {State} before the checkpoint write",
+                        workItemId, item.State);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogWarning(ex,
+                    "Shutdown checkpoint failed for work item {WorkItemId}; teardown proceeds and existing recovery paths still apply",
+                    workItemId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stop/Dispose fan-out under an overall teardown budget linked with the
+    /// host shutdown token. VMs that are still running when the budget expires
+    /// (or when the host cancels shutdown) are left alone and reported: the
+    /// next boot's startup reconciliation and stranded-item recovery reclaim
+    /// both the VM and the (already checkpointed) work item. Never throws for
+    /// budget/host-cancel expiry — the host must proceed to the worker drain.
+    /// </summary>
+    private async Task TeardownAllBoundedAsync(
+        IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> entries,
+        SandboxTeardownMode teardownMode,
+        CancellationToken hostShutdownToken)
+    {
+        var budget = TeardownBudget;
+        using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(hostShutdownToken);
+        budgetCts.CancelAfter(budget);
+        var budgetToken = budgetCts.Token;
+
+        using var gate = new SemaphoreSlim(_maxParallel, _maxParallel);
+        var tasks = new List<Task<bool>>(entries.Count);
+        foreach (var (workItemId, sandbox) in entries)
+        {
+            try
+            {
+                await gate.WaitAsync(budgetToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    return await TeardownOneAsync(workItemId, sandbox, teardownMode, budgetToken);
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            }, CancellationToken.None));
+        }
+
+        var completed = 0;
+        try
+        {
+            var results = await Task.WhenAll(tasks);
+            completed = results.Count(r => r);
+        }
+        catch (OperationCanceledException) when (budgetToken.IsCancellationRequested)
+        {
+            // Budget/host-cancel expiry aborts the join, not the shutdown:
+            // fall through to the leftover report below.
+        }
+
+        var total = entries.Count;
+        if (completed < total)
+        {
+            _log.LogWarning(
+                "Sandbox shutdown teardown ({Mode}) completed {Completed}/{Total} within {Budget}; {Left} sandbox(es) left running for startup reconciliation and recovery on next boot",
+                teardownMode, completed, total, budget, total - completed);
+        }
+    }
+
+    /// <summary>
+    /// LastError note stamped by <see cref="CheckpointInflightItemsAsync"/> so a
+    /// post-mortem can tell a pre-teardown checkpoint from the worker-abort or
+    /// startup recoveries that may follow it.
+    /// </summary>
+    internal const string HostShutdownCheckpointReason =
+        "interrupted by host shutdown before VM teardown";
+
+    private Task<bool> TeardownOneAsync(
+        WorkItemId workItemId,
+        IShutdownTeardownSandbox sandbox,
+        SandboxTeardownMode teardownMode,
+        CancellationToken teardownToken) =>
         // The default arm throws rather than silently routing through suspend.
         // Silent fallthrough would defeat the whole feature's intent: a new
         // teardown mode added without an explicit case here would re-introduce
@@ -270,9 +486,9 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         teardownMode switch
         {
             SandboxTeardownMode.Suspend => SuspendOneAsync(workItemId, sandbox),
-            SandboxTeardownMode.Stop => StopOneAsync(workItemId, sandbox),
-            SandboxTeardownMode.Dispose => DisposeOneAsync(workItemId, sandbox),
-            _ => Task.FromException(new InvalidOperationException(
+            SandboxTeardownMode.Stop => StopOneAsync(workItemId, sandbox, teardownToken),
+            SandboxTeardownMode.Dispose => DisposeOneAsync(workItemId, sandbox, teardownToken),
+            _ => Task.FromException<bool>(new InvalidOperationException(
                 $"SandboxTeardownMode {(int)teardownMode} is not handled; add an explicit case in TeardownOneAsync rather than relying on silent fallthrough.")),
         };
 
@@ -280,19 +496,23 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
     /// Teardown via stop/preserve. Avoids the RAM snapshot that makes
     /// <c>multipass suspend</c> risky. Falls back to dispose only when a
     /// recoverable sandbox lacks stop/preserve support.
+    /// Returns true when the entry needs no further handling (stopped, left
+    /// running for PipelineRunner by design, or disposed via fallback);
+    /// false when the VM was left in an unknown state by a timeout or by the
+    /// overall teardown budget / host shutdown firing first.
     /// </summary>
-    private async Task StopOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
+    private async Task<bool> StopOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox, CancellationToken teardownToken)
     {
         var (loaded, item) = await TryLoadWorkItemForStopTeardownAsync(workItemId, sandbox.Id);
         if (!loaded)
-            return;
+            return true;
 
         if (item is not null && WorkItemRecoveryPolicy.RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(item))
         {
             _log.LogInformation(
                 "Stop teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the active agent phase still needs PipelineRunner's preempt checkpoint; leaving it running for host-shutdown recovery",
                 workItemId, sandbox.Id);
-            return;
+            return true;
         }
 
         if (sandbox is not IPreemptibleSandbox preemptible)
@@ -300,23 +520,32 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
             _log.LogWarning(
                 "Stop teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the sandbox does not support stop/preserve; falling back to dispose",
                 workItemId, sandbox.Id);
-            await DisposeOneAsync(workItemId, sandbox);
-            return;
+            return await DisposeOneAsync(workItemId, sandbox, teardownToken);
         }
 
         var timeout = NonSuspendTeardownTimeout;
         using var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, teardownToken);
         try
         {
-            await preemptible.StopAndPreserveAsync(timeoutCts.Token).WaitAsync(timeoutCts.Token);
+            await preemptible.StopAndPreserveAsync(linkedCts.Token).WaitAsync(linkedCts.Token);
             sandbox.MarkOwnedByShutdownHandler();
             AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
+            return true;
+        }
+        catch (OperationCanceledException) when (!timeoutCts.IsCancellationRequested)
+        {
+            _log.LogWarning(
+                "Stop/preserve cut short by the shutdown teardown budget for work item {WorkItemId} sandbox {SandboxId}; leaving it running for startup reconciliation and recovery on next boot",
+                workItemId, sandbox.Id);
+            return false;
         }
         catch (OperationCanceledException)
         {
             _log.LogWarning(
                 "Stop/preserve exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; surfacing as needing operator attention",
                 timeout, workItemId, sandbox.Id);
+            return false;
         }
         catch (Exception ex)
         {
@@ -356,26 +585,40 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
     /// already been) <c>multipass delete --purge</c>'d — without this signal
     /// the catch block would fault inside a non-existent VM, leaving the work
     /// item Working/Reworking with no PreemptCheckpoint.</para>
+    ///
+    /// <para>Returns true when the VM was disposed; false when the dispose was
+    /// cut short by the per-VM timeout or the overall teardown budget / host
+    /// shutdown (the VM is left for startup reconciliation).</para>
     /// </summary>
-    private async Task DisposeOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
+    private async Task<bool> DisposeOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox, CancellationToken teardownToken)
     {
         sandbox.MarkOwnedByShutdownHandler();
         var timeout = NonSuspendTeardownTimeout;
         using var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, teardownToken);
         try
         {
-            await sandbox.DisposeAsync().AsTask().WaitAsync(timeoutCts.Token);
+            await sandbox.DisposeAsync().AsTask().WaitAsync(linkedCts.Token);
             var metrics = sandbox.ResourceMetrics;
             AuditLog.SandboxDisposedOnShutdown(
                 workItemId,
                 sandbox.Id,
                 metrics);
+            return true;
+        }
+        catch (OperationCanceledException) when (!timeoutCts.IsCancellationRequested)
+        {
+            _log.LogWarning(
+                "Dispose cut short by the shutdown teardown budget for work item {WorkItemId} sandbox {SandboxId}; leaving it for startup reconciliation and recovery on next boot",
+                workItemId, sandbox.Id);
+            return false;
         }
         catch (OperationCanceledException)
         {
             _log.LogWarning(
                 "Dispose exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; surfacing as needing operator attention",
                 timeout, workItemId, sandbox.Id);
+            return false;
         }
         catch (Exception ex)
         {
@@ -386,14 +629,14 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         }
     }
 
-    private async Task SuspendOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
+    private async Task<bool> SuspendOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
     {
         if (sandbox is not ISuspendableSandbox suspendable)
         {
             _log.LogWarning(
                 "Suspend teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the sandbox does not support suspend; leaving it for normal shutdown recovery",
                 workItemId, sandbox.Id);
-            return;
+            return true;
         }
 
         var timeout = SuspendTimeoutFor(suspendable);
@@ -409,7 +652,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         // CancellationToken.None: a single-row SQLite UPDATE is fast enough to
         // finish even under shutdown pressure.
         if (!await TryPersistSuspendBookkeepingAsync(workItemId, sandbox.Id))
-            return;
+            return true;
 
         using var timeoutCts = new CancellationTokenSource(timeout);
         try
@@ -421,7 +664,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
             _log.LogWarning(
                 "Suspend exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; multipassd is likely still writing the RAM snapshot. The (work item → VM) mapping is persisted, so the next startup will attempt to resume this VM.",
                 timeout, workItemId, sandbox.Id);
-            return;
+            return true;
         }
         catch (Exception ex)
         {
@@ -429,10 +672,11 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
                 "Suspend failed for work item {WorkItemId} sandbox {SandboxId}; clearing suspend bookkeeping so the item recovers via the standard stranded-item path",
                 workItemId, sandbox.Id);
             await ClearSuspendBookkeepingAsync(workItemId);
-            return;
+            return true;
         }
 
         AuditLog.SandboxSuspendedOnShutdown(workItemId, sandbox.Id);
+        return true;
     }
 
     private async Task<bool> TryPersistSuspendBookkeepingAsync(WorkItemId workItemId, string vmName)
