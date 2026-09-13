@@ -18,7 +18,6 @@ public sealed class ConvergenceBriefComposer
     private const int MaxInlineModelIdChars = 200;
     private const int MaxInlineOutcomeChars = 500;
     private const int MaxInlineReasonChars = 1000;
-    private const int MaxStreamFilesToInspect = 50;
     private const int MaxTailBytesHardCap = 64 * 1024;
     private const string TruncationMarker = "\n[...truncated]";
     private const string FenceCloseMarker = "\n```";
