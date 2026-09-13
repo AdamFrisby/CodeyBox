@@ -126,6 +126,36 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
         return GetByWorkItemCoreAsync(workItemId, target, ct);
     }
 
+    /// <summary>
+    /// Newest-first slice of telemetry-carrying rows backing the soundness
+    /// report. The <c>LIMIT</c> is enforced in SQL (before buffering); rows
+    /// without telemetry (pre-telemetry or non-test-pass auditors) are
+    /// excluded. Selector filtering stays in the pure computer so the stored
+    /// slice remains selector-agnostic.
+    /// </summary>
+    public async Task<IReadOnlyList<AuditReport>> GetRecentTestSelectionAsync(
+        int limit,
+        CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            throw new ArgumentOutOfRangeException(nameof(limit), "must be positive");
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, work_item_id, iteration, audit_target, auditor_name, auditor_kind, worst_severity,
+                   started_at, ended_at, duration_ms, findings_json, raw_output, test_selection_json
+            FROM audit_reports
+            WHERE test_selection_json IS NOT NULL AND test_selection_json != ''
+            ORDER BY ended_at DESC, rowid DESC
+            LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$limit", limit);
+        using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        var results = new List<AuditReport>();
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            results.Add(ReadRow(reader));
+        return results;
+    }
+
     private async Task<IReadOnlyList<AuditReport>> GetByWorkItemCoreAsync(
         string workItemId,
         AuditTarget? target,

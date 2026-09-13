@@ -222,6 +222,17 @@ codeybox queue costs aabbccdd-... --json
 codeybox version
 ```
 
+### `codeybox audit test-selection-soundness`
+
+Show the unsafe-skip count, would-be savings, and enforce-readiness gate over
+recent shadow runs (`GET /audit/test-selection/soundness`), rendered from real
+persisted shadow telemetry:
+
+```bash
+codeybox audit test-selection-soundness --limit 100 --selector coverage
+codeybox audit test-selection-soundness --limit 100 --json
+```
+
 ## Common workflows
 
 ```bash

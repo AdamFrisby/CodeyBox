@@ -291,6 +291,18 @@ internal sealed class CodeyBoxClient
         return await GetRawAsync("/fleet/summary", ct);
     }
 
+    internal async Task<string> GetTestSelectionSoundnessAsync(
+        int? limit = null,
+        string? selector = null,
+        CancellationToken ct = default)
+    {
+        var parts = new List<string>();
+        if (limit is not null) parts.Add($"limit={limit}");
+        if (!string.IsNullOrWhiteSpace(selector)) parts.Add($"selector={Uri.EscapeDataString(selector.Trim())}");
+        var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
+        return await GetRawAsync($"/audit/test-selection/soundness{qs}", ct);
+    }
+
     internal async Task ReorderQueueAsync(string[] ids, CancellationToken ct = default)
     {
         var resp = await SendAsync(

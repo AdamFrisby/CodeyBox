@@ -328,6 +328,39 @@ multiplies it by the run's `durationMs` for display), the `layers` consulted,
 the shadow `assessment`, and the `fallbacks` that fired. Full policy, baseline
 format, and staleness bound: `docs/quality/test-selection.md`.
 
+### Test-selection soundness
+
+The soundness report aggregates the accumulated shadow telemetry into the two
+numbers that decide whether any selector may graduate from shadow to
+enforcing: over the last N `csharp:test-pass` runs, (1) the **unsafe-skip
+count** — times the selector would have deselected a test that actually
+FAILED — which must be ~0 for selection to be safe, and (2) the
+**wall-clock/test-count that would have been saved** (test-count saved =
+Σ(total − selected) over assessable runs; wall-clock saved = Σ(durationMs ×
+estimatedSavedFraction)). The report is selector-agnostic: an optional
+`selector` filter narrows the window by exact (case-insensitive) match, and
+the `bySelector` breakdown always covers every selector present — so the same
+surface validates the project-graph selector and the coverage selector.
+
+- **API (read-only):** `GET /audit/test-selection/soundness?limit=N&selector=coverage`
+  evaluates the N most recent telemetry-carrying audit reports (newest first;
+  `limit` clamps to `Audit:TestSelection:Soundness:MaxLimit`) and returns the
+  counts, the savings, the per-selector breakdown, and the `gate` block. See
+  `docs/reference/api.md`.
+- **CLI:** `codeybox audit test-selection-soundness --limit N --selector coverage [--json]`
+  renders the same report as tables (or raw JSON).
+
+**Enforce-readiness gate (explicit, machine-checkable).** No layer may switch
+from shadow to enforcing until the gate reports `readyForEnforcement: true`,
+which holds if and only if **zero unsafe skips** (`maxAllowedUnsafeSkips: 0`,
+fixed in `TestSelectionSoundnessComputer`) were observed across
+**`Audit:TestSelection:Soundness:CalibrationWindowSize` assessable runs**
+(default 100; hot-reloadable). Only verdicts `safe-for-this-run` and
+`unsafe-skips-observed` are assessable — `full-suite` and `unverifiable` runs
+carry no safety evidence and do not count toward calibration. The gate's
+`reason` names the blocking condition (unsafe skips observed vs. calibration
+incomplete). Branch on `gate.readyForEnforcement`, not on prose.
+
 ### `process:build-script`
 
 Runs `./build.sh` from the work-branch repository root in the credential-free

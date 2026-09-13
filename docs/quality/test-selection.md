@@ -101,7 +101,12 @@ with the verdict `safe-for-this-run` | `unsafe-skips-observed` |
 `full-suite` | `unverifiable`, the deselected set, the full run's failures,
 and their intersection (the unsafe skips). This is the shared harness every
 selector reports through; the enforcement gate for real skipping consumes
-these records and does not exist yet.
+the persisted per-run telemetry derived from these records — see
+"Test-selection soundness" in `docs/quality/audit.md` (report: `GET
+/audit/test-selection/soundness`; CLI: `codeybox audit
+test-selection-soundness`). No layer may switch from shadow to enforcing
+until that gate reports `readyForEnforcement: true` (zero unsafe skips
+across the calibration window).
 
 ## Per-run telemetry (audit report + dashboard)
 
