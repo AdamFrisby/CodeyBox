@@ -3463,6 +3463,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         RequiredBuildVerificationTimeout = TimeSpan.FromSeconds(Math.Max(60, opts.RequiredBuildVerificationTimeoutSeconds)),
         EmitPlanTestCases = opts.EmitPlanTestCases,
         HostGitIdentity = hostIdentity,
+        MaxFailureDetailBytes = opts.MaxFailureDetailBytes > 0 ? opts.MaxFailureDetailBytes : SanitizedAgentDetail.DefaultTailMaxBytes,
     };
 });
 builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
@@ -5560,6 +5561,13 @@ namespace CodeyBox.Api
         /// <see cref="PipelineOptions.EmitPlanTestCases"/>; edits require restart.
         /// </summary>
         public bool EmitPlanTestCases { get; set; } = true;
+
+        /// <summary>
+        /// Upper bound on the tail of agent stdout/stderr retained in failure details (bytes).
+        /// Defaults to 32 KiB. Captured once at startup into
+        /// <see cref="PipelineOptions.MaxFailureDetailBytes"/>; edits require restart.
+        /// </summary>
+        public int MaxFailureDetailBytes { get; set; } = SanitizedAgentDetail.DefaultTailMaxBytes;
 
         /// <summary>
         /// Optional runtime flake attribution for parsed dotnet test failures.

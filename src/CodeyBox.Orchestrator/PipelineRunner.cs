@@ -2053,7 +2053,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             "planning",
             $"Planning agent {runner.Kind} reported failure",
             classification);
-        var detail = BuildAgentFailureDetail($"Planning agent {runner.Kind} reported failure", result);
+        var detail = BuildAgentFailureDetail($"Planning agent {runner.Kind} reported failure", result, _opts.MaxFailureDetailBytes);
         throw new InvalidOperationException(detail);
     }
 
@@ -5773,7 +5773,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         agentPhase,
                         BuildAgentFailureDetail(
                             $"Agent {runner.Kind} was terminated by infrastructure (exit {agentExitCode})",
-                            agentResult));
+                            agentResult,
+                            _opts.MaxFailureDetailBytes));
                 }
                 ThrowIfInfrastructureAgentFailure(
                     runner,
@@ -5797,7 +5798,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // Redact and truncate agent-controlled output before it reaches
                 // LastError, audit persistence, webhooks, or API responses via the
                 // exception message chain.
-                var detail = BuildAgentFailureDetail($"Agent {runner.Kind} reported failure", agentResult);
+                var detail = BuildAgentFailureDetail($"Agent {runner.Kind} reported failure", agentResult, _opts.MaxFailureDetailBytes);
                 throw new InvalidOperationException(detail);
             }
 
@@ -8173,7 +8174,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     result,
                     "check",
                     $"Check-and-act agent {agentRunner.Kind} reported failure");
-                var detail = BuildAgentFailureDetail("check-and-act agent failed", result);
+                var detail = BuildAgentFailureDetail("check-and-act agent failed", result, _opts.MaxFailureDetailBytes);
                 throw new InvalidOperationException(detail);
             }
 
@@ -8207,7 +8208,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (resolved.Kind != AgentFailureKind.Infrastructure)
             return;
 
-        var detail = BuildAgentFailureDetail(messagePrefix, result);
+        var detail = BuildAgentFailureDetail(messagePrefix, result, _opts.MaxFailureDetailBytes);
         throw new AgentInfrastructureFailureException(runner.Kind, phase, detail);
     }
 
@@ -8280,14 +8281,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
             $"Agent {runner.Kind} reported transient transport failure {failureContext}{phaseSuffix}: {summary} ({reason})");
     }
 
-    private static string BuildAgentFailureDetail(string firstLine, AgentResult result) =>
+    internal static string BuildAgentFailureDetail(
+        string firstLine,
+        AgentResult result,
+        int maxDetailBytes = SanitizedAgentDetail.DefaultTailMaxBytes) =>
         string.Join("\n",
             new[]
             {
                 $"{firstLine}: {RedactAndTruncateAgentDetail(result.Summary)}",
-                !string.IsNullOrEmpty(result.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(result.Stderr)}" : null,
-                !string.IsNullOrEmpty(result.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(result.Stdout)}" : null,
+                !string.IsNullOrEmpty(result.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetailTail(result.Stderr, maxDetailBytes)}" : null,
+                !string.IsNullOrEmpty(result.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetailTail(result.Stdout, maxDetailBytes)}" : null,
             }.Where(s => s is not null));
+
+    private static string RedactAndTruncateAgentDetailTail(string s, int maxBytes)
+        => SanitizedAgentDetail.FromRawTail(s, maxBytes).Value;
 
     /// <summary>
     /// Builds and persists the on-yes follow-up Normal work item triggered by
@@ -8738,7 +8745,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (!result.Success)
         {
             ThrowIfTransientAgentFailure(agentRunner, result, "post-act-recheck");
-            var detail = BuildAgentFailureDetail("post-act re-check agent failed", result);
+            var detail = BuildAgentFailureDetail("post-act re-check agent failed", result, _opts.MaxFailureDetailBytes);
             throw new InvalidOperationException(detail);
         }
 
@@ -16370,7 +16377,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         phase,
                         BuildAgentFailureDetail(
                             $"Agent {runner.Kind} exhausted native session recovery after sandbox execution became unavailable",
-                            ex.LastResult));
+                            ex.LastResult,
+                            _opts.MaxFailureDetailBytes));
                 }
 
                 var exitCode = AgentSuspendResilience.ParseAgentExitCode(ex.LastResult.Summary);
@@ -16384,7 +16392,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         phase,
                         BuildAgentFailureDetail(
                             $"Agent {runner.Kind} exhausted native session recovery after process termination (exit {exitCode})",
-                            ex.LastResult));
+                            ex.LastResult,
+                            _opts.MaxFailureDetailBytes));
                 }
 
                 await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.FailureAgent);
@@ -17833,7 +17842,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
-                var detail = BuildAgentFailureDetail($"Merge agent {chosenMergeRunner.Kind} reported failure", agentResult);
+                var detail = BuildAgentFailureDetail($"Merge agent {chosenMergeRunner.Kind} reported failure", agentResult, _opts.MaxFailureDetailBytes);
                 throw new InvalidOperationException(detail);
             }
 
@@ -19697,7 +19706,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         NewTip: null,
                         FailureReason: BuildAgentFailureDetail(
                             $"Conflict-rework agent {runner.Kind} reported infrastructure failure after exhausting session resume",
-                            ex.LastResult),
+                            ex.LastResult,
+                            _opts.MaxFailureDetailBytes),
                         SemanticIncompatibleReason: null,
                         FilesChanged: null, Insertions: null, Deletions: null,
                         FailureKind: WorkItemFailureKinds.Infrastructure,
@@ -19794,7 +19804,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         NewTip: null,
                         FailureReason: BuildAgentFailureDetail(
                             $"Conflict-rework agent {runner.Kind} reported infrastructure failure",
-                            agentResult),
+                            agentResult,
+                            _opts.MaxFailureDetailBytes),
                         SemanticIncompatibleReason: null,
                         FilesChanged: null, Insertions: null, Deletions: null,
                         FailureKind: WorkItemFailureKinds.Infrastructure,
@@ -22172,6 +22183,12 @@ public sealed record PipelineOptions
     /// cases. No effect unless an <see cref="Core.ITestCaseStore"/> is wired.
     /// </summary>
     public bool EmitPlanTestCases { get; init; } = true;
+
+    /// <summary>
+    /// Upper bound on the tail of agent stdout/stderr retained in failure details (bytes).
+    /// Defaults to 32 KiB. Configurable via <c>CodeyBox:MaxFailureDetailBytes</c>.
+    /// </summary>
+    public int MaxFailureDetailBytes { get; init; } = SanitizedAgentDetail.DefaultTailMaxBytes;
 
     /// <summary>
     internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;

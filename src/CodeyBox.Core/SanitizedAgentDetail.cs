@@ -11,6 +11,9 @@ public readonly record struct SanitizedAgentDetail
     /// <summary>Maximum UTF-8 bytes retained after redaction.</summary>
     public const int MaxBytes = 4096;
 
+    /// <summary>Default maximum UTF-8 bytes retained for failure detail tail.</summary>
+    public const int DefaultTailMaxBytes = 32 * 1024;
+
     /// <summary>The redacted, truncated detail text.</summary>
     public string Value { get; }
 
@@ -18,11 +21,25 @@ public readonly record struct SanitizedAgentDetail
 
     /// <summary>
     /// Redacts secret-shaped tokens and truncates to <see cref="MaxBytes"/>
-    /// UTF-8 bytes. Null is treated as empty. Idempotent: applying it to an
-    /// already-sanitized value returns an equal value.
+    /// UTF-8 bytes from the start of the output. Null is treated as empty. Idempotent:
+    /// applying it to an already-sanitized value returns an equal value.
     /// </summary>
     public static SanitizedAgentDetail FromRaw(string? raw)
         => new(RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(raw ?? string.Empty), MaxBytes));
+
+    /// <summary>
+    /// Redacts secret-shaped tokens, collapses consecutive repeated lines, and
+    /// truncates from the tail to at most <paramref name="maxBytes"/> UTF-8 bytes.
+    /// Used to preserve terminating events and diagnosis context from large output captures.
+    /// Null is treated as empty.
+    /// </summary>
+    public static SanitizedAgentDetail FromRawTail(string? raw, int maxBytes = DefaultTailMaxBytes)
+    {
+        if (raw is null) return new(string.Empty);
+        var redacted = RawOutputRedactor.Redact(raw);
+        var collapsed = RawOutputRedactor.CollapseRepeatedLines(redacted);
+        return new(RawOutputRedactor.TruncateTailToBytes(collapsed, maxBytes));
+    }
 
     public override string ToString() => Value;
 }

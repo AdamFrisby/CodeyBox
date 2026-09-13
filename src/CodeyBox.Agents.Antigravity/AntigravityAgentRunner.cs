@@ -80,6 +80,9 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// the sandbox image installs it elsewhere.</summary>
     public string Binary { get; init; } = DefaultBinary;
 
+    /// <summary>Configuration key for the print timeout budget.</summary>
+    public const string PrintTimeoutConfigKey = "CodeyBox:Antigravity:PrintTimeoutMinutes";
+
     /// <summary>
     /// Per-model-response wait passed to agy as <c>--print-timeout</c>. agy's
     /// built-in default is 5m: the first time a single gemini turn on a large
@@ -441,29 +444,33 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             // A broken capture path (sandbox/provider fault) must be observable
             // rather than silently degrading back to zero diagnostics.
             AuditLog.AgentLogCaptureFailed(Kind, ex.GetType().Name, ex.Message);
-            return result;
+            return ProcessTerminatingConditions(result, redactedLog: string.Empty);
         }
 
-        if (!tailCmd.Success || string.IsNullOrEmpty(tailCmd.Stdout))
+        var redactedLog = string.Empty;
+        if (tailCmd.Success && !string.IsNullOrEmpty(tailCmd.Stdout))
         {
-            return result;
+            // Redact with the same routine the normal stream-capture path uses
+            // (SensitiveDataRedactionEnricher.RedactText — see AgentStreamParser)
+            // so token/auth lines in agy's glog are scrubbed identically before they
+            // reach the stream or audit.
+            redactedLog = SensitiveDataRedactionEnricher.RedactText(tailCmd.Stdout);
+
+            // (1) Archive the FULL glog to the per-run stream (observability / audit) on
+            // EVERY outcome — this is what surfaces agy's otherwise invisible
+            // diagnostics (model resolution, applyAuthResult, tool output) in the
+            // agent-stream files, which the pipeline records and audits.
+            if (stdoutChunkCallback is not null)
+            {
+                ForwardLogToStream(redactedLog, stdoutChunkCallback, captureStructuredStream);
+            }
         }
 
-        // Redact with the same routine the normal stream-capture path uses
-        // (SensitiveDataRedactionEnricher.RedactText — see AgentStreamParser)
-        // so token/auth lines in agy's glog are scrubbed identically before they
-        // reach the stream or audit.
-        var redactedLog = SensitiveDataRedactionEnricher.RedactText(tailCmd.Stdout);
+        return ProcessTerminatingConditions(result, redactedLog);
+    }
 
-        // (1) Archive the FULL glog to the per-run stream (observability / audit) on
-        // EVERY outcome — this is what surfaces agy's otherwise invisible
-        // diagnostics (model resolution, applyAuthResult, tool output) in the
-        // agent-stream files, which the pipeline records and audits.
-        if (stdoutChunkCallback is not null)
-        {
-            ForwardLogToStream(redactedLog, stdoutChunkCallback, captureStructuredStream);
-        }
-
+    internal AgentResult ProcessTerminatingConditions(AgentResult result, string redactedLog)
+    {
         // (2) Lift agy's TERMINAL error region out of the glog. We extract ONLY the
         // terminal region (the slice from the last quota/auth marker in the tail
         // window to end — agy aborts right after its terminal error, so an earlier
@@ -493,6 +500,49 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             // the pipeline's no-changes branch classifies it to park a real 429 in
             // WaitingForQuotaReset with the gateway's reset hint.
             result = result with { TerminalDiagnostic = terminalError };
+        }
+
+        // (3) On failure, check for recognized terminating conditions across stdout, stderr, and glog.
+        if (!result.Success)
+        {
+            var combinedSources = new[] { result.Stderr, result.Stdout, redactedLog };
+            var isTimeout = combinedSources.Any(s => !string.IsNullOrEmpty(s) && AntigravityTerminatingConditionDetector.IsPrintModeTimeout(s));
+            if (isTimeout)
+            {
+                result = result with
+                {
+                    Summary = AntigravityTerminatingConditionDetector.FormatBudgetExhaustionSummary(PrintTimeout),
+                };
+            }
+
+            string? condition = null;
+            if (!string.IsNullOrEmpty(result.Stdout))
+            {
+                condition = AntigravityTerminatingConditionDetector.ExtractTerminatingCondition(result.Stdout);
+                if (condition is not null)
+                {
+                    result = result with { Stdout = condition };
+                }
+            }
+
+            if (condition is null && !string.IsNullOrEmpty(redactedLog))
+            {
+                condition = AntigravityTerminatingConditionDetector.ExtractTerminatingCondition(redactedLog);
+            }
+
+            if (condition is null && !string.IsNullOrEmpty(result.Stderr))
+            {
+                condition = AntigravityTerminatingConditionDetector.ExtractTerminatingCondition(result.Stderr);
+                if (condition is not null)
+                {
+                    result = result with { Stderr = condition };
+                }
+            }
+
+            if (condition is not null && string.IsNullOrEmpty(result.TerminalDiagnostic))
+            {
+                result = result with { TerminalDiagnostic = condition };
+            }
         }
 
         return result;
