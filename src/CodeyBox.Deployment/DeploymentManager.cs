@@ -80,6 +80,17 @@ public sealed class DeploymentManager : IDeploymentManager
         return result;
     }
 
+    public bool TryGetActive(string deploymentId, out IDeploymentHandle? handle)
+    {
+        handle = null;
+        if (string.IsNullOrWhiteSpace(deploymentId))
+            return false;
+        if (!_active.TryGetValue(deploymentId, out var tracked))
+            return false;
+        handle = tracked;
+        return true;
+    }
+
     private void Untrack(string id) => _active.TryRemove(id, out _);
 
     private sealed class TrackedDeployment(

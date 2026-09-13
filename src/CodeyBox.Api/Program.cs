@@ -2751,6 +2751,19 @@ builder.Services.AddSingleton<Func<PlanAdherenceAuditorOptions>>(sp =>
     return () => monitor.CurrentValue;
 });
 
+// Human deployment reviewer (operator as reviewer through the auditor seam).
+// Hot-reloadable via CodeyBox:HumanReview, explicit opt-in (default off); the
+// accessor mirrors the Func<TestRunOptions> pattern so the
+// ProjectAuditorComposer observes the same live IOptionsMonitor snapshot and
+// composes the reviewer into the deployment stage when enabled.
+builder.Services.Configure<HumanDeploymentReviewOptions>(
+    builder.Configuration.GetSection("CodeyBox:HumanReview"));
+builder.Services.AddSingleton<Func<HumanDeploymentReviewOptions>>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<HumanDeploymentReviewOptions>>();
+    return () => monitor.CurrentValue;
+});
+
 builder.Services.AddSingleton(new RequiredAuditorPolicy(
     builder.Configuration.GetSection("CodeyBox:RequiredAuditors").Get<string[]>() ?? []));
 builder.Services.AddSingleton<ProjectAuditorComposer>();
@@ -3043,6 +3056,23 @@ builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>
         opts.StateDatabasePath,
         sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
+builder.Services.AddSingleton<IHumanDeploymentReviewStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteHumanDeploymentReviewStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
+builder.Services.AddHostedService(sp => new HumanDeploymentReviewSweeper(
+    sp.GetService<IHumanDeploymentReviewStore>(),
+    sp.GetService<IDeploymentManager>(),
+    sp.GetService<IWorkItemStore>(),
+    sp.GetService<IWorkItemQuestionStore>(),
+    sp.GetService<ITaskQueue>(),
+    sp.GetService<IWebhookDispatcher>(),
+    sp.GetService<Func<HumanDeploymentReviewOptions>>(),
+    TimeProvider.System,
+    sp.GetService<ILogger<HumanDeploymentReviewSweeper>>()));
 builder.Services.AddSingleton<ITestCaseStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -3632,6 +3662,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>(),
     deploymentManager: sp.GetService<IDeploymentManager>(),
     deploymentSubstrates: sp.GetService<IDeploymentSubstrateProvider>(),
+    humanReviews: sp.GetService<IHumanDeploymentReviewStore>(),
     staleBaseReworkRouter: sp.GetRequiredService<StaleBaseConflictReworkRouter>(),
     flakeEscalation: sp.GetService<NonDeterministicTestEscalationService>(),
     flakeEscalationOptions: sp.GetRequiredService<NonDeterministicTestEscalationSnapshot>(),

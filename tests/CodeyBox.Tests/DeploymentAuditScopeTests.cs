@@ -40,6 +40,11 @@ public sealed class DeploymentAuditScopeTests
             return start(recipe, context, ct);
         }
         public IReadOnlyList<ActiveDeploymentInfo> GetActive() => [];
+        public bool TryGetActive(string deploymentId, out IDeploymentHandle? handle)
+        {
+            handle = null;
+            return false;
+        }
     }
 
     private sealed class FakeSubstrates : IDeploymentSubstrateProvider
