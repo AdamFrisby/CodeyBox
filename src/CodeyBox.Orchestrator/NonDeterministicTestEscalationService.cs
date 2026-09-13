@@ -72,7 +72,7 @@ public sealed class NonDeterministicTestEscalationService
 
         try
         {
-            return await EscalateCoreAsync(parent, tests, baseBranch, opts, ct).ConfigureAwait(false);
+            return await EscalateCoreAsync(parent, tests, baseBranch, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -91,7 +91,6 @@ public sealed class NonDeterministicTestEscalationService
         WorkItem parent,
         IReadOnlyList<string> tests,
         string baseBranch,
-        NonDeterministicTestEscalationOptions opts,
         CancellationToken ct)
     {
         var allItems = new List<WorkItem>();
@@ -131,9 +130,9 @@ public sealed class NonDeterministicTestEscalationService
             {
                 Id = WorkItemId.New(),
                 ProjectId = current.ProjectId,
-                Title = NonDeterministicTestEscalationPolicy.BuildChildTitle(tests, opts.MaxTitleTestNames),
+                Title = NonDeterministicTestEscalationPolicy.BuildChildTitle(tests.Count, dedupKey),
                 Prompt = NonDeterministicTestEscalationPolicy.BuildChildPrompt(
-                    tests, baseBranch, current.Title, current.Id),
+                    tests.Count, dedupKey, baseBranch, current.Title, current.Id),
                 BaseBranch = string.IsNullOrWhiteSpace(current.BaseBranch) ? baseBranch : current.BaseBranch,
                 DependsOn = [],
                 QueuePosition = now.Ticks,

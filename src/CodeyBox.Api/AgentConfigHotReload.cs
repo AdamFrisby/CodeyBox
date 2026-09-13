@@ -515,7 +515,6 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             {
                 Enabled = opts.NonDeterministicTestEscalation.Enabled,
                 MaxTestsPerChild = opts.NonDeterministicTestEscalation.MaxTestsPerChild,
-                MaxTitleTestNames = opts.NonDeterministicTestEscalation.MaxTitleTestNames,
             });
             _lastFlakeEscalation = next;
             AuditLog.ConfigReloaded("NonDeterministicTestEscalation", prev, next);
@@ -1075,7 +1074,6 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             {
                 opts.Enabled,
                 opts.MaxTestsPerChild,
-                opts.MaxTitleTestNames,
             },
             JsonOpts);
 

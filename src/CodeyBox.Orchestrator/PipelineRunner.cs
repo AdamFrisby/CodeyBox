@@ -11268,17 +11268,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         if (attributions is null || attributions.Count == 0)
             return false;
-        var hasCandidate = false;
-        foreach (var a in attributions)
-        {
-            if (a.Attribution == TestFailureAttribution.NotDiffAttributable
-                && a.SkipReason == TestFailureAttributionSkipReason.None)
-            {
-                hasCandidate = true;
-                break;
-            }
-        }
-        if (!hasCandidate)
+        if (!NonDeterministicTestEscalationPolicy.HasActionableTests(attributions))
             return false;
 
         NonDeterministicTestEscalationService service;
@@ -11288,8 +11278,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ?? new NonDeterministicTestEscalationService(
                     _store, _taskQueue, _flakeEscalationOptions, _opts.TimeProvider);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            _log.LogWarning(ex,
+                "Flake escalation service construction for work item {Id} failed; falling back to normal rework",
+                item.Id);
             return false;
         }
 

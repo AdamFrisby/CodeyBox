@@ -20,21 +20,15 @@ public sealed class NonDeterministicTestEscalationOptions
 
     /// <summary>
     /// Maximum flaky test names carried into a single child item. Bounds the
-    /// child prompt and title. Clamped to [1, 50]. Default 10.
+    /// structured de-dup set and the escalation result. Clamped to [1, 50].
+    /// Default 10.
     /// </summary>
     public int MaxTestsPerChild { get; set; } = 10;
-
-    /// <summary>
-    /// Maximum test names embedded in the child title. Remaining names are
-    /// summarised as "+N more". Clamped to [1, 10]. Default 3.
-    /// </summary>
-    public int MaxTitleTestNames { get; set; } = 3;
 
     /// <summary>Validates and clamps this instance in place.</summary>
     public void Normalize()
     {
         MaxTestsPerChild = Math.Clamp(MaxTestsPerChild, 1, 50);
-        MaxTitleTestNames = Math.Clamp(MaxTitleTestNames, 1, 10);
     }
 
     /// <summary>Returns a normalized copy of this instance.</summary>
@@ -44,7 +38,6 @@ public sealed class NonDeterministicTestEscalationOptions
         {
             Enabled = Enabled,
             MaxTestsPerChild = MaxTestsPerChild,
-            MaxTitleTestNames = MaxTitleTestNames,
         };
         copy.Normalize();
         return copy;
