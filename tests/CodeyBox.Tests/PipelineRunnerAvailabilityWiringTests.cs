@@ -576,6 +576,74 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task FailedWorkRun_WithPure401AuthError_AndHealthyQuotaProbe_DoesNotBenchAgent()
+    {
+        // The 401-shaped substring arrived on captured (agent-relayed) stderr
+        // while the same credential still reads healthy on the quota probe, so
+        // the classification is contradicted: the item fails terminally but the
+        // agent kind stays routable — no fleet-wide exclusion, no operator
+        // alert. Without the probe the same output still benches (see the
+        // RequeuesAfterAgentRestore case above).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            auditQuotaProbes: [new RecordingProbe(AgentKind.Codex)]);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: 401 Unauthorized"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Item, final.AuthFailureScope);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("item-level failure only", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task FailedWorkRun_WithLoginPrompt_AndHealthyQuotaProbe_DoesNotBenchAgent()
+    {
+        // Same contradiction policy through the AuthRequired handling path: a
+        // CLI-shaped login prompt on captured stderr is still recorded as the
+        // item failure, but the healthy same-credential quota reading vetoes
+        // the fleet-wide bench.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            auditQuotaProbes: [new RecordingProbe(AgentKind.Codex)]);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "not logged into codex; run `codex login`"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Item, final.AuthFailureScope);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
     public async Task AuthLoginPrompt_SurvivesSmokeDisabled_DoesNotBenchAgentForNextItem()
     {
         // Master smoke switch OFF. Captured agent stderr is not trusted enough
@@ -1784,7 +1852,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         int maxConsecutiveFastFails = 3,
         SmokeOptionsSnapshot? smokeOptions = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        IReadOnlyList<IAuditor>? auditors = null)
+        IReadOnlyList<IAuditor>? auditors = null,
+        IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1859,7 +1928,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
             inVmSmokeGate: inVmSmokeGate,
-            involvement: involvement);
+            involvement: involvement,
+            auditQuotaProbes: auditQuotaProbes);
 
         return new TestFixture(pipeline, store, involvement, codex, webhooks, availability, gitHost);
     }

@@ -141,7 +141,8 @@ public sealed record AgenticConflictResolverAuthFailureEvidence(
     IAgentRunner Runner,
     bool AgentSucceeded,
     AgentFailureClassification Classification,
-    bool StdoutOnlyEvidence = false);
+    bool StdoutOnlyEvidence = false,
+    bool MatchedConfiguredPattern = false);
 
 public sealed record AgenticConflictResolverResult(
     bool Success,
@@ -1049,7 +1050,8 @@ public sealed class AgenticConflictResolver
             runner,
             agentSucceeded,
             detection.Classification,
-            detection.IsStdoutOnly);
+            detection.IsStdoutOnly,
+            detection.MatchedConfiguredStderrPattern || detection.MatchedConfiguredStdoutPattern);
         authFailures.Add(evidence);
         return evidence;
     }

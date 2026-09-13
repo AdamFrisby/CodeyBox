@@ -24,6 +24,38 @@ public static class AgentFailureClassifier
 
     private const int MaxStructuredOutputLineChars = 64 * 1024;
 
+    /// <summary>
+    /// Bounds for the shared CLI-login matcher below. Both captured streams
+    /// are treated as potentially model-controlled: agent CLIs relay model
+    /// text to stderr as well as stdout, and build/test/tool output is
+    /// interleaved there. A genuine auth failure is the CLI refusing to run,
+    /// which is a short transcript — not a substring buried in prose — so
+    /// both streams require the same short, whole-line CLI shape.
+    /// </summary>
+    private const int MaxTrustedLoginChars = 4096;
+    private const int MaxTrustedLoginLines = 8;
+    private const int MaxTrustedLoginTranscriptChars = 8192;
+    private const int MaxTrustedLoginTranscriptLines = 8;
+
+    /// <summary>
+    /// Longest single line still considered CLI-shaped. Genuine login-prompt
+    /// lines are terse (the longest are OAuth URLs with query strings); a
+    /// longer line embedding the same phrase is narration, not a refusal.
+    /// </summary>
+    private const int MaxCliLoginLineChars = 1024;
+
+    /// <summary>
+    /// Longest line that may match solely via an unanchored
+    /// <c>run `... login`</c> directive fragment. Anchored shapes (prefix,
+    /// exact, URL, not-logged-in) already constrain the whole line; a bare
+    /// fragment inside a longer sentence is prose quoting the CLI, so
+    /// fragment-only matches stay terse.
+    /// </summary>
+    private const int MaxCliLoginDirectiveLineChars = 200;
+
+    /// <summary>Longest matched line retained as auth evidence on a detection.</summary>
+    private const int MaxAuthEvidenceLineChars = 200;
+
     private static readonly IReadOnlyList<string> StructuredTurnFailedTimeoutPatterns = new[]
     {
         "stream timeout",
@@ -364,10 +396,10 @@ public static class AgentFailureClassifier
         var matchedStderrAuthError = ContainsAuthErrorPattern(stderr);
         // Compute the trusted-transcript hit once and reuse it: the public
         // ContainsAuthRequiredPatternInStdout helper would otherwise re-split
-        // the stdout buffer line-by-line a second time on the hot path.
-        var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
+        // the buffer line-by-line a second time on the hot path.
+        var matchedTrustedStdoutTranscript = ContainsTrustedLoginTranscript(stdout);
         var matchedDefaultStdout = matchedTrustedStdoutTranscript
-            || ContainsShortAuthRequiredStdout(stdout);
+            || ContainsShortCliLoginOutput(stdout);
         var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
         var matchedConfiguredStderr = false;
         var matchedConfiguredStdout = false;
@@ -404,10 +436,21 @@ public static class AgentFailureClassifier
         var source = matchedStderr && matchedStdout
             ? "stderr/stdout"
             : matchedStderr ? "stderr" : "stdout";
+        var evidence = FindCliLoginEvidence(
+            matchedStderr ? stderr : null,
+            matchedStdout ? stdout : null)
+            ?? FindConfiguredAuthEvidence(
+                kind,
+                matchedConfiguredStderr ? stderr : null,
+                matchedConfiguredStdout ? stdout : null,
+                additionalPatternsByAgent);
+        var reason = evidence is { } hit
+            ? $"auth/login prompt pattern matched in {source} (pattern '{hit.Pattern}' on {hit.Stream}: '{hit.Line}')"
+            : $"auth/login prompt pattern matched in {source}";
         return new AgentAuthFailureDetection(
             new AgentFailureClassification(
                 AgentFailureKind.AuthRequired,
-                Reason: $"auth/login prompt pattern matched in {source}"),
+                Reason: reason),
             matchedStderr,
             matchedStdout,
             matchedTrustedStdoutTranscript,
@@ -415,7 +458,55 @@ public static class AgentFailureClassifier
             matchedDefaultStdout)
         {
             MatchedConfiguredStderrPattern = matchedConfiguredStderr,
+            MatchedPattern = evidence?.Pattern,
+            MatchedStream = evidence?.Stream,
+            MatchedLine = evidence?.Line,
         };
+    }
+
+    /// <summary>
+    /// Evidence for an operator-configured pattern hit: the configured pattern
+    /// text, the stream it matched, and the surrounding line that carried it.
+    /// </summary>
+    private static (string Pattern, string Stream, string Line)? FindConfiguredAuthEvidence(
+        AgentKind kind,
+        string? stderr,
+        string? stdout,
+        IReadOnlyDictionary<string, IReadOnlyList<AuthFailurePattern>>? additionalPatternsByAgent)
+    {
+        foreach (var pattern in AdditionalAuthPatternsFor(kind, additionalPatternsByAgent))
+        {
+            if (string.IsNullOrWhiteSpace(pattern.Pattern))
+                continue;
+
+            if (stderr is not null
+                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase)
+                && FindPatternLine(stderr, pattern.Pattern) is { } stderrLine)
+            {
+                return (pattern.Pattern, "stderr", stderrLine);
+            }
+
+            if (stdout is not null
+                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase)
+                && FindPatternLine(stdout, pattern.Pattern) is { } stdoutLine)
+            {
+                return (pattern.Pattern, "stdout", stdoutLine);
+            }
+        }
+
+        return null;
+    }
+
+    private static string? FindPatternLine(string text, string pattern)
+    {
+        foreach (var rawLine in text.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                return TruncateEvidenceLine(line);
+        }
+
+        return null;
     }
 
     private static IEnumerable<AuthFailurePattern> AdditionalAuthPatternsFor(
@@ -567,42 +658,18 @@ public static class AgentFailureClassifier
     }
 
     public static bool ContainsAuthRequiredPatternInStderr(string? stderr) =>
-        ContainsAny(stderr, AuthRequiredPatterns)
-        || ContainsStandaloneOAuthLoginUrlLine(stderr)
-        || ContainsCliLoginLine(stderr);
+        ContainsTrustedLoginTranscript(stderr) || ContainsShortCliLoginOutput(stderr);
 
     public static bool ContainsAuthErrorPattern(string? text) =>
         ContainsAny(text, AuthPatterns);
 
+    /// <summary>
+    /// Guarded stdout matcher. Delegates to the same shared predicate as
+    /// <see cref="ContainsAuthRequiredPatternInStderr"/> so the two streams
+    /// cannot drift apart: an input accepted on one is accepted on the other.
+    /// </summary>
     public static bool ContainsAuthRequiredPatternInStdout(string? stdout) =>
-        ContainsTrustedStdoutLoginTranscript(stdout) || ContainsShortAuthRequiredStdout(stdout);
-
-    private static bool ContainsCliLoginLine(string? text) =>
-        !string.IsNullOrWhiteSpace(text)
-        && text
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Any(IsCliLoginLine);
-
-    private static bool ContainsShortAuthRequiredStdout(string? stdout)
-    {
-        // Stdout can be model-controlled, so accept only short outputs whose
-        // non-empty lines are themselves CLI-shaped login prompts. This catches
-        // one-line auth prompts without accepting prose that embeds the same
-        // strings as examples.
-        const int maxTrustedStdoutLoginChars = 4096;
-        const int maxTrustedStdoutLoginLines = 8;
-
-        if (string.IsNullOrWhiteSpace(stdout))
-            return false;
-        if (stdout.Length > maxTrustedStdoutLoginChars)
-            return false;
-
-        var lines = stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .ToArray();
-        return lines.Length is > 0 and <= maxTrustedStdoutLoginLines
-            && lines.All(IsCliLoginLine);
-    }
+        ContainsTrustedLoginTranscript(stdout) || ContainsShortCliLoginOutput(stdout);
 
     public static bool ContainsAuthRequiredFragmentInStdout(string? stdout)
     {
@@ -614,69 +681,149 @@ public static class AgentFailureClassifier
             .Any(IsCliLoginLine);
     }
 
-    public static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
+    /// <summary>
+    /// Backwards-compatible name for <see cref="ContainsTrustedLoginTranscript"/>.
+    /// Kept because operator tooling references the stdout-named entry point.
+    /// </summary>
+    public static bool ContainsTrustedStdoutLoginTranscript(string? stdout) =>
+        ContainsTrustedLoginTranscript(stdout);
+
+    /// <summary>
+    /// Shared whole-transcript guard used for both captured streams: trust only
+    /// a short output that is entirely the CLI login transcript (login prompt
+    /// plus wait/timeout lines), not task prose embedding one.
+    /// </summary>
+    private static bool ContainsTrustedLoginTranscript(string? text)
     {
-        // Stdout is often model-controlled. Trust only a short output that is
-        // entirely the CLI login transcript, not task prose embedding one.
-        const int maxTrustedStdoutLoginTranscriptChars = 8192;
-        const int maxTrustedStdoutLoginTranscriptLines = 8;
-
-        if (string.IsNullOrWhiteSpace(stdout))
+        if (string.IsNullOrWhiteSpace(text))
             return false;
-        if (stdout.Length > maxTrustedStdoutLoginTranscriptChars)
+        if (text.Length > MaxTrustedLoginTranscriptChars)
             return false;
 
-        var lines = stdout
+        var lines = text
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToArray();
-        if (lines.Length == 0 || lines.Length > maxTrustedStdoutLoginTranscriptLines)
+        if (lines.Length == 0 || lines.Length > MaxTrustedLoginTranscriptLines)
             return false;
-        if (lines.Any(static line => !IsTrustedStdoutLoginTranscriptLine(line)))
+        if (lines.Any(static line => !IsTrustedLoginTranscriptLine(line)))
             return false;
 
         var hasLoginPrompt = AuthRequiredLoginPromptPrefixes
-            .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+            .Any(pattern => text.Contains(pattern, StringComparison.OrdinalIgnoreCase));
         var hasWaitOrTimeout =
             AuthRequiredWaitOrTimeoutLinePrefixes
-                .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                .Any(pattern => text.Contains(pattern, StringComparison.OrdinalIgnoreCase))
             || AuthRequiredExactLines
-                .Any(pattern => stdout.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+                .Any(pattern => text.Contains(pattern, StringComparison.OrdinalIgnoreCase));
         return hasLoginPrompt && hasWaitOrTimeout;
     }
 
-    private static bool IsTrustedStdoutLoginTranscriptLine(string line) =>
+    /// <summary>
+    /// Shared short-output guard used for both captured streams: accept only
+    /// short outputs whose non-empty lines are themselves CLI-shaped login
+    /// prompts. This catches one-line auth refusals without accepting prose
+    /// that embeds the same strings as examples.
+    /// </summary>
+    private static bool ContainsShortCliLoginOutput(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+        if (text.Length > MaxTrustedLoginChars)
+            return false;
+
+        var lines = text
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+        return lines.Length is > 0 and <= MaxTrustedLoginLines
+            && lines.All(IsCliLoginLine);
+    }
+
+    /// <summary>
+    /// Finds the first CLI-shaped login line in either stream for evidence
+    /// recording. Checks stderr before stdout: harness diagnostics outrank
+    /// model-relayed text when both carry a match.
+    /// </summary>
+    private static (string Pattern, string Stream, string Line)? FindCliLoginEvidence(string? stderr, string? stdout)
+    {
+        foreach (var (text, stream) in new[] { (stderr, "stderr"), (stdout, "stdout") })
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                continue;
+            foreach (var rawLine in text.Split('\n'))
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line))
+                    continue;
+                var pattern = DescribeCliLoginLine(line);
+                if (pattern is not null)
+                    return (pattern, stream, TruncateEvidenceLine(line));
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Names the catalogued shape a CLI login line matched, for evidence
+    /// recording. Returns null when the line is not CLI-shaped. The match
+    /// order mirrors <see cref="IsCliLoginLine"/> so the recorded pattern is
+    /// the shape the classifier actually accepted.
+    /// </summary>
+    private static string? DescribeCliLoginLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line) || line.Length > MaxCliLoginLineChars)
+            return null;
+
+        foreach (var pattern in AuthRequiredLinePrefixes)
+        {
+            if (line.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
+                return pattern;
+        }
+
+        foreach (var pattern in AuthRequiredExactLines)
+        {
+            if (line.Equals(pattern, StringComparison.OrdinalIgnoreCase))
+                return pattern;
+        }
+
+        if (IsStandaloneOAuthLoginUrl(line))
+            return "standalone OAuth login URL";
+
+        var lower = line.ToLowerInvariant();
+        if (lower.StartsWith("not logged in", StringComparison.Ordinal)
+            && lower.Contains("run ", StringComparison.Ordinal)
+            && lower.Contains(" login", StringComparison.Ordinal))
+        {
+            return "not-logged-in login directive";
+        }
+
+        if (line.Length <= MaxCliLoginDirectiveLineChars)
+        {
+            foreach (var pattern in CliLoginCommandFragments)
+            {
+                if (line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                    return pattern;
+            }
+        }
+
+        return null;
+    }
+
+    private static string TruncateEvidenceLine(string line)
+    {
+        var trimmed = line.Trim();
+        return trimmed.Length <= MaxAuthEvidenceLineChars
+            ? trimmed
+            : trimmed[..MaxAuthEvidenceLineChars] + "…";
+    }
+
+    private static bool IsTrustedLoginTranscriptLine(string line) =>
         AuthRequiredLinePrefixes.Any(pattern => line.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
         || AuthRequiredExactLines.Any(pattern => line.Equals(pattern, StringComparison.OrdinalIgnoreCase))
         || IsStandaloneOAuthLoginUrl(line);
 
-    private static bool IsCliLoginLine(string line)
-    {
-        if (string.IsNullOrWhiteSpace(line))
-            return false;
-
-        if (AuthRequiredLinePrefixes.Any(pattern => line.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
-            || AuthRequiredExactLines.Any(pattern => line.Equals(pattern, StringComparison.OrdinalIgnoreCase))
-            || IsStandaloneOAuthLoginUrl(line))
-        {
-            return true;
-        }
-
-        if (CliLoginCommandFragments.Any(pattern => line.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
-        {
-            return true;
-        }
-
-        // "not logged into ..." is a strict prefix of "not logged in", so a
-        // single startswith check covers both shapes.
-        var lower = line.ToLowerInvariant();
-        return lower.StartsWith("not logged in", StringComparison.Ordinal)
-            && lower.Contains("run ", StringComparison.Ordinal)
-            && lower.Contains(" login", StringComparison.Ordinal);
-    }
-
-    private static bool ContainsStandaloneOAuthLoginUrlLine(string? text) =>
-        !string.IsNullOrWhiteSpace(text)
-        && text.Split('\n').Any(static line => IsStandaloneOAuthLoginUrl(line.Trim()));
+    private static bool IsCliLoginLine(string line) =>
+        DescribeCliLoginLine(line) is not null;
 
     private static bool IsStandaloneOAuthLoginUrl(string line) =>
         line.StartsWith("https://accounts.google.com/o/oauth2", StringComparison.OrdinalIgnoreCase)
