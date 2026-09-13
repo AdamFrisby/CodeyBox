@@ -19,11 +19,13 @@ public interface IAgentAuthFailureClassifier
 
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
-    /// the evidence. Stderr is treated as CLI diagnostics and matched by
-    /// substring. Stdout defaults use the shared guarded stdout matcher so
-    /// concrete CLI login transcripts count even when they are printed without a
-    /// matching stderr line. Operator-supplied patterns are stream-scoped and
-    /// default to stderr-only; stdout patterns must be opted into explicitly.
+    /// the evidence. Both captured streams are potentially model-controlled,
+    /// so default login-prompt patterns use the shared guarded matcher
+    /// (short, whole-line CLI-shaped transcripts) on either stream: concrete
+    /// CLI login transcripts count even when they are printed without a
+    /// matching stderr line. Operator-supplied patterns are stream-scoped
+    /// substring matches and default to stderr-only; stdout patterns must be
+    /// opted into explicitly.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 

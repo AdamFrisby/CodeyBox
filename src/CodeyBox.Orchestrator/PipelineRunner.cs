@@ -3456,6 +3456,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     throwOnMatch: false,
                     stdoutOnlyEvidence: authDetection.IsStdoutOnly,
                     requireStdoutOnlyCorroboration: true,
+                    matchedConfiguredPattern: authDetection.MatchedConfiguredStderrPattern
+                        || authDetection.MatchedConfiguredStdoutPattern,
                     ct: CancellationToken.None);
                 _log.LogWarning(
                     "Work item {Id} failed because agent {Agent} requires re-authentication after session resume exhaustion: {Reason}",
@@ -5913,6 +5915,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         requireAuthCorroboration: isAuditEmptyRework
                             || !deferredSuccessAuthDetection.IsStdoutOnly
                                 && !matchedConfiguredStderrPattern,
+                        matchedConfiguredPattern: deferredSuccessAuthDetection.MatchedConfiguredStderrPattern
+                            || deferredSuccessAuthDetection.MatchedConfiguredStdoutPattern,
                         ct: ct);
                 }
 
@@ -6057,6 +6061,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     deferredSuccessAuthDetection.Classification,
                     throwOnMatch: true,
                     stdoutOnlyEvidence: false,
+                    matchedConfiguredPattern: deferredSuccessAuthDetection.MatchedConfiguredStderrPattern
+                        || deferredSuccessAuthDetection.MatchedConfiguredStdoutPattern,
                     ct: ct);
             }
 
@@ -8247,12 +8253,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentFailureClassification classification,
         CancellationToken ct)
     {
+        // A 401/403-shaped substring in captured output is agent-relayed text,
+        // not a harness refusal. When the same credential still reads healthy
+        // on the quota probe the classification is contradicted: fail the item
+        // without benching the agent kind fleet-wide.
+        var contradicted = await IsAuthContradictedByHealthyQuotaProbeAsync(item, project, agent, item.ModelId, ct).ConfigureAwait(false);
         var reason = _authRequiredHandler.BuildReason(
             phase,
             classification,
-            stdoutOnlyEvidence: false);
-        await _authRequiredHandler.PublishSideEffectsAsync(agent, reason, item, project, ct: ct);
-        throw new AgentAuthRequiredException(agent, phase, reason, WorkItemAuthFailureScope.Fleet);
+            stdoutOnlyEvidence: false,
+            stdoutOnlyNote: contradicted
+                ? "credential reads healthy on quota probe; item-level failure only, no fleet-wide bench"
+                : null);
+        if (!contradicted)
+            await _authRequiredHandler.PublishSideEffectsAsync(agent, reason, item, project, ct: ct);
+        throw new AgentAuthRequiredException(
+            agent,
+            phase,
+            reason,
+            contradicted ? WorkItemAuthFailureScope.Item : WorkItemAuthFailureScope.Fleet);
     }
 
     private void ThrowIfTransientAgentFailure(
@@ -9703,6 +9722,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throwOnMatch,
             stdoutOnlyEvidence: detection.IsStdoutOnly,
             requireStdoutOnlyCorroboration: requireStdoutOnlyCorroboration,
+            matchedConfiguredPattern: detection.MatchedConfiguredStderrPattern
+                || detection.MatchedConfiguredStdoutPattern,
             ct: ct);
         return handling.Matched;
     }
@@ -9717,6 +9738,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         bool stdoutOnlyEvidence = false,
         bool requireStdoutOnlyCorroboration = false,
         bool requireAuthCorroboration = false,
+        bool matchedConfiguredPattern = false,
         CancellationToken ct = default)
     {
         if (classification.Kind != AgentFailureKind.AuthRequired)
@@ -9745,6 +9767,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 _ =>
                     "auth evidence NOT corroborated (forced in-VM smoke unavailable); item-level failure only, no fleet-wide bench",
             };
+        }
+
+        if (publishSideEffects
+            && !matchedConfiguredPattern
+            && await IsAuthContradictedByHealthyQuotaProbeAsync(item, project, agent, item?.ModelId, ct).ConfigureAwait(false))
+        {
+            // The quota probe authenticates with the same credential the failed
+            // run used and just read healthy: the credential is valid, so the
+            // captured text is the agent's narration (e.g. credential-handling
+            // work quoting auth shapes), not a harness refusal. Fail the item
+            // without the fleet-wide exclusion — one item's output must not
+            // bench the agent kind with operator-only recovery. Explicitly
+            // operator-configured patterns are exempt: the operator asserted
+            // that text means auth failure for the agent, so a heuristic
+            // reading does not overrule it.
+            publishSideEffects = false;
+            authCorroborationNote = authCorroborationNote is null
+                ? "credential reads healthy on quota probe; item-level failure only, no fleet-wide bench"
+                : $"{authCorroborationNote}; credential reads healthy on quota probe; item-level failure only, no fleet-wide bench";
         }
 
         var reason = _authRequiredHandler.BuildReason(phase, classification, stdoutOnlyEvidence, authCorroborationNote);
@@ -9991,6 +10032,65 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Quota probe corroboration failed for no-diff quota evidence from agent {Agent} during {Phase}; ignoring untrusted quota text",
                 agent.Value,
                 phase);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether the agent's quota probe — which authenticates with the
+    /// same credential the failed run used — currently reads healthy. A known
+    /// healthy reading contradicts an auth-failure classification: the
+    /// credential just authenticated successfully against the provider, so the
+    /// captured text is the agent's narration (e.g. credential-handling work
+    /// quoting auth shapes), not the harness refusing to run. Callers
+    /// downgrade contradicted evidence to an item-scoped failure instead of a
+    /// fleet-wide exclusion. Unknown or missing probes never contradict:
+    /// absence of evidence is not evidence of health, so paths without probe
+    /// coverage keep their existing benching behaviour.
+    /// </summary>
+    private async Task<bool> IsAuthContradictedByHealthyQuotaProbeAsync(
+        WorkItem? item,
+        Project? project,
+        AgentKind agent,
+        string? observedModelId,
+        CancellationToken ct)
+    {
+        if (item is null || project is null || _quotaProbes is null)
+            return false;
+
+        var member = BuildQuotaProbeMember(item, project, agent, observedModelId);
+        var probe = ResolveQuotaProbe(member).Probe;
+        if (probe is null)
+            return false;
+
+        try
+        {
+            var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+            var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+            if (!quota.IsKnown)
+                return false;
+
+            var gate = _auditQuotaGatePolicy.Evaluate(member, quota, _opts.TimeProvider.GetUtcNow());
+            if (gate.Allow)
+            {
+                _log.LogWarning(
+                    "Auth evidence from agent {Agent} during failure handling contradicted by healthy quota probe; downgrading to item-level failure without fleet-wide bench",
+                    agent.Value);
+                return true;
+            }
+
+            return false;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                ex,
+                "Quota probe contradiction check failed for auth evidence from agent {Agent}; keeping existing fleet-bench behaviour",
+                agent.Value);
             return false;
         }
     }
@@ -10461,6 +10561,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throwOnMatch: false,
                 failure.StdoutOnlyEvidence,
                 requireStdoutOnlyCorroboration: true,
+                matchedConfiguredPattern: failure.MatchedConfiguredPattern,
                 ct: ct);
 
             // If the resolver ultimately succeeded, a failed earlier candidate's
@@ -14753,6 +14854,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throwOnMatch: true,
                 stdoutOnlyEvidence: detection.IsStdoutOnly,
                 requireStdoutOnlyCorroboration: true,
+                matchedConfiguredPattern: detection.MatchedConfiguredStderrPattern
+                    || detection.MatchedConfiguredStdoutPattern,
                 ct: ct);
         }
 
@@ -16585,6 +16688,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     throwOnMatch: false,
                     stdoutOnlyEvidence: detection.IsStdoutOnly,
                     requireStdoutOnlyCorroboration: true,
+                    matchedConfiguredPattern: detection.MatchedConfiguredStderrPattern
+                        || detection.MatchedConfiguredStdoutPattern,
                     ct: token).ConfigureAwait(false);
 
                 var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
@@ -16599,21 +16704,33 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (classification.Kind != AgentFailureKind.AuthError)
                 return null;
 
+            // Same contradiction policy as the steady-state AuthError path: a
+            // healthy quota reading on the same credential vetoes the
+            // fleet-wide bench; the item still fails terminally.
+            var contradicted = await IsAuthContradictedByHealthyQuotaProbeAsync(
+                trialItem, project, runner.Kind, trialItem.ModelId, token).ConfigureAwait(false);
             var authErrorReason = _authRequiredHandler.BuildReason(
                 phase,
                 classification,
-                stdoutOnlyEvidence: false);
-            await _authRequiredHandler.PublishSideEffectsAsync(
-                runner.Kind,
-                authErrorReason,
-                trialItem,
-                project,
-                ct: token).ConfigureAwait(false);
+                stdoutOnlyEvidence: false,
+                stdoutOnlyNote: contradicted
+                    ? "credential reads healthy on quota probe; item-level failure only, no fleet-wide bench"
+                    : null);
+            if (!contradicted)
+            {
+                await _authRequiredHandler.PublishSideEffectsAsync(
+                    runner.Kind,
+                    authErrorReason,
+                    trialItem,
+                    project,
+                    ct: token).ConfigureAwait(false);
+            }
+
             return new AgentAuthRequiredException(
                 runner.Kind,
                 phase,
                 authErrorReason,
-                WorkItemAuthFailureScope.Fleet);
+                contradicted ? WorkItemAuthFailureScope.Item : WorkItemAuthFailureScope.Fleet);
         }
 
         async Task<TerminalQuotaError?> TryConvertResumeExhaustionToQuotaAsync(
@@ -18559,6 +18676,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throwOnMatch: true,
                 stdoutOnlyEvidence: authDetection.IsStdoutOnly,
                 requireStdoutOnlyCorroboration: true,
+                matchedConfiguredPattern: authDetection.MatchedConfiguredStderrPattern
+                    || authDetection.MatchedConfiguredStdoutPattern,
                 ct: ct);
         }
 
@@ -19806,6 +19925,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         throwOnMatch: true,
                         stdoutOnlyEvidence: authDetection.IsStdoutOnly,
                         requireStdoutOnlyCorroboration: true,
+                        matchedConfiguredPattern: authDetection.MatchedConfiguredStderrPattern
+                            || authDetection.MatchedConfiguredStdoutPattern,
                         ct: ct);
                 }
 

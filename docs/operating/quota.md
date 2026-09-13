@@ -346,6 +346,18 @@ availability registry, an `agent.smoke_failed` webhook with
 `failureKind=auth_required` rather than being treated as a normal no-diff run
 or retryable infrastructure failure.
 
+Two corroboration rules keep one item's output from halting the fleet. First,
+captured stderr is held to the same standard as stdout: only a short transcript
+whose non-empty lines are themselves CLI-shaped login prompts classifies, so
+task prose that quotes auth phrases (for example, work items about credential
+handling) is not evidence of a credential failure. The detection records the
+matched pattern, the stream, and the surrounding line in its reason. Second, a
+healthy quota-probe reading obtained with the same credential contradicts the
+classification — the credential just authenticated successfully — so the item
+fails with item-level scope and no fleet-wide bench. Explicitly
+operator-configured `AuthFailurePatterns` are exempt from the quota veto: the
+operator asserted that text means auth failure for the agent.
+
 ## `GET /quota`
 
 `GET /quota` returns:
