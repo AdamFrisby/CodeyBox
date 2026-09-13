@@ -95,7 +95,13 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             if (mode == TestSelectionMode.CoverageShadow)
                 return await RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
             if (mode == TestSelectionMode.ProjectGraph)
-                return await RunWithProjectGraphEnforcementAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+                return await RunWithEnforcementAsync(
+                    sandbox, workingDirectory, context, shadow,
+                    ProjectGraphTestSelector.SelectorName, ct).ConfigureAwait(false);
+            if (mode == TestSelectionMode.Coverage)
+                return await RunWithEnforcementAsync(
+                    sandbox, workingDirectory, context, shadow,
+                    CoverageTestSelector.SelectorName, ct).ConfigureAwait(false);
         }
         var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
         return full with { TestSelection = TestSelectionTelemetryComputer.FullSuiteWithoutShadow(ResolveModeName(shadow)) };
@@ -249,19 +255,26 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
     }
 
     /// <summary>
-    /// ENFORCING project-graph selection (<c>Audit:TestSelection:Mode=project-graph</c>):
-    /// resolves the affected tests and executes ONLY that subset via
-    /// <c>--filter</c>. Fail-safe: any selector error, unreadable options,
-    /// unknown base ref, an ambiguous result (empty/blank filters), a
-    /// filter-build failure, or a narrowed run that executes zero tests falls
-    /// back to the full suite. The merge/release path never reaches here — it
-    /// takes no <c>ITestSelector</c> dependency by construction.
+    /// ENFORCING selection (<c>Audit:TestSelection:Mode=project-graph</c> or
+    /// <c>coverage</c>): resolves the affected tests and executes ONLY that
+    /// subset via <c>--filter</c>. The <paramref name="enforcedSelectorName"/>
+    /// stamps the telemetry selector (and its layers): the project-graph rung
+    /// executes the superset, while the coverage rung executes the
+    /// coverage-narrowed subset nested inside that superset — or, when the
+    /// coverage rung falls back (<see cref="CoverageTestSelector.ProjectGraphRungMarker"/>),
+    /// the superset itself, with the fired rung recorded in telemetry
+    /// fallbacks. Fail-safe: any selector error, unreadable options, unknown
+    /// base ref, an ambiguous result (empty/blank filters), a filter-build
+    /// failure, or a narrowed run that executes zero tests falls back to the
+    /// full suite. The merge/release path never reaches here — it takes no
+    /// <c>ITestSelector</c> dependency by construction.
     /// </summary>
-    private async Task<AuditResult> RunWithProjectGraphEnforcementAsync(
+    private async Task<AuditResult> RunWithEnforcementAsync(
         ISandbox sandbox,
         string workingDirectory,
         AuditContext context,
         TestSelectionShadowConfig shadow,
+        string enforcedSelectorName,
         CancellationToken ct)
     {
         var changedFiles = await TestSelectionShadowIO.GetChangedFilesAsync(
@@ -274,7 +287,9 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         var universe = baseline.Baseline is null
             ? (IReadOnlyList<string>)[]
             : [.. baseline.Baseline.Tests.Keys];
-        var modeName = TestSelectionMode.ProjectGraph.ToString();
+        var modeName = enforcedSelectorName == CoverageTestSelector.SelectorName
+            ? TestSelectionMode.Coverage.ToString()
+            : TestSelectionMode.ProjectGraph.ToString();
 
         TestSelectionDecision decision;
         if (string.IsNullOrWhiteSpace(context.BaseBranch))
@@ -307,7 +322,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             }
             var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
             var telemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
-                modeName, ProjectGraphTestSelector.SelectorName, decision, universe.Count, detail);
+                modeName, enforcedSelectorName, decision, universe.Count, detail);
             return full with { TestSelection = telemetry };
         }
 
@@ -321,7 +336,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             var buildFailure = detail + $" | filter build failed ({ex.GetType().Name}: {TruncateForDetail(ex.Message)})";
             var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
             var fallbackTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
-                modeName, ProjectGraphTestSelector.SelectorName,
+                modeName, enforcedSelectorName,
                 new TestSelectionDecision(TestSelection.All, buildFailure),
                 universe.Count, buildFailure);
             return full with { TestSelection = fallbackTelemetry };
@@ -333,15 +348,28 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             var zeroTests = detail + " | narrowed run executed zero tests; fell back to the full suite";
             var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
             var fallbackTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
-                modeName, ProjectGraphTestSelector.SelectorName,
+                modeName, enforcedSelectorName,
                 new TestSelectionDecision(TestSelection.All, zeroTests),
                 universe.Count, zeroTests);
             return full with { TestSelection = fallbackTelemetry };
         }
         var enforcedTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
-            modeName, ProjectGraphTestSelector.SelectorName, decision, universe.Count, detail);
+            modeName, enforcedSelectorName, decision, universe.Count, detail,
+            RungFallbacks(decision));
         return narrowed with { TestSelection = enforcedTelemetry };
     }
+
+    /// <summary>
+    /// Ladder-rung attribution for a narrowed enforcing run: when the coverage
+    /// selector descended to its project-graph rung, the coverage reason rides
+    /// in telemetry fallbacks so operators see which rung fired. Any other
+    /// narrowed run narrowed without falling back.
+    /// </summary>
+    private static IReadOnlyList<string>? RungFallbacks(TestSelectionDecision decision)
+        => decision.Justification.Contains(
+            CoverageTestSelector.ProjectGraphRungMarker, StringComparison.Ordinal)
+            ? [decision.Justification]
+            : null;
 
     private static string TruncateForDetail(string message, int maxChars = 200)
     {
@@ -500,10 +528,12 @@ public sealed record DotnetTestAuditorOptions
     /// Test-selection configuration. When set, the live mode decides the run:
     /// <c>coverage-shadow</c> computes the selector's advisory decision, still
     /// executes the FULL suite, and emits a shadow record (SHADOW-BEFORE-ENFORCE);
-    /// <c>project-graph</c> executes ONLY the selector's subset (enforcing),
-    /// falling back to the full suite on any error or ambiguous result;
-    /// <c>all</c> (or unset) runs the full suite. Null (the default) disables
-    /// selection — byte-identical legacy runs.
+    /// <c>project-graph</c> executes ONLY the project-graph subset (enforcing),
+    /// <c>coverage</c> executes ONLY the coverage subset nested inside that
+    /// superset (enforcing, with fallback down the coverage → project-graph →
+    /// all ladder), each falling back to the full suite on any error or
+    /// ambiguous result; <c>all</c> (or unset) runs the full suite. Null (the
+    /// default) disables selection — byte-identical legacy runs.
     /// </summary>
     public TestSelectionShadowConfig? Shadow { get; init; }
 }

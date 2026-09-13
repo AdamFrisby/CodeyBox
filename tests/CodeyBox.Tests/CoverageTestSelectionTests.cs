@@ -474,7 +474,7 @@ public sealed class CoverageTestSelectionTests
     }
 
     [Fact]
-    public void Coverage_SelectsIntersectingPlusMustInclude_WithinSuperset()
+    public void Coverage_NarrowsSupersetToCoveringTests_NeverGrowsBeyondIt()
     {
         var runner = NewRunner();
         var decision = NewCoverageSelector().Select(RequestFor(
@@ -483,42 +483,47 @@ public sealed class CoverageTestSelectionTests
 
         Assert.False(decision.Selection.IsAll);
         var selected = decision.Selection.Filters.OrderBy(f => f, StringComparer.Ordinal).ToList();
-        // Line 10-11 intersect BarTests; OtherTests rides the project-graph
-        // superset; NewTests has no coverage record and is always included.
-        Assert.Equal(
-            ["Ns.Foo.BarTests", "Ns.Foo.NewTests", "Ns.Foo.OtherTests"],
-            selected);
+        // Line 10-11 intersect BarTests only: OtherTests (covers line 50) is
+        // deselected even though the project-graph superset contains it, and
+        // NewTests (no coverage record) stays out because it is outside the
+        // superset — coverage shrinks the superset, never grows beyond it.
+        Assert.Equal(["Ns.Foo.BarTests"], selected);
+        Assert.Contains("deselected", decision.Justification);
     }
 
     [Fact]
-    public void Coverage_NonExecutableChange_KeepsSupersetOnly()
+    public void Coverage_NoIntersectingCoverage_FallsBackToProjectGraphRung()
     {
         // Line 99 is executable nowhere, but the file is referenced — the
-        // change contributes no coverage hits, so the superset floor stands.
+        // coverage rung carries no signal, so the ladder descends to the
+        // project-graph superset instead of the full suite.
         var decision = NewCoverageSelector().Select(RequestFor(
             NewRunner(), StandardBaseline(),
             new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(99, 1)])));
 
         Assert.False(decision.Selection.IsAll);
         Assert.Equal(
-            ["Ns.Foo.BarTests", "Ns.Foo.NewTests", "Ns.Foo.OtherTests"],
+            ["Ns.Foo.BarTests", "Ns.Foo.OtherTests"],
             [.. decision.Selection.Filters.OrderBy(f => f, StringComparer.Ordinal)]);
+        Assert.Contains(CoverageTestSelector.ProjectGraphRungMarker, decision.Justification);
     }
 
     [Fact]
-    public void Coverage_PreservesSupersetFiltersVerbatim_NeverSelectsLess()
+    public void Coverage_RawSupersetExpression_ExecutedVerbatim_NeverGrown()
     {
-        // A superset emitting a raw expression: the coverage selector must
-        // preserve it verbatim (never less than the superset).
+        // A superset emitting a raw expression cannot be provably nested
+        // inside — the ladder descends to it verbatim and coverage adds
+        // nothing (never grows beyond the superset).
         var superset = new RawExpressionSelector("FullyQualifiedName~Flaky");
         var selector = new CoverageTestSelector(superset, FreshOptions, new FixedClock(Now));
         var decision = selector.Select(RequestFor(
             NewRunner(), StandardBaseline(),
             new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(10, 1)])));
 
+        Assert.False(decision.Selection.IsAll);
         Assert.Contains("FullyQualifiedName~Flaky", decision.Selection.Filters);
-        Assert.Contains("Ns.Foo.BarTests", decision.Selection.Filters);
-        Assert.Contains("Ns.Foo.NewTests", decision.Selection.Filters);
+        Assert.DoesNotContain("Ns.Foo.BarTests", decision.Selection.Filters);
+        Assert.Contains(CoverageTestSelector.ProjectGraphRungMarker, decision.Justification);
     }
 
     [Fact]
@@ -856,7 +861,12 @@ public sealed class CoverageTestSelectionTests
         Assert.Equal(TestSelectionShadowRecord.AssessmentSafe, record.Assessment);
         Assert.Empty(record.UnsafeSkips);
         Assert.Contains("--filter", record.WouldBeArgv);
-        Assert.Equal(["Ns.Foo.UnrelatedTests"], record.DeselectedTests);
+        // Nested inside the project-graph superset {BarTests, OtherTests}:
+        // only BarTests covers the changed line, so every other recorded test
+        // would have been deselected.
+        Assert.Equal(
+            ["Ns.Foo.NewTests", "Ns.Foo.OtherTests", "Ns.Foo.UnrelatedTests"],
+            record.DeselectedTests);
     }
 
     [Fact]

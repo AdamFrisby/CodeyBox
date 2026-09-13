@@ -271,10 +271,12 @@ Capability: `None`.
 ### Test selection (`Audit:TestSelection`)
 
 `csharp:test-pass` can narrow `dotnet test` to the tests a change may affect.
-Narrowing ships **advisory/shadow only**: the selector computes the subset it
-*WOULD* run, the **full suite still runs**, and per-run telemetry plus a shadow
-record capture whether any deselected test failed. No ticket in this sequence
-skips a test.
+New selectors first ship **advisory/shadow only** (`coverage-shadow`): the
+selector computes the subset it *WOULD* run, the **full suite still runs**,
+and per-run telemetry plus a shadow record capture whether any deselected
+test failed. Real skipping is gated on the soundness gate below reporting
+`readyForEnforcement`, after which operators may opt into the enforcing
+`project-graph` or `coverage` modes.
 
 **Selection scopes (`all` | `project-graph` | `coverage`)** — the three layers,
 innermost first:
@@ -285,22 +287,30 @@ innermost first:
 - `project-graph` (`ProjectGraphTestSelector`): maps each changed file to its
   owning MSBuild project and selects the baseline's precomputed affected tests,
   plus tests defined in the changed files.
-- `coverage` (`CoverageTestSelector`): refines the project-graph superset by
-  per-test coverage intersection — and ALWAYS also selects tests defined in
-  changed files, tests with NO coverage record (new/uninstrumented), and
-  everything the project-graph layer picks. Coverage only refines WITHIN that
-  superset: the result is a union, never less.
+- `coverage` (`CoverageTestSelector`): intersects the changed lines with
+  per-test recorded coverage, NESTED INSIDE the project-graph superset — the
+  executed set only shrinks that superset, never grows beyond it — and ALWAYS
+  keeps (within the superset) tests defined in changed files and tests with NO
+  coverage record (new/uninstrumented). A change no recorded coverage
+  intersects descends the fallback ladder to the project-graph rung.
 
 The live config knob is `Audit:TestSelection:Mode` (`all` |
-`coverage-shadow`, case-insensitive, hot-reloaded via `IOptionsMonitor`; an
-unrecognised value fails fast at load). `coverage-shadow` runs the
-`project-graph` + `coverage` layers advisorially and records the verdict; `all`
-runs neither. `csharp:test-pass` consults the configured `ITestSelector` only
-in `coverage-shadow` mode, and only on paper: it computes the advisory
-selection, still runs the FULL suite (the narrowed `--filter` argv is recorded,
-never executed), parses the full run's failed tests, and emits a shadow record
-(`safe-for-this-run` / `unsafe-skips-observed` / `full-suite` /
-`unverifiable`).
+`coverage-shadow` | `project-graph` | `coverage`, case-insensitive,
+hot-reloaded via `IOptionsMonitor`; an unrecognised value fails fast at load).
+`coverage-shadow` runs the `project-graph` + `coverage` layers advisorially
+and records the verdict; `project-graph` enforces the superset rung;
+`coverage` enforces the nested coverage subset with fallback down the
+coverage → project-graph → all ladder; `all` runs neither. Enable an enforcing
+mode only after the soundness gate below reports `readyForEnforcement: true`
+for that selector. `csharp:test-pass` consults the configured `ITestSelector`
+only in these selection modes, and only for per-item audit runs: the
+merge/release verification path (`IRequiredBuildVerifier` /
+`process:required-build`) takes no selector dependency and always runs the
+full surface. In `coverage-shadow` mode the advisory selection is computed on
+paper only: the FULL suite still runs (the narrowed `--filter` argv is
+recorded, never executed), the full run's failed tests are parsed, and a
+shadow record is emitted (`safe-for-this-run` / `unsafe-skips-observed` /
+`full-suite` / `unverifiable`).
 
 **Fallback ladder** — running MORE tests is always safe, so ANY uncertainty
 resolves to the full suite, in this order: unknown/empty changeset → no
@@ -309,13 +319,18 @@ than `MaxBaselineAge`) → global-target touch (`Directory.Build.*`,
 `Directory.Packages.props`, `global.json`, `NuGet.Config`, `CodeyBox.slnx`,
 `.github/workflows/`) → whole-file change (no line granularity) → changed test
 file (may define unrecorded tests) → changed file no record references →
-project-graph superset already full → selector error. Each rung records its
-reason in the telemetry `fallbacks` list and the shadow record detail.
+change no recorded coverage intersects (coverage rung only — descends to the
+project-graph rung rather than the full suite) → project-graph superset
+already full → selector error. In `coverage` mode the ladder is structural:
+the coverage rung is attempted first, then the project-graph rung, then the
+full suite. Each rung records its reason in the telemetry `fallbacks` list
+and the shadow record detail.
 
 **Full-suite-on-main soundness invariant** — the merge/release path
 (`IRequiredBuildVerifier` / `process:required-build`) takes NO dependency on
 the `ITestSelector` seam and always runs the full build/test surface,
-regardless of mode. Selectors are advisory for the audit loop only; the gate
+regardless of mode. Selectors narrow per-item audit runs only (advisory in
+`coverage-shadow`, enforcing in `project-graph`/`coverage`); the gate
 that certifies `main` cannot narrow. Enforced structurally in code (see
 `TestSelectorTests`), not by config.
 

@@ -327,7 +327,7 @@ builder.Services.AddOptions<TestSelectionOptions>()
     .Bind(builder.Configuration.GetSection(TestSelectionOptions.SectionName))
     .Validate(
         static opts => TestSelectionModeParser.TryParse(opts.Mode, out _),
-        $"{TestSelectionOptions.SectionName}:Mode must be one of: all, coverage-shadow, project-graph");
+        $"{TestSelectionOptions.SectionName}:Mode must be one of: all, coverage-shadow, project-graph, coverage");
 // Coverage-guided selection knobs (Audit:TestSelection:Coverage). Bound through
 // AddOptions so IOptionsMonitor<CoverageTestSelectionOptions> hot-reloads the
 // baseline location, age/size caps, and global targets without a restart, with
@@ -2617,13 +2617,19 @@ builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(ne
 // from IOptionsMonitor on every call (hot-reload) and dispatches to the selector
 // registered for that mode; the default 'all' maps to RunAllTestSelector, whose
 // TestSelection.All keeps the emitted dotnet-test command byte-identical to the
-// legacy path. 'coverage-shadow' maps to CoverageTestSelector, which refines the
+// legacy path. 'coverage-shadow' maps to CoverageTestSelector, which narrows the
 // project-graph superset by per-test coverage — ADVISORY ONLY: the per-item
 // csharp:test-pass runner computes the decision, still runs the full suite, and
 // emits a shadow record (SHADOW-BEFORE-ENFORCE). 'project-graph' maps to
 // ProjectGraphTestSelector and is ENFORCING: the per-item csharp:test-pass runner
 // executes only the selected subset (fail-safe fallback to the full suite on any
-// error or ambiguous result). The merge/release verification
+// error or ambiguous result). 'coverage' maps to the same CoverageTestSelector
+// instance and is ENFORCING: the runner executes only the coverage-narrowed
+// subset nested inside the project-graph superset, descending the
+// coverage → project-graph → all fallback ladder on any error or ambiguous
+// result. Opt into either enforcing mode only after the soundness gate
+// (GET /audit/test-selection/soundness, selector=project-graph or coverage)
+// reports readyForEnforcement. The merge/release verification
 // path (IRequiredBuildVerifier / process:required-build) deliberately takes NO
 // dependency on this seam: it always verifies the full build/test surface
 // regardless of Mode.
@@ -2632,14 +2638,16 @@ builder.Services.AddSingleton<ITestSelector>(sp =>
     var modeMonitor = sp.GetRequiredService<IOptionsMonitor<TestSelectionOptions>>();
     var coverageOptionsMonitor = sp.GetRequiredService<IOptionsMonitor<CoverageTestSelectionOptions>>();
     var projectGraph = new ProjectGraphTestSelector(() => coverageOptionsMonitor.CurrentValue, TimeProvider.System);
+    var coverage = new CoverageTestSelector(
+        projectGraph,
+        () => coverageOptionsMonitor.CurrentValue,
+        TimeProvider.System);
     var selectorsByMode = new Dictionary<TestSelectionMode, ITestSelector>
     {
         [TestSelectionMode.All] = new RunAllTestSelector(),
-        [TestSelectionMode.CoverageShadow] = new CoverageTestSelector(
-            projectGraph,
-            () => coverageOptionsMonitor.CurrentValue,
-            TimeProvider.System),
+        [TestSelectionMode.CoverageShadow] = coverage,
         [TestSelectionMode.ProjectGraph] = projectGraph,
+        [TestSelectionMode.Coverage] = coverage,
     };
     return new ConfiguredTestSelector(
         () => TestSelectionModeParser.Parse(modeMonitor.CurrentValue.Mode),
@@ -2649,7 +2657,8 @@ builder.Services.AddSingleton<ITestSelector>(sp =>
 // threaded into every csharp:test-pass runner the preset catalogs build.
 // Mode=all (the default) is an instant kill-switch: the runner checks the live
 // mode on every run and runs the full suite for anything but coverage-shadow
-// (advisory shadow) or project-graph (enforcing subset).
+// (advisory shadow), project-graph (enforcing subset), or coverage (enforcing
+// coverage-nested subset).
 builder.Services.AddSingleton<ITestSelectionShadowSink, LoggerTestSelectionShadowSink>();
 builder.Services.AddSingleton<TestSelectionShadowConfig>(sp => new TestSelectionShadowConfig
 {

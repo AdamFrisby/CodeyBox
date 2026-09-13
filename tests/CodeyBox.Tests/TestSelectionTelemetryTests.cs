@@ -167,8 +167,8 @@ public sealed class TestSelectionTelemetryTests : IDisposable
         Assert.Equal(TestSelectionMode.CoverageShadow.ToString(), telemetry.Mode);
         Assert.Equal(CoverageTestSelector.SelectorName, telemetry.Selector);
         Assert.Equal(4, telemetry.TotalCount);
-        Assert.Equal(3, telemetry.SelectedCount);
-        Assert.Equal(0.25, telemetry.EstimatedSavedFraction, precision: 9);
+        Assert.Equal(1, telemetry.SelectedCount);
+        Assert.Equal(0.75, telemetry.EstimatedSavedFraction, precision: 9);
         Assert.Equal(TestSelectionShadowRecord.AssessmentSafe, telemetry.Assessment);
         Assert.Empty(telemetry.Fallbacks);
     }
@@ -185,7 +185,7 @@ public sealed class TestSelectionTelemetryTests : IDisposable
         Assert.NotNull(result.TestSelection);
         var telemetry = result.TestSelection;
         Assert.Equal(TestSelectionShadowRecord.AssessmentUnsafe, telemetry.Assessment);
-        Assert.Equal(3, telemetry.SelectedCount);
+        Assert.Equal(1, telemetry.SelectedCount);
         Assert.Equal(4, telemetry.TotalCount);
     }
 

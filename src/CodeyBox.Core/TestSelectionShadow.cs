@@ -231,9 +231,11 @@ public sealed record TestSelectionShadowConfig
 
     /// <summary>
     /// Live mode reader (backed by <c>IOptionsMonitor</c>). The shadow runs
-    /// ONLY for <see cref="TestSelectionMode.CoverageShadow"/>; the enforcing
-    /// project-graph run applies ONLY for
-    /// <see cref="TestSelectionMode.ProjectGraph"/>; every other
+    /// ONLY for <see cref="TestSelectionMode.CoverageShadow"/>; an enforcing
+    /// subset run applies ONLY for <see cref="TestSelectionMode.ProjectGraph"/>
+    /// (project-graph subset) or <see cref="TestSelectionMode.Coverage"/>
+    /// (coverage subset nested inside the project-graph superset, with
+    /// fallback down the coverage → project-graph → all ladder); every other
     /// mode — including the <c>all</c> kill-switch — runs the full suite with
     /// no selection.
     /// </summary>
