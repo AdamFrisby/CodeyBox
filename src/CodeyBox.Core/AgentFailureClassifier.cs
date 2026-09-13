@@ -10,11 +10,14 @@ namespace CodeyBox.Core;
 ///
 /// <para>
 /// Pattern dictionaries are exposed as static fields so the operator can tune
-/// or replace them in tests without touching runner internals. The patterns
-/// here are intentionally substring-only — the orchestrator-side
-/// <c>QuotaFailureDetector</c> still owns the structured-stream parsing and
-/// reset-window extraction; this classifier is responsible only for the
-/// in-iteration fallback decision (which agent kind, if any, to retry on).
+/// or replace them in tests without touching runner internals. Quota,
+/// transient-network, and provider-auth-error patterns remain substring
+/// matches; interactive login prompts match only as short, whole-line
+/// CLI-shaped transcripts on either captured stream, because both streams can
+/// carry model-relayed prose. The orchestrator-side <c>QuotaFailureDetector</c>
+/// still owns the structured-stream parsing and reset-window extraction; this
+/// classifier is responsible only for the in-iteration fallback decision
+/// (which agent kind, if any, to retry on).
 /// </para>
 /// </summary>
 public static class AgentFailureClassifier
@@ -364,7 +367,17 @@ public static class AgentFailureClassifier
 
         var stderrAuthError = ContainsAuthErrorPattern(stderr);
         if (stderrAuthError)
-            return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
+        {
+            // Record what matched, as for login-prompt detections: the
+            // incident reviews had to read source to establish that the
+            // trigger was the agent's own text, so the reason carries the
+            // pattern, the stream, and the surrounding line.
+            var authErrorEvidence = FindAuthErrorEvidence(stderr);
+            var authErrorReason = authErrorEvidence is { } hit
+                ? $"auth pattern matched in stderr (pattern '{hit.Pattern}' on stderr: '{hit.Line}')"
+                : "auth pattern matched";
+            return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: authErrorReason);
+        }
 
         // The transient list is intentionally conservative; apply it to the
         // captured CLI streams so stdout-only transport diagnostics still park
@@ -662,6 +675,34 @@ public static class AgentFailureClassifier
 
     public static bool ContainsAuthErrorPattern(string? text) =>
         ContainsAny(text, AuthPatterns);
+
+    /// <summary>
+    /// Finds the first stderr line carrying an <see cref="AuthPatterns"/> hit
+    /// so an <see cref="AgentFailureKind.AuthError"/> classification can
+    /// record the pattern and the surrounding line. Auth-error evidence is
+    /// always stderr: unlike the login-prompt matcher, stdout is never
+    /// consulted for these shapes, so there is no stream to disambiguate.
+    /// Returns null only when no line carries a hit (possible solely for a
+    /// pattern spanning a line break); callers keep the bare reason then.
+    /// </summary>
+    private static (string Pattern, string Line)? FindAuthErrorEvidence(string? stderr)
+    {
+        if (string.IsNullOrEmpty(stderr))
+            return null;
+        foreach (var rawLine in stderr.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (string.IsNullOrEmpty(line))
+                continue;
+            foreach (var pattern in AuthPatterns)
+            {
+                if (line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                    return (pattern, TruncateEvidenceLine(line));
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Guarded stdout matcher. Delegates to the same shared predicate as

@@ -166,4 +166,21 @@ public sealed class AgentFailureStderrGuardTests
         Assert.Equal("stdout", detection.MatchedStream);
         Assert.Contains(GenuineRefusal, detection.MatchedLine, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void AuthErrorClassification_RecordsPatternStreamAndLine()
+    {
+        // The fleet halts under review were triggered on this path, whose
+        // bare "auth pattern matched" reason forced reviewers to read source
+        // to establish that the trigger was the agent's own text. The reason
+        // now carries the pattern, the stream, and the surrounding line.
+        const string stderr = "request failed: API Error: 401 Unauthorized for url";
+
+        var classification = AgentFailureClassifier.Classify(stderr: stderr);
+
+        Assert.Equal(AgentFailureKind.AuthError, classification.Kind);
+        Assert.Contains("API Error: 401", classification.Reason, StringComparison.Ordinal);
+        Assert.Contains("stderr", classification.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(stderr, classification.Reason, StringComparison.Ordinal);
+    }
 }
