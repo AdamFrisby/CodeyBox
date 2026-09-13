@@ -76,10 +76,15 @@ Hot-reloadable today:
   see the not-hot-reloadable list below.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
-- `PipelineTuning.AgentSessionResumeMaxAttempts` and
-  `PipelineTuning.MaxRetainedAgentTurnSandboxes` — re-read at the next resume
-  claim or retained-lease publication respectively. Existing claims and leases
-  are not rewritten by a reload.
+- `PipelineTuning.*` — the whole block is re-applied via `AgentConfigHotReload`
+  into the shared `PipelineTuningSnapshot`, which `PipelineRunner` reads at
+  each use, so audit idle/absolute timeouts (`AuditorIdleTimeout`,
+  `AuditorAbsoluteTimeout`, `CSharpTestPassAuditorIdleTimeout`), retry caps,
+  sandbox reuse bounds, and the remaining tuning knobs take effect on the next
+  pickup / audit run without a restart. (`AgentSuspendMaxRetries` and
+  `AgentSessionResumeMaxAttempts` are additionally pushed to the process-wide
+  runner knobs.) The block swaps atomically; in-flight runs keep the reference
+  they started with.
 - `SqliteWriteGate.{AcquisitionTimeout,MaxHoldDuration,MaxQueuedWaiters,MaxConcurrentReadConnections}`
   — sampled on each subsequent SQLite gate/read-slot acquisition. Edits do not
   alter a holder already inside the gate. Values have defensive upper bounds:
@@ -189,6 +194,26 @@ Hot-reloadable today:
   the retention window, and the total-size backstop all take effect on the next
   capture / retention sweep. `AgentStreams.Path` remains startup-only (see the
   guarded list below).
+
+## Reload feedback
+
+Silence after an edit used to mean both "applied" and "ignored". Every reload
+now reports all three outcomes:
+
+- Applied hot-reloadable blocks emit a `config_reloaded` audit event (with
+  `Block`, `OldValue`, `NewValue`) plus an information log naming the block.
+- Keys that changed but require a restart emit a `config_requires_restart`
+  audit event and a warning log naming each key — the running process keeps
+  the prior values until restarted.
+- Keys that bind to no option emit a `config_unbound_keys` audit event and a
+  warning log naming each key (the startup validator refuses to start on such
+  keys; this is the same signal at reload time, where a live operator will
+  actually see it).
+
+To answer "will editing this key take effect" without reading source, query
+`GET /config/reload-effects` (or `?key=<full key path>` for a single key).
+Each entry reports `HotReload` or `RestartRequired`; keys outside the
+classified surface return `found: false`.
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 

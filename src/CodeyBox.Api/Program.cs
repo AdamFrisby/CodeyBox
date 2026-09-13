@@ -4008,7 +4008,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         agents: sp.GetRequiredService<IAgentRegistry>(),
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
         hostPoolSnapshot: sp.GetService<ISandboxProvider>() as ISandboxHostPoolSnapshot,
-        sandboxAdmission: sp.GetService<ISandboxProvider>() as SandboxAdmissionControlledProvider);
+        sandboxAdmission: sp.GetService<ISandboxProvider>() as SandboxAdmissionControlledProvider,
+        configuration: builder.Configuration);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -4307,6 +4308,7 @@ ResetAdviceEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 AgentPauseEndpoints.Map(app);
 TestSelectionSoundnessEndpoints.Map(app);
+ConfigReloadEndpoints.Map(app);
 
 // Prometheus scrape endpoint — registered only when the exporter is enabled
 // so the surface is invisible (route not on the table) by default. Mapped
