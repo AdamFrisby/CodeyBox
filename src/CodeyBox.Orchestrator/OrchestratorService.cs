@@ -2705,7 +2705,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (item.State is WorkItemState.Cancelled or WorkItemState.Done
             or WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed
-            or WorkItemState.AbandonedAfterRecoveryAttempts)
+            or WorkItemState.AbandonedAfterRecoveryAttempts
+            or WorkItemState.NoActionRequired)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
             ClearPreStartRefactorDrainClaim(item);
@@ -2796,7 +2797,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (current.State is WorkItemState.Cancelled or WorkItemState.Done
                 or WorkItemState.Failed or WorkItemState.AuditFailed
                 or WorkItemState.MergeConflictResolutionFailed
-                or WorkItemState.AbandonedAfterRecoveryAttempts)
+                or WorkItemState.AbandonedAfterRecoveryAttempts
+                or WorkItemState.NoActionRequired)
             {
                 _log.LogInformation("Worker {WorkerId} skipping {Id} after active claim: terminal state {State}", workerIndex, id, current.State);
                 ClearPreStartRefactorDrainClaim(current);
@@ -3400,6 +3402,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         and not WorkItemState.AuditFailed
         and not WorkItemState.MergeConflictResolutionFailed
         and not WorkItemState.AbandonedAfterRecoveryAttempts
+        and not WorkItemState.NoActionRequired
         and not WorkItemState.NeedsOperatorInput
         and not WorkItemState.WaitingForQuotaReset
         and not WorkItemState.WaitingForAgentResume

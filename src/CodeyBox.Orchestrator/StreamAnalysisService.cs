@@ -173,5 +173,6 @@ public sealed class StreamAnalysisService : BackgroundService
             or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.Cancelled
+            or WorkItemState.NoActionRequired
             or WorkItemState.AbandonedAfterRecoveryAttempts;
 }

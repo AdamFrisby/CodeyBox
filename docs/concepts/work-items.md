@@ -52,6 +52,7 @@ A dependency is **satisfied** when it has reached `Done` — successful end-to-e
 | `MergeConflictResolutionFailed` | ❌ No | Resolve the conflict manually, then `POST /workitems/{depId}/retry` |
 | `Cancelled` | ❌ No | `POST /workitems/{depId}/uncancel` (cascade) or `/resume` (operator-cancelled), then let it reach `Done` |
 | `AbandonedAfterRecoveryAttempts` | ❌ No | Investigate the stuck root cause, then `POST /workitems/{depId}/retry` |
+| `NoActionRequired` | ❌ No | The agent determined no action is warranted; `POST /workitems/{depId}/retry` to re-run if the precondition now holds, then let it reach `Done` |
 | Any non-terminal state | ❌ No | None — wait for completion |
 
 Rationale: a dependent built on a failed prerequisite cannot be validated end-to-end. Running it anyway burns agent quota on speculative work the operator will likely discard once the parent is retried.
@@ -164,11 +165,20 @@ POST /workitems/{id}/resume
 
 Returns `412 Precondition Failed` when the bare repo or the work-branch ref is no longer present on disk — fall back to `POST /workitems/{id}/replay` for a fresh start. Returns `409` when the item is not in `Cancelled` state.
 
-Distinct from `/uncancel` (operator cancels are refused there by design — the operator chose to stop, so undoing that needs its own verb) and from `/retry` (which is scoped to terminal-failed states, not Cancelled).
+Distinct from `/uncancel` (operator cancels are refused there by design — the operator chose to stop, so undoing that needs its own verb) and from `/retry` (which is scoped to terminal-failed and `NoActionRequired` states, not Cancelled).
 
 ### AbandonedAfterRecoveryAttempts
 
 When the recovery loop has retried an item more than `CodeyBox:DeadWorker:MaxRecoveryAttempts` times (default 10) without it ever completing the recovered phase, the item is transitioned to `AbandonedAfterRecoveryAttempts` with a descriptive `lastError`. Use `POST /workitems/{id}/retry` to resume manually after investigating the root cause.
+
+### NoActionRequired
+
+When the initial work agent exits cleanly with no diff AND reports — via the structured `.codeybox/no-action-required.json` protocol (schema in `agent-feedback.md`) — that no action is warranted (typically a conditional item whose precondition does not hold), the item resolves terminally to `NoActionRequired` instead of failing:
+
+* The agent's reasoning is preserved on the item (`lastError` reads `no action required: <reason>`, plus the checked precondition when reported) and emitted on the `work_item.no_action_required` webhook, so the determination can be reviewed later.
+* The outcome is terminal and resolved: the item never re-enters the queue on its own, does not count as in-flight, and does not satisfy the dependency gate (like any other non-`Done` terminal state).
+* It is not a failure: the agent-level no-changes breaker is not fed, the per-agent dispatch breaker treats the run as a success, and no failure notification fires. An empty diff WITHOUT such a report still fails the item with "Agent produced no changes to commit" and still feeds the breaker.
+* It stays revisitable: `POST /workitems/{id}/retry` re-runs the item from scratch if the precondition later holds. `DELETE /workitems/{id}` refuses it (like `Done`) so the recorded determination is not overwritten by a cancel.
 
 ### Cancellation source attribution
 
@@ -243,9 +253,11 @@ DELETE /workitems/{id}?reason=<text>&resolutionSha=<7-40 hex chars>
 
 `reason` and `resolutionSha` are surfaced in `lastError` on the resulting
 `Cancelled` row and in the webhook `details` payload. Accepted from any
-non-`Done` state, including the terminal-failure states
+non-`Done`, non-`NoActionRequired` state, including the terminal-failure states
 (`Failed` / `AuditFailed` / `MergeConflictResolutionFailed` /
 `AbandonedAfterRecoveryAttempts`) — see *Closing terminal-failure items* above.
+(`NoActionRequired` is refused like `Done` so the recorded determination is
+preserved; retry the item instead if the precondition now holds.)
 
 ### Per-phase agent involvement
 
@@ -584,7 +596,8 @@ existence check, self-loop and cycle rejection.
 
 Allowed on any **non-terminal** state. Terminal items
 (`Done` / `Cancelled` / `Failed` / `AuditFailed` /
-`MergeConflictResolutionFailed` / `AbandonedAfterRecoveryAttempts`)
+`MergeConflictResolutionFailed` / `AbandonedAfterRecoveryAttempts` /
+`NoActionRequired`)
 reject with `409` because dependencies on closed work are moot. Editing
 an in-flight item (`Working` / `Auditing` / …) does not affect the
 current iteration — the gate has already passed — but is recorded for

@@ -110,6 +110,16 @@ public static class AuditLog
             .Warning("Work item {WorkItemId} failed: {Error}", id.ToString(), error);
 
     /// <summary>
+    /// The agent explicitly determined that no action is warranted (terminal
+    /// <c>NoActionRequired</c> resolution). Informational — not a failure —
+    /// so operator dashboards can separate "resolved without changes" from
+    /// failed items. <paramref name="reason"/> must already be redacted.
+    /// </summary>
+    public static void WorkItemNoActionRequired(WorkItemId id, string reason) =>
+        Audit("work_item.no_action_required")
+            .Information("Work item {WorkItemId} resolved with no action required: {Reason}", id.ToString(), reason);
+
+    /// <summary>
     /// Emitted by <c>TerminalFailureRecoveryService</c> for every terminal
     /// failure it inspects (Failed, AuditFailed,
     /// MergeConflictResolutionFailed). Captures the classifier verdict and

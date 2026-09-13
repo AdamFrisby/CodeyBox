@@ -2850,6 +2850,7 @@ public sealed class SqliteWorkItemStore :
                     {(int)WorkItemState.AuditFailed},
                     {(int)WorkItemState.MergeConflictResolutionFailed},
                     {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                    {(int)WorkItemState.NoActionRequired},
                     {(int)WorkItemState.NeedsOperatorInput},
                     {(int)WorkItemState.WaitingForQuotaReset},
                     {(int)WorkItemState.WaitingForAgentResume},
@@ -2912,6 +2913,7 @@ public sealed class SqliteWorkItemStore :
                         $state_audit_failed,
                         $state_merge_conflict_resolution_failed,
                         $state_abandoned_after_recovery_attempts,
+                        $state_no_action_required,
                         $state_needs_operator_input,
                         $state_waiting_for_quota_reset,
                         $state_waiting_for_agent_resume,
@@ -2966,6 +2968,7 @@ public sealed class SqliteWorkItemStore :
             cmd.Parameters.AddWithValue("$state_audit_failed", (int)WorkItemState.AuditFailed);
             cmd.Parameters.AddWithValue("$state_merge_conflict_resolution_failed", (int)WorkItemState.MergeConflictResolutionFailed);
             cmd.Parameters.AddWithValue("$state_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
+            cmd.Parameters.AddWithValue("$state_no_action_required", (int)WorkItemState.NoActionRequired);
             cmd.Parameters.AddWithValue("$state_needs_operator_input", (int)WorkItemState.NeedsOperatorInput);
             cmd.Parameters.AddWithValue("$state_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
             cmd.Parameters.AddWithValue("$state_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
@@ -3099,6 +3102,7 @@ public sealed class SqliteWorkItemStore :
                   $inflight_waiting_for_quota_reset,
                   $inflight_waiting_for_agent_resume,
                   $inflight_waiting_for_transient_retry,
+                  $inflight_no_action_required,
                   $inflight_abandoned_after_recovery_attempts
               );
             """;
@@ -3140,6 +3144,7 @@ public sealed class SqliteWorkItemStore :
                   $inflight_waiting_for_quota_reset,
                   $inflight_waiting_for_agent_resume,
                   $inflight_waiting_for_transient_retry,
+                  $inflight_no_action_required,
                   $inflight_abandoned_after_recovery_attempts
               );
             """;
@@ -3165,6 +3170,7 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$inflight_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
         cmd.Parameters.AddWithValue("$inflight_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
         cmd.Parameters.AddWithValue("$inflight_waiting_for_transient_retry", (int)WorkItemState.WaitingForTransientRetry);
+        cmd.Parameters.AddWithValue("$inflight_no_action_required", (int)WorkItemState.NoActionRequired);
         cmd.Parameters.AddWithValue("$inflight_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
     }
 
@@ -3376,7 +3382,7 @@ public sealed class SqliteWorkItemStore :
                 SELECT project_id, state,
                        ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
                 FROM work_items
-                WHERE state IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.Cancelled})
+                WHERE state IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.NoActionRequired})
             )
             SELECT project_id, state FROM ranked WHERE rn <= $per_project
             ORDER BY project_id, rn;

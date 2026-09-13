@@ -3521,6 +3521,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // treating the infrastructure flap as an agent failure.
             throw;
         }
+        catch (NoActionRequiredException ex)
+        {
+            // The agent's explicit, structured determination that no action is
+            // warranted — a terminal resolution, not a failure. The item is
+            // resolved to NoActionRequired with the reasoning preserved, the
+            // no-changes breaker is untouched (it was never fed), and the
+            // item does not re-enter the queue. An empty diff WITHOUT such a
+            // report still lands in the generic failure catch below.
+            _log.LogInformation(
+                "Work item {Id} resolved as no action required by agent {Agent}: {Reason}",
+                item.Id, ex.Agent.Value, SanitizedAgentDetail.FromRaw(ex.Reason).Value);
+            await TransitionNoActionRequiredAsync(item, project, ex, CancellationToken.None);
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
@@ -5832,6 +5845,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (isInitial)
                 suggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
 
+            // Read the no-action-required report BEFORE stripping it, for the
+            // same reason. Only the initial work phase can resolve to
+            // NoActionRequired; rework empty diffs keep the converge-aware
+            // audit-loop handling.
+            string? noActionRequiredJson = null;
+            if (isInitial)
+                noActionRequiredJson = await TryReadNoActionRequiredFileAsync(sandbox, ct);
+
             // Strip suggestions.json from the staged tree so it is never committed
             // to the work branch, regardless of whether the agent staged it.
             // Use separate argv so ProcessSandbox translates the -C path correctly.
@@ -5841,6 +5862,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
                 ".codeybox/suggestions.json"],
             }, ct);
+
+            // Strip the no-action-required protocol file the same way: it must
+            // never land on the work branch, whether or not this run resolves
+            // to NoActionRequired.
+            await StripNoActionRequiredFileFromIndexAsync(sandbox, ct);
 
             // Strip CodeyBox's internal agent-log scratch dir from the staged tree
             // so it is never committed to the work branch and pushed in the PR.
@@ -6024,6 +6050,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // passes driven by zero blocking findings or by a verdict that
                 // never completed: with nothing (finished) to fix, an empty
                 // diff is the correct outcome, not a silent failure.
+                //
+                // An explicit no-action-required report short-circuits BEFORE
+                // the breaker feed: the agent deliberately determined that no
+                // action is warranted (conditional item, precondition unmet),
+                // which is a terminal resolution — not a silent failure — so
+                // it must neither bench the agent nor fail the item. Only the
+                // initial work phase resolves this way; rework keeps the
+                // converge-aware handling below.
+                if (isInitial && noActionRequiredJson is not null)
+                {
+                    var noActionReport = NoActionRequiredFileParser.Parse(noActionRequiredJson, _log);
+                    if (noActionReport is not null)
+                        throw new NoActionRequiredException(
+                            runner.Kind,
+                            noActionReport.Reason,
+                            noActionReport.Precondition);
+                }
+
                 if (!suppressNoChangesBreaker)
                     await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
 
@@ -6031,7 +6075,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     // Initial work phase stays fail-fast: there is no audit /
                     // rework loop sitting behind it to converge a "declined to
-                    // work" outcome. Same shape as before this change.
+                    // work" outcome. Same shape as before this change. (A valid
+                    // no-action-required report already threw above.)
                     throw new InvalidOperationException("Agent produced no changes to commit");
                 }
 
@@ -7058,6 +7103,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "git", "-C", SandboxConventions.WorkDir,
                 "diff", "--quiet", beforeSha, afterSha, "--", ".",
                 ":(exclude).codeybox/suggestions.json",
+                ":(exclude).codeybox/no-action-required.json",
                 .. ReservedLegacyScratchpadExcludePathspecs,
             ],
             MaxStdoutBytes = 4096,
@@ -16406,6 +16452,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         if (error is null)
             return true;
+        // A no-action-required determination is a successful dispatch: the
+        // agent ran cleanly and delivered its verdict. It resets the failure
+        // window like any other success rather than feeding it.
+        if (error is NoActionRequiredException)
+            return true;
         if (genuineAttemptTimeout)
             return false;
         // Any remaining OperationCanceledException is a host/operator/phase
@@ -16638,6 +16689,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // Any non-cancellation exception (agent error, quota, infrastructure,
                 // terminal quota) is a genuine dispatch failure for the breaker.
                 breakerSuccess = ClassifyDispatchOutcome(ex, genuineAttemptTimeout: false);
+                if (ex is NoActionRequiredException)
+                {
+                    // Terminal resolution, not a run failure: the invocation
+                    // metric must not record an error for an agent that ran
+                    // cleanly and delivered its determination. (Involvement
+                    // outcome maps to success via OutcomeForFailure below.)
+                    outcome = AgentInvolvementOutcomes.Success;
+                }
                 await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
                 throw;
             }
@@ -20944,6 +21003,40 @@ public sealed partial class PipelineRunner : IPipelineRunner
         });
     }
 
+    private async Task TransitionNoActionRequiredAsync(
+        WorkItem item,
+        Project? project,
+        NoActionRequiredException ex,
+        CancellationToken ct)
+    {
+        await RunBoundedPostAgentAsync(item.Id, "transition-to-no-action-required", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                current.With(WorkItemState.NoActionRequired, BuildNoActionRequiredDetail(ex)),
+                current.State,
+                WorkItemState.NoActionRequired);
+            await _store.UpdateAsync(next, transitionCt);
+            await EmitTransitionSideEffectsAsync(next, WorkItemState.NoActionRequired, project, transitionCt);
+        });
+        AuditLog.WorkItemNoActionRequired(item.Id, SanitizedAgentDetail.FromRaw(ex.Reason).Value);
+    }
+
+    /// <summary>
+    /// Builds the operator-facing resolution text for a no-action-required
+    /// terminal transition. Both halves are agent-controlled, so each is
+    /// redacted and truncated at this sink before it reaches LastError,
+    /// webhooks, API responses, and the audit log.
+    /// </summary>
+    private static string BuildNoActionRequiredDetail(NoActionRequiredException ex)
+    {
+        var reason = SanitizedAgentDetail.FromRaw(ex.Reason).Value;
+        if (string.IsNullOrWhiteSpace(ex.Precondition))
+            return $"no action required: {reason}";
+        var precondition = SanitizedAgentDetail.FromRaw(ex.Precondition).Value;
+        return $"no action required: {reason} (precondition checked: {precondition})";
+    }
+
     private async Task EmitTransitionSideEffectsAsync(
         WorkItem item,
         WorkItemState state,
@@ -21801,6 +21894,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         WorkItemState.Failed => "work_item.failed",
         WorkItemState.Cancelled => "work_item.cancelled",
         WorkItemState.NeedsOperatorInput => "work_item.needs_operator_input",
+        WorkItemState.NoActionRequired => "work_item.no_action_required",
         WorkItemState.WaitingForQuotaReset => "work_item.waiting_for_quota_reset",
         WorkItemState.WaitingForTransientRetry => "work_item.waiting_for_transient_retry",
         _ => $"work_item.{state.ToString().ToLowerInvariant()}",
@@ -22124,6 +22218,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private Task PickUpSuggestionsAsync(
         WorkItem item, Project project, string rawJson, CancellationToken ct) =>
         _questionsSuggestions.PickUpSuggestionsAsync(item, project, rawJson, ct);
+
+    // ── No-action-required report ────────────────────────────────────────────
+
+    /// <summary>
+    /// Tries to read <c>.codeybox/no-action-required.json</c> from the sandbox
+    /// working directory. Returns the raw content string when the file exists
+    /// and is within the 8 KB size limit; null otherwise.
+    /// </summary>
+    private Task<string?> TryReadNoActionRequiredFileAsync(ISandbox sandbox, CancellationToken ct) =>
+        _questionsSuggestions.TryReadNoActionRequiredFileAsync(sandbox, ct);
+
+    /// <summary>
+    /// Removes <c>.codeybox/no-action-required.json</c> from the sandbox Git
+    /// index so the protocol file is never committed to the work branch.
+    /// </summary>
+    private Task StripNoActionRequiredFileFromIndexAsync(ISandbox sandbox, CancellationToken ct) =>
+        _questionsSuggestions.StripNoActionRequiredFileFromIndexAsync(sandbox, ct);
 
     private sealed class ActivityTrackingSandbox : ISandbox, ISandboxDecorator
     {

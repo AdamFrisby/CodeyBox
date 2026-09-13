@@ -138,6 +138,7 @@ public sealed class EventSchemaDocSyncTests
             "work_item.plan_approved",
             "audit.auditor_timed_out",
             "quota.reset_optimal",
+            "work_item.no_action_required",
         };
 
         Assert.All(schema.Envelope.Values, field =>
@@ -159,6 +160,7 @@ public sealed class EventSchemaDocSyncTests
         Assert.Equal("1.5", schema.EventTypes["work_item.plan_approved"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["audit.auditor_timed_out"].IntroducedIn);
         Assert.Equal("1.6", schema.EventTypes["quota.reset_optimal"].IntroducedIn);
+        Assert.Equal("1.6", schema.EventTypes["work_item.no_action_required"].IntroducedIn);
     }
 
     private static IReadOnlyDictionary<string, string> ParseDocEventTypeVersions(string doc)

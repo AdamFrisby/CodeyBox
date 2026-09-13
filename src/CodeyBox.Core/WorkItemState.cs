@@ -77,4 +77,18 @@ public enum WorkItemState
     /// manually after investigating.
     /// </summary>
     AbandonedAfterRecoveryAttempts = 103,
+    /// <summary>
+    /// The work agent exited cleanly with no diff AND reported — via the
+    /// structured <c>.codeybox/no-action-required.json</c> protocol — that no
+    /// action is warranted (e.g. a conditional item whose precondition does
+    /// not hold). Terminal: the item is resolved and never re-enters the
+    /// queue on its own. Distinct from <see cref="Failed"/> (nothing failed)
+    /// and from <see cref="Done"/> (no change was produced or merged). The
+    /// agent's reasoning is preserved on <c>LastError</c> for review, the
+    /// no-changes circuit breaker is not fed, and the operator may re-run
+    /// the item with <c>POST /workitems/{id}/retry</c> if the precondition
+    /// later holds. An empty diff WITHOUT such a report still fails the item
+    /// as before.
+    /// </summary>
+    NoActionRequired = 105,
 }

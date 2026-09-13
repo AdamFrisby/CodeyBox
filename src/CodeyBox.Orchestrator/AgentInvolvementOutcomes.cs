@@ -35,6 +35,9 @@ internal static class AgentInvolvementOutcomes
         TerminalTransientNetworkError => FailureTransient,
         AgentInfrastructureFailureException => FailureInfrastructure,
         PipelineRunner.AgentAttemptTimeoutException => FailureTimeout,
+        // The agent ran cleanly and delivered its no-action determination;
+        // the report is the work product, not a run failure.
+        NoActionRequiredException => Success,
         OperationCanceledException => FailureCancelled,
         _ => FailureAgent,
     };

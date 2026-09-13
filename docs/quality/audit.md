@@ -600,7 +600,10 @@ Item-level park / escalation is one of two layers:
   with no diff and excludes the agent across the fleet when the streak
   trips. The breaker still fires on a genuinely-empty rework — only the
   auth / quota classifier branches skip it, because an infra failure
-  isn't evidence the agent itself is broken.
+  isn't evidence the agent itself is broken. (Separately, an explicit
+  no-action-required report on the initial work phase resolves the item
+  terminally as `NoActionRequired` and never feeds the breaker at all —
+  see `docs/concepts/agent-feedback.md`.)
 
 ## Rework non-compile loop-back
 

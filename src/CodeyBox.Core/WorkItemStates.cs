@@ -23,6 +23,7 @@ public static class WorkItemStates
             WorkItemState.Cancelled,
             WorkItemState.MergeConflictResolutionFailed,
             WorkItemState.AbandonedAfterRecoveryAttempts,
+            WorkItemState.NoActionRequired,
         };
 
     /// <summary>True when <paramref name="state"/> is a terminal state.</summary>

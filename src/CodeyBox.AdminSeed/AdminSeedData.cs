@@ -53,7 +53,9 @@ public static class AdminSeedData
                 LastError = state is WorkItemState.Failed or WorkItemState.AuditFailed
                     or WorkItemState.MergeConflictResolutionFailed or WorkItemState.AbandonedAfterRecoveryAttempts
                     ? "seeded failure: see audit timeline"
-                    : null,
+                    : state == WorkItemState.NoActionRequired
+                        ? "no action required: seeded trigger absent (precondition checked: a seeded reset trigger)"
+                        : null,
                 FailureKind = state == WorkItemState.Failed ? "normal" : null,
             });
         }
@@ -174,6 +176,7 @@ public static class AdminSeedData
         WorkItemState.ReworkingForConflict,
         WorkItemState.MergeConflictResolutionFailed,
         WorkItemState.AbandonedAfterRecoveryAttempts,
+        WorkItemState.NoActionRequired,
     ];
 
     private static string SeedPromptFor(WorkItemState state, int index) => state switch
@@ -187,6 +190,7 @@ public static class AdminSeedData
         WorkItemState.PlanReview => $"Seeded prompt {index:00}: plan under review",
         WorkItemState.PlanApproved => $"Seeded prompt {index:00}: plan approved, ready for work",
         WorkItemState.ReworkingForConflict => $"Seeded prompt {index:00}: resolve merge conflict on seeded branch",
+        WorkItemState.NoActionRequired => $"Seeded prompt {index:00}: gated step, run only when the seeded trigger exists",
         _ => $"Seeded prompt {index:00}: implement seeded change {index:00}",
     };
 

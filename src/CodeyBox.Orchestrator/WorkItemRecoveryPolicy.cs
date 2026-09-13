@@ -432,7 +432,7 @@ public static class WorkItemRecoveryPolicy
     /// States NOT in this set are never worker-held: <c>Queued</c> is
     /// dispatcher-owned; terminal states (<c>Done</c>, <c>Failed</c>,
     /// <c>Cancelled</c>, <c>AuditFailed</c>,
-    /// <c>MergeConflictResolutionFailed</c>,
+    /// <c>MergeConflictResolutionFailed</c>, <c>NoActionRequired</c>,
     /// <c>AbandonedAfterRecoveryAttempts</c>) have no owner; parked states
     /// (<c>NeedsOperatorInput</c>, <c>WaitingForQuotaReset</c>,
     /// <c>WaitingForAgentResume</c>, <c>WaitingForTransientRetry</c>) wait on

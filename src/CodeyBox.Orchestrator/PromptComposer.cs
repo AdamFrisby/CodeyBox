@@ -36,6 +36,17 @@ internal sealed class PromptComposer
         var sb = new System.Text.StringBuilder();
         sb.Append($"Work only in the repository and branch already checked out in this workspace. Commit your changes locally, but do not push branches, create pull requests, or use GitHub/GitLab APIs, MCP tools, CLIs, or web interfaces for delivery. The CodeyBox orchestrator owns all upstream publication after audit.\n\nEvery commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.PromptRevisionTrailerKey}: ${CodeyBoxTrailers.PromptRevisionEnvVar}\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nThe `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/concepts/agent-feedback.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
 
+        // No-action-required protocol: a CONDITIONAL work item (e.g. "do X only
+        // when precondition P holds") whose investigation shows the
+        // precondition does not hold must not fake progress or exit silently.
+        // The agent writes its determination (with reasoning) to
+        // .codeybox/no-action-required.json as {"reason": "...", "precondition": "..."}
+        // (schema in docs/concepts/agent-feedback.md) and exits WITHOUT
+        // committing anything. The orchestrator resolves the item terminally
+        // as NoActionRequired — a resolved outcome, not a failure — and never
+        // penalises the agent for it. Only write this file when the item
+        // genuinely requires no action; an empty diff without it fails the item.
+        sb.Append("\n\nIf this work item is conditional (it tells you to act only when a precondition holds) and your investigation shows the precondition does NOT hold, do not fake progress and do not exit silently: write your determination with reasoning to `.codeybox/no-action-required.json` as `{\"reason\": \"...\", \"precondition\": \"...\"}` (schema in `docs/concepts/agent-feedback.md`) and exit without committing anything. The orchestrator records your reasoning and resolves the item as no-action-required. Only use this when the item genuinely requires no action — an empty diff without this file fails the item.");
         // Pre-flight self-check: surface the project's mechanical (shell-kind)
         // auditors so the agent runs them before declaring done. Language-agnostic
         // by construction — derived from whatever auditors the project's catalog
