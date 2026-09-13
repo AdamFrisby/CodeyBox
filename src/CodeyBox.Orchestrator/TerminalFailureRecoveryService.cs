@@ -30,6 +30,7 @@ public sealed class TerminalFailureRecoveryService : BackgroundService
     private readonly WorkItemRetrier _retrier;
     private readonly ITerminalFailureClassifier _classifier;
     private readonly Func<TerminalFailureRecoveryOptions> _optionsAccessor;
+    private readonly DelegationEscalationService? _delegationEscalation;
     private readonly TimeProvider _time;
     private readonly Func<int, int> _jitter;
     private readonly ILogger<TerminalFailureRecoveryService> _log;
@@ -48,13 +49,18 @@ public sealed class TerminalFailureRecoveryService : BackgroundService
         Func<TerminalFailureRecoveryOptions> optionsAccessor,
         ILogger<TerminalFailureRecoveryService> log,
         TimeProvider? timeProvider = null,
-        Func<int, int>? jitter = null)
+        Func<int, int>? jitter = null,
+        // Delegation triggers (automatic escalation on repeated terminal
+        // failure). Optional: without it the sweep keeps today's
+        // retry-then-dead-letter behaviour.
+        DelegationEscalationService? delegationEscalation = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _retrier = retrier ?? throw new ArgumentNullException(nameof(retrier));
         _classifier = classifier ?? throw new ArgumentNullException(nameof(classifier));
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log ?? throw new ArgumentNullException(nameof(log));
+        _delegationEscalation = delegationEscalation;
         _time = timeProvider ?? TimeProvider.System;
         // Random is non-deterministic; tests inject a fixed jitter to keep
         // backoff windows reproducible.
@@ -215,12 +221,45 @@ public sealed class TerminalFailureRecoveryService : BackgroundService
         }
     }
 
-    private Task HandleNonRetryableAsync(
+    private async Task HandleNonRetryableAsync(
         WorkItem item,
         TerminalFailureRecoveryOptions opts,
         TerminalFailureClassification verdict,
         CancellationToken ct)
     {
+        // Repeated-failure escalation first: a deterministic/unknown item
+        // that has terminally failed across retries (manual or otherwise —
+        // TerminalFailureCount survives every retry path) leaves the failed
+        // cycle for a delegation turn instead of sitting parked. The failure
+        // signal is preserved on the escalated row (LastError, attempt
+        // history, classification audit log below with action "escalated").
+        if (_delegationEscalation?.IsAutoTriggerArmed(DelegationTriggers.RepeatedTerminalFailure, item) == true)
+        {
+            var escalation = await _delegationEscalation.DelegateAsync(
+                item,
+                DelegationTriggers.RepeatedTerminalFailure,
+                note: null,
+                markAutoEscalated: true,
+                failureContext: item.LastError,
+                ct);
+            if (escalation.Delegated)
+            {
+                AuditLog.TerminalFailureClassified(
+                    item.Id,
+                    failureClass: verdict.Class.ToString(),
+                    reason: verdict.Reason,
+                    state: item.State.ToString(),
+                    action: "escalated",
+                    attempt: item.TerminalRetryAttempts,
+                    maxAttempts: opts.MaxAutoRetriesPerWorkItem,
+                    nextRetryAt: null);
+                return;
+            }
+            _log.LogWarning(
+                "Automatic delegation escalation for work item {Id} refused ({Error}); leaving parked",
+                item.Id, escalation.Error);
+        }
+
         // No state mutation: the item is already in its terminal state.
         // Single audit-log line per sweep so operators can see why nothing
         // is happening. The log row is emitted on EVERY sweep so the
@@ -238,7 +277,7 @@ public sealed class TerminalFailureRecoveryService : BackgroundService
             nextRetryAt: null);
         _ = item;
         _ = ct;
-        return Task.CompletedTask;
+        return;
     }
 
     private async Task HandleTransientAsync(
@@ -386,6 +425,40 @@ public sealed class TerminalFailureRecoveryService : BackgroundService
         var lastError =
             $"Transient terminal-failure auto-retry reached max attempts ({opts.MaxAutoRetriesPerWorkItem}). " +
             $"Previous error: {item.LastError ?? "(none)"}. Operator intervention required.";
+
+        // Repeated-failure escalation first: the item burned its whole
+        // auto-retry budget and still fails, so it leaves the failed cycle
+        // for a delegation turn. The dead-letter signal is NOT consumed —
+        // the message above rides into LastError, the retry counters stay on
+        // the row, and the classification audit log below records the
+        // escalation — so the underlying defect stays visible even if the
+        // delegate repairs the item.
+        if (_delegationEscalation?.IsAutoTriggerArmed(DelegationTriggers.RepeatedTerminalFailure, item) == true)
+        {
+            var escalation = await _delegationEscalation.DelegateAsync(
+                item,
+                DelegationTriggers.RepeatedTerminalFailure,
+                note: null,
+                markAutoEscalated: true,
+                failureContext: lastError,
+                ct);
+            if (escalation.Delegated)
+            {
+                AuditLog.TerminalFailureClassified(
+                    item.Id,
+                    failureClass: nameof(TerminalFailureClass.Transient),
+                    reason: verdict.Reason,
+                    state: item.State.ToString(),
+                    action: "escalated",
+                    attempt: item.TerminalRetryAttempts,
+                    maxAttempts: opts.MaxAutoRetriesPerWorkItem,
+                    nextRetryAt: null);
+                return;
+            }
+            _log.LogWarning(
+                "Automatic delegation escalation for work item {Id} refused ({Error}); dead-lettering instead",
+                item.Id, escalation.Error);
+        }
 
         // NeedsOperatorInput is the operator-visible park state — the
         // pipeline already treats it as a "yes I see it" inbox and the

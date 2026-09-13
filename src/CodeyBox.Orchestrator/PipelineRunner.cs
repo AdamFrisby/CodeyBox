@@ -174,6 +174,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // Hot-reloadable delegation knobs (result-diff bounds). Defaults to
     // built-in values when no accessor is wired.
     private readonly Func<DelegationOptions> _delegationOptionsAccessor;
+    private readonly DelegationEscalationService? _delegationEscalation;
     // Upper bound for parsed reset-window hints extracted from an agent's stdout/stderr.
     // Without a cap, a maliciously-crafted Retry-After header (or prompt-injected output)
     // could park an item arbitrarily far in the future. 24h is the longest legitimate
@@ -404,7 +405,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // drops the durable brief/diff trail.
         ConvergenceBriefComposer? briefComposer = null,
         IDelegationEventStore? delegationEvents = null,
-        Func<DelegationOptions>? delegationOptionsAccessor = null)
+        Func<DelegationOptions>? delegationOptionsAccessor = null,
+        // Delegation triggers (operator + automatic escalation). Optional:
+        // without it the audit-max path keeps parking for the operator.
+        DelegationEscalationService? delegationEscalation = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -556,6 +560,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _briefComposer = briefComposer;
         _delegationEvents = delegationEvents;
         _delegationOptionsAccessor = delegationOptionsAccessor ?? (() => new DelegationOptions());
+        _delegationEscalation = delegationEscalation;
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
             _auditReports is null ? null : PersistAuditReportAsync,
@@ -11386,13 +11391,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 if (HasAuditConvergenceProgress(auditHistory))
                 {
+                    var escalated = await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+                    var outcome = escalated ? "delegation_escalated" : "needs_operator_input";
                     CodeyBoxMeters.AuditIterations.Add(1,
-                        new KeyValuePair<string, object?>("outcome", "needs_operator_input"),
+                        new KeyValuePair<string, object?>("outcome", outcome),
                         selfReviewTag,
                         iterationTag,
                         plannedTag);
-                    EmitSessionAuditOutcomeMetrics(iteration, "needs_operator_input");
-                    await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+                    EmitSessionAuditOutcomeMetrics(iteration, outcome);
                     return true;
                 }
 
@@ -11619,10 +11625,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         if (HasAuditConvergenceProgress(auditHistory))
         {
+            var escalated = await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+            var outcome = escalated ? "delegation_escalated" : "needs_operator_input";
             CodeyBoxMeters.AuditIterations.Add(1,
-                new KeyValuePair<string, object?>("outcome", "needs_operator_input"),
+                new KeyValuePair<string, object?>("outcome", outcome),
                 new KeyValuePair<string, object?>("planned", HasReviewedPlanArtifact(item) ? "on" : "off"));
-            await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
             return true;
         }
 
@@ -12034,7 +12041,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return string.IsNullOrEmpty(originalPrompt) ? header : header + originalPrompt;
     }
 
-    private async Task ParkAuditMaxIterationsForOperatorAsync(
+    private async Task<bool> ParkAuditMaxIterationsForOperatorAsync(
         WorkItem item,
         Project project,
         IReadOnlyList<AuditProgressSnapshot> history,
@@ -12042,6 +12049,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var message = _promptComposer.BuildAuditMaxIterationEscalationMessage(history);
         var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+        if (_delegationEscalation is not null
+            && _delegationEscalation.IsAutoTriggerArmed(DelegationTriggers.AuditMaxIterations, item))
+        {
+            // Automatic escalation on non-convergence: the item leaves the
+            // failed cycle for a delegation turn instead of parking. The
+            // failure signal is NOT consumed — audit progress, the attempt
+            // history, and the park message (preserved into LastError and the
+            // escalation webhook) stay on the record, and the delegation
+            // trigger meter counts the escalation by condition.
+            var escalation = await _delegationEscalation.DelegateAsync(
+                item,
+                DelegationTriggers.AuditMaxIterations,
+                note: null,
+                markAutoEscalated: true,
+                failureContext: message,
+                ct);
+            if (escalation.Delegated)
+                return true;
+            _log.LogWarning(
+                "Automatic delegation escalation for work item {Id} refused ({Error}); parking for operator instead",
+                item.Id, escalation.Error);
+        }
         await ParkAuditForOperatorAsync(
             item,
             project,
@@ -12051,6 +12080,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             message,
             details,
             auditLogReason: "audit max iterations with progress");
+        return false;
     }
 
     private async Task ParkEmptyReworkForOperatorAsync(
@@ -12107,6 +12137,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var parked = current.With(WorkItemState.NeedsOperatorInput, message) with
             {
                 DelegationAttempts = current.DelegationAttempts + (countAttempt ? 1 : 0),
+                // The turn is over: drop the operator note so it cannot leak
+                // into a later brief, and record a non-advancing outcome so a
+                // proven-unhelpful delegation never re-arms automatic
+                // escalation. Paths that never ran a turn (no trigger, not
+                // configured) carry no attempt and set no failure flag.
+                DelegationNote = null,
+                DelegationFailed = current.DelegationFailed
+                    || (countAttempt && IsNonAdvancingDelegationOutcome(outcome)),
             };
             var updated = await _store.TryUpdateIfStateAsync(parked, current.State, transitionCt);
             if (!updated)
@@ -12143,6 +12181,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }, CancellationToken.None);
         });
     }
+
+    /// <summary>
+    /// Whether a delegation-turn outcome completed without advancing the item
+    /// (no changes to audit, or the turn itself failed). Only counted turns
+    /// feed this verdict; parks that never ran a turn are excluded by the
+    /// caller via <c>countAttempt</c>.
+    /// </summary>
+    private static bool IsNonAdvancingDelegationOutcome(string outcome) =>
+        string.Equals(outcome, DelegationOutcomes.NoChanges, StringComparison.Ordinal)
+        || string.Equals(outcome, DelegationOutcomes.Failed, StringComparison.Ordinal);
 
     /// <summary>
     /// Appends the first-class delegation event (brief + agent/model +
@@ -12477,6 +12525,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     latest.With(WorkItemState.WorkComplete) with
                     {
                         DelegationAttempts = latest.DelegationAttempts + 1,
+                        // The turn completed: the operator note served its
+                        // purpose in this turn's brief and must not leak into
+                        // a later one. A completed turn is not a failure, so
+                        // the delegation-failure flag is untouched.
+                        DelegationNote = null,
                     },
                     latest.State,
                     WorkItemState.WorkComplete);

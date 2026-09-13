@@ -17,6 +17,7 @@ internal static class WorkItemEndpoints
         group.MapPost("/{id}/abandon", AbandonAsync);
         group.MapPost("/{id}/promote", PromoteAsync);
         group.MapPost("/{id}/retry", RetryAsync);
+        group.MapPost("/{id}/delegate", DelegateAsync);
         group.MapPost("/{id}/replay", ReplayAsync);
         group.MapGet("/", ListAsync);
         group.MapGet("/{id}", GetAsync);
@@ -551,6 +552,175 @@ internal static class WorkItemEndpoints
         if (!recovery.Recovered)
         {
             return Results.Conflict(new { error = $"cannot retry stale worker-held item {item.Id}: {recovery.Error ?? "recovery did not transition the work item"}" });
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Delegate a work item to the unconstrained delegation phase: one repair
+    /// turn with latitude the normal work/audit/rework cycle does not grant,
+    /// verified by the same audit and merge gates afterwards.
+    ///
+    /// Works from any non-terminal state and from the terminal failure states
+    /// (Failed, AuditFailed, MergeConflictResolutionFailed,
+    /// AbandonedAfterRecoveryAttempts) — exactly the items that need it.
+    /// Done (nothing to repair), Cancelled (operator-stopped), and
+    /// NoActionRequired (resolved) return 409.
+    ///
+    /// The optional <c>note</c> is stored on the item and rendered into the
+    /// convergence brief so the operator can direct the attempt. A
+    /// worker-held in-flight item is fenced through worker recovery first
+    /// (operator intent substitutes for a staleness verdict); when fencing
+    /// fails closed the command returns 409 rather than racing the pipeline.
+    ///
+    /// The delegated turn competes for the same worker and sandbox capacity
+    /// as normal work through the shared dispatcher: priority is preserved,
+    /// an explicit end-of-queue position is stamped, and no lane or boost is
+    /// granted — so delegation cannot starve normal dispatch.
+    ///
+    /// Returns:
+    ///   - 202 with the Delegating item when the trigger is armed.
+    ///   - 400 when the note violates its length/control-character guard.
+    ///   - 404 when the item does not exist.
+    ///   - 409 when the state is not delegable, operator questions are still
+    ///     open, the worker fence fails closed, or the row advanced
+    ///     concurrently.
+    /// </summary>
+    private static async Task<IResult> DelegateAsync(
+        string id,
+        DelegateWorkItemRequest? body,
+        IWorkItemStore store,
+        DelegationEscalationService delegationEscalation,
+        IWorkerRegistry registry,
+        ItemStaleProgressWatchdog staleWatchdog,
+        IWorkItemQuestionStore? questions,
+        IOptionsMonitor<CodeyBoxOptions> options,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var maxNoteChars = Math.Max(1, options.CurrentValue.DelegationEscalation.MaxNoteChars);
+        var note = body?.Note;
+        if (string.IsNullOrWhiteSpace(note))
+        {
+            note = null;
+        }
+        else if (note.Length > maxNoteChars)
+        {
+            return Results.BadRequest(new { error = $"note must be <= {maxNoteChars} chars" });
+        }
+        else if (note.Any(c => char.IsControl(c) && c is not ('\r' or '\n' or '\t')))
+        {
+            return Results.BadRequest(new { error = "note must not contain control characters" });
+        }
+
+        if (!DelegationEscalationPolicy.IsDelegableState(item!.State))
+            return Results.Conflict(new { error = $"cannot delegate item in state {item.State}; only non-terminal states and terminal failure states can be delegated" });
+
+        if (item.State == WorkItemState.NeedsOperatorInput && questions is not null)
+        {
+            var openQuestions = (await questions.ListByWorkItemAsync(item.Id.ToString(), ct))
+                .Where(q => string.Equals(q.State, "open", StringComparison.Ordinal))
+                .Select(q => q.QuestionId)
+                .Take(5)
+                .ToArray();
+            if (openQuestions.Length > 0)
+            {
+                return Results.Conflict(new
+                {
+                    error = "cannot delegate item while operator questions are open; answer or dismiss them first",
+                    openQuestions,
+                });
+            }
+        }
+
+        // A worker-held in-flight item cannot simply be flipped to Delegating
+        // under a live pipeline. Fence it through worker recovery first — the
+        // explicit operator command authorizes interrupting the current turn,
+        // so no staleness verdict is required; recovery still fails closed on
+        // unfenceable dispatch claims and concurrent advances.
+        if (WorkItemRecoveryPolicy.IsItemStaleWatchedState(item.State))
+        {
+            var fenceError = await TryFenceLiveWorkerItemForDelegateAsync(
+                item, registry, staleWatchdog, ct);
+            if (fenceError is not null)
+                return fenceError;
+            var fenced = await store.GetAsync(item.Id, ct);
+            if (fenced is null)
+                return Results.Conflict(new { error = "work item no longer exists" });
+            if (!DelegationEscalationPolicy.IsDelegableState(fenced.State))
+                return Results.Conflict(new { error = $"cannot delegate item in state {fenced.State} after fencing the previous worker; only non-terminal states and terminal failure states can be delegated" });
+            item = fenced;
+        }
+
+        var result = await delegationEscalation.DelegateAsync(
+            item,
+            DelegationTriggers.Operator,
+            note,
+            markAutoEscalated: false,
+            failureContext: null,
+            ct);
+        if (!result.Delegated)
+            return Results.Conflict(new { error = result.Error });
+
+        return Results.Accepted(
+            $"/workitems/{item.Id}",
+            new
+            {
+                id = item.Id.ToString(),
+                trigger = DelegationTriggers.Operator,
+                priorState = item.State.ToString(),
+                state = WorkItemState.Delegating.ToString(),
+            });
+    }
+
+    /// <summary>
+    /// Fences a worker-bound item so an operator delegate cannot race the live
+    /// pipeline. Returns null when delegation may proceed (no worker binds the
+    /// item, or recovery fenced it); otherwise the 409 result to return.
+    /// Unlike the retry fence, staleness is not required: the explicit
+    /// operator command itself authorizes interrupting the current turn.
+    /// Recovery fails closed on unfenceable dispatch claims, concurrent
+    /// advances, and exhausted attempt budgets that cannot park.
+    /// </summary>
+    private static async Task<IResult?> TryFenceLiveWorkerItemForDelegateAsync(
+        WorkItem item,
+        IWorkerRegistry registry,
+        ItemStaleProgressWatchdog staleWatchdog,
+        CancellationToken ct)
+    {
+        var idStr = item.Id.ToString();
+        var bound = false;
+        try
+        {
+            var workers = await registry.ListAsync(ct);
+            foreach (var worker in workers)
+            {
+                if (string.Equals(worker.CurrentWorkItemId, idStr, StringComparison.OrdinalIgnoreCase))
+                {
+                    bound = true;
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            return Results.Conflict(new { error = $"cannot delegate worker-held item {item.Id}: failed to inspect worker bindings: {ex.Message}" });
+        }
+
+        if (!bound)
+            return null;
+
+        var recovery = await staleWatchdog.RecoverItemAsync(
+            item,
+            $"operator delegate fenced worker-held item in {item.State}",
+            ct);
+        if (!recovery.Recovered)
+        {
+            return Results.Conflict(new { error = $"cannot delegate worker-held item {item.Id}: {recovery.Error ?? "recovery did not transition the work item"}" });
         }
 
         return null;
@@ -2351,6 +2521,10 @@ internal static class WorkItemEndpoints
             DelegationAttempts: item.DelegationAttempts,
             DelegationRequested: item.DelegationRequested,
             DelegationReason: item.DelegationReason,
+            DelegationNote: item.DelegationNote,
+            AutoDelegationEscalated: item.AutoDelegationEscalated,
+            DelegationFailed: item.DelegationFailed,
+            TerminalFailureCount: item.TerminalFailureCount,
             Knobs: item.Knobs.Count == 0
                 ? null
                 : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
@@ -2647,6 +2821,8 @@ public sealed record AgentControlDto(
 
 public sealed record RetryWorkItemRequest(string? From);
 
+public sealed record DelegateWorkItemRequest(string? Note = null);
+
 public sealed record ResumeWorkItemRequest(string? From = null, string? Reason = null);
 
 public sealed record PatchWorkItemRequest(
@@ -2794,6 +2970,10 @@ public sealed record WorkItemDto(
     int DelegationAttempts = 0,
     bool DelegationRequested = false,
     string? DelegationReason = null,
+    string? DelegationNote = null,
+    bool AutoDelegationEscalated = false,
+    bool DelegationFailed = false,
+    int TerminalFailureCount = 0,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyDictionary<string, string>? Knobs = null);
 

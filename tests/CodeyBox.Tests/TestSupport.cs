@@ -224,7 +224,12 @@ internal static class TestSupport
         // Delegation phase support: when true, wires a real convergence-brief
         // composer and sqlite delegation event store (same state db) into the
         // pipeline and exposes them on TestPipeline for assertions.
-        bool enableDelegation = false)
+        bool enableDelegation = false,
+        // Delegation triggers: when non-null, wires a real
+        // DelegationEscalationService with these options (hot-reloadable via
+        // the captured reference) so tests can arm automatic escalation.
+        // Null (default) keeps today's operator-only behaviour.
+        DelegationEscalationOptions? delegationEscalationOptions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -367,6 +372,16 @@ internal static class TestSupport
                 new SqliteAgentStreamSummaryStore(stateDb));
         }
 
+        DelegationEscalationService? delegationEscalation = null;
+        if (delegationEscalationOptions is not null)
+        {
+            var escalationOpts = delegationEscalationOptions;
+            delegationEscalation = new DelegationEscalationService(
+                pipelineStore,
+                queue,
+                () => escalationOpts);
+        }
+
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, resolvedUpstreamFactory, composer,
@@ -439,7 +454,8 @@ internal static class TestSupport
             deploymentSubstrates: deploymentSubstrates,
             staleBaseReworkRouter: staleBaseReworkRouter,
             briefComposer: briefComposer,
-            delegationEvents: delegationEvents);
+            delegationEvents: delegationEvents,
+            delegationEscalation: delegationEscalation);
 
         return new TestPipeline(
             pipeline,

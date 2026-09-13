@@ -43,6 +43,14 @@ public sealed class ConvergenceBriefOptions
     public int MaxFindingTitleChars { get; set; } = 250;
 
     /// <summary>
+    /// Upper bound on the operator direction note included in the brief.
+    /// Default 4,000 chars (matches the operator-facing note cap on the
+    /// delegate command so an accepted note is never silently truncated
+    /// below what the API allowed).
+    /// </summary>
+    public int MaxOperatorNoteChars { get; set; } = 4_000;
+
+    /// <summary>
     /// Upper bound on how many captured stream files are inspected for excerpts.
     /// Default 50 files.
     /// </summary>

@@ -819,6 +819,36 @@ incidents. A parsed stream-json `turn.failed` event whose `error.message` is
 exactly `timeout` is the exception because that is provider transport metadata,
 not free-form build output.
 
+## `DelegationEscalation`
+
+Delegation triggers: the operator delegate command (`POST
+/workitems/{id}/delegate`, always available) plus automatic escalation when an
+item provably stops converging. Automatic escalation fires at most once per
+item — a second delegation always requires an operator — and an item whose
+delegation turn failed is never escalated automatically again. Escalation
+preserves the failure signal (audit history, `LastError`, attempt counters)
+and counts every trigger by condition on the `codeybox.delegation.triggers`
+metric (`trigger` = `operator` | `audit-max-iterations` |
+`repeated-terminal-failure`).
+
+```json
+"DelegationEscalation": {
+  "Enabled": false,
+  "OnAuditMaxIterations": true,
+  "OnRepeatedTerminalFailure": true,
+  "RepeatedTerminalFailureThreshold": 2,
+  "MaxNoteChars": 4000
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Enabled` | `false` | Master switch for automatic escalation. Default off so the feature is operator-only unless deliberately opted into. The operator command works regardless. |
+| `OnAuditMaxIterations` | `true` | Escalate when audit iterations reach the configured maximum without passing (otherwise parked for the operator). Individually disableable. |
+| `OnRepeatedTerminalFailure` | `true` | Escalate when an item terminally fails repeatedly after retry. Individually disableable. |
+| `RepeatedTerminalFailureThreshold` | `2` | Terminal-failure episodes required before the repeated-failure condition fires. The count survives retries, so manual retries count too. |
+| `MaxNoteChars` | `4000` | Upper bound on the operator note stored per delegation request. Longer notes are rejected by the API (400). |
+
 ## `ConfigValidation`
 
 Optional startup cross-check that every `AgentClass` member's `ModelId`

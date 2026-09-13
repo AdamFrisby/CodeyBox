@@ -62,6 +62,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.merge_conflict_resolution_failed` | Merge conflict resolution was rejected by host verification or the scope fence; the item is terminal |
 | `work_item.waiting_for_quota_reset` | Every eligible class member hit quota in one pickup; the item is parked, not failed. Details use the agent-fallback shape |
 | `work_item.resumed` | An operator-cancelled item re-entered the pipeline via `POST /workitems/{id}/resume`. Details: `id`, `externalId`, resumed-from phase |
+| `work_item.delegated` | An item entered the delegation phase via the operator delegate command or automatic escalation. Details: `trigger` (`operator` \| `audit-max-iterations` \| `repeated-terminal-failure`), `priorState`, `reason`, `note`, `terminalFailureCount`, `autoEscalated` |
 | `work_item.check_followup_enqueued` | A check-and-act verdict matched and its follow-up item was queued. Details: `originCheckWorkItemId`, `followupWorkItemId` |
 | `work_item.post_act_recheck_completed` | A post-act re-check finished. Details: iteration, `answer`, `actionableAnswer`, originating check id |
 | `agent.fallback` | Routing moved a phase to another class member mid-item. Details: phase, iteration, from/to agent and model, reason |
