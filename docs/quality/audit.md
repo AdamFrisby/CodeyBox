@@ -393,7 +393,7 @@ CodeyBox ships these audit-type presets as YAML resources (see `docs/quality/pre
 | `quality`      | LLM review focus for dead code, magic numbers, naming, error handling.       |
 | `completeness` | LLM review focus for TODOs, missing tests, half-finished impls.              |
 | `cheating`     | Deterministic diff-patterns + LLM review focus for agent shortcuts. |
-| `tests`        | Deterministic diff-patterns for no-op assertions + LLM review focus for test meaningfulness. |
+| `tests`        | Deterministic diff-patterns for no-op assertions + LLM review focus for test assertion quality (anti-gaming). Test existence/completeness is owned by the deterministic `tests:coverage` gate below. |
 
 A project enables a preset by listing its name in
 `Audit.AuditTypes` (see `docs/concepts/projects.md`).
@@ -466,6 +466,23 @@ tool auditor (`Required = None`), auto-included by the composer like
 `tests:mutation-rigor`, and skips to a pass off the .NET path or on an empty
 diff. A project opts out via `ExcludedAuditors`. See
 [`coverage.md`](coverage.md) for the full configuration.
+
+### Meaningfulness review vs coverage gate
+
+Test existence and test quality are owned by different auditors by design, so the
+audit converges instead of re-litigating the same gap on every iteration:
+
+* `tests:coverage` (deterministic) owns **existence / completeness**: every executable
+  line changed in the item's diff must be exercised by a test. It is stateless per
+  iteration and never judges whether an assertion is any good.
+* `tests:meaningfulness-review` (LLM) owns **assertion quality / anti-gaming only**,
+  bounded strictly to tests added or modified in the diff: tests that execute code but
+  assert nothing, tests that assert on a mock/stub instead of the result under test,
+  missing error/edge-path assertions inside those tests, and coverage-padding tests
+  written only to satisfy the gate. It must never enumerate untested internal methods,
+  demand tests for code outside the diff, or report the mere absence of a test — that
+  is the coverage gate's job. Like the gate, it is stateless / isolated per audit
+  iteration, with no cross-iteration memory.
 
 ## Rework prompt
 

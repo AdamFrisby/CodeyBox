@@ -115,9 +115,14 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
 """;
 
     private const string TestsGuidance = """
-- **Adequacy**: Ensure each new public class, function, endpoint, and error path has at least one test.
-- **Meaningfulness**: Avoid implementation-mirroring, pure-mock tests, no-assertion tests, and trivially-true assertions.
-- **Edge cases & failures**: Cover boundaries, empty, null, unicode, timeouts, network errors, and resource exhaustion.
+- **Assertion quality, not existence**: test existence and line coverage belong to the
+  deterministic tests:coverage gate — never ask for a test that does not exist and never
+  enumerate untested methods or branches.
+- **Gaming tests**: flag added/modified tests that execute code but assert nothing, assert
+  on a mock/stub instead of the SUT-produced value, or pad coverage without verifying
+  behavior.
+- **Edge assertions within the test**: the added test should assert the error/edge paths
+  it executes, not just the happy path.
 - **Heuristic**: Ask yourself: "if I introduced a plausible bug (off-by-one, inverted condition, forgotten null check), would this test catch it?"
 """;
 
