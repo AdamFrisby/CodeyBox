@@ -356,6 +356,31 @@ public sealed record WorkItem
     public string? ReasoningMode { get; init; }
 
     /// <summary>
+    /// Number of completed delegation turns for this work item. Incremented
+    /// exactly once per delegation run (success, no-change, or failure).
+    /// Quota/transient parks mid-turn do not increment it: resuming the same
+    /// attempt is not a new attempt.
+    /// </summary>
+    public int DelegationAttempts { get; init; }
+
+    /// <summary>
+    /// Explicit one-shot authorization for the delegation phase. Set only by
+    /// an explicit new trigger (operator retry from <c>delegation</c>); the
+    /// pipeline consumes it when the delegation turn completes and never
+    /// mints it itself. A <see cref="WorkItemState.Delegating"/> entry without
+    /// this flag is rejected to <see cref="WorkItemState.NeedsOperatorInput"/>
+    /// instead of running, so the phase cannot be entered twice on one trigger
+    /// and is unreachable from its own failure path.
+    /// </summary>
+    public bool DelegationRequested { get; init; }
+
+    /// <summary>
+    /// Operator-facing reason recorded with the delegation request (which
+    /// trigger asked for it). Retained as history after the turn completes.
+    /// </summary>
+    public string? DelegationReason { get; init; }
+
+    /// <summary>
     /// Minimum acceptable <see cref="AgentMembership.QualityScore"/> for this work item.
     /// The router picks any member whose base score is at or above this floor.
     /// Default 0: open to ANY agent — most tasks should run on whatever agent is
@@ -821,6 +846,14 @@ public sealed record WorkItem
             TransientRetryFrom = carriesTransientRetry ? TransientRetryFrom : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,
+            // The delegation request is a one-shot authorization scoped to the
+            // Delegating state: only an explicit new trigger may move an item
+            // into Delegating (the retrier stamps this flag there), and
+            // leaving the state consumes it. Quota/transient parks of an
+            // in-flight turn resume through the retrier, which re-stamps the
+            // flag — so clearing here cannot strand a legitimate resume.
+            // Attempts and the request reason are history and ride along.
+            DelegationRequested = state == WorkItemState.Delegating && DelegationRequested,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
             // CancellationSource is preserved on Failed (so triage shows what cancelled the
@@ -869,6 +902,7 @@ public sealed record WorkItem
             or WorkItemState.Merging
             or WorkItemState.UpstreamPushing
             or WorkItemState.ReworkingForConflict
+            or WorkItemState.Delegating
             or WorkItemState.WaitingForTransientRetry
             or WorkItemState.NeedsOperatorInput;
 }

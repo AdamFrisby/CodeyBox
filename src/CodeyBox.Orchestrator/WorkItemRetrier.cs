@@ -343,6 +343,15 @@ public sealed class WorkItemRetrier
         // detect a re-route; only an operator retry clears it back to
         // unstamped.
         var isOperatorRetry = trigger == "manual";
+        // A resume into Delegating re-arms the one-shot trigger the pipeline
+        // consumes when the turn completes. Scheduler resumes of an in-flight
+        // delegation turn (quota / transient / agent-resume parks) preserve
+        // the original request reason; a fresh explicit trigger mints one so
+        // every attempt carries which trigger authorized it.
+        var resumingDelegationTurn = resumeState == WorkItemState.Delegating
+            && item.State is WorkItemState.WaitingForQuotaReset
+                or WorkItemState.WaitingForTransientRetry
+                or WorkItemState.WaitingForAgentResume;
         var resumed = item.With(resumeState, error: null) with
         {
             RecoveryAttempts = 0,
@@ -364,7 +373,9 @@ public sealed class WorkItemRetrier
                 : null,
             TerminalRetryAttempts = isOperatorRetry ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
-            StartedAt = null
+            StartedAt = null,
+            DelegationRequested = resumeState == WorkItemState.Delegating,
+            DelegationReason = ResolveDelegationReason(resumeState, resumingDelegationTurn, item.DelegationReason, trigger, requestedFrom),
         };
         var discardedAgentTurnRecoveryMetadata =
             !resumingAgentTurn
@@ -648,6 +659,30 @@ public sealed class WorkItemRetrier
         AgentTurnResumePhase.Rework => RetryFromPolicy.Rework,
         _ => throw new ArgumentOutOfRangeException(nameof(phase), phase, "Unsupported agent-turn resume phase."),
     };
+
+    /// <summary>
+    /// Resolves the delegation reason carried by a retry: keep the current
+    /// reason unless entering <see cref="WorkItemState.Delegating"/> fresh
+    /// (not a scheduler resume of an in-flight delegation turn), in which
+    /// case mint one naming the trigger that authorized the attempt.
+    /// </summary>
+    private static string? ResolveDelegationReason(
+        WorkItemState resumeState,
+        bool resumingDelegationTurn,
+        string? current,
+        string trigger,
+        string requestedFrom)
+    {
+        if (resumeState != WorkItemState.Delegating)
+        {
+            return current;
+        }
+        if (resumingDelegationTurn && !string.IsNullOrWhiteSpace(current))
+        {
+            return current;
+        }
+        return $"Delegation requested by '{trigger}' retry from '{requestedFrom}'.";
+    }
 
     /// <summary>
     /// Picks a sensible default <c>from</c> phase for retries when the operator

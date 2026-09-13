@@ -105,7 +105,8 @@ public static class WorkItemRecoveryPolicy
                 WorkItemState.WorkComplete => recoverySourceState is
                     WorkItemState.PlanApproved
                     or WorkItemState.Working
-                    or WorkItemState.Reworking,
+                    or WorkItemState.Reworking
+                    or WorkItemState.Delegating,
                 WorkItemState.AuditPassed => recoverySourceState is
                     WorkItemState.WorkComplete
                     or WorkItemState.Auditing
@@ -462,6 +463,7 @@ public static class WorkItemRecoveryPolicy
             WorkItemState.AuditPassed,
             WorkItemState.Merging,
             WorkItemState.ReworkingForConflict,
+            WorkItemState.Delegating,
             WorkItemState.Merged,
             WorkItemState.UpstreamPushing,
         ]);
@@ -627,6 +629,11 @@ public static class WorkItemRecoveryPolicy
         WorkItemState.Reworking => WorkItemState.WorkComplete,
         WorkItemState.WorkComplete => WorkItemState.WorkComplete,
         WorkItemState.Auditing => WorkItemState.WorkComplete,
+        // A dead worker mid-delegation recovers in place: the explicit
+        // trigger (DelegationRequested) survives on the row, so the next
+        // pickup re-runs the same authorized attempt rather than minting a
+        // new one or dropping the operator's request.
+        WorkItemState.Delegating => WorkItemState.Delegating,
         WorkItemState.AuditPassed => WorkItemState.AuditPassed,
         WorkItemState.Merging => WorkItemState.AuditPassed,
         WorkItemState.Merged => WorkItemState.Merged,
