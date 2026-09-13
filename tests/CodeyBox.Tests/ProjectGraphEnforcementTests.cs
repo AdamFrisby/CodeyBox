@@ -137,6 +137,72 @@ public sealed class ProjectGraphEnforcementTests
     }
 
     [Fact]
+    public void FilterExpression_EscapesVstestMetacharacters()
+    {
+        // Baseline test names are untrusted input: every entry must become a
+        // single escaped FullyQualifiedName match — no raw operators survive,
+        // so a crafted name cannot rewrite the executed subset.
+        var auditor = EnforcingRunner(new InMemoryTestSelectionShadowSink());
+        var argv = auditor.BuildInvocation(
+            new TestSelection(["Ns.Leaf.LeafTests|A&B", "FullyQualifiedName=x", "A~B=C(1)!"]),
+            TestRunOptions.Default);
+
+        var filterIndex = ((List<string>)[.. argv]).IndexOf("--filter");
+        Assert.True(filterIndex >= 0);
+        Assert.Equal(
+            @"FullyQualifiedName=Ns.Leaf.LeafTests\|A\&B|FullyQualifiedName=FullyQualifiedName\=x|FullyQualifiedName=A\~B\=C\(1\)\!",
+            argv[filterIndex + 1]);
+    }
+
+    [Fact]
+    public async Task EnforcingRun_ZeroTestsExecuted_FallsBackToFullSuite()
+    {
+        // A narrowed run that exits 0 with zero tests executed (a filter that
+        // matches nothing) must fall back to the full suite, not report a pass.
+        var sink = new InMemoryTestSelectionShadowSink();
+        var baseline = LeafBaseline();
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "git")
+                return new SandboxExecResult(0, LeafDiff(), "");
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "cat")
+                return new SandboxExecResult(0, baseline, "");
+            if (exec.Argv.Contains("--filter"))
+                return new SandboxExecResult(0, "No test matches the given testcase filter `FullyQualifiedName=Ns.Leaf.LeafTests`.", "");
+            return new SandboxExecResult(0, "Passed! - Failed: 0, Passed: 2", "");
+        });
+        var auditor = EnforcingRunner(sink);
+
+        var result = await auditor.RunAsync(sandbox, "/work", ContextFor());
+
+        Assert.True(result.Passed);
+        var testArgvs = sandbox.ExecutedArgv.Where(a => a.Count > 1 && a[1] == "test").ToList();
+        Assert.Equal(2, testArgvs.Count);
+        Assert.Contains("--filter", testArgvs[0]);
+        Assert.DoesNotContain("--filter", testArgvs[1]);
+        Assert.Equal(TestSelectionShadowRecord.AssessmentFullSuite, result.TestSelection!.Assessment);
+        Assert.Contains("zero tests", result.TestSelection.Detail);
+    }
+
+    [Fact]
+    public async Task EnforcingRun_StaleBaseline_FallsBackToFullSuite()
+    {
+        // A baseline older than MaxBaselineAge must not narrow the enforcing
+        // run, even for a change confined to one leaf project.
+        var sink = new InMemoryTestSelectionShadowSink();
+        var sandbox = SandboxFor(LeafDiff(), LeafBaseline(DateTimeOffset.UtcNow.AddDays(-8)), "Passed!");
+        var auditor = EnforcingRunner(sink);
+
+        var result = await auditor.RunAsync(sandbox, "/work", ContextFor());
+
+        Assert.True(result.Passed);
+        var testArgv = Assert.Single(sandbox.ExecutedArgv, a => a.Count > 1 && a[1] == "test");
+        Assert.DoesNotContain("--filter", testArgv);
+        Assert.Equal(TestSelectionShadowRecord.AssessmentFullSuite, result.TestSelection!.Assessment);
+        Assert.Contains("stale", result.TestSelection.Detail);
+    }
+
+    [Fact]
     public void Program_ResolvesProjectGraphSelector_ForEnforcingMode()
     {
         using var factory = new EnforcingWiringFactory(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
@@ -174,12 +240,15 @@ public sealed class ProjectGraphEnforcementTests
             },
         });
 
-    private static string LeafBaseline()
+    private static string LeafDiff()
+        => "diff --git a/src/Leaf/A.cs b/src/Leaf/A.cs\n+++ b/src/Leaf/A.cs\n@@ -0,0 +10,1 @@\n+var x = 1;\n";
+
+    private static string LeafBaseline(DateTimeOffset? producedAt = null)
         => $$"""
             {
               "format": "codeybox-test-selection-baseline/1",
               "commit": "abc123",
-              "producedAtUtc": "{{DateTimeOffset.UtcNow.AddHours(-1):O}}",
+              "producedAtUtc": "{{(producedAt ?? DateTimeOffset.UtcNow.AddHours(-1)):O}}",
               "fileProject": {
                 "src/Leaf/A.cs": "src/Leaf/Leaf.csproj",
                 "src/CodeyBox.Core/Foo.cs": "src/CodeyBox.Core/CodeyBox.Core.csproj"

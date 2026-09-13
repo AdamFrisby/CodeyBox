@@ -238,7 +238,7 @@ internal static class DotnetTestFailureAttributionRunner
         }
 
         argv.Add("--filter");
-        argv.Add($"FullyQualifiedName={EscapeFilterValue(TrimDisplayArguments(testName))}");
+        argv.Add($"FullyQualifiedName={VstestFilterEscaping.EscapeValue(TrimDisplayArguments(testName))}");
         return argv;
     }
 
@@ -246,19 +246,6 @@ internal static class DotnetTestFailureAttributionRunner
     {
         var paren = testName.IndexOf('(', StringComparison.Ordinal);
         return paren > 0 ? testName[..paren].TrimEnd() : testName;
-    }
-
-    private static string EscapeFilterValue(string value)
-    {
-        var chars = new List<char>(value.Length);
-        foreach (var ch in value)
-        {
-            if (ch is '\\' or ',' or '(' or ')' or '!' or '~' or '&' or '|' or '=')
-                chars.Add('\\');
-            chars.Add(ch);
-        }
-
-        return new string(chars.ToArray());
     }
 
     private static TestFailureRunOutcome ToRunOutcome(SandboxExecResult result)

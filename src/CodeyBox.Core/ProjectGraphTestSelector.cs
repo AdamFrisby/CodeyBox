@@ -19,20 +19,24 @@ public sealed record ProjectGraphSelection(
 /// affected tests for those projects, plus the tests defined in the changed
 /// files themselves.
 ///
-/// <para>Fail-safe: ANY uncertainty — no baseline, invalid selection options,
-/// unknown changeset, a global target, a change owned by an ALWAYS-FULL
-/// project (shared/root contracts, source generators, test infrastructure),
-/// a whole-file change (no line granularity), a changed file the baseline
-/// never references, or an empty affected set — resolves to the full suite.
-/// Running more tests is always safe; running fewer than the change requires
-/// is not.</para>
+/// <para>Fail-safe: ANY uncertainty — no baseline, a missing or stale baseline
+/// (age past <c>MaxBaselineAge</c> or commit mismatch, same policy as the
+/// coverage layer), invalid selection options, unknown changeset, a global
+/// target, a change owned by an ALWAYS-FULL project (shared/root contracts,
+/// source generators, test infrastructure), a changed probable-test-file
+/// (which may define unrecorded tests), a whole-file change (no line
+/// granularity), a changed file the baseline never references, or an empty
+/// affected set — resolves to the full suite. Running more tests is always
+/// safe; running fewer than the change requires is not.</para>
 /// </summary>
 public static class ProjectGraphSelectorCore
 {
     public static ProjectGraphSelection SelectTests(
         IReadOnlyList<TestSelectionChangedFile> changedFiles,
         TestSelectionBaseline? baseline,
-        CoverageTestSelectionOptions options)
+        CoverageTestSelectionOptions options,
+        DateTimeOffset nowUtc,
+        string? currentCommit = null)
     {
         ArgumentNullException.ThrowIfNull(changedFiles);
         ArgumentNullException.ThrowIfNull(options);
@@ -42,6 +46,10 @@ public static class ProjectGraphSelectorCore
             return Full("selection options are invalid");
         if (changedFiles.Count == 0)
             return Full("the changeset could not be determined");
+
+        var freshness = TestSelectionBaselineFreshness.Check(baseline, nowUtc, options.MaxBaselineAge, currentCommit);
+        if (!freshness.IsFresh)
+            return Full($"stale project-graph baseline ({freshness.Reason})");
 
         var graph = baseline.ProjectGraph;
         var byDefiningFile = IndexByDefiningFile(baseline.Tests);
@@ -54,6 +62,8 @@ public static class ProjectGraphSelectorCore
                 return Full($"change touches global target '{path}'");
             if (file.ChangedRanges.Count == 0)
                 return Full($"whole-file change to '{path}' (no line granularity)");
+            if (TestSelectionPaths.IsProbableTestFile(path))
+                return Full($"changed test file '{path}' may define unrecorded tests");
 
             var known = false;
             if (graph.FileProject.TryGetValue(path, out var project)
@@ -125,13 +135,25 @@ public sealed class ProjectGraphTestSelector : ITestSelector
     public const string SelectorName = "project-graph";
 
     private readonly Func<CoverageTestSelectionOptions> _optionsProvider;
+    private readonly TimeProvider _clock;
+    private readonly Func<string?> _currentCommitProvider;
 
     /// <param name="optionsProvider">Live hot-reloadable selection options.
     /// Null defaults to fresh defaults (used by unit tests); the composition
     /// root passes an <c>IOptionsMonitor</c>-backed accessor.</param>
-    public ProjectGraphTestSelector(Func<CoverageTestSelectionOptions>? optionsProvider = null)
+    /// <param name="clock">Clock for the baseline-freshness age check.
+    /// Null defaults to <see cref="TimeProvider.System"/>.</param>
+    /// <param name="currentCommitProvider">Resolves the current commit for the
+    /// baseline commit-match check. Null means "unknown" (only the age check
+    /// applies); the auditor passes a <c>git rev-parse HEAD</c> accessor.</param>
+    public ProjectGraphTestSelector(
+        Func<CoverageTestSelectionOptions>? optionsProvider = null,
+        TimeProvider? clock = null,
+        Func<string?>? currentCommitProvider = null)
     {
         _optionsProvider = optionsProvider ?? (static () => new CoverageTestSelectionOptions());
+        _clock = clock ?? TimeProvider.System;
+        _currentCommitProvider = currentCommitProvider ?? (static () => null);
     }
 
     public TestSelectionDecision Select(TestSelectionRequest request)
@@ -149,7 +171,12 @@ public sealed class ProjectGraphTestSelector : ITestSelector
                 TestSelection.All,
                 $"{SelectorName}: full suite (selection options unavailable ({ex.GetType().Name}))");
         }
-        var resolved = ProjectGraphSelectorCore.SelectTests(request.ChangedFiles, request.Baseline, options);
+        var resolved = ProjectGraphSelectorCore.SelectTests(
+            request.ChangedFiles,
+            request.Baseline,
+            options,
+            _clock.GetUtcNow(),
+            request.CurrentCommit ?? _currentCommitProvider());
         if (resolved.IsFullSuite)
         {
             return new TestSelectionDecision(

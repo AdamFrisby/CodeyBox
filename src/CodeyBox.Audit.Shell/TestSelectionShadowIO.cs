@@ -135,6 +135,41 @@ public static class TestSelectionShadowIO
     }
 
     /// <summary>
+    /// Resolves the current commit (<c>git rev-parse HEAD</c>) for the baseline
+    /// commit-match freshness check. Any failure yields null ("unknown") — the
+    /// selectors then apply only the age check and still fall back to the full
+    /// suite when the baseline is missing or stale (fail-safe).
+    /// </summary>
+    public static async Task<string?> GetCurrentCommitAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentNullException.ThrowIfNull(workingDirectory);
+
+        SandboxExecResult resolved;
+        try
+        {
+            resolved = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "rev-parse", "--end-of-options", "HEAD"],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = 1024,
+            }, ct).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        if (!resolved.Success || string.IsNullOrWhiteSpace(resolved.Stdout))
+            return null;
+        var commit = resolved.Stdout.Trim();
+        return commit.Length == 0 || commit.IndexOfAny([' ', '\t', '\r', '\n']) >= 0 ? null : commit;
+    }
+
+    /// <summary>
     /// Loads the baseline artifact from its sandbox path. Missing files, read
     /// failures, oversized output, and parse errors all yield a null baseline
     /// with a detail fragment — never a throw.

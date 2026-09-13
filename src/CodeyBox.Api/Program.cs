@@ -2631,7 +2631,7 @@ builder.Services.AddSingleton<ITestSelector>(sp =>
 {
     var modeMonitor = sp.GetRequiredService<IOptionsMonitor<TestSelectionOptions>>();
     var coverageOptionsMonitor = sp.GetRequiredService<IOptionsMonitor<CoverageTestSelectionOptions>>();
-    var projectGraph = new ProjectGraphTestSelector(() => coverageOptionsMonitor.CurrentValue);
+    var projectGraph = new ProjectGraphTestSelector(() => coverageOptionsMonitor.CurrentValue, TimeProvider.System);
     var selectorsByMode = new Dictionary<TestSelectionMode, ITestSelector>
     {
         [TestSelectionMode.All] = new RunAllTestSelector(),

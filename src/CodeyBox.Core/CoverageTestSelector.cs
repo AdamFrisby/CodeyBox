@@ -196,13 +196,19 @@ public sealed class CoverageTestSelector : ITestSelector
         }
 
         var options = _optionsProvider();
-        var superset = ProjectGraphSelectorCore.SelectTests(request.ChangedFiles, request.Baseline, options);
+        var superset = ProjectGraphSelectorCore.SelectTests(
+            request.ChangedFiles,
+            request.Baseline,
+            options,
+            _clock.GetUtcNow(),
+            request.CurrentCommit);
         var resolved = CoverageSelectionCore.SelectTests(
             request.ChangedFiles,
             request.Baseline,
             options,
             _clock.GetUtcNow(),
-            superset);
+            superset,
+            request.CurrentCommit);
 
         if (resolved.IsFullSuite)
         {

@@ -1458,27 +1458,31 @@ public sealed class AuditTests
         var auditor = CSharpTestPassAuditor();
 
         var command = auditor.BuildInvocation(
-            new TestSelection(["Ns.A", "FullyQualifiedName~Slow"]),
+            new TestSelection(["Ns.A", "Ns.B"]),
             TestRunOptions.Default);
 
         Assert.Equal<string[]>(
-            ["dotnet", "test", "--no-build", "--filter", "FullyQualifiedName=Ns.A|FullyQualifiedName~Slow"],
+            ["dotnet", "test", "--no-build", "--filter", "FullyQualifiedName=Ns.A|FullyQualifiedName=Ns.B"],
             [.. command]);
     }
 
     [Fact]
-    public void DotnetTestAuditor_SelectionWithExplicitOperator_PassesThroughUnprefixed()
+    public void DotnetTestAuditor_SelectionEntries_AreEscapedNeverRawExpressions()
     {
         var auditor = CSharpTestPassAuditor();
 
-        // Entries already carrying '=' (including '!=') must NOT be re-prefixed
-        // with FullyQualifiedName=.
+        // Entries carrying filter operators MUST be escaped, never passed
+        // through as raw expressions: test names originate from the
+        // test-selection baseline (untrusted sandbox-produced input), and a
+        // raw '='/'~' entry could rewrite the executed subset (e.g. match zero
+        // tests and falsify the gate as a pass).
         var command = auditor.BuildInvocation(
-            new TestSelection(["FullyQualifiedName=Ns.A", "Category!=Slow"]),
+            new TestSelection(["FullyQualifiedName=Ns.A", "Category!=Slow", "A|B"]),
             TestRunOptions.Default);
 
         Assert.Equal<string[]>(
-            ["dotnet", "test", "--no-build", "--filter", "FullyQualifiedName=Ns.A|Category!=Slow"],
+            ["dotnet", "test", "--no-build", "--filter",
+                @"FullyQualifiedName=FullyQualifiedName\=Ns.A|FullyQualifiedName=Category\!\=Slow|FullyQualifiedName=A\|B"],
             [.. command]);
     }
 
