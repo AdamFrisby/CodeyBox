@@ -1,11 +1,13 @@
 # Regression test selection (`csharp:test-pass`)
 
 The `csharp:test-pass` audit can narrow `dotnet test` to the tests a change
-may affect. Narrowing ships **advisory/shadow only**: the selector computes the
-subset it *would* run, the **full suite still runs**, and a shadow record
-captures whether any deselected test failed. Real skipping is gated on
-accumulated shadow data showing zero unsafe skips — no ticket in this sequence
-skips a test.
+may affect. New selectors first ship **advisory/shadow only**
+(SHADOW-BEFORE-ENFORCE): the selector computes the subset it *would* run, the
+**full suite still runs**, and a shadow record captures whether any deselected
+test failed. Real skipping is gated on accumulated shadow data showing zero
+unsafe skips over the calibration window (the soundness gate,
+`readyForEnforcement`). The `project-graph` mode below is the first ENFORCING
+mode, enabled by operators only after that gate reports ready.
 
 ## Modes (`Audit:TestSelection:Mode`)
 
@@ -13,6 +15,7 @@ skips a test.
 |------|-----------|
 | `all` (default) | Full suite; the emitted command is byte-identical to the legacy path. Instant kill-switch: hot-reloading back to `all` disables all selection. |
 | `coverage-shadow` | Coverage selector computes the would-be subset; full suite still runs; one structured `test-selection shadow` log line is emitted per run. |
+| `project-graph` | ENFORCING: the project-graph selector's subset is executed via `--filter`; any selector error, missing/stale data, global-target touch, or ambiguous result falls back to the full suite (fail-safe). Opt in only after the soundness gate reports zero unsafe skips. |
 
 The value is case-insensitive (`coverage_shadow` also parses) and hot-reloads
 via `IOptionsMonitor`. An unrecognised value fails fast at load.
@@ -85,13 +88,17 @@ suite. Size caps (`MaxBaselineBytes`, `MaxBaselineTests`,
 ## Structural invariants
 
 - **SHADOW-BEFORE-ENFORCE** — `DotnetTestAuditor` executes
-  `BuildInvocation(TestSelection.All, …)` on every run; the narrowed
+  `BuildInvocation(TestSelection.All, …)` on every shadow run; the narrowed
   `--filter` argv is computed for the shadow record only, never executed.
+  The enforcing `project-graph` mode executes the narrowed argv only after the
+  soundness gate reported zero unsafe skips over the calibration window.
 - **FULL-SUITE-ON-MAIN** — the merge/release path (`IRequiredBuildVerifier` /
   `process:required-build`) takes no `ITestSelector` dependency and always
   runs everything, enforced in code (see `TestSelectorTests`), not config.
-- **FAIL-SAFE** — selector errors, missing/stale data, and global-target
-  touches all resolve to the full run.
+  The selector is consulted ONLY for per-item audit runs.
+- **FAIL-SAFE** — selector errors, missing/stale data, global-target
+  touches, and ambiguous results all resolve to the full run; `Mode=all`
+  (hot-reload) is an instant kill-switch.
 
 ## Shadow records (the shared validation harness)
 
@@ -118,12 +125,12 @@ Timeline dashboard pages):
 
 | Field | Meaning |
 |-------|---------|
-| `mode` | Live selection mode (`All`, `CoverageShadow`). |
-| `selector` | Selector that decided (`coverage`, or `none` when the shadow was inactive). |
-| `layers` | Layers consulted, innermost first (`["project-graph","coverage"]` for the coverage selector, which refines the project-graph superset). |
-| `selectedCount` / `totalCount` | WOULD-BE subset / known universe size. `0/0` means the universe was unknown (no baseline) — the dashboard shows "full suite". For a full-suite fallback with a known universe, both equal the universe size. |
-| `estimatedSavedFraction` | Proportional estimate: deselected / total in [0,1]. The dashboard multiplies it by the run's `durationMs` (`est. saved 62.5% (~75s)`). Zero for full-suite runs. This is an estimate, not a measurement — the full suite always ran. |
-| `assessment` | Shadow verdict (`safe-for-this-run` \| `unsafe-skips-observed` \| `full-suite` \| `unverifiable`). |
+| `mode` | Live selection mode (`All`, `CoverageShadow`, `ProjectGraph`). |
+| `selector` | Selector that decided (`coverage`, `project-graph`, or `none` when neither shadow nor enforcement was active). |
+| `layers` | Layers consulted, innermost first (`["project-graph","coverage"]` for the coverage selector, which refines the project-graph superset; `["project-graph"]` for enforcing project-graph runs). |
+| `selectedCount` / `totalCount` | WOULD-BE subset / known universe size. `0/0` means the universe was unknown (no baseline) — the dashboard shows "full suite". For a full-suite fallback with a known universe, both equal the universe size. For enforcing runs, the EXECUTED subset / universe size. |
+| `estimatedSavedFraction` | Proportional estimate: deselected / total in [0,1]. The dashboard multiplies it by the run's `durationMs` (`est. saved 62.5% (~75s)`). Zero for full-suite runs. For shadow runs this is an estimate, not a measurement — the full suite always ran. |
+| `assessment` | Shadow verdict (`safe-for-this-run` \| `unsafe-skips-observed` \| `full-suite` \| `unverifiable`), plus `enforced-subset` for enforcing runs that executed a narrowed subset (deselected tests were skipped, so no safe/unsafe claim is made; the soundness gate ignores these runs). |
 | `fallbacks` | Which fallback-ladder rungs fired (e.g. `no per-test coverage baseline is available`). Empty when the selector narrowed without falling back. |
 | `detail` | Operator-facing selection detail (capped at 4000 chars). |
 

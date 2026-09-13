@@ -18,6 +18,15 @@ public enum TestSelectionMode
     /// gated on that data showing zero unsafe skips — this mode never skips.
     /// </summary>
     CoverageShadow,
+
+    /// <summary>
+    /// Enforcing project-graph selection: the project-graph selector narrows
+    /// the executed <c>dotnet test</c> run to the affected tests. Opt-in only
+    /// after the soundness gate reports zero unsafe skips over the calibration
+    /// window. Any selector error, missing/stale data, global-target touch, or
+    /// ambiguous result falls back to the full suite (fail-safe).
+    /// </summary>
+    ProjectGraph,
 }
 
 /// <summary>
@@ -73,6 +82,9 @@ public static class TestSelectionModeParser
             case "coverageshadow":
                 mode = TestSelectionMode.CoverageShadow;
                 return true;
+            case "projectgraph":
+                mode = TestSelectionMode.ProjectGraph;
+                return true;
             default:
                 return false;
         }
@@ -88,7 +100,7 @@ public static class TestSelectionModeParser
             ? mode
             : throw new FormatException(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Unknown {TestSelectionOptions.SectionName}:Mode value '{value}'. Valid modes: all, coverage-shadow."));
+                $"Unknown {TestSelectionOptions.SectionName}:Mode value '{value}'. Valid modes: all, coverage-shadow, project-graph."));
 }
 
 /// <summary>

@@ -89,8 +89,14 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         CancellationToken ct = default)
     {
         var shadow = _opts.Shadow;
-        if (shadow is not null && IsShadowMode(shadow))
-            return await RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+        if (shadow is not null)
+        {
+            var mode = ResolveMode(shadow);
+            if (mode == TestSelectionMode.CoverageShadow)
+                return await RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+            if (mode == TestSelectionMode.ProjectGraph)
+                return await RunWithProjectGraphEnforcementAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+        }
         var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
         return full with { TestSelection = TestSelectionTelemetryComputer.FullSuiteWithoutShadow(ResolveModeName(shadow)) };
     }
@@ -109,17 +115,18 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         }
     }
 
-    private static bool IsShadowMode(TestSelectionShadowConfig shadow)
+    private static TestSelectionMode ResolveMode(TestSelectionShadowConfig shadow)
     {
         try
         {
-            return shadow.ModeAccessor() == TestSelectionMode.CoverageShadow;
+            return shadow.ModeAccessor();
         }
         catch (Exception)
         {
-            // A hot-reloaded invalid mode must never break the test gate: skip
-            // the shadow (the options validator surfaces the bad value at load).
-            return false;
+            // A hot-reloaded invalid mode must never break the test gate: fall
+            // through to the full suite (the options validator surfaces the bad
+            // value at load).
+            return TestSelectionMode.All;
         }
     }
 
@@ -127,7 +134,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
     /// SHADOW-BEFORE-ENFORCE: computes the advisory selection and records the
     /// validation verdict, but ALWAYS executes the full suite. The narrowed
     /// <c>--filter</c> argv is computed for the record only and is never
-    /// executed by this ticket.
+    /// executed by this path.
     /// </summary>
     private async Task<AuditResult> RunWithShadowAsync(
         ISandbox sandbox,
@@ -140,6 +147,8 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             sandbox, workingDirectory, context.BaseBranch, shadow.OptionsAccessor, ct).ConfigureAwait(false);
         var baseline = await TestSelectionShadowIO.ReadBaselineAsync(
             sandbox, workingDirectory, shadow.OptionsAccessor, ct).ConfigureAwait(false);
+        var currentCommit = await TestSelectionShadowIO.GetCurrentCommitAsync(
+            sandbox, workingDirectory, ct).ConfigureAwait(false);
 
         var selectionDetail = $"baseline: {baseline.Detail}";
         TestSelectionDecision decision;
@@ -152,14 +161,14 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             try
             {
                 decision = shadow.Selector.Select(new TestSelectionRequest(
-                    this, context.BaseBranch, changedFiles, baseline.Baseline));
+                    this, context.BaseBranch, changedFiles, baseline.Baseline, currentCommit));
             }
             catch (Exception ex)
             {
                 // Fail-safe: any selector error falls back to the full run.
                 decision = new TestSelectionDecision(
                     TestSelection.All,
-                    $"selector error ({ex.GetType().Name})");
+                    $"selector error ({ex.GetType().Name}: {TruncateForDetail(ex.Message)})");
             }
         }
         selectionDetail = $"{decision.Justification} | {selectionDetail}";
@@ -239,6 +248,139 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             universe, failedTests, wouldBeArgv, selectionDetail);
     }
 
+    /// <summary>
+    /// ENFORCING project-graph selection (<c>Audit:TestSelection:Mode=project-graph</c>):
+    /// resolves the affected tests and executes ONLY that subset via
+    /// <c>--filter</c>. Fail-safe: any selector error, unreadable options,
+    /// unknown base ref, an ambiguous result (empty/blank filters), a
+    /// filter-build failure, or a narrowed run that executes zero tests falls
+    /// back to the full suite. The merge/release path never reaches here — it
+    /// takes no <c>ITestSelector</c> dependency by construction.
+    /// </summary>
+    private async Task<AuditResult> RunWithProjectGraphEnforcementAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        TestSelectionShadowConfig shadow,
+        CancellationToken ct)
+    {
+        var changedFiles = await TestSelectionShadowIO.GetChangedFilesAsync(
+            sandbox, workingDirectory, context.BaseBranch, shadow.OptionsAccessor, ct).ConfigureAwait(false);
+        var baseline = await TestSelectionShadowIO.ReadBaselineAsync(
+            sandbox, workingDirectory, shadow.OptionsAccessor, ct).ConfigureAwait(false);
+        var currentCommit = await TestSelectionShadowIO.GetCurrentCommitAsync(
+            sandbox, workingDirectory, ct).ConfigureAwait(false);
+
+        var universe = baseline.Baseline is null
+            ? (IReadOnlyList<string>)[]
+            : [.. baseline.Baseline.Tests.Keys];
+        var modeName = TestSelectionMode.ProjectGraph.ToString();
+
+        TestSelectionDecision decision;
+        if (string.IsNullOrWhiteSpace(context.BaseBranch))
+        {
+            decision = new TestSelectionDecision(TestSelection.All, "unknown base ref");
+        }
+        else
+        {
+            try
+            {
+                decision = shadow.Selector.Select(new TestSelectionRequest(
+                    this, context.BaseBranch, changedFiles, baseline.Baseline, currentCommit));
+            }
+            catch (Exception ex)
+            {
+                // Fail-safe: any selector error falls back to the full run.
+                decision = new TestSelectionDecision(
+                    TestSelection.All,
+                    $"selector error ({ex.GetType().Name}: {TruncateForDetail(ex.Message)})");
+            }
+        }
+
+        var detail = $"{decision.Justification} | baseline: {baseline.Detail}";
+        if (decision.Selection.IsAll || IsAmbiguousSelection(decision.Selection))
+        {
+            if (!decision.Selection.IsAll)
+            {
+                detail += " | ambiguous selection fell back to the full suite";
+                decision = new TestSelectionDecision(TestSelection.All, detail);
+            }
+            var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+            var telemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
+                modeName, ProjectGraphTestSelector.SelectorName, decision, universe.Count, detail);
+            return full with { TestSelection = telemetry };
+        }
+
+        IReadOnlyList<string> invocation;
+        try
+        {
+            invocation = BuildInvocation(decision.Selection, CurrentRunOptions);
+        }
+        catch (Exception ex)
+        {
+            var buildFailure = detail + $" | filter build failed ({ex.GetType().Name}: {TruncateForDetail(ex.Message)})";
+            var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+            var fallbackTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
+                modeName, ProjectGraphTestSelector.SelectorName,
+                new TestSelectionDecision(TestSelection.All, buildFailure),
+                universe.Count, buildFailure);
+            return full with { TestSelection = fallbackTelemetry };
+        }
+
+        var narrowed = await RunInvocationAsync(invocation, context, sandbox, workingDirectory, ct).ConfigureAwait(false);
+        if (narrowed.Passed && RanZeroTests(narrowed.RawOutput ?? ""))
+        {
+            var zeroTests = detail + " | narrowed run executed zero tests; fell back to the full suite";
+            var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+            var fallbackTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
+                modeName, ProjectGraphTestSelector.SelectorName,
+                new TestSelectionDecision(TestSelection.All, zeroTests),
+                universe.Count, zeroTests);
+            return full with { TestSelection = fallbackTelemetry };
+        }
+        var enforcedTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
+            modeName, ProjectGraphTestSelector.SelectorName, decision, universe.Count, detail);
+        return narrowed with { TestSelection = enforcedTelemetry };
+    }
+
+    private static string TruncateForDetail(string message, int maxChars = 200)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "no detail";
+        var singleLine = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return singleLine.Length <= maxChars ? singleLine : singleLine[..maxChars] + "...";
+    }
+
+    private static bool IsAmbiguousSelection(TestSelection selection)
+    {
+        if (selection.IsAll)
+            return false;
+        if (selection.Filters.Count == 0)
+            return true;
+        return selection.Filters.Any(string.IsNullOrWhiteSpace);
+    }
+
+    private Task<AuditResult> RunInvocationAsync(
+        IReadOnlyList<string> invocation,
+        AuditContext context,
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct)
+    {
+        var inner = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = _opts.Name,
+            Argv = invocation,
+            ResultClassifier = _classifier,
+            CanShortCircuitOnBlockingFinding = _opts.CanShortCircuitOnBlockingFinding,
+            Role = _opts.Role,
+            BuildTestGateEvidence = _opts.BuildTestGateEvidence,
+            SelfHealNuGetHome = _opts.SelfHealNuGetHome,
+            TestFailureAttributionOptions = _opts.TestFailureAttributionOptions,
+        });
+        return inner.RunAsync(sandbox, workingDirectory, context, ct);
+    }
+
     private Task<AuditResult> RunFullAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -269,16 +411,41 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
 
     /// <summary>
     /// Maps a set of selected tests to a <c>dotnet test --filter</c> expression.
-    /// Bare names are matched by fully-qualified name; entries that already carry
-    /// an <c>=</c> or <c>~</c> operator are passed through unchanged so a selector
-    /// can supply raw expressions (this covers <c>!=</c> too, since it contains
-    /// <c>=</c>). Multiple entries are OR-joined.
+    /// Every entry is emitted as an escaped <c>FullyQualifiedName=</c> match:
+    /// test names originate from the test-selection baseline (untrusted
+    /// sandbox-produced input), so no entry is ever passed through as raw
+    /// filter syntax — VSTest metacharacters are backslash-escaped via
+    /// <see cref="VstestFilterEscaping"/>. Multiple entries are OR-joined.
     /// </summary>
     private static string BuildFilterExpression(IReadOnlyList<string> filters)
         => string.Join("|", filters.Select(f =>
-            f.Contains('=', StringComparison.Ordinal) || f.Contains('~', StringComparison.Ordinal)
-                ? f
-                : $"FullyQualifiedName={f}"));
+            $"FullyQualifiedName={VstestFilterEscaping.EscapeValue(f)}"));
+
+    /// <summary>
+    /// True when a narrowed run's output shows ZERO tests executed: VSTest
+    /// prints "No test matches the given testcase filter" (exit 0), or a
+    /// summary with a zero total. Such a run must fall back to the full suite
+    /// rather than report a pass — a crafted filter that matches nothing would
+    /// otherwise falsify the gate.
+    /// </summary>
+    private static bool RanZeroTests(string output)
+    {
+        if (string.IsNullOrWhiteSpace(output))
+            return false;
+        if (output.Contains("No test matches the given testcase filter", StringComparison.OrdinalIgnoreCase))
+            return true;
+        foreach (var line in output.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if ((trimmed.StartsWith("Passed!", StringComparison.OrdinalIgnoreCase)
+                    || trimmed.StartsWith("Failed!", StringComparison.OrdinalIgnoreCase))
+                && trimmed.Contains("Total: 0", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// <summary>
     /// Formats a hang timeout for <c>--blame-hang-timeout</c>, which accepts a
@@ -330,12 +497,13 @@ public sealed record DotnetTestAuditorOptions
     public TestFailureAttributionOptionsSnapshot? TestFailureAttributionOptions { get; init; }
 
     /// <summary>
-    /// Advisory test-selection shadow (SHADOW-BEFORE-ENFORCE). When set and the
-    /// live mode is <c>coverage-shadow</c>, each run computes the selector's
-    /// advisory decision, still executes the FULL suite, and emits a shadow
-    /// record (would-be selection plus whether any deselected test failed).
-    /// Null (the default) disables the shadow — byte-identical legacy runs.
-    /// Real skipping is never performed here.
+    /// Test-selection configuration. When set, the live mode decides the run:
+    /// <c>coverage-shadow</c> computes the selector's advisory decision, still
+    /// executes the FULL suite, and emits a shadow record (SHADOW-BEFORE-ENFORCE);
+    /// <c>project-graph</c> executes ONLY the selector's subset (enforcing),
+    /// falling back to the full suite on any error or ambiguous result;
+    /// <c>all</c> (or unset) runs the full suite. Null (the default) disables
+    /// selection — byte-identical legacy runs.
     /// </summary>
     public TestSelectionShadowConfig? Shadow { get; init; }
 }

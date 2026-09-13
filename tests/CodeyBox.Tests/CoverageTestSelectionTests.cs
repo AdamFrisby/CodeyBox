@@ -31,6 +31,11 @@ public sealed class CoverageTestSelectionTests
 
     private static CoverageTestSelectionOptions FreshOptions() => new();
 
+    private static ProjectGraphTestSelector NewProjectGraphSelector(
+        Func<CoverageTestSelectionOptions>? options = null,
+        TimeProvider? clock = null)
+        => new(options ?? FreshOptions, clock ?? new FixedClock(Now));
+
     private static TestSelectionBaseline Baseline(
         string commit = "abc123",
         DateTimeOffset? producedAt = null,
@@ -80,6 +85,13 @@ public sealed class CoverageTestSelectionTests
         TestSelectionBaseline? baseline,
         params TestSelectionChangedFile[] files)
         => new(runner, "main", files, baseline);
+
+    private static TestSelectionRequest RequestWithCommit(
+        ITestRunnerAuditor runner,
+        TestSelectionBaseline? baseline,
+        string? currentCommit,
+        params TestSelectionChangedFile[] files)
+        => new(runner, "main", files, baseline, currentCommit);
 
     private static DotnetTestAuditor NewRunner()
         => new(new DotnetTestAuditorOptions
@@ -255,7 +267,7 @@ public sealed class CoverageTestSelectionTests
     public void ProjectGraph_SelectsAffectedTests()
     {
         var runner = NewRunner();
-        var decision = new ProjectGraphTestSelector().Select(RequestFor(
+        var decision = NewProjectGraphSelector().Select(RequestFor(
             runner, StandardBaseline(),
             new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(10, 1)])));
 
@@ -270,7 +282,7 @@ public sealed class CoverageTestSelectionTests
     [InlineData("src/Unknown/File.cs")]
     public void ProjectGraph_UnknownFile_FallsBackToFullSuite(string path)
     {
-        var decision = new ProjectGraphTestSelector().Select(RequestFor(
+        var decision = NewProjectGraphSelector().Select(RequestFor(
             NewRunner(), StandardBaseline(),
             new TestSelectionChangedFile(path, [new ChangedLineRange(1, 1)])));
         Assert.True(decision.Selection.IsAll);
@@ -280,7 +292,7 @@ public sealed class CoverageTestSelectionTests
     [Fact]
     public void ProjectGraph_FailSafePaths_FallBackToFullSuite()
     {
-        var selector = new ProjectGraphTestSelector();
+        var selector = NewProjectGraphSelector();
         var runner = NewRunner();
 
         // No baseline.
@@ -292,11 +304,11 @@ public sealed class CoverageTestSelectionTests
         Assert.True(selector.Select(RequestFor(runner, StandardBaseline(),
             new TestSelectionChangedFile("src/Foo/Bar.cs", []))).Selection.IsAll);
         // Invalid selection options.
-        var badOptions = new ProjectGraphTestSelector(() => new CoverageTestSelectionOptions { MaxDiffBytes = 0 });
+        var badOptions = NewProjectGraphSelector(() => new CoverageTestSelectionOptions { MaxDiffBytes = 0 });
         Assert.True(badOptions.Select(RequestFor(runner, StandardBaseline(),
             new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(1, 1)]))).Selection.IsAll);
         // Unreadable selection options (hot-reload failure) never breaks the gate.
-        var throwingOptions = new ProjectGraphTestSelector(
+        var throwingOptions = NewProjectGraphSelector(
             () => throw new InvalidOperationException("options down"));
         Assert.True(throwingOptions.Select(RequestFor(runner, StandardBaseline(),
             new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(1, 1)]))).Selection.IsAll);
@@ -324,7 +336,7 @@ public sealed class CoverageTestSelectionTests
                     new Dictionary<string, IReadOnlyList<int>>(StringComparer.Ordinal)),
             });
 
-        var decision = new ProjectGraphTestSelector().Select(RequestFor(
+        var decision = NewProjectGraphSelector().Select(RequestFor(
             NewRunner(), baseline,
             new TestSelectionChangedFile("src/CodeyBox.Core/Guard.cs", [new ChangedLineRange(1, 1)])));
 
@@ -339,7 +351,7 @@ public sealed class CoverageTestSelectionTests
         // projects via config; those changes also force the full suite.
         var options = FreshOptions();
         options.AlwaysFullProjects.Add("src/Foo/Foo.csproj");
-        var selector = new ProjectGraphTestSelector(() => options);
+        var selector = NewProjectGraphSelector(() => options);
 
         var decision = selector.Select(RequestFor(
             NewRunner(), StandardBaseline(),
@@ -373,7 +385,7 @@ public sealed class CoverageTestSelectionTests
                     new Dictionary<string, IReadOnlyList<int>>(StringComparer.Ordinal)),
             });
 
-        var decision = new ProjectGraphTestSelector().Select(RequestFor(
+        var decision = NewProjectGraphSelector().Select(RequestFor(
             NewRunner(), baseline,
             new TestSelectionChangedFile(path, [new ChangedLineRange(1, 1)])));
 
@@ -390,10 +402,76 @@ public sealed class CoverageTestSelectionTests
     public void Options_AlwaysFullProjects_ExactMatchOnly(string project, bool expected)
         => Assert.Equal(expected, FreshOptions().IsAlwaysFullProject(project));
 
+    [Fact]
+    public void ProjectGraph_StaleBaseline_FallsBackToFullSuite()
+    {
+        // A baseline older than MaxBaselineAge (default 7 days) must not narrow:
+        // after a quiet main the enforcing run falls back to the full suite.
+        var decision = NewProjectGraphSelector().Select(RequestFor(
+            NewRunner(), StandardBaseline(Now.AddDays(-8)),
+            new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(10, 1)])));
+
+        Assert.True(decision.Selection.IsAll);
+        Assert.Contains("stale", decision.Justification);
+    }
+
+    [Fact]
+    public void ProjectGraph_ChangedTestFile_FallsBackToFullSuite()
+    {
+        // The baseline cannot enumerate test methods added since it was
+        // produced, so a change to a probable test file forces the full suite —
+        // even when the baseline knows the file.
+        var baseline = Baseline(
+            fileProject: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["tests/Foo.Tests/BarTests.cs"] = "tests/Foo.Tests/Foo.Tests.csproj",
+                ["src/Foo/Bar.cs"] = "src/Foo/Foo.csproj",
+            },
+            affected: new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal)
+            {
+                ["tests/Foo.Tests/Foo.Tests.csproj"] = ["Ns.Foo.BarTests"],
+                ["src/Foo/Foo.csproj"] = ["Ns.Foo.BarTests"],
+            },
+            tests: new Dictionary<string, BaselineTestEntry>(StringComparer.Ordinal)
+            {
+                ["Ns.Foo.BarTests"] = new BaselineTestEntry(
+                    "tests/Foo.Tests/BarTests.cs",
+                    new Dictionary<string, IReadOnlyList<int>>(StringComparer.Ordinal)),
+            });
+
+        var decision = NewProjectGraphSelector().Select(RequestFor(
+            NewRunner(), baseline,
+            new TestSelectionChangedFile("tests/Foo.Tests/BarTests.cs", [new ChangedLineRange(5, 1)])));
+
+        Assert.True(decision.Selection.IsAll);
+        Assert.Contains("unrecorded tests", decision.Justification);
+    }
+
+    [Fact]
+    public void ProjectGraph_CommitMismatch_FallsBackToFullSuite()
+    {
+        // A baseline recorded at another commit must not narrow: the change may
+        // add tests the baseline never saw.
+        var change = new TestSelectionChangedFile("src/Foo/Bar.cs", [new ChangedLineRange(10, 1)]);
+        var stale = NewProjectGraphSelector().Select(
+            RequestWithCommit(NewRunner(), StandardBaseline(), "other-commit", change));
+
+        Assert.True(stale.Selection.IsAll);
+        Assert.Contains("commit", stale.Justification);
+
+        // Control: a matching commit still narrows.
+        var fresh = NewProjectGraphSelector().Select(
+            RequestWithCommit(NewRunner(), StandardBaseline(), "abc123", change));
+        Assert.False(fresh.Selection.IsAll);
+    }
+
     // ---- Coverage selector.
 
     private static CoverageTestSelector NewCoverageSelector(TimeProvider? clock = null)
-        => new(new ProjectGraphTestSelector(), FreshOptions, clock ?? new FixedClock(Now));
+    {
+        var fixedClock = clock ?? new FixedClock(Now);
+        return new(NewProjectGraphSelector(clock: fixedClock), FreshOptions, fixedClock);
+    }
 
     [Fact]
     public void Coverage_SelectsIntersectingPlusMustInclude_WithinSuperset()
@@ -447,7 +525,7 @@ public sealed class CoverageTestSelectionTests
     public void Coverage_SupersetFullSuite_StaysFullSuite()
     {
         var selector = new CoverageTestSelector(
-            new ProjectGraphTestSelector(), FreshOptions, new FixedClock(Now));
+            NewProjectGraphSelector(clock: new FixedClock(Now)), FreshOptions, new FixedClock(Now));
         var decision = selector.Select(RequestFor(
             NewRunner(), StandardBaseline(),
             new TestSelectionChangedFile("src/Unknown/File.cs", [new ChangedLineRange(1, 1)])));

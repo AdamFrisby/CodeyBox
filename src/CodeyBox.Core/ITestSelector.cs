@@ -42,7 +42,8 @@ public sealed record TestSelectionRequest
         ITestRunnerAuditor testRunner,
         string baseRef,
         IReadOnlyList<TestSelectionChangedFile> changedFiles,
-        TestSelectionBaseline? baseline = null)
+        TestSelectionBaseline? baseline = null,
+        string? currentCommit = null)
     {
         ArgumentNullException.ThrowIfNull(testRunner);
         ArgumentNullException.ThrowIfNull(changedFiles);
@@ -53,6 +54,7 @@ public sealed record TestSelectionRequest
         BaseRef = baseRef;
         ChangedFiles = changedFiles;
         Baseline = baseline;
+        CurrentCommit = currentCommit;
     }
 
     /// <summary>The test-runner capability whose suite is being narrowed.</summary>
@@ -75,6 +77,14 @@ public sealed record TestSelectionRequest
     /// selector must then fall back to <see cref="TestSelection.All"/>.
     /// </summary>
     public TestSelectionBaseline? Baseline { get; }
+
+    /// <summary>
+    /// The current commit the change is measured at (e.g. <c>git rev-parse
+    /// HEAD</c>). Compared by exact ordinal equality against the baseline's
+    /// commit for the freshness check; null means "unknown" (only the age
+    /// check applies).
+    /// </summary>
+    public string? CurrentCommit { get; }
 }
 
 /// <summary>
