@@ -16,6 +16,7 @@ internal static class AgentPauseResumeMapper
         WorkItemState.Auditing => RetryFromPolicy.Audit,
         WorkItemState.Reworking => RetryFromPolicy.Audit,
         WorkItemState.ReworkingForConflict => RetryFromPolicy.ConflictRework,
+        WorkItemState.Delegating => RetryFromPolicy.Delegation,
         WorkItemState.AuditFailed => RetryFromPolicy.Audit,
         WorkItemState.AuditPassed => RetryFromPolicy.Merge,
         WorkItemState.Merging => RetryFromPolicy.Merge,

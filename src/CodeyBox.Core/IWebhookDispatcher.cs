@@ -85,6 +85,7 @@ public static class IterationPhase
 {
     public const string Work = "work";
     public const string Rework = "rework";
+    public const string Delegation = "delegation";
 }
 
 /// <summary>Verdict for <c>audit.completed</c> events.</summary>
@@ -216,6 +217,22 @@ public sealed record AuditMaxIterationsEscalationDetails
     public string? VerdictStatus { get; init; }
     /// <summary>When the driving audit verdict was recorded. Null when unknown.</summary>
     public DateTimeOffset? VerdictRecordedAt { get; init; }
+}
+
+/// <summary>
+/// Details payload for <c>work_item.needs_operator_input</c> when the
+/// delegation phase parks: carries which attempt parked, its outcome, and
+/// how to authorize another attempt. The full brief/diff trail lives in the
+/// delegation event log, retrievable per work item.
+/// </summary>
+public sealed record DelegationParkedDetails
+{
+    public required string WorkItemId { get; init; }
+    public required int Attempt { get; init; }
+    public required string Outcome { get; init; }
+    public required string Reason { get; init; }
+    public string ResumeHint { get; init; } =
+        "Use POST /workitems/{id}/retry with from='delegation' to authorize another attempt.";
 }
 
 /// <summary>One audit iteration inside <see cref="AuditMaxIterationsEscalationDetails"/>.</summary>

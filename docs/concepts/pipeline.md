@@ -144,7 +144,6 @@ default in-memory impl this is just metadata; with a Gitea/Forgejo backend
 it would be a real PR on a self-hosted forge.
 
 ## Phase 2: Audit + rework loop
-
 Skipped if no auditors are registered. See [`audit.md`](../quality/audit.md) for
 the full breakdown. Tool auditors run in a credential-free sandbox; LLM
 auditors run in a sandbox with agent credentials. On failure the agent
@@ -162,6 +161,36 @@ its endpoint to those auditors, and tears it down on every exit path
 (pass, fail, abort, timeout — the leak reaper covers orchestrator
 restarts). The next iteration provisions a fresh deployment. Deployment
 findings re-enter the normal rework loop with full blocking authority.
+
+## Phase 1.D: Delegation (operator-triggered escape hatch)
+
+An item that cannot converge through the normal work/audit/rework cycle
+has no route back except an operator repairing it by hand. Delegation
+performs that repair inside the pipeline, with the same sandboxing as
+every other phase: a single delegate turn runs in a sandbox with the
+repository (work-profile sandbox target) on the existing work branch.
+
+The operator requests it with `POST /workitems/{id}/retry` and
+`from='delegation'`, which moves the item to the `Delegating` state and
+arms a one-shot `DelegationRequested` flag. The delegate prompt combines
+the composed convergence brief (prior history, failures, audit findings)
+with an instruction to get the item working — and grants latitude the
+work phase does not: the delegate may change approach, restructure the
+change, or alter tests and configuration where those are the actual
+obstacle.
+
+Exactly one attempt per trigger. On completion the item advances to
+`WorkComplete` and re-enters the normal flow at the audit phase, so the
+result is verified by the same gates as any other change and is never
+merged on the delegate's assurance. A delegate that fails or produces no
+change parks the item at `NeedsOperatorInput` with the reason; it never
+returns to the cycle that already failed, and the phase can never
+re-enter itself. Quota/transient parks mid-turn resume the same attempt
+through the scheduler; they do not consume the attempt.
+
+Every turn is recorded as a first-class delegation event — the brief it
+was given, the agent and model that ran it, and the resulting branch
+diff — retrievable via `GET /workitems/{id}/delegations`.
 
 ## Phase 3: Merge
 

@@ -12,6 +12,7 @@ public static class RetryFromPolicy
     public const string Work = "work";
     public const string Rework = "rework";
     public const string Audit = "audit";
+    public const string Delegation = "delegation";
     public const string ConflictRework = "conflict_rework";
     public const string Merge = "merge";
     public const string Upstream = "upstream";
@@ -30,6 +31,7 @@ public static class RetryFromPolicy
             Work => Work,
             Rework => Rework,
             Audit => Audit,
+            Delegation => Delegation,
             ConflictRework => ConflictRework,
             Merge => Merge,
             Upstream => Upstream,
@@ -75,6 +77,7 @@ public static class RetryFromPolicy
         Work => WorkItemState.Queued,
         Rework => WorkItemState.WorkComplete,
         Audit => WorkItemState.WorkComplete,
+        Delegation => WorkItemState.Delegating,
         ConflictRework => WorkItemState.ReworkingForConflict,
         Merge => WorkItemState.AuditPassed,
         Upstream => WorkItemState.Merged,

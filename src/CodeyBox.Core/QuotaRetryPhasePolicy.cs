@@ -9,14 +9,16 @@ public static class QuotaRetryPhasePolicy
     public const string PlanningPhase = RetryFromPolicy.Planning;
     public const string AuditPhase = RetryFromPolicy.Audit;
     public const string ReworkPhase = RetryFromPolicy.Rework;
+    public const string DelegationPhase = RetryFromPolicy.Delegation;
     public const string MergePhase = RetryFromPolicy.Merge;
     public const string UpstreamPhase = RetryFromPolicy.Upstream;
     public const string WorkPhase = RetryFromPolicy.Work;
 
     /// <summary>
     /// Normalizes quota park phase labels. Supported phase labels are
-    /// <c>planning</c>, <c>audit</c>, <c>rework</c>, <c>merge</c>, and
-    /// <c>upstream</c>; unknown historical values fall back to <c>work</c>.
+    /// <c>planning</c>, <c>audit</c>, <c>rework</c>, <c>delegation</c>,
+    /// <c>merge</c>, and <c>upstream</c>; unknown historical values fall back
+    /// to <c>work</c>.
     /// </summary>
     public static string NormalizePhase(string? phase) =>
         phase?.Trim().ToLowerInvariant() switch
@@ -24,6 +26,7 @@ public static class QuotaRetryPhasePolicy
             PlanningPhase => PlanningPhase,
             AuditPhase => AuditPhase,
             ReworkPhase => ReworkPhase,
+            DelegationPhase => DelegationPhase,
             MergePhase => MergePhase,
             UpstreamPhase => UpstreamPhase,
             _ => WorkPhase,
@@ -34,6 +37,7 @@ public static class QuotaRetryPhasePolicy
         PlanningPhase => RetryFromPolicy.Planning,
         AuditPhase => RetryFromPolicy.Audit,
         ReworkPhase => RetryFromPolicy.Audit,
+        DelegationPhase => RetryFromPolicy.Delegation,
         MergePhase => RetryFromPolicy.Merge,
         UpstreamPhase => RetryFromPolicy.Upstream,
         _ => RetryFromPolicy.Work,

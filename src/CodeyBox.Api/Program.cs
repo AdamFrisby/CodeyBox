@@ -3117,6 +3117,14 @@ builder.Services.AddSingleton<IFailureEventStore>(sp =>
         opts.StateDatabasePath,
         sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
+builder.Services.AddSingleton<IDelegationEventStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteDelegationEventStore(
+        opts.StateDatabasePath,
+        optionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation,
+        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
 builder.Services.AddSingleton<ISandboxResourceUsageStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -3621,7 +3629,10 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     deploymentSubstrates: sp.GetService<IDeploymentSubstrateProvider>(),
     staleBaseReworkRouter: sp.GetRequiredService<StaleBaseConflictReworkRouter>(),
     flakeEscalation: sp.GetService<NonDeterministicTestEscalationService>(),
-    flakeEscalationOptions: sp.GetRequiredService<NonDeterministicTestEscalationSnapshot>()));
+    flakeEscalationOptions: sp.GetRequiredService<NonDeterministicTestEscalationSnapshot>(),
+    briefComposer: sp.GetRequiredService<ConvergenceBriefComposer>(),
+    delegationEvents: sp.GetRequiredService<IDelegationEventStore>(),
+    delegationOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -5834,6 +5845,9 @@ namespace CodeyBox.Api
 
         /// <summary>Options for composing convergence briefs from work item history.</summary>
         public ConvergenceBriefOptions ConvergenceBrief { get; set; } = new();
+
+        /// <summary>Knobs for the operator-triggered delegation phase (result-diff bounds).</summary>
+        public DelegationOptions Delegation { get; set; } = new();
 
         /// <summary>Config-gated live human supervision and injection channel.</summary>
         public AgentSupervisionOptions AgentSupervision { get; set; } = new();

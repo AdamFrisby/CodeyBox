@@ -30,6 +30,7 @@ internal static class WorkItemEndpoints
         group.MapPatch("/{id}/priority", PatchPriorityAsync);
         group.MapGet("/{id}/timeline", GetTimelineAsync);
         group.MapGet("/{id}/questions", GetQuestionsAsync);
+        group.MapGet("/{id}/delegations", GetDelegationsAsync);
         group.MapPost("/{id}/answer", AnswerQuestionAsync);
         group.MapPost("/{id}/dismiss-question", DismissQuestionAsync);
         group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
@@ -2020,6 +2021,22 @@ internal static class WorkItemEndpoints
 
     // ── Agent question endpoints ──────────────────────────────────────────────
 
+    private static async Task<IResult> GetDelegationsAsync(
+        string id,
+        IWorkItemStore store,
+        IDelegationEventStore? delegationEvents,
+        CancellationToken ct)
+    {
+        if (delegationEvents is null) return Results.Json(new { error = "delegation event store not configured" }, statusCode: 503);
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+        var events = await delegationEvents.ListByWorkItemAsync(item!.Id, ct);
+        return Results.Ok(events.Select(e => new DelegationEventDto(
+            e.Id, e.WorkItemId.ToString(), e.Attempt, e.Brief,
+            e.Agent.Value, e.Model, e.Outcome, e.Reason,
+            e.DiffStat, e.ResultDiff, e.OccurredAt)));
+    }
+
     private static async Task<IResult> GetQuestionsAsync(
         string id,
         IWorkItemStore store,
@@ -2331,6 +2348,9 @@ internal static class WorkItemEndpoints
             PlanGeneratedAt: item.PlanGeneratedAt,
             PlanReviewedAt: item.PlanReviewedAt,
             PlanReviewSummary: item.PlanReviewSummary,
+            DelegationAttempts: item.DelegationAttempts,
+            DelegationRequested: item.DelegationRequested,
+            DelegationReason: item.DelegationReason,
             Knobs: item.Knobs.Count == 0
                 ? null
                 : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
@@ -2771,6 +2791,9 @@ public sealed record WorkItemDto(
     DateTimeOffset? PlanReviewedAt = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     string? PlanReviewSummary = null,
+    int DelegationAttempts = 0,
+    bool DelegationRequested = false,
+    string? DelegationReason = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyDictionary<string, string>? Knobs = null);
 
@@ -2830,6 +2853,21 @@ public sealed record QuestionDto(
     string? AnsweredBy,
     DateTimeOffset? DismissedAt,
     string? DismissReason);
+
+/// <summary>Wire DTO for one delegation turn: what the delegate was told
+/// (brief), who ran it (agent/model), and what it did (diff).</summary>
+public sealed record DelegationEventDto(
+    string Id,
+    string WorkItemId,
+    int Attempt,
+    string Brief,
+    string Agent,
+    string? Model,
+    string Outcome,
+    string? Reason,
+    string DiffStat,
+    string ResultDiff,
+    DateTimeOffset OccurredAt);
 public sealed record ReplayWorkItemRequest(
     string? Agent = null,
     string? ModelId = null,

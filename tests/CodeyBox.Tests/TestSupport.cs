@@ -220,7 +220,11 @@ internal static class TestSupport
         DeploymentRecipe? deploymentRecipe = null,
         IDeploymentManager? deploymentManager = null,
         IDeploymentSubstrateProvider? deploymentSubstrates = null,
-        StalePullRequestSweeperOptions? staleBaseReworkOptions = null)
+        StalePullRequestSweeperOptions? staleBaseReworkOptions = null,
+        // Delegation phase support: when true, wires a real convergence-brief
+        // composer and sqlite delegation event store (same state db) into the
+        // pipeline and exposes them on TestPipeline for assertions.
+        bool enableDelegation = false)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -348,6 +352,21 @@ internal static class TestSupport
                 NullLogger<StaleBaseConflictReworkRouter>.Instance);
         }
 
+        ConvergenceBriefComposer? briefComposer = null;
+        IDelegationEventStore? delegationEvents = null;
+        if (enableDelegation)
+        {
+            delegationEvents = new SqliteDelegationEventStore(stateDb);
+            briefComposer = new ConvergenceBriefComposer(
+                pipelineStore,
+                auditProgressOverride ?? store,
+                auditReportStore ?? new SqliteAuditReportStore(stateDb),
+                new SqliteFailureEventStore(stateDb),
+                involvement ?? new SqliteAgentInvolvementStore(stateDb),
+                new SqliteAgentFallbackHistoryStore(stateDb),
+                new SqliteAgentStreamSummaryStore(stateDb));
+        }
+
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, resolvedUpstreamFactory, composer,
@@ -418,7 +437,9 @@ internal static class TestSupport
             mergeScopeResolver: mergeScopeResolver,
             deploymentManager: deploymentManager,
             deploymentSubstrates: deploymentSubstrates,
-            staleBaseReworkRouter: staleBaseReworkRouter);
+            staleBaseReworkRouter: staleBaseReworkRouter,
+            briefComposer: briefComposer,
+            delegationEvents: delegationEvents);
 
         return new TestPipeline(
             pipeline,
@@ -429,7 +450,9 @@ internal static class TestSupport
             queue,
             involvement,
             transientRetryScheduler,
-            quotaRetryScheduler);
+            quotaRetryScheduler,
+            briefComposer,
+            delegationEvents);
     }
 }
 
@@ -445,12 +468,16 @@ internal sealed class TestPipeline : IDisposable
     public IAgentInvolvementStore? Involvement { get; }
     public TransientRetryScheduler? RetryScheduler { get; }
     private readonly QuotaRetryScheduler? _quotaRetryScheduler;
+    public ConvergenceBriefComposer? BriefComposer { get; }
+    public IDelegationEventStore? DelegationEvents { get; }
 
     public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot,
         ITaskQueue? queue = null,
         IAgentInvolvementStore? involvement = null,
         TransientRetryScheduler? retryScheduler = null,
-        QuotaRetryScheduler? quotaRetryScheduler = null)
+        QuotaRetryScheduler? quotaRetryScheduler = null,
+        ConvergenceBriefComposer? briefComposer = null,
+        IDelegationEventStore? delegationEvents = null)
     {
         Pipeline = pipeline;
         Store = store;
@@ -461,12 +488,15 @@ internal sealed class TestPipeline : IDisposable
         Involvement = involvement;
         RetryScheduler = retryScheduler;
         _quotaRetryScheduler = quotaRetryScheduler;
+        BriefComposer = briefComposer;
+        DelegationEvents = delegationEvents;
     }
 
     public void Dispose()
     {
         RetryScheduler?.Dispose();
         _quotaRetryScheduler?.Dispose();
+        (DelegationEvents as IDisposable)?.Dispose();
         Store.Dispose();
     }
 }
