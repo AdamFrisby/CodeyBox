@@ -15,7 +15,40 @@ public sealed class PresetCatalogTests
         Assert.Contains("NON-EXECUTABLE CHANGE EXEMPTION", reviewFocus, StringComparison.Ordinal);
         Assert.Contains("static marker/content files", reviewFocus, StringComparison.Ordinal);
         Assert.Contains("do NOT require a new test", reviewFocus, StringComparison.Ordinal);
-        Assert.Contains("Still apply Steps 1 and 3 normally", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("Still apply the finding categories below", reviewFocus, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestsReviewFocus_IsBoundedToDiffTestsAndDefersExistenceToCoverageGate()
+    {
+        var reviewFocus = new PresetCatalog().GetAuditTypeReviewFocus("tests");
+
+        // Division of labor: existence/completeness belongs to tests:coverage.
+        Assert.Contains("tests:coverage", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("NEVER report the mere absence of a test", reviewFocus, StringComparison.Ordinal);
+
+        // Bounded to added-or-modified tests; must-nots for existence reporting.
+        Assert.Contains("strictly BOUNDED to tests ADDED or MODIFIED in this diff", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("enumerating untested internal methods", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("demanding tests for production code outside this diff", reviewFocus, StringComparison.Ordinal);
+
+        // Stateless / isolated per audit iteration.
+        Assert.Contains("STATELESS", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("no cross-iteration memory", reviewFocus, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestsReviewFocus_CoversTheFourAssertionQualityCategories()
+    {
+        var reviewFocus = new PresetCatalog().GetAuditTypeReviewFocus("tests");
+
+        Assert.Contains("FINDING 1 — EXECUTES BUT ASSERTS NOTHING", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("FINDING 2 — ASSERTS ON A MOCK/STUB INSTEAD OF THE RESULT-UNDER-TEST", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("FINDING 3 — MISSING OBVIOUS ERROR/EDGE-PATH ASSERTIONS", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("FINDING 4 — COVERAGE-PADDING TEST", reviewFocus, StringComparison.Ordinal);
+
+        // Quality-only calibration: absence of a test must never be filed.
+        Assert.Contains("DO NOT FILE (mere", reviewFocus, StringComparison.Ordinal);
     }
 
     private sealed class FakeAgent : IAgentRunner
