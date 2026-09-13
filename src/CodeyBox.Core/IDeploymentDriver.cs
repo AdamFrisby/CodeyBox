@@ -565,6 +565,17 @@ public interface IDeploymentManager
         CancellationToken ct = default);
 
     /// <summary>
+    /// Looks up a live deployment previously started through
+    /// <see cref="StartAsync"/> that has not been disposed yet. Used by the
+    /// human-review resume path to re-attach to the deployment held while
+    /// the operator verdict was pending. Returns false when the id is
+    /// unknown or the handle was already disposed (e.g. after an
+    /// orchestrator restart) — the caller then fails closed instead of
+    /// reviewing a deployment that no longer exists.
+    /// </summary>
+    bool TryGetActive(string deploymentId, out IDeploymentHandle? handle);
+
+    /// <summary>
     /// Snapshot of currently-active deployments. Used by the leak reaper
     /// and operator-facing /deployments endpoints (link 2).
     /// </summary>

@@ -30,6 +30,7 @@ public sealed class ProjectAuditorComposer
     private readonly PresetCatalogOptions _catalogOptions;
     private readonly Func<TestRunOptions>? _testRunOptions;
     private readonly Func<PlanAdherenceAuditorOptions>? _planAdherenceOptions;
+    private readonly Func<HumanDeploymentReviewOptions>? _humanReviewOptions;
     private readonly IReadOnlyDictionary<string, IAuditor> _registeredAuditorsByName;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttributionOptions;
@@ -59,6 +60,15 @@ public sealed class ProjectAuditorComposer
     /// time). Null (the default used by tests) keeps the reviewer out of the
     /// panel entirely — the feature is off unless the host wires the accessor.
     /// </param>
+    /// <param name="humanReviewOptions">
+    /// Live accessor for hot-reloadable <see cref="HumanDeploymentReviewOptions"/>.
+    /// When non-null and <see cref="HumanDeploymentReviewOptions.Enabled"/> is
+    /// true, a deployment-target <see cref="HumanDeploymentReviewAuditor"/> is
+    /// composed into the deployment stage (the pipeline parks for the operator
+    /// verdict instead of running it inline). Null (the default used by
+    /// tests) keeps the reviewer out of the panel entirely. A project drops
+    /// it via <c>ExcludedAuditors</c> by name.
+    /// </param>
     public ProjectAuditorComposer(
         IPresetCatalog catalog,
         IEnumerable<IAuditor> registeredAuditors,
@@ -68,12 +78,14 @@ public sealed class ProjectAuditorComposer
         Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null,
         TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null,
         RequiredAuditorPolicy? requiredAuditorPolicy = null,
-        TestSelectionShadowConfig? testSelectionShadow = null)
+        TestSelectionShadowConfig? testSelectionShadow = null,
+        Func<HumanDeploymentReviewOptions>? humanReviewOptions = null)
     {
         _catalog = catalog;
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _testRunOptions = testRunOptions;
         _planAdherenceOptions = planAdherenceOptions;
+        _humanReviewOptions = humanReviewOptions;
         _testFailureAttributionOptions = testFailureAttributionOptions;
         _testSelectionShadow = testSelectionShadow;
         _logger = logger;
@@ -218,6 +230,18 @@ public sealed class ProjectAuditorComposer
             && !auditors.Any(a => a.Name.Equals(planAdherence.Name, StringComparison.OrdinalIgnoreCase)))
         {
             auditors.Add(new PlanAdherenceAuditor(ctx.Agent, planAdherence));
+        }
+
+        // Human deployment reviewer: a deployment-target auditor the operator
+        // completes asynchronously through the park/resume path (the pipeline
+        // never runs it inline). Config-gated by CodeyBox:HumanReview and
+        // further gated per project by DeploymentAuditEnabled (the stage
+        // toggle) plus ExcludedAuditors by name — ordinary auditor
+        // configuration, no bespoke optionality mechanism.
+        if (_humanReviewOptions?.Invoke() is { Enabled: true } humanReview
+            && !auditors.Any(a => a.Name.Equals(humanReview.Name, StringComparison.OrdinalIgnoreCase)))
+        {
+            auditors.Add(new HumanDeploymentReviewAuditor(humanReview));
         }
 
         // Always include every registered plan-audit chain gate. Each is

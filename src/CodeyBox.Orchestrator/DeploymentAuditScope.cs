@@ -115,6 +115,23 @@ public sealed class DeploymentAuditScope : IAsyncDisposable
     }
 
     /// <summary>
+    /// Transfers teardown ownership of the deployment away from this scope
+    /// without tearing it down: subsequent <see cref="DisposeAsync"/> calls
+    /// are no-ops and the handle stays live in the deployment manager's
+    /// active set. Used by the human-review park path, which keeps only the
+    /// deployment alive while the operator verdict is pending (bounded by
+    /// the recipe's max lifetime); the resume path or the expiry sweeper
+    /// tears it down by re-attaching through the manager.
+    /// </summary>
+    public void Detach()
+    {
+        Volatile.Write(ref _disposed, 1);
+        _log.LogInformation(
+            "Deployment-stage audit detached deployment {DeploymentId}: teardown ownership moved to the human-review record",
+            _handle.Id);
+    }
+
+    /// <summary>
     /// Tears the deployment down. Idempotent: repeated calls are no-ops, so
     /// abort, cancel, timeout, and normal paths can all dispose without
     /// coordinating. Never throws for an already-disposed scope; surfaces the
