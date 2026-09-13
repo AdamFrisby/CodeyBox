@@ -75,14 +75,17 @@ public static class NonDeterministicTestEscalationPolicy
     }
 
     /// <summary>
-    /// Deterministic de-dup key for a normalized, sorted test-name set.
+    /// Deterministic de-dup key for a normalized test-name set.
     /// SHA256 hex over NUL-joined names; safe for ExternalIds (no whitespace,
-    /// fixed 64 chars).
+    /// fixed 64 chars). Sorts a copy with ordinal comparison first so callers
+    /// passing the same set in a different order still de-duplicate to the
+    /// same key.
     /// </summary>
-    public static string ComputeDedupKey(IReadOnlyList<string> normalizedSortedTests)
+    public static string ComputeDedupKey(IReadOnlyList<string> normalizedTests)
     {
-        ArgumentNullException.ThrowIfNull(normalizedSortedTests);
-        var joined = string.Join('\0', normalizedSortedTests);
+        ArgumentNullException.ThrowIfNull(normalizedTests);
+        var sorted = normalizedTests.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        var joined = string.Join('\0', sorted);
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(joined));
         return Convert.ToHexString(hash).ToLowerInvariant();
     }

@@ -90,14 +90,14 @@ public sealed class NonDeterministicTestEscalationTests : IDisposable
     [Fact]
     public void DedupKey_IsStableAndExact()
     {
-        var a = new[] { "A.T1", "B.T2" }.OrderBy(x => x, StringComparer.Ordinal).ToList();
-        var b = new[] { "B.T2", "A.T1" }.OrderBy(x => x, StringComparer.Ordinal).ToList();
-
+        // Unsorted inputs carrying the same set must map to the same key:
+        // the key function sorts internally so future callers cannot break
+        // de-dup by passing names in a different order.
         Assert.Equal(
-            NonDeterministicTestEscalationPolicy.ComputeDedupKey(a),
-            NonDeterministicTestEscalationPolicy.ComputeDedupKey(b));
+            NonDeterministicTestEscalationPolicy.ComputeDedupKey(["A.T1", "B.T2"]),
+            NonDeterministicTestEscalationPolicy.ComputeDedupKey(["B.T2", "A.T1"]));
         Assert.NotEqual(
-            NonDeterministicTestEscalationPolicy.ComputeDedupKey(a),
+            NonDeterministicTestEscalationPolicy.ComputeDedupKey(["A.T1", "B.T2"]),
             NonDeterministicTestEscalationPolicy.ComputeDedupKey(["A.T1"]));
     }
 
