@@ -152,6 +152,16 @@ public static class CodeyBoxMeters
         PipelineMeter.CreateCounter<long>("codeybox.dispatch.count", unit: "{dispatch}");
 
     /// <summary>
+    /// One increment per delegation turn authorized (operator command or
+    /// automatic escalation). Tag: <c>trigger</c> (<c>operator</c> |
+    /// <c>audit-max-iterations</c> | <c>repeated-terminal-failure</c>). Lets
+    /// dashboards read a rise in delegations as a worsening convergence
+    /// problem rather than as the system working.
+    /// </summary>
+    public static readonly Counter<long> DelegationCounts =
+        PipelineMeter.CreateCounter<long>("codeybox.delegation.triggers", unit: "{delegation}");
+
+    /// <summary>
     /// One increment per agent invocation attempt (work / rework / audit / merge /
     /// upstream). Tags: <c>agent.kind</c>, <c>model</c>, <c>agent_class</c>,
     /// <c>phase</c>, <c>outcome</c> (<c>success</c> | <c>error</c> | <c>canceled</c>).

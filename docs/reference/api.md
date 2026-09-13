@@ -302,8 +302,39 @@ The composite form is unambiguous and works with all endpoints that accept `{id}
 Returns `400 Bad Request` when the colon form has an empty project or externalId part.
 Returns `404 Not Found` when the project exists but has no item with that externalId.
 
-### `POST /workitems/{id}/replay`
+### `POST /workitems/{id}/delegate`
 
+Delegate a work item to the unconstrained delegation phase: one repair turn
+with latitude the normal work/audit/rework cycle does not grant, verified by
+the same audit and merge gates afterwards. Works from any non-terminal state
+and from the terminal failure states (`Failed`, `AuditFailed`,
+`MergeConflictResolutionFailed`, `AbandonedAfterRecoveryAttempts`); `Done`,
+`Cancelled`, and `NoActionRequired` return `409`.
+
+**Request body** (all optional):
+
+```json
+{
+  "note": "focus on the auth race; the token refresh path is suspect"
+}
+```
+
+- `note` — operator direction for the attempt, stored on the item and
+  rendered into the convergence brief (max 4000 chars; control characters
+  other than newline/tab are rejected).
+
+A worker-held in-flight item is fenced through worker recovery first; when
+fencing fails closed the command returns `409` rather than racing the
+pipeline. The delegated turn competes for the same worker and sandbox
+capacity as normal work (priority preserved, explicit end-of-queue position,
+shared dispatcher) so it cannot starve normal dispatch.
+
+Returns `202 Accepted` with the `Delegating` item, the `trigger`
+(`operator`), and the `priorState`. Fires a `work_item.delegated` webhook.
+Automatic escalation uses the same transition — see
+`CodeyBox:DelegationEscalation` in [`configuration.md`](configuration.md).
+
+### `POST /workitems/{id}/replay`
 Clone a terminal work item and run it with a different agent or model. See
 [`replay.md`](../concepts/work-items.md) for full semantics.
 

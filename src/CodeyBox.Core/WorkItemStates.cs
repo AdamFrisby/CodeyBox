@@ -28,4 +28,23 @@ public static class WorkItemStates
 
     /// <summary>True when <paramref name="state"/> is a terminal state.</summary>
     public static bool IsTerminal(WorkItemState state) => Terminal.Contains(state);
+
+    /// <summary>
+    /// Terminal failure states that count as convergence-failure episodes
+    /// (<see cref="WorkItem.TerminalFailureCount"/>). Single canonical
+    /// membership: abandonment after exhausted recovery
+    /// (<see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>) stays
+    /// delegable but is not a failure episode, so episode counts and
+    /// repeated-failure escalation cannot drift from the persisted count.
+    /// </summary>
+    public static readonly IReadOnlySet<WorkItemState> TerminalFailure =
+        new HashSet<WorkItemState>
+        {
+            WorkItemState.Failed,
+            WorkItemState.AuditFailed,
+            WorkItemState.MergeConflictResolutionFailed,
+        };
+
+    /// <summary>True when <paramref name="state"/> is a terminal failure state.</summary>
+    public static bool IsTerminalFailure(WorkItemState state) => TerminalFailure.Contains(state);
 }

@@ -3646,7 +3646,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     flakeEscalationOptions: sp.GetRequiredService<NonDeterministicTestEscalationSnapshot>(),
     briefComposer: sp.GetRequiredService<ConvergenceBriefComposer>(),
     delegationEvents: sp.GetRequiredService<IDelegationEventStore>(),
-    delegationOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation));
+    delegationOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation,
+    delegationEscalation: sp.GetService<DelegationEscalationService>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -3762,6 +3763,18 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentRestoreRetryS
 // Operators wire alternate classifiers (e.g. LLM-precision layer) by replacing
 // the singleton registration; the service treats the interface as authoritative.
 builder.Services.AddSingleton<ITerminalFailureClassifier, DefaultTerminalFailureClassifier>();
+// --- Delegation triggers ----------------------------------------------------
+// Single home for every transition into the delegation phase: the operator
+// delegate command and both automatic-escalation conditions. Constructed
+// lazily from the store/queue plus the hot-reloadable options so threshold
+// edits apply to the next trigger without restart.
+builder.Services.AddSingleton<DelegationEscalationService>(sp =>
+    new DelegationEscalationService(
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetService<ITaskQueue>(),
+        () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DelegationEscalation,
+        sp.GetService<IWebhookDispatcher>(),
+        sp.GetService<IProjectRepository>()));
 builder.Services.AddSingleton<TerminalFailureRecoveryService>(sp => new TerminalFailureRecoveryService(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<WorkItemRetrier>(),
@@ -3777,7 +3790,8 @@ builder.Services.AddSingleton<TerminalFailureRecoveryService>(sp => new Terminal
             live.JitterFraction,
             live.MaxAutoRetriesPerWorkItem);
     },
-    sp.GetRequiredService<ILogger<TerminalFailureRecoveryService>>()));
+    sp.GetRequiredService<ILogger<TerminalFailureRecoveryService>>(),
+    delegationEscalation: sp.GetService<DelegationEscalationService>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TerminalFailureRecoveryService>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
@@ -5862,6 +5876,9 @@ namespace CodeyBox.Api
 
         /// <summary>Knobs for the operator-triggered delegation phase (result-diff bounds).</summary>
         public DelegationOptions Delegation { get; set; } = new();
+
+        /// <summary>Triggers for the delegation phase: operator command plus automatic escalation.</summary>
+        public DelegationEscalationOptions DelegationEscalation { get; set; } = new();
 
         /// <summary>Config-gated live human supervision and injection channel.</summary>
         public AgentSupervisionOptions AgentSupervision { get; set; } = new();

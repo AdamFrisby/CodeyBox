@@ -381,6 +381,43 @@ public sealed record WorkItem
     public string? DelegationReason { get; init; }
 
     /// <summary>
+    /// Operator-supplied direction for the next delegation turn, appended to
+    /// the composed convergence brief so the operator can steer the attempt.
+    /// Set atomically with the transition into <see cref="WorkItemState.Delegating"/>
+    /// and cleared when the turn completes, so a stale note can never leak
+    /// into a later brief. Untrusted input: rendered into the brief as quoted
+    /// data, never as instructions.
+    /// </summary>
+    public string? DelegationNote { get; init; }
+
+    /// <summary>
+    /// Whether this item has already been escalated to delegation
+    /// automatically. Automatic escalation fires at most once per item; once
+    /// set, only an explicit operator delegation may authorize another turn.
+    /// Monotonic: set at escalation time (not on success) so a failed
+    /// delegation turn cannot re-arm the automatic path either.
+    /// </summary>
+    public bool AutoDelegationEscalated { get; init; }
+
+    /// <summary>
+    /// Whether a delegation turn for this item has completed without
+    /// advancing it (outcome <c>no-changes</c> or <c>failed</c>). An item that
+    /// has demonstrably not benefited from delegation is not eligible for
+    /// automatic escalation. Monotonic; operator delegation stays available.
+    /// </summary>
+    public bool DelegationFailed { get; init; }
+
+    /// <summary>
+    /// Number of terminal-failure episodes for this item: entries into
+    /// <see cref="WorkItemState.Failed"/>, <see cref="WorkItemState.AuditFailed"/>,
+    /// or <see cref="WorkItemState.MergeConflictResolutionFailed"/> from a
+    /// non-terminal-failure state. Same-state rewrites do not count. Retries
+    /// deliberately preserve it so "repeated terminal failure after retry" is
+    /// observable; only a fresh work item starts at zero.
+    /// </summary>
+    public int TerminalFailureCount { get; init; }
+
+    /// <summary>
     /// Minimum acceptable <see cref="AgentMembership.QualityScore"/> for this work item.
     /// The router picks any member whose base score is at or above this floor.
     /// Default 0: open to ANY agent — most tasks should run on whatever agent is
@@ -862,6 +899,18 @@ public sealed record WorkItem
             CancellationSource = IsCancellationSourceCarryingState(state)
                 ? (cancellationSource ?? CancellationSource)
                 : null,
+            // Terminal-failure episodes count entries into a terminal-failure
+            // state from outside the terminal-failure set, so "repeated
+            // terminal failure after retry" stays observable across retries.
+            // Same-state rewrites (e.g. a scheduler refreshing LastError) and
+            // moves within the set are not new episodes. Delegation and
+            // escalation bookkeeping ride along untouched: retries preserve
+            // the failure count, the auto-escalation flag, and the
+            // delegation-failure flag by construction (record with-expression
+            // copies every property not listed here).
+            TerminalFailureCount = IsTerminalFailureState(state) && !IsTerminalFailureState(State)
+                ? TerminalFailureCount + 1
+                : TerminalFailureCount,
             UpdatedAt = DateTimeOffset.UtcNow,
             // Clear StartedAt when re-queuing: retried items must not appear in-flight
             // to CountInFlightAsync, which uses started_at IS NOT NULL as its proxy.
@@ -878,6 +927,9 @@ public sealed record WorkItem
             AgentTurnRecoveryLease = carriesAgentTurnRecoveryBoundary ? AgentTurnRecoveryLease : null,
         };
     }
+
+    private static bool IsTerminalFailureState(WorkItemState state) =>
+        WorkItemStates.IsTerminalFailure(state);
 
     private static bool IsQuotaShapedState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
