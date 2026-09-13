@@ -24,4 +24,11 @@ public interface IFailureEventStore
         string? kind,
         int limit,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns all failure events for a specific work item ordered by occurred_at ascending.
+    /// </summary>
+    Task<IReadOnlyList<FailureEventRecord>> GetByWorkItemAsync(
+        WorkItemId workItemId,
+        CancellationToken ct = default);
 }

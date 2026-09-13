@@ -65,6 +65,8 @@ public sealed class SqliteFailureEventStore : IFailureEventStore, IDisposable
                     ON failure_events(occurred_at);
                 CREATE INDEX IF NOT EXISTS idx_failure_events_kind_occurred
                     ON failure_events(failure_kind, occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_failure_events_work_item
+                    ON failure_events(work_item_id, occurred_at);
                 """;
             createCmd.ExecuteNonQuery();
 
@@ -157,6 +159,34 @@ public sealed class SqliteFailureEventStore : IFailureEventStore, IDisposable
                 since.HasValue ? since.Value.ToUniversalTime().ToString("O") : DBNull.Value);
             cmd.Parameters.AddWithValue("$kind", (object?)kind ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$limit", boundedLimit);
+
+            var results = new List<FailureEventRecord>();
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                results.Add(ReadRecord(reader));
+            return results;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<FailureEventRecord>> GetByWorkItemAsync(
+        WorkItemId workItemId,
+        CancellationToken ct = default)
+    {
+        await _connectionLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT id, work_item_id, agent, phase, iteration, failure_kind, error_message, sandbox_name, provider, occurred_at
+                FROM failure_events
+                WHERE work_item_id = $wid
+                ORDER BY occurred_at ASC, rowid ASC;
+                """;
+            cmd.Parameters.AddWithValue("$wid", workItemId.ToString());
 
             var results = new List<FailureEventRecord>();
             using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);

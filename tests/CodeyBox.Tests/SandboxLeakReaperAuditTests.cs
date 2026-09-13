@@ -11,16 +11,27 @@ namespace CodeyBox.Tests;
 public sealed class SandboxLeakReaperAuditTests : IDisposable
 {
     private readonly TestSink _sink = new();
+    private readonly Serilog.ILogger _scopedLogger;
+    private readonly IDisposable _auditScope;
 
     public SandboxLeakReaperAuditTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        // Route this flow's audit events to the test sink via a scoped logger
+        // rather than by replacing the process-global Log.Logger: other tests
+        // (notably WebApplicationFactory boots) re-create the global logger
+        // concurrently, which steals our events and leaves the sink empty.
+        _scopedLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+        _auditScope = AuditLog.PushScopedLogger(_scopedLogger);
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose()
+    {
+        _auditScope.Dispose();
+        (_scopedLogger as IDisposable)?.Dispose();
+    }
 
     [Fact]
     public async Task RunSweepAsync_AutoDispose_EmitsDisposedAuditWithReason()

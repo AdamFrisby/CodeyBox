@@ -1202,9 +1202,20 @@ builder.Services.AddSingleton<IAgentPromptPreprocessor>(sp =>
 // Cross-agent handoff brief injection: fires only when the involvement store
 // shows a prior phase ran under a different AgentKind. Gated end-to-end by
 // CodeyBox:PipelineTuning:EnableHandoffSeeding (default off) — the builder
-// returns null when the flag is unset so the preprocessor stays a no-op.
 builder.Services.AddSingleton<ICrossAgentHandoffBriefBuilder, AgentStreamBriefBuilder>();
 builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptPreprocessor>();
+builder.Services.AddSingleton<ConvergenceBriefComposer>(sp =>
+    new ConvergenceBriefComposer(
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetRequiredService<IAuditProgressStore>(),
+        sp.GetRequiredService<IAuditReportStore>(),
+        sp.GetRequiredService<IFailureEventStore>(),
+        sp.GetRequiredService<IAgentInvolvementStore>(),
+        sp.GetRequiredService<IAgentFallbackHistoryStore>(),
+        sp.GetRequiredService<IAgentStreamSummaryStore>(),
+        sp.GetService<IAgentStreamStore>(),
+        () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ConvergenceBrief,
+        sp.GetService<ILogger<ConvergenceBriefComposer>>()));
 
 // --- Knob framework ----------------------------------------------------------
 // Add a new tuning knob by registering its IKnob implementation here — the
@@ -5796,6 +5807,9 @@ namespace CodeyBox.Api
 
         /// <summary>Structured agent stdout stream capture configuration.</summary>
         public AgentStreamsOptions AgentStreams { get; set; } = new();
+
+        /// <summary>Options for composing convergence briefs from work item history.</summary>
+        public ConvergenceBriefOptions ConvergenceBrief { get; set; } = new();
 
         /// <summary>Config-gated live human supervision and injection channel.</summary>
         public AgentSupervisionOptions AgentSupervision { get; set; } = new();

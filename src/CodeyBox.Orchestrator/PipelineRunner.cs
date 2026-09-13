@@ -1650,7 +1650,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? boundedTitle,
         string? boundedLocation)
     {
-        var (files, _) = ParseLocation(boundedLocation);
+        var (files, _) = FindingIdComputer.ParseLocation(boundedLocation);
         return FindingIdComputer.Compute(auditorName, boundedTitle ?? string.Empty, files);
     }
 
@@ -12263,7 +12263,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         => findings
             .Select(f =>
             {
-                var (files, _) = ParseLocation(f.Location);
+                var (files, _) = FindingIdComputer.ParseLocation(f.Location);
                 return FindingIdComputer.Compute(f.AuditorName, f.Title, files);
             })
             .Distinct(StringComparer.Ordinal)
@@ -14856,7 +14856,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             var reportFindings = result.Findings.Select(f =>
             {
-                var (files, lineHints) = ParseLocation(f.Location);
+                var (files, lineHints) = FindingIdComputer.ParseLocation(f.Location);
                 return new AuditReportFinding(
                     Id: FindingIdComputer.Compute(auditor.Name, f.Title, files),
                     Severity: f.Severity.ToString(),
@@ -14893,17 +14893,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ctx.Iteration,
                 ctx.WorkItemId);
         }
-    }
-
-    private static (IReadOnlyList<string> Files, IReadOnlyList<int> LineHints) ParseLocation(string? location)
-    {
-        if (string.IsNullOrWhiteSpace(location))
-            return ([], []);
-        // location may be "path/to/file:42" or just "path/to/file"
-        var colonIdx = location.LastIndexOf(':');
-        if (colonIdx > 0 && int.TryParse(location.AsSpan(colonIdx + 1), out var line))
-            return ([location[..colonIdx]], [line]);
-        return ([location], []);
     }
 
     /// <summary>
@@ -18343,7 +18332,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 DurationMs = (long)(ended - started).TotalMilliseconds,
                 Findings = findings.Select(f =>
                 {
-                    var (files, lineHints) = ParseLocation(f.Location);
+                    var (files, lineHints) = FindingIdComputer.ParseLocation(f.Location);
                     var reportFiles = files.Count == 0 ? conflictedFiles : files;
                     return new AuditReportFinding(
                         FindingIdComputer.Compute(f.AuditorName, f.Title, reportFiles),

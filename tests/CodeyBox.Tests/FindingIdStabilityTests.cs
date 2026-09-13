@@ -100,4 +100,34 @@ public sealed class FindingIdStabilityTests
         var id2 = FindingIdComputer.Compute("Lint", "Missing null check", []);
         Assert.Equal(id1, id2);
     }
+
+    [Theory]
+    [InlineData(null, 0, 0)]
+    [InlineData("", 0, 0)]
+    [InlineData("   ", 0, 0)]
+    public void ParseLocation_NullOrWhitespace_ReturnsEmpty(string? input, int expectedFiles, int expectedLines)
+    {
+        var (files, lines) = FindingIdComputer.ParseLocation(input);
+        Assert.Equal(expectedFiles, files.Count);
+        Assert.Equal(expectedLines, lines.Count);
+    }
+
+    [Fact]
+    public void ParseLocation_WithLineNumber_ExtractsFileAndLine()
+    {
+        var (files, lines) = FindingIdComputer.ParseLocation("src/Repo.cs:42");
+        var file = Assert.Single(files);
+        var line = Assert.Single(lines);
+        Assert.Equal("src/Repo.cs", file);
+        Assert.Equal(42, line);
+    }
+
+    [Fact]
+    public void ParseLocation_WithoutLineNumber_ExtractsFileOnly()
+    {
+        var (files, lines) = FindingIdComputer.ParseLocation("src/Repo.cs");
+        var file = Assert.Single(files);
+        Assert.Empty(lines);
+        Assert.Equal("src/Repo.cs", file);
+    }
 }
