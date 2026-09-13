@@ -187,13 +187,18 @@ public static class TestSelectionTelemetryComputer
     /// tests were not executed, so no safe/unsafe verdict can be claimed and
     /// the soundness gate (which only counts safe/unsafe) ignores these runs.
     /// Full-suite fallbacks report <c>full-suite</c> with the fallback reason.
+    /// An optional <paramref name="fallbacks"/> list records intermediate
+    /// ladder rungs that fired on the way to a narrowed run (e.g. the coverage
+    /// rung falling back to the executed project-graph superset); entries are
+    /// truncated and capped like any fallback.
     /// </summary>
     public static TestSelectionTelemetry FromEnforcedSelection(
         string mode,
         string selectorName,
         TestSelectionDecision decision,
         int universeCount,
-        string detail)
+        string detail,
+        IReadOnlyList<string>? fallbacks = null)
     {
         ArgumentNullException.ThrowIfNull(decision);
         ArgumentNullException.ThrowIfNull(detail);
@@ -230,7 +235,12 @@ public static class TestSelectionTelemetryComputer
             TotalCount = universeCount,
             EstimatedSavedFraction = fraction,
             Assessment = AssessmentEnforced,
-            Fallbacks = [],
+            Fallbacks = fallbacks is null
+                ? []
+                : [.. fallbacks
+                    .Where(f => !string.IsNullOrWhiteSpace(f))
+                    .Select(f => Truncate(f, MaxFallbackChars))
+                    .Take(MaxFallbacks)],
             Detail = Truncate(detail, MaxDetailChars),
         };
     }

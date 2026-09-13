@@ -27,6 +27,20 @@ public enum TestSelectionMode
     /// ambiguous result falls back to the full suite (fail-safe).
     /// </summary>
     ProjectGraph,
+
+    /// <summary>
+    /// Enforcing coverage selection: the coverage selector narrows the executed
+    /// <c>dotnet test</c> run to the tests whose recorded per-test coverage
+    /// intersects the changed lines, NESTED INSIDE the project-graph superset
+    /// (the result is always a subset of that superset — coverage can only
+    /// shrink it, never grow beyond it). Fallback ladder: coverage rung
+    /// (narrowed) → project-graph rung (the superset) → full suite.
+    /// Opt-in only after the soundness gate reports zero unsafe skips for the
+    /// coverage selector over the calibration window. Any selector error,
+    /// missing/stale data, global-target touch, or ambiguous result falls back
+    /// down the ladder to the full suite (fail-safe).
+    /// </summary>
+    Coverage,
 }
 
 /// <summary>
@@ -85,6 +99,9 @@ public static class TestSelectionModeParser
             case "projectgraph":
                 mode = TestSelectionMode.ProjectGraph;
                 return true;
+            case "coverage":
+                mode = TestSelectionMode.Coverage;
+                return true;
             default:
                 return false;
         }
@@ -100,7 +117,7 @@ public static class TestSelectionModeParser
             ? mode
             : throw new FormatException(string.Create(
                 CultureInfo.InvariantCulture,
-                $"Unknown {TestSelectionOptions.SectionName}:Mode value '{value}'. Valid modes: all, coverage-shadow, project-graph."));
+                $"Unknown {TestSelectionOptions.SectionName}:Mode value '{value}'. Valid modes: all, coverage-shadow, project-graph, coverage."));
 }
 
 /// <summary>

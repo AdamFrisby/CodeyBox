@@ -6,8 +6,9 @@ may affect. New selectors first ship **advisory/shadow only**
 **full suite still runs**, and a shadow record captures whether any deselected
 test failed. Real skipping is gated on accumulated shadow data showing zero
 unsafe skips over the calibration window (the soundness gate,
-`readyForEnforcement`). The `project-graph` mode below is the first ENFORCING
-mode, enabled by operators only after that gate reports ready.
+`readyForEnforcement`). The `project-graph` and `coverage` modes below are the
+ENFORCING modes, each enabled by operators only after that gate reports ready
+for the matching selector.
 
 ## Modes (`Audit:TestSelection:Mode`)
 
@@ -16,6 +17,7 @@ mode, enabled by operators only after that gate reports ready.
 | `all` (default) | Full suite; the emitted command is byte-identical to the legacy path. Instant kill-switch: hot-reloading back to `all` disables all selection. |
 | `coverage-shadow` | Coverage selector computes the would-be subset; full suite still runs; one structured `test-selection shadow` log line is emitted per run. |
 | `project-graph` | ENFORCING: the project-graph selector's subset is executed via `--filter`; any selector error, missing/stale data, global-target touch, or ambiguous result falls back to the full suite (fail-safe). Opt in only after the soundness gate reports zero unsafe skips. |
+| `coverage` | ENFORCING: the coverage selector's subset — nested inside the project-graph superset (coverage can only shrink it, never grow beyond it) — is executed via `--filter`. Fallback ladder: coverage rung → project-graph rung (the superset) → full suite, on missing/stale coverage data, selector error, or global-target touch. Opt in only after the soundness gate reports zero unsafe skips for the `coverage` selector. |
 
 The value is case-insensitive (`coverage_shadow` also parses) and hot-reloads
 via `IOptionsMonitor`. An unrecognised value fails fast at load.
@@ -28,10 +30,13 @@ via `IOptionsMonitor`. An unrecognised value fails fast at load.
   precomputed affected tests, plus tests defined in the changed files.
   A change owned by an ALWAYS-FULL project forces the full suite (see below).
 - **Coverage** (`CoverageTestSelector`): selects tests whose recorded per-test
-  coverage intersects the changed lines, and ALWAYS also selects tests defined
-  in changed files, tests with NO coverage record (new/uninstrumented), and
-  everything the project-graph selector picks. Coverage only refines WITHIN
-  that superset — the result is a union, never less.
+  coverage intersects the changed lines, NESTED INSIDE the project-graph
+  superset — every candidate (coverage hit, test defined in a changed file,
+  test with NO coverage record) is kept only when the superset already
+  contains it. Coverage only shrinks that superset, never grows beyond it
+  (defense in depth against a poisoned/stale coverage map). A change no
+  recorded coverage intersects carries no signal, so the ladder descends to
+  the project-graph rung instead of narrowing.
 
 Both fall back to the full suite on ANY uncertainty: no/unknown changeset, no
 baseline, stale baseline, global targets (`Directory.Build.*`,
@@ -90,8 +95,9 @@ suite. Size caps (`MaxBaselineBytes`, `MaxBaselineTests`,
 - **SHADOW-BEFORE-ENFORCE** — `DotnetTestAuditor` executes
   `BuildInvocation(TestSelection.All, …)` on every shadow run; the narrowed
   `--filter` argv is computed for the shadow record only, never executed.
-  The enforcing `project-graph` mode executes the narrowed argv only after the
-  soundness gate reported zero unsafe skips over the calibration window.
+  The enforcing `project-graph` and `coverage` modes execute the narrowed argv
+  only after the soundness gate reported zero unsafe skips over the calibration
+  window (for the matching selector).
 - **FULL-SUITE-ON-MAIN** — the merge/release path (`IRequiredBuildVerifier` /
   `process:required-build`) takes no `ITestSelector` dependency and always
   runs everything, enforced in code (see `TestSelectorTests`), not config.
@@ -125,13 +131,13 @@ Timeline dashboard pages):
 
 | Field | Meaning |
 |-------|---------|
-| `mode` | Live selection mode (`All`, `CoverageShadow`, `ProjectGraph`). |
+| `mode` | Live selection mode (`All`, `CoverageShadow`, `ProjectGraph`, `Coverage`). |
 | `selector` | Selector that decided (`coverage`, `project-graph`, or `none` when neither shadow nor enforcement was active). |
 | `layers` | Layers consulted, innermost first (`["project-graph","coverage"]` for the coverage selector, which refines the project-graph superset; `["project-graph"]` for enforcing project-graph runs). |
 | `selectedCount` / `totalCount` | WOULD-BE subset / known universe size. `0/0` means the universe was unknown (no baseline) — the dashboard shows "full suite". For a full-suite fallback with a known universe, both equal the universe size. For enforcing runs, the EXECUTED subset / universe size. |
 | `estimatedSavedFraction` | Proportional estimate: deselected / total in [0,1]. The dashboard multiplies it by the run's `durationMs` (`est. saved 62.5% (~75s)`). Zero for full-suite runs. For shadow runs this is an estimate, not a measurement — the full suite always ran. |
 | `assessment` | Shadow verdict (`safe-for-this-run` \| `unsafe-skips-observed` \| `full-suite` \| `unverifiable`), plus `enforced-subset` for enforcing runs that executed a narrowed subset (deselected tests were skipped, so no safe/unsafe claim is made; the soundness gate ignores these runs). |
-| `fallbacks` | Which fallback-ladder rungs fired (e.g. `no per-test coverage baseline is available`). Empty when the selector narrowed without falling back. |
+| `fallbacks` | Which fallback-ladder rungs fired (e.g. `no per-test coverage baseline is available`, or the coverage → project-graph descent marker `project-graph rung:`). Empty when the selector narrowed without falling back. |
 | `detail` | Operator-facing selection detail (capped at 4000 chars). |
 
 See `tests/CodeyBox.Tests/CoverageTestSelectionTests.cs` and

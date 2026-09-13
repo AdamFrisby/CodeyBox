@@ -13,16 +13,21 @@ public sealed record CoverageSelection(
 
 /// <summary>
 /// Pure core of coverage-guided selection. Given the changed lines, selects the
-/// tests whose recorded per-test coverage intersects them, and ALWAYS also
-/// selects: the tests defined in the changed files, the tests with NO coverage
-/// record (new/uninstrumented), and the project-graph superset passed in.
-/// Coverage may only refine WITHIN that superset — the result is always a
-/// superset of it, never less.
+/// tests whose recorded per-test coverage intersects them, NESTED INSIDE the
+/// project-graph superset passed in: every candidate (coverage hit, test
+/// defined in a changed file, test with NO coverage record) is kept only when
+/// it is already a member of that superset. Coverage can only shrink the
+/// superset, never grow beyond it — a poisoned or stale coverage map cannot
+/// widen the executed set past the project-graph bound (defense in depth).
 ///
 /// <para>Fail-safe: a missing or stale baseline, an unknown changeset, a
 /// global target, a whole-file change, a changed test file (which may define
-/// unrecorded tests), or a changed file no coverage record references all
-/// resolve to the full suite.</para>
+/// unrecorded tests), a changed file no coverage record references, a change
+/// no recorded coverage intersects (no signal — the project-graph rung owns
+/// it), or zero coverage hits all resolve to the full suite at THIS layer.
+/// The <see cref="CoverageTestSelector"/> then descends the fallback ladder
+/// (coverage → project-graph → all) rather than running the full suite
+/// directly when the superset still narrows.</para>
 /// </summary>
 public static class CoverageSelectionCore
 {
@@ -79,14 +84,17 @@ public static class CoverageSelectionCore
         }
 
         var changedFilesSet = new HashSet<string>(changedLines.Keys, StringComparer.Ordinal);
-        var selected = new SortedSet<string>(superset.Tests, StringComparer.Ordinal);
+        var selected = new SortedSet<string>(StringComparer.Ordinal);
         var viaCoverage = 0;
         var viaDefiningFile = 0;
         var viaNoRecord = 0;
 
         foreach (var (name, entry) in baseline.Tests)
         {
-            if (selected.Contains(name))
+            // Nested-inside-superset: a test outside the project-graph bound is
+            // never added, however its coverage reads. The superset's soundness
+            // is the floor; the shadow/soundness gate validates the narrowing.
+            if (!superset.Tests.Contains(name))
                 continue;
 
             if (entry.Covers.Count == 0)
@@ -111,10 +119,19 @@ public static class CoverageSelectionCore
             }
         }
 
+        if (viaCoverage == 0)
+        {
+            return Full(
+                "no recorded per-test coverage intersects the changed lines " +
+                $"({selected.Count} must-include test(s) inside the superset carry no signal)");
+        }
+
+        var deselected = Math.Max(0, superset.Tests.Count - selected.Count);
         return new CoverageSelection(false, selected, string.Create(
             CultureInfo.InvariantCulture,
             $"{selected.Count} test(s) ({viaCoverage} via coverage, " +
-            $"{viaDefiningFile} defined in changed files, {viaNoRecord} without a coverage record)"));
+            $"{viaDefiningFile} defined in changed files, {viaNoRecord} without a coverage record; " +
+            $"{deselected} project-graph test(s) not covering the change deselected)"));
     }
 
     private static CoverageSelection Full(string reason)
@@ -153,18 +170,28 @@ public static class CoverageSelectionCore
 }
 
 /// <summary>
-/// Coverage-guided regression-test selector. Refines the project-graph
-/// superset (<see cref="ProjectGraphTestSelector"/>) by coverage intersection
-/// while preserving every test the superset picked: the emitted filters are
-/// the superset's filters verbatim plus the coverage/must-include test names,
-/// so the result is never less than the superset. Falls back to
-/// <see cref="TestSelection.All"/> on any uncertainty — see
-/// <see cref="CoverageSelectionCore"/>.
+/// Coverage-guided regression-test selector. Narrows the project-graph
+/// superset (<see cref="ProjectGraphTestSelector"/>) by coverage intersection:
+/// the emitted filters are always a subset of that superset — coverage can
+/// only shrink it, never grow beyond it. Implements the fallback ladder
+/// coverage → project-graph → all: when the coverage rung cannot narrow
+/// (missing/stale data, global target, no intersecting coverage, selector
+/// error) but the superset still narrows, the superset decision is returned
+/// verbatim; only when both rungs fail does the selector fall back to
+/// <see cref="TestSelection.All"/>.
 /// </summary>
 public sealed class CoverageTestSelector : ITestSelector
 {
     /// <summary>Selector name used in justifications and shadow records.</summary>
     public const string SelectorName = "coverage";
+
+    /// <summary>
+    /// Marker stamped into a project-graph-rung justification: the coverage
+    /// rung fell back and the superset decision is executed verbatim. The
+    /// enforcing auditor reads this (exact ordinal match) to attribute the
+    /// fallback in per-run telemetry.
+    /// </summary>
+    public const string ProjectGraphRungMarker = "project-graph rung:";
 
     private readonly ITestSelector _supersetSelector;
     private readonly Func<CoverageTestSelectionOptions> _optionsProvider;
@@ -187,7 +214,19 @@ public sealed class CoverageTestSelector : ITestSelector
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var supersetDecision = _supersetSelector.Select(request);
+        TestSelectionDecision supersetDecision;
+        try
+        {
+            supersetDecision = _supersetSelector.Select(request);
+        }
+        catch (Exception ex)
+        {
+            // Fail-safe: a broken superset selector bottoms the ladder at the
+            // full run — there is no narrower rung to trust.
+            return new TestSelectionDecision(
+                TestSelection.All,
+                $"{SelectorName}: full suite (superset selector error ({ex.GetType().Name}))");
+        }
         if (supersetDecision.Selection.IsAll)
         {
             return new TestSelectionDecision(
@@ -195,37 +234,74 @@ public sealed class CoverageTestSelector : ITestSelector
                 $"{SelectorName}: full suite (superset selector chose the full suite: {supersetDecision.Justification})");
         }
 
-        var options = _optionsProvider();
+        CoverageTestSelectionOptions options;
+        try
+        {
+            options = _optionsProvider();
+        }
+        catch (Exception)
+        {
+            // The coverage rung cannot read its knobs, but the superset
+            // decision above already narrowed without them — descend to it.
+            return ProjectGraphRung(supersetDecision, "selection options unavailable");
+        }
+
+        // A superset carrying raw filter expressions (operators the bare-name
+        // set cannot express) cannot be provably nested inside — execute it
+        // verbatim rather than risk a false "shrunk" claim.
+        if (HasRawExpressions(supersetDecision.Selection))
+            return ProjectGraphRung(supersetDecision, "superset carries raw filter expressions");
+
+        var utcNow = _clock.GetUtcNow();
         var superset = ProjectGraphSelectorCore.SelectTests(
             request.ChangedFiles,
             request.Baseline,
             options,
-            _clock.GetUtcNow(),
+            utcNow,
             request.CurrentCommit);
         var resolved = CoverageSelectionCore.SelectTests(
             request.ChangedFiles,
             request.Baseline,
             options,
-            _clock.GetUtcNow(),
+            utcNow,
             superset,
             request.CurrentCommit);
 
-        if (resolved.IsFullSuite)
+        if (!resolved.IsFullSuite)
+        {
+            foreach (var test in resolved.Tests)
+            {
+                if (!supersetDecision.Selection.Filters.Contains(test))
+                {
+                    // Structural defense-in-depth tripwire: the core promises a
+                    // subset of the recomputed superset; the executed superset
+                    // decision must agree. Any drift falls down the ladder.
+                    return ProjectGraphRung(supersetDecision, "coverage result escapes the superset");
+                }
+            }
+
+            return new TestSelectionDecision(
+                new TestSelection([.. resolved.Tests]),
+                $"{SelectorName}: {resolved.Reason}; superset: {supersetDecision.Justification}");
+        }
+
+        if (superset.IsFullSuite)
         {
             return new TestSelectionDecision(
                 TestSelection.All,
-                $"{SelectorName}: full suite ({resolved.Reason})");
+                $"{SelectorName}: full suite ({resolved.Reason}); superset: {superset.Reason}");
         }
 
-        // Preserve the superset's filters verbatim (they may carry raw
-        // expressions a bare-name set cannot express), then add the
-        // coverage/must-include names. Union — never less than the superset.
-        var filters = new SortedSet<string>(supersetDecision.Selection.Filters, StringComparer.Ordinal);
-        foreach (var test in resolved.Tests)
-            filters.Add(test);
-
-        return new TestSelectionDecision(
-            new TestSelection([.. filters]),
-            $"{SelectorName}: {resolved.Reason}; superset: {supersetDecision.Justification}");
+        return ProjectGraphRung(supersetDecision, resolved.Reason);
     }
+
+    private static TestSelectionDecision ProjectGraphRung(
+        TestSelectionDecision supersetDecision, string coverageReason)
+        => new(
+            supersetDecision.Selection,
+            $"{SelectorName}: full suite ({coverageReason}); {ProjectGraphRungMarker} {supersetDecision.Justification}");
+
+    private static bool HasRawExpressions(TestSelection selection)
+        => selection.Filters.Any(f =>
+            f.Contains('=', StringComparison.Ordinal) || f.Contains('~', StringComparison.Ordinal));
 }
