@@ -220,6 +220,8 @@ internal static class TestSupport
         DeploymentRecipe? deploymentRecipe = null,
         IDeploymentManager? deploymentManager = null,
         IDeploymentSubstrateProvider? deploymentSubstrates = null,
+        IWorkItemQuestionStore? questionStore = null,
+        IHumanDeploymentReviewStore? humanReviewStore = null,
         StalePullRequestSweeperOptions? staleBaseReworkOptions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -418,6 +420,8 @@ internal static class TestSupport
             mergeScopeResolver: mergeScopeResolver,
             deploymentManager: deploymentManager,
             deploymentSubstrates: deploymentSubstrates,
+            questionStore: questionStore,
+            humanReviews: humanReviewStore,
             staleBaseReworkRouter: staleBaseReworkRouter);
 
         return new TestPipeline(

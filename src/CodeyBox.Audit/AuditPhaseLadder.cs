@@ -25,7 +25,8 @@ public static class AuditPhaseLadder
         if (auditor.Role == AuditorRole.BuildTestGate)
             return AuditCostClass.MechanicalGate;
         if (auditor.Required.HasFlag(AuditCapabilities.AgentCredentials)
-            || string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase))
+            || string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(auditor.Kind, WellKnownAuditorKinds.Human, StringComparison.OrdinalIgnoreCase))
             return AuditCostClass.Reviewer;
         return AuditCostClass.Tool;
     }

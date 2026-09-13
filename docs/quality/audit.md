@@ -179,6 +179,27 @@ deployment-stage content: a deployment-targeted tool auditor can execute
 them against the endpoint, but the stage never blocks on the E2E chain
 itself.
 
+A human reviewer (`Kind: "human"`, name `human:deployment-review`) closes
+the loop as the operator acting through the standard auditor seam. Enabled
+explicitly via `CodeyBox:HumanReview:Enabled` (default off, hot-reloadable;
+`SweepInterval` tunes the expiry sweeper); a project drops it via
+`ExcludedAuditors` by name. When composed, every code-clean iteration with
+automated deployment probes also clean parks instead of passing: the item
+moves to `NeedsOperatorInput` (releasing the worker slot and audit sandbox
+while keeping only the deployment alive, bounded by the recipe's
+`MaxLifetime`), the operator is notified with the deployment endpoint,
+expiry, and acceptance criteria (backing question
+`human-deployment-review-{iteration}` plus a `work_item.question_asked` /
+`work_item.needs_operator_input` webhook pair), and the verdict resumes the
+iteration. Approve passes and tears the deployment down immediately;
+reject-with-notes yields blocking `Error` findings feeding the normal
+rework loop (a fresh deployment per iteration); an undecided review past
+its deadline fails closed as `expired unreviewed` — silence never passes.
+Verdicts arrive via `POST /workitems/{id}/deployment-review/approve`,
+`.../reject` (notes required), or by answering the backing question with
+`approve` (any other text rejects with that text as notes). A late verdict
+is refused with 410 and fails closed through the same expiry path.
+
 ### .NET gates need a writable NuGet home
 
 `dotnet` materialises its per-user NuGet settings directory
