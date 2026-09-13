@@ -18,16 +18,6 @@ public static class DelegationEscalationPolicy
         state is not (WorkItemState.Done or WorkItemState.Cancelled or WorkItemState.NoActionRequired);
 
     /// <summary>
-    /// Terminal failure states an item may delegate from: the three
-    /// terminal-failure states plus abandonment after exhausted recovery.
-    /// </summary>
-    public static bool IsTerminalFailureState(WorkItemState state) =>
-        state is WorkItemState.Failed
-            or WorkItemState.AuditFailed
-            or WorkItemState.MergeConflictResolutionFailed
-            or WorkItemState.AbandonedAfterRecoveryAttempts;
-
-    /// <summary>
     /// Whether the item may escalate automatically: it has not already done
     /// so (at most once per item), and no delegation turn has completed
     /// without advancing it (a proven-unhelpful delegation never re-arms the

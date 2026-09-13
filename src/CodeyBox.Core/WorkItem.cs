@@ -929,9 +929,7 @@ public sealed record WorkItem
     }
 
     private static bool IsTerminalFailureState(WorkItemState state) =>
-        state is WorkItemState.Failed
-            or WorkItemState.AuditFailed
-            or WorkItemState.MergeConflictResolutionFailed;
+        WorkItemStates.IsTerminalFailure(state);
 
     private static bool IsQuotaShapedState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
