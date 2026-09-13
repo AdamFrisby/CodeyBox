@@ -400,6 +400,13 @@ public sealed class SqliteWorkItemStore :
             // Authenticated work initiator snapshot. Null is the explicit
             // backfill for work created before initiator attribution existed.
             RunMigration("ALTER TABLE work_items ADD COLUMN initiator_json TEXT;");
+            // Delegation-phase bookkeeping. Attempts counts completed
+            // delegation turns; requested is the one-shot trigger flag (set by
+            // an explicit retry-from-delegation, consumed when the turn
+            // completes); reason records which trigger asked for it.
+            RunMigration("ALTER TABLE work_items ADD COLUMN delegation_attempts INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN delegation_requested INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN delegation_reason TEXT;");
 
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
@@ -1373,6 +1380,7 @@ public sealed class SqliteWorkItemStore :
                         preserve_work_branch_on_queued_pickup,
                         terminal_retry_attempts, next_terminal_retry_at,
                         knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary, plan_review_attempts,
+                        delegation_attempts, delegation_requested, delegation_reason,
                         initiator_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
@@ -1393,6 +1401,7 @@ public sealed class SqliteWorkItemStore :
                         $preserve_work_branch_on_queued_pickup,
                         $terminal_retry_attempts, $next_terminal_retry_at,
                         $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary, $plan_review_attempts,
+                        $delegation_attempts, $delegation_requested, $delegation_reason,
                         $initiator);
                     """;
                 Bind(cmd, item);
@@ -1662,6 +1671,9 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    delegation_attempts = $delegation_attempts,
+                    delegation_requested = $delegation_requested,
+                    delegation_reason = $delegation_reason,
                     baseline_image_ref = $baseline_image_ref,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
@@ -1757,6 +1769,9 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    delegation_attempts = $delegation_attempts,
+                    delegation_requested = $delegation_requested,
+                    delegation_reason = $delegation_reason,
                     baseline_image_ref = $baseline_image_ref,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
@@ -1854,6 +1869,9 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    delegation_attempts = $delegation_attempts,
+                    delegation_requested = $delegation_requested,
+                    delegation_reason = $delegation_reason,
                     baseline_image_ref = $baseline_image_ref,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
@@ -2265,6 +2283,9 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    delegation_attempts = $delegation_attempts,
+                    delegation_requested = $delegation_requested,
+                    delegation_reason = $delegation_reason,
                     baseline_image_ref = $baseline_image_ref,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
@@ -2698,6 +2719,9 @@ public sealed class SqliteWorkItemStore :
                         cancellation_source = $cancellation_source,
                         transient_cancel_retries = $transient_cancel_retries,
                         conflict_rework_attempts = $conflict_rework_attempts,
+                        delegation_attempts = $delegation_attempts,
+                        delegation_requested = $delegation_requested,
+                        delegation_reason = $delegation_reason,
                         baseline_image_ref = $baseline_image_ref,
                         required_capabilities_json = $required_capabilities,
                         job_type = $job_type,
@@ -4255,6 +4279,9 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$plan_reviewed_at", (object?)item.PlanReviewedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_review_summary", (object?)item.PlanReviewSummary ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_review_attempts", item.PlanReviewAttempts);
+        cmd.Parameters.AddWithValue("$delegation_attempts", item.DelegationAttempts);
+        cmd.Parameters.AddWithValue("$delegation_requested", item.DelegationRequested ? 1 : 0);
+        cmd.Parameters.AddWithValue("$delegation_reason", (object?)item.DelegationReason ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$initiator",
             item.Initiator is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Initiator, JsonOpts));
     }
@@ -4381,6 +4408,9 @@ public sealed class SqliteWorkItemStore :
         PlanReviewedAt = ReadNullableDateTimeOffset(r, "plan_reviewed_at"),
         PlanReviewSummary = ReadNullableString(r, "plan_review_summary"),
         PlanReviewAttempts = ReadInt32OrDefault(r, "plan_review_attempts", defaultValue: 0),
+        DelegationAttempts = ReadInt32OrDefault(r, "delegation_attempts", defaultValue: 0),
+        DelegationRequested = ReadInt32OrDefault(r, "delegation_requested", defaultValue: 0) != 0,
+        DelegationReason = ReadNullableString(r, "delegation_reason"),
         Initiator = ReadInitiator(r),
     };
 

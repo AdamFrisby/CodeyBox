@@ -343,6 +343,15 @@ public sealed class WorkItemRetrier
         // detect a re-route; only an operator retry clears it back to
         // unstamped.
         var isOperatorRetry = trigger == "manual";
+        // A resume into Delegating re-arms the one-shot trigger the pipeline
+        // consumes when the turn completes. Scheduler resumes of an in-flight
+        // delegation turn (quota / transient / agent-resume parks) preserve
+        // the original request reason; a fresh explicit trigger mints one so
+        // every attempt carries which trigger authorized it.
+        var resumingDelegationTurn = resumeState == WorkItemState.Delegating
+            && item.State is WorkItemState.WaitingForQuotaReset
+                or WorkItemState.WaitingForTransientRetry
+                or WorkItemState.WaitingForAgentResume;
         var resumed = item.With(resumeState, error: null) with
         {
             RecoveryAttempts = 0,
@@ -364,7 +373,13 @@ public sealed class WorkItemRetrier
                 : null,
             TerminalRetryAttempts = isOperatorRetry ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
-            StartedAt = null
+            StartedAt = null,
+            DelegationRequested = resumeState == WorkItemState.Delegating,
+            DelegationReason = resumeState != WorkItemState.Delegating
+                ? item.DelegationReason
+                : resumingDelegationTurn && !string.IsNullOrWhiteSpace(item.DelegationReason)
+                    ? item.DelegationReason
+                    : $"Delegation requested by '{trigger}' retry from '{requestedFrom}'.",
         };
         var discardedAgentTurnRecoveryMetadata =
             !resumingAgentTurn

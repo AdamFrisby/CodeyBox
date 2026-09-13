@@ -66,6 +66,15 @@ public enum WorkItemState
     /// work/audit/merge lifecycle.
     /// </summary>
     PlanApproved = 17,
+    /// <summary>
+    /// The item is undergoing a single operator-triggered delegation turn:
+    /// an unconstrained repair attempt by a delegate agent working from the
+    /// composed convergence brief. Exactly one turn per explicit trigger; on
+    /// completion the item advances to <see cref="WorkComplete"/> for audit,
+    /// or parks at <see cref="NeedsOperatorInput"/> when the delegate fails
+    /// or produces no change. The phase never transitions back to itself.
+    /// </summary>
+    Delegating = 18,
     Failed = 100,
     Cancelled = 101,
     AuditFailed = 102,

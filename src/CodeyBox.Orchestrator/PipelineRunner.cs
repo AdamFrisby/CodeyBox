@@ -156,6 +156,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // Pure prompt builders (extracted cold-tier cluster). Owns the Build*Prompt /
     // Build*EscalationMessage cluster; PipelineRunner delegates to it.
     private readonly PromptComposer _promptComposer;
+    // Convergence-brief composer for the delegation phase. Null in minimal
+    // compositions / tests that don't exercise delegation; a Delegating entry
+    // with no composer parks to NeedsOperatorInput instead of running blind.
+    private readonly ConvergenceBriefComposer? _briefComposer;
+    // Append-only delegation event log (brief + agent/model + resulting diff).
+    // Null disables durable recording; the phase still runs but the operator
+    // loses the post-hoc "what was the delegate told / what did it do" trail.
+    private readonly IDelegationEventStore? _delegationEvents;
+    // Hot-reloadable delegation knobs (result-diff bounds). Defaults to
+    // built-in values when no accessor is wired.
+    private readonly Func<DelegationOptions> _delegationOptionsAccessor;
     // Upper bound for parsed reset-window hints extracted from an agent's stdout/stderr.
     // Without a cap, a maliciously-crafted Retry-After header (or prompt-injected output)
     // could park an item arbitrarily far in the future. 24h is the longest legitimate
@@ -377,7 +388,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // composition roots that enable deployment-stage auditing wire both.
         IDeploymentManager? deploymentManager = null,
         IDeploymentSubstrateProvider? deploymentSubstrates = null,
-        StaleBaseConflictReworkRouter? staleBaseReworkRouter = null)
+        StaleBaseConflictReworkRouter? staleBaseReworkRouter = null,
+        // Delegation phase (operator-triggered escape hatch). All three are
+        // optional: a Delegating entry with no composer parks to
+        // NeedsOperatorInput instead of running; a null event store only
+        // drops the durable brief/diff trail.
+        ConvergenceBriefComposer? briefComposer = null,
+        IDelegationEventStore? delegationEvents = null,
+        Func<DelegationOptions>? delegationOptionsAccessor = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -524,6 +542,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _claudeSessionWorker = sessionAgentRunner;
         _claudeHandleSnapshot = sessionHandleSnapshot;
         _claudeSessionOptions = sessionDispatchOptions ?? new AgentSessionDispatchOptions();
+        _briefComposer = briefComposer;
+        _delegationEvents = delegationEvents;
+        _delegationOptionsAccessor = delegationOptionsAccessor ?? (() => new DelegationOptions());
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
             _auditReports is null ? null : PersistAuditReportAsync,
@@ -2322,8 +2343,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var resumingPreempt = item.HasAgentTurnRecoveryBoundary;
         var resumingConflictRework = entry is WorkItemState.ReworkingForConflict;
         var skipWork = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
+            or WorkItemState.Delegating
             || resumingConflictRework
             || (resumingPreempt && entry is WorkItemState.Reworking);
+        // Operator-triggered escape hatch: the item already failed the
+        // constrained work/audit/rework cycle. The delegation block below
+        // runs a single unconstrained turn, then the item re-enters the
+        // normal flow at the audit phase (skipAudit stays false).
+        var isDelegationEntry = entry is WorkItemState.Delegating;
         var skipAudit = entry is WorkItemState.Merged
             || resumingConflictRework;
         var skipMerge = entry is WorkItemState.Merged;
@@ -2399,7 +2426,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             && string.Equals(item.Check.Mode, CheckAndActModes.Completion, StringComparison.OrdinalIgnoreCase);
         var initialSmokePhase = item.JobType == JobType.CheckAndAct
             ? completionModeCheck ? null : "check"
-            : skipWork
+            : isDelegationEntry
+                ? "delegation"
+                : skipWork
                 ? null
                 : planningLifecycleRequiredAtEntry
                     ? "planning"
@@ -2829,6 +2858,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
                     if (parked) return;
                 }
+            }
+
+            // -------- Phase 1.D: Delegation (operator-triggered escape hatch) --------
+            // Exactly one unconstrained turn. On success the item re-enters the
+            // normal flow at the audit phase below (skipAudit is false for a
+            // Delegating entry); the phase never merges and never re-enters
+            // itself. A null result means the item parked (NeedsOperatorInput,
+            // quota, or transient) or failed fast — stop the pipeline.
+            if (isDelegationEntry)
+            {
+                var delegationResult = await RunDelegationPhaseAsync(
+                    item, project, repoId, baseBranch, workBranch, ct, hostShutdownToken);
+                if (delegationResult is null)
+                    return;
+                item = delegationResult;
             }
 
             // -------- Phase 1.5: Audit + rework loop --------
@@ -4950,7 +4994,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IReadOnlyList<IAuditor>? auditorsForPreemptiveSelfReview = null,
         ReworkNoDiffHandling reworkNoDiffHandling = ReworkNoDiffHandling.TerminalError,
         string? resumePreTurnCommitSha = null,
-        bool suppressNoChangesBreaker = false)
+        bool suppressNoChangesBreaker = false,
+        // Delegation turns reuse this method with isInitial: false (existing
+        // work branch checked out as-is) but must surface as "delegation" in
+        // timings, streams, supervision, and prompt preprocessing instead of
+        // "rework". Null keeps the legacy isInitial-derived labels.
+        string? phaseLabelOverride = null,
+        AgentPromptPhase? promptPhaseOverride = null)
     {
         item = await RefreshAgentTurnResumeCheckpointAsync(item, isInitial, iteration, ct);
         var resumingGitCheckpoint = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
@@ -4979,7 +5029,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ReasoningMode = selectedMemberForSession.ReasoningMode,
             };
         var access = _gitHost.GetSandboxAccess(repoId);
-        var agentPhase = isInitial ? "work" : "rework";
+        var agentPhase = phaseLabelOverride ?? (isInitial ? "work" : "rework");
+        var promptPhase = promptPhaseOverride ?? (isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework);
 
         // Look up the prompt revision snapshotted at iteration-dispatch time.
         // The orchestrator records this row before transitioning the item to
@@ -5286,7 +5337,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             prompt = await ProcessAgentPromptAsync(
                 item.Id,
                 runner.Kind,
-                isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
+                promptPhase,
                 iteration ?? 1,
                 project,
                 sandbox,
@@ -5383,7 +5434,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     if (supervisionHandledRun)
                     {
-                        var phaseForPreprocessor = isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework;
+                        var phaseForPreprocessor = promptPhase;
                         var iterationForPreprocessor = iteration ?? 1;
                         Func<string, CancellationToken, Task<string>> promptPreprocessor = (raw, pct) => ProcessAgentPromptAsync(
                             item.Id,
@@ -5483,7 +5534,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                 captureStructuredStream: captureStructuredStream,
                                 promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
                                     item.Id, runner.Kind,
-                                    isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
+                                    promptPhase,
                                     iteration ?? 1, project, sandbox, raw, pct));
                             agentResult = await supervision.RunPendingInjectionsAsync(
                                 agentResult, dispatcher.RunInjectionTurnAsync, runnerCts.Token);
@@ -11756,6 +11807,136 @@ public sealed partial class PipelineRunner : IPipelineRunner
             auditLogReason: "empty audit rework");
     }
 
+    /// <summary>
+    /// Parks a delegation turn at <see cref="WorkItemState.NeedsOperatorInput"/>
+    /// carrying the reason. Terminal for the delegation attempt: the item
+    /// never returns to the cycle that already failed, and the phase cannot
+    /// re-enter itself (the trigger flag is consumed by leaving Delegating;
+    /// only a new explicit trigger re-arms it). Optionally counts the attempt
+    /// (turns that ran) and records the delegation event when the record
+    /// hasn't been written yet by the caller.
+    /// </summary>
+    private async Task ParkDelegationForOperatorAsync(
+        WorkItem item,
+        Project project,
+        CancellationToken ct,
+        string message,
+        string auditLogReason,
+        string outcome,
+        bool countAttempt,
+        string? brief,
+        AgentKind? agent,
+        string? model)
+    {
+        await RunBoundedPostAgentAsync(item.Id, "park-delegation-for-operator", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            var parked = current.With(WorkItemState.NeedsOperatorInput, message) with
+            {
+                DelegationAttempts = current.DelegationAttempts + (countAttempt ? 1 : 0),
+            };
+            var updated = await _store.TryUpdateIfStateAsync(parked, current.State, transitionCt);
+            if (!updated)
+            {
+                _log.LogInformation(
+                    "Work item {Id} state changed concurrently; skipping park-delegation-for-operator ({Reason})",
+                    item.Id,
+                    auditLogReason);
+                return;
+            }
+
+            _log.LogWarning(
+                "Work item {Id} parked after delegation turn for operator review: {Reason}",
+                item.Id, auditLogReason);
+            AuditLog.WorkItemTransitioned(item.Id, $"NeedsOperatorInput ({auditLogReason})");
+            CodeyBoxMeters.PipelineTransitions.Add(1,
+                new KeyValuePair<string, object?>("to_state", WorkItemState.NeedsOperatorInput.ToString()));
+
+            var usage = await TryGetUsageSummaryAsync(item.Id);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.needs_operator_input",
+                WorkItem = parked,
+                Project = project,
+                Details = new DelegationParkedDetails
+                {
+                    WorkItemId = item.Id.ToString(),
+                    Attempt = parked.DelegationAttempts,
+                    Outcome = outcome,
+                    Reason = message,
+                },
+                Usage = usage?.Iteration,
+                UsageTotal = usage?.Total,
+            }, CancellationToken.None);
+        });
+    }
+
+    /// <summary>
+    /// Appends the first-class delegation event (brief + agent/model +
+    /// resulting branch diff). Best-effort: a store failure is logged and the
+    /// pipeline continues, mirroring the failure-event log contract — the
+    /// state transition being recorded must not break on the recording.
+    /// </summary>
+    private async Task RecordDelegationEventAsync(
+        WorkItem item,
+        string brief,
+        AgentKind? agent,
+        string? model,
+        string outcome,
+        string? Reason,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct)
+    {
+        if (_delegationEvents is null)
+        {
+            _log.LogWarning(
+                "Work item {Id}: delegation event store is not wired; skipping durable brief/diff record for attempt {Attempt}",
+                item.Id, item.DelegationAttempts + 1);
+            return;
+        }
+        if (agent is null)
+        {
+            // No runner ever dispatched (e.g. failure before the first
+            // attempt): there is no agent/model to attribute, so there is
+            // nothing honest to record. The park transition still carries the
+            // outcome and the attempt accounting.
+            _log.LogWarning(
+                "Work item {Id}: no delegate agent observed for attempt {Attempt}; skipping delegation event record",
+                item.Id, item.DelegationAttempts + 1);
+            return;
+        }
+
+        try
+        {
+            // Never throws: returns empty strings when the diff cannot be
+            // computed. The success path already verified HEAD advanced, so
+            // an empty diff here means inspection failed, not "no changes".
+            var (diffStat, fullDiff) = await _gitHost.GetDiffAsync(repoId, baseBranch, workBranch, ct);
+            await _delegationEvents.RecordAsync(new DelegationEvent
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id,
+                Attempt = item.DelegationAttempts + 1,
+                Brief = brief,
+                Agent = agent.Value,
+                Model = model,
+                Outcome = outcome,
+                Reason = Reason,
+                DiffStat = diffStat,
+                ResultDiff = fullDiff,
+                OccurredAt = _opts.TimeProvider.GetUtcNow(),
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "Work item {Id}: failed to record delegation event for attempt {Attempt}",
+                item.Id, item.DelegationAttempts + 1);
+        }
+    }
+
     private async Task ParkAuditForOperatorAsync(
         WorkItem item,
         Project project,
@@ -11804,6 +11985,253 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }, CancellationToken.None);
         });
     }
+
+    /// <summary>
+    /// Runs the delegation phase: a single unconstrained repair turn for an
+    /// item the normal work/audit/rework cycle already failed to converge.
+    /// The turn runs in a sandbox with the repository exactly as the work
+    /// phase does (work-profile sandbox target), on the existing work branch,
+    /// with a prompt combining the composed convergence brief and a latitude
+    /// instruction the work phase does not grant.
+    /// <para>
+    /// Returns the item (advanced to <see cref="WorkItemState.WorkComplete"/>)
+    /// when the delegate committed changes, so the caller falls through to
+    /// the audit loop — the result is verified by the same gates as any other
+    /// change and is never merged on the delegate's assurance. Returns null
+    /// when the item parked (<see cref="WorkItemState.NeedsOperatorInput"/>,
+    /// quota, transient) or failed fast; the caller must stop the pipeline.
+    /// The phase never transitions to Delegating itself (the trigger owns the
+    /// entry) and is unreachable from its own failure path.
+    /// </para>
+    /// </summary>
+    private async Task<WorkItem?> RunDelegationPhaseAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        if (!current.DelegationRequested)
+        {
+            // No explicit new trigger. The pipeline never mints this flag, so
+            // a Delegating entry without it is a stale or hand-written state —
+            // not a second attempt. Park instead of running so the phase
+            // cannot be entered twice on one trigger.
+            await ParkDelegationForOperatorAsync(
+                current,
+                project,
+                ct,
+                "Delegation was entered without an explicit new trigger; refusing a second attempt on the same trigger. Retry from delegation to authorize another attempt.",
+                auditLogReason: "delegation without trigger",
+                outcome: DelegationOutcomes.Failed,
+                countAttempt: false,
+                brief: null,
+                agent: null,
+                model: null);
+            return null;
+        }
+        if (_briefComposer is null)
+        {
+            // No composer, no brief — and running the delegate blind would
+            // fake the phase's core input. Park honestly instead.
+            await ParkDelegationForOperatorAsync(
+                current,
+                project,
+                ct,
+                "Delegation support is not configured on this host (no convergence-brief composer); cannot run the delegate turn.",
+                auditLogReason: "delegation not configured",
+                outcome: DelegationOutcomes.Failed,
+                countAttempt: false,
+                brief: null,
+                agent: null,
+                model: null);
+            return null;
+        }
+
+        var brief = await _briefComposer.ComposeAsync(current.Id, ct);
+        var delegationPrompt = _promptComposer.BuildDelegationPrompt(brief, current.Prompt);
+        var delegationStart = DateTimeOffset.UtcNow;
+        await PublishIterationStartedAsync(
+            current, project, IterationPhase.Delegation, AuditProgressIterationNumbers.DelegationPhase, ct);
+
+        using var delegationScope = BeginPhaseScope(current, "delegation");
+        var observedAgent = current.Agent;
+        string? observedModel = null;
+        try
+        {
+            using (var delegationPhase = new PhaseCancellation("delegation", ct, _opts.TimeProvider))
+            {
+                delegationPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(current.WorkTimeout));
+                delegationPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+                // In-iteration quota fallback mirrors the work phase: a quota
+                // hit mid-turn swaps members and retries; quota exhaustion
+                // still parks via the shared outer handlers with
+                // QuotaRetryFrom "delegation" so the scheduler resumes this
+                // same turn rather than minting a new attempt.
+                var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
+                try
+                {
+                    _ = await InvokeAgentWithQuotaFallbackAsync(
+                        current, project, "delegation", AuditProgressIterationNumbers.DelegationPhase,
+                        async (runner, trialItem, attemptCt) =>
+                        {
+                            observedAgent = runner.Kind;
+                            observedModel = trialItem.ModelId;
+                            return await RunWithStuckProbeAsync(
+                                trialItem, project, runner.Kind, "delegation", delegationPhase, ct,
+                                phaseCt => RunAgentPhaseAsync(
+                                    trialItem, runner, repoId, baseBranch, workBranch,
+                                    delegationPrompt,
+                                    isInitial: false,
+                                    networkProfile: sandboxTarget.NetworkProfile,
+                                    sandboxFlavor: sandboxTarget.Flavor,
+                                    project: project,
+                                    phaseCt,
+                                    hostShutdownToken,
+                                    // The audit loop runs immediately after
+                                    // this turn, so a non-compiling tree is
+                                    // re-detected there and folded into
+                                    // findings — same contract as the
+                                    // audit-loop rework resume path.
+                                    buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop,
+                                    reworkNoDiffHandling: ReworkNoDiffHandling.AuditEmptyRework,
+                                    suppressNoChangesBreaker: true,
+                                    phaseLabelOverride: "delegation",
+                                    promptPhaseOverride: AgentPromptPhase.Delegation),
+                                workToken: attemptCt);
+                        },
+                        ct,
+                        phaseCancellation: delegationPhase,
+                        attemptTimeout: current.WorkTimeout);
+                }
+                catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+                {
+                    throw delegationPhase.Wrap(oce);
+                }
+            }
+        }
+        catch (ReworkProducedNoChangesException empty)
+        {
+            // The delegate exited cleanly but committed nothing. The attempt
+            // is complete and there is nothing to audit — park with the
+            // reason instead of returning to the cycle that already failed.
+            var noChangeReason =
+                $"Delegate ({empty.Agent.Value}) produced no changes; nothing to audit. The item stays parked: retry from delegation to authorize another attempt, or triage manually.";
+            await RecordDelegationEventAsync(
+                current, brief, empty.Agent, observedModel, DelegationOutcomes.NoChanges,
+                noChangeReason, repoId, baseBranch, workBranch, ct);
+            await ParkDelegationForOperatorAsync(
+                current, project, ct, noChangeReason,
+                auditLogReason: "delegate produced no changes",
+                outcome: DelegationOutcomes.NoChanges,
+                countAttempt: true,
+                brief: brief,
+                agent: empty.Agent,
+                model: observedModel);
+            return null;
+        }
+        catch (InvalidOperationException agentFailure) when (IsDelegateAgentFailure(agentFailure))
+        {
+            // Plain delegate failure (non-zero exit with no recognized quota /
+            // auth / transient / infra signature). Same park contract as the
+            // no-change path: the item leaves the failed cycle for good.
+            var failureReason = RedactAndTruncateAgentDetail(agentFailure.Message);
+            await RecordDelegationEventAsync(
+                current, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
+                failureReason, repoId, baseBranch, workBranch, ct);
+            await ParkDelegationForOperatorAsync(
+                current, project, ct, failureReason,
+                auditLogReason: "delegate turn failed",
+                outcome: DelegationOutcomes.Failed,
+                countAttempt: true,
+                brief: brief,
+                agent: observedAgent,
+                model: observedModel);
+            return null;
+        }
+        catch (PhaseCancellationException timeout)
+            when (CancellationSources.IsPhaseTimeout(timeout.Source))
+        {
+            // Genuine delegation-turn timeout (not host shutdown or operator
+            // cancel, which propagate untouched): the attempt is spent.
+            var timeoutReason =
+                $"Delegate turn exceeded its timeout (source={timeout.Source}); the attempt is spent. Retry from delegation to authorize another attempt.";
+            await RecordDelegationEventAsync(
+                current, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
+                timeoutReason, repoId, baseBranch, workBranch, ct);
+            await ParkDelegationForOperatorAsync(
+                current, project, ct, timeoutReason,
+                auditLogReason: "delegate turn timed out",
+                outcome: DelegationOutcomes.Failed,
+                countAttempt: true,
+                brief: brief,
+                agent: observedAgent,
+                model: observedModel);
+            return null;
+        }
+        catch (AgentAttemptTimeoutException attemptTimeout)
+        {
+            // Per-attempt dispatch timeout: same spent-attempt contract.
+            var timeoutReason =
+                $"Delegate turn exceeded its per-attempt timeout: {RedactAndTruncateAgentDetail(attemptTimeout.Message)} Retry from delegation to authorize another attempt.";
+            await RecordDelegationEventAsync(
+                current, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
+                timeoutReason, repoId, baseBranch, workBranch, ct);
+            await ParkDelegationForOperatorAsync(
+                current, project, ct, timeoutReason,
+                auditLogReason: "delegate attempt timed out",
+                outcome: DelegationOutcomes.Failed,
+                countAttempt: true,
+                brief: brief,
+                agent: observedAgent,
+                model: observedModel);
+            return null;
+        }
+
+        // The turn committed changes (RunAgentPhaseAsync verified HEAD
+        // advanced). Record what the delegate was told and what it did, then
+        // advance to WorkComplete so the audit loop verifies the result with
+        // the same gates as any other change. Consuming the one-shot trigger
+        // (With clears DelegationRequested off the Delegating state) and
+        // counting the attempt happen atomically with the advance.
+        await RecordDelegationEventAsync(
+            current, brief, observedAgent, observedModel, DelegationOutcomes.Completed,
+            Reason: null, repoId, baseBranch, workBranch, ct);
+        await PublishIterationCompletedAsync(
+            current, project, IterationPhase.Delegation, AuditProgressIterationNumbers.DelegationPhase,
+            repoId, workBranch, delegationStart, ct);
+        WorkItem? advanced = null;
+        await RunBoundedPostAgentAsync(
+            current.Id, "transition-delegation-to-work-complete", ct, async transitionCt =>
+            {
+                var latest = await _store.GetAsync(current.Id, transitionCt) ?? current;
+                var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                    latest.With(WorkItemState.WorkComplete) with
+                    {
+                        DelegationAttempts = latest.DelegationAttempts + 1,
+                    },
+                    latest.State,
+                    WorkItemState.WorkComplete);
+                await _store.UpdateAsync(next, transitionCt);
+                await EmitTransitionSideEffectsAsync(next, WorkItemState.WorkComplete, project, transitionCt);
+                advanced = next;
+            });
+        return advanced;
+    }
+
+    /// <summary>
+    /// The delegate prompt hands the agent failure-shaped detail text only;
+    /// this matches a plain agent failure (non-zero exit with no recognized
+    /// quota/auth/transient/infra signature) by its message shape so infra
+    /// failures ("Failed to read HEAD …") keep propagating to the standard
+    /// outer handlers instead of being repackaged as delegate failures.
+    /// </summary>
+    private static bool IsDelegateAgentFailure(InvalidOperationException ex) =>
+        ex.Message.StartsWith("Agent ", StringComparison.Ordinal)
+        && ex.Message.Contains(" reported failure", StringComparison.Ordinal);
 
     private static AuditProgressSnapshot BuildAuditProgressSnapshot(
         int iteration,
@@ -16026,6 +16454,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     ?? project.NetworkProfiles.AuditTool,
                 SandboxProfileFlavor.Headless),
             "planning" => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work),
+            // "delegation" explicitly pins the delegation turn to the
+            // work-profile sandbox target — the phase runs in a sandbox with
+            // the repository exactly as the work phase does.
+            "delegation" => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work),
             "check" => new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
             "rework" => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework),
             "merge" => new SandboxTarget(project.NetworkProfiles.Merge, SandboxProfileFlavor.Headless),
@@ -21166,6 +21598,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             "planning" => "planning",
             "audit" => "audit",
             "rework" => "audit",
+            "delegation" => "delegation",
             "post-act-recheck" => "audit",
             ConflictReworkPhaseKey => "conflict_rework",
             "merge" => "merge",
@@ -21464,6 +21897,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         "planning" => "planning",
         "audit" => "audit",
         "rework" => "audit",
+        "delegation" => "delegation",
         ConflictReworkPhaseKey => "conflict_rework",
         "post-act-recheck" => "merge",
         "merge" => "merge",
@@ -21514,6 +21948,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         WorkItemState.Reworking => "rework",
         WorkItemState.ReworkingForConflict => "rework",
         WorkItemState.AuditFailed => "rework",
+        WorkItemState.Delegating => "delegation",
         WorkItemState.Merging => "merge",
         WorkItemState.UpstreamPushing => "upstream",
         _ => "work",
@@ -21530,6 +21965,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         WorkItemState.AuditPassed => "work_item.audit_passed",
         WorkItemState.Reworking => "work_item.reworking",
         WorkItemState.ReworkingForConflict => "work_item.reworking_for_conflict",
+        WorkItemState.Delegating => "work_item.delegating",
         WorkItemState.AuditFailed => "work_item.audit_failed",
         WorkItemState.Merging => "work_item.merging",
         WorkItemState.Merged => "work_item.merged",
