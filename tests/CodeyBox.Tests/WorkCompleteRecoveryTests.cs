@@ -201,6 +201,7 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
             WorkItemState.ReworkingForConflict,
             WorkItemState.Merged,
             WorkItemState.UpstreamPushing,
+            WorkItemState.Delegating,
         };
         var expectedUnwatched = new[]
         {

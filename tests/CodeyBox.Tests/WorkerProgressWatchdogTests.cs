@@ -65,6 +65,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     [InlineData(WorkItemState.AuditPassed, true)]
     [InlineData(WorkItemState.Merging, true)]
     [InlineData(WorkItemState.ReworkingForConflict, true)]
+    [InlineData(WorkItemState.Delegating, true)]
     [InlineData(WorkItemState.Merged, true)]
     [InlineData(WorkItemState.UpstreamPushing, true)]
     [InlineData(WorkItemState.Queued, false)]

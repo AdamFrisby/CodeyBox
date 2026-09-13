@@ -174,6 +174,7 @@ public static class AdminSeedData
         WorkItemState.ReworkingForConflict,
         WorkItemState.MergeConflictResolutionFailed,
         WorkItemState.AbandonedAfterRecoveryAttempts,
+        WorkItemState.Delegating,
     ];
 
     private static string SeedPromptFor(WorkItemState state, int index) => state switch
