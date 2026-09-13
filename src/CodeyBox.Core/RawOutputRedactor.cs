@@ -82,4 +82,96 @@ public static class RawOutputRedactor
         }
         return text[..lo] + Marker;
     }
+
+    /// <summary>
+    /// Truncates <paramref name="text"/> to at most <paramref name="maxBytes"/> UTF-8 bytes
+    /// from the end of the string (retaining the tail), prepending <c>[...truncated]\n</c>
+    /// when the original exceeded the cap. Char and surrogate boundaries are respected.
+    /// The cap is applied AFTER <see cref="Redact"/>; call <see cref="Redact"/> first.
+    /// </summary>
+    public static string TruncateTailToBytes(string text, int maxBytes)
+    {
+        const string Marker = "[...truncated]\n";
+        var bytes = System.Text.Encoding.UTF8.GetByteCount(text);
+        if (bytes <= maxBytes) return text;
+
+        var budget = maxBytes - System.Text.Encoding.UTF8.GetByteCount(Marker);
+        if (budget <= 0) return Marker.TrimEnd('\n');
+
+        var lo = 0;
+        var hi = text.Length;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            if (System.Text.Encoding.UTF8.GetByteCount(text.AsSpan(mid)) <= budget)
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+
+        if (lo > 0 && lo < text.Length && char.IsLowSurrogate(text[lo]))
+            lo++;
+
+        return Marker + text[lo..];
+    }
+
+    /// <summary>
+    /// Collapses consecutive identical lines in <paramref name="text"/> so repeated
+    /// diagnostics (e.g. repetitive file watcher or probe logs) do not dilute signal.
+    /// When a line is repeated, the first occurrence is kept, followed by
+    /// <c>[... repeated N times ...]</c> (or <c>[... repeated 1 time ...]</c>).
+    /// </summary>
+    public static string CollapseRepeatedLines(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+
+        var endsWithNewline = text.EndsWith('\n');
+        using var reader = new System.IO.StringReader(text);
+        var sb = new System.Text.StringBuilder(text.Length);
+
+        string? currentLine = null;
+        var repeatCount = 0;
+
+        void FlushCurrent()
+        {
+            if (currentLine is null) return;
+
+            if (sb.Length > 0)
+                sb.Append('\n');
+
+            sb.Append(currentLine);
+            if (repeatCount > 1)
+            {
+                var times = repeatCount - 1;
+                sb.Append("\n[... repeated ").Append(times).Append(times == 1 ? " time ...]" : " times ...]");
+            }
+        }
+
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            if (currentLine is null)
+            {
+                currentLine = line;
+                repeatCount = 1;
+            }
+            else if (string.Equals(line, currentLine, StringComparison.Ordinal))
+            {
+                repeatCount++;
+            }
+            else
+            {
+                FlushCurrent();
+                currentLine = line;
+                repeatCount = 1;
+            }
+        }
+
+        FlushCurrent();
+
+        if (endsWithNewline && sb.Length > 0)
+            sb.Append('\n');
+
+        return sb.ToString();
+    }
 }

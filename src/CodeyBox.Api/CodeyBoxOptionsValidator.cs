@@ -80,6 +80,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxBulkItems must be between 1 and {CodeyBoxOptions.MaximumMaxBulkItems}");
         }
 
+        if (options.MaxFailureDetailBytes <= 0)
+        {
+            failures.Add("CodeyBox:MaxFailureDetailBytes must be > 0");
+        }
+
         if (options.SqliteWriteGate is null)
         {
             failures.Add("CodeyBox:SqliteWriteGate must not be null");
