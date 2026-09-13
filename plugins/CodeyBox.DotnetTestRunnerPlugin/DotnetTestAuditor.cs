@@ -1,13 +1,15 @@
 using System.Globalization;
 using System.Text.Json;
-using CodeyBox.Audit;
+using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 
-namespace CodeyBox.Audit.Shell;
+namespace CodeyBox.DotnetTestRunnerPlugin;
 
 /// <summary>
-/// First-class <c>dotnet test</c> auditor. Replaces the previous arrangement
-/// where <c>csharp:test-pass</c> was a generic <see cref="ShellCommandAuditor"/>
+/// First-class <c>dotnet test</c> auditor, shipped as a CodeyBox plugin (see
+/// <see cref="DotnetTestRunner"/>, the attributed entry point). It replaces
+/// the previous arrangement where <c>csharp:test-pass</c> was a generic
+/// <see cref="ShellCommandAuditor"/>
 /// that three separate call sites had to sniff as "really a dotnet test"
 /// (result-classifier selection by <c>argv[1]=="test"</c>, per-test hang
 /// handling, and a future <c>--filter</c> injection).

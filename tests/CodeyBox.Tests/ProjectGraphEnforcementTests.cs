@@ -1,6 +1,7 @@
 using CodeyBox.Api;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.DotnetTestRunnerPlugin;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;

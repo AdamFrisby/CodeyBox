@@ -230,7 +230,7 @@ non-zero on findings.
 
 Capability: `None`.
 
-### `DotnetTestAuditor` (`CodeyBox.Audit.Shell`)
+### `DotnetTestAuditor` (`CodeyBox.DotnetTestRunnerPlugin`)
 
 Backs the built-in `csharp:test-pass` gate. It is a first-class
 `ITestRunnerAuditor` rather than a generic `ShellCommandAuditor`, so

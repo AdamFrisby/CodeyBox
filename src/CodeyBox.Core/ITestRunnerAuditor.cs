@@ -53,10 +53,24 @@ public interface ITestRunnerAuditorProvider
     ITestRunnerAuditor? TestRunner { get; }
 }
 
-/// <summary>Test frameworks a <see cref="ITestRunnerAuditor"/> can drive.</summary>
+/// <summary>
+/// Test frameworks an <see cref="ITestRunnerAuditor"/> can drive. The seam is
+/// framework-agnostic: peer runners (pytest, go test, cargo test, …) implement
+/// the same interface and ship as plugins without any change to this assembly.
+/// </summary>
 public enum TestFramework
 {
+    /// <summary><c>dotnet test</c> (VSTest). Bundled default merge-gate runner.</summary>
     DotnetTest,
+
+    /// <summary><c>pytest</c>. Peer runner; see the reference stub in the test-runner plugin package.</summary>
+    Pytest,
+
+    /// <summary><c>go test</c>. Peer runner (not bundled).</summary>
+    GoTest,
+
+    /// <summary><c>cargo test</c>. Peer runner (not bundled).</summary>
+    CargoTest,
 }
 
 /// <summary>

@@ -4,7 +4,12 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Shell;
 
-internal static class DotnetTestOutputParser
+/// <summary>
+/// Parses <c>dotnet test</c> output into per-test failures. Public because the
+/// plugin-packaged test runner reuses it from outside this assembly; the
+/// implementation stays here so there is exactly one copy.
+/// </summary>
+public static class DotnetTestOutputParser
 {
     private const double UnrunnableFailureThresholdMs = 50;
     private const int MaxReportedFailureFindings = 50;
@@ -238,7 +243,11 @@ internal static class DotnetTestOutputParser
         => value.Length <= max ? value : value[..max] + "...";
 }
 
-internal sealed record DotnetTestOutputParseResult(
+/// <summary>
+/// Parsed outcome of a <c>dotnet test</c> run. Public alongside
+/// <see cref="DotnetTestOutputParser"/> (same single-source-of-truth reason).
+/// </summary>
+public sealed record DotnetTestOutputParseResult(
     IReadOnlyList<AuditFinding> Findings,
     IReadOnlyList<string> FailedTestNames,
     int ParsedFailureCount,

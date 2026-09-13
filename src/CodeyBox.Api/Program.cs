@@ -22,6 +22,7 @@ using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
+using CodeyBox.DotnetTestRunnerPlugin;
 using CodeyBox.Core;
 using CodeyBox.Deployment;
 using CodeyBox.Git;
