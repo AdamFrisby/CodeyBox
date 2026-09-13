@@ -211,6 +211,7 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
             WorkItemState.AuditFailed,
             WorkItemState.MergeConflictResolutionFailed,
             WorkItemState.AbandonedAfterRecoveryAttempts,
+            WorkItemState.NoActionRequired,
             WorkItemState.NeedsOperatorInput,
             WorkItemState.WaitingForQuotaReset,
             WorkItemState.WaitingForAgentResume,

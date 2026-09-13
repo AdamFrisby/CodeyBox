@@ -7,7 +7,8 @@ namespace CodeyBox.Orchestrator;
 /// <summary>
 /// Questions parking + suggestions pickup for the pipeline. Owns the
 /// TryParkForQuestionsAsync / TryReadSuggestionsFileAsync /
-/// PickUpSuggestionsAsync cluster; <see cref="PipelineRunner"/> delegates to it.
+/// PickUpSuggestionsAsync cluster plus the no-action-required report
+/// read/strip helpers; <see cref="PipelineRunner"/> delegates to it.
 /// The NeedsOperatorInput <c>Transition</c> stays on the runner (the spine), so
 /// the runner injects it here as an explicit seam.
 /// Extracted mechanically from <see cref="PipelineRunner"/>; behavior is unchanged.
@@ -132,6 +133,52 @@ internal sealed class QuestionsSuggestionsParker
 
         return result.Stdout;
     }
+
+    /// <summary>
+    /// Tries to read <c>.codeybox/no-action-required.json</c> from the sandbox
+    /// working directory. Returns the raw content string when the file exists
+    /// and is within the 8 KB size limit; null otherwise. The cap is small
+    /// because a no-action determination is a short reason plus an optional
+    /// precondition — anything larger is agent error, not a determination.
+    /// </summary>
+    public async Task<string?> TryReadNoActionRequiredFileAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        const int MaxBytes = 8 * 1024;
+        const string ReportPath = SandboxConventions.WorkDir + "/.codeybox/no-action-required.json";
+
+        // Bound the read at the source, mirroring
+        // TryReadSuggestionsFileAsync: the file is agent-controlled, so the
+        // stdout buffer must be capped before the size check fires.
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["head", "-c", (MaxBytes + 1).ToString(), ReportPath],
+        }, ct);
+
+        if (!result.Success) return null;
+
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(result.Stdout);
+        if (byteCount > MaxBytes)
+        {
+            _log.LogWarning("no-action-required.json exceeds 8 KB ({Bytes} bytes); skipping", byteCount);
+            return null;
+        }
+
+        return result.Stdout;
+    }
+
+    /// <summary>
+    /// Removes <c>.codeybox/no-action-required.json</c> from the sandbox Git
+    /// index so the protocol file is never committed to the work branch,
+    /// mirroring the suggestions.json strip in the pipeline. Best-effort:
+    /// exit 128 (file not tracked) and other failures are tolerated because
+    /// the meaningful-changes diff excludes the path regardless.
+    /// </summary>
+    public Task StripNoActionRequiredFileFromIndexAsync(ISandbox sandbox, CancellationToken ct) =>
+        sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--ignore-unmatch", "--",
+                ".codeybox/no-action-required.json"],
+        }, ct);
 
     /// <summary>
     /// Parses raw suggestions JSON, persists valid entries, and fires one

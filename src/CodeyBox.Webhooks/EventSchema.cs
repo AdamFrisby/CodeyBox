@@ -62,7 +62,9 @@ public static class EventSchema
     private static string EventTypeIntroducedIn(string name)
         => name switch
         {
-            "quota.reset_optimal" => QuotaResetOptimalVersion,            "upstream.pr_stale_base" => UpstreamPrStaleBaseVersion,
+            "quota.reset_optimal" => QuotaResetOptimalVersion,
+            "work_item.no_action_required" => QuotaResetOptimalVersion,
+            "upstream.pr_stale_base" => UpstreamPrStaleBaseVersion,
             "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
             "work_item.waiting_for_transient_retry" => TransientRetryVersion,
             "agent.restore_requeue_swept"
@@ -127,6 +129,7 @@ public static class EventSchema
         "work_item.done",
         "work_item.failed",
         "work_item.cancelled",
+        "work_item.no_action_required",
         "work_item.resumed",
         "work_item.needs_operator_input",
         "work_item.waiting_for_quota_reset",

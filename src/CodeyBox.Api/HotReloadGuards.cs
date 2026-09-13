@@ -209,6 +209,7 @@ public sealed class ProjectsOptionsRemovalValidator : IValidateOptions<CodeyBox.
         WorkItemState.AuditFailed,
         WorkItemState.MergeConflictResolutionFailed,
         WorkItemState.AbandonedAfterRecoveryAttempts,
+        WorkItemState.NoActionRequired,
     };
 
     private readonly IWorkItemStore _workItems;

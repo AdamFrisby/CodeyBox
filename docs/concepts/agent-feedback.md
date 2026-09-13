@@ -355,3 +355,61 @@ agents observe issues as a side-effect of their current work, but the decision
 to act on an observation is an operator judgment call. Automatic queuing would
 introduce unreviewed work into the pipeline and could violate rate limits,
 budget caps, or project priorities.
+
+## No action required
+
+A **no-action-required report** is a determination, not an observation: the agent
+concluded that the work item itself requires no action — typically a conditional
+item ("do X only when precondition P holds") whose investigation shows the
+precondition does not hold. Unlike an empty diff (which fails the item and feeds
+the no-changes breaker), an explicit report resolves the item terminally as
+`NoActionRequired`: recorded, reviewable, and never re-queued on its own.
+
+### The agent contract
+
+When the precondition genuinely does not hold, the agent writes a file at:
+
+```
+<workdir>/.codeybox/no-action-required.json
+```
+
+and exits WITHOUT committing anything. The file must **not** be committed to
+the work branch — the orchestrator strips it from the git index automatically.
+Only write this file when the item genuinely requires no action; an empty diff
+without it fails the item as before.
+
+### Schema
+
+```json
+{
+  "reason": "No reset-TRIGGER endpoint exists: the API surface exposes only report-only advisor endpoints, so the gated quota-reset step has nothing to trigger.",
+  "precondition": "a POST reset-trigger endpoint for the quota advisor"
+}
+```
+
+### Field reference
+
+| Field | Required | Constraints | Description |
+|---|---|---|---|
+| `reason` | yes | 1–2000 chars after trimming | Why no action is warranted; preserved on the resolved item and shown to the operator |
+| `precondition` | no | ≤ 500 chars after trimming | The precondition that was checked and found not to hold, so the determination can be revisited |
+
+A missing/blank file, invalid JSON, a non-object root, or a missing/empty/oversize
+`reason` means no determination was reported — the file is dropped with a
+warning and the empty diff keeps the normal no-changes failure path. An invalid
+`precondition` drops just that field; a valid `reason` still resolves. The file
+must be ≤ 8 KB; larger files are ignored entirely.
+
+### What happens on a valid report
+
+| Aspect | Behaviour |
+|---|---|
+| Item state | Terminal `NoActionRequired`; never re-enters the queue, excluded from in-flight counts and dispatch |
+| Reasoning | Preserved as `lastError` (`no action required: <reason>`, plus the checked precondition when reported) and retrievable via `GET /workitems/{id}` |
+| Breakers | The agent-level no-changes breaker is NOT fed; the per-agent dispatch breaker treats the run as a success |
+| Operator signal | `work_item.no_action_required` webhook plus an informational audit-log entry — distinct from `work_item.failed` |
+| Revisit | `POST /workitems/{id}/retry` re-runs the item if the precondition later holds; `DELETE /workitems/{id}` refuses it (like `Done`) so the determination is preserved |
+| Dependents | Does NOT satisfy the dependency gate — dependents wait until the item is retried to `Done` |
+
+Only the initial work phase resolves this way. An empty diff in rework keeps
+the converge-aware audit-loop handling (see `docs/quality/audit.md`).

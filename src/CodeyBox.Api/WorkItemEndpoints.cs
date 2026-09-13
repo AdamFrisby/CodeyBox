@@ -436,12 +436,15 @@ internal static class WorkItemEndpoints
         // WaitingForTransientRetry for operator override of the schedulers,
         // WaitingForAgentResume for operator override of per-agent runtime
         // pause controls).
+        // NoActionRequired items are retryable too: the precondition may hold
+        // on a later run, so the operator can re-run the item from scratch.
         // Done items have nothing to retry; other non-terminal states would
         // race the pipeline — except a stale worker-held item, which is
         // fenced first (see below).
         if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
             or WorkItemState.AbandonedAfterRecoveryAttempts
+            or WorkItemState.NoActionRequired
             or WorkItemState.NeedsOperatorInput
             or WorkItemState.WaitingForQuotaReset
             or WorkItemState.WaitingForAgentResume
@@ -819,6 +822,13 @@ internal static class WorkItemEndpoints
             return Results.Accepted($"/workitems/{workItemId}");
 
         if (item.State == WorkItemState.Done)
+            return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
+
+        // A no-action-required resolution is a recorded determination, not a
+        // live run: cancelling it would overwrite the preserved reasoning
+        // with "cancelled via API". Like Done, it has nothing to cancel —
+        // retry it instead if the precondition now holds.
+        if (item.State == WorkItemState.NoActionRequired)
             return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
 
         var wasActive = cancellations.Cancel(workItemId);
@@ -2463,6 +2473,7 @@ internal static class WorkItemEndpoints
             WorkItemState.Done or WorkItemState.Failed or
             WorkItemState.Cancelled or WorkItemState.AuditFailed or
             WorkItemState.MergeConflictResolutionFailed or
+            WorkItemState.NoActionRequired or
             WorkItemState.AbandonedAfterRecoveryAttempts;
 
         var entries = await timeline.GetTimelineAsync(workItemId.ToString(), isTerminal, item.CreatedAt, ct);

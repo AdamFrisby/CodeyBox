@@ -147,7 +147,7 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
             FROM agent_stream_summaries s
             JOIN (
                 SELECT id FROM work_items
-                WHERE state IN ($done, $failed, $auditFailed, $cancelled, $abandoned)
+                WHERE state IN ($done, $failed, $auditFailed, $cancelled, $abandoned, $noActionRequired)
                 ORDER BY updated_at DESC
                 LIMIT $lim
             ) w ON w.id = s.work_item_id
@@ -159,6 +159,7 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
         cmd.Parameters.AddWithValue("$auditFailed", (int)WorkItemState.AuditFailed);
         cmd.Parameters.AddWithValue("$cancelled", (int)WorkItemState.Cancelled);
         cmd.Parameters.AddWithValue("$abandoned", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
+        cmd.Parameters.AddWithValue("$noActionRequired", (int)WorkItemState.NoActionRequired);
 
         using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))

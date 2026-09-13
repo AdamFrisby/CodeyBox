@@ -21,6 +21,7 @@ public static class WorkItemInFlight
         WorkItemState.WaitingForAgentResume,
         WorkItemState.WaitingForTransientRetry,
         WorkItemState.AbandonedAfterRecoveryAttempts,
+        WorkItemState.NoActionRequired,
     ];
 
     public static IReadOnlyList<WorkItemState> ExcludedStates => ExcludedStatesArray;
