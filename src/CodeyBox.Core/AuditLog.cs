@@ -1454,6 +1454,28 @@ public static class AuditLog
             .Information("Configuration reloaded: block={Block} oldValue={OldValue} newValue={NewValue}",
                 block, oldValue, newValue);
 
+    /// <summary>
+    /// Emitted by <c>AgentConfigHotReload</c> when a reload changed one or
+    /// more restart-required keys. Those edits are observed but have no effect
+    /// until the process restarts — staying silent would read as the fix not
+    /// working rather than the fix not being applied.
+    /// </summary>
+    public static void ConfigRequiresRestart(IReadOnlyList<string> keys) =>
+        Audit("config_requires_restart")
+            .Warning("Configuration change requires a restart to take effect: keys={Keys}",
+                string.Join(", ", keys));
+
+    /// <summary>
+    /// Emitted by <c>AgentConfigHotReload</c> when a reload surfaces a key
+    /// that binds to no option. The startup validator refuses to start on
+    /// such keys; reporting them at reload time gives the same signal where
+    /// an operator editing a live system will actually see it.
+    /// </summary>
+    public static void ConfigUnboundKeys(IReadOnlyList<string> keys) =>
+        Audit("config_unbound_keys")
+            .Warning("Configuration reload contains keys that bind to no option: keys={Keys}",
+                string.Join(", ", keys));
+
     // ── Test failure attribution ────────────────────────────────────────────
 
     public static void TestFailureAttributionSkipped(

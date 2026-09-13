@@ -2,6 +2,7 @@ using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -64,6 +65,18 @@ namespace CodeyBox.Api;
 /// router snapshots its catalog at the entry of each public method, so a
 /// running iteration finishes against the config snapshot it started with.
 /// </para>
+///
+/// <para>
+/// Silence after an edit means both "applied" and "ignored", so every reload
+/// also reports the two ignored shapes: keys that changed but require a
+/// restart (<see cref="ConfigReloadClassification.DiffRestartRequiredKeys"/>,
+/// emitted as <c>config_requires_restart</c> naming the keys) and keys that
+/// bind to no option at all (re-inspected against the live raw configuration
+/// and emitted as <c>config_unbound_keys</c>). Per-key effectiveness is
+/// queryable without reading source through
+/// <see cref="ConfigReloadClassification.TryGetEffect"/> and the
+/// <c>GET /config/reload-effects</c> endpoint.
+/// </para>
 /// </summary>
 public sealed class AgentConfigHotReload : IHostedService, IDisposable
 {
@@ -120,6 +133,19 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastNetworkTolerance = "";
     private string _lastHostPoolCapacity = "";
 
+    // Last-reported restart-required values (partial copy of the compared
+    // fields only — all scalars/strings, so later mutation of the monitored
+    // instance cannot corrupt the baseline). A change here is observed but
+    // has no effect until restart; it is reported, not applied.
+    private CodeyBoxOptions _restartBaseline = new();
+
+    // Raw-configuration handle for the reload-time unbound-key check. Null in
+    // tests that only exercise the typed-options path, which skips the check.
+    private readonly IConfiguration? _configuration;
+
+    // Unbound keys already reported, so each new key is named once.
+    private HashSet<string> _lastUnboundKeys = new(StringComparer.OrdinalIgnoreCase);
+
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
     internal AgentConfigHotReload(
@@ -147,7 +173,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         IAgentRegistry? agents = null,
         TransitionHealthOptionsSnapshot? transitionHealth = null,
         ISandboxHostPoolSnapshot? hostPoolSnapshot = null,
-        SandboxAdmissionControlledProvider? sandboxAdmission = null)
+        SandboxAdmissionControlledProvider? sandboxAdmission = null,
+        IConfiguration? configuration = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -180,6 +207,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _agents = agents;
         _hostPoolSnapshot = hostPoolSnapshot;
         _sandboxAdmission = sandboxAdmission;
+        _configuration = configuration;
         _log = log;
     }
 
@@ -209,6 +237,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastTransitionHealth = SerializeTransitionHealth(initial.TransitionHealth);
         _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
         _lastHostPoolCapacity = SerializeHostPoolCapacity(initial);
+        _restartBaseline = CaptureRestartBaseline(initial);
+        _lastUnboundKeys = InspectUnboundKeys();
 
         AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
         SessionResumeOptions.SetMaxResumeAttempts(initial.PipelineTuning.AgentSessionResumeMaxAttempts);
@@ -239,6 +269,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         lock (_gate)
         {
             ApplyWorkerPoolIfChanged(opts);
+            ReportRestartRequiredIfChanged(opts);
+            ReportUnboundIfChanged();
             LogRemoteHostCapacityIfChanged(opts);
             ApplyConcurrencyIfChanged(opts);
             ApplySmokeIfChanged(opts);
@@ -260,6 +292,108 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyCircuitBreakerIfChanged(opts);
         }
     }
+
+    /// <summary>
+    /// Names the restart-required keys whose effective value changed against
+    /// the last-reported baseline. Silence after an edit currently means both
+    /// "applied" and "ignored" — this report is the difference: the keys are
+    /// observed but the running process keeps the prior values until restart.
+    /// </summary>
+    private void ReportRestartRequiredIfChanged(CodeyBoxOptions opts)
+    {
+        try
+        {
+            var changed = ConfigReloadClassification.DiffRestartRequiredKeys(_restartBaseline, opts);
+            _restartBaseline = CaptureRestartBaseline(opts);
+            if (changed.Count == 0)
+                return;
+
+            AuditLog.ConfigRequiresRestart(changed);
+            _log.LogWarning(
+                "Configuration change requires a restart to take effect and was NOT applied: {Keys}. " +
+                "The running process keeps the prior values until restarted.",
+                string.Join(", ", changed));
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Could not evaluate restart-required configuration changes; keeping prior baseline.");
+        }
+    }
+
+    /// <summary>
+    /// Re-runs the unbound-key inspection against the live raw configuration
+    /// and names keys that appeared since the last check. The startup
+    /// validator refuses to start on such keys; surfacing them here gives the
+    /// same signal at reload time, where an operator editing a live system
+    /// will actually see it.
+    /// </summary>
+    private void ReportUnboundIfChanged()
+    {
+        if (_configuration is null)
+            return;
+
+        try
+        {
+            var current = InspectUnboundKeys();
+            var added = current
+                .Where(path => !_lastUnboundKeys.Contains(path))
+                .OrderBy(static path => path, StringComparer.Ordinal)
+                .ToArray();
+            _lastUnboundKeys = current;
+            if (added.Length == 0)
+                return;
+
+            AuditLog.ConfigUnboundKeys(added);
+            _log.LogWarning(
+                "Configuration reload contains keys that bind to no option and will be ignored: {Keys}. " +
+                "Fix or remove these keys; a restart with strict validation would refuse to start.",
+                string.Join(", ", added));
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Could not evaluate unbound configuration keys; keeping prior baseline.");
+        }
+    }
+
+    private HashSet<string> InspectUnboundKeys()
+    {
+        if (_configuration is null)
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        return UnboundConfigKeyHostedValidator.Inspect(_configuration)
+            .Select(static report => report.Path)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Partial copy of the restart-required surface only. Every copied member
+    /// is a value type or an immutable string (nested options are re-created,
+    /// never aliased), so later mutation of the monitored instance cannot
+    /// corrupt the baseline the next reload diffs against.
+    /// </summary>
+    private static CodeyBoxOptions CaptureRestartBaseline(CodeyBoxOptions opts) => new()
+    {
+        SandboxProvider = opts.SandboxProvider,
+        StateDatabasePath = opts.StateDatabasePath,
+        GitRootDirectory = opts.GitRootDirectory,
+        GitCommandMaxOutputBytes = opts.GitCommandMaxOutputBytes,
+        AgentStreams = new AgentStreamsOptions { Path = opts.AgentStreams.Path },
+        EnableSharedUpstreamMirror = opts.EnableSharedUpstreamMirror,
+        SharedUpstreamMirrorDirectory = opts.SharedUpstreamMirrorDirectory,
+        Incus = new IncusSandboxConfig
+        {
+            ProjectName = opts.Incus.ProjectName,
+            StagingDirectory = opts.Incus.StagingDirectory,
+        },
+        WorkerPool = new WorkerPoolOptions
+        {
+            DispatchGateAcquisitionBackoff = opts.WorkerPool.DispatchGateAcquisitionBackoff,
+            MaxConsecutiveDispatchGateTimeoutsBeforeEscalation = opts.WorkerPool.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation,
+            NoProgressBackoffBase = opts.WorkerPool.NoProgressBackoffBase,
+            NoProgressBackoffMax = opts.WorkerPool.NoProgressBackoffMax,
+            MaxNoProgressRedispatches = opts.WorkerPool.MaxNoProgressRedispatches,
+        },
+    };
 
     private async Task ApplyConfiguredAgentPausesAtStartupAsync(
         CodeyBoxOptions opts,
@@ -822,8 +956,10 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     /// <see cref="WorkerPoolHotReloadPolicy.HotReloadableFields"/> set — an
     /// edit to any other <c>WorkerPool</c> field does not trigger a reload
     /// (those fields are startup-captured and require a restart).
+    /// Internal for the fingerprint-coverage test, which proves every
+    /// hot-reloadable field is observed here.
     /// </summary>
-    private static string SerializeWorkerPool(WorkerPoolOptions opts, int? legacyConcurrency) =>
+    internal static string SerializeWorkerPool(WorkerPoolOptions opts, int? legacyConcurrency) =>
         JsonSerializer.Serialize(
             new
             {
@@ -1213,7 +1349,14 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             },
             JsonOpts);
 
-    private static string SerializePipelineTuning(PipelineTuningOptions opts) =>
+    /// <summary>
+    /// Hot-reload fingerprint for the pipeline-tuning block. Covers every
+    /// <see cref="PipelineTuningHotReloadPolicy.HotReloadableFields"/> entry:
+    /// a field missing here would silently behave as restart-required however
+    /// the policy classifies it, so a test mutates each property solo and
+    /// requires the fingerprint to move.
+    /// </summary>
+    internal static string SerializePipelineTuning(PipelineTuningOptions opts) =>
         JsonSerializer.Serialize(
             new
             {
@@ -1227,17 +1370,24 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MaxQuestionsPerWorkItem,
                 opts.AgentSuspendMaxRetries,
                 opts.AgentSessionResumeMaxAttempts,
+                opts.MaxRetainedAgentTurnSandboxes,
                 opts.AutoMergeRaceRecoveryMaxAttempts,
                 opts.EnableSandboxReuse,
                 opts.MaxSandboxReuses,
                 MaxSandboxLifetimeSeconds = opts.MaxSandboxLifetime.TotalSeconds,
                 opts.SandboxPressureThreshold,
+                SandboxPermitWaitWarningThresholdSeconds = opts.SandboxPermitWaitWarningThreshold.TotalSeconds,
                 opts.AuditShortCircuitEnabled,
                 opts.EmptyReworkEscalationRetries,
                 AuditorIdleTimeoutSeconds = opts.AuditorIdleTimeout.TotalSeconds,
+                AuditorAbsoluteTimeoutSeconds = opts.AuditorAbsoluteTimeout.TotalSeconds,
                 opts.BlockRedundantDotnetBuildTestInAuditSandbox,
                 CSharpTestPassAuditorIdleTimeoutSeconds = opts.CSharpTestPassAuditorIdleTimeout?.TotalSeconds,
                 CSharpTestPassBlameHangTimeoutSeconds = opts.CSharpTestPassBlameHangTimeout?.TotalSeconds,
+                opts.EnableHandoffSeeding,
+                opts.SelfReviewChecklistEnabled,
+                opts.PlannedItemAuditRebalanceEnabled,
+                PlannedItemAdvisoryAuditors = opts.PlannedItemAdvisoryAuditors.ToArray(),
             },
             JsonOpts);
 
