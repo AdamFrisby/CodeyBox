@@ -89,8 +89,14 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         CancellationToken ct = default)
     {
         var shadow = _opts.Shadow;
-        if (shadow is not null && IsShadowMode(shadow))
-            return await RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+        if (shadow is not null)
+        {
+            var mode = ResolveMode(shadow);
+            if (mode == TestSelectionMode.CoverageShadow)
+                return await RunWithShadowAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+            if (mode == TestSelectionMode.ProjectGraph)
+                return await RunWithProjectGraphEnforcementAsync(sandbox, workingDirectory, context, shadow, ct).ConfigureAwait(false);
+        }
         var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
         return full with { TestSelection = TestSelectionTelemetryComputer.FullSuiteWithoutShadow(ResolveModeName(shadow)) };
     }
@@ -106,6 +112,21 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         catch (Exception)
         {
             return TestSelectionMode.All.ToString();
+        }
+    }
+
+    private static TestSelectionMode ResolveMode(TestSelectionShadowConfig shadow)
+    {
+        try
+        {
+            return shadow.ModeAccessor();
+        }
+        catch (Exception)
+        {
+            // A hot-reloaded invalid mode must never break the test gate: fall
+            // through to the full suite (the options validator surfaces the bad
+            // value at load).
+            return TestSelectionMode.All;
         }
     }
 
@@ -239,6 +260,117 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             universe, failedTests, wouldBeArgv, selectionDetail);
     }
 
+    /// <summary>
+    /// ENFORCING project-graph selection (<c>Audit:TestSelection:Mode=project-graph</c>):
+    /// resolves the affected tests and executes ONLY that subset via
+    /// <c>--filter</c>. Fail-safe: any selector error, unreadable options,
+    /// unknown base ref, or ambiguous result (empty/blank filters) falls back
+    /// to the full suite. The merge/release path never reaches here — it takes
+    /// no <c>ITestSelector</c> dependency by construction.
+    /// </summary>
+    private async Task<AuditResult> RunWithProjectGraphEnforcementAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        TestSelectionShadowConfig shadow,
+        CancellationToken ct)
+    {
+        var changedFiles = await TestSelectionShadowIO.GetChangedFilesAsync(
+            sandbox, workingDirectory, context.BaseBranch, shadow.OptionsAccessor, ct).ConfigureAwait(false);
+        var baseline = await TestSelectionShadowIO.ReadBaselineAsync(
+            sandbox, workingDirectory, shadow.OptionsAccessor, ct).ConfigureAwait(false);
+
+        var universe = baseline.Baseline is null
+            ? (IReadOnlyList<string>)[]
+            : [.. baseline.Baseline.Tests.Keys];
+        var modeName = TestSelectionMode.ProjectGraph.ToString();
+
+        TestSelectionDecision decision;
+        if (string.IsNullOrWhiteSpace(context.BaseBranch))
+        {
+            decision = new TestSelectionDecision(TestSelection.All, "unknown base ref");
+        }
+        else
+        {
+            try
+            {
+                decision = shadow.Selector.Select(new TestSelectionRequest(
+                    this, context.BaseBranch, changedFiles, baseline.Baseline));
+            }
+            catch (Exception ex)
+            {
+                // Fail-safe: any selector error falls back to the full run.
+                decision = new TestSelectionDecision(
+                    TestSelection.All,
+                    $"selector error ({ex.GetType().Name})");
+            }
+        }
+
+        var detail = $"{decision.Justification} | baseline: {baseline.Detail}";
+        if (decision.Selection.IsAll || IsAmbiguousSelection(decision.Selection))
+        {
+            if (!decision.Selection.IsAll)
+            {
+                detail += " | ambiguous selection fell back to the full suite";
+                decision = new TestSelectionDecision(TestSelection.All, detail);
+            }
+            var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+            var telemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
+                modeName, ProjectGraphTestSelector.SelectorName, decision, universe.Count, detail);
+            return full with { TestSelection = telemetry };
+        }
+
+        IReadOnlyList<string> invocation;
+        try
+        {
+            invocation = BuildInvocation(decision.Selection, CurrentRunOptions);
+        }
+        catch (Exception)
+        {
+            var full = await RunFullAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+            var fallbackTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
+                modeName, ProjectGraphTestSelector.SelectorName,
+                new TestSelectionDecision(TestSelection.All, detail + " | filter build failed"),
+                universe.Count, detail + " | filter build failed");
+            return full with { TestSelection = fallbackTelemetry };
+        }
+
+        var narrowed = await RunInvocationAsync(invocation, context, sandbox, workingDirectory, ct).ConfigureAwait(false);
+        var enforcedTelemetry = TestSelectionTelemetryComputer.FromEnforcedSelection(
+            modeName, ProjectGraphTestSelector.SelectorName, decision, universe.Count, detail);
+        return narrowed with { TestSelection = enforcedTelemetry };
+    }
+
+    private static bool IsAmbiguousSelection(TestSelection selection)
+    {
+        if (selection.IsAll)
+            return false;
+        if (selection.Filters.Count == 0)
+            return true;
+        return selection.Filters.Any(string.IsNullOrWhiteSpace);
+    }
+
+    private Task<AuditResult> RunInvocationAsync(
+        IReadOnlyList<string> invocation,
+        AuditContext context,
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct)
+    {
+        var inner = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = _opts.Name,
+            Argv = invocation,
+            ResultClassifier = _classifier,
+            CanShortCircuitOnBlockingFinding = _opts.CanShortCircuitOnBlockingFinding,
+            Role = _opts.Role,
+            BuildTestGateEvidence = _opts.BuildTestGateEvidence,
+            SelfHealNuGetHome = _opts.SelfHealNuGetHome,
+            TestFailureAttributionOptions = _opts.TestFailureAttributionOptions,
+        });
+        return inner.RunAsync(sandbox, workingDirectory, context, ct);
+    }
+
     private Task<AuditResult> RunFullAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -330,12 +462,13 @@ public sealed record DotnetTestAuditorOptions
     public TestFailureAttributionOptionsSnapshot? TestFailureAttributionOptions { get; init; }
 
     /// <summary>
-    /// Advisory test-selection shadow (SHADOW-BEFORE-ENFORCE). When set and the
-    /// live mode is <c>coverage-shadow</c>, each run computes the selector's
-    /// advisory decision, still executes the FULL suite, and emits a shadow
-    /// record (would-be selection plus whether any deselected test failed).
-    /// Null (the default) disables the shadow — byte-identical legacy runs.
-    /// Real skipping is never performed here.
+    /// Test-selection configuration. When set, the live mode decides the run:
+    /// <c>coverage-shadow</c> computes the selector's advisory decision, still
+    /// executes the FULL suite, and emits a shadow record (SHADOW-BEFORE-ENFORCE);
+    /// <c>project-graph</c> executes ONLY the selector's subset (enforcing),
+    /// falling back to the full suite on any error or ambiguous result;
+    /// <c>all</c> (or unset) runs the full suite. Null (the default) disables
+    /// selection — byte-identical legacy runs.
     /// </summary>
     public TestSelectionShadowConfig? Shadow { get; init; }
 }

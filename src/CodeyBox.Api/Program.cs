@@ -327,7 +327,7 @@ builder.Services.AddOptions<TestSelectionOptions>()
     .Bind(builder.Configuration.GetSection(TestSelectionOptions.SectionName))
     .Validate(
         static opts => TestSelectionModeParser.TryParse(opts.Mode, out _),
-        $"{TestSelectionOptions.SectionName}:Mode must be one of: all, coverage-shadow");
+        $"{TestSelectionOptions.SectionName}:Mode must be one of: all, coverage-shadow, project-graph");
 // Coverage-guided selection knobs (Audit:TestSelection:Coverage). Bound through
 // AddOptions so IOptionsMonitor<CoverageTestSelectionOptions> hot-reloads the
 // baseline location, age/size caps, and global targets without a restart, with
@@ -2620,7 +2620,10 @@ builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(ne
 // legacy path. 'coverage-shadow' maps to CoverageTestSelector, which refines the
 // project-graph superset by per-test coverage — ADVISORY ONLY: the per-item
 // csharp:test-pass runner computes the decision, still runs the full suite, and
-// emits a shadow record (SHADOW-BEFORE-ENFORCE). The merge/release verification
+// emits a shadow record (SHADOW-BEFORE-ENFORCE). 'project-graph' maps to
+// ProjectGraphTestSelector and is ENFORCING: the per-item csharp:test-pass runner
+// executes only the selected subset (fail-safe fallback to the full suite on any
+// error or ambiguous result). The merge/release verification
 // path (IRequiredBuildVerifier / process:required-build) deliberately takes NO
 // dependency on this seam: it always verifies the full build/test surface
 // regardless of Mode.
@@ -2636,15 +2639,17 @@ builder.Services.AddSingleton<ITestSelector>(sp =>
             projectGraph,
             () => coverageOptionsMonitor.CurrentValue,
             TimeProvider.System),
+        [TestSelectionMode.ProjectGraph] = projectGraph,
     };
     return new ConfiguredTestSelector(
         () => TestSelectionModeParser.Parse(modeMonitor.CurrentValue.Mode),
         selectorsByMode);
 });
-// Shadow-record sink (structured logs) and the advisory shadow configuration
+// Shadow-record sink (structured logs) and the test-selection configuration
 // threaded into every csharp:test-pass runner the preset catalogs build.
-// Mode=all (the default) is an instant kill-switch: the hook checks the live
-// mode on every run and skips the shadow for anything but coverage-shadow.
+// Mode=all (the default) is an instant kill-switch: the runner checks the live
+// mode on every run and runs the full suite for anything but coverage-shadow
+// (advisory shadow) or project-graph (enforcing subset).
 builder.Services.AddSingleton<ITestSelectionShadowSink, LoggerTestSelectionShadowSink>();
 builder.Services.AddSingleton<TestSelectionShadowConfig>(sp => new TestSelectionShadowConfig
 {

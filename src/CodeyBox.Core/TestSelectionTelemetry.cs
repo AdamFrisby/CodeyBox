@@ -168,6 +168,68 @@ public static class TestSelectionTelemetryComputer
         };
     }
 
+    /// <summary>
+    /// Builds telemetry for an ENFORCING run: the narrowed subset actually
+    /// executed (or the full suite when the selector fell back). A narrowed
+    /// enforcing run reports <see cref="AssessmentEnforced"/> — the deselected
+    /// tests were not executed, so no safe/unsafe verdict can be claimed and
+    /// the soundness gate (which only counts safe/unsafe) ignores these runs.
+    /// Full-suite fallbacks report <c>full-suite</c> with the fallback reason.
+    /// </summary>
+    public static TestSelectionTelemetry FromEnforcedSelection(
+        string mode,
+        string selectorName,
+        TestSelectionDecision decision,
+        int universeCount,
+        string detail)
+    {
+        ArgumentNullException.ThrowIfNull(decision);
+        ArgumentNullException.ThrowIfNull(detail);
+        if (universeCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(universeCount), "must be non-negative");
+        var modeName = string.IsNullOrWhiteSpace(mode) ? TestSelectionMode.ProjectGraph.ToString() : mode;
+        var selector = string.IsNullOrWhiteSpace(selectorName) ? ProjectGraphTestSelector.SelectorName : selectorName;
+        if (decision.Selection.IsAll || universeCount == 0)
+        {
+            return new TestSelectionTelemetry
+            {
+                Mode = modeName,
+                Selector = selector,
+                Layers = LayersForSelector(selector),
+                SelectedCount = universeCount,
+                TotalCount = universeCount,
+                EstimatedSavedFraction = 0.0,
+                Assessment = TestSelectionShadowRecord.AssessmentFullSuite,
+                Fallbacks = [Truncate(detail, MaxFallbackChars)],
+                Detail = Truncate(detail, MaxDetailChars),
+            };
+        }
+
+        var selected = decision.Selection.Filters.Count;
+        if (universeCount > 0)
+            selected = Math.Min(selected, universeCount);
+        var fraction = universeCount > 0 ? Clamp01((double)(universeCount - selected) / universeCount) : 0.0;
+        return new TestSelectionTelemetry
+        {
+            Mode = modeName,
+            Selector = selector,
+            Layers = LayersForSelector(selector),
+            SelectedCount = selected,
+            TotalCount = universeCount,
+            EstimatedSavedFraction = fraction,
+            Assessment = AssessmentEnforced,
+            Fallbacks = [],
+            Detail = Truncate(detail, MaxDetailChars),
+        };
+    }
+
+    /// <summary>
+    /// Assessment for an enforcing run that executed a narrowed subset: the
+    /// deselected tests were skipped, so safety cannot be assessed from this
+    /// run. The soundness gate treats it like <c>unverifiable</c> (ignored).
+    /// </summary>
+    public const string AssessmentEnforced = "enforced-subset";
+
     private static IReadOnlyList<string> FallbacksFromRecord(TestSelectionShadowRecord record)
     {
         if (record.WasFullSuite

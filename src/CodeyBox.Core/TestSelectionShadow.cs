@@ -231,8 +231,11 @@ public sealed record TestSelectionShadowConfig
 
     /// <summary>
     /// Live mode reader (backed by <c>IOptionsMonitor</c>). The shadow runs
-    /// ONLY for <see cref="TestSelectionMode.CoverageShadow"/>; every other
-    /// mode — including the <c>all</c> kill-switch — skips it.
+    /// ONLY for <see cref="TestSelectionMode.CoverageShadow"/>; the enforcing
+    /// project-graph run applies ONLY for
+    /// <see cref="TestSelectionMode.ProjectGraph"/>; every other
+    /// mode — including the <c>all</c> kill-switch — runs the full suite with
+    /// no selection.
     /// </summary>
     public required Func<TestSelectionMode> ModeAccessor { get; init; }
 
