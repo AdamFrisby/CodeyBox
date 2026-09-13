@@ -375,11 +375,7 @@ public sealed class WorkItemRetrier
             NextTerminalRetryAt = null,
             StartedAt = null,
             DelegationRequested = resumeState == WorkItemState.Delegating,
-            DelegationReason = resumeState != WorkItemState.Delegating
-                ? item.DelegationReason
-                : resumingDelegationTurn && !string.IsNullOrWhiteSpace(item.DelegationReason)
-                    ? item.DelegationReason
-                    : $"Delegation requested by '{trigger}' retry from '{requestedFrom}'.",
+            DelegationReason = ResolveDelegationReason(resumeState, resumingDelegationTurn, item.DelegationReason, trigger, requestedFrom),
         };
         var discardedAgentTurnRecoveryMetadata =
             !resumingAgentTurn
@@ -663,6 +659,30 @@ public sealed class WorkItemRetrier
         AgentTurnResumePhase.Rework => RetryFromPolicy.Rework,
         _ => throw new ArgumentOutOfRangeException(nameof(phase), phase, "Unsupported agent-turn resume phase."),
     };
+
+    /// <summary>
+    /// Resolves the delegation reason carried by a retry: keep the current
+    /// reason unless entering <see cref="WorkItemState.Delegating"/> fresh
+    /// (not a scheduler resume of an in-flight delegation turn), in which
+    /// case mint one naming the trigger that authorized the attempt.
+    /// </summary>
+    private static string? ResolveDelegationReason(
+        WorkItemState resumeState,
+        bool resumingDelegationTurn,
+        string? current,
+        string trigger,
+        string requestedFrom)
+    {
+        if (resumeState != WorkItemState.Delegating)
+        {
+            return current;
+        }
+        if (resumingDelegationTurn && !string.IsNullOrWhiteSpace(current))
+        {
+            return current;
+        }
+        return $"Delegation requested by '{trigger}' retry from '{requestedFrom}'.";
+    }
 
     /// <summary>
     /// Picks a sensible default <c>from</c> phase for retries when the operator

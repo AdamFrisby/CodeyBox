@@ -92,7 +92,7 @@ public sealed class SqliteDelegationEventStore : IDelegationEventStore, IDisposa
     {
         ArgumentNullException.ThrowIfNull(@event);
         var options = _optionsAccessor();
-        var brief = Truncate(@event.Brief, options.MaxResultDiffChars);
+        var brief = Truncate(@event.Brief, options.MaxBriefChars);
         var reason = Truncate(@event.Reason, options.MaxReasonChars);
         var stat = Truncate(@event.DiffStat, options.MaxDiffStatChars);
         var diff = Truncate(@event.ResultDiff, options.MaxResultDiffChars);

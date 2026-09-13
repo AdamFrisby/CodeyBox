@@ -10,6 +10,15 @@ namespace CodeyBox.Orchestrator;
 public sealed class DelegationOptions
 {
     /// <summary>
+    /// Upper bound on the convergence-brief text stored per delegation event.
+    /// Separate from <see cref="MaxResultDiffChars"/> so tuning diff
+    /// retention never silently changes brief retention and vice versa.
+    /// Bounds the composed brief before it is buffered into the row.
+    /// Default 32 KiB chars.
+    /// </summary>
+    public int MaxBriefChars { get; set; } = 32 * 1024;
+
+    /// <summary>
     /// Upper bound on the full-diff text stored per delegation event.
     /// Bounds an unbounded/attacker-shaped diff before it is buffered into
     /// the row. Default 32 KiB chars.

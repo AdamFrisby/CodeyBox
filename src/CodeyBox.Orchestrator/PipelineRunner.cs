@@ -11813,8 +11813,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// never returns to the cycle that already failed, and the phase cannot
     /// re-enter itself (the trigger flag is consumed by leaving Delegating;
     /// only a new explicit trigger re-arms it). Optionally counts the attempt
-    /// (turns that ran) and records the delegation event when the record
-    /// hasn't been written yet by the caller.
+    /// (turns that ran). The caller records the first-class delegation event
+    /// via <c>RecordDelegationEventAsync</c> before parking when there is an
+    /// attempt to attribute; this method only advances attempt accounting and
+    /// parks.
     /// </summary>
     private async Task ParkDelegationForOperatorAsync(
         WorkItem item,
@@ -11823,10 +11825,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string message,
         string auditLogReason,
         string outcome,
-        bool countAttempt,
-        string? brief,
-        AgentKind? agent,
-        string? model)
+        bool countAttempt)
     {
         await RunBoundedPostAgentAsync(item.Id, "park-delegation-for-operator", ct, async transitionCt =>
         {
@@ -11883,7 +11882,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentKind? agent,
         string? model,
         string outcome,
-        string? Reason,
+        string? reason,
         string repoId,
         string baseBranch,
         string workBranch,
@@ -11923,7 +11922,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 Agent = agent.Value,
                 Model = model,
                 Outcome = outcome,
-                Reason = Reason,
+                Reason = reason,
                 DiffStat = diffStat,
                 ResultDiff = fullDiff,
                 OccurredAt = _opts.TimeProvider.GetUtcNow(),
@@ -11935,6 +11934,36 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Work item {Id}: failed to record delegation event for attempt {Attempt}",
                 item.Id, item.DelegationAttempts + 1);
         }
+    }
+
+    /// <summary>
+    /// Records a failed delegation turn (brief + agent/model + resulting diff)
+    /// then parks the item at <see cref="WorkItemState.NeedsOperatorInput"/>.
+    /// Single home for the record-then-park sequence shared by the
+    /// no-change, agent-failure, phase-timeout, and attempt-timeout handlers
+    /// so attempt accounting and event recording cannot drift between them.
+    /// </summary>
+    private async Task FailDelegationTurnAsync(
+        WorkItem item,
+        Project project,
+        string brief,
+        AgentKind? agent,
+        string? model,
+        string outcome,
+        string reason,
+        string auditLogReason,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct)
+    {
+        await RecordDelegationEventAsync(
+            item, brief, agent, model, outcome, reason, repoId, baseBranch, workBranch, ct);
+        await ParkDelegationForOperatorAsync(
+            item, project, ct, reason,
+            auditLogReason: auditLogReason,
+            outcome: outcome,
+            countAttempt: true);
     }
 
     private async Task ParkAuditForOperatorAsync(
@@ -12027,10 +12056,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Delegation was entered without an explicit new trigger; refusing a second attempt on the same trigger. Retry from delegation to authorize another attempt.",
                 auditLogReason: "delegation without trigger",
                 outcome: DelegationOutcomes.Failed,
-                countAttempt: false,
-                brief: null,
-                agent: null,
-                model: null);
+                countAttempt: false);
             return null;
         }
         if (_briefComposer is null)
@@ -12044,16 +12070,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Delegation support is not configured on this host (no convergence-brief composer); cannot run the delegate turn.",
                 auditLogReason: "delegation not configured",
                 outcome: DelegationOutcomes.Failed,
-                countAttempt: false,
-                brief: null,
-                agent: null,
-                model: null);
+                countAttempt: false);
             return null;
         }
 
         var brief = await _briefComposer.ComposeAsync(current.Id, ct);
         var delegationPrompt = _promptComposer.BuildDelegationPrompt(brief, current.Prompt);
-        var delegationStart = DateTimeOffset.UtcNow;
+        var delegationStart = _opts.TimeProvider.GetUtcNow();
         await PublishIterationStartedAsync(
             current, project, IterationPhase.Delegation, AuditProgressIterationNumbers.DelegationPhase, ct);
 
@@ -12120,17 +12143,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // reason instead of returning to the cycle that already failed.
             var noChangeReason =
                 $"Delegate ({empty.Agent.Value}) produced no changes; nothing to audit. The item stays parked: retry from delegation to authorize another attempt, or triage manually.";
-            await RecordDelegationEventAsync(
-                current, brief, empty.Agent, observedModel, DelegationOutcomes.NoChanges,
-                noChangeReason, repoId, baseBranch, workBranch, ct);
-            await ParkDelegationForOperatorAsync(
-                current, project, ct, noChangeReason,
-                auditLogReason: "delegate produced no changes",
-                outcome: DelegationOutcomes.NoChanges,
-                countAttempt: true,
-                brief: brief,
-                agent: empty.Agent,
-                model: observedModel);
+            await FailDelegationTurnAsync(
+                current, project, brief, empty.Agent, observedModel, DelegationOutcomes.NoChanges,
+                noChangeReason, "delegate produced no changes", repoId, baseBranch, workBranch, ct);
             return null;
         }
         catch (InvalidOperationException agentFailure) when (IsDelegateAgentFailure(agentFailure))
@@ -12139,17 +12154,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // auth / transient / infra signature). Same park contract as the
             // no-change path: the item leaves the failed cycle for good.
             var failureReason = RedactAndTruncateAgentDetail(agentFailure.Message);
-            await RecordDelegationEventAsync(
-                current, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
-                failureReason, repoId, baseBranch, workBranch, ct);
-            await ParkDelegationForOperatorAsync(
-                current, project, ct, failureReason,
-                auditLogReason: "delegate turn failed",
-                outcome: DelegationOutcomes.Failed,
-                countAttempt: true,
-                brief: brief,
-                agent: observedAgent,
-                model: observedModel);
+            await FailDelegationTurnAsync(
+                current, project, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
+                failureReason, "delegate turn failed", repoId, baseBranch, workBranch, ct);
             return null;
         }
         catch (PhaseCancellationException timeout)
@@ -12159,17 +12166,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // cancel, which propagate untouched): the attempt is spent.
             var timeoutReason =
                 $"Delegate turn exceeded its timeout (source={timeout.Source}); the attempt is spent. Retry from delegation to authorize another attempt.";
-            await RecordDelegationEventAsync(
-                current, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
-                timeoutReason, repoId, baseBranch, workBranch, ct);
-            await ParkDelegationForOperatorAsync(
-                current, project, ct, timeoutReason,
-                auditLogReason: "delegate turn timed out",
-                outcome: DelegationOutcomes.Failed,
-                countAttempt: true,
-                brief: brief,
-                agent: observedAgent,
-                model: observedModel);
+            await FailDelegationTurnAsync(
+                current, project, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
+                timeoutReason, "delegate turn timed out", repoId, baseBranch, workBranch, ct);
             return null;
         }
         catch (AgentAttemptTimeoutException attemptTimeout)
@@ -12177,17 +12176,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // Per-attempt dispatch timeout: same spent-attempt contract.
             var timeoutReason =
                 $"Delegate turn exceeded its per-attempt timeout: {RedactAndTruncateAgentDetail(attemptTimeout.Message)} Retry from delegation to authorize another attempt.";
-            await RecordDelegationEventAsync(
-                current, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
-                timeoutReason, repoId, baseBranch, workBranch, ct);
-            await ParkDelegationForOperatorAsync(
-                current, project, ct, timeoutReason,
-                auditLogReason: "delegate attempt timed out",
-                outcome: DelegationOutcomes.Failed,
-                countAttempt: true,
-                brief: brief,
-                agent: observedAgent,
-                model: observedModel);
+            await FailDelegationTurnAsync(
+                current, project, brief, observedAgent, observedModel, DelegationOutcomes.Failed,
+                timeoutReason, "delegate attempt timed out", repoId, baseBranch, workBranch, ct);
             return null;
         }
 
@@ -12199,7 +12190,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // counting the attempt happen atomically with the advance.
         await RecordDelegationEventAsync(
             current, brief, observedAgent, observedModel, DelegationOutcomes.Completed,
-            Reason: null, repoId, baseBranch, workBranch, ct);
+            reason: null, repoId, baseBranch, workBranch, ct);
         await PublishIterationCompletedAsync(
             current, project, IterationPhase.Delegation, AuditProgressIterationNumbers.DelegationPhase,
             repoId, workBranch, delegationStart, ct);
