@@ -120,6 +120,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // item into conflict-rework instead of parking. Null preserves the
     // historical park behaviour (unchanged for tests / legacy embedders).
     private readonly StaleBaseConflictReworkRouter? _staleBaseReworkRouter;
+    // Optional NotDiffAttributable flake-escalation path. When wired AND
+    // enabled, an audit iteration whose only actionable failures reproduce on
+    // the base branch spawns an isolated fix item and parks the parent on a
+    // dependsOn gate instead of burning rework iterations. Null preserves the
+    // historical rework behaviour (unchanged for tests / legacy embedders).
+    private readonly NonDeterministicTestEscalationService? _flakeEscalation;
+    private readonly NonDeterministicTestEscalationSnapshot? _flakeEscalationOptions;
     // Per-agent concurrency view used by BuildAgenticConflictCandidatesAsync to
     // deprioritize agents whose operator-configured cap is at ceiling. The cap
     // is shorthand for "this agent's API account budget is currently
@@ -377,7 +384,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // composition roots that enable deployment-stage auditing wire both.
         IDeploymentManager? deploymentManager = null,
         IDeploymentSubstrateProvider? deploymentSubstrates = null,
-        StaleBaseConflictReworkRouter? staleBaseReworkRouter = null)
+        StaleBaseConflictReworkRouter? staleBaseReworkRouter = null,
+        NonDeterministicTestEscalationService? flakeEscalation = null,
+        NonDeterministicTestEscalationSnapshot? flakeEscalationOptions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -499,6 +508,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         _staleBaseReworkRouter = staleBaseReworkRouter;
+        _flakeEscalation = flakeEscalation;
+        _flakeEscalationOptions = flakeEscalationOptions;
         _questionsSuggestions = new QuestionsSuggestionsParker(
             _questionStore, _suggestions, _store, _webhooks, _pipelineTuning, _log,
             (item, state, ct, project) => Transition(item, state, ct, project));
@@ -10810,6 +10821,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             IReadOnlyList<string> completedAuditors;
             IReadOnlyList<string> incompleteAuditors;
             AuditFinding? requiredBuildFinding;
+            IReadOnlyList<TestFailureAttributionResult> iterationAttributions = [];
             int? revisionForCtx = null;
             List<AuditFinding>? priorBlockingFindings = null;
             // Hoisted so the deployment stage (below, outside the code-stage
@@ -10876,12 +10888,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     PriorBlockingFindings: priorBlockingFindings);
                 var prePassedBuildTestGateEvidence = BuildTestGateEvidence.None;
                 var auditorsForCollection = scheduledAuditors;
+                var preGateAttributions = new List<TestFailureAttributionResult>();
                 if (scheduledAuditors.Any(RequiresPassedBuildTestGate))
                 {
                     var requiredBuildGateResult = await _requiredBuildGate.RunForAuditGateAsync(
                         item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
                     if (requiredBuildGateResult.Applies)
                         preCompletedAuditors.Add(RequiredBuildGateIdentity.AuditorName);
+                    if (requiredBuildGateResult.TestFailureAttributions is { Count: > 0 } preAttr)
+                        preGateAttributions.AddRange(preAttr);
                     if (requiredBuildGateResult.Finding is not null)
                     {
                         preCollectedFindings.Add(requiredBuildGateResult.Finding);
@@ -10921,13 +10936,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 incompleteVerdict = collection.IncompleteVerdict;
                 completedAuditors = [.. preCompletedAuditors, .. (collection.CompletedAuditors ?? [])];
                 incompleteAuditors = collection.IncompleteAuditors ?? [];
+                iterationAttributions = [.. preGateAttributions, .. (collection.TestFailureAttributions ?? [])];
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
 
-                requiredBuildFinding = incompleteVerdict || scheduledAuditors.Any(RequiresPassedBuildTestGate)
-                    ? null
-                    : await _requiredBuildGate.RunForAuditAsync(
+                if (incompleteVerdict || scheduledAuditors.Any(RequiresPassedBuildTestGate))
+                {
+                    requiredBuildFinding = null;
+                }
+                else
+                {
+                    var postGate = await _requiredBuildGate.RunForAuditGateAsync(
                         item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
+                    requiredBuildFinding = postGate.Finding;
+                    if (postGate.TestFailureAttributions is { Count: > 0 } postAttr)
+                        iterationAttributions = [.. iterationAttributions, .. postAttr];
+                }
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
@@ -11140,6 +11164,26 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
                 iteration, maxIterations, blocking.Count, item.Id);
 
+            // NotDiffAttributable flake escalation: a test failure that
+            // reproduces on the base branch is not caused by the diff, so it
+            // must NOT be fed back to the rework agent. Spawn (or reuse) an
+            // isolated base-branch fix item, park the parent on a dependsOn
+            // gate, and leave the audit loop — the parent resumes (re-audited
+            // from the next iteration) once the child merges.
+            var flakeParked = await TryEscalateNotDiffAttributableAsync(
+                item, project, baseBranch, iterationAttributions, ct);
+            if (flakeParked)
+            {
+                CodeyBoxMeters.AuditIterations.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "flake_escalated"),
+                    selfReviewTag,
+                    iterationTag,
+                    plannedTag);
+                EmitSessionAuditOutcomeMetrics(iteration, "flake_escalated");
+                auditPhaseScope.Dispose();
+                return true;
+            }
+
             if (iteration == maxIterations)
             {
                 if (HasAuditConvergenceProgress(auditHistory))
@@ -11203,6 +11247,89 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (parked) return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// NotDiffAttributable flake escalation for one audit iteration. When the
+    /// iteration's test-failure attributions contain a genuine
+    /// NotDiffAttributable verdict, the failure reproduces on the base branch
+    /// and must not be fed back to the rework agent. Delegates to
+    /// <see cref="NonDeterministicTestEscalationService"/> (spawn-or-reuse a
+    /// base-branch fix item, park the parent on dependsOn) and publishes a
+    /// webhook event. Returns true when the parent was parked. Never throws:
+    /// any fault returns false so the audit loop falls back to normal rework.
+    /// </summary>
+    private async Task<bool> TryEscalateNotDiffAttributableAsync(
+        WorkItem item,
+        Project project,
+        string baseBranch,
+        IReadOnlyList<TestFailureAttributionResult> attributions,
+        CancellationToken ct)
+    {
+        if (attributions is null || attributions.Count == 0)
+            return false;
+        if (!NonDeterministicTestEscalationPolicy.HasActionableTests(attributions))
+            return false;
+
+        NonDeterministicTestEscalationService service;
+        try
+        {
+            service = _flakeEscalation
+                ?? new NonDeterministicTestEscalationService(
+                    _store, _taskQueue, _flakeEscalationOptions, _opts.TimeProvider);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Flake escalation service construction for work item {Id} failed; falling back to normal rework",
+                item.Id);
+            return false;
+        }
+
+        FlakeEscalationResult result;
+        try
+        {
+            result = await service.TryEscalateAsync(item, attributions, baseBranch, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Flake escalation for work item {Id} threw; falling back to normal rework",
+                item.Id);
+            return false;
+        }
+
+        if (!result.Escalated || result.ChildId is null)
+            return false;
+
+        try
+        {
+            var snapshot = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.flake_escalated",
+                WorkItem = snapshot,
+                Project = project,
+                Details = new
+                {
+                    childId = result.ChildId.ToString(),
+                    reusedExisting = result.ReusedExisting,
+                    flakyTests = result.FlakyTests ?? [],
+                },
+            }, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Flake escalation webhook for work item {Id} failed; parent is still parked",
+                item.Id);
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -12830,7 +12957,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             [.. (first.CompletedAuditors ?? []), .. (second.CompletedAuditors ?? [])],
             [.. (first.IncompleteAuditors ?? []), .. (second.IncompleteAuditors ?? [])],
             first.PassedBuildTestGateEvidence | second.PassedBuildTestGateEvidence,
-            first.BuildTestGateFailed || second.BuildTestGateFailed);
+            first.BuildTestGateFailed || second.BuildTestGateFailed,
+            [.. (first.TestFailureAttributions ?? []), .. (second.TestFailureAttributions ?? [])]);
 
     private static Func<AuditProgressUpdate, CancellationToken, Task>? PrefixProgressUpdate(
         AuditorBatchResult prefix,
@@ -12962,6 +13090,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var findings = new List<AuditFinding>();
         var completedAuditors = new List<string>();
+        var testFailureAttributions = new List<TestFailureAttributionResult>();
         AgentKind? activeAuditAgentKind = null;
         var declaredShortCircuitBlocking = false;
         using var progressWriteLock = new SemaphoreSlim(1, 1);
@@ -13226,6 +13355,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         if (needsCreds && runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= runner.Kind;
                         findings.AddRange(run.Result.Findings);
+                        if (run.Result.TestFailureAttributions.Count > 0)
+                            testFailureAttributions.AddRange(run.Result.TestFailureAttributions);
                         completedAuditors.Add(auditor.Name);
                         await PublishPartialProgressAsync(findings.ToList(), completedAuditors.ToList(), ct);
                         if (detectDeclaredShortCircuit
@@ -13242,7 +13373,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                 declaredShortCircuitBlocking,
                                 CompletedAuditors: completedAuditors.ToList(),
                                 PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
-                                BuildTestGateFailed: buildTestGateFailed);
+                                BuildTestGateFailed: buildTestGateFailed,
+                                TestFailureAttributions: testFailureAttributions.ToList());
                     }
                 }
                 catch (AuditorIdleTimeoutException ex)
@@ -13262,7 +13394,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         CompletedAuditors: completedAuditors.ToList(),
                         IncompleteAuditors: [AuditBudgetOrdering.FormatBudgetedAuditorLabel(ex.AuditorName, ex.AgentKind.Value, ex.BudgetPath, ex.Timeout)],
                         PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
-                        BuildTestGateFailed: buildTestGateFailed);
+                        BuildTestGateFailed: buildTestGateFailed,
+                        TestFailureAttributions: testFailureAttributions.ToList());
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException
                                            && (findings.Count > 0 || completedAuditors.Count > 0))
@@ -13678,6 +13811,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         var partialCompleted = baseCompletedBeforeLlm
                             .Concat(completedSnapshot.Select(e => e.Run.Auditor.Name))
                             .ToList();
+                        var partialAttributions = testFailureAttributions
+                            .Concat(completedSnapshot.SelectMany(e => e.Run.Result.TestFailureAttributions))
+                            .ToList();
                         _log.LogWarning(
                             "Audit iteration {Iteration} has incomplete LLM auditor verdict(s): {Auditors}; continuing with {FindingCount} completed finding(s)",
                             ctx.Iteration,
@@ -13691,7 +13827,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             CompletedAuditors: partialCompleted,
                             IncompleteAuditors: incompleteAuditors,
                             PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
-                            BuildTestGateFailed: buildTestGateFailed);
+                            BuildTestGateFailed: buildTestGateFailed,
+                            TestFailureAttributions: partialAttributions);
                     }
 
                     // Every task succeeded — gather results in stable order.
@@ -13709,6 +13846,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         if (needsCreds && run.Runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= run.Runner.Kind;
                         findings.AddRange(run.Result.Findings);
+                        if (run.Result.TestFailureAttributions.Count > 0)
+                            testFailureAttributions.AddRange(run.Result.TestFailureAttributions);
                         completedAuditors.Add(run.Auditor.Name);
                         if (detectDeclaredShortCircuit
                             && run.Auditor.CanShortCircuitOnBlockingFinding
@@ -13724,7 +13863,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             declaredShortCircuitBlocking,
                             CompletedAuditors: completedAuditors.ToList(),
                             PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
-                            BuildTestGateFailed: buildTestGateFailed);
+                            BuildTestGateFailed: buildTestGateFailed,
+                            TestFailureAttributions: testFailureAttributions.ToList());
                 }
                 finally
                 {
@@ -13740,7 +13880,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             declaredShortCircuitBlocking,
             CompletedAuditors: completedAuditors.ToList(),
             PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
-            BuildTestGateFailed: buildTestGateFailed);
+            BuildTestGateFailed: buildTestGateFailed,
+            TestFailureAttributions: testFailureAttributions.ToList());
     }
 
     private static List<(IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member)> OrderResolvedAuditorsForBatch(
@@ -14818,7 +14959,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IReadOnlyList<string>? CompletedAuditors = null,
         IReadOnlyList<string>? IncompleteAuditors = null,
         BuildTestGateEvidence PassedBuildTestGateEvidence = BuildTestGateEvidence.None,
-        bool BuildTestGateFailed = false);
+        bool BuildTestGateFailed = false,
+        IReadOnlyList<TestFailureAttributionResult>? TestFailureAttributions = null);
 
     private enum AuditProgressUpdateOperation
     {

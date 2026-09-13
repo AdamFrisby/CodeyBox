@@ -81,6 +81,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentPricingState? _pricingState;
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
     private readonly PipelineTuningSnapshot? _pipelineTuning;
+    private readonly NonDeterministicTestEscalationSnapshot? _flakeEscalation;
     private readonly BudgetDeferralRecheckSnapshot? _budgetDeferralRecheck;
     private readonly AgentCircuitBreakerSnapshot? _circuitBreaker;
     private readonly QuotaRouterOptions? _quotaRouterOptions;
@@ -107,6 +108,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastBudgets = "";
     private string _lastDefaults = "";
     private string _lastIncrementalRebase = "";
+    private string _lastFlakeEscalation = "";
     private string _lastSanitizer = "";
     private string _lastQuotaRouter = "";
     private string _lastPipelineTuning = "";
@@ -136,6 +138,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         IAgentBudgetConfigReloadable? budgetReloader = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
+        NonDeterministicTestEscalationSnapshot? flakeEscalation = null,
         BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
         AgentCircuitBreakerSnapshot? circuitBreaker = null,
         QuotaRouterOptions? quotaRouterOptions = null,
@@ -167,6 +170,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _costCalculator = costCalculator;
         _pricingState = pricingState;
         _incrementalRebase = incrementalRebase;
+        _flakeEscalation = flakeEscalation;
         _pipelineTuning = pipelineTuning;
         _budgetDeferralRecheck = budgetDeferralRecheck;
         _circuitBreaker = circuitBreaker;
@@ -198,6 +202,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastDefaults = SerializeDefaults(initial.AgentDefaults);
         _lastNetworkTolerance = SerializeNetworkTolerance(initial.AgentNetworkTolerance);
         _lastIncrementalRebase = SerializeIncrementalRebase(initial.IncrementalRebase);
+        _lastFlakeEscalation = SerializeFlakeEscalation(initial.NonDeterministicTestEscalation);
         _lastSanitizer = SerializeSanitizer(initial.ClaudeThinkingBlockSanitizer);
         _lastQuotaRouter = SerializeQuotaRouter(initial.QuotaRouter);
         _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
@@ -253,6 +258,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyNetworkToleranceIfChanged(opts);
             ApplyAgentPausesIfChanged(opts);
             ApplyIncrementalRebaseIfChanged(opts);
+            ApplyFlakeEscalationIfChanged(opts);
             ApplySanitizerIfChanged(opts);
             ApplyQuotaRouterIfChanged(opts);
             ApplyPipelineTuningIfChanged(opts);
@@ -489,6 +495,35 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         {
             _log.LogError(ex,
                 "Hot-reload of IncrementalRebase rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    private void ApplyFlakeEscalationIfChanged(CodeyBoxOptions opts)
+    {
+        if (_flakeEscalation is null) return;
+
+        var next = SerializeFlakeEscalation(opts.NonDeterministicTestEscalation);
+        if (string.Equals(_lastFlakeEscalation, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastFlakeEscalation;
+        try
+        {
+            _flakeEscalation.Replace(new NonDeterministicTestEscalationOptions
+            {
+                Enabled = opts.NonDeterministicTestEscalation.Enabled,
+                MaxTestsPerChild = opts.NonDeterministicTestEscalation.MaxTestsPerChild,
+            });
+            _lastFlakeEscalation = next;
+            AuditLog.ConfigReloaded("NonDeterministicTestEscalation", prev, next);
+            _log.LogInformation("Hot-reloaded NonDeterministicTestEscalation: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of NonDeterministicTestEscalation rejected; keeping prior view ({Prev}). " +
                 "Fix the configuration error and re-save to retry.",
                 prev);
         }
@@ -1032,6 +1067,15 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     private static string SerializeIncrementalRebase(IncrementalRebaseOptions opts) =>
         JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
+
+    private static string SerializeFlakeEscalation(NonDeterministicTestEscalationOptions opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.Enabled,
+                opts.MaxTestsPerChild,
+            },
+            JsonOpts);
 
     private static string SerializeSanitizer(ClaudeThinkingBlockSanitizerOptions opts) =>
         JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
