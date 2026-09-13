@@ -14,25 +14,37 @@ namespace CodeyBox.Tests;
 /// condition is armed, stays parked when it is not, and never escalates a
 /// second time. Pipeline-level audit-max coverage lives in
 /// <see cref="DelegationAuditEscalationTests"/>.
+///
+/// Audit assertions use a dedicated Serilog logger pushed through
+/// <see cref="CodeyBox.Core.AuditLog.PushScopedLogger"/> rather than the
+/// process-global <c>Log.Logger</c>: a <c>WebApplicationFactory</c> host boot
+/// running concurrently in a sibling collection rebuilds the global logger,
+/// which previously rerouted the sweep's <c>terminal_failure_classified</c>
+/// event off the test sink (and let foreign host events land in it). The
+/// AsyncLocal scope flows into the awaited sweep and is immune to those
+/// global swaps, so this class stays out of the GlobalSerilog collection.
 /// </summary>
-[Collection("GlobalSerilog")]
 public sealed class DelegationSweepEscalationTests : IDisposable
 {
     private static readonly ProjectId TestProjectId = new("test-project");
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-delseep-").FullName;
     private readonly TestSink _sink = new();
+    private readonly Serilog.Core.Logger _auditLogger;
+    private readonly IDisposable _auditScope;
 
     public DelegationSweepEscalationTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+        _auditScope = CodeyBox.Core.AuditLog.PushScopedLogger(_auditLogger);
     }
 
     public void Dispose()
     {
-        Log.CloseAndFlush();
+        _auditScope.Dispose();
+        _auditLogger.Dispose();
         try { Directory.Delete(_workspace, recursive: true); } catch { }
     }
 
