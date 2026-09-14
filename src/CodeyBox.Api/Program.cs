@@ -7,6 +7,7 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Antigravity;
+using CodeyBox.Agents.CavemanCode;
 using CodeyBox.Agents.Crock;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
@@ -1154,6 +1155,8 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new GeminiAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner>(sp => new CavemanCodeAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner>(sp => new AntigravityAgentRunner
 {
     // agy's built-in --print-timeout default (5m) aborts a one-shot session with
@@ -1571,6 +1574,20 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
             CopilotAgentRunner.ProviderBearerTokenEnvironmentVariable),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
+        // CavemanCode is BYOK across providers: the CLI reads whichever
+        // provider key is present (ANTHROPIC_API_KEY, OPENAI_API_KEY, … —
+        // see CavemanCodeAgentRunner.CredentialEnvironmentVariables). The
+        // namespaced host vars keep secrets out of config files; the
+        // verbatim rows let hosts that already inject the conventional
+        // provider keys work without extra operator wiring.
+        new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_GEMINI_API_KEY", "GEMINI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "OPENAI_API_KEY", "OPENAI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "GEMINI_API_KEY", "GEMINI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
         // Cursor: the CLI uses subscription auth via ~/.cursor/credentials.json
         // (NOT an env-var key). The orchestrator ships the file's contents to
         // the sandbox via CODEYBOX_CURSOR_AUTH_JSON and CursorAgentRunner
@@ -2270,6 +2287,9 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new OpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new CavemanCodeSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CavemanCodeSmokeProbe>()));
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new AntigravitySmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AntigravitySmokeProbe>()));
@@ -2284,6 +2304,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CavemanCodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CrockInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
@@ -2336,6 +2357,14 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         new DefaultOpencodeCliRunner(),
         binary: Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_BINARY"),
         loggerFactory.CreateLogger<OpencodeModelListProbe>());
+});
+builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    return new CavemanCodeModelListProbe(
+        new DefaultCavemanCodeCliRunner(),
+        binary: Environment.GetEnvironmentVariable("CODEYBOX_CAVEMANCODE_BINARY"),
+        loggerFactory.CreateLogger<CavemanCodeModelListProbe>());
 });
 builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
 {
@@ -3346,6 +3375,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Copilot] = new CopilotCostExtractor(),
         [AgentKind.Antigravity] = new AntigravityCostExtractor(),
         [AgentKind.Crock] = new CrockCostExtractor(),
+        [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3437,6 +3467,7 @@ builder.Services.AddSingleton<IAgentStreamParser, CopilotStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -3472,6 +3503,7 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
     return new CursorQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CopilotQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
