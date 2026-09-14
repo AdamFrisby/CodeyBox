@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using CodeyBox.Agents.CavemanCode;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 
 namespace CodeyBox.Tests;
 
@@ -129,6 +130,59 @@ public sealed class CavemanCodeModelListProbeTests
         Assert.Null(result.FailureReason);
         Assert.Contains("openai/gpt-5.5", result.ModelIds);
         Assert.Contains("anthropic/claude-opus-4-6", result.ModelIds);
+    }
+
+    [Fact]
+    public async Task DefaultCliRunner_StartFailed_MapsToFailureResult()
+    {
+        var process = new StartFailedProcessRunner();
+        var runner = new DefaultCavemanCodeCliRunner(
+            process,
+            environment: new Dictionary<string, string>());
+
+        var run = await runner.RunListModelsAsync("caveman-code", CancellationToken.None);
+
+        Assert.Equal(new[] { "caveman-code", "--list-models" }, process.SeenArgv);
+        Assert.Equal(1, run.ExitCode);
+        Assert.Equal("", run.Stdout);
+        Assert.Equal("", run.Stderr);
+    }
+
+    [Fact]
+    public async Task GetModelListAsync_BinaryMissing_FailsGracefullyThroughRealRunner()
+    {
+        // Real runner + probe wiring with only the process boundary stubbed:
+        // a missing binary must surface as a probe failure, never a throw
+        // and never an empty success.
+        var probe = new CavemanCodeModelListProbe(
+            new DefaultCavemanCodeCliRunner(
+                new StartFailedProcessRunner(),
+                environment: new Dictionary<string, string>()));
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.NotNull(result.FailureReason);
+        Assert.Empty(result.ModelIds);
+    }
+
+    private sealed class StartFailedProcessRunner : IProcessRunner
+    {
+        public IReadOnlyList<string> SeenArgv { get; private set; } = Array.Empty<string>();
+
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
+        {
+            SeenArgv = argv;
+            return Task.FromResult(new ProcessRunResult(1, "", "", StartFailed: true));
+        }
     }
 
     private sealed class StubCavemanCodeCliRunner(int exitCode, string stdout, string stderr) : ICavemanCodeCliRunner
