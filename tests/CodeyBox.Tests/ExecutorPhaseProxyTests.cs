@@ -293,18 +293,28 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     }
 
     [Fact]
-    public async Task CordonedExecutor_IsNeverSelected_FallsBackToInProcess()
+    public async Task CordonedExecutor_IsNeverSelected_RequeuedUnderBackoff_NotFailed()
     {
         using var ctx = CreateContext(["exec-1"], cordoned: true);
         var item = WorkItemId.New();
         await SeedBareRepoAsync(ctx.Git, item);
+        var request = NewRequest(item, "work", 0);
 
-        var result = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => ctx.Proxy.ExecutePhaseAsync(request, CancellationToken.None));
 
-        Assert.Equal(ExecutorPhaseOutcome.Succeeded, result.Outcome);
-        Assert.NotNull(result.CommitSha);
+        Assert.Equal("executor", thrown.Provider);
+        Assert.Equal("placement", thrown.Operation);
+        Assert.Equal("no-eligible-host", thrown.ErrorClass);
+        Assert.Contains("exec-1=cordoned", thrown.Detail);
+        Assert.Equal(TimeSpan.FromSeconds(15), thrown.RecheckIn);
         Assert.Equal(0, ctx.Factory.Resolves);
-        Assert.Equal(1, ctx.InnerSpy.Calls);
+        Assert.Equal(0, ctx.InnerSpy.Calls);
+        var lookup = await ctx.Store.LookupAsync(
+            ExecutorPhaseProxy.BuildDispatchKey(request),
+            ExecutorPhaseProxy.ComputeBodyHash(request),
+            DateTimeOffset.UtcNow);
+        Assert.Equal(IdempotencyLookupOutcome.Miss, lookup.Outcome);
     }
 
     [Fact]
@@ -313,7 +323,177 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => new ExecutorPhaseDispatchOptions { StageOutMaxArchiveBytes = 0 }.Validate());
         Assert.Throws<InvalidOperationException>(() => new ExecutorPhaseDispatchOptions { StageOutMaxEntries = 0 }.Validate());
         Assert.Throws<InvalidOperationException>(() => new ExecutorPhaseDispatchOptions { StageOutMaxExpansionRatio = 0.5 }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new ExecutorPhaseDispatchOptions { PlacementRecheckIn = TimeSpan.Zero }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new ExecutorPhaseDispatchOptions { RuntimeUnhealthyBackoff = TimeSpan.Zero }.Validate());
         new ExecutorPhaseDispatchOptions().Validate();
+    }
+
+    // ── verification 8: credential-aware placement ──────────────────────────
+
+    [Fact]
+    public async Task CredentialHeldByOneHost_PlacedOnThatHost()
+    {
+        using var ctx = CreateContext([]);
+        AddExecutorHost(ctx, "exec-1", credentials: ["claude"]);
+        AddExecutorHost(ctx, "exec-2", credentials: ["codex"]);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+
+        var result = await ctx.Proxy.ExecutePhaseAsync(
+            NewPlacementRequest(item, "work", 0, credential: "codex"), CancellationToken.None);
+
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, result.Outcome);
+        Assert.Equal(0, ctx.Transports["exec-1"].RunPhaseCalls);
+        Assert.Equal(1, ctx.Transports["exec-2"].RunPhaseCalls);
+    }
+
+    // ── verification 9: network-profile placement ───────────────────────────
+
+    [Fact]
+    public async Task NetworkProfileAbsentFromHost_NeverPlacedThere()
+    {
+        using var ctx = CreateContext([]);
+        AddExecutorHost(ctx, "exec-1", profiles: ["open"]);
+        AddExecutorHost(ctx, "exec-2", profiles: ["open", "restricted"]);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+
+        var result = await ctx.Proxy.ExecutePhaseAsync(
+            NewPlacementRequest(item, "work", 0, networkProfile: "restricted"), CancellationToken.None);
+
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, result.Outcome);
+        Assert.Equal(0, ctx.Transports["exec-1"].RunPhaseCalls);
+        Assert.Equal(1, ctx.Transports["exec-2"].RunPhaseCalls);
+    }
+
+    // ── verification 10: capacity ───────────────────────────────────────────
+
+    [Fact]
+    public async Task FullHost_SkippedWhileAtCapacity_SelectableWhenFreed()
+    {
+        using var ctx = CreateContext([]);
+        AddExecutorHost(ctx, "exec-1", capacity: 1, currentWorkItemId: WorkItemId.New().ToString());
+        AddExecutorHost(ctx, "exec-2", capacity: 1);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+
+        var first = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, first.Outcome);
+        Assert.Equal(0, ctx.Transports["exec-1"].RunPhaseCalls);
+        Assert.Equal(1, ctx.Transports["exec-2"].RunPhaseCalls);
+
+        await ctx.Registry.HeartbeatAsync(ExecutorRegistration.WorkerIdFor("exec-1"), null);
+        var freed = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, freed);
+        var second = await ctx.Proxy.ExecutePhaseAsync(NewRequest(freed, "work", 0), CancellationToken.None);
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, second.Outcome);
+        Assert.Equal(1, ctx.Transports["exec-1"].RunPhaseCalls);
+    }
+
+    // ── verification 11: unhealthy excluded, requeued under backoff ─────────
+
+    [Fact]
+    public async Task UnhealthyHost_Excluded_RequeuedUnderBackoff_NotFailed()
+    {
+        using var ctx = CreateContext([]);
+        AddExecutorHost(ctx, "exec-1", healthy: false);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+        var request = NewRequest(item, "work", 0);
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => ctx.Proxy.ExecutePhaseAsync(request, CancellationToken.None));
+
+        Assert.Equal("executor", thrown.Provider);
+        Assert.Equal("no-eligible-host", thrown.ErrorClass);
+        Assert.Contains("exec-1=unhealthy", thrown.Detail);
+        Assert.Equal(TimeSpan.FromSeconds(15), thrown.RecheckIn);
+        Assert.Equal(0, ctx.Factory.Resolves);
+        Assert.Equal(0, ctx.InnerSpy.Calls);
+    }
+
+    // ── verification 12: unplaceable capability ─────────────────────────────
+
+    [Fact]
+    public async Task CapabilityNoHostProvides_ReportedUnplaceable_NamingTag_WithoutReworkCost()
+    {
+        using var ctx = CreateContext([]);
+        AddExecutorHost(ctx, "exec-1", capabilities: ["general"]);
+        AddExecutorHost(ctx, "exec-2", capabilities: ["general"]);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+        var request = NewPlacementRequest(item, "work", 0, capabilities: ["sensitive"]);
+
+        var thrown = await Assert.ThrowsAsync<ExecutorPlacementUnplaceableException>(
+            () => ctx.Proxy.ExecutePhaseAsync(request, CancellationToken.None));
+
+        Assert.Equal("sensitive", thrown.UnmetCapability);
+        Assert.Contains("exec-1=missing-capability:sensitive", thrown.Detail);
+        Assert.Contains("exec-2=missing-capability:sensitive", thrown.Detail);
+        Assert.NotNull(thrown.Decision);
+        Assert.True(thrown.Decision.IsUnplaceable);
+        Assert.Equal(0, ctx.Factory.Resolves);
+        Assert.Equal(0, ctx.InnerSpy.Calls);
+        var lookup = await ctx.Store.LookupAsync(
+            ExecutorPhaseProxy.BuildDispatchKey(request),
+            ExecutorPhaseProxy.ComputeBodyHash(request),
+            DateTimeOffset.UtcNow);
+        Assert.Equal(IdempotencyLookupOutcome.Miss, lookup.Outcome);
+    }
+
+    // ── verification 13: refusal reasons recorded per candidate ─────────────
+
+    [Fact]
+    public async Task NoEligibleHost_DeferralNames_EachCandidateRefusalReason()
+    {
+        using var ctx = CreateContext([]);
+        AddExecutorHost(ctx, "exec-1", cordoned: true);
+        AddExecutorHost(ctx, "exec-2", capacity: 1, currentWorkItemId: WorkItemId.New().ToString());
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None));
+
+        Assert.Equal("no-eligible-host", thrown.ErrorClass);
+        Assert.Contains("exec-1=cordoned", thrown.Detail);
+        Assert.Contains("exec-2=at-capacity(1/1)", thrown.Detail);
+    }
+
+    // ── verification 14: lying host fails over, failure host-attributed ─────
+
+    [Fact]
+    public async Task HostDeclaringCredentialItLacks_FailsOverToEligibleHost_NotAgentFailure()
+    {
+        using var ctx = CreateContext([]);
+        AddExecutorHost(ctx, "exec-1", credentials: ["codex"]);
+        AddExecutorHost(ctx, "exec-2", credentials: ["codex"]);
+        ctx.Transports["exec-1"].RunPhaseOverride = _ => new ExecutorPhaseResult
+        {
+            Outcome = ExecutorPhaseOutcome.AgentFailed,
+            Usage = new ExecutorPhaseUsage(1, 1, 0m),
+            Findings = [],
+            ErrorMessage = ExecutorPhaseProxy.CredentialMissingErrorPrefix + " credential file absent on host",
+        };
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+
+        var result = await ctx.Proxy.ExecutePhaseAsync(
+            NewPlacementRequest(item, "work", 0, credential: "codex"), CancellationToken.None);
+
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, result.Outcome);
+        Assert.NotNull(result.CommitSha);
+        Assert.Equal(1, ctx.Transports["exec-1"].RunPhaseCalls);
+        Assert.Equal(1, ctx.Transports["exec-2"].RunPhaseCalls);
+        Assert.Equal(0, ctx.InnerSpy.Calls);
+
+        var next = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, next);
+        var second = await ctx.Proxy.ExecutePhaseAsync(
+            NewPlacementRequest(next, "work", 0, credential: "codex"), CancellationToken.None);
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, second.Outcome);
+        Assert.Equal(1, ctx.Transports["exec-1"].RunPhaseCalls);
+        Assert.Equal(2, ctx.Transports["exec-2"].RunPhaseCalls);
     }
 
     // ── harness ─────────────────────────────────────────────────────────────
@@ -347,13 +527,45 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         var inner = new InProcessExecutorPhaseRunner(git, handler, () => options);
         var spy = new SpyRunner(inner);
         var proxy = new ExecutorPhaseProxy(registry, factory, git, store, spy, () => options);
+        var ctx = new TestHarness(git, store, registry, handler, factory, inner, spy, proxy);
         foreach (var host in executors)
-        {
-            registry.AddExecutor(host, cordoned);
-            factory.AddHost(host, Path.Combine(_root, "executor-" + host + "-" + Guid.NewGuid().ToString("N")), handler);
-        }
-        return new TestHarness(git, store, handler, factory, inner, spy, proxy);
+            AddExecutorHost(ctx, host, cordoned: cordoned);
+        return ctx;
     }
+
+    private void AddExecutorHost(
+        TestHarness ctx,
+        string hostId,
+        bool cordoned = false,
+        bool healthy = true,
+        int? capacity = 4,
+        string[]? profiles = null,
+        string[]? credentials = null,
+        string[]? capabilities = null,
+        string? currentWorkItemId = null)
+    {
+        ctx.Registry.AddExecutor(hostId, cordoned, healthy, capacity, profiles, credentials, capabilities, currentWorkItemId);
+        ctx.Factory.AddHost(hostId, Path.Combine(_root, "executor-" + hostId + "-" + Guid.NewGuid().ToString("N")), ctx.Handler);
+    }
+
+    private static ExecutorPhaseRequest NewPlacementRequest(
+        WorkItemId item,
+        string phase,
+        int attempt,
+        string? credential = null,
+        string? networkProfile = null,
+        string[]? capabilities = null,
+        string payload = "{}") => new()
+        {
+            WorkItemId = item.ToString(),
+            Phase = phase,
+            Attempt = attempt,
+            RepositoryId = item.ToString(),
+            PayloadJson = payload,
+            RequiredCredential = credential,
+            RequiredNetworkProfile = networkProfile,
+            RequiredCapabilities = capabilities ?? [],
+        };
 
     private async Task SeedBareRepoAsync(LocalGitHost git, WorkItemId item)
     {
@@ -454,6 +666,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         public TestHarness(
             LocalGitHost git,
             SqliteIdempotencyStore store,
+            FakeWorkerRegistry registry,
             GitCommitPhaseHandler handler,
             FakeTransportFactory factory,
             InProcessExecutorPhaseRunner inner,
@@ -462,6 +675,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         {
             Git = git;
             Store = store;
+            Registry = registry;
             Handler = handler;
             Factory = factory;
             Inner = inner;
@@ -471,6 +685,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
 
         public LocalGitHost Git { get; }
         public SqliteIdempotencyStore Store { get; }
+        public FakeWorkerRegistry Registry { get; }
         public GitCommitPhaseHandler Handler { get; }
         public FakeTransportFactory Factory { get; }
         public Dictionary<string, FakePhaseTransport> Transports => Factory.Transports;
@@ -500,7 +715,15 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     {
         private readonly Dictionary<string, WorkerRegistration> _rows = new(StringComparer.Ordinal);
 
-        public void AddExecutor(string hostId, bool cordoned = false)
+        public void AddExecutor(
+            string hostId,
+            bool cordoned = false,
+            bool healthy = true,
+            int? capacity = 4,
+            string[]? profiles = null,
+            string[]? credentials = null,
+            string[]? capabilities = null,
+            string? currentWorkItemId = null)
         {
             var now = DateTimeOffset.UtcNow;
             _rows[ExecutorRegistration.WorkerIdFor(hostId)] = new WorkerRegistration
@@ -510,12 +733,14 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
                 ProcessId = 4242,
                 StartedAt = now,
                 LastHeartbeatAt = now,
+                CurrentWorkItemId = currentWorkItemId,
                 ExecutorHostId = hostId,
-                MaxConcurrentSandboxes = 4,
-                ExecutorNetworkProfiles = [],
-                ExecutorCredentials = [],
+                MaxConcurrentSandboxes = capacity,
+                ExecutorNetworkProfiles = profiles ?? [],
+                ExecutorCredentials = credentials ?? [],
+                ExecutorCapabilities = capabilities ?? [],
                 Cordoned = cordoned,
-                Healthy = true,
+                Healthy = healthy,
             };
         }
 
@@ -650,6 +875,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         public int RunPhaseCalls { get; private set; }
         public ExecutorPhaseTransportException? FailWith;
         public Func<Stream, Task>? CustomArchive;
+        public Func<ExecutorPhaseRequest, ExecutorPhaseResult?>? RunPhaseOverride;
         public long? LastStageOutMaxBytes { get; private set; }
         public long StageOutBytesWritten { get; private set; }
 
@@ -666,6 +892,15 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         {
             ThrowIfFailing();
             StagedInPaths.Add(Path.GetFullPath(hostRepoPath));
+            foreach (var entry in Directory.GetFileSystemEntries(ExecutorRoot))
+            {
+                try
+                {
+                    if (Directory.Exists(entry)) Directory.Delete(entry, recursive: true);
+                    else File.Delete(entry);
+                }
+                catch { }
+            }
             var dest = Path.Combine(ExecutorRoot, Path.GetFileName(hostRepoPath.TrimEnd(Path.DirectorySeparatorChar)));
             CopyDirectory(hostRepoPath, dest);
             return Task.CompletedTask;
@@ -674,6 +909,12 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         public Task<ExecutorPhaseResult> RunPhaseAsync(ExecutorPhaseRequest request, CancellationToken ct)
         {
             ThrowIfFailing();
+            var overridden = RunPhaseOverride?.Invoke(request);
+            if (overridden is not null)
+            {
+                RunPhaseCalls++;
+                return Task.FromResult(overridden);
+            }
             RunPhaseCalls++;
             var staged = StagedCopy ?? throw new InvalidOperationException("No staged repo on fake executor.");
             return _handler.ExecuteAsync(request, staged, ct);

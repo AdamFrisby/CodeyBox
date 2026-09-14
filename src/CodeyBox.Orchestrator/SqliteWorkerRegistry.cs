@@ -84,6 +84,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     max_concurrent_sandboxes INTEGER,
                     executor_network_profiles TEXT,
                     executor_credentials TEXT,
+                    executor_capabilities TEXT,
                     cordoned             INTEGER NOT NULL DEFAULT 0,
                     healthy              INTEGER NOT NULL DEFAULT 1
                 );
@@ -114,8 +115,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id, executor_host_id, max_concurrent_sandboxes, executor_network_profiles, executor_credentials, cordoned, healthy)
-                VALUES ($id, $host, $pid, $started, $hb, $item, $exhost, $cap, $profiles, $creds, $cordoned, $healthy)
+                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id, executor_host_id, max_concurrent_sandboxes, executor_network_profiles, executor_credentials, executor_capabilities, cordoned, healthy)
+                VALUES ($id, $host, $pid, $started, $hb, $item, $exhost, $cap, $profiles, $creds, $caps, $cordoned, $healthy)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     host_name = excluded.host_name,
                     process_id = excluded.process_id,
@@ -126,6 +127,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     max_concurrent_sandboxes = excluded.max_concurrent_sandboxes,
                     executor_network_profiles = excluded.executor_network_profiles,
                     executor_credentials = excluded.executor_credentials,
+                    executor_capabilities = excluded.executor_capabilities,
                     cordoned = excluded.cordoned,
                     healthy = excluded.healthy;
                 """;
@@ -400,6 +402,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         cmd.Parameters.AddWithValue("$cap", (object?)reg.MaxConcurrentSandboxes ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$profiles", (object?)SerializeStringList(reg.ExecutorNetworkProfiles) ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$creds", (object?)SerializeStringList(reg.ExecutorCredentials) ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$caps", (object?)SerializeStringList(reg.ExecutorCapabilities) ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$cordoned", reg.Cordoned ? 1 : 0);
         cmd.Parameters.AddWithValue("$healthy", reg.Healthy ? 1 : 0);
     }
@@ -416,9 +419,20 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         MaxConcurrentSandboxes = r.IsDBNull(r.GetOrdinal("max_concurrent_sandboxes")) ? null : r.GetInt32(r.GetOrdinal("max_concurrent_sandboxes")),
         ExecutorNetworkProfiles = r.IsDBNull(r.GetOrdinal("executor_network_profiles")) ? null : DeserializeStringList(r.GetString(r.GetOrdinal("executor_network_profiles"))),
         ExecutorCredentials = r.IsDBNull(r.GetOrdinal("executor_credentials")) ? null : DeserializeStringList(r.GetString(r.GetOrdinal("executor_credentials"))),
+        ExecutorCapabilities = HasColumn(r, "executor_capabilities") && !r.IsDBNull(r.GetOrdinal("executor_capabilities")) ? DeserializeStringList(r.GetString(r.GetOrdinal("executor_capabilities"))) : null,
         Cordoned = r.GetInt32(r.GetOrdinal("cordoned")) != 0,
         Healthy = r.GetInt32(r.GetOrdinal("healthy")) != 0,
     };
+
+    private static bool HasColumn(SqliteDataReader r, string column)
+    {
+        for (var i = 0; i < r.FieldCount; i++)
+        {
+            if (string.Equals(r.GetName(i), column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
 
     /// <summary>
     /// Adds the executor-attribute columns to a <c>worker_registry</c> table
@@ -455,6 +469,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         ("max_concurrent_sandboxes", "max_concurrent_sandboxes INTEGER"),
         ("executor_network_profiles", "executor_network_profiles TEXT"),
         ("executor_credentials", "executor_credentials TEXT"),
+        ("executor_capabilities", "executor_capabilities TEXT"),
         ("cordoned", "cordoned INTEGER NOT NULL DEFAULT 0"),
         ("healthy", "healthy INTEGER NOT NULL DEFAULT 1"),
     ];

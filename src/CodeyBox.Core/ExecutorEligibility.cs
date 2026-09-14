@@ -75,4 +75,77 @@ public static class ExecutorEligibility
         }
         return false;
     }
+
+    /// <summary>
+    /// True when the executor's declared capabilities cover every required
+    /// tag. Uses the same vocabulary and comparison as the agent-class
+    /// router's <c>RequiredCapabilities</c> gate: ordinal, case-insensitive,
+    /// exact equality per tag. An empty required set is covered by any host.
+    /// </summary>
+    public static bool CoversRequiredCapabilities(
+        ExecutorRegistration registration,
+        IReadOnlyList<string>? required)
+    {
+        ArgumentNullException.ThrowIfNull(registration);
+        if (required is null || required.Count == 0)
+            return true;
+        if (registration.DeclaredCapabilities.Count == 0)
+            return false;
+        foreach (var tag in required)
+        {
+            if (string.IsNullOrWhiteSpace(tag))
+                continue;
+            var wanted = tag.Trim();
+            var hit = false;
+            foreach (var have in registration.DeclaredCapabilities)
+            {
+                if (string.Equals(have?.Trim(), wanted, StringComparison.OrdinalIgnoreCase))
+                {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit)
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// First required capability no host in <paramref name="hosts"/> declares
+    /// (ordinal, case-insensitive), or null when every required tag is held
+    /// by at least one host. Blank required entries are ignored.
+    /// </summary>
+    public static string? FindCapabilityNoHostProvides(
+        IEnumerable<ExecutorRegistration> hosts,
+        IReadOnlyList<string>? required)
+    {
+        ArgumentNullException.ThrowIfNull(hosts);
+        if (required is null || required.Count == 0)
+            return null;
+        foreach (var tag in required)
+        {
+            if (string.IsNullOrWhiteSpace(tag))
+                continue;
+            var wanted = tag.Trim();
+            var provided = false;
+            foreach (var host in hosts)
+            {
+                ArgumentNullException.ThrowIfNull(host);
+                foreach (var have in host.DeclaredCapabilities)
+                {
+                    if (string.Equals(have?.Trim(), wanted, StringComparison.OrdinalIgnoreCase))
+                    {
+                        provided = true;
+                        break;
+                    }
+                }
+                if (provided)
+                    break;
+            }
+            if (!provided)
+                return wanted;
+        }
+        return null;
+    }
 }

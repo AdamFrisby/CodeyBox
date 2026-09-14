@@ -38,6 +38,7 @@ public sealed class ExecutorHostTests
         Assert.Equal(2, registration.MaxConcurrentSandboxes);
         Assert.Equal(["restricted"], registration.AllowedNetworkProfiles);
         Assert.Equal(["claude"], registration.DeclaredCredentials);
+        Assert.Equal(["sensitive"], registration.DeclaredCapabilities);
     }
 
     [Theory]
@@ -212,6 +213,7 @@ public sealed class ExecutorHostTests
         Assert.Equal("exec-1", doc.RootElement.GetProperty("hostId").GetString());
         Assert.Equal(2, doc.RootElement.GetProperty("maxConcurrentSandboxes").GetInt32());
         Assert.Equal("claude", doc.RootElement.GetProperty("declaredCredentials").EnumerateArray().Single().GetString());
+        Assert.Equal("sensitive", doc.RootElement.GetProperty("declaredCapabilities").EnumerateArray().Single().GetString());
     }
 
     [Fact]
@@ -433,6 +435,32 @@ public sealed class ExecutorHostTests
             declaredCredentials = Enumerable.Range(0, ExecutorRegistration.MaxDeclaredEntries + 1).Select(i => "c" + i).ToArray(),
         });
         Assert.Equal(HttpStatusCode.BadRequest, tooMany.StatusCode);
+
+        var tooManyCapabilities = await api.PostAsJsonAsync("/executors/register", new
+        {
+            hostId = "h",
+            declaredCapabilities = Enumerable.Range(0, ExecutorRegistration.MaxDeclaredEntries + 1).Select(i => "t" + i).ToArray(),
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, tooManyCapabilities.StatusCode);
+    }
+
+    [Fact]
+    public async Task Server_Register_PersistsDeclaredCapabilities()
+    {
+        using var factory = new ExecutorApiFactory();
+        using var api = factory.CreateClient();
+
+        var resp = await api.PostAsJsonAsync("/executors/register", new
+        {
+            hostId = "cap-host",
+            declaredCapabilities = new[] { "sensitive" },
+        });
+        resp.EnsureSuccessStatusCode();
+
+        var workers = await api.GetFromJsonAsync<JsonElement>("/workers");
+        var row = workers.EnumerateArray()
+            .Single(w => w.GetProperty("workerId").GetString() == "executor:cap-host");
+        Assert.Equal("sensitive", row.GetProperty("executorCapabilities").EnumerateArray().Single().GetString());
     }
 
     [Fact]
@@ -464,6 +492,7 @@ public sealed class ExecutorHostTests
                 MaxConcurrentSandboxes = 3,
                 ExecutorNetworkProfiles = ["restricted"],
                 ExecutorCredentials = ["claude", "codex"],
+                ExecutorCapabilities = ["sensitive"],
                 Cordoned = true,
                 Healthy = false,
             });
@@ -473,6 +502,7 @@ public sealed class ExecutorHostTests
             Assert.Equal(3, found.MaxConcurrentSandboxes);
             Assert.Equal(["restricted"], found.ExecutorNetworkProfiles);
             Assert.Equal(["claude", "codex"], found.ExecutorCredentials);
+            Assert.Equal(["sensitive"], found.ExecutorCapabilities);
             Assert.True(found.Cordoned);
             Assert.False(found.Healthy);
             Assert.True(found.IsExecutor);
@@ -627,6 +657,7 @@ public sealed class ExecutorHostTests
         MaxConcurrentSandboxes = 2,
         AllowedNetworkProfiles = ["restricted"],
         DeclaredCredentials = ["claude"],
+        DeclaredCapabilities = ["sensitive"],
     };
 
     private static ExecutorClient MakeClient(

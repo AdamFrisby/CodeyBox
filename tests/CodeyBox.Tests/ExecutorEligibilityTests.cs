@@ -13,7 +13,8 @@ public sealed class ExecutorEligibilityTests
         bool cordoned = false,
         bool healthy = true,
         string[]? profiles = null,
-        string[]? credentials = null) => new()
+        string[]? credentials = null,
+        string[]? capabilities = null) => new()
         {
             HostId = "exec-1",
             MaxConcurrentSandboxes = capacity,
@@ -21,6 +22,7 @@ public sealed class ExecutorEligibilityTests
             Healthy = healthy,
             AllowedNetworkProfiles = profiles ?? [],
             DeclaredCredentials = credentials ?? [],
+            DeclaredCapabilities = capabilities ?? [],
         };
 
     [Fact]
@@ -114,5 +116,45 @@ public sealed class ExecutorEligibilityTests
         var host = Host();
         Assert.Equal("executor:exec-1", host.WorkerId);
         Assert.Equal(host.WorkerId, ExecutorRegistration.WorkerIdFor("  exec-1 "));
+    }
+
+    [Fact]
+    public void Capabilities_EmptyRequired_CoveredByAnyHost()
+    {
+        Assert.True(ExecutorEligibility.CoversRequiredCapabilities(Host(), []));
+        Assert.True(ExecutorEligibility.CoversRequiredCapabilities(Host(capabilities: []), []));
+    }
+
+    [Fact]
+    public void Capabilities_CoveredOnlyByExactCaseInsensitiveMatch()
+    {
+        var host = Host(capabilities: ["Sensitive"]);
+        Assert.True(ExecutorEligibility.CoversRequiredCapabilities(host, ["sensitive"]));
+        Assert.True(ExecutorEligibility.CoversRequiredCapabilities(host, ["SENSITIVE"]));
+        Assert.False(ExecutorEligibility.CoversRequiredCapabilities(host, ["sensitive-extra"]));
+        Assert.False(ExecutorEligibility.CoversRequiredCapabilities(host, ["sens"]));
+        Assert.False(ExecutorEligibility.CoversRequiredCapabilities(Host(capabilities: []), ["sensitive"]));
+    }
+
+    [Fact]
+    public void Capabilities_AllRequiredTagsMustBeCovered()
+    {
+        var host = Host(capabilities: ["sensitive", "audit"]);
+        Assert.True(ExecutorEligibility.CoversRequiredCapabilities(host, ["sensitive", "audit"]));
+        Assert.False(ExecutorEligibility.CoversRequiredCapabilities(host, ["sensitive", "architectural"]));
+    }
+
+    [Fact]
+    public void FindCapabilityNoHostProvides_NamesFirstUnmetTag()
+    {
+        var hosts = new[]
+        {
+            new ExecutorRegistration { HostId = "a", DeclaredCapabilities = ["general"] },
+            new ExecutorRegistration { HostId = "b", DeclaredCapabilities = ["sensitive"] },
+        };
+        Assert.Null(ExecutorEligibility.FindCapabilityNoHostProvides(hosts, []));
+        Assert.Null(ExecutorEligibility.FindCapabilityNoHostProvides(hosts, ["sensitive"]));
+        Assert.Equal("architectural", ExecutorEligibility.FindCapabilityNoHostProvides(hosts, ["sensitive", "architectural"]));
+        Assert.Equal("nope", ExecutorEligibility.FindCapabilityNoHostProvides(hosts, ["nope"]));
     }
 }
