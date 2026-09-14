@@ -1,0 +1,6 @@
+provider   model                       context  max-out  thinking  images
+anthropic  claude-haiku-4-5            200K     64K      yes       yes   
+anthropic  claude-opus-4-6             1M       128K     yes       yes   
+anthropic  claude-sonnet-4-6           1M       64K      yes       yes   
+openai     gpt-5-codex                 400K     128K     yes       yes   
+openai     gpt-5.5                     1.1M     128K     yes       yes   
