@@ -61,6 +61,33 @@ public sealed record ExecutorPhaseRequest
     /// by dispatch options; covered by the idempotency body hash.
     /// </summary>
     public required string PayloadJson { get; init; }
+
+    /// <summary>
+    /// Agent credential set the phase's route requires (for example "claude").
+    /// Null or blank means the phase needs no specific credential and any
+    /// host may run it. Matched against
+    /// <see cref="ExecutorRegistration.DeclaredCredentials"/> by exact
+    /// ordinal equality. At most 128 chars.
+    /// </summary>
+    public string? RequiredCredential { get; init; }
+
+    /// <summary>
+    /// Sandbox network profile the phase's sandbox target requires. Null or
+    /// blank means "(default)". Matched against
+    /// <see cref="ExecutorRegistration.AllowedNetworkProfiles"/> with the
+    /// same empty-means-all / "*" semantics. At most 128 chars.
+    /// </summary>
+    public string? RequiredNetworkProfile { get; init; }
+
+    /// <summary>
+    /// Clearance tags the phase's work item demands, in the same vocabulary
+    /// as <see cref="WorkItem.RequiredCapabilities"/>. Empty means no
+    /// clearance required. Placement only selects hosts whose
+    /// <see cref="ExecutorRegistration.DeclaredCapabilities"/> covers every
+    /// tag here (ordinal, case-insensitive). At most 16 entries, each at most
+    /// 128 chars.
+    /// </summary>
+    public IReadOnlyList<string> RequiredCapabilities { get; init; } = [];
 }
 
 /// <summary>

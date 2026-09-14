@@ -52,10 +52,12 @@ internal static class ExecutorEndpoints
 
         string[] profiles;
         string[] credentials;
+        string[] capabilities;
         try
         {
             profiles = NormalizeEntries(req.AllowedNetworkProfiles, nameof(req.AllowedNetworkProfiles));
             credentials = NormalizeEntries(req.DeclaredCredentials, nameof(req.DeclaredCredentials));
+            capabilities = NormalizeEntries(req.DeclaredCapabilities, nameof(req.DeclaredCapabilities));
         }
         catch (ArgumentException ex)
         {
@@ -74,6 +76,7 @@ internal static class ExecutorEndpoints
             MaxConcurrentSandboxes = req.MaxConcurrentSandboxes,
             ExecutorNetworkProfiles = profiles,
             ExecutorCredentials = credentials,
+            ExecutorCapabilities = capabilities,
             Cordoned = req.Cordoned,
             Healthy = req.Healthy ?? true,
         };
@@ -191,6 +194,7 @@ internal static class ExecutorEndpoints
         public int? MaxConcurrentSandboxes { get; set; }
         public List<string>? AllowedNetworkProfiles { get; set; }
         public List<string>? DeclaredCredentials { get; set; }
+        public List<string>? DeclaredCapabilities { get; set; }
         public bool Cordoned { get; set; }
         public bool? Healthy { get; set; }
         public int? ProcessId { get; set; }
