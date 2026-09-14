@@ -920,6 +920,102 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task Coordinator_OnChange_MemberPoolOnlyEdit_AppliesReload()
+    {
+        // Regression: SerializeRouterInputs omitted AgentMembership.Pool, so a
+        // Pool-only edit produced an identical fingerprint, the reload was
+        // skipped, and the router kept Pool=null with no error or log line.
+        // Adding, changing, or removing a member's Pool must each reload.
+        var initial = new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new AgentClassOptions
+                {
+                    Id = "frontier",
+                    Members =
+                    [
+                        new AgentMembershipOptions
+                        {
+                            Agent = "claude",
+                            Billing = "Subscription",
+                            QualityScore = 100,
+                        },
+                    ],
+                },
+            ],
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            AgentClassesConfigBuilder.Build(initial.AgentClasses, NullLogger<AgentClassRouter>.Instance),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Null(router.GetClassMembers("frontier")[0].Pool);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new AgentClassOptions
+                {
+                    Id = "frontier",
+                    Members =
+                    [
+                        new AgentMembershipOptions
+                        {
+                            Agent = "claude",
+                            Billing = "Subscription",
+                            QualityScore = 100,
+                            Pool = "opencode-go",
+                        },
+                    ],
+                },
+            ],
+        });
+
+        var added = router.GetClassMembers("frontier");
+        Assert.Single(added);
+        Assert.Equal("opencode-go", added[0].Pool);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new AgentClassOptions
+                {
+                    Id = "frontier",
+                    Members =
+                    [
+                        new AgentMembershipOptions
+                        {
+                            Agent = "claude",
+                            Billing = "Subscription",
+                            QualityScore = 100,
+                        },
+                    ],
+                },
+            ],
+        });
+
+        var removed = router.GetClassMembers("frontier");
+        Assert.Single(removed);
+        Assert.Null(removed[0].Pool);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
     private static AgentClassOptions HotReloadClass(string id, params string[] agents)
     {
         var cls = new AgentClassOptions { Id = id, DisplayName = id };
