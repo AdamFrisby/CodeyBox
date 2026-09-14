@@ -751,3 +751,90 @@ frame and the bare `message.model` id (pi strips the `provider/` qualifier in
 `pi` bucket for the shipped Anthropic-backed member; operators fronting other
 providers add that provider's list prices there (or under
 `CodeyBox:AgentPricing`) keyed by the bare model id.
+
+### Caveman-code CLI (`caveman-code`)
+
+Caveman-code (`github.com/JuliusBrussee/caveman-code`, npm
+`@juliusbrussee/caveman-code`, **MIT**) is a standalone terminal coding agent
+in the pi-mono family whose pitch is token compression (~2× fewer tokens than
+Codex CLI on its published 25-task MicroBench: 524k vs 1,010k fresh tokens,
+14/25 vs 15/25 passes, gpt-5.5 xhigh). All CLI behaviour below was verified
+live against 0.65.2 (npm install + `--help` + unauthenticated dispatch +
+`--list-models` with placeholder keys).
+
+**Status: frozen upstream.** The author froze this repo in August 2026; active
+work moved to the `caveman wrap` successor, whose `caveman` binary **shadows**
+this package's primary alias — uninstall one before installing the other. The
+runner therefore invokes the unambiguous `caveman-code` alias (same CLI, no
+collision), and the shipped `frontier-coding` member carries no `sensitive`
+capability: same-model, same-vendor spend as the codex member, but a frozen
+upstream gets conservative clearance until an operator opts in. Expect no
+upstream fixes; treat CLI-flag drift as freeze, not breakage.
+
+**Install in the sandbox image** — needs Node.js 20+:
+
+```sh
+npm install -g @juliusbrussee/caveman-code
+```
+
+**Non-interactive invocation.** `caveman-code -p` ("print mode: process
+prompt and exit") with the prompt on **stdin** — a piped prompt with no
+positional reaches agent init, which keeps large rework prompts under the
+128 KiB MAX_ARG_STRLEN ceiling. Do NOT switch to `caveman-code exec --json`
+for large prompts: the exec subcommand is dispatched before stdin is read, so
+its prompt must ride argv (and it accepts no `--provider`/`--thinking`). Text
+mode prints only the final assistant text; errors go to stderr (exit 1) —
+except the missing-key message, which prints to **stdout with exit 0**, so a
+keyless dispatch looks "successful" unless the smoke gate benches the agent
+first (it does — see below).
+
+**Authentication — BYOK API keys only.** The CLI reads provider keys from the
+environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, … —
+full list in `CavemanCodeAgentRunner.CredentialEnvironmentVariables`). OAuth
+(`/login`, OS-keychain tokens) has no headless path and is unsupported. The
+runner never passes `--api-key` (secrets must not ride argv). Operator
+wiring: set `CODEYBOX_CAVEMAN_ANTHROPIC_API_KEY` /
+`CODEYBOX_CAVEMAN_OPENAI_API_KEY` / `CODEYBOX_CAVEMAN_GEMINI_API_KEY` /
+`CODEYBOX_CAVEMAN_OPENROUTER_API_KEY` on the host (or inject the conventional
+provider vars directly — both are mapped through). Endpoint-style providers
+(Azure OpenAI, AWS Bedrock) need companion config beyond a bare key and are
+not covered; per-instance member `CredentialReference` tokens are not mapped
+for this kind (the sandbox var is provider-dependent), so multi-key setups
+use one member per provider key. The key never appears in any log line.
+
+**Default model.** Shipped default is `openai/gpt-5.5` (both
+`CodeyBox:AgentDefaults:caveman` and the `frontier-coding` member): the
+provider-prefixed form pins the provider so `--model` resolves without
+`--provider`, and it is the exact configuration the upstream bench measured.
+`gpt-5.5`, `claude-opus-4-6`, `claude-opus-4-7`, and `claude-sonnet-4-6` are
+confirmed present in the 0.65.2 registry via `caveman-code --list-models`.
+
+**Reasoning effort.** `--thinking off|minimal|low|medium|high|xhigh`
+(verified). The runner forwards `ReasoningMode` only when it matches that set
+(lowercased); anything else is dropped rather than forwarded. Pin thinking
+via member `ReasoningMode`, not a `:suffix` on `ModelId` — a suffixed id will
+not match the model-list probe and trips a startup warning.
+
+**Billing — pay-per-token (`PayPerApi`).** Spend bills to the operator's own
+provider accounts, so the orchestrator never waits on quota for this member.
+Rates live in `agent-pricing-defaults.json` under the `caveman` bucket in both
+bare and provider-prefixed key forms, hot-reloadable under
+`CodeyBox:AgentPricing`. Cost extraction is JSON-envelope-only (caveman
+camelCase usage, Anthropic/OpenAI usage objects): plain-text `-p` runs emit
+no counts, and prose token mentions are never matched, so a normal dispatch
+attributes zero until a structured envelope appears.
+
+**Quota probe.** None — BYOK keys expose no remaining-credit meter (same
+position as opencode). Availability is covered by the credential-presence host
+smoke probe plus the in-VM `caveman-code --list-models` check; transient
+provider refusals (shared 429 shapes, `overloaded_error`, missing-key output)
+are classified by `CavemanCodeQuotaFailureDetector` into rate-limit backoff /
+auth-error paths.
+
+**Model-list probe.** Runs `caveman-code --list-models` on the API host and
+parses the provider table (emits both `provider/model` and bare `model` ids
+so either member spelling validates). The registry answers offline from env
+keys alone, but with no key visible it prints `No models available…` at exit
+0 — the probe treats zero parsed ids as failure. Set
+`CODEYBOX_CAVEMANCODE_BINARY` to override the binary path. When the CLI is
+missing or keyless on the host, validation is skipped with a warning.
