@@ -1,9 +1,9 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// Regression-test-selection seam. Given the change under review and a
-/// <see cref="ITestRunnerAuditor"/> capability (from the DotnetTestAuditor
-/// foundation), a selector decides which subset of the suite the
+/// Regression-test-selection seam. Given the change under review and an
+/// <see cref="ITestRunnerAuditor"/> capability (from a test-runner auditor
+/// implementation), a selector decides which subset of the suite the
 /// <c>csharp:test-pass</c> audit runs — enabling a SOUND narrowing for the audit
 /// loop while the merge/release verification path always runs everything.
 ///

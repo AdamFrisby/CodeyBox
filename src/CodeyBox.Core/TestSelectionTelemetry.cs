@@ -82,7 +82,7 @@ public sealed record TestSelectionTelemetry
 /// <summary>
 /// Pure computer behind <see cref="TestSelectionTelemetry"/>. All methods are
 /// total functions of their inputs; the only impure step (reading the run's
-/// mode/decision/universe) stays in <c>DotnetTestAuditor</c>.
+/// mode/decision/universe) stays in the test-runner auditor.
 /// </summary>
 public static class TestSelectionTelemetryComputer
 {

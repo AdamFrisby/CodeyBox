@@ -3,6 +3,7 @@ using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.DotnetTestRunnerPlugin;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
 

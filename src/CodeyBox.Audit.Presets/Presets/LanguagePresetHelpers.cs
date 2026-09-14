@@ -1,5 +1,6 @@
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.DotnetTestRunnerPlugin;
 
 namespace CodeyBox.Audit.Presets.Presets;
 

@@ -144,21 +144,37 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 
     public async Task<Release?> GetAsync(ReleaseId id, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM releases WHERE id = $id;";
-        cmd.Parameters.AddWithValue("$id", id.ToString());
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? Read(reader) : null;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM releases WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            return await reader.ReadAsync(ct) ? Read(reader) : null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<Release?> GetByNameAsync(ProjectId projectId, string name, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM releases WHERE project_id = $pid AND name = $name;";
-        cmd.Parameters.AddWithValue("$pid", projectId.Value);
-        cmd.Parameters.AddWithValue("$name", name);
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? Read(reader) : null;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM releases WHERE project_id = $pid AND name = $name;";
+            cmd.Parameters.AddWithValue("$pid", projectId.Value);
+            cmd.Parameters.AddWithValue("$name", name);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            return await reader.ReadAsync(ct) ? Read(reader) : null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<Release>> ListAsync(
@@ -168,37 +184,45 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         int? offset = null,
         CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        var conditions = new List<string>();
-        if (projectId.HasValue)
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            conditions.Add("project_id = $pid");
-            cmd.Parameters.AddWithValue("$pid", projectId.Value.Value);
-        }
-        if (state.HasValue)
-        {
-            conditions.Add("state = $state");
-            cmd.Parameters.AddWithValue("$state", (int)state.Value);
-        }
-        var where = conditions.Count > 0 ? " WHERE " + string.Join(" AND ", conditions) : "";
-        var limitClause = "";
-        if (limit.HasValue)
-        {
-            limitClause = " LIMIT $limit";
-            cmd.Parameters.AddWithValue("$limit", limit.Value);
-            if (offset.HasValue)
+            using var cmd = _conn.CreateCommand();
+            var conditions = new List<string>();
+            if (projectId.HasValue)
             {
-                limitClause += " OFFSET $offset";
-                cmd.Parameters.AddWithValue("$offset", offset.Value);
+                conditions.Add("project_id = $pid");
+                cmd.Parameters.AddWithValue("$pid", projectId.Value.Value);
             }
+            if (state.HasValue)
+            {
+                conditions.Add("state = $state");
+                cmd.Parameters.AddWithValue("$state", (int)state.Value);
+            }
+            var where = conditions.Count > 0 ? " WHERE " + string.Join(" AND ", conditions) : "";
+            var limitClause = "";
+            if (limit.HasValue)
+            {
+                limitClause = " LIMIT $limit";
+                cmd.Parameters.AddWithValue("$limit", limit.Value);
+                if (offset.HasValue)
+                {
+                    limitClause += " OFFSET $offset";
+                    cmd.Parameters.AddWithValue("$offset", offset.Value);
+                }
+            }
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- conditions/pagination built from hardcoded literals only; parameter values injected via AddWithValue
+            cmd.CommandText = $"SELECT * FROM releases{where} ORDER BY created_at DESC{limitClause};";
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var result = new List<Release>();
+            while (await reader.ReadAsync(ct))
+                result.Add(Read(reader));
+            return result;
         }
-        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- conditions/pagination built from hardcoded literals only; parameter values injected via AddWithValue
-        cmd.CommandText = $"SELECT * FROM releases{where} ORDER BY created_at DESC{limitClause};";
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        var result = new List<Release>();
-        while (await reader.ReadAsync(ct))
-            result.Add(Read(reader));
-        return result;
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     /// <inheritdoc/>
@@ -278,32 +302,40 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 
     public async Task<IReadOnlyList<ReleaseAuditIteration>> ListAuditIterationsAsync(ReleaseId releaseId, CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM release_audit_iterations WHERE release_id = $rid ORDER BY iteration ASC;";
-        cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        var result = new List<ReleaseAuditIteration>();
-        while (await reader.ReadAsync(ct))
+        await _writeLock.WaitAsync(ct);
+        try
         {
-            var findingsJson = reader.GetString(reader.GetOrdinal("findings_json"));
-            var findings = JsonSerializer.Deserialize<List<AuditFindingRecord>>(findingsJson, _findingsSerializerOptions)
-                ?? [];
-            var remIdCol = reader.GetOrdinal("remediation_work_item_id");
-            WorkItemId? remId = reader.IsDBNull(remIdCol) ? null
-                : new WorkItemId(Guid.Parse(reader.GetString(remIdCol)));
-            result.Add(new ReleaseAuditIteration
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM release_audit_iterations WHERE release_id = $rid ORDER BY iteration ASC;";
+            cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var result = new List<ReleaseAuditIteration>();
+            while (await reader.ReadAsync(ct))
             {
-                ReleaseId = ReleaseId.Parse(reader.GetString(reader.GetOrdinal("release_id"))),
-                Iteration = reader.GetInt32(reader.GetOrdinal("iteration")),
-                MaxIterations = reader.GetInt32(reader.GetOrdinal("max_iterations")),
-                TotalFindings = reader.GetInt32(reader.GetOrdinal("total_findings")),
-                BlockingFindings = reader.GetInt32(reader.GetOrdinal("blocking_findings")),
-                Findings = findings.Select(f => new AuditFinding(f.AuditorName, f.Severity, f.Title, f.Description, f.Location)).ToList(),
-                RemediationWorkItemId = remId,
-                CreatedAt = DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at")), System.Globalization.CultureInfo.InvariantCulture),
-            });
+                var findingsJson = reader.GetString(reader.GetOrdinal("findings_json"));
+                var findings = JsonSerializer.Deserialize<List<AuditFindingRecord>>(findingsJson, _findingsSerializerOptions)
+                    ?? [];
+                var remIdCol = reader.GetOrdinal("remediation_work_item_id");
+                WorkItemId? remId = reader.IsDBNull(remIdCol) ? null
+                    : new WorkItemId(Guid.Parse(reader.GetString(remIdCol)));
+                result.Add(new ReleaseAuditIteration
+                {
+                    ReleaseId = ReleaseId.Parse(reader.GetString(reader.GetOrdinal("release_id"))),
+                    Iteration = reader.GetInt32(reader.GetOrdinal("iteration")),
+                    MaxIterations = reader.GetInt32(reader.GetOrdinal("max_iterations")),
+                    TotalFindings = reader.GetInt32(reader.GetOrdinal("total_findings")),
+                    BlockingFindings = reader.GetInt32(reader.GetOrdinal("blocking_findings")),
+                    Findings = findings.Select(f => new AuditFinding(f.AuditorName, f.Severity, f.Title, f.Description, f.Location)).ToList(),
+                    RemediationWorkItemId = remId,
+                    CreatedAt = DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("created_at")), System.Globalization.CultureInfo.InvariantCulture),
+                });
+            }
+            return result;
         }
-        return result;
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task SaveE2eReplayResultsAsync(ReleaseId releaseId, int iteration, IReadOnlyList<ReleaseE2eReplayResult> results, CancellationToken ct = default)

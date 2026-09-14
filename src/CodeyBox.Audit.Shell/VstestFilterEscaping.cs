@@ -7,8 +7,12 @@ namespace CodeyBox.Audit.Shell;
 /// test-selection baseline, which is untrusted sandbox-produced input. VSTest
 /// treats <c>\ , ( ) ! ~ &amp; | =</c> as filter metacharacters, so each is
 /// backslash-escaped; anything else (including whitespace) is literal.
+///
+/// Public because the plugin-packaged test runner reuses this guard from
+/// outside this assembly; the implementation stays here so there is exactly
+/// one copy.
 /// </summary>
-internal static class VstestFilterEscaping
+public static class VstestFilterEscaping
 {
     public static string EscapeValue(string value)
     {

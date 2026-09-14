@@ -233,6 +233,15 @@ GET /plugins
 → [{ "pluginId": "myorg.no-var-keyword", "displayName": "MyOrg: Ban var keyword" }]
 ```
 
+## Test-runner auditors
+
+Test execution is a specialised plugin shape: `ITestRunnerAuditor`
+(`CodeyBox.Core`) owns invocation building, test-universe enumeration, and
+result classification for one framework. The bundled `dotnet test` runner and
+a pytest reference stub ship in `plugins/CodeyBox.DotnetTestRunnerPlugin/`.
+See [`docs/extending/test-runner-plugins.md`](test-runner-plugins.md) for the
+packaging, the peer-runner recipe, and the bundling caveat.
+
 ## Sample plugin
 
 A fully working sample is provided at `samples/CodeyBox.SampleAuditorPlugin/`.
