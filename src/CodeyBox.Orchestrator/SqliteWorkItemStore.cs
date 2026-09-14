@@ -2218,6 +2218,61 @@ public sealed class SqliteWorkItemStore :
         }
     }
 
+    public async Task<AgentClassUpdateResult> UpdateAgentClassAsync(
+        WorkItemId id,
+        string? agentClassId,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+
+            if (current is null)
+                return new AgentClassUpdateResult(AgentClassUpdateOutcome.NotFound, null, null);
+
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, _conn, ct) };
+
+            if (WorkItemDependencies.TerminalStates.Contains(current.State))
+                return new AgentClassUpdateResult(AgentClassUpdateOutcome.TerminalState, current, current.AgentClassId);
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    agent_class_id = $agent_class_id,
+                    updated_at = $updated_at
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$agent_class_id", (object?)agentClassId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            var updated = current with
+            {
+                AgentClassId = agentClassId,
+                UpdatedAt = updatedAt,
+            };
+            return new AgentClassUpdateResult(AgentClassUpdateOutcome.Updated, updated, current.AgentClassId);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("UpdateAgentClassAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<bool> TryReplaceKnobsIfStateAndUpdatedAtAsync(
         WorkItemId id,
         IReadOnlyDictionary<string, string> knobs,

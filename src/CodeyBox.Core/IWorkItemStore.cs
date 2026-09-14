@@ -101,6 +101,32 @@ public enum AuditBudgetUpdateOutcome
 public readonly record struct AuditBudgetUpdateResult(AuditBudgetUpdateOutcome Outcome, WorkItem? Item);
 
 /// <summary>
+/// Outcome of <see cref="IWorkItemStore.UpdateAgentClassAsync"/>.
+/// </summary>
+public enum AgentClassUpdateOutcome
+{
+    /// <summary>The row was updated and the new agent class id is persisted.</summary>
+    Updated,
+    /// <summary>The row no longer exists.</summary>
+    NotFound,
+    /// <summary>The row exists but is in a terminal state; no write was issued.</summary>
+    TerminalState,
+}
+
+/// <summary>
+/// Result returned by <see cref="IWorkItemStore.UpdateAgentClassAsync"/>.
+/// <see cref="Item"/> is populated on <see cref="AgentClassUpdateOutcome.Updated"/>
+/// and on <see cref="AgentClassUpdateOutcome.TerminalState"/> so callers can
+/// return the current state to the client; null on <see cref="AgentClassUpdateOutcome.NotFound"/>.
+/// <see cref="OldAgentClassId"/> is the pre-update class id, captured so the
+/// caller can emit a meaningful audit-log entry without re-reading the row.
+/// </summary>
+public readonly record struct AgentClassUpdateResult(
+    AgentClassUpdateOutcome Outcome,
+    WorkItem? Item,
+    string? OldAgentClassId);
+
+/// <summary>
 /// Snapshot of a single dispatched iteration. <see cref="PromptRevisionAtDispatch"/>
 /// is the value of <see cref="WorkItem.PromptRevision"/> at the moment the iteration
 /// was handed to the agent; the orchestrator compares it against the trailer on the
@@ -238,6 +264,30 @@ public interface IWorkItemStore
         string? auditComplexity,
         DateTimeOffset updatedAt,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Partial UPDATE that touches only the <c>agent_class_id</c> column and
+    /// <c>updated_at</c> for the row identified by <paramref name="id"/>.
+    /// Used by PATCH /workitems/{id} when an operator moves an item to a
+    /// different agent class — e.g. a <c>WorkComplete</c> item parked behind
+    /// an auditor class whose members are all unavailable. The full-row
+    /// <see cref="UpdateAsync"/> would otherwise stomp <c>state</c>,
+    /// <c>started_at</c>, and friends when applied to an in-flight item.
+    ///
+    /// Returns <see cref="AgentClassUpdateOutcome.TerminalState"/> when the row
+    /// is in a terminal state — class edits cannot affect closed work.
+    ///
+    /// The default implementation throws; persistent stores must override it
+    /// with a terminal-guarded partial UPDATE like
+    /// <see cref="UpdateAuditBudgetAsync"/>.
+    /// </summary>
+    Task<AgentClassUpdateResult> UpdateAgentClassAsync(
+        WorkItemId id,
+        string? agentClassId,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store must implement guarded agent-class replacement before it can accept agent class edits.");
 
     /// <summary>
     /// Partial UPDATE that touches only the per-item knob map and

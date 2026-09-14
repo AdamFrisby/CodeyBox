@@ -226,6 +226,25 @@ public static class AuditLog
                 string.Join(",", oldDependsOn.Select(d => d.ToString())),
                 string.Join(",", newDependsOn.Select(d => d.ToString())));
 
+    /// <summary>
+    /// Distinct audit event for post-hoc agent-class edits via PATCH /workitems/{id}.
+    /// Records the previous and new class ids explicitly so the audit trail
+    /// captures the routing mutation; <see cref="WorkItemPatched"/>'s flags-only
+    /// shape would otherwise erase it. Null on either side means the item
+    /// carries no class (direct agent routing): the empty-string sentinel is
+    /// used because Serilog drops null properties, and readers rely on the
+    /// property being present to distinguish "no class" from "schema changed".
+    /// </summary>
+    public static void WorkItemAgentClassChanged(
+        WorkItemId id,
+        string? oldAgentClassId,
+        string? newAgentClassId) =>
+        Audit("work_item.agent_class_changed")
+            .Information("Work item {WorkItemId} agent class changed: {OldAgentClassId} → {NewAgentClassId}",
+                id.ToString(),
+                oldAgentClassId ?? "",
+                newAgentClassId ?? "");
+
     public static void WorkItemReordered(int count) =>
         Audit("work_item.reordered")
             .Information("Queue reordered: {Count} items repositioned", count);

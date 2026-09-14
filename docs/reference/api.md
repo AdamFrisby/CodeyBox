@@ -1125,16 +1125,18 @@ provided (non-null) in the body are updated.
   "mergeTimeoutMinutes": 60,
   "minModelScore": 70,
   "requiredCapabilities": ["sensitive"],
-  "dependsOn": ["<id-or-externalId>", "..."]
+  "dependsOn": ["<id-or-externalId>", "..."],
+  "agentClassId": "optional agent class id"
 }
 ```
 
 * Returns `200 OK` with the updated work item record.
-* Returns `409 Conflict` for non-`dependsOn` fields when the item is not in `Queued` state (in-flight items are read-only). `dependsOn` is allowed on any **non-terminal** state and returns `409` only on terminal items.
+* Returns `409 Conflict` for non-`dependsOn` fields when the item is not in `Queued` state (in-flight items are read-only). `dependsOn`, the audit-budget fields, and `agentClassId` are allowed on any **non-terminal** state and return `409` only on terminal items. `agentClassId` additionally returns `409` while a worker holds the item, so the edit cannot race the dispatch path.
 * Validation rules for `title`, `prompt`, and `agent` are identical to `POST /workitems`.
 * `workTimeoutMinutes` is clamped to `[1, 480]`, `mergeTimeoutMinutes` to `[1, 240]`, `minModelScore` to `[0, 200]` — out-of-range values pin to the boundary rather than 400, matching the creation surface. This lets an operator bulk-PATCH the queue after a defaults bump without special-casing stray inputs.
 * `requiredCapabilities` is the explicit clearance/trust gate (see [agent-classes.md](../concepts/agent-classes.md#capability-gate)). Tags are trimmed, de-duplicated case-insensitively, and validated for length (≤64 chars) and count (≤16 entries). Sending the field replaces the existing list; omit it to leave the list unchanged.
 * `dependsOn` is replace-set semantics: the array overwrites the item's full dependency list. Each entry is a GUID, a namespaced `ns:value` externalId, or a bare externalId (must be unambiguous within the project). Capped at 100 entries; the create-time validation (existence, self-loop, cycle) re-runs against the proposed graph and `400`s on rejection. Pass `[]` to clear all deps. Persisted via a partial UPDATE that does not stomp `state` / `startedAt`, and a `work_item.dependencies_changed` audit-log entry records the pre/post sets.
+* `agentClassId` moves the item to a different agent class without re-running completed phases — e.g. a `WorkComplete` item parked behind an auditor class whose members are all unavailable. The id must name a class in the live router catalog (unknown ids `400`); the value is persisted via a terminal-guarded partial UPDATE alongside a `work_item.agent_class_changed` audit-log entry recording the old and new class.
 * Priority is not editable here — use `PATCH /workitems/{id}/priority` (works on any non-terminal state, uses a TOCTOU-safe partial UPDATE).
 
 ### `PATCH /workitems/{id}/priority`
