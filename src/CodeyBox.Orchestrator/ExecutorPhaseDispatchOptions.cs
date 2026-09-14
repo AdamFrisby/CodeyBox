@@ -11,8 +11,11 @@ public sealed class ExecutorPhaseDispatchOptions
 {
     /// <summary>
     /// Maximum tar bytes accepted back from an executor per dispatch. The
-    /// archive lands on the orchestrator before validation, so this cap
-    /// bounds how much executor-controlled content can be persisted locally.
+    /// transport enforces this cap while receiving (see
+    /// <c>IExecutorPhaseTransport.StageOutToArchiveAsync</c>) so
+    /// executor-controlled content cannot fill the orchestrator disk before
+    /// validation; the validator re-checks the landed size as defense in
+    /// depth.
     /// Equivalent to <c>MultipassRemoteSandboxOptions.StageOutMaxArchiveBytes</c>.
     /// </summary>
     public long StageOutMaxArchiveBytes { get; set; } = 2L * 1024 * 1024 * 1024;

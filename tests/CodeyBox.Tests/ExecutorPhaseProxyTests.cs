@@ -105,6 +105,12 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         await Assert.ThrowsAsync<ExecutorPhaseException>(
             () => ctx.Proxy.ExecutePhaseAsync(request, CancellationToken.None));
 
+        // The cap travels into the transport and aborts the transfer
+        // mid-stream: fewer than the planted 1 MiB ever land on disk.
+        Assert.Equal(256 * 1024, ctx.Transports["exec-1"].LastStageOutMaxBytes);
+        Assert.True(
+            ctx.Transports["exec-1"].StageOutBytesWritten <= 256 * 1024,
+            $"Streaming stage-out wrote {ctx.Transports["exec-1"].StageOutBytesWritten} bytes past the 256 KiB cap.");
         Assert.Equal(before, (await RunGitBareCapture(bare, "rev-parse", "phase/seed")).Trim());
         Assert.Empty((await RunGitBareCapture(bare, "branch", "--list", "phase/work-0")).Trim());
         var lookup = await ctx.Store.LookupAsync(
@@ -141,9 +147,9 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         var before = (await RunGitBareCapture(bare, "rev-parse", "phase/seed")).Trim();
 
         var rootName = Path.GetFileName(bare.TrimEnd(Path.DirectorySeparatorChar));
-        ctx.Transports["exec-1"].CustomArchive = archivePath =>
+        ctx.Transports["exec-1"].CustomArchive = stream =>
         {
-            WriteInflatedArchive(archivePath, rootName);
+            WriteInflatedArchive(stream, rootName);
             return Task.CompletedTask;
         };
         await Assert.ThrowsAsync<ExecutorPhaseException>(
@@ -151,6 +157,47 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
 
         Assert.Equal(before, (await RunGitBareCapture(bare, "rev-parse", "phase/seed")).Trim());
         Assert.Empty((await RunGitBareCapture(bare, "branch", "--list", "phase/work-0")).Trim());
+    }
+
+    [Theory]
+    [InlineData("traversal")]
+    [InlineData("absolute")]
+    [InlineData("wrong-root")]
+    [InlineData("symlink")]
+    public async Task StageBack_MaliciousEntry_IsRejectedWithoutRepoWrite(string kind)
+    {
+        using var ctx = CreateContext(["exec-1"]);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+        var bare = ctx.Git.GetRepoPath(item.ToString());
+        var before = (await RunGitBareCapture(bare, "rev-parse", "phase/seed")).Trim();
+        var rootName = Path.GetFileName(bare.TrimEnd(Path.DirectorySeparatorChar));
+
+        var (entryName, typeFlag) = kind switch
+        {
+            "traversal" => ("../evil.txt", '0'),
+            "absolute" => ("/tmp/evil.txt", '0'),
+            "wrong-root" => ("other-root.git/evil.txt", '0'),
+            "symlink" => (rootName + "/evil-link", '2'),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+        };
+        ctx.Transports["exec-1"].CustomArchive = stream =>
+        {
+            WriteTarHeader(stream, entryName, typeFlag, 0);
+            return Task.CompletedTask;
+        };
+        var request = NewRequest(item, "work", 0);
+        await Assert.ThrowsAsync<ExecutorPhaseException>(
+            () => ctx.Proxy.ExecutePhaseAsync(request, CancellationToken.None));
+
+        Assert.Equal(before, (await RunGitBareCapture(bare, "rev-parse", "phase/seed")).Trim());
+        Assert.Empty((await RunGitBareCapture(bare, "branch", "--list", "phase/work-0")).Trim());
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(bare)!, "evil.txt")), "Traversal entry escaped the staging root.");
+        var lookup = await ctx.Store.LookupAsync(
+            ExecutorPhaseProxy.BuildDispatchKey(request),
+            ExecutorPhaseProxy.ComputeBodyHash(request),
+            DateTimeOffset.UtcNow);
+        Assert.Equal(IdempotencyLookupOutcome.Miss, lookup.Outcome);
     }
 
     // ── verification 5: idempotency ─────────────────────────────────────────
@@ -375,9 +422,8 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     /// archive itself carries almost no data: declared bytes dwarf
     /// archive-bytes × ratio, so the expansion-ratio guard must reject it.
     /// </summary>
-    private static void WriteInflatedArchive(string archivePath, string rootName)
+    private static void WriteInflatedArchive(Stream stream, string rootName)
     {
-        using var stream = File.OpenWrite(archivePath);
         WriteTarHeader(stream, rootName + "/", '5', 0);
         WriteTarHeader(stream, rootName + "/payload.bin", '0', 1024 * 1024);
         stream.Write(new byte[1024]);
@@ -603,7 +649,9 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         public List<string> StagedInPaths { get; } = [];
         public int RunPhaseCalls { get; private set; }
         public ExecutorPhaseTransportException? FailWith;
-        public Func<string, Task>? CustomArchive;
+        public Func<Stream, Task>? CustomArchive;
+        public long? LastStageOutMaxBytes { get; private set; }
+        public long StageOutBytesWritten { get; private set; }
 
         public string? StagedCopy
         {
@@ -631,16 +679,32 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
             return _handler.ExecuteAsync(request, staged, ct);
         }
 
-        public async Task StageOutToArchiveAsync(string hostArchivePath, CancellationToken ct)
+        public async Task StageOutToArchiveAsync(string hostArchivePath, long maxArchiveBytes, CancellationToken ct)
         {
             ThrowIfFailing();
-            if (CustomArchive is not null)
+            LastStageOutMaxBytes = maxArchiveBytes;
+            StageOutBytesWritten = 0;
+            await using var file = File.OpenWrite(hostArchivePath);
+            await using var bounded = new BoundedStageOutStream(file, maxArchiveBytes, HostId, bytes => StageOutBytesWritten = bytes);
+            try
             {
-                await CustomArchive(hostArchivePath).ConfigureAwait(false);
-                return;
+                if (CustomArchive is not null)
+                {
+                    await CustomArchive(bounded).ConfigureAwait(false);
+                    await bounded.FlushAsync(ct).ConfigureAwait(false);
+                    return;
+                }
+                var staged = StagedCopy ?? throw new InvalidOperationException("No staged repo on fake executor.");
+                await WriteTarOfDirectoryAsync(staged, bounded, ct).ConfigureAwait(false);
             }
-            var staged = StagedCopy ?? throw new InvalidOperationException("No staged repo on fake executor.");
-            await WriteTarOfDirectoryAsync(staged, hostArchivePath, ct).ConfigureAwait(false);
+            catch
+            {
+                // The streaming cap was exceeded (or the payload was hostile):
+                // leave no usable archive behind, mirroring the production
+                // contract that an aborted stage-out is a phase failure.
+                try { File.Delete(hostArchivePath); } catch { }
+                throw;
+            }
         }
 
         private void ThrowIfFailing()
@@ -659,11 +723,10 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
                 File.Copy(file, Path.Combine(destination, Path.GetRelativePath(source, file)), overwrite: true);
         }
 
-        private static async Task WriteTarOfDirectoryAsync(string sourceDir, string archivePath, CancellationToken ct)
+        private static async Task WriteTarOfDirectoryAsync(string sourceDir, Stream destination, CancellationToken ct)
         {
             var rootName = Path.GetFileName(sourceDir.TrimEnd(Path.DirectorySeparatorChar));
-            await using var stream = File.OpenWrite(archivePath);
-            await using var writer = new TarWriter(stream, TarEntryFormat.Pax, leaveOpen: true);
+            await using var writer = new TarWriter(destination, TarEntryFormat.Pax, leaveOpen: true);
             foreach (var dir in Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories).OrderBy(x => x, StringComparer.Ordinal))
             {
                 ct.ThrowIfCancellationRequested();
@@ -679,6 +742,73 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
                 entry.DataStream = data;
                 await writer.WriteEntryAsync(entry, ct).ConfigureAwait(false);
             }
+        }
+
+        /// <summary>
+        /// Write-only wrapper that aborts the stage-out as soon as the
+        /// configured archive cap is exceeded, so the fake mirrors the
+        /// production contract: the cap is enforced while receiving, never
+        /// by measuring a fully-buffered file afterwards. Exceeding the cap
+        /// is an <see cref="ExecutorPhaseException"/> (phase failure: the
+        /// host was reachable) rather than a transport failure.
+        /// </summary>
+        private sealed class BoundedStageOutStream : Stream
+        {
+            private readonly Stream _inner;
+            private readonly long _maxBytes;
+            private readonly string _hostId;
+            private readonly Action<long> _progress;
+            private long _written;
+
+            public BoundedStageOutStream(Stream inner, long maxBytes, string hostId, Action<long> progress)
+            {
+                _inner = inner;
+                _maxBytes = maxBytes;
+                _hostId = hostId;
+                _progress = progress;
+            }
+
+            public override bool CanRead => false;
+            public override bool CanSeek => false;
+            public override bool CanWrite => true;
+            public override long Length => _written;
+            public override long Position { get => _written; set => throw new NotSupportedException(); }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                if (_written + count > _maxBytes)
+                    throw new ExecutorPhaseException(
+                        $"Staged-back archive from host '{_hostId}' exceeded configured StageOutMaxArchiveBytes={_maxBytes}.");
+                _inner.Write(buffer, offset, count);
+                _written += count;
+                _progress(_written);
+            }
+
+            public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+            {
+                if (_written + count > _maxBytes)
+                    throw new ExecutorPhaseException(
+                        $"Staged-back archive from host '{_hostId}' exceeded configured StageOutMaxArchiveBytes={_maxBytes}.");
+                await _inner.WriteAsync(buffer.AsMemory(offset, count), ct).ConfigureAwait(false);
+                _written += count;
+                _progress(_written);
+            }
+
+            public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+            {
+                if (_written + buffer.Length > _maxBytes)
+                    throw new ExecutorPhaseException(
+                        $"Staged-back archive from host '{_hostId}' exceeded configured StageOutMaxArchiveBytes={_maxBytes}.");
+                await _inner.WriteAsync(buffer, ct).ConfigureAwait(false);
+                _written += buffer.Length;
+                _progress(_written);
+            }
+
+            public override void Flush() => _inner.Flush();
+            public override Task FlushAsync(CancellationToken ct) => _inner.FlushAsync(ct);
+            public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
         }
     }
 

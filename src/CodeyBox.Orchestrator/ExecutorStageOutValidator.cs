@@ -10,7 +10,10 @@ namespace CodeyBox.Orchestrator;
 /// payload vs archive size, path containment under the expected repo root,
 /// directory/regular-file entries only): the remote payload is untrusted and
 /// nothing is extracted over the orchestrator's bare repo until every check
-/// passes. Violations throw <see cref="ExecutorPhaseException"/> — the host
+/// passes. The archive-byte cap is enforced first by the transport while
+/// receiving (so an unbounded payload cannot fill the orchestrator disk);
+/// the size check here is defense in depth for transports that landed the
+/// file by other means. Violations throw <see cref="ExecutorPhaseException"/> — the host
 /// was reachable, so this is a phase failure, not a transport failure — and
 /// leave the bare repo untouched.
 /// </summary>

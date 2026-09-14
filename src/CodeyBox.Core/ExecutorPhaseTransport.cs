@@ -104,8 +104,19 @@ public interface IExecutorPhaseTransport
     /// <paramref name="hostArchivePath"/>. The caller validates the archive
     /// (size, entry count, expansion ratio, path containment) before anything
     /// is extracted over the orchestrator's bare repo.
+    ///
+    /// <para>The transport MUST enforce <paramref name="maxArchiveBytes"/>
+    /// while receiving — aborting the transfer as soon as the cap is
+    /// exceeded — rather than buffering an unbounded payload and reporting
+    /// its size afterwards. The executor is untrusted, so a post-write size
+    /// check alone lets a compromised executor fill the orchestrator disk
+    /// before validation rejects the payload. Exceeding the cap throws
+    /// <see cref="ExecutorPhaseException"/> (a phase failure: the host was
+    /// reachable, the payload was hostile), never a transport exception, and
+    /// must leave no usable archive behind at
+    /// <paramref name="hostArchivePath"/>.</para>
     /// </summary>
-    Task StageOutToArchiveAsync(string hostArchivePath, CancellationToken ct);
+    Task StageOutToArchiveAsync(string hostArchivePath, long maxArchiveBytes, CancellationToken ct);
 }
 
 /// <summary>

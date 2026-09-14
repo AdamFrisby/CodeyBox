@@ -19,7 +19,10 @@ unhealthy hosts register but are never selected), stages the phase's single
 bare repo to the host through `IExecutorPhaseTransport`, runs the phase
 there, and stages the repo back as a tar archive that is validated (archive
 bytes, entry count, expansion ratio, path containment) before anything is
-extracted over the orchestrator's bare repo. Only the per-item repo is ever
+extracted over the orchestrator's bare repo. The archive-byte cap is enforced
+by the transport while receiving — an unbounded payload is aborted mid-stream
+rather than buffered to disk and rejected afterwards — with the validator
+re-checking the landed size as defense in depth. Only the per-item repo is ever
 transferred — never the whole repos root — so an executor receives only the
 repo for the item it is running.
 

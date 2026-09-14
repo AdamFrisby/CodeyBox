@@ -154,7 +154,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         try
         {
             var archivePath = Path.Combine(scratchRoot, "stageout.tar");
-            await CallTransportAsync(hostId, "stage-out", token => transport.StageOutToArchiveAsync(archivePath, token), ct).ConfigureAwait(false);
+            await CallTransportAsync(hostId, "stage-out", token => transport.StageOutToArchiveAsync(archivePath, options.StageOutMaxArchiveBytes, token), ct).ConfigureAwait(false);
             await ExecutorStageOutValidator.ValidateAndInstallAsync(archivePath, canonicalRepo, scratchRoot, options, ct).ConfigureAwait(false);
         }
         finally
@@ -204,6 +204,14 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         }
         catch (ExecutorPhaseTransportException)
         {
+            throw;
+        }
+        catch (ExecutorPhaseException)
+        {
+            // A stage-out transport that enforces the archive cap (or any
+            // phase-side rejection raised mid-transfer) reports a phase
+            // failure, not a host failure: the host was reachable. Let it
+            // through unwrapped so it is not charged as a transport failure.
             throw;
         }
         catch (Exception ex)
