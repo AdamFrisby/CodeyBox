@@ -31,6 +31,16 @@ at least 32 characters or the service refuses to start.
           "Subject": "service",
           "DisplayName": "JobTrack"
         }
+      },
+      {
+        "Name": "exec-1",
+        "TokenEnvVar": "CODEYBOX_EXEC_1_API_KEY",
+        "ExecutorHostId": "exec-1",
+        "Principal": {
+          "Issuer": "codeybox",
+          "Subject": "exec-1",
+          "DisplayName": "Executor exec-1"
+        }
       }
     ]
   }
@@ -43,6 +53,14 @@ configured fixed principal, and the operator key cannot delegate at all.
 Delegated identities are authenticated claims from the integration—not
 credentials—and are persisted with the work item for API, commit, and pull
 request attribution.
+
+A client with `ExecutorHostId` is a host-bound executor token: it may act
+only as that executor host on host-scoped executor endpoints (notably
+`POST /executors/{hostId}/quota-reports`, which rejects any other caller —
+including the operator key — so a shared bearer cannot forge another host's
+quota meter). Give each executor host its own token environment variable and
+matching `ExecutorHostId`, and put that token (not the operator key) in the
+executor's `ApiKeyEnvVar` on that host.
 
 ### GitHub App delivery credentials
 
@@ -1397,6 +1415,21 @@ Heartbeat a registered executor into the worker registry. Request body is `{ "cu
 ### `POST /executors/{hostId}/deregister`
 
 Remove an executor registration (clean shutdown). Response: `200 OK` with `{ "hostId": "exec-1" }`.
+
+### `POST /executors/{hostId}/quota-reports`
+
+Report one quota reading for a pool whose credential the calling host holds
+(pool identity, availability reading, reset time, observed time). The bearer
+must be a per-executor token bound to the path host (see `ExecutorHostId`
+under [Authentication](#authentication)); the shared operator key and any
+token without a host binding are rejected, so one bearer holder cannot forge
+another host's meter. The host must also be registered and be declared in
+the pool's `HolderHostIds`. Response: `200 OK` with `{ "accepted": true,
+"pool": "<pool>" }`. `401` with no bearer, `403` on a token/host mismatch,
+`404` for an unregistered host, `400` on a rejected report (unknown pool,
+non-holder, out-of-range reading, inconsistent reset). Accepting a report
+never decides admission — the orchestrator's quota gate does that. See
+[`quota.md`](../operating/quota.md) for the executor-reported pool design.
 
 ### `GET /sandboxes/leaked`
 

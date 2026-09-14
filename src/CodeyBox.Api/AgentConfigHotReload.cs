@@ -1267,6 +1267,11 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                         Kind = kv.Value.Kind.ToString(),
                         kv.Value.BalanceUnit,
                         kv.Value.ReservationEstimate,
+                        ProbeSource = kv.Value.ProbeSource.ToString(),
+                        ReportedReadingMaxAgeSeconds = checked((int)kv.Value.ReportedReadingMaxAge.TotalSeconds),
+                        HolderHostIds = kv.Value.HolderHostIds
+                            .OrderBy(h => h, StringComparer.Ordinal)
+                            .ToArray(),
                     }),
                 FloorByPool = mapped.FloorByPool
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
@@ -1289,6 +1294,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 UnknownPolicy = opts.UnknownPolicy.ToString(),
                 opts.ObservedFailureWindowMinutes,
                 opts.ObservedFailureRetentionMinutes,
+                opts.ReportedReadingClockSkewSeconds,
                 opts.CapRetryIntervalSeconds,
                 opts.ColdStartFitInWindow,
                 opts.DrainAggressiveness,

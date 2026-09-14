@@ -64,6 +64,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // estimated cost; the caller owns the returned lease and must release it
     // on the same lifecycle that releases the worker slot.
     private readonly QuotaReservationLedger? _reservationLedger;
+    private readonly ExecutorQuotaReportStore? _reportStore;
     private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
     private readonly AgentQuotaAvailabilityBroadcaster? _localQuotaAvailability;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
@@ -114,7 +115,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         IAgentDispatchAvailability? dispatchAvailability = null,
         IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null,
         AgentCircuitBreaker? circuitBreaker = null,
-        QuotaReservationLedger? reservationLedger = null)
+        QuotaReservationLedger? reservationLedger = null,
+        ExecutorQuotaReportStore? reportStore = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -136,6 +138,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _dispatchAvailability = dispatchAvailability;
         _circuitBreaker = circuitBreaker;
         _reservationLedger = reservationLedger;
+        _reportStore = reportStore;
         _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
         if (quotaAvailabilityPublisher is not IAgentQuotaAvailabilitySignal)
             _localQuotaAvailability = new AgentQuotaAvailabilityBroadcaster();
@@ -1954,22 +1957,50 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// pool-mates within a dispatch pass: the first member evaluated for a
     /// pool performs the probe and later members reuse the identical snapshot
     /// from <paramref name="poolCache"/>. Members with no (or an unresolvable)
-    /// pool always probe directly. The probe itself is unchanged — only the
-    /// redundant call is skipped.
+    /// pool always probe directly. Members of an executor-reported pool never
+    /// probe directly — the orchestrator holds no credential for those
+    /// accounts — and instead meter from the latest fresh executor report;
+    /// a stale or missing report reads as unknown. The probe itself is
+    /// unchanged — only the redundant call is skipped.
     /// </summary>
     private async Task<AgentQuotaSnapshot> ProbePoolMemberAsync(
         AgentMembership member,
         Dictionary<string, AgentQuotaSnapshot> poolCache,
         CancellationToken ct)
     {
-        if (QuotaPoolResolver.TryResolvePool(_opts, member, out var poolName, out _, out _)
+        string? poolName = null;
+        QuotaPoolOptions? pool = null;
+        if (QuotaPoolResolver.TryResolvePool(_opts, member, out poolName, out pool, out _)
             && poolName is not null
             && poolCache.TryGetValue(poolName, out var cached))
             return cached;
-        var snapshot = await ProbeOrUnknownAsync(member, ct);
+        AgentQuotaSnapshot snapshot;
+        if (pool is not null
+            && poolName is not null
+            && pool.ProbeSource == QuotaProbeSource.ExecutorReported)
+            snapshot = ReadExecutorReportedSnapshot(poolName);
+        else
+            snapshot = await ProbeOrUnknownAsync(member, ct);
         if (poolName is not null)
             poolCache[poolName] = snapshot;
         return snapshot;
+    }
+
+    /// <summary>
+    /// Serves the snapshot for an executor-reported pool from the report
+    /// store. No direct probe is attempted — there is no orchestrator-held
+    /// credential to probe against — so a missing store reads as unknown and
+    /// the gate's standard unknown handling applies. Admission is still
+    /// decided by <see cref="QuotaGatePolicy"/> on the orchestrator; this
+    /// only supplies the reading.
+    /// </summary>
+    private AgentQuotaSnapshot ReadExecutorReportedSnapshot(string poolName)
+    {
+        if (_reportStore is null)
+            return AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Transient,
+                $"quota pool '{poolName}' is executor-reported but no report store is wired");
+        return _reportStore.GetSnapshot(poolName);
     }
 
     /// <summary>
@@ -3359,6 +3390,15 @@ public sealed class QuotaRouterOptions
     public TimeSpan ObservedFailureWindow { get; set; } = TimeSpan.FromMinutes(10);
 
     public TimeSpan ObservedFailureRetention { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Tolerance for clock skew between executor and orchestrator hosts when
+    /// validating an executor-reported reading's observed time. A report dated
+    /// further in the future than this is rejected. Default 5 minutes.
+    /// Hot-reloadable.
+    /// </summary>
+    public TimeSpan ReportedReadingClockSkew { get; set; } =
+        QuotaRouterDefaults.DefaultReportedReadingClockSkew;
 
     /// <summary>
     /// Suggested recheck delay surfaced by <see cref="AgentClassRouter.ResolveAsync"/>

@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Api;
 
@@ -26,6 +27,7 @@ internal static class ExecutorEndpoints
         app.MapPost("/executors/register", RegisterAsync);
         app.MapPost("/executors/{hostId}/heartbeat", HeartbeatAsync);
         app.MapPost("/executors/{hostId}/deregister", DeregisterAsync);
+        app.MapPost("/executors/{hostId}/quota-reports", ReportQuotaAsync);
     }
 
     private static async Task<IResult> RegisterAsync(
@@ -155,6 +157,107 @@ internal static class ExecutorEndpoints
         return trimmed;
     }
 
+    /// <summary>
+    /// Ingests one executor-reported quota reading for a pool whose credential
+    /// the reporting host holds. The caller is bound to the claimed host in
+    /// three layers: the bearer must be a per-executor token bound to the
+    /// path host (a shared bearer such as the operator key proves nothing
+    /// about which host is calling, so it is rejected here — see
+    /// <c>ApiClientOptions.ExecutorHostId</c>); the host must have a live
+    /// worker-registry registration (checked here at ingress — an unregistered
+    /// host has no 404-free path to this store); and it must be
+    /// operator-declared in the pool's <c>HolderHostIds</c> (checked by the
+    /// store, which rejects anything else without mutating the stored
+    /// reading). The caller check runs before the registry lookup so a
+    /// rejected caller cannot probe which host ids are registered. The store
+    /// further validates values and reset consistency. This endpoint accepts
+    /// or rejects reports only — admission is decided by the orchestrator's
+    /// quota gate, never here.
+    /// </summary>
+    private static async Task<IResult> ReportQuotaAsync(
+        string hostId,
+        ExecutorQuotaReportRequest? req,
+        ExecutorQuotaReportStore store,
+        IWorkerRegistry registry,
+        HttpContext httpContext,
+        CancellationToken ct)
+    {
+        string normalized;
+        try
+        {
+            normalized = NormalizeHostId(hostId);
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+
+        if (CheckQuotaReportCaller(httpContext, normalized) is { } callerRejection)
+            return callerRejection;
+
+        if (req is null)
+            return Results.BadRequest(new { error = "request body is required" });
+
+        var workerId = ExecutorRegistration.WorkerIdFor(normalized);
+        var workers = await registry.ListAsync(ct);
+        if (!workers.Any(w => string.Equals(w.WorkerId, workerId, StringComparison.Ordinal)))
+            return Results.NotFound(new { error = $"no executor registered for host id '{normalized}'" });
+
+        QuotaUnknownReason? unknown = null;
+        if (!string.IsNullOrWhiteSpace(req.Unknown))
+        {
+            if (!Enum.TryParse<QuotaUnknownReason>(req.Unknown.Trim(), ignoreCase: true, out var parsed)
+                || !Enum.IsDefined(parsed))
+                return Results.BadRequest(
+                    new { error = $"unknown must be one of {string.Join(", ", Enum.GetNames<QuotaUnknownReason>())}" });
+            unknown = parsed;
+        }
+
+        var report = new ExecutorQuotaReport
+        {
+            PoolName = req.Pool ?? string.Empty,
+            AvailablePct = req.AvailablePct,
+            BalanceRemaining = req.BalanceRemaining,
+            ResetAt = req.ResetAt,
+            ObservedAt = req.ObservedAt ?? default,
+            Unknown = unknown,
+            Notes = req.Notes,
+        };
+
+        if (!store.TryReport(normalized, report, out var rejectionReason))
+            return Results.BadRequest(new { error = rejectionReason });
+
+        var pool = QuotaPoolResolver.NormalizePoolName(report.PoolName) ?? string.Empty;
+        if (store.TryGetStored(pool, out var stored, out _) && stored?.PoolName is { } storedName)
+            pool = storedName;
+        return Results.Ok(new { accepted = true, pool });
+    }
+
+    /// <summary>
+    /// Binds the quota-report path host to the authenticated caller. A
+    /// host-bound executor token may report only for its own host; anything
+    /// else — a missing principal, a token with no host binding (including
+    /// the shared operator key), or a bound token calling for a different
+    /// host — is rejected. Returns null when the caller may proceed.
+    /// Pure apart from reading the already-authenticated principal.
+    /// </summary>
+    internal static IResult? CheckQuotaReportCaller(HttpContext httpContext, string normalizedHostId)
+    {
+        if (!ApiKeyAuth.TryGetPrincipal(httpContext, out var principal) || principal is null)
+            return Results.Unauthorized();
+        if (ApiKeyAuth.IsAuthenticationDisabled(principal))
+            return null;
+        if (string.IsNullOrWhiteSpace(principal.ExecutorHostId))
+            return Results.Json(
+                new { error = "quota reports require a host-bound executor token (CodeyBox:ApiClients ExecutorHostId); shared bearer tokens cannot report readings" },
+                statusCode: StatusCodes.Status403Forbidden);
+        if (!string.Equals(principal.ExecutorHostId, normalizedHostId, StringComparison.Ordinal))
+            return Results.Json(
+                new { error = $"this token is bound to executor host '{principal.ExecutorHostId}' and cannot report for host '{normalizedHostId}'" },
+                statusCode: StatusCodes.Status403Forbidden);
+        return null;
+    }
+
     internal static string? ValidateCapacity(int? capacity)
     {
         if (capacity is null)
@@ -203,5 +306,22 @@ internal static class ExecutorEndpoints
     public sealed class ExecutorHeartbeatRequest
     {
         public string? CurrentWorkItemId { get; set; }
+    }
+
+    /// <summary>
+    /// One executor-reported quota reading. The pool identity, the availability
+    /// reading, the reset time, and the time it was observed travel here; the
+    /// orchestrator validates and stores the report and keeps the gate
+    /// decision for itself.
+    /// </summary>
+    public sealed class ExecutorQuotaReportRequest
+    {
+        public string? Pool { get; set; }
+        public double? AvailablePct { get; set; }
+        public double? BalanceRemaining { get; set; }
+        public DateTimeOffset? ResetAt { get; set; }
+        public DateTimeOffset? ObservedAt { get; set; }
+        public string? Unknown { get; set; }
+        public string? Notes { get; set; }
     }
 }

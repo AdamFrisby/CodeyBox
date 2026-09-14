@@ -30,6 +30,34 @@ public enum QuotaPoolKind
 }
 
 /// <summary>
+/// Where a quota pool's probe runs and how its reading reaches the gate.
+/// The default keeps current behaviour: the orchestrator holds the credential
+/// and probes directly in-process. The executor-reported mode is for accounts
+/// whose credential lives on an executor host the orchestrator cannot read:
+/// that host probes locally and reports readings, and the orchestrator meters
+/// the pool from the latest fresh reported reading. The gate decision itself
+/// is always made by the orchestrator in both modes — an executor reports
+/// readings and never decides admission.
+/// </summary>
+public enum QuotaProbeSource
+{
+    /// <summary>
+    /// The orchestrator holds the credential and probes directly in-process.
+    /// Current behaviour; the default for every pool.
+    /// </summary>
+    OrchestratorDirect,
+
+    /// <summary>
+    /// An executor host holding the credential probes locally and reports
+    /// readings to the orchestrator, which meters the pool from the latest
+    /// fresh report. A stale or missing report reads as unknown (never as
+    /// healthy headroom); reports from hosts not declared in
+    /// <see cref="QuotaPoolOptions.HolderHostIds"/> are rejected.
+    /// </summary>
+    ExecutorReported,
+}
+
+/// <summary>
 /// Operator-declared identity for one underlying account or subscription.
 /// Pool membership is declared per class member
 /// (<see cref="AgentMembership.Pool"/>); members that name the same pool are
@@ -64,6 +92,38 @@ public sealed class QuotaPoolOptions
     /// Hot-reloadable.
     /// </summary>
     public double? ReservationEstimate { get; set; }
+
+    /// <summary>
+    /// Where this pool's probe runs. <see cref="QuotaProbeSource.OrchestratorDirect"/>
+    /// (the default) probes in-process against orchestrator-held credentials,
+    /// exactly as today. <see cref="QuotaProbeSource.ExecutorReported"/> meters
+    /// the pool from readings reported by the executor host(s) holding the
+    /// credential. Hot-reloadable.
+    /// </summary>
+    public QuotaProbeSource ProbeSource { get; set; } = QuotaProbeSource.OrchestratorDirect;
+
+    /// <summary>
+    /// Maximum age of an executor-reported reading before the pool reads as
+    /// unknown. Applies only to <see cref="QuotaProbeSource.ExecutorReported"/>
+    /// pools; the unknown then flows through the same unknown handling as a
+    /// direct probe (fail-closed whenever a non-zero floor is in force).
+    /// Silence from an executor therefore never presents as healthy headroom.
+    /// Hot-reloadable. Must be positive; defaults to
+    /// <see cref="QuotaRouterDefaults.DefaultReportedReadingMaxAge"/>.
+    /// </summary>
+    public TimeSpan ReportedReadingMaxAge { get; set; } = QuotaRouterDefaults.DefaultReportedReadingMaxAge;
+
+    /// <summary>
+    /// Executor host ids authorised to report readings for this pool.
+    /// Applies only to <see cref="QuotaProbeSource.ExecutorReported"/> pools:
+    /// a report for the pool from any other host is rejected and the stored
+    /// reading is left unchanged, so a misconfigured or compromised executor
+    /// cannot overwrite a meter it does not own. Matched by exact ordinal
+    /// equality against the executor's registered host id — never by
+    /// substring. Operator-declared; never self-asserted by the executor.
+    /// Hot-reloadable.
+    /// </summary>
+    public List<string> HolderHostIds { get; set; } = [];
 }
 
 /// <summary>
@@ -226,6 +286,9 @@ public static class QuotaPoolValidation
     public static void Validate(QuotaRouterOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        if (options.ReportedReadingClockSkew < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"ReportedReadingClockSkew ({options.ReportedReadingClockSkew}) must be >= 0.");
         if (options.Pools is { } pools)
         {
             foreach (var (key, pool) in pools)
@@ -233,6 +296,15 @@ public static class QuotaPoolValidation
                 if (pool is null)
                     throw new InvalidOperationException(
                         $"Quota pool '{key}' has no configuration; declare its replenishment kind.");
+                if (!Enum.IsDefined(pool.ProbeSource))
+                    throw new InvalidOperationException(
+                        $"Quota pool '{key}' names an unknown probe source '{(int)pool.ProbeSource}'; " +
+                        $"expected '{nameof(QuotaProbeSource.OrchestratorDirect)}' or '{nameof(QuotaProbeSource.ExecutorReported)}'.");
+                if (pool.ReportedReadingMaxAge <= TimeSpan.Zero)
+                    throw new InvalidOperationException(
+                        $"Quota pool '{key}' must have a positive ReportedReadingMaxAge; " +
+                        $"staleness without a bound would present silence as headroom.");
+                ValidateHolderHostIds(key, pool);
             }
         }
         if (options.FloorByPool is not { } floors)
@@ -267,6 +339,36 @@ public static class QuotaPoolValidation
                         $"Quota pool '{key}' is a resetting-window pool; express its floor " +
                         $"in percent via MinQuotaPct/StartFloorPct/EndFloorPct, not absolute MinBalance.");
             }
+        }
+    }
+
+    /// <summary>
+    /// Validates the operator-declared holder allowlist for one pool: entries
+    /// must be non-empty, bounded like executor host ids, and free of control
+    /// characters. An executor-reported pool with no holders accepts no
+    /// reports, so it meters as unknown until the operator declares who holds
+    /// the credential — that gap fails closed at the gate rather than at load.
+    /// </summary>
+    private static void ValidateHolderHostIds(string poolName, QuotaPoolOptions pool)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var raw in pool.HolderHostIds)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                throw new InvalidOperationException(
+                    $"Quota pool '{poolName}' has an empty holder host id; " +
+                    $"holder entries must name an executor host id.");
+            var hostId = raw.Trim();
+            if (hostId.Length > CodeyBox.Core.ExecutorRegistration.MaxHostIdLength)
+                throw new InvalidOperationException(
+                    $"Quota pool '{poolName}' holder host id '{hostId}' exceeds " +
+                    $"{CodeyBox.Core.ExecutorRegistration.MaxHostIdLength} characters.");
+            if (hostId.Any(char.IsControl))
+                throw new InvalidOperationException(
+                    $"Quota pool '{poolName}' holder host id must not contain control characters.");
+            if (!seen.Add(hostId))
+                throw new InvalidOperationException(
+                    $"Quota pool '{poolName}' declares holder host id '{hostId}' more than once.");
         }
     }
 }

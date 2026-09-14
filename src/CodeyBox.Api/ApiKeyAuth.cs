@@ -59,8 +59,9 @@ internal static class ApiKeyAuth
                     throw new InvalidOperationException(
                         $"{client.TokenEnvVar} must contain at least 32 characters of high-entropy random data.");
                 ValidateInitiator(client.Principal);
+                var executorHostId = NormalizeExecutorHostId(client);
                 resolved.Add(new ResolvedApiClient(
-                    client.Name, token, client.Principal, client.CanDelegateInitiator));
+                    client.Name, token, client.Principal, client.CanDelegateInitiator, executorHostId));
             }
 
             return new ApiKeyState(Token: key, Disabled: false, Clients: resolved);
@@ -82,7 +83,7 @@ internal static class ApiKeyAuth
             if (state.Disabled)
             {
                 ctx.Items[PrincipalItemKey] = new ApiClientPrincipal(
-                    "authentication-disabled", OperatorInitiator, CanDelegateInitiator: false);
+                    AuthenticationDisabledClientName, OperatorInitiator, CanDelegateInitiator: false);
                 await next();
                 return;
             }
@@ -133,6 +134,25 @@ internal static class ApiKeyAuth
         return state.Disabled || TryAuthenticate(ctx, state, out _);
     }
 
+    internal static bool TryGetPrincipal(HttpContext context, out ApiClientPrincipal? principal)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (context.Items.TryGetValue(PrincipalItemKey, out var value)
+            && value is ApiClientPrincipal typed)
+        {
+            principal = typed;
+            return true;
+        }
+        principal = null;
+        return false;
+    }
+
+    internal static bool IsAuthenticationDisabled(ApiClientPrincipal principal)
+    {
+        ArgumentNullException.ThrowIfNull(principal);
+        return string.Equals(principal.Name, AuthenticationDisabledClientName, StringComparison.Ordinal);
+    }
+
     internal static InitiatorResolution ResolveInitiator(
         HttpContext context,
         WorkInitiator? delegated)
@@ -175,10 +195,25 @@ internal static class ApiKeyAuth
             if (!ConstantTimeEquals(presented, client.Token))
                 continue;
             principal = new ApiClientPrincipal(
-                client.Name, client.FixedInitiator, client.CanDelegateInitiator);
+                client.Name, client.FixedInitiator, client.CanDelegateInitiator, client.ExecutorHostId);
             return true;
         }
         return false;
+    }
+
+    private static string? NormalizeExecutorHostId(ApiClientOptions client)
+    {
+        if (string.IsNullOrWhiteSpace(client.ExecutorHostId))
+            return null;
+        var trimmed = client.ExecutorHostId.Trim();
+        if (trimmed.Length > ExecutorRegistration.MaxHostIdLength)
+            throw new InvalidOperationException(
+                $"CodeyBox:ApiClients entry '{client.Name}': ExecutorHostId must be at most " +
+                $"{ExecutorRegistration.MaxHostIdLength} characters.");
+        if (trimmed.Any(char.IsControl))
+            throw new InvalidOperationException(
+                $"CodeyBox:ApiClients entry '{client.Name}': ExecutorHostId must not contain control characters.");
+        return trimmed;
     }
 
     private static void ValidateInitiator(WorkInitiator initiator)
@@ -205,6 +240,14 @@ internal static class ApiKeyAuth
     }
 
     internal const string PrincipalItemKey = "CodeyBox.ApiClientPrincipal";
+
+    /// <summary>
+    /// Client name assigned to requests served while authentication is
+    /// disabled (<c>CodeyBox:DangerouslyDisableAuth=true</c>, loopback dev
+    /// only). Such callers carry no token and therefore no executor binding;
+    /// host-scoped endpoints treat them as the local operator.
+    /// </summary>
+    internal const string AuthenticationDisabledClientName = "authentication-disabled";
     private static readonly WorkInitiator OperatorInitiator = new()
     {
         Issuer = "codeybox",
@@ -240,12 +283,14 @@ internal sealed record ResolvedApiClient(
     string Name,
     string Token,
     WorkInitiator FixedInitiator,
-    bool CanDelegateInitiator);
+    bool CanDelegateInitiator,
+    string? ExecutorHostId);
 
 internal sealed record ApiClientPrincipal(
     string Name,
     WorkInitiator FixedInitiator,
-    bool CanDelegateInitiator);
+    bool CanDelegateInitiator,
+    string? ExecutorHostId = null);
 
 internal sealed record InitiatorResolution(WorkInitiator? Value, IResult? Error);
 
@@ -255,6 +300,17 @@ public sealed class ApiClientOptions
     public string TokenEnvVar { get; set; } = string.Empty;
     public WorkInitiator? Principal { get; set; }
     public bool CanDelegateInitiator { get; set; }
+
+    /// <summary>
+    /// Optional executor host this client's token is bound to. When set, the
+    /// token may only act as that host on host-scoped executor endpoints
+    /// (notably <c>POST /executors/{hostId}/quota-reports</c>): a path host
+    /// that does not exactly equal this value is rejected, so one executor
+    /// cannot forge another host's quota meter. Tokens without a binding
+    /// (including the operator key) are rejected on quota-report ingress —
+    /// a shared bearer proves nothing about which host is calling.
+    /// </summary>
+    public string? ExecutorHostId { get; set; }
 }
 
 /// <summary>
