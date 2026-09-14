@@ -1618,6 +1618,8 @@ internal sealed class ShutdownTestHarness : IDisposable
 /// </summary>
 internal sealed class BlockingAgentRunner : IAgentRunner
 {
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public AgentKind Kind { get; init; } = AgentKind.Claude;
 
     public async Task<AgentResult> RunAsync(
@@ -1630,6 +1632,7 @@ internal sealed class BlockingAgentRunner : IAgentRunner
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
     {
+        Started.TrySetResult();
         await Task.Delay(Timeout.Infinite, ct);
         return new AgentResult(false, "unreachable", null, null);
     }

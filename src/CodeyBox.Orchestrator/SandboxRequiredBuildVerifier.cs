@@ -106,6 +106,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         # assemblies. Redirect the CLI/NuGet per-user home to a directory this
         # script owns so the gate no longer depends on $HOME being writable.
         dotnet_home="$tmp_root/codeybox-dotnet-home-$$"
+        original_home="${HOME:-}"
 
         cleanup() { rm -rf "$targets_file" "$dotnet_home"; }
         trap cleanup EXIT INT TERM
@@ -121,9 +122,14 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         # against an empty folder and require network access. Preserve that
         # cache (read access is sufficient — restore never writes to an
         # already-extracted package) so offline/pinned images keep working.
-        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "${HOME:-}" ] && [ -d "$HOME/.nuget/packages" ]; then
-          export NUGET_PACKAGES="$HOME/.nuget/packages"
+        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$original_home" ] && [ -d "$original_home/.nuget/packages" ]; then
+          export NUGET_PACKAGES="$original_home/.nuget/packages"
         fi
+
+        # Some NuGet builds resolve their user-config path from HOME even when
+        # DOTNET_CLI_HOME is set. Point both variables at the isolated writable
+        # directory, after preserving the original package-cache path above.
+        export HOME="$dotnet_home"
 
         find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$targets_file"
 

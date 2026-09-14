@@ -14,6 +14,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 {
     private readonly SqliteConnection _conn;
+    private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
@@ -99,52 +100,68 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 
     public async Task CreateAsync(Release release, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                INSERT INTO releases (id, project_id, name, description, state, base_commit_sha,
-                    branch_name, created_at, closed_at, review_started_at, released_at,
-                    failed_reason, target_tag, config_json)
-                VALUES ($id, $pid, $name, $desc, $state, $sha, $branch, $ca, $closed, $review, $released,
-                    $failed, $tag, $cfg);
-                """;
-            Bind(cmd, release);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO releases (id, project_id, name, description, state, base_commit_sha,
+                        branch_name, created_at, closed_at, review_started_at, released_at,
+                        failed_reason, target_tag, config_json)
+                    VALUES ($id, $pid, $name, $desc, $state, $sha, $branch, $ca, $closed, $review, $released,
+                        $failed, $tag, $cfg);
+                    """;
+                Bind(cmd, release);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task UpdateAsync(Release release, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                UPDATE releases SET
-                    project_id = $pid, name = $name, description = $desc, state = $state,
-                    base_commit_sha = $sha, branch_name = $branch,
-                    closed_at = $closed, review_started_at = $review, released_at = $released,
-                    failed_reason = $failed, target_tag = $tag, config_json = $cfg
-                WHERE id = $id;
-                """;
-            Bind(cmd, release);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    UPDATE releases SET
+                        project_id = $pid, name = $name, description = $desc, state = $state,
+                        base_commit_sha = $sha, branch_name = $branch,
+                        closed_at = $closed, review_started_at = $review, released_at = $released,
+                        failed_reason = $failed, target_tag = $tag, config_json = $cfg
+                    WHERE id = $id;
+                    """;
+                Bind(cmd, release);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task<Release?> GetAsync(ReleaseId id, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -155,13 +172,13 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task<Release?> GetByNameAsync(ProjectId projectId, string name, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -173,7 +190,7 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
@@ -184,7 +201,7 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         int? offset = null,
         CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -221,13 +238,16 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
     /// <inheritdoc/>
     public async Task<bool> TrySetBranchAsync(ReleaseId id, string branchName, string baseCommitSha, CancellationToken ct = default)
     {
+        await _connectionLock.WaitAsync(ct);
+        try
+        {
         await _writeLock.WaitAsync(ct);
         try
         {
@@ -245,10 +265,18 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         {
             _writeLock.Release();
         }
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     public async Task<bool> TryTransitionStateAsync(Release release, ReleaseState expectedCurrentState, CancellationToken ct = default)
     {
+        await _connectionLock.WaitAsync(ct);
+        try
+        {
         await _writeLock.WaitAsync(ct);
         try
         {
@@ -269,11 +297,19 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         {
             _writeLock.Release();
         }
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     public async Task SaveAuditIterationAsync(ReleaseAuditIteration iteration, CancellationToken ct = default)
     {
         var findingsJson = JsonSerializer.Serialize(iteration.Findings, _findingsSerializerOptions);
+        await _connectionLock.WaitAsync(ct);
+        try
+        {
         await _writeLock.WaitAsync(ct);
         try
         {
@@ -298,11 +334,16 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         {
             _writeLock.Release();
         }
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<ReleaseAuditIteration>> ListAuditIterationsAsync(ReleaseId releaseId, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -334,7 +375,7 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
@@ -342,6 +383,9 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
     {
         if (results.Count == 0) return;
 
+        await _connectionLock.WaitAsync(ct);
+        try
+        {
         await _writeLock.WaitAsync(ct);
         try
         {
@@ -387,11 +431,16 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         {
             _writeLock.Release();
         }
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<ReleaseE2eReplayResult>> ListE2eReplayResultsAsync(ReleaseId releaseId, int? iteration = null, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -429,7 +478,7 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
@@ -458,6 +507,7 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         }
         finally
         {
+            _connectionLock.Dispose();
             _writeLock.Dispose();
         }
     }

@@ -186,6 +186,8 @@ public sealed class RequiredBuildGateTests : IDisposable
             psi.Environment.Remove("DOTNET_CLI_HOME");
             psi.Environment.Remove("NUGET_PACKAGES");
             psi.Environment["HOME"] = brokenHome;
+            psi.Environment["EXPECTED_NUGET_PACKAGES"] =
+                Path.Combine(brokenHome, ".nuget", "packages");
 
             using var proc = Process.Start(psi)!;
             var stderr = await proc.StandardError.ReadToEndAsync();
@@ -229,6 +231,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         psi.Environment.Remove("NUGET_PACKAGES");
         psi.Environment["HOME"] = home;
         psi.Environment["TMPDIR"] = tmpDir;
+        psi.Environment["EXPECTED_NUGET_PACKAGES"] = Path.Combine(home, ".nuget", "packages");
         psi.Environment["PATH"] =
             Path.GetDirectoryName(fakeDotnet) + Path.PathSeparator + "/usr/bin:/bin";
 
@@ -242,10 +245,9 @@ public sealed class RequiredBuildGateTests : IDisposable
 
     /// <summary>
     /// Writes a fake <c>dotnet</c> that models NuGet restore's real
-    /// precondition: it reads/creates the per-user settings directory under the
-    /// CLI home ($DOTNET_CLI_HOME, else $HOME) and fails if that directory is
-    /// not writable, and it fails if a pre-baked $HOME/.nuget/packages cache
-    /// was not preserved via NUGET_PACKAGES.
+    /// precondition: it reads/creates the per-user settings directory from HOME,
+    /// deliberately ignoring DOTNET_CLI_HOME as affected NuGet builds do, and it
+    /// fails if the pre-baked package cache was not preserved via NUGET_PACKAGES.
     /// </summary>
     private async Task<string> WriteNuGetSensitiveFakeDotnetAsync()
     {
@@ -255,15 +257,14 @@ public sealed class RequiredBuildGateTests : IDisposable
         await File.WriteAllTextAsync(dotnet, """
             #!/bin/sh
             # Model NuGet's writable per-user settings-directory requirement.
-            cli_home="${DOTNET_CLI_HOME:-$HOME}"
-            ngdir="$cli_home/.nuget/NuGet"
+            ngdir="$HOME/.nuget/NuGet"
             mkdir -p "$ngdir" 2>/dev/null || true
             if ! touch "$ngdir/NuGet.Config" 2>/dev/null; then
               echo "error : Failed to read NuGet.Config due to unauthorized access. Path: '$ngdir/NuGet.Config'." >&2
               exit 1
             fi
-            if [ -n "${HOME:-}" ] && [ -d "$HOME/.nuget/packages" ] \
-               && [ "${NUGET_PACKAGES:-}" != "$HOME/.nuget/packages" ]; then
+            if [ -n "${EXPECTED_NUGET_PACKAGES:-}" ] \
+               && [ "${NUGET_PACKAGES:-}" != "$EXPECTED_NUGET_PACKAGES" ]; then
               echo "error : pre-baked NuGet package cache not preserved (NUGET_PACKAGES=${NUGET_PACKAGES:-unset})" >&2
               exit 1
             fi
