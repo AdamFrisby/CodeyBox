@@ -1097,7 +1097,19 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             },
             JsonOpts);
 
-    private static string SerializeRouterInputs(
+    /// <summary>
+    /// Hot-reload fingerprint for the <c>AgentClasses</c> / <c>AgentInstances</c> /
+    /// <c>AgentScoreModifiers</c> block. Must observe every field
+    /// <see cref="AgentClassesConfigBuilder.Build"/> consumes — a configured field
+    /// missing here silently behaves as restart-required (the <c>Pool</c> failure
+    /// mode: the edit is accepted, no reload fires, the router keeps the old value).
+    /// The only intentional exclusion is
+    /// <see cref="TimeOfDayModifierOptions.Comment"/>, a readability annotation the
+    /// builder never reads. Internal for the fingerprint-coverage test, which proves
+    /// every settable field on the member/instance/class config POCOs is observed
+    /// here and fails when a new field is added without being covered.
+    /// </summary>
+    internal static string SerializeRouterInputs(
         List<AgentClassOptions> classes,
         List<AgentInstanceOptions> instances,
         AgentScoreModifiersOptions modifiers) =>
@@ -1115,6 +1127,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                         i.SettingsFilePath,
                         i.DestinationPath,
                         i.SandboxEnvironmentVariable,
+                        i.Provider,
                     })
                     .OrderBy(i => i.Id, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(i => i.Agent, StringComparer.OrdinalIgnoreCase)
@@ -1124,11 +1137,13 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                     {
                         c.Id,
                         c.DisplayName,
+                        ClaudeSession = c.ClaudeSession?.Enabled,
                         Members = c.Members
                             .Select(m => new
                             {
                                 m.Agent,
                                 m.InstanceId,
+                                m.Pool,
                                 m.Billing,
                                 m.ModelId,
                                 m.CredentialFilePath,
@@ -1137,11 +1152,13 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                                 m.SettingsFilePath,
                                 m.DestinationPath,
                                 m.SandboxEnvironmentVariable,
+                                m.Provider,
                                 m.QualityScore,
                                 m.ReasoningMode,
                                 Capabilities = m.Capabilities
                                     .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
                                     .ToArray(),
+                                ClaudeSession = m.ClaudeSession?.Enabled,
                             })
                             .ToArray(),
                     })

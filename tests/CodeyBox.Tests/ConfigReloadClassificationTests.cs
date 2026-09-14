@@ -336,6 +336,42 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             AgentConfigHotReload.SerializeWorkerPool(mutated, legacyConcurrency: null));
     }
 
+    public static TheoryData<string> RouterFingerprintFields
+    {
+        get
+        {
+            // Driven by reflection over the config POCOs so a newly added
+            // settable property becomes a case automatically — and
+            // MutateRouterField throws for names it does not know, failing the
+            // new case until the fingerprint covers the field.
+            var data = new TheoryData<string>();
+            foreach (var p in typeof(AgentMembershipOptions).GetProperties())
+                data.Add("Member." + p.Name);
+            foreach (var p in typeof(AgentInstanceOptions).GetProperties())
+                data.Add("Instance." + p.Name);
+            foreach (var p in typeof(AgentClassOptions).GetProperties())
+                data.Add("Class." + p.Name);
+            return data;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(RouterFingerprintFields))]
+    public void RouterFingerprint_ObservesEveryConfigurableField(string field)
+    {
+        // A configured router field missing from SerializeRouterInputs silently
+        // behaves as restart-required: the edit is accepted, no reload fires,
+        // and the router keeps the old value (the Pool failure mode). Mutating
+        // the field solo must move the fingerprint.
+        var baseline = BaselineRouterInputs();
+        var mutated = BaselineRouterInputs();
+        MutateRouterField(mutated, field);
+
+        Assert.NotEqual(
+            AgentConfigHotReload.SerializeRouterInputs(baseline.Classes, baseline.Instances, baseline.Modifiers),
+            AgentConfigHotReload.SerializeRouterInputs(mutated.Classes, mutated.Instances, mutated.Modifiers));
+    }
+
     public static TheoryData<string> GuardedKeyPaths
     {
         get
@@ -555,6 +591,166 @@ public sealed class ConfigReloadClassificationTests : IDisposable
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(field), field, "No mutator for this WorkerPool field.");
+        }
+    }
+
+    private static (List<AgentClassOptions> Classes, List<AgentInstanceOptions> Instances, AgentScoreModifiersOptions Modifiers)
+        BaselineRouterInputs() =>
+        (
+            [
+                new AgentClassOptions
+                {
+                    Id = "frontier",
+                    DisplayName = "Frontier",
+                    ClaudeSession = new AgentClassClaudeSessionOptions { Enabled = true },
+                    Members = [BaselineRouterMember()],
+                },
+            ],
+            [
+                new AgentInstanceOptions
+                {
+                    Id = "acct-a",
+                    Agent = "claude",
+                    CredentialFilePath = "/cred-a",
+                    TokenEnvironmentVariable = "TOKEN_A",
+                    AuthJsonEnvironmentVariable = "AUTH_A",
+                    SettingsFilePath = "/settings-a",
+                    DestinationPath = "/dest-a",
+                    SandboxEnvironmentVariable = "SANDBOX_A",
+                    Provider = "provider-a",
+                },
+            ],
+            new AgentScoreModifiersOptions()
+        );
+
+    private static AgentMembershipOptions BaselineRouterMember() => new()
+    {
+        Agent = "claude",
+        InstanceId = "acct-a",
+        Pool = "pool-a",
+        Billing = "Subscription",
+        ModelId = "model-a",
+        CredentialFilePath = "/cred-a",
+        TokenEnvironmentVariable = "TOKEN_A",
+        AuthJsonEnvironmentVariable = "AUTH_A",
+        SettingsFilePath = "/settings-a",
+        DestinationPath = "/dest-a",
+        SandboxEnvironmentVariable = "SANDBOX_A",
+        Provider = "provider-a",
+        QualityScore = 100,
+        ReasoningMode = "high",
+        Capabilities = ["tag-a"],
+        ClaudeSession = new AgentClassClaudeSessionOptions { Enabled = true },
+    };
+
+    private static void MutateRouterField(
+        (List<AgentClassOptions> Classes, List<AgentInstanceOptions> Instances, AgentScoreModifiersOptions Modifiers) inputs,
+        string field)
+    {
+        // Every case flips exactly one configured value. A property added to
+        // any of these POCOs without a case here (and without fingerprint
+        // coverage) fails loudly via the default arm — that is the point.
+        var member = inputs.Classes[0].Members[0];
+        var instance = inputs.Instances[0];
+        var cls = inputs.Classes[0];
+        switch (field)
+        {
+            case "Member.Agent":
+                member.Agent = "codex";
+                break;
+            case "Member.InstanceId":
+                member.InstanceId = "acct-b";
+                break;
+            case "Member.Pool":
+                member.Pool = "pool-b";
+                break;
+            case "Member.Billing":
+                member.Billing = "PayPerApi";
+                break;
+            case "Member.ModelId":
+                member.ModelId = "model-b";
+                break;
+            case "Member.CredentialFilePath":
+                member.CredentialFilePath = "/cred-b";
+                break;
+            case "Member.TokenEnvironmentVariable":
+                member.TokenEnvironmentVariable = "TOKEN_B";
+                break;
+            case "Member.AuthJsonEnvironmentVariable":
+                member.AuthJsonEnvironmentVariable = "AUTH_B";
+                break;
+            case "Member.SettingsFilePath":
+                member.SettingsFilePath = "/settings-b";
+                break;
+            case "Member.DestinationPath":
+                member.DestinationPath = "/dest-b";
+                break;
+            case "Member.SandboxEnvironmentVariable":
+                member.SandboxEnvironmentVariable = "SANDBOX_B";
+                break;
+            case "Member.Provider":
+                member.Provider = "provider-b";
+                break;
+            case "Member.QualityScore":
+                member.QualityScore = 99;
+                break;
+            case "Member.ReasoningMode":
+                member.ReasoningMode = "low";
+                break;
+            case "Member.Capabilities":
+                member.Capabilities = ["tag-b"];
+                break;
+            case "Member.ClaudeSession":
+                member.ClaudeSession = new AgentClassClaudeSessionOptions { Enabled = false };
+                break;
+            case "Instance.Id":
+                instance.Id = "acct-b";
+                break;
+            case "Instance.Agent":
+                instance.Agent = "codex";
+                break;
+            case "Instance.CredentialFilePath":
+                instance.CredentialFilePath = "/cred-b";
+                break;
+            case "Instance.TokenEnvironmentVariable":
+                instance.TokenEnvironmentVariable = "TOKEN_B";
+                break;
+            case "Instance.AuthJsonEnvironmentVariable":
+                instance.AuthJsonEnvironmentVariable = "AUTH_B";
+                break;
+            case "Instance.SettingsFilePath":
+                instance.SettingsFilePath = "/settings-b";
+                break;
+            case "Instance.DestinationPath":
+                instance.DestinationPath = "/dest-b";
+                break;
+            case "Instance.SandboxEnvironmentVariable":
+                instance.SandboxEnvironmentVariable = "SANDBOX_B";
+                break;
+            case "Instance.Provider":
+                instance.Provider = "provider-b";
+                break;
+            case "Class.Id":
+                cls.Id = "other";
+                break;
+            case "Class.DisplayName":
+                cls.DisplayName = "Other";
+                break;
+            case "Class.ClaudeSession":
+                cls.ClaudeSession = new AgentClassClaudeSessionOptions { Enabled = false };
+                break;
+            case "Class.Members":
+                cls.Members.Add(new AgentMembershipOptions
+                {
+                    Agent = "codex",
+                    Billing = "Subscription",
+                    QualityScore = 50,
+                });
+                break;
+            default:
+                throw new InvalidOperationException(
+                    $"MutateRouterField has no mutation for '{field}'. " +
+                    "Cover the new config property in SerializeRouterInputs and add its mutation here.");
         }
     }
 
