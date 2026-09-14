@@ -3422,7 +3422,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
         catch (AuditUnavailableException ex)
         {
             _log.LogWarning(ex, "Work item {Id} could not verify audit gate", item.Id);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+            // A deterministic refusal (the runner rejected its arguments, so an
+            // unchanged retry fails identically) is a configuration error, not a
+            // transient provisioning fault: stamping the configuration kind
+            // classifies it Deterministic downstream, so it surfaces immediately
+            // instead of burning the recovery-attempt budget on identical retries.
+            var failureKind = ex.IsDeterministic
+                ? WorkItemFailureKinds.Configuration
+                : WorkItemFailureKinds.Infrastructure;
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: failureKind);
         }
         catch (E2eReplayGateBlockedException ex)
         {

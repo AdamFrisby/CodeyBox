@@ -114,7 +114,7 @@ public sealed class DefaultTerminalFailureClassifier : ITerminalFailureClassifie
                 TerminalFailureClass.Deterministic,
                 "failureKind=agent: agent-internal failure (e.g. stuck probe); rework required");
 
-        if (string.Equals(item.FailureKind, "configuration", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.Configuration, StringComparison.OrdinalIgnoreCase))
             return new TerminalFailureClassification(
                 TerminalFailureClass.Deterministic,
                 "failureKind=configuration: pipeline rejected the work-item's config");

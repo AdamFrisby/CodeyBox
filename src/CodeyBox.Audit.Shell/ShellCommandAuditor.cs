@@ -179,9 +179,16 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         string toolName,
         CancellationToken ct)
     {
+        // The exact vector the sandbox receives. Diagnostics (findings and the
+        // result classifier) report THIS vector — never the pre-wrap configured
+        // argv — so the logged command string is byte-identical to what actually
+        // executed. A diagnostic that omits a wrapper or an appended argument
+        // makes invocation refusals (e.g. VSTest rejecting a test source) much
+        // harder to identify.
+        var execArgv = BuildExecArgv();
         var result = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = BuildExecArgv(),
+            Argv = execArgv,
             WorkingDirectory = workingDirectory,
             ExtraEnvironment = environment,
         }, ct);
@@ -191,7 +198,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         if (result.ExitCode == 0 && !result.ExecutionUnavailable)
             return new AuditResult(true, [], RawOutput: combinedOutput);
 
-        var finding = BuildCommandFinding(result, toolName);
+        var finding = BuildCommandFinding(result, toolName, execArgv);
         if (_opts.ResultClassifier is not null)
         {
             var classified = _opts.ResultClassifier.ClassifyFailedCommand(new AuditResultClassificationContext(
@@ -199,7 +206,8 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                 _opts.Argv,
                 result,
                 combinedOutput,
-                finding));
+                finding,
+                execArgv));
             if (classified is not null)
             {
                 if (_opts.ResultClassifier is DotnetTestCommandResultClassifier
@@ -233,9 +241,9 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     /// argv is wrapped by <see cref="NuGetHomeSelfHeal.WrapDotnetInvocation"/> so
     /// restore survives a root-owned <c>~/.nuget</c> -- a single <c>sh -c</c> that
     /// runs the self-heal preamble then <c>exec "$@"</c>s the real command with
-    /// its arguments intact. The configured argv (not the wrapped form) is what
-    /// findings and the result classifier report, so wrapping is invisible to
-    /// callers.
+    /// its arguments intact. Findings and the result classifier report this
+    /// executed vector (not the pre-wrap configured argv), so the logged command
+    /// string is byte-identical to what the sandbox received.
     /// </summary>
     private IReadOnlyList<string> BuildExecArgv()
         => _opts.SelfHealNuGetHome
@@ -278,7 +286,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         }
     }
 
-    private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName)
+    private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName, IReadOnlyList<string> execArgv)
     {
         var description = DescriptionOutput(result);
 
@@ -299,7 +307,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             : AuditSeverity.Error;
         var title = missingTool
             ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
-            : $"command exited {result.ExitCode}: {string.Join(' ', _opts.Argv)}";
+            : $"command exited {result.ExitCode}: {string.Join(' ', execArgv)}";
 
         return new AuditFinding(
             AuditorName: Name,

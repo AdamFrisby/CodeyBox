@@ -31,10 +31,16 @@ public interface IAuditResultClassifier
 /// <summary>
 /// Inputs a <see cref="IAuditResultClassifier"/> inspects to decide whether a
 /// failed command should produce a refined result.
+/// <para><see cref="Argv"/> is the configured (logical) command, used to
+/// recognize which tool ran. <see cref="ExecutedArgv"/> is the exact argument
+/// vector the sandbox received (including any execution wrapper), and is what
+/// diagnostics must report so the logged command string is byte-identical to
+/// what actually executed. The two are equal when no wrapper applies.</para>
 /// </summary>
 public sealed record AuditResultClassificationContext(
     string AuditorName,
     IReadOnlyList<string> Argv,
     SandboxExecResult Result,
     string CombinedOutput,
-    AuditFinding CommandFinding);
+    AuditFinding CommandFinding,
+    IReadOnlyList<string> ExecutedArgv);

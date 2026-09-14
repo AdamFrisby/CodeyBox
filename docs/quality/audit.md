@@ -210,8 +210,8 @@ that hands the build user a root-owned `~/.nuget` therefore aborts
 `process:required-build` with `Failed to read NuGet.Config due to unauthorized
 access`. The `csharp:test-pass` "argument …dll is invalid" message is the same
 failure downstream: nothing built, so there is no test assembly. It surfaces
-as infrastructure (`could-not-verify`), not as a code finding — see
-`DotnetTestAuditor` below.
+as a deterministic configuration error (`could-not-verify`), not as a code
+finding — see `DotnetTestAuditor` below.
 
 No committed repository file can redirect that read — NuGet resolves the path
 from process environment. CodeyBox works around it in three places instead: the
@@ -282,9 +282,15 @@ compiler/SDK errors (`CS`/`NETSDK`/`NU`), or `Build FAILED.` stays a blocking
 code finding. A non-zero exit with zero parsed failures plus a
 runner-invocation refusal — VSTest's `The argument … is invalid.` /
 `The test source file … was not found.` for an absent test assembly, or
-MSBuild `MSB1001`/`MSB1003`/`MSB1009` — raises `AuditUnavailableException`,
-failing the item as infrastructure (`could-not-verify`) without consuming a
-rework iteration. When both shapes appear in one transcript, the genuine
+MSBuild `MSB1001`/`MSB1003`/`MSB1009` — raises `AuditUnavailableException`
+marked deterministic, failing the item as configuration (`could-not-verify`)
+without consuming a rework iteration or recovery-attempt budget: the same argv
+against the same tree fails identically, so an unchanged retry cannot help.
+The gate never constructs the rejected assembly form — `DotnetTestAuditor`
+refuses a bare `.dll` positional and always emits the project/solution form —
+and the reported `(command: …)` string is the argument vector actually
+executed, so a refusal names the exact invocation the runner received. When
+both shapes appear in one transcript, the genuine
 failure signals win and the outcome stays a code finding.
 
 Capability: `None`.

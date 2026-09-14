@@ -62,6 +62,10 @@ public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
     /// <see cref="AuditUnavailableException"/> routes the item to the
     /// infrastructure failure path (operator attention, rework budget intact)
     /// instead of feeding an unfixable blocking finding to the rework loop.
+    /// The refusal is deterministic (the same argv against the same tree fails
+    /// identically), so the exception is marked
+    /// <see cref="AuditUnavailableException.IsDeterministic"/> and the pipeline
+    /// surfaces it immediately without consuming recovery-attempt budget.
     /// </summary>
     /// <exception cref="AuditUnavailableException">
     /// Thrown when the output shows the runner refused its invocation.
@@ -75,9 +79,12 @@ public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
 
         var signal = FirstSignalLine(context.CombinedOutput);
         throw new AuditUnavailableException(
-            $"could-not-verify: test runner invocation failed for '{context.AuditorName}' (exit {context.Result.ExitCode}): {signal} (command: {string.Join(' ', context.Argv)})",
+            $"could-not-verify: test runner invocation failed for '{context.AuditorName}' (exit {context.Result.ExitCode}): {signal} (command: {string.Join(' ', context.ExecutedArgv)})",
             context.Result.ExitCode,
-            context.CombinedOutput);
+            context.CombinedOutput)
+        {
+            IsDeterministic = true,
+        };
     }
 
     private static string FirstSignalLine(string output)

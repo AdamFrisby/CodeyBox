@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using CodeyBox.Audit.Shell;
+using CodeyBox.Core;
+using CodeyBox.DotnetTestRunnerPlugin;
 
 namespace CodeyBox.Tests;
 
@@ -78,6 +81,51 @@ public sealed class DotnetTestRunnerVectorTests : IDisposable
 
         Assert.Equal(0, exit);
         Assert.Contains("Passed!", combined, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ConstructedGateCommand_IsAcceptedByRunnerParser_WithNoBareDllPositional()
+    {
+        // The exact argv the `csharp:test-pass` gate constructs must pass the
+        // runner's argument validation in a representative layout (a
+        // discoverable test project with no prebuilt outputs): no bare `.dll`
+        // positional, no VSTest argument refusal. Contrast with
+        // AppendedAbsentAssembly_IsRejectedWithoutRunningTests, which pins the
+        // rejected assembly form. Runs the auditor's own BuildInvocation output
+        // (not a hardcoded argv) so construction and acceptance cannot drift.
+        if (!await IsDotnetAvailableAsync())
+            return;
+
+        var auditor = new DotnetTestAuditor(new DotnetTestAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            BaseArgv = ["dotnet", "test", "--no-build"],
+        });
+        var invocation = auditor.BuildInvocation(TestSelection.All, TestRunOptions.Default);
+        Assert.Null(DotnetTestArgv.FindBareAssemblyPositional(invocation));
+
+        var layout = Path.Combine(_workspace, "accept");
+        Directory.CreateDirectory(layout);
+        await File.WriteAllTextAsync(
+            Path.Combine(layout, "Accept.Tests.csproj"),
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+                <Nullable>enable</Nullable>
+                <IsPackable>false</IsPackable>
+              </PropertyGroup>
+            </Project>
+            """);
+
+        var (exit, combined) = await RunDotnetAsync(
+            layout,
+            DefaultDotnetTimeout,
+            [.. invocation.Skip(1)]);
+
+        Assert.Equal(0, exit);
+        Assert.DoesNotContain("is invalid", combined, StringComparison.Ordinal);
+        Assert.DoesNotContain("was not found", combined, StringComparison.Ordinal);
     }
 
     private static async Task<bool> IsDotnetAvailableAsync()

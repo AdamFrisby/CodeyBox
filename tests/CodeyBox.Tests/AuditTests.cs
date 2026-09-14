@@ -595,7 +595,8 @@ public sealed class AuditTests
             ["dotnet", "build"],
             new SandboxExecResult(1, "", "build failed"),
             "build failed",
-            commandFinding));
+            commandFinding,
+            ["dotnet", "build"]));
 
         Assert.Null(result);
     }
@@ -616,7 +617,8 @@ public sealed class AuditTests
             ["dotnet", "format", "--verbosity", "diagnostic"],
             new SandboxExecResult(2, "", output),
             output,
-            commandFinding));
+            commandFinding,
+            ["dotnet", "format", "--verbosity", "diagnostic"]));
 
         Assert.Null(result);
     }
