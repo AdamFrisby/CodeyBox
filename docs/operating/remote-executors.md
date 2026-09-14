@@ -43,7 +43,23 @@ after failure stays with the pipeline state machine.
 Bounds live under `CodeyBox:ExecutorPhaseDispatch` (`StageOutMaxArchiveBytes`,
 `StageOutMaxEntries`, `StageOutMaxExpansionRatio`, `IdempotencyTtl`,
 `MaxRequestPayloadBytes`, `MaxResultFindings`, `MaxFindingLengthChars`,
-`MaxResultErrorLengthChars`), hot-reloadable like the other dispatch knobs.
+`MaxResultErrorLengthChars`, `MaxStreamChunkChars`), hot-reloadable like the other dispatch knobs.
+
+## Live agent-output relay
+
+While the phase runs, the executor streams sequenced agent-output chunks
+(`ExecutorStreamChunk`, numbered from zero) back to the orchestrator as they
+are produced — transports implementing `IStreamingExecutorPhaseTransport`
+deliver them live rather than buffering to phase end. The proxy relays each
+chunk into the orchestrator-side stream capture at the same path and key
+(work-item directory, phase/iteration file) a local phase would write, and
+re-broadcasts it through the existing stdout hub, so live subscribers see
+remote output with no contract change. The relay holds no queue of its own:
+the capture's own slicing and per-file truncation (including its truncation
+marker) apply unchanged, and `MaxStreamChunkChars` only caps the size of a
+single forwarded piece. A lost or reordered chunk is recorded as an explicit
+`[...stream gap ...]` line rather than silently omitted, and relay failure
+never fails the phase — losing the stream degrades observability only.
 
 ## Running the executor
 

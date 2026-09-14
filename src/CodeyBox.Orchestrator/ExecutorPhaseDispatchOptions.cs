@@ -51,6 +51,16 @@ public sealed class ExecutorPhaseDispatchOptions
     public int MaxResultErrorLengthChars { get; set; } = 8192;
 
     /// <summary>
+    /// Largest single piece of relayed stream text forwarded to the capture
+    /// and the live broadcast per write. Larger executor payloads are split
+    /// into pieces of at most this size before forwarding, mirroring the
+    /// capture's own queue slicing, so one hostile chunk cannot force an
+    /// unbounded single allocation through the relay. The per-file size cap
+    /// that truncates with a marker stays owned by the capture itself.
+    /// </summary>
+    public int MaxStreamChunkChars { get; set; } = 64 * 1024;
+
+    /// <summary>
     /// Fails fast on misconfiguration so a bad bound surfaces at dispatch
     /// time instead of silently admitting an unbounded payload.
     /// </summary>
@@ -80,5 +90,8 @@ public sealed class ExecutorPhaseDispatchOptions
         if (MaxResultErrorLengthChars <= 0)
             throw new InvalidOperationException(
                 "CodeyBox:ExecutorPhaseDispatch:MaxResultErrorLengthChars must be > 0.");
+        if (MaxStreamChunkChars <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:MaxStreamChunkChars must be > 0.");
     }
 }
