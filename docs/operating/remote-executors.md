@@ -7,9 +7,43 @@ phase-execution seam. It connects **outbound** to the orchestrator (plain HTTPS
 POSTs) and never opens an inbound listening port, so it can sit behind NAT or
 a host firewall.
 
-This page covers the process, its registration and its liveness. Dispatching
-work to a registered executor is a separate item: an executor that registers
-and heartbeats but is never sent work is the acceptance state.
+This page covers the process, its registration, its liveness, and the
+phase-dispatch proxy that sends work to a registered executor.
+
+## Dispatching phases to an executor
+
+`ExecutorPhaseProxy` (`src/CodeyBox.Orchestrator/ExecutorPhaseProxy.cs`)
+implements `IExecutorPhaseRunner`: it selects a registered executor from the
+worker registry using `ExecutorEligibility` (zero-capacity, cordoned and
+unhealthy hosts register but are never selected), stages the phase's single
+bare repo to the host through `IExecutorPhaseTransport`, runs the phase
+there, and stages the repo back as a tar archive that is validated (archive
+bytes, entry count, expansion ratio, path containment) before anything is
+extracted over the orchestrator's bare repo. The archive-byte cap is enforced
+by the transport while receiving — an unbounded payload is aborted mid-stream
+rather than buffered to disk and rejected afterwards — with the validator
+re-checking the landed size as defense in depth. Only the per-item repo is ever
+transferred — never the whole repos root — so an executor receives only the
+repo for the item it is running.
+
+Delivery is idempotent through `IIdempotencyStore`: the key is work item +
+phase + attempt and the body hash covers the request, so a redelivered
+dispatch replays the original result instead of provisioning a second
+sandbox, while the same key with a different body is refused as a conflict
+and never executes. With no executor registered, dispatch falls back to the
+in-process runner with unchanged behaviour.
+
+An agent failure on the executor is returned as a result (`AgentFailed`); a
+host, connection or transfer problem throws `ExecutorPhaseTransportException`
+and stores nothing, so an unreachable host is retried elsewhere rather than
+charged against the work item as an agent failure. The proxy never touches
+the work item table — the transport carries dispatch only, and re-dispatch
+after failure stays with the pipeline state machine.
+
+Bounds live under `CodeyBox:ExecutorPhaseDispatch` (`StageOutMaxArchiveBytes`,
+`StageOutMaxEntries`, `StageOutMaxExpansionRatio`, `IdempotencyTtl`,
+`MaxRequestPayloadBytes`, `MaxResultFindings`, `MaxFindingLengthChars`,
+`MaxResultErrorLengthChars`), hot-reloadable like the other dispatch knobs.
 
 ## Running the executor
 
