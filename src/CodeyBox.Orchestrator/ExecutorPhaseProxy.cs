@@ -293,6 +293,8 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         ArgumentNullException.ThrowIfNull(options);
         if (!Enum.IsDefined(result.Outcome))
             throw new ExecutorPhaseException("Executor returned an unknown phase outcome.");
+        if (result.Findings is null)
+            throw new ExecutorPhaseException("Executor returned no findings collection.");
         if (result.Findings.Count > options.MaxResultFindings)
             throw new ExecutorPhaseException($"Executor returned {result.Findings.Count} findings, exceeding MaxResultFindings={options.MaxResultFindings}.");
         foreach (var finding in result.Findings)

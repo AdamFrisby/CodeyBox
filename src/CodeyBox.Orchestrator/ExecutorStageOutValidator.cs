@@ -19,6 +19,8 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public static class ExecutorStageOutValidator
 {
+    private const int CopyBufferSize = 128 * 1024;
+
     /// <summary>
     /// Validates the archive at <paramref name="archivePath"/>, extracts it
     /// into a fresh directory under <paramref name="scratchRoot"/>, and
@@ -38,7 +40,28 @@ public static class ExecutorStageOutValidator
         ArgumentException.ThrowIfNullOrWhiteSpace(scratchRoot);
         ArgumentNullException.ThrowIfNull(options);
 
-        var expectedRoot = Path.GetFileName(targetRepoPath.TrimEnd(Path.DirectorySeparatorChar));
+        string canonicalTarget;
+        string canonicalScratch;
+        try
+        {
+            canonicalTarget = Path.GetFullPath(targetRepoPath);
+            canonicalScratch = Path.GetFullPath(scratchRoot);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw new ExecutorPhaseException($"Invalid stage-out path: {ex.Message}", ex);
+        }
+
+        if (!Path.IsPathRooted(canonicalTarget) || !Path.IsPathRooted(canonicalScratch))
+            throw new ExecutorPhaseException("Stage-out target and scratch paths must be absolute.");
+
+        var tempRoot = Path.GetFullPath(Path.GetTempPath());
+        var tempPrefix = tempRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var scratchWithSep = canonicalScratch.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!scratchWithSep.StartsWith(tempPrefix, StringComparison.Ordinal) && !string.Equals(canonicalScratch.TrimEnd(Path.DirectorySeparatorChar), tempRoot.TrimEnd(Path.DirectorySeparatorChar), StringComparison.Ordinal))
+            throw new ExecutorPhaseException("Stage-out scratch root escapes the temp directory.");
+
+        var expectedRoot = Path.GetFileName(canonicalTarget.TrimEnd(Path.DirectorySeparatorChar));
         if (string.IsNullOrEmpty(expectedRoot))
             throw new ExecutorPhaseException($"Target repo path has no basename: '{targetRepoPath}'.");
 
@@ -49,17 +72,20 @@ public static class ExecutorStageOutValidator
 
         ValidateArchiveEntries(archivePath, archiveBytes, expectedRoot, options);
 
-        var workRoot = Path.Combine(scratchRoot, ".codeybox-stageout-" + Guid.NewGuid().ToString("N"));
+        var workRoot = Path.Combine(canonicalScratch, ".codeybox-stageout-" + Guid.NewGuid().ToString("N"));
         var extractRoot = Path.Combine(workRoot, "extract");
         Directory.CreateDirectory(extractRoot);
         try
         {
             await ExtractArchiveAsync(archivePath, extractRoot, expectedRoot, ct).ConfigureAwait(false);
             var extracted = Path.Combine(extractRoot, expectedRoot);
-            if (!Directory.Exists(extracted) && !File.Exists(extracted))
+            if (File.Exists(extracted))
+                throw new ExecutorPhaseException(
+                    $"Staged-back archive root '{expectedRoot}' is a file, expected a directory.");
+            if (!Directory.Exists(extracted))
                 throw new ExecutorPhaseException(
                     $"Validated staged-back archive did not contain expected root '{expectedRoot}'.");
-            ReplacePath(extracted, targetRepoPath);
+            ReplacePath(extracted, canonicalTarget);
         }
         finally
         {
@@ -105,8 +131,7 @@ public static class ExecutorStageOutValidator
                     declaredRegularFileBytes += entry.Length;
                 }
 
-                var name = NormalizeEntryName(entry.Name);
-                EnsureUnderExpectedRoot(name, expectedRoot);
+                EnsureEntrySafe(entry, expectedRoot);
                 sawRootedEntry = true;
             }
         }
@@ -139,11 +164,7 @@ public static class ExecutorStageOutValidator
             {
                 if (IsMetadataEntry(entry.EntryType))
                     continue;
-                if (!IsSafeEntryType(entry.EntryType))
-                    throw new ExecutorPhaseException(
-                        $"Unsafe staged-back entry '{entry.Name}' has unsupported type '{entry.EntryType}'.");
-                var name = NormalizeEntryName(entry.Name);
-                EnsureUnderExpectedRoot(name, expectedRoot);
+                var name = EnsureEntrySafe(entry, expectedRoot);
                 var destination = Path.GetFullPath(Path.Combine(canonicalRoot, name));
                 EnsureContained(canonicalRoot, destination);
                 if (entry.EntryType == TarEntryType.Directory)
@@ -157,7 +178,7 @@ public static class ExecutorStageOutValidator
                         Directory.CreateDirectory(parent);
                     await using var output = new FileStream(
                         destination, FileMode.Create, FileAccess.Write, FileShare.None,
-                        bufferSize: 128 * 1024, useAsync: true);
+                        bufferSize: CopyBufferSize, useAsync: true);
                     if (entry.DataStream is not null)
                         await BoundedCopyAsync(entry.DataStream, output, entry.Length, name, ct).ConfigureAwait(false);
                 }
@@ -175,7 +196,7 @@ public static class ExecutorStageOutValidator
 
     private static async Task BoundedCopyAsync(Stream source, Stream destination, long declaredLength, string name, CancellationToken ct)
     {
-        var buffer = new byte[128 * 1024];
+        var buffer = new byte[CopyBufferSize];
         long copied = 0;
         while (true)
         {
@@ -227,6 +248,20 @@ public static class ExecutorStageOutValidator
         }
 
         return normalized;
+    }
+
+    private static string EnsureEntrySafe(TarEntry entry, string expectedRoot)
+    {
+        if (!IsSafeEntryType(entry.EntryType))
+            throw new ExecutorPhaseException(
+                $"Unsafe staged-back entry '{entry.Name}' has unsupported type '{entry.EntryType}'.");
+        var name = NormalizeEntryName(entry.Name);
+        EnsureUnderExpectedRoot(name, expectedRoot);
+        if (string.Equals(name, expectedRoot, StringComparison.Ordinal)
+            && entry.EntryType != TarEntryType.Directory)
+            throw new ExecutorPhaseException(
+                $"Staged-back archive root '{expectedRoot}' must be a directory, not '{entry.EntryType}'.");
+        return name;
     }
 
     private static void EnsureUnderExpectedRoot(string entryName, string expectedRoot)
