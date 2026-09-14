@@ -4500,20 +4500,31 @@ app.MapGet("/quota", async (
     var pausedByAgent = pausedStates
         .Where(s => s.AgentInstanceId is null)
         .ToDictionary(s => s.Agent, s => s);
-    var probeByKind = probes
-        .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
-        .ToDictionary(p => p.Kind);
+    var quotaLog = loggerFactory.CreateLogger("Quota");
+    var subscriptionProbes = AgentQuotaProbeCatalog.BuildSubscriptionProbes(probes);
+    var fallbackKinds = subscriptionProbes.Select(p => p.Kind).Distinct().ToList();
     var representedProbeKeys = new HashSet<(AgentKind Agent, string? ModelId)>();
 
     var snapshots = new List<object>();
     var kindAggregateCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     async Task AddSnapshotAsync(AgentMembership member, string? classId, string? classDisplayName)
     {
-        if (!probeByKind.TryGetValue(member.Agent, out var probe))
+        var resolution = AgentQuotaProbeCatalog.ResolveSubscriptionProbe(subscriptionProbes, member, quotaLog);
+        AgentQuotaSnapshot snapshot;
+        if (resolution.Conflict is not null)
+        {
+            representedProbeKeys.Add((member.Agent, member.ModelId));
+            snapshot = AgentQuotaProbeCatalog.ConflictUnknownSnapshot(resolution.Conflict);
+        }
+        else if (resolution.Probe is null)
+        {
             return;
-
-        representedProbeKeys.Add((member.Agent, member.ModelId));
-        var snapshot = await probe.GetAvailabilityAsync(member, ct);
+        }
+        else
+        {
+            representedProbeKeys.Add((member.Agent, member.ModelId));
+            snapshot = await resolution.Probe.GetAvailabilityAsync(member, ct);
+        }
         var poolName = QuotaPoolResolver.NormalizePoolName(member.Pool);
         string? poolKind = null;
         if (poolName is not null
@@ -4583,7 +4594,7 @@ app.MapGet("/quota", async (
                     if (paused) return false;
                     var modelMember = member with { ModelId = modelId };
                     var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
-                        f.Agent == probe.Kind &&
+                        f.Agent == member.Agent &&
                         string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
                     return WouldAllow(modelMember, modelHasRecentFailure);
                 },
@@ -4606,14 +4617,14 @@ app.MapGet("/quota", async (
         }
     }
 
-    foreach (var probe in probeByKind.Values)
+    foreach (var kind in fallbackKinds)
     {
-        if (representedProbeKeys.Any(k => k.Agent == probe.Kind && k.ModelId is null))
+        if (representedProbeKeys.Any(k => k.Agent == kind && k.ModelId is null))
             continue;
 
         await AddSnapshotAsync(new AgentMembership
         {
-            Agent = probe.Kind,
+            Agent = kind,
             Billing = AgentBilling.Subscription,
             QualityScore = 100,
         }, classId: null, classDisplayName: null);
