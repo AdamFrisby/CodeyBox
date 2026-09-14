@@ -63,6 +63,18 @@ public sealed record ExecutorRegistration
     public IReadOnlyList<string> DeclaredCredentials { get; init; } = [];
 
     /// <summary>
+    /// Clearance tags this host is trusted to handle, in the same vocabulary
+    /// as <see cref="WorkItem.RequiredCapabilities"/> and
+    /// <see cref="AgentMembership.Capabilities"/> (for example "sensitive",
+    /// "audit"). A phase whose work item demands capabilities is only placed
+    /// on a host covering every required tag. Tag comparison is ordinal,
+    /// case-insensitive — the same comparison the agent-class router uses —
+    /// so hosts extend the existing capability vocabulary instead of
+    /// introducing a parallel one.
+    /// </summary>
+    public IReadOnlyList<string> DeclaredCapabilities { get; init; } = [];
+
+    /// <summary>
     /// When true the host is draining: it registers and heartbeats but is
     /// never selected for new placements, mirroring
     /// <c>MultipassRemoteSandboxOptions.Cordoned</c>.

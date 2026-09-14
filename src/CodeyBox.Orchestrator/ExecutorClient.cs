@@ -134,6 +134,7 @@ public sealed class ExecutorClient
                     maxConcurrentSandboxes = registration.MaxConcurrentSandboxes,
                     allowedNetworkProfiles = registration.AllowedNetworkProfiles,
                     declaredCredentials = registration.DeclaredCredentials,
+                    declaredCapabilities = registration.DeclaredCapabilities,
                     cordoned = registration.Cordoned,
                     healthy = registration.Healthy,
                     processId = Environment.ProcessId,

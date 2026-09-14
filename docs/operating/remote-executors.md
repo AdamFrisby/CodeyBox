@@ -13,9 +13,17 @@ phase-dispatch proxy that sends work to a registered executor.
 ## Dispatching phases to an executor
 
 `ExecutorPhaseProxy` (`src/CodeyBox.Orchestrator/ExecutorPhaseProxy.cs`)
-implements `IExecutorPhaseRunner`: it selects a registered executor from the
-worker registry using `ExecutorEligibility` (zero-capacity, cordoned and
-unhealthy hosts register but are never selected), stages the phase's single
+implements `IExecutorPhaseRunner`: it places each phase on a registered
+executor through the pure `ExecutorPlacement` decider
+(`src/CodeyBox.Core/ExecutorPlacement.cs`), matching the phase's requirements
+against each host's declared attributes — the agent credential the route
+needs against `DeclaredCredentials` (exact equality), the sandbox target's
+network profile against `AllowedNetworkProfiles` (empty means all), and the
+work item's `RequiredCapabilities` against the host's `DeclaredCapabilities`
+in the same case-insensitive capability vocabulary the agent-class router
+uses. Cordoned, unhealthy, runtime-backed-off and at-capacity hosts are
+excluded; among the eligible hosts the least-loaded wins (ties break by host
+id). The proxy then stages the phase's single
 bare repo to the host through `IExecutorPhaseTransport`, runs the phase
 there, and stages the repo back as a tar archive that is validated (archive
 bytes, entry count, expansion ratio, path containment) before anything is
@@ -27,7 +35,8 @@ transferred — never the whole repos root — so an executor receives only the
 repo for the item it is running.
 
 Delivery is idempotent through `IIdempotencyStore`: the key is work item +
-phase + attempt and the body hash covers the request, so a redelivered
+phase + attempt and the body hash covers the request (including the placement
+requirements when set), so a redelivered
 dispatch replays the original result instead of provisioning a second
 sandbox, while the same key with a different body is refused as a conflict
 and never executes. With no executor registered, dispatch falls back to the
@@ -35,15 +44,30 @@ in-process runner with unchanged behaviour.
 
 An agent failure on the executor is returned as a result (`AgentFailed`); a
 host, connection or transfer problem throws `ExecutorPhaseTransportException`
-and stores nothing, so an unreachable host is retried elsewhere rather than
-charged against the work item as an agent failure. The proxy never touches
+and stores nothing, so an unreachable host fails over to the next eligible
+host (and, when every eligible host fails, the last host-attributed failure
+propagates) rather than being charged against the work item as an agent
+failure. A host that declared a credential it does not actually hold surfaces
+the same way — as a host-attributed failure with failover — never as an agent
+failure. When hosts are registered but none is currently eligible, the
+dispatch is deferred under `PlacementRecheckIn` so the work item is requeued
+rather than failed; when no registered host provides a required capability,
+the item is reported unplaceable naming the unmet tag instead of being
+dispatched and failed, and neither path consumes a rework iteration. Every
+decision is logged with the chosen host and the per-candidate refusal reason.
+The proxy never touches
 the work item table — the transport carries dispatch only, and re-dispatch
 after failure stays with the pipeline state machine.
 
 Bounds live under `CodeyBox:ExecutorPhaseDispatch` (`StageOutMaxArchiveBytes`,
 `StageOutMaxEntries`, `StageOutMaxExpansionRatio`, `IdempotencyTtl`,
 `MaxRequestPayloadBytes`, `MaxResultFindings`, `MaxFindingLengthChars`,
-`MaxResultErrorLengthChars`), hot-reloadable like the other dispatch knobs.
+`MaxResultErrorLengthChars`, `PlacementRecheckIn`, `RuntimeUnhealthyBackoff`),
+hot-reloadable like the other dispatch knobs. `PlacementRecheckIn` (default
+15 s, mirroring the remote sandbox provider) is the requeue delay used when
+every eligible host is full, cordoned or unhealthy; `RuntimeUnhealthyBackoff`
+(default 1 min) is how long a host that fails dispatch is skipped before the
+next dispatch probes it again.
 
 ## Running the executor
 
@@ -65,6 +89,7 @@ All operational values live under `CodeyBox:Executor` and are hot-reloadable
 | `MaxConcurrentSandboxes` | `int?` | `null` (uncapped) | Host-local sandbox capacity. `0` registers but is never selected |
 | `AllowedNetworkProfiles` | `string[]` | `[]` (all) | Network profiles this host accepts; `"*"` also means all |
 | `DeclaredCredentials` | `string[]` | `[]` | Agent credential sets this host holds (e.g. `claude`, `codex`) |
+| `DeclaredCapabilities` | `string[]` | `[]` | Clearance tags this host may handle, in the work item `RequiredCapabilities` vocabulary |
 | `Cordoned` | `bool` | `false` | Draining: registers and heartbeats but is never selected |
 | `Healthy` | `bool` | `true` | Health gate: `false` routes placements away without unregistering |
 | `LocalSandboxProvider` | `string` | `process` | `process` (dev runner, UNSAFE) or `bubblewrap` |

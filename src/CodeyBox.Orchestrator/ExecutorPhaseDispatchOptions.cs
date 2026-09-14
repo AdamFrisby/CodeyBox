@@ -51,6 +51,23 @@ public sealed class ExecutorPhaseDispatchOptions
     public int MaxResultErrorLengthChars { get; set; } = 8192;
 
     /// <summary>
+    /// Requeue delay surfaced when no executor host can currently accept a
+    /// phase because every eligible host is full, cordoned, unhealthy, or
+    /// mismatched on credential/profile. Mirrors
+    /// <c>MultipassRemoteSandboxOptions.PlacementRecheckIn</c>: the work item
+    /// is requeued under this backoff rather than failed. Hot-reloadable.
+    /// </summary>
+    public TimeSpan PlacementRecheckIn { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// How long a host that fails dispatch with a transport error is skipped
+    /// for new placements before the next dispatch probes it again. Mirrors
+    /// <c>MultipassRemoteSandboxOptions.RuntimeUnhealthyBackoff</c>.
+    /// Hot-reloadable.
+    /// </summary>
+    public TimeSpan RuntimeUnhealthyBackoff { get; set; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>
     /// Fails fast on misconfiguration so a bad bound surfaces at dispatch
     /// time instead of silently admitting an unbounded payload.
     /// </summary>
@@ -80,5 +97,11 @@ public sealed class ExecutorPhaseDispatchOptions
         if (MaxResultErrorLengthChars <= 0)
             throw new InvalidOperationException(
                 "CodeyBox:ExecutorPhaseDispatch:MaxResultErrorLengthChars must be > 0.");
+        if (PlacementRecheckIn <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:PlacementRecheckIn must be positive.");
+        if (RuntimeUnhealthyBackoff <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:RuntimeUnhealthyBackoff must be positive.");
     }
 }
