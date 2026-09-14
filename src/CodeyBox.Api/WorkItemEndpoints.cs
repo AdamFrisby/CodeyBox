@@ -34,6 +34,9 @@ internal static class WorkItemEndpoints
         group.MapGet("/{id}/delegations", GetDelegationsAsync);
         group.MapPost("/{id}/answer", AnswerQuestionAsync);
         group.MapPost("/{id}/dismiss-question", DismissQuestionAsync);
+        group.MapGet("/{id}/deployment-review", GetDeploymentReviewAsync);
+        group.MapPost("/{id}/deployment-review/approve", ApproveDeploymentReviewAsync);
+        group.MapPost("/{id}/deployment-review/reject", RejectDeploymentReviewAsync);
         group.MapGet("/{id}/stdout-tail", GetStdoutTailAsync);
         group.MapPost("/{id}/uncancel", UncancelAsync);
         group.MapPost("/{id}/resume", ResumeAsync);
@@ -2231,6 +2234,7 @@ internal static class WorkItemEndpoints
         ITaskQueue queue,
         IWebhookDispatcher webhooks,
         IProjectRepository projects,
+        IHumanDeploymentReviewStore? reviews,
         CancellationToken ct)
     {
         if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
@@ -2268,10 +2272,51 @@ internal static class WorkItemEndpoints
             Details = new QuestionAnsweredDetails(item.Id.ToString(), item.ProjectId.Value, req.QuestionId, redactedAnswer, AnsweredBy: null),
         }, ct);
 
+        // A human-review backing question carries the operator's verdict:
+        // exactly "approve" approves, any other answer rejects with the text
+        // as notes. Recorded here so the generic answer path (API or CLI)
+        // verdicts like the dedicated endpoints below.
+        await TryRecordHumanReviewVerdictAsync(item.Id, req.QuestionId, redactedAnswer, reviews, ct);
+
         // Transition out of NeedsOperatorInput if all questions are now resolved.
         await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
 
         return Results.Ok(new { status = "answered" });
+    }
+
+    /// <summary>
+    /// Interprets an answer to a human-review backing question as a verdict.
+    /// Best-effort: the answer itself is already persisted, so a missing
+    /// review store, an already-decided review, or an expired review simply
+    /// leaves the verdict unrecorded (the resume path still fails closed on
+    /// expiry).
+    /// </summary>
+    private static async Task TryRecordHumanReviewVerdictAsync(
+        WorkItemId itemId,
+        string questionId,
+        string answer,
+        IHumanDeploymentReviewStore? reviews,
+        CancellationToken ct)
+    {
+        if (reviews is null || !HumanDeploymentReviewPolicy.IsReviewQuestion(questionId))
+            return;
+        var review = await reviews.GetActiveForWorkItemAsync(itemId.ToString(), ct);
+        if (review is null
+            || review.Status != HumanDeploymentReviewStatus.Pending
+            || !string.Equals(review.QuestionId, questionId, StringComparison.Ordinal))
+            return;
+        var now = DateTimeOffset.UtcNow;
+        if (now >= review.Deadline)
+            return;
+        var approved = HumanDeploymentReviewPolicy.IsApprovalAnswer(answer);
+        await reviews.RecordVerdictAsync(
+            review.WorkItemId,
+            review.Iteration,
+            approved,
+            approved ? null : HumanDeploymentReviewPolicy.TruncateNotes(answer),
+            decidedBy: null,
+            now,
+            ct);
     }
 
     private static async Task<IResult> DismissQuestionAsync(
@@ -2322,6 +2367,157 @@ internal static class WorkItemEndpoints
         await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
 
         return Results.Ok(new { status = "dismissed" });
+    }
+
+    // ── Human deployment-review verdict endpoints ────────────────────────────
+    //
+    // The operator acts as a reviewer through the standard auditor seam:
+    // approve records a pass, reject-with-notes records blocking findings
+    // that feed the normal rework loop. A verdict past the review deadline
+    // is refused with 410 and fails closed through the shared expiry path.
+    // The generic POST /answer endpoint verdicts identically (answering the
+    // backing question with "approve" approves; any other text rejects).
+
+    private static async Task<IResult> GetDeploymentReviewAsync(
+        string id,
+        IWorkItemStore store,
+        IHumanDeploymentReviewStore? reviews,
+        CancellationToken ct)
+    {
+        if (reviews is null) return Results.Json(new { error = "human review store not configured" }, statusCode: 503);
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var review = await reviews.GetActiveForWorkItemAsync(item!.Id.ToString(), ct);
+        if (review is null)
+            return Results.NotFound(new { error = "no pending human deployment review for this work item" });
+
+        return Results.Ok(new DeploymentReviewDto(
+            review.WorkItemId,
+            review.Iteration,
+            review.DeploymentId,
+            review.Deadline,
+            review.RequestedAt,
+            review.QuestionId,
+            review.Status.ToString(),
+            review.Brief));
+    }
+
+    private static async Task<IResult> ApproveDeploymentReviewAsync(
+        string id,
+        ApproveDeploymentReviewRequest? req,
+        IWorkItemStore store,
+        IHumanDeploymentReviewStore? reviews,
+        IWorkItemQuestionStore? questionStore,
+        IDeploymentManager? deployments,
+        ITaskQueue queue,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        if (req?.Note is { Length: > 4000 })
+            return Results.BadRequest(new { error = "note must be <= 4000 chars" });
+        return await RecordDeploymentReviewVerdictAsync(
+            id, approved: true, notes: req?.Note, store, reviews, questionStore,
+            deployments, queue, webhooks, projects, ct);
+    }
+
+    private static async Task<IResult> RejectDeploymentReviewAsync(
+        string id,
+        RejectDeploymentReviewRequest? req,
+        IWorkItemStore store,
+        IHumanDeploymentReviewStore? reviews,
+        IWorkItemQuestionStore? questionStore,
+        IDeploymentManager? deployments,
+        ITaskQueue queue,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(req?.Notes))
+            return Results.BadRequest(new { error = "notes describing what fails are required" });
+        if (req!.Notes.Length > 4000)
+            return Results.BadRequest(new { error = "notes must be <= 4000 chars" });
+        return await RecordDeploymentReviewVerdictAsync(
+            id, approved: false, notes: req.Notes, store, reviews, questionStore,
+            deployments, queue, webhooks, projects, ct);
+    }
+
+    private static async Task<IResult> RecordDeploymentReviewVerdictAsync(
+        string id,
+        bool approved,
+        string? notes,
+        IWorkItemStore store,
+        IHumanDeploymentReviewStore? reviews,
+        IWorkItemQuestionStore? questionStore,
+        IDeploymentManager? deployments,
+        ITaskQueue queue,
+        IWebhookDispatcher webhooks,
+        IProjectRepository projects,
+        CancellationToken ct)
+    {
+        if (reviews is null) return Results.Json(new { error = "human review store not configured" }, statusCode: 503);
+        if (questionStore is null) return Results.Json(new { error = "question store not configured" }, statusCode: 503);
+
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        if (item!.State != WorkItemState.NeedsOperatorInput)
+            return Results.Conflict(new { error = "work item is not waiting for operator input" });
+
+        var review = await reviews.GetActiveForWorkItemAsync(item.Id.ToString(), ct);
+        if (review is null)
+            return Results.NotFound(new { error = "no pending human deployment review for this work item" });
+        if (review.Status != HumanDeploymentReviewStatus.Pending)
+            return Results.Conflict(new { error = $"review is already {review.Status.ToString().ToLowerInvariant()}; resume is pending" });
+
+        var now = DateTimeOffset.UtcNow;
+        if (now >= review.Deadline)
+        {
+            // Late verdict: refuse and fail closed through the shared expiry
+            // path (teardown + dismiss + re-queue) so silence past the
+            // deadline never becomes an implicit pass.
+            await HumanReviewExpiry.ExpireAsync(
+                reviews, deployments, store, questionStore, queue, webhooks,
+                review, now, ct: ct);
+            return Results.Json(new { error = "review expired unreviewed" }, statusCode: 410);
+        }
+
+        var recorded = await reviews.RecordVerdictAsync(
+            review.WorkItemId,
+            review.Iteration,
+            approved,
+            approved ? notes : HumanDeploymentReviewPolicy.TruncateNotes(notes ?? string.Empty),
+            decidedBy: null,
+            now,
+            ct);
+        if (!recorded)
+            return Results.Conflict(new { error = "review was decided concurrently" });
+
+        // Answer the backing question so the Q&A trail shows the verdict;
+        // the idempotent no-op branch below covers a concurrent answer.
+        var question = await questionStore.GetAsync(item.Id.ToString(), review.QuestionId, ct);
+        if (question is { State: "open" })
+        {
+            var answerText = approved ? "approve" : HumanDeploymentReviewPolicy.TruncateNotes(notes ?? string.Empty);
+            await questionStore.AnswerAsync(item.Id.ToString(), review.QuestionId, answerText, answeredBy: null, ct);
+            var project = await projects.GetAsync(item.ProjectId, ct);
+            await webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.question_answered",
+                WorkItem = item,
+                Project = project,
+                Details = new QuestionAnsweredDetails(
+                    item.Id.ToString(), item.ProjectId.Value, review.QuestionId, answerText, AnsweredBy: null),
+            }, ct);
+            await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
+        }
+
+        return Results.Ok(new
+        {
+            status = approved ? "approved" : "rejected",
+            iteration = review.Iteration,
+        });
     }
 
     /// <summary>
@@ -3020,6 +3216,20 @@ public sealed record ProjectDto(
 public sealed record AnswerQuestionRequest(string QuestionId, string Answer);
 
 public sealed record DismissQuestionRequest(string QuestionId, string Reason);
+
+public sealed record ApproveDeploymentReviewRequest(string? Note);
+
+public sealed record RejectDeploymentReviewRequest(string? Notes);
+
+public sealed record DeploymentReviewDto(
+    string WorkItemId,
+    int Iteration,
+    string DeploymentId,
+    DateTimeOffset ExpiresAt,
+    DateTimeOffset RequestedAt,
+    string QuestionId,
+    string Status,
+    string Brief);
 
 public sealed record QuestionDto(
     string Id,

@@ -1054,6 +1054,30 @@ When the question was already dismissed (idempotent no-op):
 * Returns `400 Bad Request` when `questionId` or `reason` is empty.
 * Returns `404 Not Found` when the work item or question does not exist.
 
+### `GET /workitems/{id}/deployment-review`
+
+Returns the pending human deployment review for a parked iteration
+(endpoint, expiry, backing question, brief with acceptance criteria), or
+`404` when no review is outstanding.
+
+### `POST /workitems/{id}/deployment-review/approve`
+
+Approves the pending human deployment review; the iteration passes and the
+held deployment is torn down immediately. Optional `note` (≤ 4000 chars)
+is recorded on the verdict.
+
+### `POST /workitems/{id}/deployment-review/reject`
+
+Rejects the pending review with required `notes` (≤ 4000 chars) describing
+what fails; the notes become blocking findings feeding the normal rework
+loop. Returns `400` when notes are missing, `404` when no review is
+pending, `409` when the item is not awaiting operator input or the review
+is already decided, and `410` when the review expired unreviewed (the
+expiry fails closed through teardown + dismiss + re-queue). Answering the
+backing question `human-deployment-review-{iteration}` via `POST /answer`
+verdicts identically: exactly `approve` approves, any other text rejects
+with that text as notes.
+
 ### `DELETE /workitems/{id}`
 
 Cancel a work item or close out a terminal-failure item.

@@ -220,6 +220,8 @@ internal static class TestSupport
         DeploymentRecipe? deploymentRecipe = null,
         IDeploymentManager? deploymentManager = null,
         IDeploymentSubstrateProvider? deploymentSubstrates = null,
+        IWorkItemQuestionStore? questionStore = null,
+        IHumanDeploymentReviewStore? humanReviewStore = null,
         StalePullRequestSweeperOptions? staleBaseReworkOptions = null,
         // Delegation phase support: when true, wires a real convergence-brief
         // composer and sqlite delegation event store (same state db) into the
@@ -452,6 +454,8 @@ internal static class TestSupport
             mergeScopeResolver: mergeScopeResolver,
             deploymentManager: deploymentManager,
             deploymentSubstrates: deploymentSubstrates,
+            questionStore: questionStore,
+            humanReviews: humanReviewStore,
             staleBaseReworkRouter: staleBaseReworkRouter,
             briefComposer: briefComposer,
             delegationEvents: delegationEvents,

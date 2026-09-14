@@ -460,6 +460,11 @@ public sealed class DeploymentLeakReaperTests
                 throw new InvalidOperationException("active set unavailable");
             return _active;
         }
+        public bool TryGetActive(string deploymentId, out IDeploymentHandle? handle)
+        {
+            handle = null;
+            return false;
+        }
     }
 
     private sealed class ThrowingListProvider : IDeploymentCleanupProvider
