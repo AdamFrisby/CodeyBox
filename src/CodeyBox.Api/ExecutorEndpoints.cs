@@ -159,17 +159,21 @@ internal static class ExecutorEndpoints
 
     /// <summary>
     /// Ingests one executor-reported quota reading for a pool whose credential
-    /// the reporting host holds. The store validates the report (pool exists
-    /// and is executor-reported, host is a declared holder, values in range,
-    /// reset consistent with the pool kind) and either stores it or rejects it
-    /// with a reason; rejection leaves the stored reading unchanged. This
-    /// endpoint accepts or rejects reports only — admission is decided by the
-    /// orchestrator's quota gate, never here.
+    /// the reporting host holds. The caller is bound to the claimed host in
+    /// two layers: the host must have a live worker-registry registration
+    /// (checked here at ingress — an unregistered host has no 404-free path
+    /// to this store), and it must be operator-declared in the pool's
+    /// <c>HolderHostIds</c> (checked by the store, which rejects anything
+    /// else without mutating the stored reading). The store further validates
+    /// values and reset consistency. This endpoint accepts or rejects reports
+    /// only — admission is decided by the orchestrator's quota gate, never here.
     /// </summary>
-    private static Task<IResult> ReportQuotaAsync(
+    private static async Task<IResult> ReportQuotaAsync(
         string hostId,
         ExecutorQuotaReportRequest? req,
-        ExecutorQuotaReportStore store)
+        ExecutorQuotaReportStore store,
+        IWorkerRegistry registry,
+        CancellationToken ct)
     {
         string normalized;
         try
@@ -178,19 +182,24 @@ internal static class ExecutorEndpoints
         }
         catch (ArgumentException ex)
         {
-            return Task.FromResult<IResult>(Results.BadRequest(new { error = ex.Message }));
+            return Results.BadRequest(new { error = ex.Message });
         }
 
         if (req is null)
-            return Task.FromResult<IResult>(Results.BadRequest(new { error = "request body is required" }));
+            return Results.BadRequest(new { error = "request body is required" });
+
+        var workerId = ExecutorRegistration.WorkerIdFor(normalized);
+        var workers = await registry.ListAsync(ct);
+        if (!workers.Any(w => string.Equals(w.WorkerId, workerId, StringComparison.Ordinal)))
+            return Results.NotFound(new { error = $"no executor registered for host id '{normalized}'" });
 
         QuotaUnknownReason? unknown = null;
         if (!string.IsNullOrWhiteSpace(req.Unknown))
         {
             if (!Enum.TryParse<QuotaUnknownReason>(req.Unknown.Trim(), ignoreCase: true, out var parsed)
                 || !Enum.IsDefined(parsed))
-                return Task.FromResult<IResult>(Results.BadRequest(
-                    new { error = $"unknown must be one of {string.Join(", ", Enum.GetNames<QuotaUnknownReason>())}" }));
+                return Results.BadRequest(
+                    new { error = $"unknown must be one of {string.Join(", ", Enum.GetNames<QuotaUnknownReason>())}" });
             unknown = parsed;
         }
 
@@ -206,9 +215,12 @@ internal static class ExecutorEndpoints
         };
 
         if (!store.TryReport(normalized, report, out var rejectionReason))
-            return Task.FromResult<IResult>(Results.BadRequest(new { error = rejectionReason }));
+            return Results.BadRequest(new { error = rejectionReason });
 
-        return Task.FromResult<IResult>(Results.Ok(new { accepted = true, pool = report.PoolName }));
+        var pool = QuotaPoolResolver.NormalizePoolName(report.PoolName) ?? string.Empty;
+        if (store.TryGetStored(pool, out var stored, out _) && stored?.PoolName is { } storedName)
+            pool = storedName;
+        return Results.Ok(new { accepted = true, pool });
     }
 
     internal static string? ValidateCapacity(int? capacity)

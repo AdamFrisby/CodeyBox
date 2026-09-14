@@ -172,23 +172,28 @@ public sealed class ExecutorQuotaReportStore
                 (string.IsNullOrWhiteSpace(stored.Report.Notes) ? "" : $" ({stored.Report.Notes})"));
 
         var ageSeconds = (long)Math.Round(age.TotalSeconds);
-        var notes = $"executor '{stored.ReportedByHostId}' reading (age {ageSeconds}s)"
-            + (string.IsNullOrWhiteSpace(stored.Report.Notes) ? "" : $" ({stored.Report.Notes})");
+        var balanceUnit = string.IsNullOrWhiteSpace(pool.BalanceUnit) ? null : pool.BalanceUnit.Trim();
+        var noteDetail = string.IsNullOrWhiteSpace(stored.Report.Notes) ? "" : $" ({stored.Report.Notes})";
         if (pool.Kind == QuotaPoolKind.DepletingBalance)
             return new AgentQuotaSnapshot
             {
                 AvailablePct = stored.Report.AvailablePct ?? -1,
                 BalanceRemaining = stored.Report.BalanceRemaining,
-                BalanceUnit = string.IsNullOrWhiteSpace(pool.BalanceUnit) ? null : pool.BalanceUnit.Trim(),
-                Notes = notes,
+                BalanceUnit = balanceUnit,
+                Notes = $"executor '{stored.ReportedByHostId}' reading (age {ageSeconds}s){noteDetail}",
             };
+        if (stored.Report.AvailablePct is not { } pct)
+            return AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Transient,
+                $"executor reading for pool '{normalized}' carries no percentage " +
+                "(pool reconfigured since the report was stored)");
         return new AgentQuotaSnapshot
         {
-            AvailablePct = stored.Report.AvailablePct!.Value,
+            AvailablePct = pct,
             ResetAt = stored.Report.ResetAt,
             BalanceRemaining = stored.Report.BalanceRemaining,
-            BalanceUnit = string.IsNullOrWhiteSpace(pool.BalanceUnit) ? null : pool.BalanceUnit.Trim(),
-            Notes = notes,
+            BalanceUnit = balanceUnit,
+            Notes = $"executor '{stored.ReportedByHostId}' reading (age {ageSeconds}s){noteDetail}",
         };
     }
 
@@ -284,12 +289,18 @@ public sealed class ExecutorQuotaReportStore
                 $"executor report rejected for pool '{poolName}': notes exceed {MaxReportNotesLength} characters.";
             return false;
         }
+        if (report.Notes is { } notes && notes.Any(char.IsControl))
+        {
+            rejectionReason =
+                $"executor report rejected for pool '{poolName}': notes must not contain control characters.";
+            return false;
+        }
         if (report.Unknown is { } unknown && !Enum.IsDefined(unknown))
         {
             rejectionReason = $"executor report rejected for pool '{poolName}': unknown reason is not recognised.";
             return false;
         }
-        if (ValidateReading(pool, report) is { } readingRejection)
+        if (ValidateReading(pool, report, now, _options.ReportedReadingClockSkew, MaxResetHorizon(_options)) is { } readingRejection)
         {
             rejectionReason = readingRejection;
             return false;
@@ -301,12 +312,21 @@ public sealed class ExecutorQuotaReportStore
 
     /// <summary>
     /// Validates the reading carried by a report against its pool's kind:
-    /// percentages within 0-100, balances finite and non-negative, and no
-    /// reset instant on a depleting-balance pool (which never resets).
-    /// Returns null when the reading is acceptable, otherwise the rejection
-    /// reason. Pure.
+    /// percentages within 0-100, balances finite and non-negative, no reset
+    /// instant on a depleting-balance pool (which never resets), and — for a
+    /// resetting-window pool carrying a reset — a reset after the observed
+    /// instant (within clock skew) and inside the plausible horizon (the
+    /// widest configured ramp window plus skew). An unbounded executor-set
+    /// reset would otherwise pin the gate's ramped floor at one end of its
+    /// range or surface a bogus retry hint. Returns null when the reading is
+    /// acceptable, otherwise the rejection reason. Pure.
     /// </summary>
-    private static string? ValidateReading(QuotaPoolOptions pool, ExecutorQuotaReport report)
+    private static string? ValidateReading(
+        QuotaPoolOptions pool,
+        ExecutorQuotaReport report,
+        DateTimeOffset now,
+        TimeSpan clockSkew,
+        TimeSpan resetHorizon)
     {
         var poolName = pool.Name;
         if (pool.Kind == QuotaPoolKind.DepletingBalance)
@@ -326,13 +346,18 @@ public sealed class ExecutorQuotaReportStore
                         "within 0-100 when present.";
                 return null;
             }
-            return RangedOrAbsent(report.AvailablePct, 0, 100)
-                && NonNegativeOrAbsent(report.BalanceRemaining)
-                ? null
-                : $"executor report rejected for pool '{poolName}': accompanying values " +
-                    "are outside their valid ranges.";
+            return ValidateAccompanyingValues(poolName, report);
         }
 
+        if (report.ResetAt is { } reset)
+        {
+            if (reset <= report.ObservedAt - clockSkew)
+                return $"executor report rejected for pool '{poolName}': reset must be " +
+                    "after the time the reading was observed.";
+            if (reset > now + resetHorizon + clockSkew)
+                return $"executor report rejected for pool '{poolName}': reset is " +
+                    "beyond the plausible horizon for this pool.";
+        }
         if (report.Unknown is null)
         {
             if (report.AvailablePct is not { } pct || !double.IsFinite(pct) || pct is < 0 or > 100)
@@ -343,11 +368,42 @@ public sealed class ExecutorQuotaReportStore
                     "a finite non-negative value when present.";
             return null;
         }
-        return RangedOrAbsent(report.AvailablePct, 0, 100)
+        return ValidateAccompanyingValues(poolName, report);
+    }
+
+    private static string? ValidateAccompanyingValues(string poolName, ExecutorQuotaReport report) =>
+        RangedOrAbsent(report.AvailablePct, 0, 100)
             && NonNegativeOrAbsent(report.BalanceRemaining)
             ? null
             : $"executor report rejected for pool '{poolName}': accompanying values " +
                 "are outside their valid ranges.";
+
+    /// <summary>
+    /// Widest ramp window configured anywhere (global, per-agent, per-pool),
+    /// bounding how far ahead an executor-reported reset may lie. A reset
+    /// beyond this horizon could never key a live ramp, so it is rejected as
+    /// inconsistent rather than stored. Pure.
+    /// </summary>
+    private static TimeSpan MaxResetHorizon(QuotaRouterOptions options)
+    {
+        var horizon = options.RampWindow;
+        if (options.RampWindowByAgent is { } byAgent)
+        {
+            foreach (var window in byAgent.Values)
+            {
+                if (window > horizon)
+                    horizon = window;
+            }
+        }
+        if (options.FloorByPool is { } floors)
+        {
+            foreach (var floor in floors.Values)
+            {
+                if (floor?.RampWindow is { } window && window > horizon)
+                    horizon = window;
+            }
+        }
+        return horizon > TimeSpan.Zero ? horizon : QuotaRouterDefaults.DefaultRampWindow;
     }
 
     /// <summary>

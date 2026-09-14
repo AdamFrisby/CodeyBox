@@ -636,4 +636,126 @@ public sealed class ExecutorQuotaReportTests
             },
         }));
     }
+
+    // ── Bounded resets, bounded notes, kind-change safety ────────────────────
+
+    [Fact]
+    public void FarFutureReset_IsRejectedWithoutStoring()
+    {
+        var clock = new AdvancingClock(T0);
+        var opts = BaseOpts();
+        ResettingPool(opts, "pool", floor: 20,
+            source: QuotaProbeSource.ExecutorReported, holders: ["exec-1"]);
+        var store = new ExecutorQuotaReportStore(opts, clock);
+        Assert.True(store.TryReport("exec-1", PctReport("pool", 60, clock.GetUtcNow()), out _));
+
+        Assert.False(store.TryReport("exec-1",
+            new ExecutorQuotaReport
+            {
+                PoolName = "pool",
+                AvailablePct = 60,
+                ResetAt = clock.GetUtcNow().AddDays(30),
+                ObservedAt = clock.GetUtcNow(),
+            }, out var reason));
+        Assert.Contains("horizon", reason, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(store.TryGetStored("pool", out var stored, out _));
+        Assert.Equal(60, stored!.AvailablePct);
+        Assert.Null(stored.ResetAt);
+    }
+
+    [Fact]
+    public void LongPastReset_IsRejectedWithoutStoring()
+    {
+        var clock = new AdvancingClock(T0);
+        var opts = BaseOpts();
+        ResettingPool(opts, "pool", floor: 20,
+            source: QuotaProbeSource.ExecutorReported, holders: ["exec-1"]);
+        var store = new ExecutorQuotaReportStore(opts, clock);
+        Assert.True(store.TryReport("exec-1", PctReport("pool", 60, clock.GetUtcNow()), out _));
+
+        Assert.False(store.TryReport("exec-1",
+            new ExecutorQuotaReport
+            {
+                PoolName = "pool",
+                AvailablePct = 60,
+                ResetAt = clock.GetUtcNow().AddDays(-2),
+                ObservedAt = clock.GetUtcNow(),
+            }, out var reason));
+        Assert.Contains("observed", reason, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(store.TryGetStored("pool", out var stored, out _));
+        Assert.Equal(60, stored!.AvailablePct);
+    }
+
+    [Fact]
+    public void OversizedNotes_AreRejectedWithoutStoring()
+    {
+        var clock = new AdvancingClock(T0);
+        var opts = BaseOpts();
+        ResettingPool(opts, "pool", floor: 20,
+            source: QuotaProbeSource.ExecutorReported, holders: ["exec-1"]);
+        var store = new ExecutorQuotaReportStore(opts, clock);
+        Assert.True(store.TryReport("exec-1", PctReport("pool", 60, clock.GetUtcNow()), out _));
+
+        Assert.False(store.TryReport("exec-1",
+            new ExecutorQuotaReport
+            {
+                PoolName = "pool",
+                AvailablePct = 60,
+                ObservedAt = clock.GetUtcNow(),
+                Notes = new string('n', ExecutorQuotaReportStore.MaxReportNotesLength + 1),
+            }, out var reason));
+        Assert.Contains("notes", reason, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(store.TryGetStored("pool", out var stored, out _));
+        Assert.Equal(60, stored!.AvailablePct);
+    }
+
+    [Fact]
+    public void NotesWithControlCharacters_AreRejectedWithoutStoring()
+    {
+        var clock = new AdvancingClock(T0);
+        var opts = BaseOpts();
+        ResettingPool(opts, "pool", floor: 20,
+            source: QuotaProbeSource.ExecutorReported, holders: ["exec-1"]);
+        var store = new ExecutorQuotaReportStore(opts, clock);
+        Assert.True(store.TryReport("exec-1", PctReport("pool", 60, clock.GetUtcNow()), out _));
+
+        Assert.False(store.TryReport("exec-1",
+            new ExecutorQuotaReport
+            {
+                PoolName = "pool",
+                AvailablePct = 60,
+                ObservedAt = clock.GetUtcNow(),
+                Notes = "probe ok\u0000injected",
+            }, out var reason));
+        Assert.Contains("control", reason, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(store.TryGetStored("pool", out var stored, out _));
+        Assert.Equal(60, stored!.AvailablePct);
+    }
+
+    [Fact]
+    public void BalanceReportFollowedByKindHotReload_ReadsTransientUnknownInsteadOfThrowing()
+    {
+        var clock = new AdvancingClock(T0);
+        var opts = BaseOpts();
+        BalancePool(opts, "prepaid", floor: 100,
+            source: QuotaProbeSource.ExecutorReported, holders: ["exec-1"]);
+        var store = new ExecutorQuotaReportStore(opts, clock);
+        Assert.True(store.TryReport("exec-1",
+            new ExecutorQuotaReport
+            {
+                PoolName = "prepaid",
+                BalanceRemaining = 1000,
+                ObservedAt = clock.GetUtcNow(),
+            }, out _));
+
+        opts.Pools["prepaid"].Kind = QuotaPoolKind.ResettingWindow;
+
+        var snapshot = store.GetSnapshot("prepaid");
+        Assert.False(snapshot.IsKnown);
+        Assert.Equal(QuotaUnknownReason.Transient, snapshot.Unknown);
+    }
 }

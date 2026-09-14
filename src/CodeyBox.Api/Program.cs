@@ -7442,7 +7442,8 @@ namespace CodeyBox.Api
         /// <summary>
         /// Maximum age in seconds of an executor-reported reading before the
         /// pool reads as unknown. Applies only to <c>ExecutorReported</c>
-        /// pools. Non-positive means the default (300). Hot-reloadable.
+        /// pools. Zero means the default (300); negative values are rejected.
+        /// Hot-reloadable.
         /// </summary>
         public int ReportedReadingMaxAgeSeconds { get; set; } =
             QuotaRouterDefaults.DefaultReportedReadingMaxAgeSeconds;
