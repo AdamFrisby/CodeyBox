@@ -22598,6 +22598,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // budget on top of the transient-cancel budget.
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
+            ConsecutiveInfrastructureRecoveries = 0,
         };
         var updated = await _store.TryUpdateIfStateAsync(resumed, current.State, CancellationToken.None);
         if (!updated)

@@ -1126,6 +1126,7 @@ internal static class WorkItemEndpoints
         {
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
+            ConsecutiveInfrastructureRecoveries = 0,
         };
         var updated = await store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
         if (!updated)
@@ -2095,18 +2096,40 @@ internal static class WorkItemEndpoints
         });
     }
 
+    /// <summary>Maximum length of a queue pause/drain reason (characters).</summary>
+    public const int MaxQueueReasonLength = 500;
+
+    /// <summary>Minimum drain wait (seconds) accepted by the drain endpoint.</summary>
+    public const int MinDrainTimeoutSeconds = 1;
+
+    /// <summary>Maximum drain wait (seconds) accepted by the drain endpoint.</summary>
+    public const int MaxDrainTimeoutSeconds = 3600;
+
+    /// <summary>
+    /// Shared required-reason guard for the queue pause/drain endpoints: the
+    /// reason must be present, contain no control characters, and fit within
+    /// <see cref="MaxQueueReasonLength"/> characters. Returns a BadRequest
+    /// result when invalid, null when the reason is acceptable.
+    /// </summary>
+    private static IResult? ValidateQueueReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return Results.BadRequest(new { error = "reason is required" });
+        if (reason.Any(char.IsControl))
+            return Results.BadRequest(new { error = "reason must not contain control characters" });
+        if (reason.Length > MaxQueueReasonLength)
+            return Results.BadRequest(new { error = $"reason must be <= {MaxQueueReasonLength} chars" });
+        return null;
+    }
+
     private static async Task<IResult> PauseQueueAsync(
         PauseQueueRequest body,
         IQueueController queueController,
         IWebhookDispatcher webhooks,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(body.Reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (body.Reason.Any(char.IsControl))
-            return Results.BadRequest(new { error = "reason must not contain control characters" });
-        if (body.Reason.Length > 500)
-            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        if (ValidateQueueReason(body.Reason) is { } reasonError)
+            return reasonError;
 
         await queueController.PauseAsync(body.Reason, ct);
         _ = webhooks.PublishAsync(new WebhookEvent
@@ -2162,14 +2185,12 @@ internal static class WorkItemEndpoints
         IWebhookDispatcher webhooks,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(body.Reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (body.Reason.Any(char.IsControl))
-            return Results.BadRequest(new { error = "reason must not contain control characters" });
-        if (body.Reason.Length > 500)
-            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
-        if (body.TimeoutSeconds is not { } timeoutSeconds || timeoutSeconds < 1 || timeoutSeconds > 3600)
-            return Results.BadRequest(new { error = "timeoutSeconds is required and must be between 1 and 3600" });
+        if (ValidateQueueReason(body.Reason) is { } drainReasonError)
+            return drainReasonError;
+        if (body.TimeoutSeconds is not { } timeoutSeconds
+            || timeoutSeconds < MinDrainTimeoutSeconds
+            || timeoutSeconds > MaxDrainTimeoutSeconds)
+            return Results.BadRequest(new { error = $"timeoutSeconds is required and must be between {MinDrainTimeoutSeconds} and {MaxDrainTimeoutSeconds}" });
 
         if (queueController.State == QueueState.Running)
         {
@@ -3116,6 +3137,15 @@ public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
 
 public sealed record PauseQueueRequest(string Reason = "");
 
+/// <summary>
+/// Pause-and-wait drain request. <c>Reason</c> follows the shared queue-reason
+/// guard (required, no control characters, at most
+/// <c>WorkItemEndpoints.MaxQueueReasonLength</c> characters).
+/// <c>TimeoutSeconds</c> bounds how long the endpoint waits for in-flight work
+/// to reach a safe boundary (<c>WorkItemEndpoints.MinDrainTimeoutSeconds</c> to
+/// <c>WorkItemEndpoints.MaxDrainTimeoutSeconds</c>); on expiry the endpoint
+/// reports <c>drained: false</c> and the queue stays paused.
+/// </summary>
 public sealed record DrainQueueRequest(string Reason = "", int? TimeoutSeconds = null);
 
 public sealed record WorkItemTimelineResponse(string WorkItemId, IReadOnlyList<TimelineEntry> Entries);

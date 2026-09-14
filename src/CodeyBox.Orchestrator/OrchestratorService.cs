@@ -1834,6 +1834,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return;
         }
 
+        if (recovered.State == WorkItemState.NeedsOperatorInput)
+        {
+            _log.LogWarning(
+                "Shutdown recovery parked {Id}: {FromState} reached the consecutive-infrastructure cap ({Error})",
+                id, item.State, recovered.LastError ?? "<no reason>");
+            return;
+        }
+
         await _queue.EnqueueAsync(id, ct).ConfigureAwait(false);
         _log.LogWarning(
             "Shutdown recovery re-queued {Id}: {FromState} -> {ToState} ({Reason})",
@@ -1847,7 +1855,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             item,
             _time.GetUtcNow(),
             _opts.MaxRecoveryAttempts,
-            recoveryReason);
+            recoveryReason,
+            _opts.MaxConsecutiveInfrastructureRecoveries);
 
     /// <summary>
     /// Pickup with SQLite write-gate resilience. A gate-acquisition failure is
@@ -2409,7 +2418,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// complete.
     ///
     /// Recovery state mapping:
-    ///   Working         → Failed      (crashed work phase without a preempt checkpoint)
+    ///   Working         → Queued      (infrastructure requeue without a preempt checkpoint;
+    ///                                  recovery budget unchanged; parks at NeedsOperatorInput
+    ///                                  past the consecutive-infrastructure cap)
     ///   Auditing        → WorkComplete (work commit is real; re-run the audit suite)
     ///   Reworking       → WorkComplete (re-run audit to confirm or re-rework)
     ///   Merging         → AuditPassed  (audit verdict is real; retry the merge)
@@ -2418,7 +2429,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     ///   WorkComplete / AuditPassed / Merged → (re-enqueued as-is; pipeline resumes at correct phase)
     ///
     /// State-changing interrupted recovery increments
-    /// <see cref="WorkItem.RecoveryAttempts"/>. Items that exceed
+    /// <see cref="WorkItem.RecoveryAttempts"/>, except the infrastructure
+    /// requeue of a checkpoint-less Working item, which tracks
+    /// <see cref="WorkItem.ConsecutiveInfrastructureRecoveries"/> separately
+    /// and leaves the genuine-failure budget untouched. Items that exceed
     /// <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> are transitioned to
     /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> instead.
     /// Durable phase-boundary pass-throughs also consume a recovery attempt:
@@ -2479,6 +2493,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     _log.LogWarning(
                         "Work item {Id} recovered to Failed during startup replay; persisted without re-dispatch",
                         item.Id);
+                }
+                else if (recovered.State == WorkItemState.NeedsOperatorInput)
+                {
+                    // Parked by the consecutive-infrastructure cap (or another
+                    // triage path): persist for operator triage without
+                    // re-entering the dispatch queue.
+                    await _store.UpdateAsync(recovered, ct);
+                    _log.LogWarning(
+                        "Work item {Id} parked at NeedsOperatorInput during startup replay ({Error}); operator triage required",
+                        item.Id, recovered.LastError ?? "<no reason>");
                 }
                 else if (recovered.State == WorkItemState.Done)
                 {
@@ -2628,24 +2652,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // infrastructure loss, not a work-item failure: requeue preserving
             // the work branch without consuming the recovery budget (a restart
             // must not push the item toward Failed or erode the attempts that
-            // guard genuinely wedged items). Rerunnable CheckAndAct /
-            // AgentControl loops are handled by their dedicated branches above
-            // and never reach here.
+            // guard genuinely wedged items). Past the consecutive-
+            // infrastructure cap the item parks at NeedsOperatorInput instead
+            // of requeueing. Rerunnable CheckAndAct / AgentControl loops and
+            // checkpointed turns are handled by their dedicated branches above
+            // and never reach here, so the builder below never returns null
+            // for this state.
             return WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
                 item,
                 "worker died while work phase was running without a preempt checkpoint",
-                _time.GetUtcNow())
-                ?? WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
-                {
-                    State = WorkItemState.Failed,
-                    LastError = "worker died while work phase was running without a preempt checkpoint",
-                    StartedAt = null,
-                    PreemptedAt = null,
-                    PreemptCheckpoint = null,
-                    AgentTurnResumeCheckpoint = null,
-                    AgentTurnRecoveryLease = null,
-                    UpdatedAt = _time.GetUtcNow(),
-                }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
+                _time.GetUtcNow(),
+                _opts.MaxConsecutiveInfrastructureRecoveries);
         }
 
         // Scheduler/operator parked states are resting points on startup:
@@ -4194,6 +4211,23 @@ public sealed record OrchestratorOptions
     /// item will be re-enqueued on every orchestrator restart without bound).
     /// </summary>
     public int MaxRecoveryAttempts { get; init; } = 10;
+
+    /// <summary>
+    /// Maximum number of CONSECUTIVE infrastructure-caused requeues (worker
+    /// death without a preempt checkpoint, including restart recovery and the
+    /// graceful-shutdown drain-timeout fallback) for a single work item before
+    /// it parks at <see cref="WorkItemState.NeedsOperatorInput"/> for triage
+    /// instead of requeueing. Default 20. Infrastructure requeues never consume
+    /// <see cref="MaxRecoveryAttempts"/>, so without this separate bound a
+    /// poison input that deterministically kills every worker would retry
+    /// forever; the counter resets whenever a phase completes or an operator
+    /// retries/resumes the item, so routine restarts never approach the cap.
+    /// Pairs with the reaper-side
+    /// <c>CodeyBox:DeadWorker:MaxConsecutiveInfrastructureRecoveries</c> knob.
+    /// Set to 0 (or any negative value) to disable the bound and requeue
+    /// indefinitely (not recommended in production).
+    /// </summary>
+    public int MaxConsecutiveInfrastructureRecoveries { get; init; } = 20;
 
     /// <summary>
     /// Maximum number of times a work item will be silently re-queued after a

@@ -356,6 +356,7 @@ public sealed class WorkItemRetrier
         {
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
+            ConsecutiveInfrastructureRecoveries = 0,
             QuotaRetryAttempts = accounting == RetryAccounting.QuotaAutoRetry
                 ? item.QuotaRetryAttempts + 1
                 : isOperatorRetry
@@ -1017,6 +1018,7 @@ public sealed class WorkItemRetrier
             TransientRetryFrom = null,
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
+            ConsecutiveInfrastructureRecoveries = 0,
             StartedAt = null,
             PlanArtifact = resumingFromPlanning ? null : item.PlanArtifact,
             PlanGeneratedAt = resumingFromPlanning ? null : item.PlanGeneratedAt,

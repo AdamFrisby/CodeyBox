@@ -50,7 +50,12 @@ Each active worker fires an `UPDATE worker_registry SET last_heartbeat_at = $now
      work branch **without incrementing `RecoveryAttempts`**: losing the
      worker with no durable evidence is infrastructure, not item failure, so
      a restart never erodes the item's recovery budget and never transitions
-     it to `Failed` or `AbandonedAfterRecoveryAttempts`.
+     it to `Failed` or `AbandonedAfterRecoveryAttempts`. Each such requeue
+     increments a separate consecutive-infrastructure counter (reset when a
+     phase completes or an operator retries); past
+     `MaxConsecutiveInfrastructureRecoveries` (default **20**) the item parks
+     at `NeedsOperatorInput` for triage instead of requeueing, so a poison
+     input that kills every worker cannot retry forever.
    - Otherwise, if it is in a recoverable worker-owned state (see table below),
      increment `RecoveryAttempts` and transition it.
    - If it is in a durable phase-boundary state, re-dispatch it without changing state, still consuming a recovery attempt.
@@ -76,7 +81,7 @@ The mechanics, the retained-VM fallback for Incus, and the attempt caps are in
 
 | State when worker died | Recovered to | Why |
 |---|---|---|
-| `Working` | `Queued` preserving the work branch (`PreserveWorkBranchOnQueuedPickup`), or `Working` with the preempt checkpoint when one exists | No durable mid-turn evidence means the worker loss is purely infrastructure: requeue for a fresh run **without consuming `RecoveryAttempts`** and never `Failed`. A preempt checkpoint resumes the exact interrupted turn. The one exception is a suspended sandbox whose resume was attempted and failed (VM gone, provider error, timeout): the suspended state itself is unrecoverable, so that item is marked `Failed` — a genuine resume failure, not a worker loss. |
+| `Working` | `Queued` preserving the work branch (`PreserveWorkBranchOnQueuedPickup`), or `Working` with the preempt checkpoint when one exists | No durable mid-turn evidence means the worker loss is purely infrastructure: requeue for a fresh run **without consuming `RecoveryAttempts`** and never `Failed`. Past `MaxConsecutiveInfrastructureRecoveries` (default **20**) consecutive infrastructure requeues without a phase completing, the item parks at `NeedsOperatorInput` for triage instead of requeueing. A preempt checkpoint resumes the exact interrupted turn. The one exception is a suspended sandbox whose resume was attempted and failed (VM gone, provider error, timeout): the suspended state itself is unrecoverable, so that item is marked `Failed` — a genuine resume failure, not a worker loss. |
 | `Planning` | `Queued` | Planning edits are discarded; rerun the planning-only turn from a clean sandbox |
 | `PlanReview` | `PlanReview` | A plan artifact already exists; rerun the auditor-backed plan-review loop, including plan rework if reviewers still block |
 | `PlanApproved` | `PlanApproved` | Re-dispatch implementation from the approved-plan boundary and count the recovery handoff |
@@ -100,6 +105,7 @@ All options live under `CodeyBox:DeadWorker`:
 | `DeadWorkerThreshold` | `00:01:30` | Workers not seen in this window are presumed dead |
 | `CheckInterval` | `00:01:00` | How often the reaper periodic sweep runs |
 | `MaxRecoveryAttempts` | `10` | Cap on automatic recovery transitions before the item is abandoned for operator triage |
+| `MaxConsecutiveInfrastructureRecoveries` | `20` | Cap on consecutive worker-loss-without-checkpoint requeues before the item parks at `NeedsOperatorInput`; never consumes `MaxRecoveryAttempts`. Set to `0` to disable (not recommended) |
 
 **Constraint**: `DeadWorkerThreshold` must be ≥ 3 × `HeartbeatInterval`. Startup validation throws if the constraint is violated.
 

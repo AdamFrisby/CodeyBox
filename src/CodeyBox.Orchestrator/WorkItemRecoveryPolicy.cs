@@ -88,6 +88,7 @@ public static class WorkItemRecoveryPolicy
     {
         RecoveryAttempts = 0,
         RecoveryAttemptSourceState = null,
+        ConsecutiveInfrastructureRecoveries = 0,
     };
 
     private static bool IsRealProgressTransition(
@@ -272,6 +273,22 @@ public static class WorkItemRecoveryPolicy
     }
 
     /// <summary>
+    /// Fallback cap for consecutive infrastructure-caused requeues of a single
+    /// work item, used when a caller has no configured value to pass. Production
+    /// paths must pass their configured
+    /// <c>MaxConsecutiveInfrastructureRecoveries</c> option instead of relying
+    /// on this default.
+    /// </summary>
+    public const int DefaultMaxConsecutiveInfrastructureRecoveries = 20;
+
+    /// <summary>
+    /// Whether a consecutive-infrastructure count has passed its cap.
+    /// A non-positive cap disables the bound (recover indefinitely).
+    /// </summary>
+    public static bool ExceedsInfrastructureRecoveries(int consecutiveRecoveries, int maxConsecutive)
+        => maxConsecutive > 0 && consecutiveRecoveries > maxConsecutive;
+
+    /// <summary>
     /// Requeues a regular work-phase item whose worker died without leaving a
     /// preempt checkpoint. Losing the worker is an infrastructure event, not a
     /// work-item failure: there is no durable evidence the item itself is at
@@ -281,6 +298,14 @@ public static class WorkItemRecoveryPolicy
     /// <see cref="WorkItem.RecoveryAttempts"/> and never transitions to
     /// <see cref="WorkItemState.Failed"/> or
     /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>.
+    /// Each requeue increments
+    /// <see cref="WorkItem.ConsecutiveInfrastructureRecoveries"/> (reset on
+    /// real progress and on manual retry/resume); when that count exceeds
+    /// <paramref name="maxConsecutiveInfrastructureRecoveries"/> the item parks
+    /// at <see cref="WorkItemState.NeedsOperatorInput"/> instead of requeueing,
+    /// bounding poison inputs that deterministically kill every worker that
+    /// picks the item up. The genuine-failure budget is untouched on both
+    /// outcomes.
     /// Returns null when the item is not a regular checkpoint-less
     /// <see cref="WorkItemState.Working"/> row (rerunnable CheckAndAct /
     /// AgentControl loops and checkpointed turns keep their own recovery
@@ -289,7 +314,8 @@ public static class WorkItemRecoveryPolicy
     public static WorkItem? BuildInfrastructureRequeueWithoutCheckpoint(
         WorkItem item,
         string reason,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        int maxConsecutiveInfrastructureRecoveries = DefaultMaxConsecutiveInfrastructureRecoveries)
     {
         if (item.State != WorkItemState.Working
             || item.HasAgentTurnRecoveryBoundary
@@ -297,6 +323,23 @@ public static class WorkItemRecoveryPolicy
             || IsRerunnableAgentControlWithoutPreempt(item))
         {
             return null;
+        }
+
+        var consecutive = item.ConsecutiveInfrastructureRecoveries + 1;
+        if (ExceedsInfrastructureRecoveries(consecutive, maxConsecutiveInfrastructureRecoveries))
+        {
+            return item with
+            {
+                State = WorkItemState.NeedsOperatorInput,
+                LastError = $"{reason}; parked after {consecutive} consecutive infrastructure recoveries without completing a phase",
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
+                ConsecutiveInfrastructureRecoveries = consecutive,
+                UpdatedAt = now,
+            };
         }
 
         var preserve = !string.IsNullOrWhiteSpace(item.WorkBranch);
@@ -311,6 +354,7 @@ public static class WorkItemRecoveryPolicy
             PreemptCheckpoint = null,
             AgentTurnResumeCheckpoint = null,
             AgentTurnRecoveryLease = null,
+            ConsecutiveInfrastructureRecoveries = consecutive,
             UpdatedAt = now,
         });
     }
@@ -319,7 +363,8 @@ public static class WorkItemRecoveryPolicy
         WorkItem item,
         DateTimeOffset now,
         int maxRecoveryAttempts,
-        string recoveryReason = "graceful shutdown drain timed out")
+        string recoveryReason = "graceful shutdown drain timed out",
+        int maxConsecutiveInfrastructureRecoveries = DefaultMaxConsecutiveInfrastructureRecoveries)
     {
         if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
             return null;
@@ -346,14 +391,16 @@ public static class WorkItemRecoveryPolicy
         // evidence of item fault — same infrastructure rationale as
         // BuildInfrastructureRequeueWithoutCheckpoint — so the fallback
         // requeue preserves the work branch without consuming the recovery
-        // budget and never abandons. Checkpointed turns and other states keep
-        // the bounded accounting below.
+        // budget. Past the consecutive-infrastructure cap the item parks at
+        // NeedsOperatorInput instead of requeueing. Checkpointed turns and
+        // other states keep the bounded accounting below.
         if (item.State == WorkItemState.Working && !item.HasAgentTurnRecoveryBoundary)
         {
             var infrastructureRequeue = BuildInfrastructureRequeueWithoutCheckpoint(
                 item,
                 $"{recoveryReason} while item was {item.State}; re-queued for a fresh run",
-                now);
+                now,
+                maxConsecutiveInfrastructureRecoveries);
             if (infrastructureRequeue is not null)
                 return infrastructureRequeue;
             // Rerunnable CheckAndAct / AgentControl loops fall through to the

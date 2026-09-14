@@ -105,6 +105,43 @@ public sealed class WorkerDeathInfrastructureRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task RestartWithoutCheckpoint_ParksAtNeedsOperatorInputPastInfraCap()
+    {
+        // Poison-input bound: an item whose content deterministically kills
+        // every worker must not requeue forever. Past the consecutive-
+        // infrastructure cap the item parks for triage instead of requeueing —
+        // still without consuming the genuine-failure budget, and without
+        // re-entering the dispatch queue.
+        var cappedOpts = new DeadWorkerOptions
+        {
+            HeartbeatInterval = TimeSpan.FromSeconds(5),
+            DeadWorkerThreshold = TimeSpan.FromSeconds(15),
+            CheckInterval = TimeSpan.FromMinutes(60),
+            MaxRecoveryAttempts = 2,
+            MaxConsecutiveInfrastructureRecoveries = 1,
+        };
+        var cappedReaper = new DeadWorkerReaper(
+            _registry, _store, _queue, cappedOpts,
+            NullLogger<DeadWorkerReaper>.Instance,
+            _webhooks);
+        var item = MakeItem(WorkItemState.Working, recoveryAttempts: 1) with
+        {
+            ConsecutiveInfrastructureRecoveries = 1,
+            WorkBranch = "codeybox/auto/work-poison",
+        };
+        await _store.CreateAsync(item);
+
+        await cappedReaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, after.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(2, after.ConsecutiveInfrastructureRecoveries);
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
     public async Task GenuineWorkPhaseFailure_IsNotResurrectedByRecovery()
     {
         // Regression guard: recovery must not swallow real failures. An item

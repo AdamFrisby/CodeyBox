@@ -64,7 +64,11 @@ next startup. Losing the worker is treated as infrastructure, not item
 failure: a `Working` item interrupted without a preempt checkpoint is
 re-queued preserving its work branch **without** consuming its recovery
 budget, so routine restarts never push it toward `Failed` or
-`AbandonedAfterRecoveryAttempts`. Other mid-flight states still count their
+`AbandonedAfterRecoveryAttempts`. (Repeated worker losses without any phase
+completing are bounded separately: past
+`CodeyBox:DeadWorker:MaxConsecutiveInfrastructureRecoveries` consecutive
+infrastructure requeues the item parks at `NeedsOperatorInput` for triage.)
+Other mid-flight states still count their
 recovery handoff against `CodeyBox:DeadWorker:MaxRecoveryAttempts`
 (default 10); after that many recoveries without reaching a terminal state,
 an item lands in `AbandonedAfterRecoveryAttempts` and waits for

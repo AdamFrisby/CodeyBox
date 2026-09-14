@@ -270,6 +270,21 @@ public sealed record WorkItem
     /// </summary>
     public WorkItemState? RecoveryAttemptSourceState { get; init; }
 
+    /// <summary>
+    /// Consecutive infrastructure-caused requeues (worker death without a
+    /// preempt checkpoint) since a phase last completed successfully or an
+    /// operator last retried/resumed the item. Tracked separately from
+    /// <see cref="RecoveryAttempts"/> so routine restarts never erode the
+    /// genuine-failure budget: infrastructure loss carries no evidence the
+    /// item itself is at fault. When it exceeds the configured
+    /// consecutive-infrastructure cap the item parks at
+    /// <see cref="WorkItemState.NeedsOperatorInput"/> instead of requeueing,
+    /// which bounds poison inputs that deterministically kill every worker
+    /// that picks the item up. Reset alongside <see cref="RecoveryAttempts"/>
+    /// on real progress and on manual retry/resume.
+    /// </summary>
+    public int ConsecutiveInfrastructureRecoveries { get; init; }
+
     /// <summary>Number of attempts that have been made on the upstream-push phase.</summary>
     public int UpstreamPushAttempts { get; init; }
 

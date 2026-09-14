@@ -34,6 +34,22 @@ public sealed class DeadWorkerOptions
     public int MaxRecoveryAttempts { get; set; } = 10;
 
     /// <summary>
+    /// Maximum number of CONSECUTIVE infrastructure-caused requeues (worker
+    /// death without a preempt checkpoint) for a single work item before the
+    /// reaper parks it at <c>NeedsOperatorInput</c> for triage instead of
+    /// requeueing. Default 20. Infrastructure requeues never consume
+    /// <see cref="MaxRecoveryAttempts"/>, so without this separate bound a
+    /// poison input that deterministically kills every worker would retry
+    /// forever; the counter resets whenever a phase completes or an operator
+    /// retries/resumes the item, so routine restarts never approach the cap.
+    /// Pairs with <see cref="OrchestratorOptions.MaxConsecutiveInfrastructureRecoveries"/>
+    /// (the startup-replay / shutdown-recovery counterpart).
+    /// Set to 0 (or any negative value) to disable the bound and requeue
+    /// indefinitely (not recommended in production).
+    /// </summary>
+    public int MaxConsecutiveInfrastructureRecoveries { get; set; } = 20;
+
+    /// <summary>
     /// Validates that the threshold is large enough to avoid false positives.
     /// Throws <see cref="InvalidOperationException"/> on misconfiguration.
     /// </summary>
