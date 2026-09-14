@@ -10,18 +10,18 @@ namespace CodeyBox.Orchestrator;
 /// must fail closed for that key); both are null when no probe claims the member
 /// (callers fall back to the <c>NullQuotaProbe</c> unknown path, as before).
 /// </summary>
-internal sealed record QuotaProbeResolution(IAgentQuotaProbe? Probe, QuotaProbeConflict? Conflict);
+public sealed record QuotaProbeResolution(IAgentQuotaProbe? Probe, QuotaProbeConflict? Conflict);
 
 /// <summary>
 /// Two or more equally specific probes claimed the same member. Carries the
 /// contested key and the tied probe identities for the Error log and the
 /// fail-closed unknown snapshot.
 /// </summary>
-internal sealed record QuotaProbeConflict(
+public sealed record QuotaProbeConflict(
     AgentQuotaMemberKey Key,
     IReadOnlyList<string> ProbeNames);
 
-internal static class AgentQuotaProbeCatalog
+public static class AgentQuotaProbeCatalog
 {
     /// <summary>
     /// Sentinel model id used only to rank claim specificity: no real routing

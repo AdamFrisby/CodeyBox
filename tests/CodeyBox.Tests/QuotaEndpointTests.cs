@@ -301,6 +301,156 @@ public sealed class QuotaEndpointTests
         Assert.Equal(2, aggregate.GetProperty("instances").GetInt32());
     }
 
+    private sealed class CrossKindProbe : IAgentQuotaProbe
+    {
+        private readonly AgentQuotaSnapshot _snapshot;
+        private readonly AgentKind _claimed;
+
+        public CrossKindProbe(AgentKind kind, AgentKind claimed, AgentQuotaSnapshot snapshot)
+        {
+            Kind = kind;
+            _claimed = claimed;
+            _snapshot = snapshot;
+        }
+
+        public AgentKind Kind { get; }
+
+        public bool Handles(AgentQuotaMemberKey key) => key.Agent == _claimed;
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(_snapshot);
+    }
+
+    [Fact]
+    public async Task GetQuota_ReportsMemberServedByCrossKindProbe()
+    {
+        using var factory = new WorkItemApiFactory();
+        var client = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:AgentClasses:0:Id"] = "go",
+                    ["CodeyBox:AgentClasses:0:DisplayName"] = "Go",
+                    ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "copilot",
+                    ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+                    ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "100",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new CrossKindProbe(
+                    AgentKind.Opencode,
+                    AgentKind.Copilot,
+                    new AgentQuotaSnapshot { AvailablePct = 57 }));
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/quota");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        var root = doc.RootElement;
+        var copilotRows = root.GetProperty("probes")
+            .EnumerateArray()
+            .Where(p => string.Equals(p.GetProperty("agent").GetString(), "copilot", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var row = Assert.Single(copilotRows);
+        Assert.Equal(57, row.GetProperty("latestSnapshot").GetProperty("availablePct").GetDouble());
+
+        var aggregate = Assert.Single(root.GetProperty("kindAggregates").EnumerateArray(), a =>
+            string.Equals(a.GetProperty("agent").GetString(), "copilot", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(1, aggregate.GetProperty("instances").GetInt32());
+    }
+
+    [Fact]
+    public async Task GetQuota_OmitsMemberNoProbeClaims()
+    {
+        using var factory = new WorkItemApiFactory();
+        var client = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:AgentClasses:0:Id"] = "mix",
+                    ["CodeyBox:AgentClasses:0:DisplayName"] = "Mix",
+                    ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "copilot",
+                    ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+                    ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "100",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, 60));
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/quota");
+        var debugBody = await response.Content.ReadAsStringAsync();
+        Assert.True(response.IsSuccessStatusCode, debugBody);
+        using var doc = JsonDocument.Parse(debugBody);
+
+        var root = doc.RootElement;
+        Assert.DoesNotContain(
+            root.GetProperty("probes").EnumerateArray(),
+            p => string.Equals(p.GetProperty("agent").GetString(), "copilot", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(
+            root.GetProperty("kindAggregates").EnumerateArray(),
+            a => string.Equals(a.GetProperty("agent").GetString(), "copilot", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task GetQuota_ConflictingProbesReportUnknownInsteadOfDropping()
+    {
+        using var factory = new WorkItemApiFactory();
+        var client = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:AgentClasses:0:Id"] = "go",
+                    ["CodeyBox:AgentClasses:0:DisplayName"] = "Go",
+                    ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "copilot",
+                    ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+                    ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "100",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new CrossKindProbe(
+                    AgentKind.Opencode,
+                    AgentKind.Copilot,
+                    new AgentQuotaSnapshot { AvailablePct = 57 }));
+                services.AddSingleton<IAgentQuotaProbe>(new CrossKindProbe(
+                    AgentKind.Claude,
+                    AgentKind.Copilot,
+                    new AgentQuotaSnapshot { AvailablePct = 80 }));
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/quota");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        var root = doc.RootElement;
+        var row = Assert.Single(
+            root.GetProperty("probes").EnumerateArray(),
+            p => string.Equals(p.GetProperty("agent").GetString(), "copilot", StringComparison.OrdinalIgnoreCase));
+        var latest = row.GetProperty("latestSnapshot");
+        Assert.Equal(-1, latest.GetProperty("availablePct").GetDouble());
+        Assert.Contains("conflicting quota probes", latest.GetProperty("notes").GetString(), StringComparison.OrdinalIgnoreCase);
+
+        var aggregate = Assert.Single(root.GetProperty("kindAggregates").EnumerateArray(), a =>
+            string.Equals(a.GetProperty("agent").GetString(), "copilot", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(1, aggregate.GetProperty("instances").GetInt32());
+    }
+
     private sealed class FakeBudgetProvider : IAgentBudgetProvider
     {
         public Task<AgentQuotaSnapshot?> GetBudgetSnapshotAsync(AgentKind agent, string? modelId, CancellationToken ct = default)
