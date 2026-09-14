@@ -28,6 +28,7 @@ internal static class WorkerRegistryEndpoints
             maxConcurrentSandboxes = w.MaxConcurrentSandboxes,
             executorNetworkProfiles = w.ExecutorNetworkProfiles,
             executorCredentials = w.ExecutorCredentials,
+            executorCapabilities = w.ExecutorCapabilities,
             cordoned = w.Cordoned,
             healthy = w.Healthy,
         }));

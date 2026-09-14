@@ -49,6 +49,12 @@ public sealed record WorkerRegistration
     public IReadOnlyList<string>? ExecutorCredentials { get; init; }
 
     /// <summary>
+    /// Clearance tags the executor declares, in the same vocabulary as
+    /// <see cref="WorkItem.RequiredCapabilities"/>. Null for non-executor rows.
+    /// </summary>
+    public IReadOnlyList<string>? ExecutorCapabilities { get; init; }
+
+    /// <summary>
     /// Draining flag from the executor's registration. True means the host
     /// registers and heartbeats but is never selected for new placements.
     /// </summary>

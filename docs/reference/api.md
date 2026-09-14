@@ -1352,6 +1352,7 @@ Response: `200 OK` with a JSON array:
 | `maxConcurrentSandboxes` | Declared host-local sandbox capacity (`null` = uncapped / non-executor row) |
 | `executorNetworkProfiles` | Declared network profiles the executor accepts (empty = all; `null` for non-executor rows) |
 | `executorCredentials` | Names of the agent credential sets the executor holds (`null` for non-executor rows) |
+| `executorCapabilities` | Clearance tags the executor declares, in the work item `RequiredCapabilities` vocabulary (`null` for non-executor rows) |
 | `cordoned` | Draining flag: registers and heartbeats but is never selected for new placements |
 | `healthy` | Operator health gate: `false` routes new placements away without removing the registration |
 
@@ -1369,6 +1370,7 @@ Request (`application/json`):
   "maxConcurrentSandboxes": 2,
   "allowedNetworkProfiles": ["restricted"],
   "declaredCredentials": ["claude"],
+  "declaredCapabilities": ["sensitive"],
   "cordoned": false,
   "healthy": true,
   "processId": 12345
@@ -1381,6 +1383,7 @@ Request (`application/json`):
 | `maxConcurrentSandboxes` | Host-local sandbox capacity, 0–100000. `0` registers the executor but leaves it never selected; omit for uncapped |
 | `allowedNetworkProfiles` | At most 64 entries; empty (or `"*"`) accepts every profile |
 | `declaredCredentials` | At most 64 opaque credential-set names, matched by exact equality |
+| `declaredCapabilities` | At most 64 clearance tags in the work item `RequiredCapabilities` vocabulary, matched case-insensitively |
 | `cordoned` | Draining flag: registers and heartbeats but is never selected for new placements |
 | `healthy` | Health gate, default `true` |
 | `processId` | Executor OS process id, informational only |

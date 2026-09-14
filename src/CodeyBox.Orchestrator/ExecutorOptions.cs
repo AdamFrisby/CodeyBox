@@ -42,6 +42,13 @@ public sealed class ExecutorOptions
     /// <summary>Names of the agent credential sets this host holds.</summary>
     public List<string> DeclaredCredentials { get; set; } = [];
 
+    /// <summary>
+    /// Clearance tags this host is trusted to handle, in the same vocabulary
+    /// as the work item <c>RequiredCapabilities</c> clearance tags. The
+    /// orchestrator only places phases demanding a tag on hosts declaring it.
+    /// </summary>
+    public List<string> DeclaredCapabilities { get; set; } = [];
+
     /// <summary>When true the host drains: registers and heartbeats but is never selected for new placements.</summary>
     public bool Cordoned { get; set; }
 
@@ -80,6 +87,7 @@ public sealed class ExecutorOptions
         MaxConcurrentSandboxes = MaxConcurrentSandboxes,
         AllowedNetworkProfiles = [.. AllowedNetworkProfiles],
         DeclaredCredentials = [.. DeclaredCredentials],
+        DeclaredCapabilities = [.. DeclaredCapabilities],
         Cordoned = Cordoned,
         Healthy = Healthy,
     };
@@ -112,6 +120,7 @@ public sealed class ExecutorOptions
                 $"CodeyBox:Executor:MaxConcurrentSandboxes must be between 0 and {ExecutorRegistration.MaxDeclaredCapacity}.");
         ValidateEntries(AllowedNetworkProfiles, nameof(AllowedNetworkProfiles));
         ValidateEntries(DeclaredCredentials, nameof(DeclaredCredentials));
+        ValidateEntries(DeclaredCapabilities, nameof(DeclaredCapabilities));
         if (HeartbeatInterval <= TimeSpan.Zero)
             throw new InvalidOperationException("CodeyBox:Executor:HeartbeatInterval must be positive.");
         if (RequestTimeout <= TimeSpan.Zero)
