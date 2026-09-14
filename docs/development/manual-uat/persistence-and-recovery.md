@@ -25,7 +25,8 @@ repositories only.
 3. Send `kill -9` to the orchestrator process.
 4. Restart CodeyBox with the same `state.db`.
 5. Verify startup replay maps the item to the expected durable state:
-   `Working` without a preempt checkpoint becomes `Failed`, `Auditing` and
+   `Working` without a preempt checkpoint becomes `Queued` (recovery budget
+   untouched), `Auditing` and
    `Reworking` become `WorkComplete`, `Merging` becomes `AuditPassed`, and
    `UpstreamPushing` becomes `Merged`.
 6. Repeat the interrupted recovery until `MaxRecoveryAttempts` is exceeded and

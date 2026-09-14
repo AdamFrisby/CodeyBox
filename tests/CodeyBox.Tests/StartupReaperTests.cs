@@ -34,7 +34,7 @@ public sealed class StartupReaperTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupReaper_FailsCrashedWorkingItem_BeforeWorkerPickup()
+    public async Task StartupReaper_RequeuesCrashedWorkingItem_BeforeWorkerPickup()
     {
         // Arrange: an item left in Working state from a previous crash, with a
         // corresponding stale worker row.
@@ -84,25 +84,27 @@ public sealed class StartupReaperTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Poll until the startup reaper marks the non-preempted Working item
-        // Failed. It must not enter the worker pool again.
+        // Poll until the startup reaper requeues the non-preempted Working
+        // item and the worker pool picks it up. Losing the worker is an
+        // infrastructure event: the item must return to a runnable state and
+        // run again, not terminate as Failed.
         var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
         WorkItem? final = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
             final = await _store.GetAsync(item.Id);
-            if (final?.State == WorkItemState.Failed) break;
+            if (final?.State == WorkItemState.Done) break;
             await Task.Delay(30);
         }
 
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Failed, final.State);
-        Assert.Contains("without a preempt checkpoint", final.LastError);
-        Assert.Empty(pipeline.Executed);
-        // RecoveryAttempts == 1 proves the startup reaper ran and incremented the counter.
-        Assert.Equal(1, final.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.Contains(pipeline.Executed, id => id == item.Id);
+        // The worker picked the item up from the requeued runnable state, not
+        // from a terminal or mid-flight state.
+        Assert.Equal(WorkItemState.Queued, pipeline.EntryStates[item.Id]);
     }
 
     [Fact]

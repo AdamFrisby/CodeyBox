@@ -86,6 +86,9 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         // marked Failed — the bare repo holds the work branch across the
         // restart, so the next pickup re-rebases existing commits onto
         // current upstream main rather than discarding partial progress.
+        // Spec change 2026-09-10: losing the worker is purely infrastructure,
+        // so the reclaim no longer consumes the recovery budget — a restart
+        // must not push the item toward AbandonedAfterRecoveryAttempts.
         const string workBranch = "codeybox/auto/work-orphan";
         var item = MakeItem(WorkItemState.Working) with { WorkBranch = workBranch };
         await _store.CreateAsync(item);
@@ -97,7 +100,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.NotNull(after);
         Assert.Equal(WorkItemState.Queued, after.State);
-        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(0, after.RecoveryAttempts);
         Assert.Equal(workBranch, after.WorkBranch);
         Assert.True(after.PreserveWorkBranchOnQueuedPickup);
         Assert.Null(after.StartedAt);
@@ -223,17 +226,31 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         Assert.Equal(0, _queue.Count);
     }
 
-    [Theory]
-    [InlineData(WorkItemState.Working)]
-    [InlineData(WorkItemState.Reworking)]
-    public async Task Sweep_WorkingOrReworkingItem_AtRecoveryCap_NoCheckpoint_Abandons(
-        WorkItemState state)
+    [Fact]
+    public async Task Sweep_WorkingItem_AtRecoveryCap_NoCheckpoint_StillRequeues()
+    {
+        // An infrastructure-caused worker death must not push the item toward
+        // AbandonedAfterRecoveryAttempts, even when a previous genuine
+        // recovery already consumed the budget.
+        var item = MakeItem(WorkItemState.Working, recoveryAttempts: _opts.MaxRecoveryAttempts);
+        await _store.CreateAsync(item);
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(_opts.MaxRecoveryAttempts, after.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Sweep_ReworkingItem_AtRecoveryCap_NoCheckpoint_Abandons()
     {
         // Startup dead-worker recovery shares the dead-letter budget with the
         // periodic reaper. Once the cap is exceeded, it must reach the permanent
         // abandoned state operators monitor rather than parking in the stale-item
         // watchdog's NeedsOperatorInput triage state.
-        var item = MakeItem(state, recoveryAttempts: _opts.MaxRecoveryAttempts);
+        var item = MakeItem(WorkItemState.Reworking, recoveryAttempts: _opts.MaxRecoveryAttempts);
         await _store.CreateAsync(item);
 
         await _reaper.SweepStrandedItemsAsync(CancellationToken.None);

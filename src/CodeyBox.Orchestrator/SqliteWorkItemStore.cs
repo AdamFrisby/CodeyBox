@@ -252,6 +252,13 @@ public sealed class SqliteWorkItemStore :
             RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempt_source_state INTEGER;");
 
+            // Additive migration: consecutive infrastructure-caused requeues
+            // (worker death without a preempt checkpoint) since the last phase
+            // completion or manual retry. Default 0 keeps existing rows fully
+            // eligible for infrastructure requeue; capped separately from
+            // recovery_attempts by MaxConsecutiveInfrastructureRecoveries.
+            RunMigration("ALTER TABLE work_items ADD COLUMN consecutive_infra_recoveries INTEGER NOT NULL DEFAULT 0;");
+
             // Additive migration: link work items to a release. NULL = legacy / merge-to-main behaviour.
             RunMigration("ALTER TABLE work_items ADD COLUMN release_id TEXT;");
 
@@ -1375,7 +1382,7 @@ public sealed class SqliteWorkItemStore :
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                         local_squash_sha, merged_pr_number, merged_pr_url,
-                        min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
+                        min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, consecutive_infra_recoveries, release_id, preempted_at, preempt_checkpoint,
                         agent_turn_resume_checkpoint_json, agent_turn_recovery_lease_json,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, auth_failure_scope, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
@@ -1396,7 +1403,7 @@ public sealed class SqliteWorkItemStore :
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
-                        $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
+                        $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $consecutive_infra_recoveries, $release_id, $preempted_at, $preempt_checkpoint,
                         $agent_turn_resume_checkpoint, $agent_turn_recovery_lease,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $auth_failure_scope, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
@@ -1655,6 +1662,7 @@ public sealed class SqliteWorkItemStore :
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
+                    consecutive_infra_recoveries = $consecutive_infra_recoveries,
                     recovery_attempt_source_state = $recovery_attempt_source_state,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
@@ -1757,6 +1765,7 @@ public sealed class SqliteWorkItemStore :
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
+                    consecutive_infra_recoveries = $consecutive_infra_recoveries,
                     recovery_attempt_source_state = $recovery_attempt_source_state,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
@@ -1861,6 +1870,7 @@ public sealed class SqliteWorkItemStore :
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
+                    consecutive_infra_recoveries = $consecutive_infra_recoveries,
                     recovery_attempt_source_state = $recovery_attempt_source_state,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
@@ -2280,6 +2290,7 @@ public sealed class SqliteWorkItemStore :
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
+                    consecutive_infra_recoveries = $consecutive_infra_recoveries,
                     recovery_attempt_source_state = $recovery_attempt_source_state,
                     release_id = $release_id,
                     preempted_at = $preempted_at,
@@ -2719,6 +2730,7 @@ public sealed class SqliteWorkItemStore :
                         min_model_score = $min_model_score,
                         cancellation_reason = $cancellation_reason,
                         recovery_attempts = $recovery_attempts,
+                    consecutive_infra_recoveries = $consecutive_infra_recoveries,
                         recovery_attempt_source_state = $recovery_attempt_source_state,
                         release_id = $release_id,
                         preempted_at = $preempted_at,
@@ -4250,7 +4262,7 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$cancellation_reason",
             item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
         cmd.Parameters.AddWithValue("$recovery_attempts", item.RecoveryAttempts);
-        cmd.Parameters.AddWithValue("$recovery_attempt_source_state",
+        cmd.Parameters.AddWithValue("$consecutive_infra_recoveries", item.ConsecutiveInfrastructureRecoveries);        cmd.Parameters.AddWithValue("$recovery_attempt_source_state",
             item.RecoveryAttemptSourceState.HasValue ? (object)(int)item.RecoveryAttemptSourceState.Value : DBNull.Value);
         cmd.Parameters.AddWithValue("$release_id", (object?)item.ReleaseId?.ToString() ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preempted_at", (object?)item.PreemptedAt?.ToString("O") ?? DBNull.Value);
@@ -4400,6 +4412,7 @@ public sealed class SqliteWorkItemStore :
         CancellationReason = ReadCancellationReason(r),
         RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
         RecoveryAttemptSourceState = ReadNullableWorkItemState(r, "recovery_attempt_source_state"),
+        ConsecutiveInfrastructureRecoveries = ReadInt32OrDefault(r, "consecutive_infra_recoveries", defaultValue: 0),
         ReleaseId = ReadNullableReleaseId(r, "release_id"),
         PreemptedAt = ReadNullableDateTimeOffset(r, "preempted_at"),
         PreemptCheckpoint = r.IsDBNull(r.GetOrdinal("preempt_checkpoint")) ? null : r.GetString(r.GetOrdinal("preempt_checkpoint")),

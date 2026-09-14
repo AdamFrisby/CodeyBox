@@ -389,6 +389,43 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task DrainQueue_IdleQueue_ReturnsDrainedAndPauses()
+    {
+        var resp = await _client.PostAsJsonAsync("/queue/drain", new { reason = "restart prep", timeoutSeconds = 5 });
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Equal("Paused", doc.RootElement.GetProperty("state").GetString());
+        Assert.True(doc.RootElement.GetProperty("drained").GetBoolean());
+        Assert.Equal(0, doc.RootElement.GetProperty("currentlyRunning").GetInt32());
+        Assert.Equal("restart prep", doc.RootElement.GetProperty("pausedReason").GetString());
+    }
+
+    [Fact]
+    public async Task DrainQueue_EmptyReason_Returns400()
+    {
+        var resp = await _client.PostAsJsonAsync("/queue/drain", new { reason = "", timeoutSeconds = 5 });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task DrainQueue_MissingTimeout_Returns400()
+    {
+        var resp = await _client.PostAsJsonAsync("/queue/drain", new { reason = "restart prep" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task DrainQueue_TimeoutOutOfRange_Returns400()
+    {
+        var tooSmall = await _client.PostAsJsonAsync("/queue/drain", new { reason = "restart prep", timeoutSeconds = 0 });
+        Assert.Equal(HttpStatusCode.BadRequest, tooSmall.StatusCode);
+
+        var tooLarge = await _client.PostAsJsonAsync("/queue/drain", new { reason = "restart prep", timeoutSeconds = 3601 });
+        Assert.Equal(HttpStatusCode.BadRequest, tooLarge.StatusCode);
+    }
+
+    [Fact]
     public async Task GetBudgetUsage_KnownProject_Returns200()
     {
         // The test factory seeds one project with id "proj" (no budget caps configured).

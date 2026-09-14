@@ -143,15 +143,12 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// requeued preserving its work branch and
     /// <see cref="WorkItem.PreserveWorkBranchOnQueuedPickup"/> is set so the
     /// next pickup re-rebases the branch onto current upstream main rather
-    /// than discarding partial progress. Bounded by
-    /// <see cref="DeadWorkerOptions.MaxRecoveryAttempts"/>; once exceeded
-    /// the item escalates to
-    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> so it does not loop
-    /// burning a slot per restart. Distinct from the periodic / heartbeat-
-    /// stale path, which still uses
-    /// <see cref="WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure"/>
-    /// (mark Failed) — a dead worker mid-flight is a different signal from
-    /// a clean restart with the work branch intact.
+    /// than discarding partial progress. Losing the worker is an
+    /// infrastructure event, not a work-item failure, so this path does not
+    /// consume <c>RecoveryAttempts</c> and never escalates to
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> — the same
+    /// rule the periodic / heartbeat-stale path applies through
+    /// <see cref="WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint"/>.
     /// </para>
     ///
     /// <para>
@@ -200,7 +197,7 @@ public sealed class DeadWorkerReaper : BackgroundService
                     await RecoverWorkItemAsync(
                         item,
                         StartupSweepWorkerId,
-                        noPreemptFailedReason: "orchestrator restarted while work was in progress without a preempt checkpoint",
+                        noPreemptRequeueReason: "orchestrator restarted while work was in progress without a preempt checkpoint",
                         webhookReason: "orchestrator restart with stranded item",
                         preserveWorkBranchForOrphan: true,
                         ct);
@@ -288,7 +285,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         await RecoverWorkItemAsync(
             item,
             worker.WorkerId,
-            noPreemptFailedReason: "worker died while work phase was running without a preempt checkpoint",
+            noPreemptRequeueReason: "worker died while work phase was running without a preempt checkpoint",
             webhookReason: "dead worker detected",
             preserveWorkBranchForOrphan: false,
             ct);
@@ -489,23 +486,28 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// and the orphan-recovery policy vary.
     ///
     /// <para>
-    /// When <paramref name="preserveWorkBranchForOrphan"/> is true (startup
-    /// stranded sweep), Working items without a preempt checkpoint are
-    /// reclaimed preserving the work branch until the shared recovery cap is
-    /// exceeded; cap exhaustion transitions to
-    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>. When false
-    /// (periodic dead-worker reaper), the same items are marked
-    /// <see cref="WorkItemState.Failed"/> via
-    /// <see cref="WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure"/>
-    /// because a dead worker mid-flight is a different signal — the worker
-    /// process is known to be gone, and re-pickup may re-trigger whatever
-    /// killed it.
+    /// A regular Working item without a preempt checkpoint is an
+    /// infrastructure loss on both paths: it is requeued preserving the work
+    /// branch via
+    /// <see cref="WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint"/>
+    /// without consuming <c>RecoveryAttempts</c> and never transitions to
+    /// <see cref="WorkItemState.Failed"/> or
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> — a restart
+    /// must not erode the item's recovery budget. Consecutive infrastructure
+    /// requeues are bounded separately by the configured consecutive cap:
+    /// past it the item parks at <see cref="WorkItemState.NeedsOperatorInput"/>
+    /// for triage instead of requeueing. The
+    /// <paramref name="preserveWorkBranchForOrphan"/> flag now only affects
+    /// Reworking orphans on the startup stranded sweep (bounded stale-item
+    /// accounting with WorkComplete as the durable resume point); the
+    /// no-preempt-checkpoint <c>LastError</c> phrasing and the webhook reason
+    /// still vary per caller.
     /// </para>
     /// </summary>
     private async Task RecoverWorkItemAsync(
         WorkItem item,
         string workerIdContext,
-        string noPreemptFailedReason,
+        string noPreemptRequeueReason,
         string webhookReason,
         bool preserveWorkBranchForOrphan,
         CancellationToken ct)
@@ -771,9 +773,25 @@ public sealed class DeadWorkerReaper : BackgroundService
             && !WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item)
             && !WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
         {
-            var orphanAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
             var orphanNow = DateTimeOffset.UtcNow;
-            var orphanRecovered = WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(orphanAttempt, _opts.MaxRecoveryAttempts)
+            // A checkpoint-less Working item carries no durable evidence of
+            // item fault, so its loss is purely infrastructure: requeue
+            // preserving the work branch without consuming the recovery
+            // budget. A restart must not push the item toward
+            // AbandonedAfterRecoveryAttempts. Reworking keeps the bounded
+            // stale-item accounting below (it has WorkComplete as a durable
+            // resume point, so re-audit makes genuine progress or fails
+            // genuinely).
+            var orphanAttempt = item.State == WorkItemState.Working
+                ? item.RecoveryAttempts
+                : WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+            var orphanRecovered = item.State == WorkItemState.Working
+                ? WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
+                    item,
+                    noPreemptRequeueReason,
+                    orphanNow,
+                    _opts.MaxConsecutiveInfrastructureRecoveries)
+                : WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(orphanAttempt, _opts.MaxRecoveryAttempts)
                 ? WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
                 {
                     State = WorkItemState.AbandonedAfterRecoveryAttempts,
@@ -789,7 +807,7 @@ public sealed class DeadWorkerReaper : BackgroundService
                     item,
                     orphanAttempt,
                     _opts.MaxRecoveryAttempts,
-                    noPreemptFailedReason,
+                    noPreemptRequeueReason,
                     orphanNow);
             if (orphanRecovered is not null)
             {
@@ -813,11 +831,23 @@ public sealed class DeadWorkerReaper : BackgroundService
                 }
                 else if (orphanToState == WorkItemState.NeedsOperatorInput)
                 {
-                    _log.LogWarning(
-                        "Recovery ({WorkerId}): orphaned Working work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); parked at NeedsOperatorInput for triage",
-                        workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                    // Working orphans reach this via the consecutive-infrastructure
+                    // cap (recovery budget untouched); Reworking orphans via the
+                    // stale-item path. Name the cap that actually fired.
+                    if (orphanFromState == WorkItemState.Working)
+                    {
+                        _log.LogWarning(
+                            "Recovery ({WorkerId}): orphaned Working work item {ItemId} exceeded MaxConsecutiveInfrastructureRecoveries ({Max}); parked at NeedsOperatorInput for triage",
+                            workerIdContext, itemId, _opts.MaxConsecutiveInfrastructureRecoveries);
+                    }
+                    else
+                    {
+                        _log.LogWarning(
+                            "Recovery ({WorkerId}): orphaned Reworking work item {ItemId} exceeded MaxRecoveryAttempts ({Max}); parked at NeedsOperatorInput for triage",
+                            workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                    }
                     AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, orphanAttempt);
-                    await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "orphan recovery exceeded MaxRecoveryAttempts; parked at NeedsOperatorInput", ct);
+                    await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "orphan recovery exceeded its recovery cap; parked at NeedsOperatorInput", ct);
                 }
                 else
                 {
@@ -859,14 +889,67 @@ public sealed class DeadWorkerReaper : BackgroundService
             }
         }
 
-        if (WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(item, noPreemptFailedReason, out var failed))
+        if (WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
+                item,
+                noPreemptRequeueReason,
+                DateTimeOffset.UtcNow,
+                _opts.MaxConsecutiveInfrastructureRecoveries) is { } infrastructureRequeued)
         {
-            await _store.UpdateAsync(failed, ct);
+            await _store.UpdateAsync(infrastructureRequeued, ct);
             MarkRecoveredItem(itemId);
+            if (infrastructureRequeued.State == WorkItemState.NeedsOperatorInput)
+            {
+                _log.LogWarning(
+                    "Recovery ({WorkerId}): work item {ItemId} lost its worker while Working without a preempt checkpoint {Count} times in a row (cap {Max}); parked at NeedsOperatorInput for triage (recovery budget unchanged at {Attempts})",
+                    workerIdContext, itemId, infrastructureRequeued.ConsecutiveInfrastructureRecoveries, _opts.MaxConsecutiveInfrastructureRecoveries, infrastructureRequeued.RecoveryAttempts);
+                AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, infrastructureRequeued.RecoveryAttempts);
+                if (_webhooks is not null)
+                {
+                    _ = _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.recovered",
+                        WorkItem = infrastructureRequeued,
+                        Details = new
+                        {
+                            workItemId = itemId.ToString(),
+                            projectId = item.ProjectId.Value,
+                            fromState = item.State.ToString(),
+                            toState = WorkItemState.NeedsOperatorInput.ToString(),
+                            reason = webhookReason,
+                            recoveryAttempt = infrastructureRequeued.RecoveryAttempts,
+                            maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                            consecutiveInfrastructureRecoveries = infrastructureRequeued.ConsecutiveInfrastructureRecoveries,
+                            branchPreserved = infrastructureRequeued.PreserveWorkBranchOnQueuedPickup,
+                        },
+                    }, CancellationToken.None);
+                }
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "infrastructure recovery cap reached; parked at NeedsOperatorInput", ct);
+                return;
+            }
             _log.LogWarning(
-                "Recovery ({WorkerId}): work item {ItemId} was Working without a preempt checkpoint; marked Failed",
-                workerIdContext, itemId);
-            await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery marked Working item Failed without re-dispatch", ct);
+                "Recovery ({WorkerId}): work item {ItemId} lost its worker while Working without a preempt checkpoint; re-queued preserving branch {WorkBranch} (infrastructure event, recovery budget unchanged at {Attempts})",
+                workerIdContext, itemId, infrastructureRequeued.WorkBranch ?? "<none>", infrastructureRequeued.RecoveryAttempts);
+            AuditLog.DeadWorkerRecovered(itemId, workerIdContext, item.State, WorkItemState.Queued, infrastructureRequeued.RecoveryAttempts);
+            if (_webhooks is not null)
+            {
+                _ = _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.recovered",
+                    WorkItem = infrastructureRequeued,
+                    Details = new
+                    {
+                        workItemId = itemId.ToString(),
+                        projectId = item.ProjectId.Value,
+                        fromState = item.State.ToString(),
+                        toState = WorkItemState.Queued.ToString(),
+                        reason = webhookReason,
+                        recoveryAttempt = infrastructureRequeued.RecoveryAttempts,
+                        maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                        branchPreserved = infrastructureRequeued.PreserveWorkBranchOnQueuedPickup,
+                    },
+                }, CancellationToken.None);
+            }
+            await _queue.EnqueueAsync(itemId, ct);
             return;
         }
 

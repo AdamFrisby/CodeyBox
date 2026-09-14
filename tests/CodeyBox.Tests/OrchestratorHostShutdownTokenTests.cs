@@ -95,8 +95,11 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
     }
 
     [Fact]
-    public async Task ServiceStop_HostShutdownCancellation_AtRecoveryCapAbandonsInsteadOfRequeueing()
+    public async Task ServiceStop_HostShutdownCancellation_AtRecoveryCapStillRequeues()
     {
+        // A host-shutdown interruption without a preempt checkpoint is
+        // infrastructure, not item failure: the fallback requeues without
+        // consuming the recovery budget and never abandons, even at the cap.
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
@@ -129,10 +132,10 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token);
 
         var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
-        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after.State);
-        Assert.Equal(3, after.RecoveryAttempts);
-        Assert.Contains("MaxRecoveryAttempts", after.LastError);
-        Assert.Equal(0, queue.Count);
+        Assert.Equal(WorkItemState.Queued, after.State);
+        Assert.Equal(2, after.RecoveryAttempts);
+        Assert.Contains("re-queued for a fresh run", after.LastError);
+        Assert.Equal(1, queue.Count);
         service.Dispose();
     }
 

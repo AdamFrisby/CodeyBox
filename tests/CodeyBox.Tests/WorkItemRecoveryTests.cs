@@ -53,8 +53,11 @@ public sealed class WorkItemRecoveryTests : IDisposable
     // ── State reset mapping ───────────────────────────────────────────────────
 
     [Fact]
-    public async Task WorkingWithoutPreempt_TransitionsToFailed()
+    public async Task WorkingWithoutPreempt_RequeuesPreservingBranchWithoutConsumingBudget()
     {
+        // Losing the worker is an infrastructure event, not a work-item
+        // failure: startup replay returns the item to a runnable state
+        // without consuming the recovery budget.
         var item = Item(WorkItemState.Working);
         await _store.CreateAsync(item);
 
@@ -62,10 +65,11 @@ public sealed class WorkItemRecoveryTests : IDisposable
         await svc.ReplayPendingForTestAsync(CancellationToken.None);
 
         var recovered = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, recovered!.State);
-        Assert.Equal(1, recovered.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(0, recovered.RecoveryAttempts);
         Assert.Null(recovered.StartedAt);
         Assert.Equal("codeybox/in-flight", recovered.WorkBranch);
+        Assert.True(recovered.PreserveWorkBranchOnQueuedPickup);
         Assert.Contains("without a preempt checkpoint", recovered.LastError);
     }
 

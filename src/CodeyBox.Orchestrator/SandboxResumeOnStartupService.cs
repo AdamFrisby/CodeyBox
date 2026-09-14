@@ -427,9 +427,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             // Promote whatever the adopted agent committed inside the VM into a
             // real PreemptCheckpoint git ref so DeadWorkerReaper.RecoverWorkItemAsync
             // sees a non-null checkpoint and re-enqueues the item for clean resume
-            // instead of marking it Failed for "Working without a preempt checkpoint"
-            // (the happy-path failure mode of the suspend/resume cycle before R8-core
-            // wired the checkpoint promotion). Only attempt when the resumed VM is
+            // (without it the item would fall back to the stranded-item
+            // requeue path, discarding the adopted post-resume work). Only attempt when the resumed VM is
             // actually live and the agent has exited cleanly — a non-zero exit, a
             // missing exit code (deadline elapsed) or a resume failure all leave
             // the in-VM state untrustworthy, so we fall through to the standard
@@ -449,7 +448,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             // SandboxLeakReaper.BuildSuspendedVmNameSetAsync. When promotion
             // succeeded we ALSO persist PreemptCheckpoint so the next pass of
             // DeadWorkerReaper.SweepStrandedItemsAsync re-enqueues the item via
-            // the with-checkpoint branch instead of marking it Failed.
+            // the with-checkpoint branch (clean resume) instead of the
+            // checkpoint-less requeue.
             var fresh = await _store.GetAsync(item.Id, ct);
             if (fresh is null)
             {
@@ -786,7 +786,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 return true;
 
             _log.LogWarning(
-                "Failed to promote adopted-VM HEAD for sandbox {VmName} to preempt-checkpoint {RefName} for work item {WorkItemId}; falling through to stranded-item recovery (item will be marked Failed unless it has an earlier checkpoint)",
+                "Failed to promote adopted-VM HEAD for sandbox {VmName} to preempt-checkpoint {RefName} for work item {WorkItemId}; falling through to stranded-item recovery (item will be re-queued preserving its work branch)",
                 vmName, refName, itemId);
             return false;
         }

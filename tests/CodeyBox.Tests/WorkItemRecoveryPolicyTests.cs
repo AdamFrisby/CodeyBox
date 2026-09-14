@@ -293,7 +293,6 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Theory]
-    [InlineData(WorkItemState.Working, WorkItemState.Queued, true)]
     [InlineData(WorkItemState.Planning, WorkItemState.Queued, true)]
     [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview, true)]
     [InlineData(WorkItemState.PlanApproved, WorkItemState.PlanApproved, true)]
@@ -320,6 +319,111 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal(to, recovered!.State);
         Assert.Equal(clearsStartedAt ? null : startedAt, recovered.StartedAt);
         Assert.Equal(1, recovered.RecoveryAttempts);
+    }
+
+    [Fact]
+    public void GracefulShutdownRecovery_WorkingWithoutCheckpoint_RequeuesWithoutConsumingBudget()
+    {
+        // A checkpoint-less Working item interrupted by shutdown carries no
+        // evidence of item fault: the fallback requeue must not consume the
+        // recovery budget and must never abandon, even at the cap.
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            MakeItem(WorkItemState.Working) with
+            {
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+                RecoveryAttempts = 3,
+            },
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(3, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Contains("re-queued for a fresh run", recovered.LastError);
+    }
+
+    [Fact]
+    public void InfrastructureRequeue_IncrementsConsecutiveCounterWithoutTouchingBudget()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            WorkBranch = "codeybox/auto/work-x",
+            RecoveryAttempts = 2,
+            ConsecutiveInfrastructureRecoveries = 3,
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
+            item,
+            "worker died while work phase was running without a preempt checkpoint",
+            DateTimeOffset.UtcNow,
+            maxConsecutiveInfrastructureRecoveries: 20);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(2, recovered.RecoveryAttempts);
+        Assert.Equal(4, recovered.ConsecutiveInfrastructureRecoveries);
+        Assert.True(recovered.PreserveWorkBranchOnQueuedPickup);
+    }
+
+    [Fact]
+    public void InfrastructureRequeue_ParksAtNeedsOperatorInputPastCap()
+    {
+        // A poison input that deterministically kills every worker must not
+        // retry forever: past the consecutive-infrastructure cap the item
+        // parks for triage instead of requeueing, still without consuming
+        // the genuine-failure budget or touching Failed/Abandoned.
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            RecoveryAttempts = 1,
+            ConsecutiveInfrastructureRecoveries = 2,
+        };
+
+        var parked = WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
+            item,
+            "worker died while work phase was running without a preempt checkpoint",
+            DateTimeOffset.UtcNow,
+            maxConsecutiveInfrastructureRecoveries: 2);
+
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, parked!.State);
+        Assert.Equal(1, parked.RecoveryAttempts);
+        Assert.Equal(3, parked.ConsecutiveInfrastructureRecoveries);
+        Assert.Contains("parked after 3 consecutive infrastructure recoveries", parked.LastError);
+    }
+
+    [Fact]
+    public void InfrastructureRequeue_DisabledCap_RequeuesWithoutBound()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            ConsecutiveInfrastructureRecoveries = 500,
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
+            item,
+            "worker died while work phase was running without a preempt checkpoint",
+            DateTimeOffset.UtcNow,
+            maxConsecutiveInfrastructureRecoveries: 0);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(501, recovered.ConsecutiveInfrastructureRecoveries);
+    }
+
+    [Fact]
+    public void ResetRecoveryAttemptsAfterRealProgress_ClearsInfrastructureCounter()
+    {
+        var item = MakeItem(WorkItemState.WorkComplete) with
+        {
+            RecoveryAttempts = 2,
+            ConsecutiveInfrastructureRecoveries = 5,
+        };
+
+        var cleared = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(item, WorkItemState.WorkComplete);
+
+        Assert.Equal(0, cleared.RecoveryAttempts);
+        Assert.Equal(0, cleared.ConsecutiveInfrastructureRecoveries);
     }
 
     [Fact]
