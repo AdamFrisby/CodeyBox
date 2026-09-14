@@ -14,6 +14,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Opencode;
+using CodeyBox.Agents.Pi;
 using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
@@ -1172,6 +1173,15 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 {
     SandboxOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,
 });
+// Pi: lean terminal coding agent (npm @earendil-works/pi-coding-agent, MIT).
+// Driven via `pi --mode json` (structured event stream, not raw -p and not
+// --mode rpc) with the prompt on stdin. Auth is a provider API key from the
+// environment (shipped mapping: CODEYBOX_PI_API_KEY -> ANTHROPIC_API_KEY).
+// The binary must be installed in the sandbox image
+// (`npm install -g --ignore-scripts @earendil-works/pi-coding-agent`); see
+// docs/concepts/agents.md and docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new PiAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1589,6 +1599,12 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // Note: Antigravity is NOT in this verbatim mapping. The agy CLI's
         // OAuth token bundle is shipped to the sandbox by the dedicated
         // AntigravityEnvironmentCredentialProvider registered separately below.
+        // Pi: provider API-key auth from the environment. Pi reads the
+        // provider-native variable (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+        // GEMINI_API_KEY, … — full table in pi's providers.md); the shipped
+        // mapping covers the Anthropic path. Operators fronting other
+        // providers add that provider's variable here following the same row.
+        new AgentCredentialMapping(AgentKind.Pi, "CODEYBOX_PI_API_KEY", "ANTHROPIC_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2273,6 +2289,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new AntigravitySmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AntigravitySmokeProbe>()));
+// Pi: credential-presence check only (ANTHROPIC_API_KEY in the bundle). Pi
+// fronts 30+ providers behind one CLI, so no single endpoint validates the
+// credential and any provider call would spend real quota; the real auth
+// check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new PiSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<PiSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2286,6 +2309,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CrockInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, PiInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2363,6 +2387,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, AntigravityModelListProbe>()
 // CrockKnownModels list. Operator-configured ids that are absent surface as
 // a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, CrockModelListProbe>();
+// Pi model-list probe: `pi --list-models` needs an authenticated provider
+// plus network, so it cannot back a host-side startup probe. The curated
+// PiKnownModels seed is authoritative; operator-configured ids absent from
+// the seed surface as a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, PiModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3346,6 +3375,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Copilot] = new CopilotCostExtractor(),
         [AgentKind.Antigravity] = new AntigravityCostExtractor(),
         [AgentKind.Crock] = new CrockCostExtractor(),
+        [AgentKind.Pi] = new PiCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3437,6 +3467,7 @@ builder.Services.AddSingleton<IAgentStreamParser, CopilotStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, PiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -3472,6 +3503,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
     return new CursorQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Pi detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:pi, mirroring the cursor hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Pi.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new PiQuotaFailureDetector(extras);
+});
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CopilotQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>

@@ -5,6 +5,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Opencode;
+using CodeyBox.Agents.Pi;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -110,5 +111,24 @@ public sealed class InVmSmokeProbeBuildStepsTests
         Assert.Equal([OpencodeAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
         Assert.Equal(["bash", "-c", OpencodeAgentRunner.AuthMaterialiseScript], steps[1].Argv);
         Assert.Equal([OpencodeAgentRunner.DefaultBinary, "providers"], steps[2].Argv);
+    }
+
+    [Fact]
+    public void Pi_EmitsVersionPlusModeJsonAssertion_PinnedToRunnerBinary()
+    {
+        // Pi's probe has two steps: the --version binary check plus a
+        // --mode assertion (the runner's only transport). Both pin to the
+        // runner's binary constant so probe/runner drift fails loudly.
+        var probe = new PiInVmSmokeProbe();
+        Assert.Equal(AgentKind.Pi, probe.Kind);
+
+        foreach (var credential in new AgentCredential?[] { null, Cred(AgentKind.Pi) })
+        {
+            var steps = probe.BuildSteps(credential);
+            Assert.Equal(2, steps.Count);
+            Assert.Equal([PiAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
+            Assert.Contains(PiAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
+            Assert.Contains("--mode", string.Join(" ", steps[1].Argv));
+        }
     }
 }

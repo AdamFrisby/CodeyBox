@@ -669,3 +669,85 @@ root, so a misconfiguration fails as an Infrastructure error rather than a
 catastrophic host mount. Only sandbox providers that preserve a live local Unix
 socket support this fallback. The daemon owns the tunnel + MCP tools and, if
 configured with its own key, is what bills the batch.
+
+### Pi coding agent (`pi`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against pi 0.85.1, 2026-09-14):
+
+```sh
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+MIT-licensed ([repo](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent),
+npm `@earendil-works/pi-coding-agent`). Lean terminal agent (Read/Write/Edit/Bash
+tools) fronting 30+ providers through its pi-ai layer.
+
+**Non-interactive invocation.** The runner drives `pi --mode json` with the
+prompt on stdin and NO positional prompt argument:
+
+```sh
+pi --mode json --no-session --offline [--model <id>] [--thinking <level>]
+```
+
+`--mode json` was chosen over raw `-p` and `--mode rpc`: `-p` prints only the
+final response text (usage, dispatch model, and terminal error shape would be
+unrecoverable), while `--mode rpc` is a bidirectional prompt/response protocol
+needing a driver loop for no extra signal on a one-shot run. `--mode json`
+exits after the run like `-p` but emits one JSON event per stdout line, with
+cumulative `usage {input, output, cacheRead, cacheWrite, totalTokens}` and
+`model` on the assistant message frames. `--no-session` skips persisting
+`~/.pi/agent/sessions` (the VM is ephemeral); `--offline` disables pi.dev
+startup network (version checks, telemetry). The runner deliberately passes
+NEITHER `--approve` NOR `--no-approve`: the sandbox tree is untrusted, so the
+`ask` default (ignore project resources) is the safe posture.
+
+**Exit-zero errors.** Pi exits 0 even when the run dies before producing
+output (verified: missing API key and a provider 401 both exit 0 with the
+cause only in the event stream). The runner lifts the terminal error
+(`stopReason: "error"` + `errorMessage` on the message frames, or the
+plaintext `No API key found for the selected model.`) into
+`TerminalDiagnostic`, so the pipeline's no-changes branch parks quota/auth
+give-ups instead of dead-lettering them as "produced no changes" — the same
+shape `agy` has.
+
+**Authentication.** Provider API keys from the environment (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `GEMINI_API_KEY`, … — full table in pi's `providers.md`).
+The shipped credential mapping wires host `CODEYBOX_PI_API_KEY` to
+sandbox-side `ANTHROPIC_API_KEY`; operators fronting other providers add that
+provider's variable to the mapping. Interactive `/login` state is not shipped
+into sandboxes. Prefer `provider/id`-qualified `ModelId` values
+(e.g. `anthropic/claude-haiku-4-5`): pi's default provider is google, so a bare
+id can resolve against the wrong catalog.
+
+**Reasoning effort.** `ReasoningMode` maps 1:1 onto `pi --thinking`
+(`off|minimal|low|medium|high|xhigh|max`). Only exact allowlist members are
+emitted; anything else is ignored rather than passed through to fail the CLI.
+
+**Quota probe.** Ships as Unknown-only: pi has no meterable quota endpoint
+(it fronts 30+ providers). The router's `QuotaUnknownPolicy` (default
+`UseObservedFailures`) gates dispatch via observed failure history, and
+`PiQuotaFailureDetector` classifies the relayed provider errors (401/auth
+shapes → Unauthorized; 429/rate-limit → RateLimitExceeded; 402/billing →
+LimitReached) with operator-extensible rows under
+`CodeyBox:QuotaFailurePatterns:pi`.
+
+**Smoke probes.** Host-side `PiSmokeProbe` is a credential-presence check only
+(no network call — no single endpoint validates a multi-provider credential).
+`PiInVmSmokeProbe` execs `pi --version` plus a `pi --help | grep -q -- --mode`
+assertion, so a pi build that dropped the JSON event stream benches at smoke
+time instead of failing first dispatch.
+
+**Model-list probe.** `pi --list-models` needs an authenticated provider plus
+network, so the host-side probe returns the curated `PiKnownModels` seed
+instead of live-reading the catalog. Operator `ModelId` values absent from the
+seed surface as a startup warning, never a hard reject (pi accepts fuzzy and
+provider-qualified ids beyond the seed).
+
+**Cost attribution.** `PiCostExtractor` takes the latest (cumulative) `usage`
+frame and the bare `message.model` id (pi strips the `provider/` qualifier in
+`message.model`). Bundled rates live in `agent-pricing-defaults.json` under the
+`pi` bucket for the shipped Anthropic-backed member; operators fronting other
+providers add that provider's list prices there (or under
+`CodeyBox:AgentPricing`) keyed by the bare model id.

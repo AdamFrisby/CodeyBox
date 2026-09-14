@@ -90,6 +90,7 @@ events.
 | Agent | Bundled rates | Why |
 |---|---|---|
 | `claude`, `codex`, `gemini` | yes | the provider publishes per-token list prices |
+| `pi` | yes, for the shipped Anthropic-backed member | pi is a multi-provider front; the bundled bucket mirrors Anthropic on-demand rates keyed by the bare `message.model` id. Operators fronting other providers add that provider's list prices under `CodeyBox:AgentPricing`. |
 | `opencode` | yes, estimated | OpenCode Go is subscription-priced. Bundled rates are a single subscription-equivalent USD/M per model (same value for input, cached, and output), derived from the $12/5h budget, each model's requests-per-5h limit, and the token mix documented at [opencode.ai/docs/go](https://opencode.ai/docs/go). Keys are `opencode-go/<model-id>`. |
 | `cursor`, `copilot` | no | flat-rate subscriptions with no published per-token price |
 
