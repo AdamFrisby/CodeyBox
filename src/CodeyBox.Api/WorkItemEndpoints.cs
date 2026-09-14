@@ -1396,10 +1396,16 @@ internal static class WorkItemEndpoints
     /// Partially update a work item's editable fields. Most fields (title,
     /// prompt, agent, work/merge timeouts, min model score, required
     /// capabilities) are Queued-only — they affect a running pipeline so the
-    /// endpoint rejects 409 once dispatch starts. <see cref="PatchWorkItemRequest.DependsOn"/>
-    /// and the audit-budget fields are the exceptions: they are allowed on any
-    /// non-terminal state (Queued / Working / Auditing / …), persisted via
+    /// endpoint rejects 409 once dispatch starts. <see cref="PatchWorkItemRequest.DependsOn"/>,
+    /// the audit-budget fields, and <see cref="PatchWorkItemRequest.AgentClassId"/>
+    /// are the exceptions: they are allowed on any non-terminal state
+    /// (Queued / Working / Auditing / WorkComplete / …), persisted via
     /// partial UPDATEs that do not stomp <c>state</c> and friends.
+    ///
+    /// AgentClassId is refused with 409 while a worker holds the item (the
+    /// dispatch path may be resolving the class concurrently) and with 409 on
+    /// terminal items; unknown class ids are rejected with 400 against the
+    /// live router catalog.
     ///
     /// Timeout / score fields are clamped using the same bounds as creation —
     /// out-of-range values do not error, they pin to the boundary so an
@@ -1418,6 +1424,8 @@ internal static class WorkItemEndpoints
         IProjectRepository projects,
         IAgentRegistry agents,
         IKnobRegistry knobs,
+        IWorkerRegistry registry,
+        AgentClassRouter router,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -1443,6 +1451,7 @@ internal static class WorkItemEndpoints
             || body.RequiredCapabilities is not null;
         var auditBudgetPatch = body.AuditMaxIterations is not null
             || body.AuditComplexity is not null;
+        var agentClassPatch = body.AgentClassId is not null;
 
         // ── State pre-checks: surface 409 before any write ────────────────────
         // DependsOn is allowed on any non-terminal state — adding a dependency
@@ -1457,6 +1466,16 @@ internal static class WorkItemEndpoints
             return Results.Conflict(new
             {
                 error = $"cannot edit audit budget of work item in terminal state '{item.State}'",
+            });
+        // AgentClassId is allowed on any non-terminal state — the motivating
+        // case is a WorkComplete item parked behind an auditor class whose
+        // members are all unavailable (a Queued-only restriction would not
+        // solve it). Terminal items are closed; worker-held items are refused
+        // below rather than racing the dispatch path.
+        if (agentClassPatch && WorkItemDependencies.TerminalStates.Contains(item!.State))
+            return Results.Conflict(new
+            {
+                error = $"cannot edit agent class of work item in terminal state '{item.State}'",
             });
         if (queuedOnlyPatch && item!.State != WorkItemState.Queued)
             return Results.Conflict(new
@@ -1480,6 +1499,57 @@ internal static class WorkItemEndpoints
             var (normalisedKnobs, knobErr) = WorkItemCreationService.NormaliseKnobs(patchKnobs, knobs);
             if (knobErr is not null) return knobErr;
             normalisedPatchKnobs = normalisedKnobs!;
+        }
+
+        // ── AgentClassId validation (no writes yet, may 400) ─────────────────
+        // Same bounds as the create path (≤200 chars), plus an existence check
+        // against the live router catalog: an unknown class would otherwise
+        // fall through to direct agent pick at dispatch and silently strand
+        // the item outside the class the operator intended.
+        string? newAgentClassId = null;
+        string? oldAgentClassId = item!.AgentClassId;
+        if (agentClassPatch)
+        {
+            var trimmed = body.AgentClassId!.Trim();
+            if (trimmed.Length == 0)
+                return Results.BadRequest(new { error = "agentClassId must not be empty" });
+            if (trimmed.Length > 200)
+                return Results.BadRequest(new { error = "agentClassId must be <= 200 chars" });
+            var knownClasses = router.ClassIds;
+            if (!knownClasses.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+                return Results.BadRequest(new
+                {
+                    error = $"unknown agent class '{trimmed}'",
+                    available = knownClasses.OrderBy(c => c, StringComparer.OrdinalIgnoreCase),
+                });
+            newAgentClassId = trimmed;
+
+            // Refuse while a worker holds the item rather than racing the
+            // dispatch path, which may be resolving the class concurrently.
+            // Checked last (closest to the write) to minimise the check/write
+            // gap; the store's terminal guard below still fails closed on a
+            // concurrent transition.
+            try
+            {
+                var idStr = item.Id.ToString();
+                var workers = await registry.ListAsync(ct);
+                foreach (var worker in workers)
+                {
+                    if (string.Equals(worker.CurrentWorkItemId, idStr, StringComparison.OrdinalIgnoreCase))
+                        return Results.Conflict(new
+                        {
+                            error = $"cannot change agent class while worker '{worker.WorkerId}' holds work item '{id}'",
+                        });
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                return Results.Conflict(new
+                {
+                    error = $"cannot change agent class of work item '{id}': failed to inspect worker bindings: {ex.Message}",
+                });
+            }
         }
 
         var updated = item!;
@@ -1578,6 +1648,9 @@ internal static class WorkItemEndpoints
             updated = updated with { AuditComplexity = normalised, UpdatedAt = now };
         }
 
+        if (newAgentClassId is not null)
+            updated = updated with { AgentClassId = newAgentClassId, UpdatedAt = now };
+
         IReadOnlyList<WorkItemId> oldDependsOn = updated.DependsOn;
         if (depsPatch)
             updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
@@ -1646,6 +1719,33 @@ internal static class WorkItemEndpoints
                     break;
             }
         }
+        // AgentClassId on a Queued item with other queued edits rides the
+        // guarded row UPDATE above (its SQL carries agent_class_id); every
+        // other case — notably non-Queued items, where the guarded write is
+        // unavailable — goes through the terminal-guarded partial UPDATE so
+        // pipeline-owned columns are never stomped.
+        if (agentClassPatch && !needsQueuedRowUpdate)
+        {
+            var classResult = await store.UpdateAgentClassAsync(
+                updated.Id,
+                newAgentClassId,
+                now,
+                ct);
+            switch (classResult.Outcome)
+            {
+                case AgentClassUpdateOutcome.NotFound:
+                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+                case AgentClassUpdateOutcome.TerminalState:
+                    return Results.Conflict(new
+                    {
+                        error = $"work item transitioned to terminal state '{classResult.Item!.State}' before agent class could be updated",
+                    });
+                case AgentClassUpdateOutcome.Updated:
+                    oldAgentClassId = classResult.OldAgentClassId ?? oldAgentClassId;
+                    updated = classResult.Item ?? updated with { AgentClassId = newAgentClassId, UpdatedAt = now };
+                    break;
+            }
+        }
         if (depsPatch && !queuedOnlyPatch)
         {
             var depResult = await store.UpdateDependsOnAsync(updated.Id, newDependsOn!, now, ct);
@@ -1679,6 +1779,8 @@ internal static class WorkItemEndpoints
         }
         if (depsPatch)
             AuditLog.WorkItemDependenciesChanged(updated.Id, oldDependsOn, newDependsOn!);
+        if (agentClassPatch)
+            AuditLog.WorkItemAgentClassChanged(updated.Id, oldAgentClassId, newAgentClassId);
 
         var statesById = new Dictionary<WorkItemId, WorkItemState>();
         var depExternalIds = new Dictionary<WorkItemId, string?>();
@@ -3113,7 +3215,13 @@ public sealed record PatchWorkItemRequest(
     // Replace-set knob edit (queued-only, like Title/Agent). Sending a non-null
     // map replaces the entire stored map. Unknown keys and invalid values are
     // rejected with 400. Send an empty map to clear all per-item overrides.
-    IReadOnlyDictionary<string, string>? Knobs = null);
+    IReadOnlyDictionary<string, string>? Knobs = null,
+    // Agent-class reassignment. Allowed on any non-terminal item with no
+    // worker bound to it (409 while a worker holds the item or the item is
+    // terminal). The id must name a class in the live router catalog —
+    // unknown ids are rejected with 400, mirroring the create-time bounds.
+    // A work_item.agent_class_changed audit entry records the old/new values.
+    string? AgentClassId = null);
 
 public sealed record PatchPriorityRequest(int Priority);
 
