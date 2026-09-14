@@ -120,6 +120,34 @@ public interface IExecutorPhaseTransport
 }
 
 /// <summary>
+/// Streaming extension to <see cref="IExecutorPhaseTransport"/>: the executor
+/// delivers live agent-output chunks to <paramref name="onChunk"/> as they
+/// are produced — implementations MUST NOT buffer to phase end, since the
+/// orchestrator feeds them into the live capture and the supervision hub in
+/// real time (the same requirement <c>IRemoteHostTransport</c> documents for
+/// remote agent CLIs).
+///
+/// <para>Chunks are numbered from zero with no gaps (see
+/// <see cref="ExecutorStreamChunk"/>). The callback itself never fails the
+/// phase: the orchestrator-side relay swallows its own failures, and the
+/// transport must not treat a callback exception as a phase or transport
+/// failure — losing the stream degrades observability only.</para>
+/// </summary>
+public interface IStreamingExecutorPhaseTransport : IExecutorPhaseTransport
+{
+    /// <summary>
+    /// Runs the phase like <see cref="IExecutorPhaseTransport.RunPhaseAsync"/>
+    /// while invoking <paramref name="onChunk"/> for each output chunk in
+    /// emission order as it is produced. A null callback behaves exactly like
+    /// the non-streaming overload.
+    /// </summary>
+    Task<ExecutorPhaseResult> RunPhaseAsync(
+        ExecutorPhaseRequest request,
+        Func<ExecutorStreamChunk, CancellationToken, Task>? onChunk,
+        CancellationToken ct);
+}
+
+/// <summary>
 /// Resolves the dispatch transport for a registered executor host. Returns
 /// null when the host has no transport configured (for example no SSH target
 /// is mapped for it); the proxy treats that as a transport failure rather

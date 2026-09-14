@@ -27,6 +27,12 @@ namespace CodeyBox.Orchestrator;
 /// <item>Stage the phase's single bare repo to the executor, run the phase
 /// there, and stage the repo back as a tar archive. Only the per-item repo
 /// path is ever transferred — never the whole repos root.</item>
+/// <item>While the phase runs, relay its live agent-output chunks into the
+/// orchestrator-side stream capture (same directory, same phase/iteration
+/// key a local phase would write) and the existing stdout broadcast, so a
+/// remote phase leaves the same observable artefact as a local one. Relay
+/// failure never fails the phase; a lost or reordered chunk is recorded as
+/// an explicit gap marker, never silently omitted.</item>
 /// <item>Validate the staged-back archive (size, entry count, expansion
 /// ratio, path containment) and install it over the bare repo. Violations
 /// fail the phase without writing to the bare repo and without caching.</item>
@@ -56,6 +62,8 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
     private readonly IIdempotencyStore _idempotency;
     private readonly IExecutorPhaseRunner _inner;
     private readonly Func<ExecutorPhaseDispatchOptions> _optionsAccessor;
+    private readonly IAgentStreamStore? _streamStore;
+    private readonly IStdoutBroadcaster? _broadcaster;
     private readonly TimeProvider _clock;
     private readonly ILogger<ExecutorPhaseProxy> _log;
 
@@ -67,7 +75,9 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         IExecutorPhaseRunner inner,
         Func<ExecutorPhaseDispatchOptions> optionsAccessor,
         TimeProvider? clock = null,
-        ILogger<ExecutorPhaseProxy>? log = null)
+        ILogger<ExecutorPhaseProxy>? log = null,
+        IAgentStreamStore? streamStore = null,
+        IStdoutBroadcaster? broadcaster = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _transports = transports ?? throw new ArgumentNullException(nameof(transports));
@@ -77,6 +87,8 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger<ExecutorPhaseProxy>.Instance;
+        _streamStore = streamStore;
+        _broadcaster = broadcaster;
     }
 
     public async Task<ExecutorPhaseResult> ExecutePhaseAsync(ExecutorPhaseRequest request, CancellationToken ct)
@@ -146,7 +158,57 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
 
         await CallTransportAsync(hostId, "stage-in", token => transport.StageInAsync(canonicalRepo, token), ct).ConfigureAwait(false);
 
-        var raw = await CallTransportAsync(hostId, "run-phase", token => transport.RunPhaseAsync(request, token), ct).ConfigureAwait(false);
+        // Open the orchestrator-side capture before the phase runs so a
+        // remote dispatch lands at the same path and key (work-item
+        // directory, phase/iteration file prefix) as the equivalent local
+        // phase. Attempt is zero-based while stream iterations are
+        // one-based, hence the +1. A request whose id is not a work-item
+        // GUID simply runs without a relayed stream.
+        AgentStreamCapture? streamCapture = null;
+        ExecutorStreamRelay? relay = null;
+        if (TryResolveStreamKey(request, out var streamWorkItem, out var streamIteration))
+        {
+            streamCapture = await BeginStreamCaptureAsync(streamWorkItem, request.Phase, streamIteration, ct).ConfigureAwait(false);
+            if (streamCapture is not null || _broadcaster is not null)
+                relay = new ExecutorStreamRelay(streamCapture, _broadcaster, streamWorkItem, request.Phase, _optionsAccessor, _log);
+        }
+
+        ExecutorPhaseResult raw;
+        try
+        {
+            if (relay is not null && transport is IStreamingExecutorPhaseTransport streaming)
+            {
+                var callback = relay.OnChunkAsync;
+                raw = await CallTransportAsync(
+                    hostId,
+                    "run-phase",
+                    token => streaming.RunPhaseAsync(request, callback, token),
+                    ct).ConfigureAwait(false);
+            }
+            else
+            {
+                raw = await CallTransportAsync(hostId, "run-phase", token => transport.RunPhaseAsync(request, token), ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            // The artefact is complete once the phase returns: disposing
+            // flushes buffered chunks and records truncation exactly like a
+            // local phase, even when stage-out or validation fails next.
+            // Disposal never throws out of a remote dispatch.
+            if (streamCapture is not null)
+            {
+                try
+                {
+                    await streamCapture.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogDebug(ex, "Executor stream capture disposal failed on host {HostId}", hostId);
+                }
+            }
+        }
+
         var result = ValidateResult(raw, options);
 
         var scratchRoot = Path.Combine(Path.GetTempPath(), "codeybox-executor-phase-" + Guid.NewGuid().ToString("N"));
@@ -186,6 +248,38 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         if (transport is null)
             throw new ExecutorPhaseTransportException(hostId, "resolve-transport", "No dispatch transport is configured for this host.");
         return transport;
+    }
+
+    private static bool TryResolveStreamKey(ExecutorPhaseRequest request, out WorkItemId workItemId, out int iteration)
+    {
+        workItemId = default;
+        iteration = 0;
+        if (!Guid.TryParse(request.WorkItemId, out var guid))
+            return false;
+        workItemId = new WorkItemId(guid);
+        iteration = request.Attempt == int.MaxValue ? int.MaxValue : request.Attempt + 1;
+        return iteration >= 1;
+    }
+
+    private async Task<AgentStreamCapture?> BeginStreamCaptureAsync(
+        WorkItemId workItemId,
+        string phase,
+        int iteration,
+        CancellationToken ct)
+    {
+        if (_streamStore is null)
+            return null;
+        try
+        {
+            return await _streamStore.BeginCaptureAsync(workItemId, phase, iteration, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Losing the stream degrades observability; it is never an agent
+            // or work-item failure.
+            _log.LogDebug(ex, "Executor stream capture unavailable for phase {Phase}", phase);
+            return null;
+        }
     }
 
     private static async Task<T> CallTransportAsync<T>(
