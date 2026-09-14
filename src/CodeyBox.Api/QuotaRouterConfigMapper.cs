@@ -32,6 +32,10 @@ internal static class QuotaRouterConfigMapper
             UnknownPolicy = qr.UnknownPolicy,
             ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
             ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
+            ReportedReadingClockSkew = qr.ReportedReadingClockSkewSeconds >= 0
+                ? TimeSpan.FromSeconds(qr.ReportedReadingClockSkewSeconds)
+                : throw new InvalidOperationException(
+                    "CodeyBox:QuotaRouter:ReportedReadingClockSkewSeconds must be >= 0."),
             CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
             ColdStartFitInWindow = qr.ColdStartFitInWindow,
             DrainAggressiveness = qr.DrainAggressiveness,
@@ -75,6 +79,10 @@ internal static class QuotaRouterConfigMapper
         dst.UnknownPolicy = src.UnknownPolicy;
         dst.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
         dst.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
+        if (src.ReportedReadingClockSkewSeconds < 0)
+            throw new InvalidOperationException(
+                "CodeyBox:QuotaRouter:ReportedReadingClockSkewSeconds must be >= 0.");
+        dst.ReportedReadingClockSkew = TimeSpan.FromSeconds(src.ReportedReadingClockSkewSeconds);
         dst.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
         dst.ColdStartFitInWindow = src.ColdStartFitInWindow;
         dst.DrainAggressiveness = src.DrainAggressiveness;
@@ -86,6 +94,7 @@ internal static class QuotaRouterConfigMapper
             dst.QuotaReservationMaxAge = TimeSpan.FromSeconds(src.QuotaReservationMaxAgeSeconds);
         dst.ExpectedResets = BuildExpectedResetOverrides(src.ExpectedResets);
         dst.IntraKindRoutingPolicy = src.IntraKindRoutingPolicy;
+        QuotaPoolValidation.Validate(dst);
     }
 
     private static PausedQuotaMapping BuildPausedQuotaOptions(QuotaRouterConfig qr)
@@ -205,7 +214,46 @@ internal static class QuotaRouterConfigMapper
                 Kind = kind,
                 BalanceUnit = string.IsNullOrWhiteSpace(kv.Value.BalanceUnit) ? null : kv.Value.BalanceUnit.Trim(),
                 ReservationEstimate = estimate,
+                ProbeSource = ParseProbeSource(name, kv.Value.ProbeSource),
+                ReportedReadingMaxAge = kv.Value.ReportedReadingMaxAgeSeconds > 0
+                    ? TimeSpan.FromSeconds(kv.Value.ReportedReadingMaxAgeSeconds)
+                    : kv.Value.ReportedReadingMaxAgeSeconds == 0
+                        ? QuotaRouterDefaults.DefaultReportedReadingMaxAge
+                        : throw new InvalidOperationException(
+                            $"Quota pool '{name}': ReportedReadingMaxAgeSeconds must be positive."),
+                HolderHostIds = BuildHolderHostIds(name, kv.Value.HolderHostIds),
             };
+        }
+        return dst;
+    }
+
+    private static QuotaProbeSource ParseProbeSource(string poolName, string? source)
+    {
+        if (string.IsNullOrWhiteSpace(source)
+            || string.Equals(source.Trim(), nameof(QuotaProbeSource.OrchestratorDirect), StringComparison.OrdinalIgnoreCase))
+            return QuotaProbeSource.OrchestratorDirect;
+        if (string.Equals(source.Trim(), nameof(QuotaProbeSource.ExecutorReported), StringComparison.OrdinalIgnoreCase))
+            return QuotaProbeSource.ExecutorReported;
+        throw new InvalidOperationException(
+            $"Quota pool '{poolName}': unknown probe source '{source}'. " +
+            $"Expected '{nameof(QuotaProbeSource.OrchestratorDirect)}' or '{nameof(QuotaProbeSource.ExecutorReported)}'.");
+    }
+
+    private static List<string> BuildHolderHostIds(string poolName, List<string>? src)
+    {
+        var dst = new List<string>();
+        if (src is null) return dst;
+        foreach (var raw in src)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                throw new InvalidOperationException(
+                    $"Quota pool '{poolName}' has an empty holder host id; " +
+                    $"holder entries must name an executor host id.");
+            var hostId = raw.Trim();
+            if (dst.Contains(hostId, StringComparer.Ordinal))
+                throw new InvalidOperationException(
+                    $"Quota pool '{poolName}' declares holder host id '{hostId}' more than once.");
+            dst.Add(hostId);
         }
         return dst;
     }

@@ -2061,6 +2061,10 @@ builder.Services.AddSingleton<QuotaReservationLedger>(sp =>
     new QuotaReservationLedger(
         sp.GetRequiredService<QuotaRouterOptions>(),
         TimeProvider.System));
+builder.Services.AddSingleton<ExecutorQuotaReportStore>(sp =>
+    new ExecutorQuotaReportStore(
+        sp.GetRequiredService<QuotaRouterOptions>(),
+        TimeProvider.System));
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2096,7 +2100,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentDispatchAvailability>(),
         sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
         sp.GetService<AgentCircuitBreaker>(),
-        sp.GetRequiredService<QuotaReservationLedger>());
+        sp.GetRequiredService<QuotaReservationLedger>(),
+        sp.GetRequiredService<ExecutorQuotaReportStore>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -7252,6 +7257,14 @@ namespace CodeyBox.Api
         /// <summary>Minutes observed quota failures are retained in state.db. Default 30.</summary>
         public int ObservedFailureRetentionMinutes { get; set; } = 30;
         /// <summary>
+        /// Tolerance in seconds for clock skew between executor and
+        /// orchestrator hosts when validating an executor-reported reading's
+        /// observed time. A report dated further in the future than this is
+        /// rejected. Default 300 (5 min). Hot-reloadable.
+        /// </summary>
+        public int ReportedReadingClockSkewSeconds { get; set; } =
+            QuotaRouterDefaults.DefaultReportedReadingClockSkewSeconds;
+        /// <summary>
         /// Seconds before a cap-spill-deferred work item is reconsidered (every
         /// eligible class member was at its per-agent concurrency cap). Default
         /// 15; the orchestrator's own atomic-reservation defer uses the same
@@ -7415,6 +7428,32 @@ namespace CodeyBox.Api
         /// reservation estimate. Set explicitly for balance pools.
         /// </summary>
         public double? ReservationEstimate { get; set; }
+
+        /// <summary>
+        /// Where this pool's probe runs: <c>OrchestratorDirect</c> (the
+        /// default — the orchestrator holds the credential and probes
+        /// directly, exactly as today) or <c>ExecutorReported</c> (an
+        /// executor host holding the credential probes locally and reports
+        /// readings; the orchestrator meters the pool from the latest fresh
+        /// report). Case-insensitive. Hot-reloadable.
+        /// </summary>
+        public string ProbeSource { get; set; } = "OrchestratorDirect";
+
+        /// <summary>
+        /// Maximum age in seconds of an executor-reported reading before the
+        /// pool reads as unknown. Applies only to <c>ExecutorReported</c>
+        /// pools. Non-positive means the default (300). Hot-reloadable.
+        /// </summary>
+        public int ReportedReadingMaxAgeSeconds { get; set; } =
+            QuotaRouterDefaults.DefaultReportedReadingMaxAgeSeconds;
+
+        /// <summary>
+        /// Executor host ids authorised to report readings for this pool.
+        /// Applies only to <c>ExecutorReported</c> pools: reports from any
+        /// other host are rejected. Matched by exact equality against the
+        /// executor's registered host id. Hot-reloadable.
+        /// </summary>
+        public List<string> HolderHostIds { get; set; } = [];
     }
 
     /// <summary>

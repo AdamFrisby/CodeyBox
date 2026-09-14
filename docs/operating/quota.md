@@ -127,6 +127,46 @@ refused (never dispatched on an unkeyed reading) and the reason names the
 member and the unresolved pool. `/quota` reports each member's `pool` and
 `poolKind` so operators can see which members share a meter.
 
+## Executor-reported pools: metering a credential the orchestrator cannot read
+
+By default every pool is orchestrator-probed: the orchestrator holds the
+credential and probes directly in-process. When the credential for an
+account lives on an executor host the orchestrator cannot read, that
+account has no reading — so the pool can instead be metered from readings
+the executor reports:
+
+```json
+"QuotaRouter": {
+  "Pools": {
+    "edge-sub": {
+      "Kind": "ResettingWindow",
+      "ProbeSource": "ExecutorReported",
+      "ReportedReadingMaxAgeSeconds": 300,
+      "HolderHostIds": ["edge-gpu-01"]
+    }
+  }
+}
+```
+
+The holding executor probes locally with its own credential and POSTs each
+reading (pool, available percentage or balance, reset time, observed time)
+to `/executors/{hostId}/quota-reports`. The orchestrator validates every
+report on arrival — the pool must exist and be executor-reported, the
+reporting host must be declared in the pool's `HolderHostIds` (exact match;
+a report from any other host is rejected and the stored reading is left
+unchanged), percentages must sit within 0–100, balances must be finite and
+non-negative, and a depleting-balance pool never carries a reset instant —
+and meters the pool from the latest fresh report.
+
+The orchestrator stays the sole authority for the gate decision: an
+executor reports readings and never decides admission. A stale report
+(older than `ReportedReadingMaxAgeSeconds`) or a pool that never reported
+reads as unknown — never as healthy headroom — and flows through the same
+unknown handling as a direct probe, including the Transient / Permanent /
+NoCredential distinction and fail-closed whenever a non-zero floor is in
+force. `ReportedReadingClockSkewSeconds` (default 300) bounds how far in
+the future a report's observed time may be before it is rejected.
+
 ## Replenishment kinds: resetting windows vs depleting balances
 
 Two kinds of allowance are in use and they are not interchangeable:

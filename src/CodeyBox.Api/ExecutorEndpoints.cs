@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Api;
 
@@ -26,6 +27,7 @@ internal static class ExecutorEndpoints
         app.MapPost("/executors/register", RegisterAsync);
         app.MapPost("/executors/{hostId}/heartbeat", HeartbeatAsync);
         app.MapPost("/executors/{hostId}/deregister", DeregisterAsync);
+        app.MapPost("/executors/{hostId}/quota-reports", ReportQuotaAsync);
     }
 
     private static async Task<IResult> RegisterAsync(
@@ -155,6 +157,60 @@ internal static class ExecutorEndpoints
         return trimmed;
     }
 
+    /// <summary>
+    /// Ingests one executor-reported quota reading for a pool whose credential
+    /// the reporting host holds. The store validates the report (pool exists
+    /// and is executor-reported, host is a declared holder, values in range,
+    /// reset consistent with the pool kind) and either stores it or rejects it
+    /// with a reason; rejection leaves the stored reading unchanged. This
+    /// endpoint accepts or rejects reports only — admission is decided by the
+    /// orchestrator's quota gate, never here.
+    /// </summary>
+    private static Task<IResult> ReportQuotaAsync(
+        string hostId,
+        ExecutorQuotaReportRequest? req,
+        ExecutorQuotaReportStore store)
+    {
+        string normalized;
+        try
+        {
+            normalized = NormalizeHostId(hostId);
+        }
+        catch (ArgumentException ex)
+        {
+            return Task.FromResult<IResult>(Results.BadRequest(new { error = ex.Message }));
+        }
+
+        if (req is null)
+            return Task.FromResult<IResult>(Results.BadRequest(new { error = "request body is required" }));
+
+        QuotaUnknownReason? unknown = null;
+        if (!string.IsNullOrWhiteSpace(req.Unknown))
+        {
+            if (!Enum.TryParse<QuotaUnknownReason>(req.Unknown.Trim(), ignoreCase: true, out var parsed)
+                || !Enum.IsDefined(parsed))
+                return Task.FromResult<IResult>(Results.BadRequest(
+                    new { error = $"unknown must be one of {string.Join(", ", Enum.GetNames<QuotaUnknownReason>())}" }));
+            unknown = parsed;
+        }
+
+        var report = new ExecutorQuotaReport
+        {
+            PoolName = req.Pool ?? string.Empty,
+            AvailablePct = req.AvailablePct,
+            BalanceRemaining = req.BalanceRemaining,
+            ResetAt = req.ResetAt,
+            ObservedAt = req.ObservedAt ?? default,
+            Unknown = unknown,
+            Notes = req.Notes,
+        };
+
+        if (!store.TryReport(normalized, report, out var rejectionReason))
+            return Task.FromResult<IResult>(Results.BadRequest(new { error = rejectionReason }));
+
+        return Task.FromResult<IResult>(Results.Ok(new { accepted = true, pool = report.PoolName }));
+    }
+
     internal static string? ValidateCapacity(int? capacity)
     {
         if (capacity is null)
@@ -203,5 +259,22 @@ internal static class ExecutorEndpoints
     public sealed class ExecutorHeartbeatRequest
     {
         public string? CurrentWorkItemId { get; set; }
+    }
+
+    /// <summary>
+    /// One executor-reported quota reading. The pool identity, the availability
+    /// reading, the reset time, and the time it was observed travel here; the
+    /// orchestrator validates and stores the report and keeps the gate
+    /// decision for itself.
+    /// </summary>
+    public sealed class ExecutorQuotaReportRequest
+    {
+        public string? Pool { get; set; }
+        public double? AvailablePct { get; set; }
+        public double? BalanceRemaining { get; set; }
+        public DateTimeOffset? ResetAt { get; set; }
+        public DateTimeOffset? ObservedAt { get; set; }
+        public string? Unknown { get; set; }
+        public string? Notes { get; set; }
     }
 }
