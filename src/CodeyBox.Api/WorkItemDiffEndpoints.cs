@@ -264,6 +264,11 @@ internal static class WorkItemDiffEndpoints
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        // --git-dir is explicit (not cwd discovery): hardened hosts that set
+        // safe.bareRepository=explicit refuse to treat a bare repo found via
+        // the working directory as a repository, so plain `git diff` fails
+        // there with "Not a git repository". An explicit git dir is honored.
+        psi.ArgumentList.Add("--git-dir=" + repoPath);
         psi.ArgumentList.Add("diff");
         psi.ArgumentList.Add("--unified=3");
         psi.ArgumentList.Add($"{baseSha}..{workSha}");
@@ -282,6 +287,9 @@ internal static class WorkItemDiffEndpoints
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        // See BuildGitDiffPsi: explicit --git-dir keeps bare-repo commands
+        // working under safe.bareRepository=explicit.
+        psi.ArgumentList.Add("--git-dir=" + workdir);
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = System.Diagnostics.Process.Start(psi)!;
         var readStdout = p.StandardOutput.ReadToEndAsync(ct);

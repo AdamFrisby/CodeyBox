@@ -1577,17 +1577,11 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // CavemanCode is BYOK across providers: the CLI reads whichever
         // provider key is present (ANTHROPIC_API_KEY, OPENAI_API_KEY, … —
         // see CavemanCodeAgentRunner.CredentialEnvironmentVariables). The
-        // namespaced host vars keep secrets out of config files; the
-        // verbatim rows let hosts that already inject the conventional
-        // provider keys work without extra operator wiring.
+        // namespaced host vars keep secrets out of config files.
         new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
         new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_OPENAI_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_GEMINI_API_KEY", "GEMINI_API_KEY"),
         new AgentCredentialMapping(AgentKind.CavemanCode, "CODEYBOX_CAVEMAN_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
-        new AgentCredentialMapping(AgentKind.CavemanCode, "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
-        new AgentCredentialMapping(AgentKind.CavemanCode, "OPENAI_API_KEY", "OPENAI_API_KEY"),
-        new AgentCredentialMapping(AgentKind.CavemanCode, "GEMINI_API_KEY", "GEMINI_API_KEY"),
-        new AgentCredentialMapping(AgentKind.CavemanCode, "OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
         // Cursor: the CLI uses subscription auth via ~/.cursor/credentials.json
         // (NOT an env-var key). The orchestrator ships the file's contents to
         // the sandbox via CODEYBOX_CURSOR_AUTH_JSON and CursorAgentRunner
@@ -1631,6 +1625,16 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // audit runners authenticated in hosts that inject OPENAI_API_KEY
         // directly instead of the CodeyBox-namespaced variant above.
         new AgentCredentialMapping(AgentKind.Codex, "OPENAI_API_KEY", "OPENAI_API_KEY"),
+        // CavemanCode verbatim fallbacks live in this separate provider (not
+        // alongside the CODEYBOX_CAVEMAN_* rows above): one provider instance
+        // rejects two mappings for the same agent targeting the same sandbox
+        // variable, so the Codex precedent keeps namespaced and verbatim rows
+        // in different instances. These let hosts that already inject the
+        // conventional provider keys work without extra operator wiring.
+        new AgentCredentialMapping(AgentKind.CavemanCode, "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "OPENAI_API_KEY", "OPENAI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "GEMINI_API_KEY", "GEMINI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.CavemanCode, "OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
     }));
 
     return new ChainedCredentialProvider(
