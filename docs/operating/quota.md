@@ -150,7 +150,15 @@ the executor reports:
 
 The holding executor probes locally with its own credential and POSTs each
 reading (pool, available percentage or balance, reset time, observed time)
-to `/executors/{hostId}/quota-reports`. The orchestrator validates every
+to `/executors/{hostId}/quota-reports`. The request must carry that host's
+own token: each executor gets a named `CodeyBox:ApiClients` entry whose
+`ExecutorHostId` equals its host id, and the executor uses that token (not
+the shared operator key) as its API bearer. The shared operator key and any
+token without a host binding are rejected on this endpoint with `403`, and
+a bound token reporting for a different host is rejected too — the path
+host is matched against the authenticated caller's binding before the
+registry is even consulted, so a rejected caller cannot probe which host
+ids are registered. The orchestrator validates every
 report on arrival — the pool must exist and be executor-reported, the
 reporting host must be declared in the pool's `HolderHostIds` (exact match;
 a report from any other host is rejected and the stored reading is left

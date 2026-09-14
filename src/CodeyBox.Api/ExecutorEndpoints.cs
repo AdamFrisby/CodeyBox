@@ -160,19 +160,26 @@ internal static class ExecutorEndpoints
     /// <summary>
     /// Ingests one executor-reported quota reading for a pool whose credential
     /// the reporting host holds. The caller is bound to the claimed host in
-    /// two layers: the host must have a live worker-registry registration
-    /// (checked here at ingress — an unregistered host has no 404-free path
-    /// to this store), and it must be operator-declared in the pool's
-    /// <c>HolderHostIds</c> (checked by the store, which rejects anything
-    /// else without mutating the stored reading). The store further validates
-    /// values and reset consistency. This endpoint accepts or rejects reports
-    /// only — admission is decided by the orchestrator's quota gate, never here.
+    /// three layers: the bearer must be a per-executor token bound to the
+    /// path host (a shared bearer such as the operator key proves nothing
+    /// about which host is calling, so it is rejected here — see
+    /// <c>ApiClientOptions.ExecutorHostId</c>); the host must have a live
+    /// worker-registry registration (checked here at ingress — an unregistered
+    /// host has no 404-free path to this store); and it must be
+    /// operator-declared in the pool's <c>HolderHostIds</c> (checked by the
+    /// store, which rejects anything else without mutating the stored
+    /// reading). The caller check runs before the registry lookup so a
+    /// rejected caller cannot probe which host ids are registered. The store
+    /// further validates values and reset consistency. This endpoint accepts
+    /// or rejects reports only — admission is decided by the orchestrator's
+    /// quota gate, never here.
     /// </summary>
     private static async Task<IResult> ReportQuotaAsync(
         string hostId,
         ExecutorQuotaReportRequest? req,
         ExecutorQuotaReportStore store,
         IWorkerRegistry registry,
+        HttpContext httpContext,
         CancellationToken ct)
     {
         string normalized;
@@ -184,6 +191,9 @@ internal static class ExecutorEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+
+        if (CheckQuotaReportCaller(httpContext, normalized) is { } callerRejection)
+            return callerRejection;
 
         if (req is null)
             return Results.BadRequest(new { error = "request body is required" });
@@ -221,6 +231,31 @@ internal static class ExecutorEndpoints
         if (store.TryGetStored(pool, out var stored, out _) && stored?.PoolName is { } storedName)
             pool = storedName;
         return Results.Ok(new { accepted = true, pool });
+    }
+
+    /// <summary>
+    /// Binds the quota-report path host to the authenticated caller. A
+    /// host-bound executor token may report only for its own host; anything
+    /// else — a missing principal, a token with no host binding (including
+    /// the shared operator key), or a bound token calling for a different
+    /// host — is rejected. Returns null when the caller may proceed.
+    /// Pure apart from reading the already-authenticated principal.
+    /// </summary>
+    internal static IResult? CheckQuotaReportCaller(HttpContext httpContext, string normalizedHostId)
+    {
+        if (!ApiKeyAuth.TryGetPrincipal(httpContext, out var principal) || principal is null)
+            return Results.Unauthorized();
+        if (ApiKeyAuth.IsAuthenticationDisabled(principal))
+            return null;
+        if (string.IsNullOrWhiteSpace(principal.ExecutorHostId))
+            return Results.Json(
+                new { error = "quota reports require a host-bound executor token (CodeyBox:ApiClients ExecutorHostId); shared bearer tokens cannot report readings" },
+                statusCode: StatusCodes.Status403Forbidden);
+        if (!string.Equals(principal.ExecutorHostId, normalizedHostId, StringComparison.Ordinal))
+            return Results.Json(
+                new { error = $"this token is bound to executor host '{principal.ExecutorHostId}' and cannot report for host '{normalizedHostId}'" },
+                statusCode: StatusCodes.Status403Forbidden);
+        return null;
     }
 
     internal static string? ValidateCapacity(int? capacity)
