@@ -1,3 +1,4 @@
+using CodeyBox.AdminSeed;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Orchestrator;
@@ -95,6 +96,12 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
             ["CodeyBox:Mutation"] = new(typeof(MutationTestingAuditorOptions), AllowsExtensionKeys: false),
             ["CodeyBox:Audit"] = new(typeof(AuditSectionOptions), AllowsExtensionKeys: false),
             ["CodeyBox:CheckAndActCompletion"] = new(typeof(CheckAndActCompletionOptions), AllowsExtensionKeys: false),
+            // Seeded fake-agent run mode for the admin E2E/demo instance (see
+            // docs/concepts/admin-e2e.md). Bound via
+            // IOptions<SeededFakeAgentOptions> in Program.cs; walked here so the
+            // documented opt-in (CodeyBox:SeededFakeAgents:Enabled) does not
+            // trip strict validation while typos inside it still surface.
+            ["CodeyBox:SeededFakeAgents"] = new(typeof(SeededFakeAgentOptions), AllowsExtensionKeys: false),
             ["CodeyBox:Plugins"] = new(typeof(PluginOptions), AllowsExtensionKeys: true),
         };
 

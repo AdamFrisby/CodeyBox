@@ -54,16 +54,17 @@ internal static class SqliteConnectionDisposal
     /// True iff <paramref name="ex"/> was thrown from inside the
     /// <c>Microsoft.Data.Sqlite</c> driver's dispose / close path. Narrowed by
     /// stack-trace inspection so unrelated <see cref="InvalidOperationException"/>
-    /// instances still surface.
+    /// instances still surface. Internal so short-lived reader connections can
+    /// share the exact same classification instead of re-implementing it.
     /// </summary>
-    private static bool IsSqliteTeardownRace(Exception ex)
+    internal static bool IsSqliteTeardownRace(Exception ex)
     {
         var trace = ex.StackTrace;
         return trace is not null
             && trace.Contains("Microsoft.Data.Sqlite", StringComparison.Ordinal);
     }
 
-    private static bool IsBusySqliteTeardownRace(SqliteException ex)
+    internal static bool IsBusySqliteTeardownRace(SqliteException ex)
         => ex.SqliteErrorCode == SqliteDefaults.SqliteBusy
             && IsSqliteTeardownRace(ex);
 }
