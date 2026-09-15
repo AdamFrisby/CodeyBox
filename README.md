@@ -344,6 +344,25 @@ cap. Every fallback is recorded in the commit trailer. Aider, Goose, or anything
 else is just a new `IAgentRunner` — see
 [`docs/concepts/agents.md`](docs/concepts/agents.md).
 
+## Host platform support
+
+| Orchestrator host | `incus` | `multipass` (local) | `multipass-remote` | `sprites` | `bubblewrap` | `process` (dev-only) |
+|---|---|---|---|---|---|---|
+| Linux | ✅ enforced on host | ✅ enforced on host | ✅ enforced on executor | ✅ enforced on executor | ⚠️ shared kernel, no egress | ⚠️ no isolation, dev only |
+| macOS | ❌ | ❌ | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
+| Windows | ❌ | ❌ | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
+
+Local VM sandboxes are Linux-only because egress isolation is enforced on the
+host by nftables on per-profile Linux bridges — there is no equivalent host-side
+mechanism on macOS or Windows (assessed in
+[`docs/concepts/host-platforms.md`](docs/concepts/host-platforms.md)). On macOS
+and Windows only the remote-executor topology is supported: the orchestrator
+runs locally (`./build.sh` on macOS, `./build.ps1` on Windows) while VMs execute
+on a Linux executor host where the allowlist holds. Guests are always Linux VMs;
+running the orchestrator on a platform does not imply guest sandboxes for it.
+An unenforced allowlist is never described as isolation. Unsupported provider +
+host combinations fail fast at startup with a message pointing at the matrix.
+
 ## Sandbox providers
 
 Pick with `CodeyBox.SandboxProvider`:

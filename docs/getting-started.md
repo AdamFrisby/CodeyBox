@@ -9,8 +9,13 @@ Before you put it near a repository that matters, read
 
 ## 1. Prerequisites
 
-- **Linux with KVM** (`/dev/kvm` present). Without it you are limited to the
-  shared-kernel `bubblewrap` provider or the isolation-free `process` one.
+- **A supported host + provider combination**
+  ([host platform matrix](../README.md#host-platform-support)): **Linux with KVM**
+  (`/dev/kvm` present) for local `incus`/`multipass` sandboxes, or — on macOS,
+  Windows, or KVM-less Linux — a reachable **Linux executor host** with
+  `multipass-remote`/`sprites` (see [`concepts/host-platforms.md`](concepts/host-platforms.md)).
+  Without KVM or an executor you are limited to the shared-kernel `bubblewrap`
+  provider or the isolation-free `process` one.
 - **[.NET 10 SDK](https://dotnet.microsoft.com/download)** and **git** on the host.
 - **A sandbox provider.** Incus 6.3+ with an existing ZFS or Btrfs pool for a
   persistent headless box; Multipass (`sudo snap install multipass`) for the

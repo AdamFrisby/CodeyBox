@@ -37,6 +37,45 @@ jobs:
       - name: dependency vulnerability audit
         run: dotnet list CodeyBox.slnx package --vulnerable --include-transitive
 
+  # Non-Linux hosts support only the remote-executor topology
+  # (docs/concepts/host-platforms.md): no local VM providers, no nftables.
+  # These jobs prove the declared scope — the orchestrator builds and the
+  # platform-matrix/path tests pass — without claiming isolation that has
+  # not been exercised on these hosts.
+  build-test-macos:
+    name: build and platform tests (macos)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet restore CodeyBox.slnx
+      - run: dotnet build CodeyBox.slnx --configuration Release --no-restore
+      - name: platform matrix and path tests
+        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build --filter 'FullyQualifiedName~HostPlatform|FullyQualifiedName~HostPath|FullyQualifiedName~RepoHygiene'
+
+  build-test-windows:
+    name: build and platform tests (windows)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - run: ./build.ps1 restore CodeyBox.slnx
+      - run: ./build.ps1 build CodeyBox.slnx --configuration Release --no-restore
+      - name: platform matrix and path tests
+        run: ./build.ps1 test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build --filter 'FullyQualifiedName~HostPlatform|FullyQualifiedName~HostPath|FullyQualifiedName~RepoHygiene'
+
   codeql:
     name: CodeQL
     runs-on: ubuntu-latest

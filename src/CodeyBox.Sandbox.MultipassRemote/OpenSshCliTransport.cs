@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Formats.Tar;
 using System.Globalization;
 using System.Text;
+using CodeyBox.Core;
 using CodeyBox.HostProcess;
 using Microsoft.Extensions.Logging;
 
@@ -957,7 +958,10 @@ public sealed class OpenSshCliTransport : IRemotePortForwardTransport
         argv.Add("-o"); argv.Add("ControlPath=none");
         if (!string.IsNullOrWhiteSpace(opts.SshKeyPath))
         {
-            argv.Add("-i"); argv.Add(opts.SshKeyPath);
+            // Expand a leading ~ against the orchestrator user's home so the
+            // same config works on Linux, macOS, and Windows hosts. Expanded
+            // at the argv sink so every caller benefits.
+            argv.Add("-i"); argv.Add(HostPathPolicy.ExpandHomeDirectory(opts.SshKeyPath));
             // IdentitiesOnly forces ssh to use only the provided key, not
             // anything the agent or ~/.ssh/config defaults pulled in. Reduces
             // surprise auth attempts that could lock out a service account.
