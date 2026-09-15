@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.IdentityModel.Tokens;
+using CodeyBox.Admin.Model;
 using CodeyBox.Admin.Web.Services;
 using CodeyBox.Admin.Web;
 
@@ -151,6 +152,11 @@ builder.Services.AddHttpClient<CodeyBoxApiClient>(client =>
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", orchestratorApiKey);
 });
 builder.Services.AddScoped<ICodeyBoxApiClient>(sp => sp.GetRequiredService<CodeyBoxApiClient>());
+
+// Fleet map knobs (layout, camera, node detail). Bound with reload-on-change
+// so operators can tune the map without restarting the dashboard.
+builder.Services.Configure<FleetMapOptions>(
+    builder.Configuration.GetSection("CodeyBoxAdmin:FleetMap"));
 
 // Live stdout hub settings — used by WorkItemDetail to connect to the
 // orchestrator's SignalR hub for streaming agent output. The hub URL is

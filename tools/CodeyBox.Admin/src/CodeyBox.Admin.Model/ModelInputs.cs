@@ -27,6 +27,12 @@ public sealed record AdminWorkItem
     public IReadOnlyList<string> DependsOn { get; init; } = [];
 
     /// <summary>
+    /// How many execution attempts the item has used (audits, retries,
+    /// upstream pushes). Zero when unknown — the map omits the count then.
+    /// </summary>
+    public int AttemptCount { get; init; }
+
+    /// <summary>
     /// Orchestrator-computed gate bit. Only consulted for dependency ids that
     /// are absent from the snapshot (e.g. a filtered view); ids present in
     /// the snapshot are re-evaluated from their states so the same inputs

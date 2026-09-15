@@ -5,7 +5,14 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <!-- No project references to src/CodeyBox.* — coupling is REST+JSON only. -->
+    <!-- The Admin.Model reference is tools-to-tools (pure, dependency-free
+         projection layer): the web app maps its REST DTOs onto the model at
+         the edge instead of re-implementing chains/attention/layout. -->
   </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodeyBox.Admin.Model\CodeyBox.Admin.Model.csproj" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- .NET SignalR client for server-side hub connection (live stdout panel). -->

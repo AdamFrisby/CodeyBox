@@ -1849,3 +1849,97 @@ summary:focus-visible,
     font-family: var(--mono);
     font-size: 0.8rem;
 }
+
+/* ── Fleet map: full-bleed 2D canvas, camera toolbar, legend ─────────────── */
+.map-page {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    height: calc(100vh - 6rem);
+    min-height: 24rem;
+}
+
+.map-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+}
+
+.map-mode-pill {
+    display: inline-block;
+    padding: 0.15rem 0.6rem;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-pill);
+    font-size: 0.78rem;
+    font-weight: 650;
+}
+
+.map-mode-auto { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.map-mode-manual { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
+.map-mode-still { color: var(--text-dim); border-color: var(--border-strong); }
+
+.map-focus-label { color: var(--text-dim); font-size: 0.82rem; }
+.map-counts { margin-left: auto; color: var(--text-faint); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+
+.btn-map-resume {
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent-strong);
+    border-radius: var(--radius-pill);
+    padding: 0.2rem 0.8rem;
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 650;
+}
+
+.btn-map-resume:hover { background: var(--info-bg); }
+.btn-map-resume:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.map-canvas-wrap {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-m);
+    overflow: hidden;
+}
+
+.map-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+.map-canvas:active { cursor: grabbing; }
+
+.map-legend {
+    position: absolute;
+    left: 0.6rem;
+    bottom: 0.5rem;
+    display: flex;
+    gap: 0.8rem;
+    flex-wrap: wrap;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    background: rgba(10, 14, 20, 0.72);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    padding: 0.25rem 0.8rem;
+}
+
+.map-glyph { font-style: normal; margin-right: 0.2rem; }
+.map-tone-active { color: var(--ok); }
+.map-tone-review { color: var(--violet); }
+.map-tone-queued { color: var(--info); }
+.map-tone-rework { color: var(--orange); }
+.map-tone-wait { color: var(--warn); }
+.map-tone-fail { color: var(--danger); }
+
+.map-fallback { font-size: 0.82rem; }
+.map-fallback summary { cursor: pointer; color: var(--text-dim); }
+.map-chain-row {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+    padding: 0.3rem 0;
+    border-top: 1px solid var(--border);
+}
+.map-chain-item { display: inline-flex; gap: 0.35rem; align-items: center; }
