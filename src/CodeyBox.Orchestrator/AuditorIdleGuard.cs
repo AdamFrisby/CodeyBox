@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -17,6 +16,14 @@ namespace CodeyBox.Orchestrator;
 /// <paramref name="getBudgets"/> every tick so hot-reload edits take effect
 /// on the next tick without restarting the run.
 /// </para>
+/// <para>
+/// Elapsed time and the poll delay are measured on <paramref name="timeProvider"/>
+/// (defaults to <see cref="TimeProvider.System"/>). Tests inject a
+/// <c>FakeTimeProvider</c> and advance it deterministically so a sub-second
+/// idle budget does not become a wall-clock race under parallel load.
+/// Timestamps passed via <paramref name="getLastActivityTicks"/> and
+/// <paramref name="startTicks"/> must come from the same provider.
+/// </para>
 /// </summary>
 internal static class AuditorIdleGuard
 {
@@ -30,7 +37,8 @@ internal static class AuditorIdleGuard
         long startTicks,
         Action touch,
         TimeSpan pollInterval,
-        CancellationToken ct)
+        CancellationToken ct,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(task);
         ArgumentNullException.ThrowIfNull(hasActiveExecs);
@@ -42,11 +50,12 @@ internal static class AuditorIdleGuard
         if (pollInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(pollInterval), "Poll interval must be positive.");
 
+        var clock = timeProvider ?? TimeProvider.System;
         while (true)
         {
             var completed = await Task.WhenAny(
                 task,
-                Task.Delay(pollInterval, ct)).ConfigureAwait(false);
+                Task.Delay(pollInterval, clock, ct)).ConfigureAwait(false);
             if (completed == task || task.IsCompleted)
                 return await task.ConfigureAwait(false);
 
@@ -54,9 +63,9 @@ internal static class AuditorIdleGuard
 
             var (idleTimeout, absoluteTimeout) = getBudgets();
             var decision = AuditorIdlePolicy.Decide(
-                Stopwatch.GetElapsedTime(getLastActivityTicks()),
+                clock.GetElapsedTime(getLastActivityTicks()),
                 idleTimeout,
-                Stopwatch.GetElapsedTime(startTicks),
+                clock.GetElapsedTime(startTicks),
                 absoluteTimeout,
                 task.IsCompleted,
                 hasActiveExecs());
@@ -64,7 +73,7 @@ internal static class AuditorIdleGuard
             {
                 case AuditorIdleDecision.KeepWaiting:
                     if (idleTimeout > TimeSpan.Zero
-                        && Stopwatch.GetElapsedTime(getLastActivityTicks()) >= idleTimeout
+                        && clock.GetElapsedTime(getLastActivityTicks()) >= idleTimeout
                         && hasActiveExecs())
                     {
                         touch();

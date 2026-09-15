@@ -231,7 +231,12 @@ internal static class TestSupport
         // DelegationEscalationService with these options (hot-reloadable via
         // the captured reference) so tests can arm automatic escalation.
         // Null (default) keeps today's operator-only behaviour.
-        DelegationEscalationOptions? delegationEscalationOptions = null)
+        DelegationEscalationOptions? delegationEscalationOptions = null,
+        // Pipeline clock for idle/phase timing. Tests inject a
+        // FakeTimeProvider so sub-second idle budgets are advanced
+        // deterministically instead of racing wall-clock scheduling
+        // latency under parallel load. Null (default) keeps the system clock.
+        TimeProvider? pipelineTimeProvider = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -305,6 +310,8 @@ internal static class TestSupport
             AgentAllowedHosts = [],
             HostGitIdentity = hostGitIdentity,
         };
+        if (pipelineTimeProvider is not null)
+            resolvedOptions = resolvedOptions with { TimeProvider = pipelineTimeProvider };
         QuotaRetryScheduler? quotaRetryScheduler = null;
         TransientRetryScheduler? transientRetryScheduler = null;
         IWorkItemAutoRetryScheduler? retryScheduler = null;

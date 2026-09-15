@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
@@ -48,8 +47,9 @@ public sealed partial class PipelineRunner
             return await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var lastActivityTicks = Stopwatch.GetTimestamp();
-        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+        var clock = _opts.TimeProvider;
+        var lastActivityTicks = clock.GetTimestamp();
+        void Touch() => Volatile.Write(ref lastActivityTicks, clock.GetTimestamp());
 
         var createTask = _sandboxes.CreateAsync(spec, linkedCts.Token);
         var timeoutTask = WaitForAuditorIdleTimeoutAsync(
@@ -119,8 +119,9 @@ public sealed partial class PipelineRunner
         }
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var lastActivityTicks = Stopwatch.GetTimestamp();
-        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+        var clock = _opts.TimeProvider;
+        var lastActivityTicks = clock.GetTimestamp();
+        void Touch() => Volatile.Write(ref lastActivityTicks, clock.GetTimestamp());
 
         var watchedSandbox = new ActivityTrackingSandbox(sandbox, Touch);
         var setupTask = setup(watchedSandbox, linkedCts.Token);
@@ -182,9 +183,10 @@ public sealed partial class PipelineRunner
             return await auditor.RunAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var startTicks = Stopwatch.GetTimestamp();
+        var clock = _opts.TimeProvider;
+        var startTicks = clock.GetTimestamp();
         var lastActivityTicks = startTicks;
-        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+        void Touch() => Volatile.Write(ref lastActivityTicks, clock.GetTimestamp());
 
         var originalCallback = context.StdoutChunkCallback;
         var watchedContext = context with
@@ -214,7 +216,8 @@ public sealed partial class PipelineRunner
                 // run is detected promptly; matches the legacy adaptive-delay
                 // floor (100 ms) this guard replaced.
                 TimeSpan.FromMilliseconds(100),
-                linkedCts.Token).ConfigureAwait(false);
+                linkedCts.Token,
+                clock).ConfigureAwait(false);
             Touch();
             ct.ThrowIfCancellationRequested();
             return result;
@@ -271,6 +274,7 @@ public sealed partial class PipelineRunner
         Func<long> getLastActivityTicks,
         Func<TimeSpan>? timeoutSelector = null)
     {
+        var clock = _opts.TimeProvider;
         try
         {
             while (!ct.IsCancellationRequested)
@@ -278,11 +282,11 @@ public sealed partial class PipelineRunner
                 var currentTimeout = timeoutSelector?.Invoke() ?? _pipelineTuning.Current.AuditorIdleTimeout;
                 if (currentTimeout <= TimeSpan.Zero)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(1), clock, ct).ConfigureAwait(false);
                     continue;
                 }
 
-                var elapsed = Stopwatch.GetElapsedTime(getLastActivityTicks());
+                var elapsed = clock.GetElapsedTime(getLastActivityTicks());
                 if (elapsed >= currentTimeout)
                     return currentTimeout;
 
@@ -290,7 +294,7 @@ public sealed partial class PipelineRunner
                 var delay = remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1);
                 if (delay <= TimeSpan.Zero)
                     delay = TimeSpan.FromMilliseconds(100);
-                await Task.Delay(delay, ct).ConfigureAwait(false);
+                await Task.Delay(delay, clock, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
