@@ -60,6 +60,21 @@ public interface ICodeyBoxApiClient
         string auditorName,
         CancellationToken ct = default);
 
+    // ── Audit progress (journey graph) ────────────────────────────────────
+    Task<AuditProgressListDto?> GetAuditProgressAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<AuditProgressListDto?>(null);
+
+    // ── Agent history (journey graph) ─────────────────────────────────────
+    Task<WorkItemAgentHistoryDto?> GetAgentHistoryAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult<WorkItemAgentHistoryDto?>(null);
+
+    // ── Agent-stream files (journey sandbox links) ────────────────────────
+    Task<List<AgentStreamFileDto>> GetAgentStreamFilesAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult(new List<AgentStreamFileDto>());
+    Task<Stream?> DownloadAgentStreamAsync(
+        string workItemId, string fileName, CancellationToken ct = default)
+        => Task.FromResult<Stream?>(null);
+
     // ── Timings ───────────────────────────────────────────────────────────────
     Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default);
     Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default);

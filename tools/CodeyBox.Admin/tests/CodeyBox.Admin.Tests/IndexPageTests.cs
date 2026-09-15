@@ -627,6 +627,21 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
         => Task.FromResult(DiffOverride.TryGetValue(id, out var d) ? (WorkItemDiffDto?)d : null);
+
+    public Dictionary<string, AuditProgressListDto> AuditProgressOverride { get; } = [];
+
+    public Task<AuditProgressListDto?> GetAuditProgressAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult(AuditProgressOverride.TryGetValue(workItemId, out var p) ? (AuditProgressListDto?)p : null);
+
+    public Dictionary<string, WorkItemAgentHistoryDto> AgentHistoryOverride { get; } = [];
+
+    public Task<WorkItemAgentHistoryDto?> GetAgentHistoryAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult(AgentHistoryOverride.TryGetValue(workItemId, out var h) ? (WorkItemAgentHistoryDto?)h : null);
+
+    public Dictionary<string, List<AgentStreamFileDto>> AgentStreamFilesOverride { get; } = [];
+
+    public Task<List<AgentStreamFileDto>> GetAgentStreamFilesAsync(string workItemId, CancellationToken ct = default)
+        => Task.FromResult(AgentStreamFilesOverride.TryGetValue(workItemId, out var f) ? f : new List<AgentStreamFileDto>());
     public Dictionary<string, string> StdoutTailOverride { get; } = [];
 
     public Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)

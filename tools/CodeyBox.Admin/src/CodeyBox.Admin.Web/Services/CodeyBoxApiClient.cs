@@ -403,6 +403,43 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<WorkItemDossierDto>(JsonOptions, ct);
     }
 
+    public async Task<AuditProgressListDto?> GetAuditProgressAsync(string workItemId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync(
+            $"/workitems/{Uri.EscapeDataString(workItemId)}/audit-progress", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<AuditProgressListDto>(JsonOptions, ct);
+    }
+
+    public async Task<WorkItemAgentHistoryDto?> GetAgentHistoryAsync(string workItemId, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync(
+            $"/workitems/{Uri.EscapeDataString(workItemId)}/agent-history", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemAgentHistoryDto>(JsonOptions, ct);
+    }
+
+    public async Task<List<AgentStreamFileDto>> GetAgentStreamFilesAsync(string workItemId, CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<AgentStreamFileDto>>(
+            $"/workitems/{Uri.EscapeDataString(workItemId)}/agent-streams?includeLineCount=false", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<Stream?> DownloadAgentStreamAsync(
+        string workItemId, string fileName, CancellationToken ct = default)
+    {
+        if (!StreamFileNameValidator.IsValid(fileName)) return null;
+        var resp = await _http.GetAsync(
+            $"/workitems/{Uri.EscapeDataString(workItemId)}/agent-streams/{Uri.EscapeDataString(fileName)}",
+            HttpCompletionOption.ResponseHeadersRead, ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadAsStreamAsync(ct);
+    }
+
     public async Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default)
     {
         var url = n.HasValue ? $"/workitems/timings/aggregate?n={n}" : "/workitems/timings/aggregate";

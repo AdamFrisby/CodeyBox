@@ -53,4 +53,11 @@ public sealed record AdminModelOptions
 
     /// <summary>Titles longer than this skip series parsing (bounded work).</summary>
     public int MaxTitleParseLength { get; init; } = 1000;
+
+    /// <summary>
+    /// Trailing run of complete audit iterations with an identical non-empty
+    /// blocking set that marks the journey <c>Stuck</c>. Two is the smallest
+    /// run that distinguishes recurrence from a single bad verdict.
+    /// </summary>
+    public int JourneyStuckIdenticalIterations { get; init; } = 2;
 }

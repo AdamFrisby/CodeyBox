@@ -19,6 +19,8 @@
     <PackageReference Include="Microsoft.AspNetCore.Authentication.Google" Version="10.0.0" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0" />
+    <!-- Sibling admin projection layer (pure, no I/O). Still no refs to src/CodeyBox.*. -->
+    <ProjectReference Include="..\CodeyBox.Admin.Model\CodeyBox.Admin.Model.csproj" />
   </ItemGroup>
 
 </Project>

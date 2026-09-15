@@ -286,6 +286,34 @@ var moveEndpoint = app.MapPost("/admin/move/{id}/{direction}",
 if (requireAuth)
     moveEndpoint.RequireAuthorization();
 
+// Streams the orchestrator's retained per-phase sandbox output to the
+// operator's browser. Server-side only: the API bearer token never reaches
+// the browser, and the file name must pass the admin-side guard (the
+// orchestrator re-validates before serving).
+var streamLogger = app.Services.GetRequiredService<ILoggerFactory>()
+    .CreateLogger("CodeyBox.Admin.Streams");
+var streamEndpoint = app.MapGet("/work-items/{id}/streams/{fileName}",
+    async (string id, string fileName, CodeyBoxApiClient apiClient) =>
+    {
+        if (!StreamFileNameValidator.IsValid(fileName))
+            return Results.BadRequest(new { error = "invalid file name" });
+        try
+        {
+            var stream = await apiClient.DownloadAgentStreamAsync(id, fileName);
+            if (stream is null) return Results.NotFound();
+            return Results.File(stream, "application/x-ndjson", fileDownloadName: fileName);
+        }
+        catch (Exception ex)
+        {
+            streamLogger.LogWarning(ex, "Sandbox stream download failed for item {ItemId}",
+                id.Replace("\r", "").Replace("\n", ""));
+            return Results.Problem("Failed to download sandbox output.");
+        }
+    });
+
+if (requireAuth)
+    streamEndpoint.RequireAuthorization();
+
 app.MapRazorComponents<CodeyBox.Admin.Web.Components.App>()
    .AddInteractiveServerRenderMode();
 
