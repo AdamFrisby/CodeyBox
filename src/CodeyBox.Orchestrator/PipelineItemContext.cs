@@ -17,7 +17,7 @@ namespace CodeyBox.Orchestrator;
 /// infrastructure clients (sandboxes, stores, loggers); those stay on the
 /// runner/collaborator that owns them.
 /// </summary>
-internal sealed class PipelineItemContext
+internal sealed record PipelineItemContext
 {
     public required WorkItem Item { get; init; }
     public required Project Project { get; init; }
@@ -52,40 +52,13 @@ internal sealed class PipelineItemContext
     }
 
     public PipelineItemContext WithRunner(IAgentRunner runner) =>
-        new()
-        {
-            Item = Item,
-            Project = Project,
-            AgentKind = AgentKind,
-            Runner = runner,
-            RepoId = RepoId,
-            BaseBranch = BaseBranch,
-            WorkBranch = WorkBranch,
-            SkipWork = SkipWork,
-            SkipAudit = SkipAudit,
-            SkipMerge = SkipMerge,
-            PreemptRequested = PreemptRequested,
-            ResumeCheckpoint = ResumeCheckpoint,
-            MergeSha = MergeSha,
-            AgentStdout = AgentStdout,
-        };
+        this with { Runner = runner };
 
     public PipelineItemContext WithBranches(string repoId, string baseBranch, string workBranch) =>
-        new()
+        this with
         {
-            Item = Item,
-            Project = Project,
-            AgentKind = AgentKind,
-            Runner = Runner,
             RepoId = repoId,
             BaseBranch = baseBranch,
             WorkBranch = workBranch,
-            SkipWork = SkipWork,
-            SkipAudit = SkipAudit,
-            SkipMerge = SkipMerge,
-            PreemptRequested = PreemptRequested,
-            ResumeCheckpoint = ResumeCheckpoint,
-            MergeSha = MergeSha,
-            AgentStdout = AgentStdout,
         };
 }

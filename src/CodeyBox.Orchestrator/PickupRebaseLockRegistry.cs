@@ -83,6 +83,6 @@ public sealed class PickupRebaseLockRegistry
     public sealed class PickupRebaseGate
     {
         public SemaphoreSlim Semaphore { get; } = new(1, 1);
-        public int ReferenceCount { get; set; }
+        public int ReferenceCount { get; internal set; }
     }
 }
