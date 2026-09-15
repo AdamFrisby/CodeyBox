@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Reflection;
 using Xunit;
 using Xunit.Abstractions;
@@ -20,6 +21,123 @@ public sealed class LeakTrackingTestFramework : XunitTestFramework
             SourceInformationProvider,
             DiagnosticMessageSink);
 
+    /// <summary>
+    /// Bounds every await the harness performs on test execution so a test that
+    /// stops making progress fails with a diagnostic naming what was pending
+    /// instead of hanging the whole assembly run (which consumes a pipeline
+    /// slot until a human kills it). Timeouts are configured via environment
+    /// variables (seconds; 0 disables that guard); see
+    /// <see cref="TestRunGuard"/> for names and defaults.
+    /// </summary>
+    internal static class TestRunGuard
+    {
+        internal const string CaseTimeoutEnvironmentVariable = "CODEYBOX_TESTS_CASE_TIMEOUT_SECONDS";
+        internal const string RunTimeoutEnvironmentVariable = "CODEYBOX_TESTS_RUN_TIMEOUT_SECONDS";
+        internal const string RunStallTimeoutEnvironmentVariable = "CODEYBOX_TESTS_RUN_STALL_TIMEOUT_SECONDS";
+
+        private const int DefaultCaseTimeoutSeconds = 600;
+        private const int DefaultRunTimeoutSeconds = 2400;
+        private const int DefaultRunStallTimeoutSeconds = 600;
+        private const int MaxNamedPendingTests = 5;
+
+        private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+
+        private static readonly ConcurrentDictionary<object, InFlightTest> InFlight = new();
+        private static readonly object ProgressLock = new();
+        private static DateTimeOffset _lastProgressUtc = DateTimeOffset.UtcNow;
+
+        internal static TimeSpan CaseTimeout { get; } = ResolveTimeout(CaseTimeoutEnvironmentVariable, DefaultCaseTimeoutSeconds);
+        internal static TimeSpan RunTimeout { get; } = ResolveTimeout(RunTimeoutEnvironmentVariable, DefaultRunTimeoutSeconds);
+        internal static TimeSpan RunStallTimeout { get; } = ResolveTimeout(RunStallTimeoutEnvironmentVariable, DefaultRunStallTimeoutSeconds);
+
+        internal static void RunStarted()
+        {
+            InFlight.Clear();
+            lock (ProgressLock)
+                _lastProgressUtc = DateTimeOffset.UtcNow;
+        }
+
+        internal static void Enter(object key, string displayName)
+        {
+            InFlight[key] = new InFlightTest(displayName, DateTimeOffset.UtcNow);
+        }
+
+        internal static void Exit(object key)
+        {
+            InFlight.TryRemove(key, out _);
+            lock (ProgressLock)
+                _lastProgressUtc = DateTimeOffset.UtcNow;
+        }
+
+        internal static void WaitForCompletion(Task runTask)
+        {
+            var runDeadline = RunTimeout == Timeout.InfiniteTimeSpan
+                ? DateTimeOffset.MaxValue
+                : DateTimeOffset.UtcNow + RunTimeout;
+            var waitHandle = ((IAsyncResult)runTask).AsyncWaitHandle;
+
+            while (!waitHandle.WaitOne(PollInterval))
+            {
+                var now = DateTimeOffset.UtcNow;
+                DateTimeOffset lastProgress;
+                lock (ProgressLock)
+                    lastProgress = _lastProgressUtc;
+
+                if (now >= runDeadline)
+                    throw new TimeoutException(BuildMessage("overall run timeout", RunTimeout, now));
+
+                if (RunStallTimeout != Timeout.InfiniteTimeSpan && now - lastProgress >= RunStallTimeout)
+                    throw new TimeoutException(BuildMessage("progress stall timeout", RunStallTimeout, now));
+            }
+        }
+
+        internal static string BuildCaseTimeoutMessage(string displayName, TimeSpan timeout)
+            => $"CodeyBox test harness: test case timed out after {timeout} without completing: {displayName}. "
+                + $"The test awaited something that was never signalled. Failing the test instead of hanging the run. "
+                + $"Tune with {CaseTimeoutEnvironmentVariable} (seconds, 0 disables).";
+
+        private static string BuildMessage(string kind, TimeSpan timeout, DateTimeOffset now)
+        {
+            var pending = InFlight.Values
+                .OrderBy(p => p.StartedAtUtc)
+                .Take(MaxNamedPendingTests)
+                .Select(p => $"{p.DisplayName} (waiting {(now - p.StartedAtUtc):g})")
+                .ToArray();
+            var pendingText = pending.Length == 0
+                ? "no test cases tracked as in-flight"
+                : $"{InFlight.Count} still in-flight: {string.Join("; ", pending)}"
+                    + (InFlight.Count > MaxNamedPendingTests
+                        ? $"; and {InFlight.Count - MaxNamedPendingTests} more"
+                        : string.Empty);
+            return $"CodeyBox test harness: {kind} of {timeout} elapsed with no run completion; "
+                + $"failing the run instead of hanging indefinitely. Pending: {pendingText}. "
+                + $"Tune with {RunTimeoutEnvironmentVariable}/{RunStallTimeoutEnvironmentVariable} (seconds, 0 disables).";
+        }
+
+        private static TimeSpan ResolveTimeout(string variable, int defaultSeconds)
+        {
+            var raw = Environment.GetEnvironmentVariable(variable);
+            if (string.IsNullOrWhiteSpace(raw))
+                return TimeSpan.FromSeconds(defaultSeconds);
+            if (int.TryParse(raw.Trim(), out var seconds) && seconds <= 0)
+                return Timeout.InfiniteTimeSpan;
+            if (int.TryParse(raw.Trim(), out seconds) && seconds > 0)
+                return TimeSpan.FromSeconds(seconds);
+            return TimeSpan.FromSeconds(defaultSeconds);
+        }
+
+        internal static void ObserveInBackground(Task task)
+        {
+            task.ContinueWith(
+                static t => _ = t.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+        }
+
+        private sealed record InFlightTest(string DisplayName, DateTimeOffset StartedAtUtc);
+    }
+
     private sealed class LeakTrackingTestFrameworkExecutor : XunitTestFrameworkExecutor
     {
         public LeakTrackingTestFrameworkExecutor(
@@ -41,7 +159,35 @@ public sealed class LeakTrackingTestFramework : XunitTestFramework
                 DiagnosticMessageSink,
                 executionMessageSink,
                 executionOptions);
-            runner.RunAsync().GetAwaiter().GetResult();
+            TestRunGuard.RunStarted();
+            var runTask = runner.RunAsync();
+            try
+            {
+                TestRunGuard.WaitForCompletion(runTask);
+            }
+            catch (TimeoutException ex)
+            {
+                try
+                {
+                    executionMessageSink.OnMessage(new DiagnosticMessage(ex.Message));
+                }
+                catch (InvalidOperationException)
+                {
+                }
+
+                try
+                {
+                    Console.Error.WriteLine(ex.Message);
+                }
+                catch (IOException)
+                {
+                }
+
+                TestRunGuard.ObserveInBackground(runTask);
+                throw;
+            }
+
+            runTask.GetAwaiter().GetResult();
         }
     }
 
@@ -172,12 +318,47 @@ public sealed class LeakTrackingTestFramework : XunitTestFramework
         protected override async Task<RunSummary> RunTestCaseAsync(IXunitTestCase testCase)
         {
             var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(testCase.DisplayName);
+            TestRunGuard.Enter(testCase, testCase.DisplayName);
             try
             {
-                return await base.RunTestCaseAsync(testCase);
+                var testTask = base.RunTestCaseAsync(testCase);
+                var timeout = TestRunGuard.CaseTimeout;
+                if (timeout == Timeout.InfiniteTimeSpan)
+                    return await testTask.ConfigureAwait(false);
+
+                using var delayCts = new CancellationTokenSource();
+                var completed = await Task.WhenAny(
+                    testTask,
+                    Task.Delay(timeout, delayCts.Token)).ConfigureAwait(false);
+                if (ReferenceEquals(completed, testTask))
+                {
+                    await delayCts.CancelAsync().ConfigureAwait(false);
+                    return await testTask.ConfigureAwait(false);
+                }
+
+                var message = TestRunGuard.BuildCaseTimeoutMessage(testCase.DisplayName, timeout);
+                try
+                {
+                    MessageBus.QueueMessage(new DiagnosticMessage(message));
+                }
+                catch (InvalidOperationException)
+                {
+                }
+
+                try
+                {
+                    Console.Error.WriteLine(message);
+                }
+                catch (IOException)
+                {
+                }
+
+                TestRunGuard.ObserveInBackground(testTask);
+                throw new TimeoutException(message);
             }
             finally
             {
+                TestRunGuard.Exit(testCase);
                 try
                 {
                     scope.ReportLeaks(line =>
