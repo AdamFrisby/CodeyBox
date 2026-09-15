@@ -936,6 +936,7 @@ subtree skip is **not** applied:
 | `CodeyBox:Presets` | `PresetCatalogOptions` |
 | `CodeyBox:Mutation` | `MutationTestingAuditorOptions` |
 | `CodeyBox:CheckAndActCompletion` | `CheckAndActCompletionOptions` |
+| `CodeyBox:SeededFakeAgents` | `SeededFakeAgentOptions` (seeded admin E2E/demo instance opt-in) |
 | `CodeyBox:Plugins` | `PluginOptions` (plus operator-defined `<plugin-id>` sub-trees are opaque) |
 
 `CodeyBox:Plugins` is the only section that mixes typed properties

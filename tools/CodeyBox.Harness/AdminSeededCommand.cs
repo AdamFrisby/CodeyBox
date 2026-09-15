@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using CodeyBox.AdminSeed;
 
 namespace CodeyBox.Harness;
@@ -24,6 +26,20 @@ public static class AdminSeededCommand
     /// missing-output error so the operator can copy-paste the fix.
     /// </summary>
     public const string RequiredBuildCommand = "dotnet build CodeyBox.slnx -c Release";
+
+    /// <summary>
+    /// Env var carrying the orchestrator API bearer token. The seeded
+    /// instance mints an ephemeral value at serve time (see
+    /// <see cref="ResolveSeededApiKey"/>) so a throwaway instance boots
+    /// unattended without weakening the API's default-auth-required posture.
+    /// </summary>
+    internal const string ApiKeyEnvVar = "CODEYBOX_API_KEY";
+
+    /// <summary>
+    /// Random bytes per ephemeral seeded API key. Hex-encoded to 64
+    /// characters, comfortably above the API's 32-character minimum.
+    /// </summary>
+    internal const int EphemeralApiKeyBytes = 32;
 
     /// <summary>
     /// Children <c>serve</c> supervises: (supervisor name, project path
@@ -203,19 +219,21 @@ public static class AdminSeededCommand
         Directory.CreateDirectory(logDir);
 
         var seedText = parsed.Seed.ToString(CultureInfo.InvariantCulture);
-        var apiEnv = SeededInstanceEnv(
-            parsed.Db, seedText,
-            new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["ASPNETCORE_URLS"] = parsed.ApiUrl,
-            });
-        var adminEnv = new Dictionary<string, string>(StringComparer.Ordinal)
+        var apiKey = ResolveSeededApiKey();
+        var apiEnv = new Dictionary<string, string>(
+            SeededInstanceEnv(
+                parsed.Db, seedText,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["ASPNETCORE_URLS"] = parsed.ApiUrl,
+                }),
+            StringComparer.Ordinal)
         {
-            ["ASPNETCORE_URLS"] = parsed.AdminUrl,
-            ["ASPNETCORE_ENVIRONMENT"] = "Development",
-            ["DOTNET_LAUNCH_PROFILE"] = "",
-            ["CodeyBoxAdmin__ApiBaseUrl"] = parsed.ApiUrl,
+            [ApiKeyEnvVar] = apiKey,
         };
+        var adminEnv = new Dictionary<string, string>(
+            SeededAdminEnv(parsed.AdminUrl, parsed.ApiUrl, apiKey),
+            StringComparer.Ordinal);
 
         var apiLog = Path.Combine(logDir, "codeybox-api.log");
         var adminLog = Path.Combine(logDir, "codeybox-admin-web.log");
@@ -231,7 +249,7 @@ public static class AdminSeededCommand
             await WaitForReadyAsync(parsed.ApiUrl, parsed.AdminUrl, children, output, linked.Token).ConfigureAwait(false);
 
             if (parsed.FreezeQueue)
-                await FreezeQueueAsync(parsed.ApiUrl, output).ConfigureAwait(false);
+                await FreezeQueueAsync(parsed.ApiUrl, apiKey, output).ConfigureAwait(false);
 
             output.WriteLine($"Seeded admin ready: api={parsed.ApiUrl} admin={parsed.AdminUrl} (seed {parsed.Seed})");
             output.WriteLine("Press Ctrl+C to stop.");
@@ -264,9 +282,55 @@ public static class AdminSeededCommand
         }
     }
 
+    /// <summary>
+    /// Mints a high-entropy ephemeral bearer token for the seeded instance.
+    /// Hex-encoded to twice <see cref="EphemeralApiKeyBytes"/> characters so
+    /// the API's 32-character minimum is always satisfied. The value is only
+    /// ever passed to the two supervised children via their environment, never
+    /// logged or written to disk.
+    /// </summary>
+    internal static string GenerateEphemeralApiKey() =>
+        Convert.ToHexString(RandomNumberGenerator.GetBytes(EphemeralApiKeyBytes));
+
+    /// <summary>
+    /// API key for the seeded instance: an operator-supplied
+    /// <c>CODEYBOX_API_KEY</c> wins when present so explicit credentials keep
+    /// working; otherwise a fresh ephemeral key is minted so a clean checkout
+    /// boots unattended with auth still enabled.
+    /// </summary>
+    internal static string ResolveSeededApiKey()
+    {
+        var existing = Environment.GetEnvironmentVariable(ApiKeyEnvVar);
+        return string.IsNullOrWhiteSpace(existing) ? GenerateEphemeralApiKey() : existing;
+    }
+
+    /// <summary>
+    /// Environment for the Admin.Web child: loopback listener, API base URL,
+    /// and the same bearer token the API child enforces, so the dashboard can
+    /// authenticate to the orchestrator without operator configuration.
+    /// </summary>
+    internal static IReadOnlyDictionary<string, string> SeededAdminEnv(
+        string adminUrl, string apiUrl, string apiKey)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["ASPNETCORE_URLS"] = adminUrl,
+            ["ASPNETCORE_ENVIRONMENT"] = "Development",
+            ["DOTNET_LAUNCH_PROFILE"] = "",
+            ["CodeyBoxAdmin__ApiBaseUrl"] = apiUrl,
+        };
+        if (!string.IsNullOrWhiteSpace(apiKey))
+            env[ApiKeyEnvVar] = apiKey;
+        return env;
+    }
+
     internal static IReadOnlyDictionary<string, string> SeededInstanceEnv(
         string dbPath, string seedText, IDictionary<string, string> extra)
     {
+        // Seeded RepositoryUrls use the RFC 2606 .invalid TLD so the address
+        // can never resolve: the instance never contacts a real remote.
+        // Upstream.Kind=noop is set explicitly (not relied on as a default)
+        // so merged work stays local and can never publish anywhere.
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["ASPNETCORE_ENVIRONMENT"] = "Development",
@@ -278,12 +342,16 @@ public static class AdminSeededCommand
             ["CodeyBox__GitRootDirectory"] = Path.Combine(Path.GetTempPath(), "codeybox-admin-seed", "repos"),
             ["CodeyBox__Projects__0__Id"] = "seeded-shop",
             ["CodeyBox__Projects__0__DisplayName"] = "Seeded Shop",
+            ["CodeyBox__Projects__0__RepositoryUrl"] = "https://seeded.invalid/seeded-shop.git",
             ["CodeyBox__Projects__0__BaseBranch"] = "main",
             ["CodeyBox__Projects__0__DefaultAgentClass"] = "seeded",
+            ["CodeyBox__Projects__0__Upstream__Kind"] = "noop",
             ["CodeyBox__Projects__1__Id"] = "seeded-portal",
             ["CodeyBox__Projects__1__DisplayName"] = "Seeded Portal",
+            ["CodeyBox__Projects__1__RepositoryUrl"] = "https://seeded.invalid/seeded-portal.git",
             ["CodeyBox__Projects__1__BaseBranch"] = "main",
             ["CodeyBox__Projects__1__DefaultAgentClass"] = "seeded",
+            ["CodeyBox__Projects__1__Upstream__Kind"] = "noop",
             ["CodeyBox__AgentClasses__0__Id"] = "seeded",
             ["CodeyBox__AgentClasses__0__DisplayName"] = "Seeded fake agents",
             ["CodeyBox__AgentClasses__0__Members__0__Agent"] = "seeded-fake",
@@ -490,11 +558,13 @@ public static class AdminSeededCommand
         }
     }
 
-    private static async Task FreezeQueueAsync(string apiUrl, TextWriter output)
+    private static async Task FreezeQueueAsync(string apiUrl, string? apiKey, TextWriter output)
     {
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
             using var content = new StringContent(
                 """{"reason":"seeded E2E freeze: keep seeded states deterministic"}""",
                 System.Text.Encoding.UTF8, "application/json");
