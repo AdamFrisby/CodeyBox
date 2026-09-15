@@ -8,9 +8,10 @@
 <h1>Fleet</h1>
 
 @* ── Per-project pause fallback banner ───────────────────────────────────── *@
-<div class="queue-banner" style="background:#f5f0e0;border:1px solid #d4b800;padding:0.5rem 0.75rem;margin-bottom:1rem;font-size:0.85rem;">
-    Per-project pause requires the budget-alerts work item; falling back to global queue pause.
-    Use the <a href="/">Queue</a> page for pause/resume. Pause buttons below affect the <strong>entire queue</strong>.
+<div class="queue-banner queue-banner-warn">
+    <span class="chip-glyph" aria-hidden="true">⚠</span>
+    <span>Per-project pause requires the budget-alerts work item; falling back to global queue pause.
+    Use the <a href="/">Queue</a> page for pause/resume. Pause buttons below affect the <strong>entire queue</strong>.</span>
 </div>
 
 @if (_error is not null)
@@ -51,7 +52,7 @@
                 @foreach (var p in _pausedAgents)
                 {
                     <tr>
-                        <td><code>@PauseDisplay(p)</code></td>
+                        <td><CopyableId Value="@PauseDisplay(p)" ShowFull="true" /></td>
                         <td>@(p.PausedReason ?? "—")</td>
                         <td>@FormatDate(p.PausedAt)</td>
                         <td>@FormatDate(p.ExpiresAt)</td>
@@ -99,18 +100,21 @@ else
                     <td>
                         <strong>@s.DisplayName</strong>
                         <br />
-                        <span class="external-id" title="@s.ProjectId">@ShortId(s.ProjectId)</span>
+                        <CopyableId Value="@s.ProjectId" ShortLength="12" />
                     </td>
                     <td>
-                        <span class="fleet-dot fleet-dot-@s.StatusColor" title="@StatusTitle(s)">●</span>
+                        <StatusChip Info="@StatusVocabulary.ForProject(s.IsPaused, s.HasRecentFailures, s.InFlightCount, s.QueuedCount)" />
                     </td>
-                    <td>@(s.CurrentPhase ?? "—")</td>
-                    <td>@s.QueuedCount</td>
-                    <td>@s.InFlightCount</td>
+                    <td>@(s.CurrentPhase is null ? "—" : "")@if (s.CurrentPhase is not null)
+                        {
+                            <StatusChip Info="@StatusVocabulary.ForWorkItem(s.CurrentPhase)" />
+                        }</td>
+                    <td>@AdminFormat.FormatCount(s.QueuedCount)</td>
+                    <td>@AdminFormat.FormatCount(s.InFlightCount)</td>
                     <td class="fleet-outcomes">
                         @foreach (var o in s.RecentOutcomes)
                         {
-                            <span class="fleet-outcome fleet-outcome-@OutcomeCss(o)" title="@o">@OutcomeGlyph(o)</span>
+                            <StatusChip Info="@StatusVocabulary.ForWorkItem(o)" />
                         }
                         @if (s.RecentOutcomes.Count == 0)
                         {
@@ -124,7 +128,7 @@ else
                                 <span class="budget-bar-wrap" style="width:5rem;">
                                     <span class="budget-bar @s.BudgetBarCss" style="width:@((int)s.BudgetPct)%"></span>
                                 </span>
-                                <span>$@s.MonthlySpendUsd.Value.ToString("0.00")@(s.MonthlyBudgetUsd.HasValue ? $" / ${s.MonthlyBudgetUsd.Value:0}" : "")</span>
+                                <span>@AdminFormat.FormatUsd(s.MonthlySpendUsd.Value)@(s.MonthlyBudgetUsd.HasValue ? " / " + AdminFormat.FormatUsd(s.MonthlyBudgetUsd.Value) : "")</span>
                             </div>
                         }
                         else
@@ -166,7 +170,7 @@ else
                     @foreach (var tool in _agentActivity.SlowestToolCalls)
                     {
                         <tr>
-                            <td><a href="/work-items/@tool.WorkItemId/timings">@ShortId(tool.WorkItemId)</a></td>
+                            <td><a href="/work-items/@tool.WorkItemId/timings"><CopyableId Value="@tool.WorkItemId" /></a> <CopyableId Value="@tool.WorkItemId" CopyButtonOnly="true" /></td>
                             <td>
                                 <code>@(tool.Phase ?? "unknown")</code>
                                 @if (tool.Iteration.HasValue)
@@ -315,26 +319,6 @@ else
         _cts?.Dispose();
     }
 
-    private static string ShortId(string id) =>
-        id.Length > 12 ? id[..12] + "…" : id;
-
-    private static string StatusTitle(FleetSummaryDto s) =>
-        s.IsPaused ? "Paused" :
-        s.HasRecentFailures ? "Recent failures (≥3 of last 5 outcomes)" :
-        s.InFlightCount > 0 ? "In-flight" :
-        s.QueuedCount > 0 ? "Queued (waiting)" :
-        "Idle";
-
-    private static string OutcomeCss(string state) =>
-        state is "Done" ? "ok" :
-        state is "Failed" or "AuditFailed" ? "fail" :
-        "cancel";
-
-    private static string OutcomeGlyph(string state) =>
-        state is "Done" ? "✓" :
-        state is "Failed" or "AuditFailed" ? "✗" :
-        "!";
-
     private static string FormatToolStatus(bool? succeeded) => succeeded switch
     {
         true => "ok",
@@ -342,15 +326,7 @@ else
         null => "unknown",
     };
 
-    private static string FormatDuration(long ms)
-    {
-        if (ms < 1000) return $"{ms}ms";
-        if (ms < 60_000) return $"{ms / 1000.0:F1}s";
-        var min = ms / 60_000;
-        var sec = (ms % 60_000) / 1000;
-        return $"{min}m {sec}s";
-    }
+    private static string FormatDuration(long ms) => AdminFormat.FormatDurationMs(ms);
 
-    private static string FormatDate(DateTimeOffset? value) =>
-        value is null ? "—" : value.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+    private static string FormatDate(DateTimeOffset? value) => AdminFormat.FormatDateTime(value);
 }

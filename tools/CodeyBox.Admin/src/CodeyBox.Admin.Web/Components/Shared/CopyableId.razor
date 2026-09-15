@@ -1,0 +1,42 @@
+@* Monospace identifier with one-gesture copy. The full value is always in
+   the title and the copy button; the code element stays text-selectable. *@
+<span class="ident">@if (!CopyButtonOnly)
+    {
+        <code class="ident-code" title="@Value">@Display</code>
+    }<button type="button" class="ident-copy" data-copy="@Value" onclick="navigator.clipboard&&navigator.clipboard.writeText(this.dataset.copy)" title="Copy full identifier" aria-label="Copy full identifier @Value">⧉</button></span>
+
+@code {
+    /// <summary>Full identifier (work item id, SHA, branch name, …).</summary>
+    [Parameter, EditorRequired]
+    public string Value { get; set; } = "";
+
+    /// <summary>Visible prefix length; the full value stays copyable. Defaults to 8.</summary>
+    [Parameter]
+    public int ShortLength { get; set; } = 8;
+
+    /// <summary>Show the full value instead of a prefix (detail pages).</summary>
+    [Parameter]
+    public bool ShowFull { get; set; }
+
+    /// <summary>Render only the copy button (sits next to an existing link).</summary>
+    [Parameter]
+    public bool CopyButtonOnly { get; set; }
+
+    private string Display
+    {
+        get
+        {
+            if (CopyButtonOnly || string.IsNullOrEmpty(Value))
+            {
+                return CopyButtonOnly ? "" : "—";
+            }
+
+            if (ShowFull || Value.Length <= ShortLength)
+            {
+                return Value;
+            }
+
+            return Value[..ShortLength];
+        }
+    }
+}

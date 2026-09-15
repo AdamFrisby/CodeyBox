@@ -20,7 +20,7 @@ else if (_item is null)
 else if (!_item.IsQueued)
 {
     <div class="error-banner">
-        <p>This item is in state <strong>@_item.State</strong> and cannot be edited.</p>
+        <p>This item is in state <StatusChip Info="@StatusVocabulary.ForWorkItem(_item.State)" /> and cannot be edited.</p>
         <p>Only Queued items are editable.</p>
         <a href="/work-items/@Id" class="btn">Back</a>
     </div>

@@ -16,7 +16,7 @@
             — reason: @_queueStatus.PausedReason
             @if (_queueStatus.PausedAt is { } at)
             {
-                <span> — paused at @at.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz")</span>
+                <span> — paused at @at.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz", System.Globalization.CultureInfo.InvariantCulture)</span>
             }
             <button class="btn btn-resume" @onclick="ResumeQueueAsync">Resume queue</button>
         </div>
@@ -86,9 +86,9 @@
                 }
                 @if (cb is not null && cb.MonthlyBudgetUsd > 0)
                 {
-                    <span title="30-day cost budget: $@cb.CurrentSpendUsd.ToString("F2") of $@cb.MonthlyBudgetUsd.ToString("F2") (@cb.Pct.ToString("F1")%)">
+                    <span title="30-day cost budget: @AdminFormat.FormatUsd(cb.CurrentSpendUsd) of @AdminFormat.FormatUsd(cb.MonthlyBudgetUsd) (@cb.Pct.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)%)">
                         <span class="budget-bar-wrap"><span class="budget-bar @costCss" style="width:@costPct%"></span></span>
-                        <span style="margin-left:0.3rem;">$@cb.CurrentSpendUsd.ToString("F2")/$@cb.MonthlyBudgetUsd.ToString("F2")/30d</span>
+                        <span style="margin-left:0.3rem;">@AdminFormat.FormatUsd(cb.CurrentSpendUsd)/@AdminFormat.FormatUsd(cb.MonthlyBudgetUsd)/30d</span>
                     </span>
                 }
                 @if (cb?.ProjectQueue?.Paused == true)
@@ -151,6 +151,7 @@ else if (visibleItems!.Count == 0)
 }
 else
 {
+    <div class="table-scroll">
     <table class="queue-table">
         <thead>
             <tr>
@@ -167,20 +168,20 @@ else
             @foreach (var item in visibleItems!)
             {
                 var projPaused = _costBudgets.TryGetValue(item.ProjectId, out var cb) && cb?.ProjectQueue?.Paused == true;
-                <tr class="state-@item.State.ToLowerInvariant()">
+                <tr>
                     <td class="col-id">
                         <a href="/work-items/@item.Id">@item.ShortId</a>
+                        <CopyableId Value="@item.Id" CopyButtonOnly="true" />
                         @if (item.ExternalId is not null)
                         {
-                            var display = item.ExternalId.Length > 16 ? item.ExternalId[..16] + "…" : item.ExternalId;
-                            <span class="external-id" title="@item.ExternalId">@display</span>
+                            <CopyableId Value="@item.ExternalId" ShortLength="16" />
                         }
                     </td>
                     <td>
                         @item.ProjectId
                         @if (projPaused && item.IsQueued)
                         {
-                            <span class="project-paused-badge" title="@cb!.ProjectQueue.PausedReason">⏸ PROJECT PAUSED — budget exceeded — $@cb!.CurrentSpendUsd.ToString("F2") over $@cb!.MonthlyBudgetUsd.ToString("F2")</span>
+                            <span class="project-paused-badge" title="@cb!.ProjectQueue.PausedReason">⏸ PROJECT PAUSED — budget exceeded — @AdminFormat.FormatUsd(cb!.CurrentSpendUsd) over @AdminFormat.FormatUsd(cb!.MonthlyBudgetUsd)</span>
                         }
                     </td>
                     <td>@item.Title</td>
@@ -194,8 +195,8 @@ else
                             @(string.IsNullOrWhiteSpace(item.Agent) ? "—" : item.Agent)
                         }
                     </td>
-                    <td class="col-state">@item.State</td>
-                    <td class="col-age">@item.Age</td>
+                    <td><StatusChip Info="@StatusVocabulary.ForWorkItem(item.State)" /></td>
+                    <td class="col-age" title="@AdminFormat.FormatRelative(item.CreatedAt, DateTimeOffset.UtcNow)">@item.Age</td>
                     <td class="col-actions">
                         <a href="/work-items/@item.Id" class="btn">open</a>
                         @if (item.IsQueued)
@@ -223,6 +224,7 @@ else
             }
         </tbody>
     </table>
+    </div>
 }
 
 @code {
@@ -452,6 +454,5 @@ else
     private static int BudgetPct(int used, int limit) =>
         limit <= 0 ? 0 : Math.Min(100, (int)(100.0 * used / limit));
 
-    private static string BudgetCss(int pct) =>
-        pct >= 100 ? "budget-full" : pct >= 80 ? "budget-warn" : "";
+    private static string BudgetCss(int pct) => StatusVocabulary.BudgetBarCss(pct);
 }

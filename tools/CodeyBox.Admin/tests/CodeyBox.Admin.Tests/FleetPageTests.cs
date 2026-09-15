@@ -59,7 +59,8 @@ public sealed class FleetPageTests : BunitContext
 
         var cut = Render<FleetPage>();
 
-        Assert.Contains("fleet-dot-grey", cut.Markup);
+        Assert.Contains("status-chip", cut.Markup);
+        Assert.Contains(">Idle<", cut.Markup);
     }
 
     [Fact]
@@ -71,7 +72,8 @@ public sealed class FleetPageTests : BunitContext
 
         var cut = Render<FleetPage>();
 
-        Assert.Contains("fleet-dot-blue", cut.Markup);
+        Assert.Contains("chip--active", cut.Markup);
+        Assert.Contains(">Active<", cut.Markup);
     }
 
     [Fact]
@@ -83,7 +85,8 @@ public sealed class FleetPageTests : BunitContext
 
         var cut = Render<FleetPage>();
 
-        Assert.Contains("fleet-dot-yellow", cut.Markup);
+        Assert.Contains("chip--queued", cut.Markup);
+        Assert.Contains(">Queued<", cut.Markup);
     }
 
     [Fact]
@@ -95,7 +98,8 @@ public sealed class FleetPageTests : BunitContext
 
         var cut = Render<FleetPage>();
 
-        Assert.Contains("fleet-dot-red", cut.Markup);
+        Assert.Contains("chip--wait", cut.Markup);
+        Assert.Contains(">Paused<", cut.Markup);
     }
 
     [Fact]
@@ -110,10 +114,11 @@ public sealed class FleetPageTests : BunitContext
 
         var cut = Render<FleetPage>();
 
-        // Done → ✓, Failed/AuditFailed → ✗, Cancelled → !
-        Assert.Contains("fleet-outcome-ok", cut.Markup);
-        Assert.Contains("fleet-outcome-fail", cut.Markup);
-        Assert.Contains("fleet-outcome-cancel", cut.Markup);
+        // Done → ✓, Failed/AuditFailed → ✗/‼, Cancelled → ⊘, each with text.
+        Assert.Contains("status-chip", cut.Markup);
+        Assert.Contains("\u2713", cut.Markup);
+        Assert.Contains("\u2717", cut.Markup);
+        Assert.Contains("\u2298", cut.Markup);
     }
 
     [Fact]
@@ -129,8 +134,8 @@ public sealed class FleetPageTests : BunitContext
         var cut = Render<FleetPage>();
 
         // ✗ must appear before ✓✓ in the rendered output (newest first).
-        var failIdx = cut.Markup.IndexOf("fleet-outcome-fail", StringComparison.Ordinal);
-        var okIdx = cut.Markup.IndexOf("fleet-outcome-ok", StringComparison.Ordinal);
+        var failIdx = cut.Markup.IndexOf("\u2717", StringComparison.Ordinal);
+        var okIdx = cut.Markup.IndexOf("\u2713", StringComparison.Ordinal);
         Assert.True(failIdx < okIdx, "Failed outcome (✗) should appear before Done (✓) outcomes");
     }
 

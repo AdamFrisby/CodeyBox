@@ -64,7 +64,8 @@ public sealed class ReleaseDetailPageTests : BunitContext
 
         var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
-        Assert.Contains("state-open", cut.Markup);
+        Assert.Contains("chip--queued", cut.Markup);
+        Assert.Contains(">Open<", cut.Markup);
     }
 
     [Fact]
@@ -141,8 +142,8 @@ public sealed class ReleaseDetailPageTests : BunitContext
 
         var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
-        Assert.Contains("state-done", cut.Markup);
-        Assert.Contains("state-failed", cut.Markup);
+        Assert.Contains("chip--done", cut.Markup);
+        Assert.Contains("chip--fail", cut.Markup);
     }
 
     [Fact]

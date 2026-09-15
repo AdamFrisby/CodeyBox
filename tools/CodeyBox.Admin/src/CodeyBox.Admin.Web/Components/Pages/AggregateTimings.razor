@@ -79,12 +79,5 @@ else
         }
     }
 
-    private static string FormatDuration(long ms)
-    {
-        if (ms < 1000) return $"{ms}ms";
-        if (ms < 60_000) return $"{ms / 1000.0:F1}s";
-        var min = ms / 60_000;
-        var sec = (ms % 60_000) / 1000;
-        return $"{min}m {sec}s";
-    }
+    private static string FormatDuration(long ms) => AdminFormat.FormatDurationMs(ms);
 }

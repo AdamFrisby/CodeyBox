@@ -13,7 +13,7 @@
             Promoting suggestion:
             <strong>@_fromSuggestionData.Title</strong>
             (<span class="category-badge">@_fromSuggestionData.Category</span>
-            / <span class="@_fromSuggestionData.SeverityCss">@_fromSuggestionData.Severity</span>).
+            / <StatusChip Info="@StatusVocabulary.ForSeverity(_fromSuggestionData.Severity)" />).
             The suggestion title and rationale are automatically prepended to the prompt.
         </p>
     </div>

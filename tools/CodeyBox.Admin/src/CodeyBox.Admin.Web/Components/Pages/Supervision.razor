@@ -46,13 +46,13 @@ else
                     {
                         <tr class="@(session.SessionId == _selectedSessionId ? "selected-row" : "")" @onclick="() => SelectSession(session.SessionId)">
                             <td>
-                                <code>@Short(session.SessionId)</code><br />
-                                <a href="/work-items/@session.WorkItemId">@Short(session.WorkItemId)</a>
+                                <CopyableId Value="@session.SessionId" ShortLength="12" /><br />
+                                <a href="/work-items/@session.WorkItemId">@Short(session.WorkItemId)</a> <CopyableId Value="@session.WorkItemId" CopyButtonOnly="true" />
                             </td>
                             <td><code>@session.Phase</code> @session.Iteration</td>
                             <td>@session.Agent</td>
-                            <td>@session.State</td>
-                            <td>@session.PendingInjections</td>
+                            <td><StatusChip Info="@StatusVocabulary.ForSessionState(session.State)" /></td>
+                            <td>@AdminFormat.FormatCount(session.PendingInjections)</td>
                         </tr>
                     }
                     @if (_sessions.Count == 0)
@@ -76,7 +76,7 @@ else
                         <span>@SelectedSession.Agent</span>
                         <span>@SelectedSession.SandboxId</span>
                     </div>
-                    <span>@(SelectedSession.AcceptingInjections ? "open" : "closed")</span>
+                    <span><StatusChip Info="@StatusVocabulary.ForSessionState(SelectedSession.AcceptingInjections ? "open" : "closed")" /></span>
                 </div>
 
                 <pre class="stdout-stream supervision-output">@DisplayOutput(SelectedSession)</pre>

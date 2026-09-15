@@ -77,9 +77,9 @@ else
                                @onchange="e => ToggleItem(s.Id, (bool)e.Value!)" /></td>
                     <td><a href="/suggestions/@s.Id">@s.Title</a></td>
                     <td><span class="category-badge">@s.Category</span></td>
-                    <td><span class="@s.SeverityCss">@s.Severity</span></td>
-                    <td><a href="/work-items/@s.SourceWorkItemId">@s.ShortWorkItemId</a></td>
-                    <td class="col-age">@s.Age</td>
+                    <td><StatusChip Info="@StatusVocabulary.ForSeverity(s.Severity)" /></td>
+                    <td><a href="/work-items/@s.SourceWorkItemId">@s.ShortWorkItemId</a> <CopyableId Value="@s.SourceWorkItemId" CopyButtonOnly="true" /></td>
+                    <td class="col-age" title="@AdminFormat.FormatRelative(s.CreatedAt, DateTimeOffset.UtcNow)">@s.Age</td>
                     <td class="col-actions">
                         <a href="/suggestions/@s.Id" class="btn">view</a>
                         <button class="btn btn-danger" @onclick="() => DismissOneAsync(s.Id)">dismiss</button>

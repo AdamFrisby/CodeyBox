@@ -59,6 +59,40 @@ Both methods may be enabled. A direct/internal request with no Cloudflare assert
 use Google; an invalid assertion is rejected rather than silently falling back. Local
 username/password login remains Development-only.
 
+## Design system
+
+Dark, dense, plain CSS (`wwwroot/css/admin.css`, no frameworks). Dark is the
+default; a light variant ships via `[data-theme="light"]` on
+`<html>`, toggled from the nav (◐) and remembered in `localStorage`.
+
+### Reusable components (`Components/Shared/`)
+
+| Component | Use |
+|-----------|-----|
+| `StatusChip` + `StatusVocabulary` | **The only way to render a state.** Covers every `WorkItemState` (25), release states, suggestion states, severities, agent availability, quota bands, breaker state, project rollups and supervision session states. Same value → identical chip everywhere. |
+| `CopyableId` | Monospace identifiers (ids, SHAs, branches). Prefix display, full value on hover, one-click copy button; text stays selectable. `ShowFull` for detail pages, `CopyButtonOnly` next to nav links. |
+
+Every status pairs a tone (colour) with a **distinct glyph and text label** —
+colour is never the only carrier. `DesignSystemTests` asserts all 25 work-item
+states resolve, all glyphs are distinct, and no page formats a state inline
+(`state-@`, `severity-badge--@`, `fleet-dot-@`, `fleet-outcome-@` are banned in
+`Components/Pages/`).
+
+### Numbers and times (`Services/AdminFormat`)
+
+One pure, invariant-culture helper: `FormatDurationMs` (`850ms`, `12.0s`,
+`3m 4s`, `2h 0m`), `FormatShortAge` (`4m`), `FormatRelative` (`4m ago`),
+`FormatCountdown` (quota resets), `FormatCount` (`12.3K`), `FormatUsd`,
+`FormatDateTime`. Pages keep their call sites but delegate bodies here.
+
+### Surfaces and type
+
+Tokens: `--bg` (page) → `--bg-card` (cards, tables) → `--bg-inset` (code,
+prompt/output wells) → `--bg-overlay` (modals, `.overlay`/`.modal-overlay`,
+elev-3). Reusable `.card`, `.panel-inset`, `.overlay` classes. Small type
+(13px, 1.6 line height), monospace identifiers, `:focus-visible` outlines on
+every interactive element, fluid rem layouts that scale to 200%.
+
 ## Pages
 
 | Route | Description |

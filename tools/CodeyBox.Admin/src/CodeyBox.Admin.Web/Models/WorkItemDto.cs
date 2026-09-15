@@ -1,3 +1,5 @@
+using CodeyBox.Admin.Web.Services;
+
 namespace CodeyBox.Admin.Web.Models;
 
 /// <summary>
@@ -59,17 +61,7 @@ public sealed class WorkItemDto
 
     public string ShortId => Id.Length >= 8 ? Id[..8] : Id;
 
-    public string Age
-    {
-        get
-        {
-            var elapsed = DateTimeOffset.UtcNow - CreatedAt;
-            if (elapsed.TotalSeconds < 60) return $"{(int)elapsed.TotalSeconds}s";
-            if (elapsed.TotalMinutes < 60) return $"{(int)elapsed.TotalMinutes}m";
-            if (elapsed.TotalHours < 24) return $"{(int)elapsed.TotalHours}h";
-            return $"{(int)elapsed.TotalDays}d";
-        }
-    }
+    public string Age => AdminFormat.FormatShortAge(DateTimeOffset.UtcNow - CreatedAt);
 }
 
 public sealed class WorkInitiatorDto

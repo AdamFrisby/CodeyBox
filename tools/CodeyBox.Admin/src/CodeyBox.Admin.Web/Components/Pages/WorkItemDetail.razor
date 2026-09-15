@@ -53,23 +53,29 @@ else
     </div>
 
     <table class="detail-table">
-        <tr><th>ID</th><td><code>@_item.Id</code></td></tr>
+        <tr><th>ID</th><td><CopyableId Value="@_item.Id" ShowFull="true" /></td></tr>
         @if (_item.ExternalId is not null)
         {
-            <tr><th>External ID</th><td><code>@_item.ExternalId</code></td></tr>
+            <tr><th>External ID</th><td><CopyableId Value="@_item.ExternalId" ShowFull="true" /></td></tr>
         }
         <tr><th>Project</th><td>@_item.ProjectId</td></tr>
         <tr><th>Agent</th><td>@_item.Agent</td></tr>
-        <tr><th>State</th><td class="state-@_item.State.ToLowerInvariant()">@_item.State</td></tr>
-        <tr><th>Base branch</th><td>@(_item.BaseBranch ?? "(project default)")</td></tr>
-        <tr><th>Work branch</th><td>@(_item.WorkBranch ?? "(auto-generated)")</td></tr>
+        <tr><th>State</th><td><StatusChip Info="@StatusVocabulary.ForWorkItem(_item.State)" /></td></tr>
+        <tr><th>Base branch</th><td>@(_item.BaseBranch is null ? "(project default)" : "")@if (_item.BaseBranch is not null)
+            {
+                <CopyableId Value="@_item.BaseBranch" ShowFull="true" />
+            }</td></tr>
+        <tr><th>Work branch</th><td>@(_item.WorkBranch is null ? "(auto-generated)" : "")@if (_item.WorkBranch is not null)
+            {
+                <CopyableId Value="@_item.WorkBranch" ShowFull="true" />
+            }</td></tr>
         @if (_item.Initiator is not null)
         {
             <tr><th>Initiator</th><td>@_item.Initiator.DisplayName <small>(@_item.Initiator.Issuer)</small></td></tr>
         }
-<tr><th>Created</th><td>@_item.CreatedAt.ToString("O")</td></tr>
-        <tr><th>Updated</th><td>@_item.UpdatedAt.ToString("O")</td></tr>
-        <tr><th>Age</th><td>@_item.Age</td></tr>
+<tr><th>Created</th><td title="@AdminFormat.FormatRelative(_item.CreatedAt, DateTimeOffset.UtcNow)">@AdminFormat.FormatDateTimeFull(_item.CreatedAt)</td></tr>
+        <tr><th>Updated</th><td title="@AdminFormat.FormatRelative(_item.UpdatedAt, DateTimeOffset.UtcNow)">@AdminFormat.FormatDateTimeFull(_item.UpdatedAt)</td></tr>
+        <tr><th>Age</th><td class="col-age" title="@AdminFormat.FormatRelative(_item.CreatedAt, DateTimeOffset.UtcNow)">@_item.Age</td></tr>
         @if (_item.UpstreamPushAttempts > 0)
         {
             <tr><th>Push attempts</th><td>@_item.UpstreamPushAttempts</td></tr>
@@ -82,7 +88,7 @@ else
         {
             <tr>
                 <th>Replay of</th>
-                <td><a href="/work-items/@_item.ReplayOfWorkItemId">@_item.ReplayOfWorkItemId[..Math.Min(8, _item.ReplayOfWorkItemId.Length)]</a></td>
+                <td><a href="/work-items/@_item.ReplayOfWorkItemId">@_item.ReplayOfWorkItemId[..Math.Min(8, _item.ReplayOfWorkItemId.Length)]</a> <CopyableId Value="@_item.ReplayOfWorkItemId" CopyButtonOnly="true" /></td>
             </tr>
         }
         @if (_item.DependsOn.Count > 0)
@@ -94,7 +100,7 @@ else
                     {
                         var extId = _item.DependsOnExternalIds.TryGetValue(dep, out var eid) ? eid : null;
                         var label = extId ?? dep[..Math.Min(8, dep.Length)];
-                        <a href="/work-items/@dep" title="@dep">@label</a><span> </span>
+                        <a href="/work-items/@dep" title="@dep">@label</a><CopyableId Value="@dep" CopyButtonOnly="true" /><span> </span>
                     }
                     @(_item.DependsOnSatisfied ? "(satisfied)" : "(waiting)")
                 </td>
@@ -114,11 +120,11 @@ else
             <div class="plan-meta">
                 @if (_item.PlanGeneratedAt is not null)
                 {
-                    <span>Generated @_item.PlanGeneratedAt.Value.ToString("O")</span>
+                    <span>Generated @AdminFormat.FormatDateTimeFull(_item.PlanGeneratedAt)</span>
                 }
                 @if (_item.PlanReviewedAt is not null)
                 {
-                    <span>Reviewed @_item.PlanReviewedAt.Value.ToString("O")</span>
+                    <span>Reviewed @AdminFormat.FormatDateTimeFull(_item.PlanReviewedAt)</span>
                 }
                 @if (!string.IsNullOrWhiteSpace(_item.PlanReviewSummary))
                 {

@@ -58,7 +58,7 @@ else
                             {
                                 <tr>
                                     <td class="audit-matrix-finding">
-                                        <span class="severity-badge severity-badge--@row.Severity.ToLowerInvariant()">@row.Severity[0]</span>
+                                        <StatusChip Info="@StatusVocabulary.ForSeverity(row.Severity)" />
                                         <span title="@row.Id">@row.Title</span>
                                         @if (row.Files.Count > 0)
                                         {
@@ -109,7 +109,7 @@ else
                     {
                         <details class="audit-auditor" @key="auditor.Name">
                             <summary class="audit-auditor-summary">
-                                <span class="severity-badge severity-badge--@auditor.WorstSeverity.ToLowerInvariant()">@auditor.WorstSeverity</span>
+                                <StatusChip Info="@StatusVocabulary.ForSeverity(auditor.WorstSeverity)" />
                                 @auditor.Name
                                 <span class="audit-auditor-meta">(@auditor.Kind, @FormatDuration(auditor.DurationMs))</span>
                                 @if (auditor.RawOutputAvailable)
@@ -157,8 +157,8 @@ else
                                 <ul class="audit-findings">
                                     @foreach (var finding in auditor.Findings)
                                     {
-                                        <li class="audit-finding audit-finding--@finding.Severity.ToLowerInvariant()">
-                                            <span class="severity-badge severity-badge--@finding.Severity.ToLowerInvariant()">@finding.Severity[0]</span>
+                                        <li class="audit-finding">
+                                            <StatusChip Info="@StatusVocabulary.ForSeverity(finding.Severity)" />
                                             <strong>@finding.Title</strong>
                                             @if (finding.Files.Count > 0)
                                             {
@@ -279,10 +279,7 @@ else
             .ToList();
     }
 
-    private static string FormatDuration(long ms) =>
-        ms < 1_000 ? $"{ms}ms" :
-        ms < 60_000 ? $"{ms / 1000}s" :
-        $"{ms / 60_000}m {(ms % 60_000) / 1000}s";
+    private static string FormatDuration(long ms) => AdminFormat.FormatDurationMs(ms);
 
     private static string FormatTestSelectionCounts(AuditReportTestSelectionDto ts) =>
         ts.TotalCount > 0
@@ -295,7 +292,7 @@ else
             return "est. saved 0%";
         var pct = ts.EstimatedSavedFraction * 100.0;
         var savedMs = (long)(ts.EstimatedSavedFraction * durationMs);
-        return $"est. saved {pct:0.#}% (~{FormatDuration(savedMs)})";
+        return "est. saved " + pct.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + "% (~" + FormatDuration(savedMs) + ")";
     }
 
     private static string FormatTestSelectionLayers(AuditReportTestSelectionDto ts) =>

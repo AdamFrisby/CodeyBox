@@ -88,19 +88,20 @@
                         <td>
                             @if (!known || pct < 0)
                             {
-                                <span style="color:#999">unknown</span>
+                                <StatusChip Info="@StatusVocabulary.ForQuotaBand(null)" />
                             }
                             else
                             {
-                                <span style="display:inline-flex;align-items:center;gap:0.4rem;">
+                                <span style="display:inline-flex;align-items:center;gap:0.4rem;flex-wrap:wrap;">
                                     <span class="budget-bar-wrap" style="width:5rem;">
                                         <span class="budget-bar @QuotaCss(pct)" style="width:@pct%"></span>
                                     </span>
+                                    <StatusChip Info="@StatusVocabulary.ForQuotaBand(pct)" />
                                     <span>@pct%</span>
                                 </span>
                             }
                         </td>
-                        <td>@FormatReset(snap?.ResetAt)</td>
+                        <td class="col-age">@FormatReset(snap?.ResetAt)</td>
                     </tr>
                 }
             </tbody>
@@ -133,10 +134,10 @@
                 {
                     <tr>
                         <td><strong>@w.Label</strong></td>
-                        <td>@w.InputTokens.ToString("N0")</td>
-                        <td>@w.CachedInputTokens.ToString("N0")</td>
-                        <td>@w.OutputTokens.ToString("N0")</td>
-                        <td>$@w.Usd.ToString("N2")</td>
+                        <td>@w.InputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)</td>
+                        <td>@w.CachedInputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)</td>
+                        <td>@w.OutputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)</td>
+                        <td>@AdminFormat.FormatUsd(w.Usd)</td>
                     </tr>
                 }
             </tbody>
@@ -169,15 +170,15 @@
                             <td><strong>@a.Agent</strong></td>
                             <td><code>@(a.ModelId ?? "—")</code></td>
                             <td>@a.ItemCount</td>
-                            <td>@a.InputTokens.ToString("N0")</td>
-                            <td>@a.CachedInputTokens.ToString("N0")</td>
-                            <td>@a.OutputTokens.ToString("N0")</td>
-                            <td>$@a.Usd.ToString("N2")</td>
+                            <td>@a.InputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)</td>
+                            <td>@a.CachedInputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)</td>
+                            <td>@a.OutputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)</td>
+                            <td>@AdminFormat.FormatUsd(a.Usd)</td>
                             <td>
                                 @if (a.ItemCount > 0)
                                 {
                                     var rate = 100.0 * a.DoneCount / a.ItemCount;
-                                    <span title="@a.DoneCount done / @a.ItemCount with cost">@rate.ToString("F0")%</span>
+                                    <span title="@a.DoneCount done / @a.ItemCount with cost">@rate.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)%</span>
                                 }
                                 else
                                 {
@@ -399,27 +400,12 @@
                 .OrderByDescending(kv => kv.Value)
                 .ToList();
 
-    private static string QuotaCss(int pct) =>
-        pct <= 10 ? "budget-full" : pct <= 30 ? "budget-warn" : "";
+    private static string QuotaCss(int pct) => StatusVocabulary.QuotaBarCss(pct);
 
-    private static string FormatReset(DateTimeOffset? at)
-    {
-        if (at is null) return "—";
-        var delta = at.Value - DateTimeOffset.UtcNow;
-        if (delta <= TimeSpan.Zero) return "now";
-        if (delta.TotalHours < 1) return $"{(int)delta.TotalMinutes}m";
-        if (delta.TotalDays < 1) return $"{(int)delta.TotalHours}h {(int)(delta.Minutes)}m";
-        return $"{(int)delta.TotalDays}d {(int)(delta.Hours)}h";
-    }
+    private static string FormatReset(DateTimeOffset? at) =>
+        AdminFormat.FormatCountdown(at, DateTimeOffset.UtcNow);
 
-    private static string FormatDuration(TimeSpan ts)
-    {
-        if (ts < TimeSpan.Zero) return "—";
-        if (ts.TotalSeconds < 60) return $"{(int)ts.TotalSeconds}s";
-        if (ts.TotalMinutes < 60) return $"{(int)ts.TotalMinutes}m {ts.Seconds}s";
-        if (ts.TotalHours < 24) return $"{(int)ts.TotalHours}h {ts.Minutes}m";
-        return $"{(int)ts.TotalDays}d {ts.Hours}h";
-    }
+    private static string FormatDuration(TimeSpan ts) => AdminFormat.FormatDuration(ts);
 
     private sealed class WindowTotals(string label, DateTimeOffset since)
     {

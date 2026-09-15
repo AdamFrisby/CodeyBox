@@ -36,7 +36,7 @@ else
         @if (_costs.Totals.CachedInputTokens > 0)
         {
             var cacheHitPct = _costs.Totals.InputTokens > 0 ? (double)_costs.Totals.CachedInputTokens / _costs.Totals.InputTokens * 100.0 : 0.0;
-            <span>, @cacheHitPct.ToString("F0")% cache hit</span>
+            <span>, @cacheHitPct.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)% cache hit</span>
         }
     </p>
 
@@ -225,33 +225,16 @@ else
         return GetDouble(el, "estimatedUsd") ?? 0;
     }
 
-    private static string FormatUsd(double usd)
-    {
-        if (usd == 0) return "$0.00";
-        if (usd < 0.01) return $"${usd:F4}";
-        return $"${usd:F2}";
-    }
+    private static string FormatUsd(double usd) => AdminFormat.FormatUsd(usd);
 
-    private static string FormatTokens(int n)
-    {
-        if (n >= 1_000_000) return $"{n / 1_000_000.0:F1}M";
-        if (n >= 1_000) return $"{n / 1_000.0:F1}K";
-        return n.ToString();
-    }
+    private static string FormatTokens(int n) => AdminFormat.FormatCount(n);
 
     private static string AgentDisplay(AgentCostBreakdownDto agent) =>
         string.IsNullOrWhiteSpace(agent.AgentInstanceId) ? agent.Agent : agent.AgentInstanceId!;
 
     private static string FormatRuns(int count) => count == 1 ? "1 run" : $"{count} runs";
 
-    private static string FormatDuration(long elapsedMs)
-    {
-        if (elapsedMs <= 0) return "0s";
-        var ts = TimeSpan.FromMilliseconds(elapsedMs);
-        if (ts.TotalHours >= 1) return $"{(int)ts.TotalHours}h {ts.Minutes:D2}m";
-        if (ts.TotalMinutes >= 1) return $"{ts.Minutes}m {ts.Seconds:D2}s";
-        return $"{Math.Max(1, (int)Math.Round(ts.TotalSeconds))}s";
-    }
+    private static string FormatDuration(long elapsedMs) => AdminFormat.FormatDurationMs(elapsedMs);
 
     private static int? GetInt(JsonElement el, string key)
     {
