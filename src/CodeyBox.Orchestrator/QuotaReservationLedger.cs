@@ -42,6 +42,18 @@ public sealed class QuotaReservationLedger
     private readonly TimeProvider _time;
 
     /// <summary>
+    /// Raised after reservation entries change (reserve, settle, release,
+    /// probe-driven retirement, expiry sweep). Raised outside the ledger lock,
+    /// so handlers must not call back into the ledger while holding their own
+    /// locks that ledger callbacks could also need. Intended for
+    /// observability and for tests to wait on ledger state without polling
+    /// wall-clock time.
+    /// </summary>
+    public event Action? ReservationsChanged;
+
+    private void RaiseReservationsChanged() => ReservationsChanged?.Invoke();
+
+    /// <summary>
     /// Creates a ledger keyed by <see cref="AgentMembership.RouteKey"/> with
     /// default reservation settings.
     /// </summary>
@@ -179,30 +191,37 @@ public sealed class QuotaReservationLedger
 
         var key = ResolveKey(member);
         var estimate = ResolveEstimateFor(member, estimatePctOverride);
+        QuotaReservationAttempt attempt;
+        var reserved = false;
         lock (_sync)
         {
             var outstanding = SumOutstandingLocked(key);
             var effective = EffectiveAvailablePct(availablePct, outstanding);
             if (!MeetsFloor(effective - estimate, floorPct))
             {
-                return new QuotaReservationAttempt(
+                attempt = new QuotaReservationAttempt(
                     false, null, outstanding, effective,
                     $"quota reservation of {estimate:F1}% would breach floor ({effective - estimate:F1}% < {floorPct:F1}%; {outstanding:F1}% already escrowed)");
             }
-
-            var now = _time.GetUtcNow();
-            var entry = new ReservationEntry
+            else
             {
-                Id = Guid.NewGuid(),
-                Key = key,
-                ReservedPct = estimate,
-                CreatedAt = now,
-            };
-            _entries[entry.Id] = entry;
-            var lease = new QuotaReservationLease(
-                entry.Id, key, member.Agent, member.ModelId, estimate, now);
-            return new QuotaReservationAttempt(true, lease, outstanding + estimate, effective, null);
+                var now = _time.GetUtcNow();
+                var entry = new ReservationEntry
+                {
+                    Id = Guid.NewGuid(),
+                    Key = key,
+                    ReservedPct = estimate,
+                    CreatedAt = now,
+                };
+                _entries[entry.Id] = entry;
+                var lease = new QuotaReservationLease(
+                    entry.Id, key, member.Agent, member.ModelId, estimate, now);
+                attempt = new QuotaReservationAttempt(true, lease, outstanding + estimate, effective, null);
+                reserved = true;
+            }
         }
+        if (reserved) RaiseReservationsChanged();
+        return attempt;
     }
 
     /// <summary>
@@ -255,10 +274,13 @@ public sealed class QuotaReservationLedger
     /// </summary>
     public bool Release(Guid reservationId)
     {
+        bool removed;
         lock (_sync)
         {
-            return _entries.Remove(reservationId);
+            removed = _entries.Remove(reservationId);
         }
+        if (removed) RaiseReservationsChanged();
+        return removed;
     }
 
     /// <summary>
@@ -304,6 +326,7 @@ public sealed class QuotaReservationLedger
     /// </summary>
     public bool Complete(Guid reservationId, double? observedPct, bool hasObservedUsage)
     {
+        bool settled;
         lock (_sync)
         {
             if (!_entries.TryGetValue(reservationId, out var entry)) return false;
@@ -311,22 +334,25 @@ public sealed class QuotaReservationLedger
             {
                 entry.CompletedAt = _time.GetUtcNow();
                 RecordSettlementLocked(entry, fromActuals: false);
-                return true;
+                settled = true;
             }
-
-            if (observedPct is not { } observed
+            else if (observedPct is not { } observed
                 || !double.IsFinite(observed)
                 || observed <= 0)
             {
                 _entries.Remove(reservationId);
-                return true;
+                settled = true;
             }
-
-            entry.ReservedPct = observed;
-            entry.CompletedAt = _time.GetUtcNow();
-            RecordSettlementLocked(entry, fromActuals: true, settledPct: observed);
-            return true;
+            else
+            {
+                entry.ReservedPct = observed;
+                entry.CompletedAt = _time.GetUtcNow();
+                RecordSettlementLocked(entry, fromActuals: true, settledPct: observed);
+                settled = true;
+            }
         }
+        RaiseReservationsChanged();
+        return settled;
     }
 
     /// <summary>
@@ -351,6 +377,7 @@ public sealed class QuotaReservationLedger
     {
         ArgumentNullException.ThrowIfNull(key);
         if (availablePct < 0) return;
+        bool retiredAny;
         lock (_sync)
         {
             _lastReading[key] = new ProbeMark(availablePct, observedAt);
@@ -363,7 +390,9 @@ public sealed class QuotaReservationLedger
             }
             if (retire is null) return;
             foreach (var id in retire) _entries.Remove(id);
+            retiredAny = retire.Count > 0;
         }
+        if (retiredAny) RaiseReservationsChanged();
     }
 
     /// <summary>
@@ -378,6 +407,7 @@ public sealed class QuotaReservationLedger
     {
         var maxAge = _options.QuotaReservationMaxAge;
         if (maxAge <= TimeSpan.Zero) return 0;
+        int removed;
         lock (_sync)
         {
             List<Guid>? expired = null;
@@ -388,8 +418,10 @@ public sealed class QuotaReservationLedger
             }
             if (expired is null) return 0;
             foreach (var id in expired) _entries.Remove(id);
-            return expired.Count;
+            removed = expired.Count;
         }
+        if (removed > 0) RaiseReservationsChanged();
+        return removed;
     }
 
     private double ResolveEstimateFor(AgentMembership member, double? estimateOverride)
