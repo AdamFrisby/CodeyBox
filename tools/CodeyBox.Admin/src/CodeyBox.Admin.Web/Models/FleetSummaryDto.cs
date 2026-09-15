@@ -19,17 +19,6 @@ public sealed class FleetSummaryDto
     public double? MonthlyBudgetUsd { get; set; }
     public string BudgetThresholdState { get; set; } = "unknown";
 
-    /// <summary>
-    /// Derived status indicator color for the UI dot.
-    /// Red if paused or ≥3 of the last 5 outcomes are failures.
-    /// Blue if in-flight. Yellow if only queued. Grey if idle.
-    /// </summary>
-    public string StatusColor =>
-        IsPaused || HasRecentFailures ? "red" :
-        InFlightCount > 0 ? "blue" :
-        QueuedCount > 0 ? "yellow" :
-        "grey";
-
     /// <summary>Budget bar CSS class based on threshold state.</summary>
     public string BudgetBarCss =>
         BudgetThresholdState == "critical" ? "budget-full" :

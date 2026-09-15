@@ -86,7 +86,8 @@ public sealed class SuggestionListPageTests : BunitContext
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(severity: "important")]));
         var cut = Render<SuggestionsPage>();
-        Assert.Contains("severity-important", cut.Markup);
+        Assert.Contains("chip--fail", cut.Markup);
+        Assert.Contains("Important", cut.Markup);
     }
 
     [Fact]
@@ -94,7 +95,8 @@ public sealed class SuggestionListPageTests : BunitContext
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(severity: "minor")]));
         var cut = Render<SuggestionsPage>();
-        Assert.Contains("severity-minor", cut.Markup);
+        Assert.Contains("chip--queued", cut.Markup);
+        Assert.Contains("Minor", cut.Markup);
     }
 
     [Fact]

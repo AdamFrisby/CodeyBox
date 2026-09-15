@@ -18,12 +18,12 @@ else if (_suggestion is not null)
 
     <div class="suggestion-meta">
         <span class="category-badge">@_suggestion.Category</span>
-        <span class="@_suggestion.SeverityCss">@_suggestion.Severity</span>
+        <StatusChip Info="@StatusVocabulary.ForSeverity(_suggestion.Severity)" />
         <span>effort: @_suggestion.EstimatedEffort</span>
         <span>project: @_suggestion.ProjectId</span>
-        <span>from: <a href="/work-items/@_suggestion.SourceWorkItemId">@_suggestion.ShortWorkItemId</a>@(_sourceExternalId is not null ? $" ({_sourceExternalId})" : "")</span>
-        <span>@_suggestion.Age ago</span>
-        <span class="state-@_suggestion.State.ToLowerInvariant()">@_suggestion.State</span>
+        <span>from: <a href="/work-items/@_suggestion.SourceWorkItemId">@_suggestion.ShortWorkItemId</a> <CopyableId Value="@_suggestion.SourceWorkItemId" CopyButtonOnly="true" />@(_sourceExternalId is not null ? $" ({_sourceExternalId})" : "")</span>
+        <span title="@AdminFormat.FormatDateTime(_suggestion.CreatedAt)">@AdminFormat.FormatRelative(_suggestion.CreatedAt, DateTimeOffset.UtcNow)</span>
+        <StatusChip Info="@StatusVocabulary.ForSuggestion(_suggestion.State)" />
     </div>
 
     <h2>Rationale</h2>
@@ -42,7 +42,7 @@ else if (_suggestion is not null)
 
     @if (_suggestion.PromotedToWorkItemId is not null)
     {
-        <p>Promoted to work item <a href="/work-items/@_suggestion.PromotedToWorkItemId">@_suggestion.PromotedToWorkItemId[..8]</a></p>
+        <p>Promoted to work item <a href="/work-items/@_suggestion.PromotedToWorkItemId">@_suggestion.PromotedToWorkItemId[..8]</a> <CopyableId Value="@_suggestion.PromotedToWorkItemId" CopyButtonOnly="true" /></p>
     }
 
     @if (_suggestion.State == "open")

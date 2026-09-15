@@ -18,7 +18,7 @@ else if (_release is not null)
     <h1>@_release.Name</h1>
 
     <div class="suggestion-meta">
-        <span class="state-@_release.State.ToLowerInvariant()">@_release.State</span>
+        <StatusChip Info="@StatusVocabulary.ForRelease(_release.State)" />
         <span>project: @_release.ProjectId</span>
         @if (_release.BranchName is not null)
         {
@@ -106,7 +106,7 @@ else if (_release is not null)
                     <tr>
                         <td><a href="/work-items/@wi.Id">@wi.Id[..8]</a></td>
                         <td><a href="/work-items/@wi.Id">@wi.Title</a></td>
-                        <td><span class="state-@wi.State.ToLowerInvariant()">@wi.State</span></td>
+                        <td><StatusChip Info="@StatusVocabulary.ForWorkItem(wi.State)" /></td>
                     </tr>
                 }
             </tbody>
@@ -135,14 +135,12 @@ else if (_release is not null)
             <div class="audit-iter-block">
                 <h3>
                     Iteration @iter.Iteration / @iter.MaxIterations
-                    <span class="@(iter.BlockingFindings == 0 ? "state-released" : "state-failed")">
-                        @(iter.BlockingFindings == 0 ? "PASSED" : $"{iter.BlockingFindings} blocking")
-                    </span>
+                    <StatusChip Info="@(iter.BlockingFindings == 0 ? new StatusInfo("PASSED", "✓", "done", "Iteration passed — no blocking findings") : new StatusInfo($"{iter.BlockingFindings} blocking", "‼", "fail", "Iteration has blocking findings"))" />
                 </h3>
-                <p>@iter.TotalFindings total finding(s), @iter.BlockingFindings blocking &mdash; @iter.CreatedAt.ToString("yyyy-MM-dd HH:mm") UTC</p>
+                <p>@iter.TotalFindings total finding(s), @iter.BlockingFindings blocking &mdash; @AdminFormat.FormatDateTime(iter.CreatedAt) local</p>
                 @if (iter.RemediationWorkItemId is not null)
                 {
-                    <p>Remediation work item: <a href="/work-items/@iter.RemediationWorkItemId">@iter.RemediationWorkItemId[..8]</a></p>
+                    <p>Remediation work item: <a href="/work-items/@iter.RemediationWorkItemId">@iter.RemediationWorkItemId[..8]</a> <CopyableId Value="@iter.RemediationWorkItemId" CopyButtonOnly="true" /></p>
                 }
                 @if (iter.Findings.Count > 0)
                 {
@@ -160,7 +158,7 @@ else if (_release is not null)
                             {
                                 <tr>
                                     <td>@f.AuditorName</td>
-                                    <td><span class="state-@f.Severity.ToLowerInvariant()">@f.Severity</span></td>
+                    <td><StatusChip Info="@StatusVocabulary.ForSeverity(f.Severity)" /></td>
                                     <td>@f.Title</td>
                                     <td>@(f.Location ?? "")</td>
                                 </tr>

@@ -94,7 +94,7 @@ public sealed class FleetPagePauseButtonTests : BunitContext
         Assert.Equal(21600, fake.AgentPauseDurationCaptured);
         cut.WaitForAssertion(() =>
         {
-            Assert.Contains("<code>claude</code>", cut.Markup);
+            Assert.Contains(">claude</code>", cut.Markup);
             Assert.Contains("reserve quota", cut.Markup);
             Assert.DoesNotContain("No paused agents.", cut.Markup);
         });

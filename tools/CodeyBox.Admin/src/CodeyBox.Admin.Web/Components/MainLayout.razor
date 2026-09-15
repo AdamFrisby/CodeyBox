@@ -33,6 +33,8 @@
                 </span>
             </Authorized>
         </AuthorizeView>
+        <button type="button" class="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle light / dark theme"
+                onclick="var d=document.documentElement;var n=d.getAttribute('data-theme')==='light'?'dark':'light';if(n==='dark'){d.removeAttribute('data-theme');}else{d.setAttribute('data-theme','light');}try{localStorage.setItem('cb-theme',n);}catch(e){}">◐</button>
     </nav>
     <main class="admin-main">
         @Body

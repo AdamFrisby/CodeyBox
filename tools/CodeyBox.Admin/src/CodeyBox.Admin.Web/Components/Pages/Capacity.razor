@@ -87,7 +87,7 @@ else
                         <td>
                             @if (e.CurrentPct.HasValue)
                             {
-                                <span>@e.CurrentPct.Value.ToString("F1")%</span>
+                                <span>@e.CurrentPct.Value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)%</span>
                             }
                             else
                             {
@@ -209,32 +209,25 @@ else
     private static string FormatPerPct(double? value)
     {
         if (!value.HasValue || value.Value <= 0) return "—";
-        return value.Value >= 1000 ? value.Value.ToString("N0") : value.Value.ToString("F1");
+        return value.Value >= 1000 ? value.Value.ToString("N0", System.Globalization.CultureInfo.InvariantCulture) : value.Value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static string FormatFullCap(double? value)
     {
         if (!value.HasValue || value.Value <= 0) return "—";
-        return value.Value.ToString("N0");
+        return value.Value.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static string ConfidenceColor(string confidence) => confidence switch
     {
-        "High" => "#0a7f2e",
-        "Medium" => "#a06400",
-        "Low" => "#b03030",
-        _ => "#999",
+        "High" => "var(--ok)",
+        "Medium" => "var(--warn)",
+        "Low" => "var(--danger)",
+        _ => "var(--text-faint)",
     };
 
-    private static string FormatReset(DateTimeOffset? at)
-    {
-        if (at is null) return "—";
-        var delta = at.Value - DateTimeOffset.UtcNow;
-        if (delta <= TimeSpan.Zero) return "now";
-        if (delta.TotalHours < 1) return $"{(int)delta.TotalMinutes}m";
-        if (delta.TotalDays < 1) return $"{(int)delta.TotalHours}h {(int)(delta.Minutes)}m";
-        return $"{(int)delta.TotalDays}d {(int)(delta.Hours)}h";
-    }
+    private static string FormatReset(DateTimeOffset? at) =>
+        AdminFormat.FormatCountdown(at, DateTimeOffset.UtcNow);
 
     private RenderFragment RenderBurnChart(CapacityEntryDto entry) => builder =>
     {
@@ -272,7 +265,7 @@ else
             builder.AddAttribute(15, "fill", fill);
             builder.AddAttribute(16, "title",
                 $"{iv.FromUtc:HH:mm} → {iv.ToUtc:HH:mm}\n" +
-                $"Δ {iv.DeltaPct.ToString("F2")}% · in {iv.InputTokens:N0} · out {iv.OutputTokens:N0} · {iv.Requests} reqs" +
+                $"Δ {iv.DeltaPct.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)}% · in {iv.InputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} · out {iv.OutputTokens.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} · {iv.Requests} reqs" +
                 (iv.IsWindowReset ? "\n(window reset)" : ""));
             builder.CloseElement();
         }

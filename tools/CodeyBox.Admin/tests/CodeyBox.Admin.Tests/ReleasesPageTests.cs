@@ -102,7 +102,8 @@ public sealed class ReleasesPageTests : BunitContext
 
         var cut = Render<ReleasesPage>();
 
-        Assert.Contains("state-open", cut.Markup);
+        Assert.Contains("chip--queued", cut.Markup);
+        Assert.Contains(">Open<", cut.Markup);
     }
 
     [Fact]
@@ -114,7 +115,8 @@ public sealed class ReleasesPageTests : BunitContext
 
         var cut = Render<ReleasesPage>();
 
-        Assert.Contains("state-closed", cut.Markup);
+        Assert.Contains("chip--muted", cut.Markup);
+        Assert.Contains(">Closed<", cut.Markup);
     }
 
     [Fact]
@@ -126,7 +128,8 @@ public sealed class ReleasesPageTests : BunitContext
 
         var cut = Render<ReleasesPage>();
 
-        Assert.Contains("state-inreview", cut.Markup);
+        Assert.Contains("chip--review", cut.Markup);
+        Assert.Contains("In review", cut.Markup);
     }
 
     [Fact]
@@ -138,7 +141,8 @@ public sealed class ReleasesPageTests : BunitContext
 
         var cut = Render<ReleasesPage>();
 
-        Assert.Contains("state-released", cut.Markup);
+        Assert.Contains("chip--done", cut.Markup);
+        Assert.Contains(">Released<", cut.Markup);
     }
 
     [Fact]
@@ -150,7 +154,8 @@ public sealed class ReleasesPageTests : BunitContext
 
         var cut = Render<ReleasesPage>();
 
-        Assert.Contains("state-failed", cut.Markup);
+        Assert.Contains("chip--fail", cut.Markup);
+        Assert.Contains(">Failed<", cut.Markup);
     }
 
     [Fact]

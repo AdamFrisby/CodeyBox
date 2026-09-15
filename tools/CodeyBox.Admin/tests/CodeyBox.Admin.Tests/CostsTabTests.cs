@@ -134,7 +134,7 @@ public sealed class CostsTabTests : BunitContext
         var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("Token counts unavailable", cut.Markup);
-        Assert.Contains("15s", cut.Markup);
+        Assert.Contains("15.0s", cut.Markup);
         Assert.Contains("cursor", cut.Markup);
     }
 

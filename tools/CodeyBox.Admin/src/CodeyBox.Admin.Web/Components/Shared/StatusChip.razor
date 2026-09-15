@@ -1,0 +1,10 @@
+@using CodeyBox.Admin.Web.Components.Shared
+@* Shared status chip: glyph + text + tone. Every state in the admin renders
+   through StatusVocabulary so the same value looks identical everywhere. *@
+<span class="status-chip chip--@Info.Tone" title="@Info.Title"><span class="chip-glyph" aria-hidden="true">@Info.Glyph</span><span class="chip-text">@Info.Text</span></span>
+
+@code {
+    /// <summary>Resolved vocabulary entry to render. Build it with <see cref="StatusVocabulary"/>.</summary>
+    [Parameter, EditorRequired]
+    public StatusInfo Info { get; set; } = new("Unknown", "?", "muted", "Uninitialised status chip");
+}
