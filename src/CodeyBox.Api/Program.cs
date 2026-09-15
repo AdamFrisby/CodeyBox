@@ -543,9 +543,28 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         }
     }
 
+    var hostPlatformEarly = CodeyBox.Core.HostPlatformSupport.HostOperatingSystem.Current;
+    if (!CodeyBox.Core.HostPlatformSupport.IsProviderSupportedOnHost(kind, hostPlatformEarly))
+    {
+        throw new InvalidOperationException(
+            $"CodeyBox:SandboxProvider '{kind}' is not supported on {hostPlatformEarly.Name}: " +
+            CodeyBox.Core.HostPlatformSupport.GetUnsupportedReason(kind, hostPlatformEarly));
+    }
+
     var inner = SandboxProviderKinds.SupportsHotReload(kind)
         ? BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog)
         : BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    var hostPlatform = hostPlatformEarly;
+    if (CodeyBox.Core.HostPlatformSupport.GetEgressEnforcement(kind)
+        == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnRemoteExecutorHost)
+    {
+        startupLog.LogInformation(
+            "Sandbox egress enforcement for provider '{Provider}' lives on the remote Linux executor host; " +
+            "the {Host} orchestrator host needs no packet filter, but the executor must have " +
+            "scripts/setup-host-networks.sh applied (see docs/concepts/host-platforms.md).",
+            kind,
+            hostPlatform.Name);
+    }
     var workloadTrust = Enum.TryParse<WorkloadTrust>(opts.WorkloadTrust, true, out var configuredTrust)
         ? configuredTrust
         : environment.IsDevelopment() ? WorkloadTrust.Trusted : WorkloadTrust.Untrusted;
@@ -5573,11 +5592,11 @@ namespace CodeyBox.Api
     {
         public List<ApiClientOptions> ApiClients { get; set; } = [];
         public string? PublicBaseUrl { get; set; }
-        public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
+        public string GitRootDirectory { get; set; } = CodeyBox.Core.HostPathPolicy.DefaultGitRootDirectory();
         public int GitCommandMaxOutputBytes { get; set; } = LocalGitHostOptions.DefaultGitCommandMaxOutputBytes;
         public bool EnableSharedUpstreamMirror { get; set; } = false;
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
-        public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
+        public string StateDatabasePath { get; set; } = CodeyBox.Core.HostPathPolicy.DefaultStateDatabasePath();
         public SqliteWriteGateOptions SqliteWriteGate { get; set; } = new();
         public SqliteMaintenanceOptions SqliteMaintenance { get; set; } = new();
         public string TemplateDirectory { get; set; } = "templates";

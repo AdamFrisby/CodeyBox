@@ -25,6 +25,7 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
 
         var selectedProvider = NormalizeSandboxProviderId(options.SandboxProvider, failures);
         var retainedProviders = ValidateRetainedSandboxProviderInventory(options, failures);
+        ValidateProviderHostSupport(selectedProvider, failures);
         if (string.Equals(selectedProvider, SandboxProviderKinds.Incus, StringComparison.OrdinalIgnoreCase)
             || retainedProviders.Contains(SandboxProviderKinds.Incus))
         {
@@ -436,6 +437,17 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add($"CodeyBox:SandboxProvider is invalid: {ex.Message}");
             return string.Empty;
         }
+    }
+
+    private static void ValidateProviderHostSupport(
+        string providerId,
+        ICollection<string> failures)
+    {
+        if (string.IsNullOrEmpty(providerId))
+            return;
+        var host = HostPlatformSupport.HostOperatingSystem.Current;
+        if (!HostPlatformSupport.IsProviderSupportedOnHost(providerId, host))
+            failures.Add($"CodeyBox:SandboxProvider '{providerId}' is not supported on {host.Name}: {HostPlatformSupport.GetUnsupportedReason(providerId, host)}");
     }
 
     private static HashSet<string> ValidateRetainedSandboxProviderInventory(
