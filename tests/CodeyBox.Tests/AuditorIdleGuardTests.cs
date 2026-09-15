@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using IdleClock = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -132,5 +133,64 @@ public sealed class AuditorIdleGuardTests
                 touch: () => { },
                 pollInterval: Poll,
                 cts.Token));
+    }
+
+    [Fact]
+    public async Task FrozenClock_IdleBudgetNeverFiresDespiteRealTimePassing()
+    {
+        // The idle budget runs on the injected clock: real wall time advances
+        // past the 100 ms budget while the frozen fake clock reports zero
+        // elapsed, so a quiet run with no live work still completes instead
+        // of being declared idle. Proves the guard does not race the wall
+        // clock when tests freeze it.
+        var clock = new IdleClock();
+        var idle = TimeSpan.FromMilliseconds(100);
+        var start = clock.GetTimestamp();
+        var run = Task.Delay(TimeSpan.FromMilliseconds(250)).ContinueWith(_ => "verdict");
+
+        var result = await AuditorIdleGuard.WaitAsync(
+            run,
+            "csharp:test-pass",
+            AgentKind.Claude,
+            hasActiveExecs: () => false,
+            getBudgets: () => (idle, TimeSpan.Zero),
+            getLastActivityTicks: () => start,
+            startTicks: start,
+            touch: () => { },
+            pollInterval: Poll,
+            CancellationToken.None,
+            timeProvider: clock);
+
+        Assert.Equal("verdict", result);
+    }
+
+    [Fact]
+    public async Task AdvancedClock_DeadRunDeclaredIdleDeterministically()
+    {
+        // Advancing the injected clock past the idle budget terminates a
+        // quiet run with no live work without waiting out any real time.
+        var clock = new IdleClock();
+        var idle = TimeSpan.FromMilliseconds(100);
+        var start = clock.GetTimestamp();
+        var never = new TaskCompletionSource<string>().Task;
+
+        var wait = AuditorIdleGuard.WaitAsync(
+            never,
+            "csharp:test-pass",
+            AgentKind.Claude,
+            hasActiveExecs: () => false,
+            getBudgets: () => (idle, TimeSpan.Zero),
+            getLastActivityTicks: () => start,
+            startTicks: start,
+            touch: () => { },
+            pollInterval: Poll,
+            CancellationToken.None,
+            timeProvider: clock);
+        Assert.False(wait.IsCompleted);
+
+        clock.Advance(TimeSpan.FromMilliseconds(150));
+        var ex = await Assert.ThrowsAsync<AuditorIdleTimeoutException>(() => wait);
+        Assert.Equal(idle, ex.Timeout);
+        Assert.Equal(AuditBudgetOrdering.AuditorIdleTimeoutPath, ex.BudgetPath);
     }
 }

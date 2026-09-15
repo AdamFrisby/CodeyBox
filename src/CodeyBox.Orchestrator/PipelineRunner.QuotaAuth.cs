@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
@@ -857,8 +856,9 @@ public sealed partial class PipelineRunner
             return await CanCaptureStructuredStreamAsync(runner, sandbox, phase, ct).ConfigureAwait(false);
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var lastActivityTicks = Stopwatch.GetTimestamp();
-        void Touch() => Volatile.Write(ref lastActivityTicks, Stopwatch.GetTimestamp());
+        var clock = _opts.TimeProvider;
+        var lastActivityTicks = clock.GetTimestamp();
+        void Touch() => Volatile.Write(ref lastActivityTicks, clock.GetTimestamp());
 
         var watchedSandbox = new ActivityTrackingSandbox(sandbox, Touch);
         var probeTask = CanCaptureStructuredStreamAsync(runner, watchedSandbox, phase, linkedCts.Token);

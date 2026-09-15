@@ -8,6 +8,7 @@ using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using Serilog;
 using Serilog.Events;
+using IdleClock = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -1968,6 +1969,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return new AuditResult(true, []);
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
@@ -1978,13 +1981,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             auditors: TestAuditGates.WithPassedBuildAndTest([blocker, sometimesHangs]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
@@ -2024,6 +2028,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return new AuditResult(true, []);
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
@@ -2034,13 +2040,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             auditors: TestAuditGates.WithPassedBuildAndTest([blocker, unavailable, hanging]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 3,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-rework"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
@@ -2119,6 +2126,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 await Task.Delay(Timeout.InfiniteTimeSpan);
             return new AuditResult(true, []);
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
@@ -2129,13 +2138,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             auditors: TestAuditGates.WithPassedBuildAndTest([warning, sometimesHangs]),
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-warning-rework"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
@@ -2172,6 +2182,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return new AuditResult(true, []);
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
@@ -2182,13 +2194,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             auditors: TestAuditGates.WithPassedBuildAndTest([blocker, sometimesHangs]),
             maxAuditIterations: 1,
             maxLlmAuditorParallelism: 2,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-final-incomplete-rework"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
@@ -2218,6 +2231,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return new AuditResult(true, []);
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
@@ -2228,14 +2243,15 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             auditors: TestAuditGates.WithPassedBuildAndTest([blocker, alwaysHangs]),
             maxAuditIterations: 1,
             maxLlmAuditorParallelism: 2,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-one-extra-rework"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-second-extra-rework"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.True(
@@ -2276,6 +2292,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var requiredBuild = new TestRequiredBuildVerifier(
             RequiredBuildProbeResult.Applies,
             RequiredBuildVerificationResult.Passed(0, "ok"));
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
@@ -2287,13 +2305,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock,
             requiredBuildVerifier: requiredBuild);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
@@ -2440,6 +2459,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 TaskScheduler.Default);
         });
         var idle = TimeSpan.FromMilliseconds(100);
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             AuditorIdleTimeout = idle,
@@ -2449,13 +2470,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
         var sw = Stopwatch.StartNew();
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
         sw.Stop();
 
         var final = await tp.Store.GetAsync(item.Id);
@@ -2464,8 +2486,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Contains("did not reach a complete verdict", final.LastError);
         Assert.Contains(AuditBudgetOrdering.AuditorIdleTimeoutPath, final.LastError);
         Assert.Contains(idle.ToString(), final.LastError);
-        Assert.Equal(2, calls);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), $"auditor timeout took {sw.Elapsed}");
+        Assert.True(
+            calls == 2,
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} did not terminate and retry the hung auditor exactly once (calls={calls})");
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} took {sw.Elapsed} to terminate the hung auditor");
     }
 
     [Fact]
@@ -2476,17 +2502,25 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         // window while its sandbox exec is demonstrably still running. The
         // liveness-aware guard must let it finish instead of recording it
         // incomplete.
+        //
+        // The idle budget runs on a FROZEN fake clock (never advanced), so no
+        // amount of scheduling stall under parallel-suite load can trip the
+        // guard before the 2 s sandbox exec finishes: a retry here would be a
+        // product regression, never a timing artefact.
         var auditor = new SandboxProcessAuditor("quality", sleepSeconds: 2);
+        var idle = TimeSpan.FromMilliseconds(100);
+        var idleClock = NewIdleClock();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
-            AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
+            AuditorIdleTimeout = idle,
         });
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
@@ -2495,9 +2529,15 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Equal(1, auditor.CallCount);
-        Assert.Equal(1, auditor.CompletedExecCount);
-        Assert.Equal(1, auditor.MaxConcurrentExecs);
+        Assert.True(
+            auditor.CallCount == 1,
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} fired spuriously under load (CallCount={auditor.CallCount}); the quiet-but-alive run must keep its slot");
+        Assert.True(
+            auditor.CompletedExecCount == 1,
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} interrupted the live sandbox exec (CompletedExecCount={auditor.CompletedExecCount})");
+        Assert.True(
+            auditor.MaxConcurrentExecs == 1,
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} caused a concurrent retry (MaxConcurrentExecs={auditor.MaxConcurrentExecs})");
     }
 
     [Fact]
@@ -2517,12 +2557,15 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock,
             agentStreams: streamStore);
         tp.Agent.StructuredStreamSupportHandler = (_, _) => Task.FromResult(true);
         tp.Agent.BeforeWorkAsync = (_, _, _) =>
@@ -2539,7 +2582,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var item = NewItem();
         await tp.Store.CreateAsync(item);
         var sw = Stopwatch.StartNew();
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
         sw.Stop();
 
         var final = await tp.Store.GetAsync(item.Id);
@@ -2548,7 +2591,9 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Contains("did not reach a complete verdict", final.LastError);
         Assert.Equal(0, auditorRuns);
         Assert.True(tp.Agent.StructuredStreamSupportProbeCount >= 3);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"auditor timeout took {sw.Elapsed}");
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(5),
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath} took {sw.Elapsed} to terminate the hung structured-stream probe");
     }
 
     [Fact]
@@ -2566,26 +2611,31 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock,
             sandboxProvider: sandboxProvider);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
         var sw = Stopwatch.StartNew();
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
         sw.Stop();
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.True(sandboxProvider.ObservedCloneCancellation);
         Assert.Equal(1, auditorRuns);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"audit setup timeout took {sw.Elapsed}");
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(5),
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath} took {sw.Elapsed} to kill the hung audit-setup clone");
     }
 
     [Fact]
@@ -2603,26 +2653,31 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest([auditor]),
             maxAuditIterations: 1,
             pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock,
             sandboxProvider: sandboxProvider);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
         var sw = Stopwatch.StartNew();
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
         sw.Stop();
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.True(sandboxProvider.ObservedCreateCancellation);
         Assert.Equal(1, auditorRuns);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"audit launch timeout took {sw.Elapsed}");
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(5),
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath} took {sw.Elapsed} to cancel the hung sandbox launch");
     }
 
     [Fact]
@@ -2672,12 +2727,16 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Frozen fake clock: heartbeats touch activity in real time while the
+        // idle budget cannot elapse on wall-clock stall, so completion is
+        // deterministic under load.
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest([streaming]),
             maxAuditIterations: 1,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: NewIdleClock());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
@@ -2705,12 +2764,15 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Frozen fake clock: sandbox output touches activity in real time
+        // while the idle budget cannot elapse on wall-clock stall.
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [tool],
             maxAuditIterations: 1,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: NewIdleClock());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
@@ -2745,18 +2807,21 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [blocker, sometimesHangs],
             maxAuditIterations: 2,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-tool-rework"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
@@ -2940,6 +3005,40 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Contains("architecture", reworkPrompt);
         Assert.Contains("persisted blocker", reworkPrompt);
         Assert.Contains("fix it", reworkPrompt);
+    }
+
+    // Idle-clock discipline for every AuditorIdleTimeout budget in this file.
+    //
+    // A sub-second wall-clock budget is a load-dependent assertion: under
+    // parallel-suite scheduling pressure a 100 ms real-time window is
+    // trivially exceeded by an ordinary GC pause, the idle guard fires
+    // spuriously, the auditor is retried, and a CallCount assertion reports
+    // a behavioural claim ("classified incomplete") for what was really a
+    // busy machine. Every test below therefore drives the pipeline clock off
+    // an injected FakeTimeProvider instead of the wall clock:
+    //   - tests proving the idle path did NOT fire use a frozen clock (never
+    //     advanced), so no scheduling stall can trip the guard;
+    //   - tests proving the idle path DID fire advance the clock
+    //     deterministically via RunWithAdvancingIdleClockAsync while the
+    //     pipeline runs, so the timeout is guaranteed without racing time.
+    // No AuditorIdleTimeout in this file elapses in real time.
+    //
+    // The clock starts at the real now so fake timestamps stay comparable
+    // with the real-clock timestamps recorded by stores outside the
+    // pipeline clock (audit progress rows, iteration dispatch times).
+    private static IdleClock NewIdleClock() => new(DateTimeOffset.UtcNow);
+
+    private static async Task RunWithAdvancingIdleClockAsync(IdleClock clock, Task pipelineTask)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        ArgumentNullException.ThrowIfNull(pipelineTask);
+        while (!pipelineTask.IsCompleted)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(50));
+            await Task.Delay(10);
+        }
+
+        await pipelineTask;
     }
 
     private static async Task<(WorkItemId WorkItemId, AuditProgressRecord Progress)> WaitForProgressAsync(
