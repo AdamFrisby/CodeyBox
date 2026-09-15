@@ -10,6 +10,11 @@ namespace CodeyBox.Admin.Web.Services;
 /// </summary>
 public static class AdminFormat
 {
+    /// <summary>Values below this render with 4 decimals so tiny costs stay visible.</summary>
+    private const double SubCentThresholdUsd = 0.01;
+
+    /// <summary>Decimal overload threshold matching <see cref="SubCentThresholdUsd"/>.</summary>
+    private const decimal SubCentThresholdUsdDecimal = 0.01m;
     /// <summary>Formats a millisecond duration: "850ms", "4.2s", "3m 4s", "2h 5m".</summary>
     public static string FormatDurationMs(long ms)
     {
@@ -25,7 +30,7 @@ public static class AdminFormat
 
         if (ms < 60_000)
         {
-            return $"{ms / 1000.0:F1}s";
+            return (ms / 1000.0).ToString("F1", CultureInfo.InvariantCulture) + "s";
         }
 
         var totalSeconds = ms / 1000;
@@ -89,28 +94,56 @@ public static class AdminFormat
     {
         < 0 => "—",
         < 1000 => count.ToString(CultureInfo.InvariantCulture),
-        < 1_000_000 => $"{count / 1000.0:F1}K",
-        _ => $"{count / 1_000_000.0:F1}M",
+        < 1_000_000 => (count / 1000.0).ToString("F1", CultureInfo.InvariantCulture) + "K",
+        _ => (count / 1_000_000.0).ToString("F1", CultureInfo.InvariantCulture) + "M",
     };
 
     /// <summary>USD money: "$18.42". Zero renders as "$0.00"; sub-cent values keep 4 decimals so tiny costs stay visible.</summary>
     public static string FormatUsd(double usd)
+    {
+        if (double.IsNaN(usd) || double.IsInfinity(usd))
+        {
+            return "—";
+        }
+
+        if (usd == 0)
+        {
+            return "$0.00";
+        }
+
+        if (usd < 0)
+        {
+            return "-$" + Math.Abs(usd).ToString("F2", CultureInfo.InvariantCulture);
+        }
+
+        if (usd < SubCentThresholdUsd)
+        {
+            return "$" + usd.ToString("F4", CultureInfo.InvariantCulture);
+        }
+
+        return "$" + usd.ToString("F2", CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>USD money (decimal overload for budget DTOs). Formats directly to avoid double rounding.</summary>
+    public static string FormatUsd(decimal usd)
     {
         if (usd == 0)
         {
             return "$0.00";
         }
 
-        if (usd != 0 && usd < 0.01)
+        if (usd < 0)
         {
-            return $"${usd.ToString("F4", CultureInfo.InvariantCulture)}";
+            return "-$" + Math.Abs(usd).ToString("F2", CultureInfo.InvariantCulture);
         }
 
-        return $"${usd.ToString("F2", CultureInfo.InvariantCulture)}";
-    }
+        if (usd < SubCentThresholdUsdDecimal)
+        {
+            return "$" + usd.ToString("F4", CultureInfo.InvariantCulture);
+        }
 
-    /// <summary>USD money (decimal overload for budget DTOs).</summary>
-    public static string FormatUsd(decimal usd) => FormatUsd((double)usd);
+        return "$" + usd.ToString("F2", CultureInfo.InvariantCulture);
+    }
 
     /// <summary>Countdown to a future stamp: "now", "5m", "2h 5m", "3d 4h". Never throws; null renders as an em dash.</summary>
     public static string FormatCountdown(DateTimeOffset? at, DateTimeOffset now)

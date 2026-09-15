@@ -28,18 +28,18 @@ else if (_release is not null)
         {
             <span>tag: <code>@_release.TargetTag</code></span>
         }
-        <span>created: @_release.CreatedAt.ToString("yyyy-MM-dd HH:mm")</span>
+        <span>created: @_release.CreatedAt.ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture)</span>
         @if (_release.ClosedAt is not null)
         {
-            <span>closed: @_release.ClosedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+            <span>closed: @_release.ClosedAt.Value.ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture)</span>
         }
         @if (_release.ReviewStartedAt is not null)
         {
-            <span>review started: @_release.ReviewStartedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+            <span>review started: @_release.ReviewStartedAt.Value.ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture)</span>
         }
         @if (_release.ReleasedAt is not null)
         {
-            <span>released: @_release.ReleasedAt.Value.ToString("yyyy-MM-dd HH:mm")</span>
+            <span>released: @_release.ReleasedAt.Value.ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture)</span>
         }
         @if (_release.FailedReason is not null)
         {

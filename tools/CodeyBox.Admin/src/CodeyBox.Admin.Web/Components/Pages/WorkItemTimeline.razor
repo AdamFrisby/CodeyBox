@@ -55,7 +55,7 @@ else
         }
         @if (FilterSince is { } fsinceChip)
         {
-            <span class="filter-chip filter-chip--active">since @fsinceChip.ToString("yyyy-MM-dd HH:mm")
+            <span class="filter-chip filter-chip--active">since @fsinceChip.ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture)
                 <button class="filter-chip-remove" @onclick="() => FilterSince = null">✕</button>
             </span>
         }

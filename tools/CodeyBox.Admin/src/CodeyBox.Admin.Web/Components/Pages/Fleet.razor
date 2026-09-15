@@ -128,7 +128,7 @@ else
                                 <span class="budget-bar-wrap" style="width:5rem;">
                                     <span class="budget-bar @s.BudgetBarCss" style="width:@((int)s.BudgetPct)%"></span>
                                 </span>
-                                <span>@AdminFormat.FormatUsd(s.MonthlySpendUsd.Value)@(s.MonthlyBudgetUsd.HasValue ? $" / ${s.MonthlyBudgetUsd.Value:0}" : "")</span>
+                                <span>@AdminFormat.FormatUsd(s.MonthlySpendUsd.Value)@(s.MonthlyBudgetUsd.HasValue ? " / " + AdminFormat.FormatUsd(s.MonthlyBudgetUsd.Value) : "")</span>
                             </div>
                         }
                         else

@@ -16,7 +16,7 @@
             — reason: @_queueStatus.PausedReason
             @if (_queueStatus.PausedAt is { } at)
             {
-                <span> — paused at @at.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz")</span>
+                <span> — paused at @at.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz", System.Globalization.CultureInfo.InvariantCulture)</span>
             }
             <button class="btn btn-resume" @onclick="ResumeQueueAsync">Resume queue</button>
         </div>
@@ -86,7 +86,7 @@
                 }
                 @if (cb is not null && cb.MonthlyBudgetUsd > 0)
                 {
-                    <span title="30-day cost budget: @AdminFormat.FormatUsd(cb.CurrentSpendUsd) of @AdminFormat.FormatUsd(cb.MonthlyBudgetUsd) (@cb.Pct.ToString("F1")%)">
+                    <span title="30-day cost budget: @AdminFormat.FormatUsd(cb.CurrentSpendUsd) of @AdminFormat.FormatUsd(cb.MonthlyBudgetUsd) (@cb.Pct.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)%)">
                         <span class="budget-bar-wrap"><span class="budget-bar @costCss" style="width:@costPct%"></span></span>
                         <span style="margin-left:0.3rem;">@AdminFormat.FormatUsd(cb.CurrentSpendUsd)/@AdminFormat.FormatUsd(cb.MonthlyBudgetUsd)/30d</span>
                     </span>

@@ -36,7 +36,7 @@ else
         @if (_costs.Totals.CachedInputTokens > 0)
         {
             var cacheHitPct = _costs.Totals.InputTokens > 0 ? (double)_costs.Totals.CachedInputTokens / _costs.Totals.InputTokens * 100.0 : 0.0;
-            <span>, @cacheHitPct.ToString("F0")% cache hit</span>
+            <span>, @cacheHitPct.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)% cache hit</span>
         }
     </p>
 

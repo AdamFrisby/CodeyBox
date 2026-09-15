@@ -292,7 +292,7 @@ else
             return "est. saved 0%";
         var pct = ts.EstimatedSavedFraction * 100.0;
         var savedMs = (long)(ts.EstimatedSavedFraction * durationMs);
-        return $"est. saved {pct:0.#}% (~{FormatDuration(savedMs)})";
+        return "est. saved " + pct.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + "% (~" + FormatDuration(savedMs) + ")";
     }
 
     private static string FormatTestSelectionLayers(AuditReportTestSelectionDto ts) =>
