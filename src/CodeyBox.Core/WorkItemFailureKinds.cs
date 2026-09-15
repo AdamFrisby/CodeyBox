@@ -24,6 +24,14 @@ public static class WorkItemFailureKinds
     /// </summary>
     public const string AgentRoutingUnavailable = "agent_routing_unavailable";
 
+    /// <summary>
+    /// Deterministic pipeline/auditor configuration error (malformed command,
+    /// rejected work-item config). An unchanged retry fails identically, so
+    /// downstream classifiers treat this as non-retryable and surface it
+    /// immediately instead of spending recovery budget on it.
+    /// </summary>
+    public const string Configuration = "configuration";
+
     private static readonly string[] InfraShaped =
     [
         Infrastructure,

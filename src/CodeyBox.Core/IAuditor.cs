@@ -399,6 +399,18 @@ public class AuditUnavailableException : Exception
 
     public int? ExitCode { get; }
     public string? Output { get; }
+
+    /// <summary>
+    /// True when the failure is a deterministic configuration error: the same
+    /// command against the same tree will fail identically on every retry, so
+    /// the pipeline must surface it immediately instead of spending transient /
+    /// recovery retry budget on it. Set by classifiers that prove the runner
+    /// refused its arguments (e.g. VSTest rejecting a test-source path with
+    /// zero tests executed). Defaults to false — most unavailability (missing
+    /// tools, provisioning faults) is transient and keeps the existing retry
+    /// behavior.
+    /// </summary>
+    public bool IsDeterministic { get; init; }
 }
 
 public enum AuditSeverity { Info, Warning, Error }

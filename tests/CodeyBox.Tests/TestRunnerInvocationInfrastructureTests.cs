@@ -32,6 +32,7 @@ public sealed class TestRunnerInvocationInfrastructureTests : IDisposable
     [Fact]
     public async Task TestGateInvocationError_FailsAsInfrastructureWithoutRework()
     {
+        using var _ = TestSupport.AmbientGitConfigScope.Clear();
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new InvocationFailingTestGateAuditor();
         var involvement = new InMemoryAgentInvolvementStore();
@@ -78,6 +79,57 @@ public sealed class TestRunnerInvocationInfrastructureTests : IDisposable
     }
 
     /// <summary>
+    /// A deterministic runner-invocation refusal (the same argv against the
+    /// same tree fails identically) is a configuration error, not a transient
+    /// provisioning fault: it must fail as <c>configuration</c> so the
+    /// terminal classifier parks it immediately, without consuming rework
+    /// iterations or recovery-attempt budget on identical retries.
+    /// </summary>
+    [Fact]
+    public async Task DeterministicTestGateInvocationError_FailsAsConfigurationWithoutRecoveryBudget()
+    {
+        using var _ = TestSupport.AmbientGitConfigScope.Clear();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new DeterministicInvocationFailingTestGateAuditor();
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 3,
+            involvement: involvement);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "deterministic test gate invocation error",
+            Prompt = "change the repo",
+            WorkBranch = "feature/testgate-deterministic",
+            BaseBranch = "main",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Configuration, final.FailureKind);
+        Assert.Contains("could-not-verify", final.LastError ?? string.Empty, StringComparison.Ordinal);
+
+        // Surfaced immediately: exactly one gate attempt, no recovery-attempt
+        // budget consumed, no rework driven.
+        Assert.Equal(1, auditor.Calls);
+        Assert.Equal(0, final.RecoveryAttempts);
+        Assert.Single(tp.Agent.WorkPrompts);
+        var rows = await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.DoesNotContain(rows, r => string.Equals(r.Phase, "rework", StringComparison.Ordinal));
+        var iterations = await tp.Store.GetIterationsAsync(item.Id, CancellationToken.None);
+        Assert.DoesNotContain(iterations, i => i.Iteration > 1);
+    }
+
+    /// <summary>
     /// Stands in for the <c>csharp:test-pass</c> gate after its classifier
     /// raises a runner-invocation refusal as <see cref="AuditUnavailableException"/>.
     /// Throws the incident-shaped fault instead of returning findings so the
@@ -111,6 +163,46 @@ public sealed class TestRunnerInvocationInfrastructureTests : IDisposable
                 1,
                 "The argument /work/tests/CodeyBox.Tests/bin/Debug/net10.0/CodeyBox.Tests.dll is invalid. "
                 + "Please use the /help option to check the list of valid arguments.");
+        }
+    }
+
+    /// <summary>
+    /// Stands in for the <c>csharp:test-pass</c> gate after its classifier
+    /// proves a runner argument-validation refusal and marks it deterministic.
+    /// The pipeline must route it as a configuration error (immediate,
+    /// non-retryable) rather than transient infrastructure.
+    /// </summary>
+    private sealed class DeterministicInvocationFailingTestGateAuditor : IAuditor
+    {
+        public string Name => "csharp:test-pass";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public bool CanShortCircuitOnBlockingFinding => true;
+        public AuditorRole Role => AuditorRole.BuildTestGate;
+        public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.Test;
+        public int Calls { get; private set; }
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            Calls++;
+            throw new AuditUnavailableException(
+                "could-not-verify: test runner invocation failed for 'csharp:test-pass' (exit 1): "
+                + "The argument /work/tests/CodeyBox.Tests/bin/Debug/net10.0/CodeyBox.Tests.dll is invalid. "
+                + "(command: dotnet test --no-build)",
+                1,
+                "The argument /work/tests/CodeyBox.Tests/bin/Debug/net10.0/CodeyBox.Tests.dll is invalid. "
+                + "Please use the /help option to check the list of valid arguments.")
+            {
+                IsDeterministic = true,
+            };
         }
     }
 }

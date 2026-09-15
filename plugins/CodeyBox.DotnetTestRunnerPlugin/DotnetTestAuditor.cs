@@ -34,6 +34,12 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         ArgumentNullException.ThrowIfNull(opts);
         if (opts.BaseArgv.Count == 0)
             throw new ArgumentException("BaseArgv must be non-empty", nameof(opts));
+        if (DotnetTestArgv.FindBareAssemblyPositional(opts.BaseArgv) is { } assembly)
+            throw new ArgumentException(
+                $"BaseArgv must not pass a test assembly as a bare positional argument to 'dotnet test' (got '{assembly}'). "
+                + "A bare .dll flips the command into VSTest passthrough, which rejects the source with "
+                + "'The argument ... is invalid' and runs zero tests. Use the project/solution form instead.",
+                nameof(opts));
         _opts = opts;
         _runOptions = opts.RunOptionsAccessor ?? (static () => TestRunOptions.Default);
     }
@@ -55,9 +61,12 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
     public TestRunOptions CurrentRunOptions => _runOptions();
 
     /// <summary>
-    /// The argv this auditor invokes for a full test run under the current
-    /// (hot-reloadable) options. Exposed so the work-phase prompt builder can
-    /// advise the agent to run the same command before committing.
+    /// The configured argv for a full test run under the current
+    /// (hot-reloadable) options: the command the work-phase prompt builder
+    /// advises the agent to run itself before committing. This is the logical
+    /// command, not the executed vector — failure diagnostics report the exact
+    /// executed argv (see <c>ShellCommandAuditor</c>), which may carry the
+    /// NuGet-home self-heal wrapper.
     /// </summary>
     public IReadOnlyList<string> Argv => BuildInvocation(TestSelection.All, CurrentRunOptions);
 
@@ -80,6 +89,12 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             argv.Add("--blame-hang-timeout");
             argv.Add(FormatHangTimeout(hang));
         }
+
+        if (DotnetTestArgv.FindBareAssemblyPositional(argv) is { } stray)
+            throw new InvalidOperationException(
+                $"Refusing to run 'dotnet test' with bare test-assembly positional '{stray}'. "
+                + "A bare .dll flips the command into VSTest passthrough, which rejects the source with "
+                + "'The argument ... is invalid' and runs zero tests. Use the project/solution form instead.");
 
         return argv;
     }
