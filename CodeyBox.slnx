@@ -58,7 +58,9 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/CodeyBox.Admin/src/CodeyBox.Admin.Web/CodeyBox.Admin.Web.csproj" />
+    <Project Path="tools/CodeyBox.Admin/src/CodeyBox.Admin.Model/CodeyBox.Admin.Model.csproj" />
     <Project Path="tools/CodeyBox.Admin/tests/CodeyBox.Admin.Tests/CodeyBox.Admin.Tests.csproj" />
+    <Project Path="tools/CodeyBox.Admin/tests/CodeyBox.Admin.Model.Tests/CodeyBox.Admin.Model.Tests.csproj" />
     <Project Path="tools/CodeyBox.Cli/CodeyBox.Cli.csproj" />
     <Project Path="tools/CodeyBox.Cli/tests/CodeyBox.Cli.Tests/CodeyBox.Cli.Tests.csproj" />
     <Project Path="tools/CodeyBox.Harness/CodeyBox.Harness.csproj" />

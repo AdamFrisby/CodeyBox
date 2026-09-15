@@ -152,5 +152,9 @@ tools/CodeyBox.Admin/
 │   ├── Models/                     # Local DTOs (no shared types)
 │   ├── Services/                   # CodeyBoxApiClient + interface
 │   └── wwwroot/css/admin.css       # Plain CSS, no JS frameworks
+├── src/CodeyBox.Admin.Model/       # Pure projection layer (chains, activity,
+│                                   # vitals, attention) — no I/O, no clock.
+│                                   # See its README for endpoint mapping.
 └── tests/CodeyBox.Admin.Tests/     # xUnit + bunit component tests
+└── tests/CodeyBox.Admin.Model.Tests/ # xUnit tests for the projection layer
 ```
