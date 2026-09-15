@@ -19,6 +19,29 @@ point is to be able to leave it running — see
 > Built in C#/.NET 10. Managed repos can be any stack — Python, Node, Go, Rust,
 > C#, or your own — through config-driven auditors.
 
+![The work queue — every item, its state, and the controls to steer it](screenshots/01-queue.png)
+
+## The admin UI
+
+Everything the orchestrator is doing is visible and steerable from a web admin
+on your host — pause the queue or a single project, inspect any item's timeline,
+audit reports, timings, costs and diff, and watch agent output live.
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/10-work-item-detail.png" alt="A single work item"><br><sub><b>One item, end to end</b> — state, branches, and tabs for its timeline, audit reports, timings, costs and diff.</sub></td>
+<td width="50%"><img src="screenshots/02-fleet.png" alt="Fleet view"><br><sub><b>Fleet</b> — per-project status, current phase, queued and in-flight counts, the last five outcomes, and spend.</sub></td>
+</tr>
+<tr>
+<td><img src="screenshots/05-capacity.png" alt="Capacity"><br><sub><b>Capacity</b> — where the worker slots are going and what is waiting on them.</sub></td>
+<td><img src="screenshots/06-releases.png" alt="Releases"><br><sub><b>Releases</b> — batch changes into a release branch and track it to landing.</sub></td>
+</tr>
+</table>
+
+More in [`screenshots/`](screenshots). They are generated from the real UI
+against a deterministic seeded instance — see
+[`tools/screenshots/`](tools/screenshots) to regenerate them.
+
 ## Why you might want this
 
 - **You have more coding work than reviewer attention.** Queue it. CodeyBox

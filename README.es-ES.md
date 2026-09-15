@@ -22,6 +22,30 @@ host, porque el objetivo es poder dejarlo en ejecución — consulta
 > stack —Python, Node, Go, Rust, C# o el tuyo propio— a través de auditores
 > impulsados por configuración.
 
+![La cola de trabajo: cada elemento, su estado y los controles para dirigirla](screenshots/01-queue.png)
+
+## La interfaz de administración
+
+Todo lo que el orquestador está haciendo es visible y dirigible desde un panel
+de administración web en tu host: pausa la cola o un solo proyecto, inspecciona
+la cronología de cualquier elemento, sus informes de auditoría, tiempos, costos
+y diff, y observa en vivo la salida del agente.
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/10-work-item-detail.png" alt="Un único elemento de trabajo"><br><sub><b>Un elemento, de principio a fin</b> — estado, ramas y pestañas para su cronología, informes de auditoría, tiempos, costos y diff.</sub></td>
+<td width="50%"><img src="screenshots/02-fleet.png" alt="Vista de la flota"><br><sub><b>Flota</b> — estado por proyecto, fase actual, recuentos en cola y en curso, los últimos cinco resultados y el gasto.</sub></td>
+</tr>
+<tr>
+<td><img src="screenshots/05-capacity.png" alt="Capacidad"><br><sub><b>Capacidad</b> — a dónde van las ranuras de trabajadores y qué está esperándolas.</sub></td>
+<td><img src="screenshots/06-releases.png" alt="Releases"><br><sub><b>Releases</b> — agrupa cambios en una rama de versión y haz su seguimiento hasta que se apliquen.</sub></td>
+</tr>
+</table>
+
+Hay más en [`screenshots/`](screenshots). Se generan desde la interfaz real
+contra una instancia con datos semilla deterministas; consulta
+[`tools/screenshots/`](tools/screenshots) para regenerarlas.
+
 ## Por qué podrías querer esto
 
 - **Tienes más trabajo de código que atención de revisión.** Ponlo en cola.
@@ -170,10 +194,10 @@ cd CodeyBox
 > Reubica a un lado un árbol no escribible (sin necesidad de root), preserva la
 > caché de paquetes poblada mediante un enlace simbólico para que la restauración
 > siga siendo segura sin conexión y siembra una configuración de usuario legible.
-> Si el propio home del CLI no es escribible y no se puede reubicar a un lado
-> —un montaje de solo lectura heredado, por ejemplo—, recurre a redirigir
-> `DOTNET_CLI_HOME` a un directorio temporal escribible para ese árbol de
-> procesos.
+> Si no se puede escribir en el propio `$HOME` —un montaje de solo lectura
+> heredado, por ejemplo—, ni siquiera es posible mover el árbol a un lado, así
+> que en su lugar redirige `DOTNET_CLI_HOME` a un directorio temporal escribible
+> para ese árbol de procesos.
 >
 > ```bash
 > ./build.sh                     # builds, healing the NuGet home first if needed

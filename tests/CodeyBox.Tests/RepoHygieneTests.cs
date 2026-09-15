@@ -111,4 +111,34 @@ public sealed class RepoHygieneTests
             + "silently, so the repository's pinned package sources stop applying: "
             + string.Join("; ", missing));
     }
+
+    /// <summary>
+    /// A README that shows a broken image is worse than one with no images —
+    /// it is the first thing a visitor sees. Assert every local image the
+    /// READMEs reference actually exists. Remote URLs are not checked.
+    /// </summary>
+    [Fact]
+    public void ReadmeImageReferencesResolve()
+    {
+        var root = FindRepoRoot();
+        var missing = new List<string>();
+
+        foreach (var readme in Directory.EnumerateFiles(root, "README*.md", SearchOption.TopDirectoryOnly))
+        {
+            var text = File.ReadAllText(readme);
+            var references = System.Text.RegularExpressions.Regex
+                .Matches(text, @"(?:!\[[^\]]*\]\(|<img[^>]*?src="")([^"")\s]+)")
+                .Select(m => m.Groups[1].Value)
+                .Where(r => !r.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                            && !r.StartsWith("data:", StringComparison.OrdinalIgnoreCase));
+
+            foreach (var reference in references)
+                if (!File.Exists(Path.Combine(root, reference)))
+                    missing.Add($"{Path.GetFileName(readme)} -> {reference}");
+        }
+
+        Assert.True(
+            missing.Count == 0,
+            "README references an image that does not exist: " + string.Join("; ", missing));
+    }
 }
