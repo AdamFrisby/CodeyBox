@@ -4908,10 +4908,47 @@ public sealed class SqliteWorkItemStore :
         }
     }
 
-    private async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
+    // Reader connections register per-connection scalar functions, so closing
+    // one while an in-flight statement still references those functions
+    // intermittently throws SQLITE_BUSY out of SqliteConnection.Deactivate
+    // (observed as Dispatch_PicksHigherPriorityFirst failing inside a polling
+    // GetAsync racing a live orchestrator). The handle is being discarded
+    // either way, so disposal swallows exactly the classified teardown race
+    // and lets every other error propagate unchanged.
+    internal sealed class TolerantReadConnection : SqliteConnection
+    {
+        public TolerantReadConnection(string connectionString)
+            : base(connectionString)
+        {
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            try
+            {
+                base.Dispose(disposing);
+            }
+            catch (NullReferenceException ex) when (SqliteConnectionDisposal.IsSqliteTeardownRace(ex))
+            {
+                // Internal Sqlite teardown race; safe to ignore because the connection is being discarded.
+            }
+            catch (InvalidOperationException ex) when (SqliteConnectionDisposal.IsSqliteTeardownRace(ex))
+            {
+                // SqliteCommand.DisposePreparedStatements race against an in-flight finalize.
+            }
+            catch (SqliteException ex) when (SqliteConnectionDisposal.IsBusySqliteTeardownRace(ex))
+            {
+                // SqliteConnection.Deactivate can report active statements as SQLITE_BUSY while closing.
+            }
+        }
+    }
+
+    // Internal (rather than private) so the regression test can verify the
+    // read seam hands out teardown-tolerant connections.
+    internal async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        var conn = new SqliteConnection(_connectionString);
+        var conn = new TolerantReadConnection(_connectionString);
         await conn.OpenAsync(ct);
 
         // Reader connections must expose the same scalar functions as the
