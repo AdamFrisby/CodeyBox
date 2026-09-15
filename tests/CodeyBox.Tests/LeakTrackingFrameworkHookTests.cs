@@ -6,6 +6,7 @@ public sealed class LeakTrackingFrameworkHookTests
 {
     private const string SentinelDirectoryEnvironmentVariable = "CODEYBOX_TESTS_LEAK_TRACKING_FRAMEWORK_SENTINEL_DIR";
     private const string SentinelTestName = nameof(Sentinel_LeaksTrackedWatcher_WhenNestedRunnerEnablesIt);
+    private const string HangSentinelTestName = nameof(Sentinel_HangsOnUnsignalledGate_WhenNestedRunnerEnablesIt);
 
     [Fact]
     public async Task XunitFramework_ReportsTrackedWatcherLeak_AfterRealTestCaseCompletes()
@@ -47,6 +48,52 @@ public sealed class LeakTrackingFrameworkHookTests
         Assert.True(TestFileSystemWatcherLeakTracker.IsTrackingPath(path));
     }
 
+    [Fact]
+    public async Task XunitFramework_FailsUnsignalledTestWithinBoundedTime_WithNamingDiagnostic()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "codeybox-hang-framework-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var startedAt = DateTimeOffset.UtcNow;
+            var result = await RunSentinelTestAsync(
+                tempDir,
+                HangSentinelTestName,
+                new Dictionary<string, string>
+                {
+                    [LeakTrackingTestFramework.TestRunGuard.CaseTimeoutEnvironmentVariable] = "10",
+                    [LeakTrackingTestFramework.TestRunGuard.RunTimeoutEnvironmentVariable] = "120",
+                    [LeakTrackingTestFramework.TestRunGuard.RunStallTimeoutEnvironmentVariable] = "120",
+                },
+                outerTimeoutSeconds: 150);
+            var output = result.Stdout + result.Stderr;
+
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("timed out after", output);
+            Assert.Contains(HangSentinelTestName, output);
+            Assert.True(
+                DateTimeOffset.UtcNow - startedAt < TimeSpan.FromSeconds(140),
+                $"Nested run with an unsignalled test must fail within a bounded time; output: {output}");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [SentinelFact]
+    public async Task Sentinel_HangsOnUnsignalledGate_WhenNestedRunnerEnablesIt()
+    {
+        var tempDir = Environment.GetEnvironmentVariable(SentinelDirectoryEnvironmentVariable);
+        Assert.False(
+            string.IsNullOrWhiteSpace(tempDir),
+            $"{SentinelDirectoryEnvironmentVariable} must be set by the nested runner.");
+
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await gate.Task;
+    }
+
     public sealed class SentinelFactAttribute : FactAttribute
     {
         public SentinelFactAttribute()
@@ -57,9 +104,16 @@ public sealed class LeakTrackingFrameworkHookTests
     }
 
     private static async Task<(int ExitCode, string Stdout, string Stderr)> RunSentinelTestAsync(string tempDir)
+        => await RunSentinelTestAsync(tempDir, SentinelTestName, new Dictionary<string, string>(), outerTimeoutSeconds: 60);
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunSentinelTestAsync(
+        string tempDir,
+        string sentinelTestName,
+        Dictionary<string, string> extraEnvironment,
+        int outerTimeoutSeconds = 60)
     {
         var testAssembly = typeof(LeakTrackingFrameworkHookTests).Assembly.Location;
-        var filter = $"FullyQualifiedName={typeof(LeakTrackingFrameworkHookTests).FullName}.{SentinelTestName}";
+        var filter = $"FullyQualifiedName={typeof(LeakTrackingFrameworkHookTests).FullName}.{sentinelTestName}";
         var psi = new ProcessStartInfo
         {
             FileName = "dotnet",
@@ -75,12 +129,14 @@ public sealed class LeakTrackingFrameworkHookTests
         psi.ArgumentList.Add("console;verbosity=detailed");
         psi.Environment[SentinelDirectoryEnvironmentVariable] = tempDir;
         psi.Environment[TestFileSystemWatcherLeakTracker.DisableProcessExitReportEnvironmentVariable] = "1";
+        foreach (var pair in extraEnvironment)
+            psi.Environment[pair.Key] = pair.Value;
 
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start dotnet test.");
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(outerTimeoutSeconds));
         try
         {
             await process.WaitForExitAsync(timeout.Token);
