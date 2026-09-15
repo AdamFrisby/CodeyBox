@@ -18,6 +18,29 @@ public static class AdminSeededCommand
     public const string DefaultApiUrl = "http://localhost:5050";
     public const string DefaultAdminUrl = "http://localhost:5070";
 
+    /// <summary>
+    /// Exact command that produces the Release outputs <c>serve</c> runs via
+    /// <c>dotnet run --no-build -c Release</c>. Named verbatim in the
+    /// missing-output error so the operator can copy-paste the fix.
+    /// </summary>
+    public const string RequiredBuildCommand = "dotnet build CodeyBox.slnx -c Release";
+
+    /// <summary>
+    /// Children <c>serve</c> supervises: (supervisor name, project path
+    /// relative to the repo root, as passed to <c>dotnet run --project</c>).
+    /// </summary>
+    internal static readonly IReadOnlyList<(string Name, string ProjectRelPath)> ServeChildProjects =
+    [
+        ("codeybox-api", Path.Combine("src", "CodeyBox.Api")),
+        ("codeybox-admin-web", Path.Combine("tools", "CodeyBox.Admin", "src", "CodeyBox.Admin.Web")),
+    ];
+
+    private const int ReadinessPollSeconds = 5;
+    private const int ReadinessProbeTimeoutSeconds = 5;
+    private const int LogTailMaxLines = 20;
+    private const int LogTailMaxChars = 4000;
+    private const long LogTailMaxReadBytes = 65536;
+
     public enum ParseStatus { Ok, Usage, Invalid }
 
     public sealed record Parsed(
@@ -167,6 +190,13 @@ public static class AdminSeededCommand
 
     private static async Task<int> RunServeAsync(Parsed parsed, TextWriter output, TextWriter error, CancellationToken ct)
     {
+        var missing = FindMissingReleaseOutputs(parsed.RepoRoot);
+        if (missing.Count > 0)
+        {
+            error.WriteLine(FormatMissingReleaseMessage(missing));
+            return 1;
+        }
+
         var logDir = Environment.GetEnvironmentVariable("CODEYBOX_SEED_LOG_DIR");
         if (string.IsNullOrWhiteSpace(logDir))
             logDir = Path.Combine(Path.GetTempPath(), "codeybox-admin-seed", "logs");
@@ -189,16 +219,16 @@ public static class AdminSeededCommand
 
         var apiLog = Path.Combine(logDir, "codeybox-api.log");
         var adminLog = Path.Combine(logDir, "codeybox-admin-web.log");
-        using var api = StartChild("codeybox-api", "src/CodeyBox.Api", parsed.RepoRoot, apiEnv, apiLog);
-        using var admin = StartChild(
-            "codeybox-admin-web", Path.Combine("tools", "CodeyBox.Admin", "src", "CodeyBox.Admin.Web"),
+        using var api = StartChild(ServeChildProjects[0].Name, ServeChildProjects[0].ProjectRelPath, parsed.RepoRoot, apiEnv, apiLog);
+        using var admin = StartChild(ServeChildProjects[1].Name, ServeChildProjects[1].ProjectRelPath,
             parsed.RepoRoot, adminEnv, adminLog);
+        IServeChild[] children = [api, admin];
 
         try
         {
             using var timeout = new CancellationTokenSource(parsed.ReadyTimeout);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
-            await WaitForReadyAsync(parsed.ApiUrl, parsed.AdminUrl, output, linked.Token).ConfigureAwait(false);
+            await WaitForReadyAsync(parsed.ApiUrl, parsed.AdminUrl, children, output, linked.Token).ConfigureAwait(false);
 
             if (parsed.FreezeQueue)
                 await FreezeQueueAsync(parsed.ApiUrl, output).ConfigureAwait(false);
@@ -208,9 +238,18 @@ public static class AdminSeededCommand
             await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
             return 0;
         }
+        catch (ChildExitException ex)
+        {
+            error.WriteLine(ex.Message);
+            return 1;
+        }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            error.WriteLine($"Serve timed out waiting for readiness within {parsed.ReadyTimeout}.");
+            var exited = children.FirstOrDefault(c => c.HasExited);
+            if (exited is not null)
+                error.WriteLine(FormatChildExitMessage(exited.Name, exited.ExitCode, exited.LogPath, ReadLogTail(exited.LogPath)));
+            else
+                error.WriteLine($"Serve timed out waiting for readiness within {parsed.ReadyTimeout}.");
             return 1;
         }
         catch (Exception ex)
@@ -312,21 +351,125 @@ public static class AdminSeededCommand
         }
     }
 
-    private static async Task WaitForReadyAsync(string apiUrl, string adminUrl, TextWriter output, CancellationToken ct)
+    /// <summary>
+    /// Finds the <c>serve</c> children whose Release output is absent: the
+    /// <c>bin/Release</c> directory under each child project must exist and be
+    /// non-empty, otherwise <c>dotnet run --no-build -c Release</c> exits
+    /// immediately. Returns (child name, expected directory) per gap.
+    /// </summary>
+    internal static IReadOnlyList<(string Name, string ExpectedDir)> FindMissingReleaseOutputs(string repoRoot)
     {
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        var missing = new List<(string Name, string ExpectedDir)>();
+        foreach (var (name, rel) in ServeChildProjects)
+        {
+            var dir = Path.Combine(repoRoot, rel, "bin", "Release");
+            if (!Directory.Exists(dir) || !Directory.EnumerateFileSystemEntries(dir).Any())
+                missing.Add((name, dir));
+        }
+        return missing;
+    }
+
+    internal static string FormatMissingReleaseMessage(IReadOnlyList<(string Name, string ExpectedDir)> missing)
+    {
+        var details = string.Join("; ", missing.Select(m => $"'{m.Name}' (expected at '{m.ExpectedDir}')"));
+        return $"Serve cannot start: missing Release build output for {details}. " +
+            $"The seeded serve runs children with 'dotnet run --no-build -c Release'. " +
+            $"Build it first with: {RequiredBuildCommand}";
+    }
+
+    /// <summary>
+    /// Bounds-checked tail of a child log file. Reads at most the last
+    /// <c>LogTailMaxReadBytes</c> bytes (the writer may still hold the file
+    /// open, hence <c>FileShare.ReadWrite</c>), then keeps the last
+    /// <paramref name="maxLines"/> lines capped at <paramref name="maxChars"/>
+    /// characters. Control characters are stripped so pasting hostile child
+    /// output into a terminal cannot smuggle escape sequences.
+    /// </summary>
+    internal static string ReadLogTail(string logPath, int maxLines = LogTailMaxLines, int maxChars = LogTailMaxChars)
+    {
+        string text;
+        try
+        {
+            using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (stream.Length > LogTailMaxReadBytes)
+                stream.Seek(-LogTailMaxReadBytes, SeekOrigin.End);
+            using var reader = new StreamReader(stream);
+            text = reader.ReadToEnd();
+        }
+        catch (IOException)
+        {
+            return $"(log unavailable at '{logPath}')";
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return $"(log unavailable at '{logPath}')";
+        }
+
+        var lines = text.Split('\n');
+        var tail = string.Join('\n', lines.Skip(Math.Max(0, lines.Length - maxLines)));
+        if (tail.Length > maxChars)
+            tail = tail[^maxChars..];
+        return SanitizeForTerminal(tail.Trim('\n'));
+    }
+
+    internal static string SanitizeForTerminal(string text)
+    {
+        var kept = new System.Text.StringBuilder(text.Length);
+        foreach (var ch in text)
+        {
+            if (ch is '\n' or '\t')
+                kept.Append(ch);
+            else if (!char.IsControl(ch))
+                kept.Append(ch);
+        }
+        return kept.ToString();
+    }
+
+    internal static string FormatChildExitMessage(string childName, int exitCode, string logPath, string logTail) =>
+        $"Serve failed: child '{childName}' exited with code {exitCode.ToString(CultureInfo.InvariantCulture)} " +
+        $"before readiness. Last log lines from '{logPath}':{Environment.NewLine}{logTail}";
+
+    private static async Task WaitForReadyAsync(
+        string apiUrl, string adminUrl, IReadOnlyList<IServeChild> children, TextWriter output, CancellationToken ct)
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(ReadinessProbeTimeoutSeconds) };
+        var apiHealth = $"{apiUrl.TrimEnd('/')}/healthz";
+        await WaitForReadyAsync(
+            async token => (
+                await ProbeAsync(http, apiHealth, token).ConfigureAwait(false),
+                await ProbeAsync(http, adminUrl, token).ConfigureAwait(false)),
+            children, output, TimeSpan.FromSeconds(ReadinessPollSeconds), ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Readiness supervisor: polls <paramref name="probe"/> until both sides
+    /// report ready, but checks supervised <paramref name="children"/> for an
+    /// early exit on every iteration and throws <see cref="ChildExitException"/>
+    /// — carrying the child name, exit code, and captured-log tail — instead of
+    /// polling on into a misleading readiness timeout. The probe is injectable
+    /// so the fail-fast behavior is unit-testable without real processes.
+    /// </summary>
+    internal static async Task WaitForReadyAsync(
+        Func<CancellationToken, Task<(bool ApiOk, bool AdminOk)>> probe,
+        IReadOnlyList<IServeChild> children,
+        TextWriter output,
+        TimeSpan pollInterval,
+        CancellationToken ct)
+    {
         var attempt = 0;
         while (true)
         {
             ct.ThrowIfCancellationRequested();
+            var exited = children.FirstOrDefault(c => c.HasExited);
+            if (exited is not null)
+                throw new ChildExitException(exited.Name, exited.ExitCode, exited.LogPath, ReadLogTail(exited.LogPath));
             attempt++;
-            var apiOk = await ProbeAsync(http, $"{apiUrl.TrimEnd('/')}/healthz", ct).ConfigureAwait(false);
-            var adminOk = await ProbeAsync(http, adminUrl, ct).ConfigureAwait(false);
+            var (apiOk, adminOk) = await probe(ct).ConfigureAwait(false);
             if (apiOk && adminOk)
                 return;
             if (attempt % 6 == 0)
                 output.WriteLine($"Waiting for seeded instance (attempt {attempt}): api={apiOk} admin={adminOk} …");
-            await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+            await Task.Delay(pollInterval, ct).ConfigureAwait(false);
         }
     }
 
@@ -370,7 +513,38 @@ public static class AdminSeededCommand
         }
     }
 
-    private sealed class ChildProcess : IDisposable
+    /// <summary>Supervised child process: the readiness wait polls this (it must
+    /// stay valid until the supervisor disposes it) and reports early exits
+    /// with the child name, exit code, and captured-log tail.</summary>
+    internal interface IServeChild
+    {
+        string Name { get; }
+        bool HasExited { get; }
+        int ExitCode { get; }
+        string LogPath { get; }
+    }
+
+    /// <summary>Thrown when a supervised child exits before readiness is
+    /// reached. The message names the child, its exit code, and the tail of
+    /// its captured log, so the operator sees the cause instead of a timeout.</summary>
+    internal sealed class ChildExitException : Exception
+    {
+        public ChildExitException(string childName, int exitCode, string logPath, string logTail)
+            : base(FormatChildExitMessage(childName, exitCode, logPath, logTail))
+        {
+            ChildName = childName;
+            ExitCode = exitCode;
+            LogPath = logPath;
+            LogTail = logTail;
+        }
+
+        public string ChildName { get; }
+        public int ExitCode { get; }
+        public string LogPath { get; }
+        public string LogTail { get; }
+    }
+
+    private sealed class ChildProcess : IDisposable, IServeChild
     {
         public ChildProcess(string name, Process process, StreamWriter log, string logPath)
         {
@@ -384,6 +558,8 @@ public static class AdminSeededCommand
         public Process Process { get; }
         public StreamWriter Log { get; }
         public string LogPath { get; }
+        public bool HasExited => Process.HasExited;
+        public int ExitCode => Process.ExitCode;
 
         public void Dispose()
         {
@@ -408,5 +584,8 @@ public static class AdminSeededCommand
         error.WriteLine("  --repo-root <path>      Repository checkout to run from (serve; default: cwd).");
         error.WriteLine("  --live                  Do not freeze the queue on boot (serve freezes by default).");
         error.WriteLine("  --ready-timeout-sec <n> Readiness budget 1..1800 (serve; default: 120).");
+        error.WriteLine();
+        error.WriteLine("serve runs its children with 'dotnet run --no-build -c Release';");
+        error.WriteLine($"build the Release outputs first with: {RequiredBuildCommand}");
     }
 }

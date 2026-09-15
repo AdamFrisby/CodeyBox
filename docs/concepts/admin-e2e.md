@@ -37,6 +37,21 @@ queue on boot so seeded states stay deterministic (`--live` opts out), and
 tears both children down on Ctrl+C. Usable for manual demos and exploratory
 runs, not just E2E.
 
+**Build prerequisite:** `serve` launches its children with
+`dotnet run --no-build -c Release`, so the Release outputs must exist first:
+
+```bash
+dotnet build CodeyBox.slnx -c Release
+```
+
+(A plain `dotnet build CodeyBox.slnx` produces Debug outputs only, which
+`serve` cannot use.) If the Release outputs are missing, `serve` refuses to
+start and prints that build command. If a child exits while `serve` waits
+for readiness, `serve` fails immediately naming the child, its exit code,
+and the tail of its captured log (`codeybox-api.log` /
+`codeybox-admin-web.log` under `$CODEYBOX_SEED_LOG_DIR` or the temp
+`codeybox-admin-seed` directory) instead of timing out.
+
 `CodeyBoxAdminRecipe` (`src/CodeyBox.ExploratoryTesting/Recipes/`) wires
 this into the graphical-sandbox harness: build steps, a deterministic
 reset+seed step, and a serve run step exposing Admin.Web at
