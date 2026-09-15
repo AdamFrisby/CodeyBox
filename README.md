@@ -42,7 +42,7 @@ flowchart TD
     subgraph atomic["Atomic — lands cleanly or not at all"]
         W -->|"'plan' knob set"| P0["0 · Plan (optional) · draft + review a plan artifact first"]
         P0 --> P1
-        W --> P1["1 · Work · run the agent, commit, push a branch"]
+        W -->|"no 'plan' knob"| P1["1 · Work · run the agent, commit, push a branch"]
         P1 --> P2["2 · Audit · tool + LLM review"]
         P2 -->|"findings"| RW["Rework"]
         RW --> P2
@@ -101,81 +101,67 @@ anything that matters.
 
 ## Quickstart
 
-Install the [.NET 10 SDK](https://dotnet.microsoft.com/download), Git, a sandbox
-provider, and at least one authenticated agent CLI. Then:
+On a Linux host, the fastest path — it checks prerequisites, installs what is
+missing, offers to set up host network isolation, builds, and writes a starter
+config:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AdamFrisby/CodeyBox/main/install.sh | bash
+```
+
+It is idempotent, prompts before anything with side effects, and refuses to
+continue silently if host network isolation could not be set up. It does steps
+**1 to 3** for you and prints where it put the config, so when it finishes go
+straight to **step 4**.
+
+Because the script arrives on stdin, flags need `bash -s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AdamFrisby/CodeyBox/main/install.sh | bash -s -- --yes
+curl -fsSL https://raw.githubusercontent.com/AdamFrisby/CodeyBox/main/install.sh | bash -s -- --help
+```
+
+### Step by step
+
+Follow all four steps to set up by hand. Use them on macOS and Windows too,
+where the installer does not run and only the remote-executor topology is
+supported.
+
+**1. Install prerequisites** — the [.NET 10 SDK](https://dotnet.microsoft.com/download),
+Git, a sandbox provider, and at least one authenticated agent CLI.
+
+**2. Clone and build.** Use `./build.sh` on Linux and macOS — it heals an
+unwritable NuGet home first (see below). On Windows use `./build.ps1`, which
+forwards to `dotnet` with the same telemetry settings.
 
 ```bash
 git clone https://github.com/AdamFrisby/CodeyBox.git
 cd CodeyBox
-dotnet build CodeyBox.slnx
+./build.sh          # Windows: ./build.ps1
 ```
 
-> The repository supplies its package sources through `Directory.Build.props` for
-> direct project builds and `Directory.Solution.props` for solution builds. Both
-> resolve `NuGet.Config` relative to the repository, so package-source selection is
-> independent of the caller's working directory. NuGet still inspects — and creates,
-> when absent — user-level configuration under `$HOME/.nuget/NuGet/`, so it needs a
-> **writable** location for that directory. In locked-down environments where the
-> inherited path is not writable (for example a home baked read-only or owned by
-> another user), NuGet otherwise aborts restore with an unauthorized-access error
-> (`Failed to read NuGet.Config due to unauthorized access`) for every project — a
-> checked-in `NuGet.Config` or `--configfile` does not help, because NuGet still
-> probes the user settings directory regardless.
+> **If restore fails with `Failed to read NuGet.Config due to unauthorized access`:**
+> This applies to `install.sh` too, since it builds the same way. NuGet
+> probes user-level configuration under `$HOME/.nuget/NuGet/` regardless of what
+> the repository pins, so it needs that directory to be writable. A home baked
+> read-only, or owned by another user, aborts restore for every project — and a
+> checked-in config or `--configfile` does not help, because NuGet probes the
+> user settings directory anyway.
 >
-> The repository heals this automatically for **any** `dotnet` invocation, including
-> the bare `dotnet build`/`dotnet test` the CI and audit gates run directly.
-> `Directory.Build.props` and `Directory.Solution.props` carry an MSBuild
-> `InitialTargets` hook (defined once in `Directory.NuGetHomeHeal.targets`) that runs
-> at the very start of every MSBuild invocation — before NuGet's user-config read, at
-> both the solution and project level. When it finds the inherited `.nuget/NuGet`
-> unusable it quarantines it aside and recreates a writable one, preserving the baked
-> package cache via symlink so restore stays offline-safe; when the home is already
-> usable it is a no-op. So `dotnet build CodeyBox.slnx`, `dotnet build
-> --no-incremental /warnaserror`, and `dotnet test --no-build` all self-heal with no
-> wrapper or environment override. (The hook is POSIX-shell based and conditioned to
-> Unix; on Windows keep the home writable.)
+> `./build.sh` handles this for you: it sources
+> [`scripts/nuget-home-heal.sh`](scripts/nuget-home-heal.sh), which is the single
+> source of truth for the repair and is shared with the audit path. It relocates
+> an unwritable tree aside (no root needed), preserves the populated package
+> cache by symlink so restore stays offline-safe, and seeds a readable user
+> config. If `$HOME` itself cannot be written to — an inherited read-only mount,
+> say — then even moving the tree aside is impossible, so it instead redirects
+> `DOTNET_CLI_HOME` to a writable scratch directory for that process tree.
 >
-> `./build.sh` applies the same recovery for non-MSBuild callers: it probes the
-> inherited `.nuget/NuGet` directory and, when it is not writable, quarantines it
-> aside and recreates a writable one (falling back to a scratch `DOTNET_CLI_HOME` only
-> when `$HOME` itself is unwritable), then forwards any arguments straight to `dotnet`
-> — for example `./build.sh build --no-incremental -warnaserror` or `./build.sh test
-> --no-build CodeyBox.slnx`; with no arguments it builds the whole solution. The heal
-> logic in both paths is the single source of truth in `scripts/nuget-home-heal.sh`.
->
-> If you would rather fix the condition at its source — a baseline image that bakes
-> `$HOME/.nuget` owned by another account, so every COW clone inherits it — heal it
-> once at environment/baseline provisioning time instead (fixing ownership with
-> `chown -R "$(id -u):$(id -g)" ~/.nuget`, pointing `DOTNET_CLI_HOME` at a writable
-> directory, or applying the following probe-then-quarantine recipe):
->
-> ```sh
-> # Probe first and only heal when the home is genuinely unusable, exactly like the
-> # in-tree recovery, so the recipe is safe to re-run (a second pass on an
-> # already-healed home is a no-op instead of quarantining the good tree). $HOME
-> # is writable even when $HOME/.nuget is not, so rename the broken tree aside
-> # (no root needed) into a unique, PID-suffixed name — never a fixed one that a
-> # re-run would move the recovered tree into — recreate a writable one, and
-> # preserve the populated package cache via symlink so restore stays
-> # offline-safe. Seed a readable user config too: the fatal gate error is a
-> # *read* failure, so pre-writing the file guarantees the read succeeds without
-> # relying on NuGet creating it later.
-> if ! ( mkdir -p "$HOME/.nuget/NuGet" \
->          && [ ! -e "$HOME/.nuget/NuGet/NuGet.Config" -o -r "$HOME/.nuget/NuGet/NuGet.Config" ] \
->          && touch "$HOME/.nuget/NuGet/.probe" ) 2>/dev/null; then
->   quarantine="$HOME/.nuget.unwritable.$$" \
->     && mv "$HOME/.nuget" "$quarantine" \
->     && mkdir -p "$HOME/.nuget/NuGet" \
->     && ln -s "$quarantine/packages" "$HOME/.nuget/packages" \
->     && printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration />' \
->          > "$HOME/.nuget/NuGet/NuGet.Config"
-> fi
-> rm -f "$HOME/.nuget/NuGet/.probe" 2>/dev/null || true
+> ```bash
+> ./build.sh                     # builds, healing the NuGet home first if needed
+> . scripts/nuget-home-heal.sh   # or just heal the current shell
 > ```
->
-> Verified both ways: with the home healed (in-tree or at the baseline)
-> `dotnet build CodeyBox.slnx` is 0 warnings / 0 errors and the solution-level
-> `dotnet test --no-build` runs clean.
+
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
@@ -236,7 +222,7 @@ Recovery procedures are in
   → [`docs/operating/host-firewall.md`](docs/operating/host-firewall.md)
 - **Quality gates you stack.** Compose exactly which auditors must pass before a
   merge — tool checks (format/build/test, gitleaks, semgrep) and LLM reviews
-  (security, architecture, quality, completeness, anti-cheating, tests) — and
+  (security, architecture, quality, completeness, cheating, tests) — and
   nothing lands until it clears all of them.
   → [Quality gates you control](#quality-gates-you-control)
 - **Per-item cost tracking.** Every work item's token spend is tracked by phase
@@ -392,8 +378,8 @@ both Incus and Multipass. Turn it on **per project** with
 ## Going to production
 
 1. **Choose the provider deliberately.** Prefer Incus for persistent,
-   high-throughput headless operation; use Multipass when simpler setup or
-   graphical sandboxes matter more. Follow
+   high-throughput headless operation; use Multipass for the simplest setup.
+   (Graphical sandboxes are not a differentiator — they work on both.) Follow
    [`docs/concepts/sandboxes.md`](docs/concepts/sandboxes.md), including Incus
    storage-pool and service-identity prerequisites.
 2. **Set up host egress** once, with sudo: `scripts/setup-host-networks.sh`

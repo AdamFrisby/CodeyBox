@@ -48,7 +48,7 @@ flowchart TD
     subgraph atomic["Atomic — lands cleanly or not at all"]
         W -->|"'plan' knob set"| P0["0 · Plan (optional) · draft + review a plan artifact first"]
         P0 --> P1
-        W --> P1["1 · Work · run the agent, commit, push a branch"]
+        W -->|"no 'plan' knob"| P1["1 · Work · run the agent, commit, push a branch"]
         P1 --> P2["2 · Audit · tool + LLM review"]
         P2 -->|"findings"| RW["Rework"]
         RW --> P2
@@ -117,91 +117,69 @@ que importe.
 
 ## Inicio rápido
 
-Instala el [.NET 10 SDK](https://dotnet.microsoft.com/download), Git, un
-proveedor de entornos aislados y al menos un CLI de agente autenticado. Luego:
+En un host Linux, la vía más rápida —comprueba los prerrequisitos, instala lo que
+falte, ofrece configurar el aislamiento de red del host, compila y escribe una
+configuración inicial—:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AdamFrisby/CodeyBox/main/install.sh | bash
+```
+
+Es idempotente, pregunta antes de cualquier acción con efectos secundarios y se
+niega a continuar en silencio si no se pudo configurar el aislamiento de red del
+host. Hace los pasos **1 a 3** por ti e imprime dónde dejó la configuración, así
+que cuando termine, ve directamente al **paso 4**.
+
+Como el script llega por stdin, los flags necesitan `bash -s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AdamFrisby/CodeyBox/main/install.sh | bash -s -- --yes
+curl -fsSL https://raw.githubusercontent.com/AdamFrisby/CodeyBox/main/install.sh | bash -s -- --help
+```
+
+### Paso a paso
+
+Sigue los cuatro pasos para configurarlo a mano, y en macOS o Windows, donde el
+instalador no se ejecuta y solo se admite la topología de ejecutor remoto.
+
+**1. Instala los prerrequisitos** — el [.NET 10 SDK](https://dotnet.microsoft.com/download),
+Git, un proveedor de entornos aislados y al menos un CLI de agente autenticado.
+
+**2. Clona y compila.** Usa `./build.sh` en Linux y macOS: primero sana un home
+de NuGet no escribible (ver abajo). En Windows usa `./build.ps1`, que reenvía a
+`dotnet` con la misma configuración de telemetría.
 
 ```bash
 git clone https://github.com/AdamFrisby/CodeyBox.git
 cd CodeyBox
-dotnet build CodeyBox.slnx
+./build.sh          # Windows: ./build.ps1
 ```
 
-> El repositorio proporciona sus orígenes de paquetes mediante
-> `Directory.Build.props` para las compilaciones directas de proyecto y
-> `Directory.Solution.props` para las compilaciones de solución. Ambos resuelven
-> `NuGet.Config` de forma relativa al repositorio, por lo que la selección del
-> origen de paquetes es independiente del directorio de trabajo de quien invoca.
-> Aun así, NuGet inspecciona —y crea, cuando no existe— la configuración de nivel
-> de usuario bajo `$HOME/.nuget/NuGet/`, así que necesita una ubicación
-> **escribible** para ese directorio. En entornos restringidos donde la ruta
-> heredada no es escribible (por ejemplo, un home horneado como solo lectura o
-> propiedad de otro usuario), NuGet aborta la restauración con un error de acceso
-> no autorizado (`Failed to read NuGet.Config due to unauthorized access`) para
-> cada proyecto: ni un `NuGet.Config` versionado ni `--configfile` ayudan, porque
-> NuGet sondea el directorio de configuración de usuario de todos modos.
+> **Si la restauración falla con `Failed to read NuGet.Config due to unauthorized access`:**
+> Esto también se aplica a `install.sh`, ya que compila de la misma forma. NuGet
+> sondea la configuración de nivel de usuario bajo `$HOME/.nuget/NuGet/`
+> independientemente de lo que fije el repositorio, así que necesita que ese
+> directorio sea escribible. Un home horneado como solo lectura, o propiedad de
+> otro usuario, aborta la restauración para cada proyecto, y ni una configuración
+> versionada ni `--configfile` ayudan, porque NuGet sondea el directorio de
+> configuración de usuario de todos modos.
 >
-> El repositorio subsana esto automáticamente para **cualquier** invocación de
-> `dotnet`, incluidos los `dotnet build`/`dotnet test` pelados que ejecutan
-> directamente la CI y las puertas de auditoría. `Directory.Build.props` y
-> `Directory.Solution.props` llevan un hook `InitialTargets` de MSBuild (definido
-> una sola vez en `Directory.NuGetHomeHeal.targets`) que se ejecuta al inicio
-> mismo de cada invocación de MSBuild —antes de que NuGet lea la configuración de
-> usuario, tanto a nivel de solución como de proyecto—. Cuando encuentra
-> inutilizable el `.nuget/NuGet` heredado, lo pone en cuarentena a un lado y
-> recrea uno escribible, preservando la caché de paquetes horneada mediante un
-> enlace simbólico para que la restauración siga siendo segura sin conexión;
-> cuando el home ya es utilizable, no hace nada. Así,
-> `dotnet build CodeyBox.slnx`, `dotnet build --no-incremental /warnaserror` y
-> `dotnet test --no-build` se autorreparan sin envoltorio ni anulación de
-> entorno. (El hook
-> está basado en shell POSIX y condicionado a Unix; en Windows, mantén el home
-> escribible).
+> `./build.sh` se encarga de esto por ti: incorpora (source)
+> [`scripts/nuget-home-heal.sh`](scripts/nuget-home-heal.sh), que es la única
+> fuente de verdad de la reparación y se comparte con la ruta de auditoría.
+> Reubica a un lado un árbol no escribible (sin necesidad de root), preserva la
+> caché de paquetes poblada mediante un enlace simbólico para que la restauración
+> siga siendo segura sin conexión y siembra una configuración de usuario legible.
+> Si el propio home del CLI no es escribible y no se puede reubicar a un lado
+> —un montaje de solo lectura heredado, por ejemplo—, recurre a redirigir
+> `DOTNET_CLI_HOME` a un directorio temporal escribible para ese árbol de
+> procesos.
 >
-> `./build.sh` aplica la misma recuperación para quienes invocan fuera de
-> MSBuild: sondea el directorio `.nuget/NuGet` heredado y, cuando no es
-> escribible, lo pone en cuarentena a un lado y recrea uno escribible (recurriendo
-> a un `DOTNET_CLI_HOME` temporal solo cuando el propio `$HOME` no es escribible);
-> después reenvía cualquier argumento directamente a `dotnet` —por ejemplo
-> `./build.sh build --no-incremental -warnaserror` o
-> `./build.sh test --no-build CodeyBox.slnx`—; sin argumentos, compila la
-> solución completa. La lógica de
-> reparación de ambas rutas tiene una única fuente de verdad en
-> `scripts/nuget-home-heal.sh`.
->
-> Si prefieres corregir la condición en su origen —una imagen base que hornea
-> `$HOME/.nuget` como propiedad de otra cuenta, de modo que cada clon COW lo
-> hereda—, subsánalo una sola vez en el aprovisionamiento del entorno o de la
-> imagen base (corrigiendo la propiedad con
-> `chown -R "$(id -u):$(id -g)" ~/.nuget`, apuntando `DOTNET_CLI_HOME` a un
-> directorio escribible o aplicando la siguiente receta de sondeo y cuarentena):
->
-> ```sh
-> # Probe first and only heal when the home is genuinely unusable, exactly like the
-> # in-tree recovery, so the recipe is safe to re-run (a second pass on an
-> # already-healed home is a no-op instead of quarantining the good tree). $HOME
-> # is writable even when $HOME/.nuget is not, so rename the broken tree aside
-> # (no root needed) into a unique, PID-suffixed name — never a fixed one that a
-> # re-run would move the recovered tree into — recreate a writable one, and
-> # preserve the populated package cache via symlink so restore stays
-> # offline-safe. Seed a readable user config too: the fatal gate error is a
-> # *read* failure, so pre-writing the file guarantees the read succeeds without
-> # relying on NuGet creating it later.
-> if ! ( mkdir -p "$HOME/.nuget/NuGet" \
->          && [ ! -e "$HOME/.nuget/NuGet/NuGet.Config" -o -r "$HOME/.nuget/NuGet/NuGet.Config" ] \
->          && touch "$HOME/.nuget/NuGet/.probe" ) 2>/dev/null; then
->   quarantine="$HOME/.nuget.unwritable.$$" \
->     && mv "$HOME/.nuget" "$quarantine" \
->     && mkdir -p "$HOME/.nuget/NuGet" \
->     && ln -s "$quarantine/packages" "$HOME/.nuget/packages" \
->     && printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration />' \
->          > "$HOME/.nuget/NuGet/NuGet.Config"
-> fi
-> rm -f "$HOME/.nuget/NuGet/.probe" 2>/dev/null || true
+> ```bash
+> ./build.sh                     # builds, healing the NuGet home first if needed
+> . scripts/nuget-home-heal.sh   # or just heal the current shell
 > ```
->
-> Verificado de ambas maneras: con el home subsanado (dentro del árbol o en la
-> imagen base), `dotnet build CodeyBox.slnx` da 0 advertencias / 0 errores y el
-> `dotnet test --no-build` a nivel de solución se ejecuta sin fallos.
+
 
 **3. Configura un proyecto.** Deja un archivo JSON en algún lugar y apunta
 `CODEYBOX_EXTRA_CONFIG` a él (se recarga en caliente al cambiar):
@@ -266,7 +244,7 @@ procedimientos de recuperación están en
 - **Puertas de calidad que apilas.** Compón exactamente qué auditores deben pasar
   antes de una fusión —verificaciones de herramientas (formato/compilación/
   pruebas, gitleaks, semgrep) y revisiones con LLM (seguridad, arquitectura,
-  calidad, completitud, anti-trampas, pruebas)— y nada se aplica hasta que las
+  calidad, completitud, trampas, pruebas)— y nada se aplica hasta que las
   supere todas.
   → [Puertas de calidad bajo tu control](#puertas-de-calidad-bajo-tu-control)
 - **Seguimiento de costos por elemento.** El gasto de tokens de cada elemento de
@@ -386,6 +364,27 @@ trailer del commit. Aider, Goose o cualquier otro es simplemente un nuevo
 `IAgentRunner`: consulta
 [`docs/concepts/agents.md`](docs/concepts/agents.md).
 
+## Compatibilidad de plataformas host
+
+| Host del orquestador | `incus` | `multipass` (local) | `multipass-remote` | `sprites` | `bubblewrap` | `process` (solo desarrollo) |
+|---|---|---|---|---|---|---|
+| Linux | ✅ impuesto en el host | ✅ impuesto en el host | ✅ impuesto en el ejecutor | ✅ impuesto en el ejecutor | ⚠️ kernel compartido, sin egreso | ⚠️ sin aislamiento, solo desarrollo |
+| macOS | ❌ | ❌ | ✅ impuesto en el ejecutor | ✅ impuesto en el ejecutor | ❌ | ❌ |
+| Windows | ❌ | ❌ | ✅ impuesto en el ejecutor | ✅ impuesto en el ejecutor | ❌ | ❌ |
+
+Los entornos aislados de VM locales son exclusivos de Linux porque el aislamiento
+de egreso se impone en el host mediante nftables sobre puentes Linux por perfil:
+no existe un mecanismo equivalente del lado del host en macOS ni en Windows
+(evaluado en
+[`docs/concepts/host-platforms.md`](docs/concepts/host-platforms.md)). En macOS y
+Windows solo se admite la topología de ejecutor remoto: el orquestador se ejecuta
+localmente (`./build.sh` en macOS, `./build.ps1` en Windows) mientras las VMs se
+ejecutan en un host ejecutor Linux, donde la lista blanca se sostiene. Los
+invitados son siempre VMs Linux; ejecutar el orquestador en una plataforma no
+implica entornos aislados invitados para ella. Una lista blanca no impuesta nunca
+se describe como aislamiento. Las combinaciones de proveedor + host no admitidas
+fallan rápido al arrancar con un mensaje que apunta a la matriz.
+
 ## Proveedores de entornos aislados
 
 Elige con `CodeyBox.SandboxProvider`:
@@ -418,8 +417,9 @@ seleccionando un proveedor.
 ## Pasar a producción
 
 1. **Elige el proveedor deliberadamente.** Prefiere Incus para una operación
-   headless persistente y de alto rendimiento; usa Multipass cuando importe más
-   la simplicidad de la configuración o los entornos aislados gráficos. Sigue
+   headless persistente y de alto rendimiento; usa Multipass para la
+   configuración más simple. (Los entornos aislados gráficos no son un factor
+   diferenciador: funcionan en ambos). Sigue
    [`docs/concepts/sandboxes.md`](docs/concepts/sandboxes.md), incluidos los
    prerrequisitos de Incus sobre el pool de almacenamiento y la identidad de
    servicio.

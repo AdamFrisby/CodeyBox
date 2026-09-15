@@ -11,7 +11,7 @@
     <!-- Solution restore evaluates this before dispatching project restores, so
          the repository config is selected even when the solution is built from
          outside its directory. NuGet can still inspect user-level configuration. -->
-    <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)nuget.config</RestoreConfigFile>
   </PropertyGroup>
 
 </Project>

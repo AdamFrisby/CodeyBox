@@ -13,7 +13,7 @@
     <!-- Direct project restores use the repository's declared package sources here.
          Directory.Solution.props supplies the same repository-relative property for
          solution restores before they dispatch work to individual projects. -->
-    <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)nuget.config</RestoreConfigFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>

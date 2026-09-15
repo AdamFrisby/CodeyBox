@@ -74,4 +74,41 @@ public sealed class RepoHygieneTests
             "Paths differing only in case cannot coexist on macOS/Windows checkouts: "
             + string.Join("; ", collisions));
     }
+
+    /// <summary>
+    /// A <c>RestoreConfigFile</c> pointing at a path that does not exist is
+    /// silently ignored by NuGet: restore still succeeds, but the repository's
+    /// pinned package sources stop being applied and nothing says so. That
+    /// happened when <c>Directory.Solution.props</c> still referenced
+    /// <c>NuGet.Config</c> after only <c>nuget.config</c> remained. Assert every
+    /// configured path resolves to a real file.
+    /// </summary>
+    [Fact]
+    public void EveryRestoreConfigFilePathExists()
+    {
+        var root = FindRepoRoot();
+        var missing = new List<string>();
+
+        foreach (var props in Directory.EnumerateFiles(root, "Directory.*.props", SearchOption.TopDirectoryOnly))
+        {
+            foreach (var line in File.ReadLines(props))
+            {
+                var open = line.IndexOf("<RestoreConfigFile>", StringComparison.Ordinal);
+                if (open < 0) continue;
+                var start = open + "<RestoreConfigFile>".Length;
+                var end = line.IndexOf("</RestoreConfigFile>", start, StringComparison.Ordinal);
+                if (end < 0) continue;
+
+                var value = line[start..end].Replace("$(MSBuildThisFileDirectory)", root + Path.DirectorySeparatorChar);
+                if (!File.Exists(value))
+                    missing.Add($"{Path.GetFileName(props)} -> {value}");
+            }
+        }
+
+        Assert.True(
+            missing.Count == 0,
+            "RestoreConfigFile points at a path that does not exist. NuGet ignores this "
+            + "silently, so the repository's pinned package sources stop applying: "
+            + string.Join("; ", missing));
+    }
 }
