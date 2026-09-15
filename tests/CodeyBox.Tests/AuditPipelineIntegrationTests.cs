@@ -3032,9 +3032,16 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     {
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(pipelineTask);
+        // Advance the fake clock in lockstep with real time (10 ms fake per
+        // ~10 ms real delay) — never faster. A faster rate would tighten
+        // every 100 ms pipeline budget in real terms (e.g. a 5x rate turns
+        // the audit-setup git clone's 100 ms budget into ~20 ms real and
+        // kills setups spuriously). Under load the real delay stretches
+        // while the fake step stays fixed, so fake time lags real time and
+        // timeouts fire later — never spuriously early.
         while (!pipelineTask.IsCompleted)
         {
-            clock.Advance(TimeSpan.FromMilliseconds(50));
+            clock.Advance(TimeSpan.FromMilliseconds(10));
             await Task.Delay(10);
         }
 
