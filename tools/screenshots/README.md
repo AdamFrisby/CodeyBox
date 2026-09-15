@@ -35,7 +35,27 @@ Capture at `1440x900`, `deviceScaleFactor: 2`.
 
 ## What is committed
 
-Only pages that render real content are committed. Two are deliberately
-excluded: **Statistics** errors in a seeded instance because the statistics
-plugin is not loaded, and **Supervision** renders essentially empty with no
-live workers. Shipping either would advertise a broken or blank screen.
+Only pages that render real content and no error or warning state are
+committed. `scan.mjs` checks each page for alert/warning/error elements and
+red or amber text — checking body text for error *words* is not enough, because
+a banner element can carry the failure without the word appearing in prose.
+
+Three pages are deliberately excluded:
+
+- **Statistics** fails to load in a seeded instance even with the statistics
+  plugin enabled — it needs real quota and usage history, which seeded data
+  does not have.
+- **Supervision** renders essentially empty with no live workers.
+- **Fleet** carries a permanent banner: *"Per-project pause requires the
+  budget-alerts work item; falling back to global queue pause."* That is
+  accurate — the feature is unimplemented, and every user sees it — but the
+  README should not showcase a page whose most prominent element says a
+  feature is missing. The screenshot is not committed.
+
+The seeded instance must load the statistics plugin, or **Capacity** renders
+"Capacity analysis unavailable. Is the statistics plugin loaded?":
+
+```
+CodeyBox__Plugins__AssemblyPaths__0=<repo>/plugins/CodeyBox.StatisticsPlugin/bin/Release/net10.0/CodeyBox.StatisticsPlugin.dll
+CodeyBox__Plugins__Allowlist__0=codeybox.statistics
+```

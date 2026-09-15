@@ -34,11 +34,11 @@ y diff, y observa en vivo la salida del agente.
 <table>
 <tr>
 <td width="50%"><img src="screenshots/10-work-item-detail.png" alt="Un único elemento de trabajo"><br><sub><b>Un elemento, de principio a fin</b> — estado, ramas y pestañas para su cronología, informes de auditoría, tiempos, costos y diff.</sub></td>
-<td width="50%"><img src="screenshots/02-fleet.png" alt="Vista de la flota"><br><sub><b>Flota</b> — estado por proyecto, fase actual, recuentos en cola y en curso, los últimos cinco resultados y el gasto.</sub></td>
+<td width="50%"><img src="screenshots/05-capacity.png" alt="Capacidad de la suscripción"><br><sub><b>Capacidad</b> — cruza las instantáneas de cuota con el consumo real de tokens, para estimar qué compra cada 1 % de una ventana.</sub></td>
 </tr>
 <tr>
-<td><img src="screenshots/05-capacity.png" alt="Capacidad"><br><sub><b>Capacidad</b> — a dónde van las ranuras de trabajadores y qué está esperándolas.</sub></td>
 <td><img src="screenshots/06-releases.png" alt="Releases"><br><sub><b>Releases</b> — agrupa cambios en una rama de versión y haz su seguimiento hasta que se apliquen.</sub></td>
+<td><img src="screenshots/08-plugins.png" alt="Plugins"><br><sub><b>Plugins</b> — qué está cargado, desde dónde y con qué contribuye cada uno.</sub></td>
 </tr>
 </table>
 

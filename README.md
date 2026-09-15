@@ -30,11 +30,11 @@ audit reports, timings, costs and diff, and watch agent output live.
 <table>
 <tr>
 <td width="50%"><img src="screenshots/10-work-item-detail.png" alt="A single work item"><br><sub><b>One item, end to end</b> — state, branches, and tabs for its timeline, audit reports, timings, costs and diff.</sub></td>
-<td width="50%"><img src="screenshots/02-fleet.png" alt="Fleet view"><br><sub><b>Fleet</b> — per-project status, current phase, queued and in-flight counts, the last five outcomes, and spend.</sub></td>
+<td width="50%"><img src="screenshots/05-capacity.png" alt="Subscription capacity"><br><sub><b>Capacity</b> — quota snapshots joined against real token consumption, to estimate what each 1% of a window buys.</sub></td>
 </tr>
 <tr>
-<td><img src="screenshots/05-capacity.png" alt="Capacity"><br><sub><b>Capacity</b> — where the worker slots are going and what is waiting on them.</sub></td>
-<td><img src="screenshots/06-releases.png" alt="Releases"><br><sub><b>Releases</b> — batch changes into a release branch and track it to landing.</sub></td>
+<td><img src="screenshots/06-releases.png" alt="Releases"><br><sub><b>Releases</b> — batch changes onto a release branch and track it to landing.</sub></td>
+<td><img src="screenshots/08-plugins.png" alt="Plugins"><br><sub><b>Plugins</b> — what is loaded, from where, and what each one contributes.</sub></td>
 </tr>
 </table>
 
