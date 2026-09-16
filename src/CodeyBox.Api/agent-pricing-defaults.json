@@ -8,7 +8,8 @@
       "caveman": "https://openai.com/api/pricing/ + https://docs.anthropic.com/en/docs/about-claude/pricing (same per-token rates as the codex/claude buckets; caveman-code is BYOK so spend bills to the operator's own provider accounts)",
       "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
       "pi": "https://docs.anthropic.com/en/docs/about-claude/pricing",
-      "aider": "https://openrouter.ai/anthropic/claude-haiku-4.5 (OpenRouter list price for the shipped member; mirrors the Anthropic on-demand rate for the same model)"
+      "aider": "https://openrouter.ai/anthropic/claude-haiku-4.5 (OpenRouter list price for the shipped member; mirrors the Anthropic on-demand rate for the same model)",
+      "prime": "https://openrouter.ai/anthropic/claude-haiku-4.5 (OpenRouter list price for the shipped member; mirrors the Anthropic on-demand rate for the same model)"
     },
     "notes": {
       "opencode": "OpenCode Go is subscription-priced ($12 per 5h usage budget on https://opencode.ai/docs/go). Each model entry uses one subscription-equivalent USD/M rate for input, cached input, and output: ($12 ÷ requests-per-5h) ÷ ((typical input + cached + output tokens per request) ÷ 1e6), using the request limits and typical token mix published on that page. Keys use opencode-go/<model-id>. Cost attribution charges the stored non-cached input bucket and cached input bucket separately; public total-input reporting adds them.",
@@ -20,7 +21,8 @@
       "copilot":  "Copilot uses a flat subscription and does not publish per-token rates; intentionally omitted from defaults.",
       "crock":    "CrockCode is a pay-per-token Anthropic API-key path that rides the Message Batches API (~50% discount applied by Anthropic at billing time). Rates below are the post-batch-discount effective rates (half of the on-demand /v1/messages rate for the same model id). Keys mirror the canonical Anthropic model ids. Cost attribution is an ESTIMATE, not exact spend: like the claude bucket, cache-write (cache_creation) tokens are folded into fresh input at the base rate and Anthropic's 1.25x/2x cache-write premium is not represented. DefaultRates.crock is the Opus-tier upper-bound fallback for any model id not enumerated here.",
       "pi":       "Pi is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes Anthropic, so this bucket mirrors the Anthropic on-demand rates for the models operators route through pi. Keys are the bare provider model ids pi reports in message.model (pi strips the provider/ qualifier), so operator overrides use the same bare form. Operators fronting other providers add that provider's list prices here (or under CodeyBox:AgentPricing) keyed by the bare message.model id.",
-      "aider":    "Aider is a multi-provider front routed through litellm; rates depend on the backing provider. The shipped AgentClasses member routes OpenRouter, so this bucket mirrors the OpenRouter list price for that model. Keys are the full aider dispatch ids aider reports in its `Model:` run header (provider/ qualifier retained, e.g. openrouter/anthropic/claude-haiku-4.5), so operator overrides use the same qualified form. Cost attribution is an ESTIMATE, not exact spend: aider counts cache-write tokens inside its sent total and OpenRouter may add its own margin over provider list prices."
+      "aider":    "Aider is a multi-provider front routed through litellm; rates depend on the backing provider. The shipped AgentClasses member routes OpenRouter, so this bucket mirrors the OpenRouter list price for that model. Keys are the full aider dispatch ids aider reports in its `Model:` run header (provider/ qualifier retained, e.g. openrouter/anthropic/claude-haiku-4.5), so operator overrides use the same qualified form. Cost attribution is an ESTIMATE, not exact spend: aider counts cache-write tokens inside its sent total and OpenRouter may add its own margin over provider list prices.",
+      "prime":    "Prime is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes OpenRouter, so this bucket mirrors the OpenRouter list price for that model. Keys are the provider-catalog ids prime-agent reports verbatim in message.model (e.g. anthropic/claude-haiku-4.5), so operator overrides use the same form. Cost attribution is an ESTIMATE, not exact spend: OpenRouter may add its own margin over provider list prices. The nvidia/nemotron-3.5-lightning:free row is the $0 free tier (rate-limited) used for smoke verification."
     }
   },
   "DefaultRates": {
@@ -83,6 +85,10 @@
     },
     "aider": {
       "openrouter/anthropic/claude-haiku-4.5":  { "inputPerMillion": 1.00, "cachedInputPerMillion": 0.10, "outputPerMillion": 5.00 }
+    },
+    "prime": {
+      "anthropic/claude-haiku-4.5":             { "inputPerMillion": 1.00, "cachedInputPerMillion": 0.10, "outputPerMillion": 5.00 },
+      "nvidia/nemotron-3.5-lightning:free":     { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
     }
   }
 }

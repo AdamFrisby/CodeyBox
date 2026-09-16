@@ -1,34 +1,36 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
 
-namespace CodeyBox.Agents.Pi;
+namespace CodeyBox.Agents.Prime;
 
 /// <summary>
-/// Best-effort token-count extractor for pi's <c>--mode json</c> event stream.
+/// Best-effort token-count extractor for prime-agent's <c>-p --mode
+/// json</c> event stream.
 ///
-/// <para>Every assistant <c>message_start</c> / <c>message_end</c> frame embeds
-/// the provider-reported cumulative <c>message.usage</c> object
+/// <para>Every assistant <c>message_end</c> frame embeds the
+/// provider-reported cumulative <c>message.usage</c> object
 /// (<c>{input, output, cacheRead, cacheWrite, totalTokens, cost:{…}}</c> —
-/// field names verified against pi 0.85.1's live error frames; the success
-/// path carries the same object with non-zero counts). The extractor scans
-/// every JSON line of stdout/stderr and keeps the LATEST usage object: usage
-/// is cumulative per session, so the last frame is the run total. The dispatch
-/// model id rides alongside on the same frames as <c>message.model</c> and is
-/// recorded for per-model rate lookup. Frame scanning itself lives in
-/// <see cref="PiShapeParsing.ScanLatestUsage"/> (shared with the prime-agent
+/// verified against prime-agent 0.9.5 live frames: a real OpenRouter run
+/// reported <c>{input:1185, output:104, cacheRead:4352, …}</c> while error
+/// runs report all zeros). The extractor scans every JSON line of
+/// stdout/stderr and keeps the latest non-zero usage object as the run
+/// total. The dispatch model id rides alongside on the same frames as
+/// <c>message.model</c> (reported verbatim, e.g.
+/// <c>nvidia/nemotron-3.5-lightning:free</c>) and is recorded for per-model
+/// rate lookup. Frame scanning lives in
+/// <see cref="PiShapeParsing.ScanLatestUsage"/> (shared with the pi
 /// extractor — both CLIs speak the same wire shape).</para>
 ///
-/// <para>No <see cref="DefaultPricing"/> is shipped: pi fronts 30+ providers
-/// with unrelated per-token economics, so no single fallback rate is honest.
-/// Per-model rates ship in <c>agent-pricing-defaults.json</c> or as operator
-/// overrides under <c>CodeyBox:AgentPricing</c>, keyed <c>pi/&lt;model-id&gt;</c>
-/// by the model id this extractor records. Unrated models cost $0 with a
-/// startup warning (see <c>AgentCostCalculator.ValidateAtStartup</c>) —
-/// mirroring the Cursor/Copilot subscription-path posture.</para>
+/// <para>No <see cref="DefaultPricing"/> is shipped: prime fronts many
+/// providers with unrelated per-token economics, so no single fallback rate
+/// is honest. Per-model rates ship in <c>agent-pricing-defaults.json</c> or
+/// as operator overrides under <c>CodeyBox:AgentPricing</c>, keyed by the
+/// model id this extractor records. A stream with no usage frame yields null
+/// (unknown) — never a zero that looks like data.</para>
 /// </summary>
-public sealed class PiCostExtractor : IAgentCostExtractor
+public sealed class PrimeCostExtractor : IAgentCostExtractor
 {
-    public AgentKind Kind => AgentKind.Pi;
+    public AgentKind Kind => AgentKind.Prime;
 
     public ModelRateConfig? DefaultPricing { get; } = null;
 

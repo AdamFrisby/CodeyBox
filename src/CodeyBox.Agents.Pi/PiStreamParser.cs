@@ -23,7 +23,9 @@ namespace CodeyBox.Agents.Pi;
 /// <c>input_tokens/prompt_tokens</c>-style names; pi reports
 /// <c>usage:{input, output, cacheRead, cacheWrite, totalTokens}</c>, so this
 /// parser supplements the base parse with pi's names (base results win when
-/// both are present). <c>cacheWrite</c> has no cost-bucket in
+/// both are present) via <see cref="PiShapeParsing"/> — the same helper the
+/// prime-agent parser uses, since both CLIs speak this wire shape.
+/// <c>cacheWrite</c> has no cost-bucket in
 /// <see cref="AgentCostSnapshot"/> and is ignored for token accounting —
 /// same treatment as the other providers.</para>
 /// </summary>
@@ -34,21 +36,7 @@ public sealed class PiStreamParser : FlexibleAgentStreamParser
     {
     }
 
-    private static readonly HashSet<string> PiLifecycleTypes = new(StringComparer.Ordinal)
-    {
-        "session",
-        "agent_start",
-        "agent_end",
-        "agent_settled",
-        "turn_start",
-        "turn_end",
-        "message_start",
-        "message_update",
-        "message_end",
-        "queue_update",
-        "compaction_start",
-        "compaction_end",
-    };
+    private static readonly HashSet<string> PiLifecycleTypes = PiShapeParsing.LifecycleTypes;
 
     public override bool TryClaim(JsonElement line)
         => IsPiStreamJsonEvent(line);
@@ -88,26 +76,17 @@ public sealed class PiStreamParser : FlexibleAgentStreamParser
         // Supplement (never override) the base usage parse with pi's field
         // names. The usage object rides on the nested assistant message;
         // top-level turn/agent frames repeat it via "message".
-        var message = root;
-        if (TryGet(root, out var nested, "message") && nested.ValueKind == JsonValueKind.Object)
-            message = nested;
+        var message = PiShapeParsing.MessageEnvelope(root);
 
-        if (TryGet(message, out var usage, "usage") && usage.ValueKind == JsonValueKind.Object)
+        if (message.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
         {
-            var input = parsed.InputTokens ?? FirstNullableInt(usage, "input");
-            var output = parsed.OutputTokens ?? FirstNullableInt(usage, "output");
-            var cached = parsed.CachedInputTokens ?? FirstNullableInt(usage, "cacheRead");
+            var input = parsed.InputTokens ?? PiShapeParsing.TryReadUsageCounter(usage, "input");
+            var output = parsed.OutputTokens ?? PiShapeParsing.TryReadUsageCounter(usage, "output");
+            var cached = parsed.CachedInputTokens ?? PiShapeParsing.TryReadUsageCounter(usage, "cacheRead");
             if (input != parsed.InputTokens || output != parsed.OutputTokens || cached != parsed.CachedInputTokens)
                 parsed = parsed with { InputTokens = input, OutputTokens = output, CachedInputTokens = cached };
         }
 
         return parsed;
-    }
-
-    private static int? FirstNullableInt(JsonElement obj, string name)
-    {
-        if (obj.TryGetProperty(name, out var value) && value.TryGetInt32(out var n) && n >= 0)
-            return n;
-        return null;
     }
 }

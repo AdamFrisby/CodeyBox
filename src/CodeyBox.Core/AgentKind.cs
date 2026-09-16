@@ -15,6 +15,7 @@ public readonly record struct AgentKind(string Value)
     public static AgentKind Antigravity { get; } = new("antigravity");
     public static AgentKind Crock { get; } = new("crock");
     public static AgentKind Pi { get; } = new("pi");
+    public static AgentKind Prime { get; } = new("prime");
     public static AgentKind Aider { get; } = new("aider");
     public static AgentKind CavemanCode { get; } = new("caveman");
 

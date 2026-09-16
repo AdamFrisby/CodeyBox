@@ -17,6 +17,7 @@ using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
+using CodeyBox.Agents.Prime;
 using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
@@ -1217,6 +1218,19 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new PiAgentRunner(
 // docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new AiderAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
+// Prime: Prime Agent CLI (prime-agent, installed from
+// https://app.primeintellect.ai/prime-agent/install.sh). Driven headless via
+// `prime-agent -p --mode json` (the -p one-shot contract with the JSON event
+// stream) with the prompt on stdin. Auth is a provider API key from the
+// environment (shipped mapping: CODEYBOX_PRIME_API_KEY -> OPENROUTER_API_KEY;
+// CodeyBox:Prime:Provider selects the --provider flag). The binary must be
+// installed in the sandbox image; see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new PrimeAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>())
+{
+    PrimeOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Prime,
+});
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1655,6 +1669,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // covers the OpenRouter path. Operators fronting other providers add
         // that provider's variable here following the same row.
         new AgentCredentialMapping(AgentKind.Aider, "CODEYBOX_AIDER_API_KEY", "OPENROUTER_API_KEY"),
+        // Prime: provider API-key auth from the environment. prime-agent
+        // reads the provider-native variable (OPENROUTER_API_KEY,
+        // ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, … — 26 provider
+        // variables recognised; full table in prime's providers.md); the
+        // shipped mapping covers the OpenRouter path and matches the
+        // CodeyBox:Prime:Provider default. Operators fronting other
+        // providers add that provider's variable here following the same
+        // row and set CodeyBox:Prime:Provider to match. PRIME_API_KEY is
+        // only the Prime Inference provider entry, not a CLI credential,
+        // so it is deliberately NOT mapped here.
+        new AgentCredentialMapping(AgentKind.Prime, "CODEYBOX_PRIME_API_KEY", "OPENROUTER_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2364,6 +2389,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new PiSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<PiSmokeProbe>()));
+// Prime: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// prime-agent fronts many providers behind one CLI, so no single endpoint
+// validates the credential and any provider call would spend real quota;
+// the real auth check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new PrimeSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<PrimeSmokeProbe>()));
 // Aider: credential-presence check only (OPENROUTER_API_KEY in the bundle).
 // Aider fronts many providers behind one CLI, so no single endpoint validates
 // the credential and any provider call would spend real quota; the real auth
@@ -2387,6 +2419,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CrockInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AiderInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, PrimeInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2484,6 +2517,12 @@ builder.Services.AddSingleton<IAgentModelListProbe, PiModelListProbe>();
 // operator-configured ids absent from the seed surface as a startup warning,
 // not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, AiderModelListProbe>();
+// Prime model-list probe: `prime-agent model list` needs an authenticated
+// provider plus network and emits a human-readable table rather than
+// machine-readable ids, so it cannot back a host-side startup probe. The
+// curated PrimeKnownModels seed is authoritative; operator-configured ids
+// absent from the seed surface as a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, PrimeModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3481,6 +3520,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Crock] = new CrockCostExtractor(),
         [AgentKind.Pi] = new PiCostExtractor(),
         [AgentKind.Aider] = new AiderCostExtractor(),
+        [AgentKind.Prime] = new PrimeCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
@@ -3574,6 +3614,11 @@ builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, PiStreamParser>();
+// Prime never claims by shape (byte-identical to pi — see
+// PrimeStreamParser): attribution flows through ResolveKind's work-item /
+// cost-row resolution via CanEmitShapeOf. Registered after pi so the shape
+// owner's claim order is untouched.
+builder.Services.AddSingleton<IAgentStreamParser, PrimeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AiderStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
@@ -3640,6 +3685,22 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new AiderQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Prime detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:prime, mirroring the cursor/pi/aider
+    // hooks above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Prime.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new PrimeQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
@@ -5794,6 +5855,12 @@ namespace CodeyBox.Api
         /// <c>CodeyBox:Antigravity</c>.
         /// </summary>
         public AntigravitySectionOptions Antigravity { get; set; } = new();
+
+        /// <summary>
+        /// Prime Agent (<c>prime-agent</c>) runner settings, notably the
+        /// <c>--provider</c> default. Bound from <c>CodeyBox:Prime</c>.
+        /// </summary>
+        public PrimeSectionOptions Prime { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;

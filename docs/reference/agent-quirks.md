@@ -862,6 +862,124 @@ OpenRouter-backed member, keyed by the full dispatch id; operators fronting
 other providers add that provider's list prices there (or under
 `CodeyBox:AgentPricing`) in the same qualified form.
 
+### Prime Agent (`prime-agent`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against prime-agent 0.9.5, 2026-09-16):
+
+```sh
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+```
+
+The installer drops a self-contained `prime-agent` binary on PATH (no
+Node/Python runtime needed) and resolves the latest stable release unless
+`PRIME_AGENT_VERSION` is set — pin with
+`PRIME_AGENT_VERSION=0.9.5 curl -fsSL … | sh` for reproducible bakes. Prime
+shares lineage with pi (same `--mode json` event vocabulary, same usage
+shape) but is a separate CLI with its own provider wiring.
+
+**Non-interactive invocation.** The runner drives the documented headless
+form with the prompt on stdin and NO positional prompt argument:
+
+```sh
+prime-agent -p --mode json --no-session --offline --provider <id> [--model <id>] [--thinking <level>]
+```
+
+`-p` ("Print response and exit") is the one-shot contract — without it
+prime-agent enters the interactive TUI and waits forever in the sandbox.
+`--mode json` keeps the JSON event stream (cumulative
+`usage {input, output, cacheRead, cacheWrite, totalTokens}` and `model` on
+the assistant message frames); bare `-p` prints only the final text and
+`--mode rpc` needs a driver loop, so neither is used. `--no-session` skips
+persisting `~/.prime/agent/sessions` (the VM is ephemeral); `--offline`
+disables startup network. `--provider` defaults to `openrouter` via
+`CodeyBox:Prime:Provider` (blank omits the flag); `--model` takes the
+provider-catalog id verbatim (OpenRouter-style when the provider is
+openrouter). `--autonomous` is deliberately NOT passed: budget exhaustion
+exits non-zero ("Autonomous run stopped before terminal evidence"), which
+the pipeline treats as a reported failure before staging diffs — losing real
+work. A plain `-p` run already works multi-turn until the model stops
+(verified live: a file edit completed across 3 turns, exit 0). Prompt travels
+on stdin (verified: stdin-only answers normally) to dodge the 128 KiB
+`MAX_ARG_STRLEN` ceiling on rework prompts.
+
+**Exit-zero errors.** Prime exits 0 even when the run dies before producing
+output (verified: a bad OpenRouter key exits 0 with
+`stopReason:"error"` + `errorMessage:"401 User not found…"` in the event
+stream; a missing key exits 0 with `No API key found for the selected
+model.` on STDERR — unlike pi, which prints it on stdout). The runner lifts
+the terminal error into `TerminalDiagnostic` via `PrimeTerminalDiagnoser`,
+which scans BOTH streams, so the pipeline's no-changes branch parks
+quota/auth give-ups instead of dead-lettering them as "produced no changes".
+
+**Authentication.** Provider API keys from the environment
+(`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … — 26
+provider variables recognised; full table in prime's `providers.md`, with a
+verbatim OpenRouter block in the docs). The shipped credential mapping wires
+host `CODEYBOX_PRIME_API_KEY` to sandbox-side `OPENROUTER_API_KEY` and
+`CodeyBox:Prime:Provider` defaults to `openrouter` to match; operators
+fronting other providers add that provider's variable to the mapping and set
+the provider knob. `PRIME_API_KEY` is only the Prime Inference provider
+entry, not a CLI credential, and is not mapped. Interactive `/login` state
+is in-session only and is not shipped into sandboxes. Always configure an
+explicit `--model` (via `CodeyBox:AgentDefaults[prime]` or the class
+member): the CLI's own startup default is a paid model, which fails a $0-key
+run with `Key limit exceeded`. Custom providers live in
+`~/.prime/agent/models.json` for local use but the sandbox path always uses
+the staged environment plus `--provider`/`--model`.
+
+**Project trust.** Unlike pi's ask-default posture, prime loads `AGENTS.md`
+context non-interactively with no approval prompt (verified in a fresh
+directory: a marker rule fired with exit 0 and empty stderr). The CLI
+exposes no approve/trust override flags, so the runner passes none — and
+nothing can gate an unattended run.
+
+**Reasoning effort.** `ReasoningMode` maps 1:1 onto prime's `--thinking`
+(`off|minimal|low|medium|high|xhigh|max` — same vocabulary as pi). Only
+exact allowlist members are emitted; anything else is ignored rather than
+passed through to fail the CLI.
+
+**Quota probe.** None — prime exposes no quota/credit meter (same position
+as aider/opencode). Availability is covered by the credential-presence host
+probe plus observed failure history (`QuotaUnknownPolicy`, default
+`UseObservedFailures`), and `PrimeQuotaFailureDetector` classifies the
+relayed provider errors (`401 User not found` / `Missing Authentication
+header` / `No API key found` rows → Unauthorized; `Key limit exceeded` /
+`insufficient credits` / 402 rows → LimitReached; shared 429 rows →
+RateLimitExceeded) with operator-extensible rows under
+`CodeyBox:QuotaFailurePatterns:prime`. Both stdout and stderr are scanned —
+terminal frames live on stdout, the pre-session failure on stderr. Note the
+ordering: prime appends `Run /login to update credentials.` to EVERY
+provider error including quota refusals, so the auth row sits last and a 403
+parks as LimitReached, not Unauthorized.
+
+**Smoke probes.** Host-side `PrimeSmokeProbe` is a credential-presence check
+only (`OPENROUTER_API_KEY` in the bundle — no network call).
+`PrimeInVmSmokeProbe` execs `prime-agent --version` plus a
+`prime-agent --help` assertion covering BOTH halves of the transport
+(`-p/--print` and `--mode`), so a prime build that dropped either half
+benches at smoke time instead of dispatching into an interactive wait or an
+unparseable run.
+
+**Model-list probe.** `prime-agent model list` needs an authenticated
+provider plus network and emits a human-readable table rather than
+machine-readable ids, so the host-side probe returns the curated
+`PrimeKnownModels` seed instead of live-reading the catalog. Operator
+`ModelId` values absent from the seed surface as a startup warning, never a
+hard reject (prime routes any provider-catalog id beyond the seed).
+
+**Cost attribution.** `PrimeCostExtractor` takes the latest non-zero
+(cumulative) `usage` frame and the verbatim `message.model` id (prime
+reports the full provider-catalog id, e.g.
+`nvidia/nemotron-3.5-lightning:free`). No stream usage means unknown
+(null), never a zero that looks like data. Frame scanning is shared with pi
+(`PiShapeParsing`) — both CLIs speak the same wire shape. Bundled rates live
+in `agent-pricing-defaults.json` under the `prime` bucket for the shipped
+OpenRouter-backed member (plus a $0 row for the `:free` smoke tier);
+operators fronting other providers add that provider's list prices there (or
+under `CodeyBox:AgentPricing`) keyed by the verbatim `message.model` id.
+
 ### Caveman-code CLI (`caveman-code`)
 
 Caveman-code (`github.com/JuliusBrussee/caveman-code`, npm

@@ -206,7 +206,8 @@ first dispatch can actually run.
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
-      "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2"
+      "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
+      "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
     ],
     "MultipassExecutableProvisions": [
       {
@@ -234,7 +235,8 @@ The equivalent Incus executable provisioning is provider-local:
         "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
-        "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2"
+        "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
+        "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
       ],
       "ExecutableProvisions": [
         {
@@ -261,7 +263,11 @@ when re-verifying against a newer aider. `UV_TOOL_BIN_DIR` pins the
 `uv tool install` would otherwise land it in root's home directory, off the
 sandbox user's PATH.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
-on `$PATH` after the bake. **Antigravity (`agy`) is provisioned via the selected
+on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
+binary on PATH (no runtime needed); the installer resolves the latest stable
+release unless `PRIME_AGENT_VERSION` is set, so pin it
+(`PRIME_AGENT_VERSION=0.9.5 curl -fsSL … | sh`) for deterministic bakes and
+bump the pin when re-verifying against a newer prime-agent. **Antigravity (`agy`) is provisioned via the selected
 provider's executable-provision list, NOT a `curl … | bash` runcmd entry**: the
 upstream installer URL (`https://antigravity.google/cli/install.sh`) no longer
 returns a shell script — as of 2026-06-17 it serves the Antigravity landing
