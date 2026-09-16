@@ -143,7 +143,7 @@ not inside a sandbox.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `Enabled` | `true` | Global switch. |
+| `Enabled` | `false` | Global switch. Changelog automation is opt-in: the default is off so an unconfigured install starts cleanly. |
 | `GeneratorAgent` | `"claude"` | The only supported generator today. |
 | `GeneratorModelId` | `"claude-opus-4-7"` | Model passed to the Anthropic API. |
 | `GeneratorBaseUrl` | `"https://api.anthropic.com/v1/messages"` | Completion endpoint; any OpenAI-compatible URL works with a matching `GeneratorWireApi`. |
@@ -152,7 +152,7 @@ not inside a sandbox.
 | `GeneratorAnthropicVersion` | `"2023-06-01"` | Anthropic version header for the `AnthropicMessages` shape. |
 | `ChangelogPath` | `"CHANGELOG.md"` | Path inside the repository. |
 | `SectionHeaderFormat` | `"## [{tag}] - {date:yyyy-MM-dd}"` | Supports `{tag}` and `{date:yyyy-MM-dd}`. |
-| `GitHubWebhookSecretEnvVar` | `null` | Env var holding the HMAC secret. With no secret configured, signatures are not verified — do not run that way in production. |
+| `GitHubWebhookSecretEnvVar` | `null` | Env var holding the HMAC secret. Required when `Enabled` is `true`: outside Development startup fails without it, and the webhook endpoint rejects every request with `401` while the secret is missing at runtime. |
 
 Per-project overrides go in the project's entry:
 
