@@ -6,6 +6,7 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Aider;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.CavemanCode;
 using CodeyBox.Agents.Crock;
@@ -1205,6 +1206,17 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 // docs/concepts/agents.md and docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new PiAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
+// Aider: Python pair-programming CLI (aider-chat, Apache-2.0). Driven
+// headless via `--message-file /dev/stdin` (prompt on stdin — the -m/--message
+// one-shot form's file twin, dodging the 128 KiB MAX_ARG_STRLEN ceiling) with
+// the reply applied to the worktree and no auto-commit. Auth is a provider API
+// key from the environment (shipped mapping: CODEYBOX_AIDER_API_KEY ->
+// OPENROUTER_API_KEY; other providers extend the mapping). The binary must be
+// installed in the sandbox image (`uv tool install aider-chat` — the
+// aider.chat/install.sh path); see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new AiderAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1636,6 +1648,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // mapping covers the Anthropic path. Operators fronting other
         // providers add that provider's variable here following the same row.
         new AgentCredentialMapping(AgentKind.Pi, "CODEYBOX_PI_API_KEY", "ANTHROPIC_API_KEY"),
+        // Aider: provider API-key auth from the environment. Aider reads the
+        // provider-native variable through litellm (OPENROUTER_API_KEY,
+        // OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, … — OpenRouter is
+        // supported natively with openrouter/<model> ids); the shipped mapping
+        // covers the OpenRouter path. Operators fronting other providers add
+        // that provider's variable here following the same row.
+        new AgentCredentialMapping(AgentKind.Aider, "CODEYBOX_AIDER_API_KEY", "OPENROUTER_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2345,6 +2364,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new PiSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<PiSmokeProbe>()));
+// Aider: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// Aider fronts many providers behind one CLI, so no single endpoint validates
+// the credential and any provider call would spend real quota; the real auth
+// check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new AiderSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AiderSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2360,6 +2386,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CavemanCodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CrockInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PiInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, AiderInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2450,6 +2477,13 @@ builder.Services.AddSingleton<IAgentModelListProbe, CrockModelListProbe>();
 // PiKnownModels seed is authoritative; operator-configured ids absent from
 // the seed surface as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, PiModelListProbe>();
+// Aider model-list probe: `aider --list-models <query>` needs a partial-match
+// query, prints an interactive onboarding prompt when no model or key is
+// configured, and emits thousands of rows, so it cannot back a host-side
+// startup probe. The curated AiderKnownModels seed is authoritative;
+// operator-configured ids absent from the seed surface as a startup warning,
+// not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, AiderModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3464,6 +3498,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Antigravity] = new AntigravityCostExtractor(),
         [AgentKind.Crock] = new CrockCostExtractor(),
         [AgentKind.Pi] = new PiCostExtractor(),
+        [AgentKind.Aider] = new AiderCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
@@ -3557,6 +3592,7 @@ builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, PiStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, AiderStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
@@ -3607,6 +3643,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new PiQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Aider detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:aider, mirroring the cursor/pi hooks above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Aider.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new AiderQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();

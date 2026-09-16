@@ -1,3 +1,4 @@
+using CodeyBox.Agents.Aider;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
@@ -129,6 +130,25 @@ public sealed class InVmSmokeProbeBuildStepsTests
             Assert.Equal([PiAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
             Assert.Contains(PiAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
             Assert.Contains("--mode", string.Join(" ", steps[1].Argv));
+        }
+    }
+
+    [Fact]
+    public void Aider_EmitsVersionPlusMessageAssertion_PinnedToRunnerBinary()
+    {
+        // Aider's probe has two steps: the --version binary check plus a
+        // --message assertion (the runner's only transport). Both pin to the
+        // runner's binary constant so probe/runner drift fails loudly.
+        var probe = new AiderInVmSmokeProbe();
+        Assert.Equal(AgentKind.Aider, probe.Kind);
+
+        foreach (var credential in new AgentCredential?[] { null, Cred(AgentKind.Aider) })
+        {
+            var steps = probe.BuildSteps(credential);
+            Assert.Equal(2, steps.Count);
+            Assert.Equal([AiderAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
+            Assert.Contains(AiderAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
+            Assert.Contains("--message", string.Join(" ", steps[1].Argv));
         }
     }
 }

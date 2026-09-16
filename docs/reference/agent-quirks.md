@@ -752,6 +752,116 @@ frame and the bare `message.model` id (pi strips the `provider/` qualifier in
 providers add that provider's list prices there (or under
 `CodeyBox:AgentPricing`) keyed by the bare model id.
 
+### Aider (`aider`)
+
+**Install in the sandbox image** — add the install lines to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against aider 0.86.2, 2026-09-16):
+
+```sh
+curl -fsSL https://aider.chat/install.sh | bash
+uv tool install --python python3.12 aider-chat==0.86.2
+```
+
+Apache-2.0 ([repo](https://github.com/Aider-AI/aider), PyPI `aider-chat`).
+The install script installs `uv` and then aider via
+`uv tool install --force --python python3.12 --with pip aider-chat@latest`;
+pin with `uv tool install aider-chat@<version>` for reproducible bakes. Needs
+Python 3.12 on the image. Aider is the smallest integration surface of the
+registered agents: no hooks, no session resume — a pure one-shot runner.
+
+**Non-interactive invocation.** The runner drives aider's headless one-shot
+form via its file twin, with the prompt on stdin and NO argv prompt:
+
+```sh
+aider --model <id> --message-file /dev/stdin [--yes-always --no-auto-commits ...]
+```
+
+`--message` / `--msg` / `-m` ("send one message, process the reply, then
+exit — disables chat mode") is the documented one-shot flag; the runner uses
+`--message-file /dev/stdin` instead so the rework prompt travels on stdin
+rather than in one argv element (Linux `MAX_ARG_STRLEN` is 128 KiB per
+element). Verified live: a piped-stdin message ran one-shot and produced
+`Applied edit to …` plus the `Tokens: …` accounting line. Without either flag
+aider waits on interactive input that never arrives in the sandbox. The runner
+adds `--yes-always` (never prompt), `--no-auto-commits` (CodeyBox owns
+commits — edits stay in the worktree for the pipeline to collect),
+`--no-gitignore` (otherwise aider appends `.aider*` to the repo's
+`.gitignore`, polluting the diff), `--analytics-disable`,
+`--no-check-update`, `--no-show-release-notes` (no telemetry or self-update
+stalls outside the sandbox allow-list), and `--no-pretty` (ANSI-free logs).
+`--chat-history-file /dev/null --input-history-file /dev/null` redirect aider's
+default repo-dir history files away so one-shot runs never pollute the worktree
+diff (verified: `/dev/null` targets run normally and create no files).
+
+**Exit-zero errors.** Aider exits 0 even when the run dies before producing
+output (verified: a bad OpenRouter key exits 0 with only
+`litellm.AuthenticationError: AuthenticationError: OpenrouterException -
+{"error":{"message":"Missing Authentication header","code":401}}` on stdout,
+followed by `The API provider is not able to authenticate you. Check your API
+key.`). The runner lifts the first terminal error line into
+`TerminalDiagnostic` via `AiderTerminalDiagnoser`, so the pipeline's
+no-changes branch parks quota/auth give-ups instead of dead-lettering them as
+"produced no changes" — the same shape `agy` and `pi` have.
+
+**Authentication.** Provider API keys from the environment through aider's
+litellm layer (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GEMINI_API_KEY`, …); OpenRouter is supported natively with
+`openrouter/<model>` ids. The shipped credential mapping wires host
+`CODEYBOX_AIDER_API_KEY` to sandbox-side `OPENROUTER_API_KEY`; operators
+fronting other providers add that provider's variable to the mapping.
+`--env-file` / `.env` and `-c` / `.aider.conf.yml` exist for local use but the
+sandbox path always uses the staged environment. Always configure an explicit
+`--model` (via `CodeyBox:AgentDefaults[aider]` or the class member): aider's
+own startup default is `gpt-4o`, which needs an OpenAI key the sandbox may not
+carry. Aider model ids are `provider/id`-qualified; the shipped default is
+`openrouter/anthropic/claude-haiku-4.5` (note the dotted form — `claude-haiku-4-5`
+is unknown to aider's catalog and only triggers a "Did you mean" warning).
+
+**Reasoning effort.** `ReasoningMode` is deliberately NOT mapped: aider
+exposes both `--reasoning-effort` (reasoning_effort API parameter) and
+`--thinking-tokens` (thinking budget), and which knob — and which value
+vocabulary — is valid depends on the backing provider behind `--model`.
+Emitting one unconditionally would fail dispatches for the other provider
+family.
+
+**Quota probe.** None — aider exposes no quota/credit meter (same position as
+opencode). Availability is covered by the credential-presence host probe plus
+observed failure history (`QuotaUnknownPolicy`, default
+`UseObservedFailures`), and `AiderQuotaFailureDetector` classifies the relayed
+litellm errors (`litellm.RateLimitError` / shared 429 rows →
+RateLimitExceeded; `litellm.AuthenticationError` / 401 / missing-key rows →
+Unauthorized; `insufficient_quota` / `insufficient credits` / 402 rows →
+LimitReached) with operator-extensible rows under
+`CodeyBox:QuotaFailurePatterns:aider`. Both stdout and stderr are scanned —
+aider's one-shot output is stdout-first and exits 0 on failure.
+
+**Smoke probes.** Host-side `AiderSmokeProbe` is a credential-presence check
+only (`OPENROUTER_API_KEY` in the bundle — no network call). `AiderInVmSmokeProbe`
+execs `aider --version` plus an `aider --help | grep -q -- --message`
+assertion, so an aider build that dropped the one-shot message form benches at
+smoke time instead of dispatching into an interactive wait.
+
+**Model-list probe.** `aider --list-models <query>` needs a partial-match query
+argument, prints an interactive OpenRouter onboarding prompt when no model or
+key is configured, and emits thousands of rows, so the host-side probe returns
+the curated `AiderKnownModels` seed instead of live-reading the catalog.
+Operator `ModelId` values absent from the seed surface as a startup warning,
+never a hard reject (aider routes any litellm `provider/id` beyond the seed).
+
+**Cost attribution.** `AiderCostExtractor` parses aider's own accounting line
+(`Tokens: <sent> sent[, <n> cache hit], <received> received.` with `k`
+suffixes per aider's `format_tokens`) and the dispatch id from the
+`Model: <id> with … edit format` run header. The `sent` counter already
+includes cache-write tokens, and cache hits are split out of `sent` so the
+calculator does not double count. The optional dollar `Cost:` trailer is
+provider-billed spend, not a token count, and is not parsed. No output line
+means unknown (null), never a zero that looks like data. Bundled rates live in
+`agent-pricing-defaults.json` under the `aider` bucket for the shipped
+OpenRouter-backed member, keyed by the full dispatch id; operators fronting
+other providers add that provider's list prices there (or under
+`CodeyBox:AgentPricing`) in the same qualified form.
+
 ### Caveman-code CLI (`caveman-code`)
 
 Caveman-code (`github.com/JuliusBrussee/caveman-code`, npm
