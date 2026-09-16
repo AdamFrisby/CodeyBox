@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Agents.Goose;
 using CodeyBox.Core;
 
@@ -131,14 +132,24 @@ public sealed class GooseCostExtractorTests
     [Fact]
     public void NeverThrows_OnHostileInput()
     {
+        // Every hostile shape must return normally with null (unknown cost),
+        // never throw and never fabricate a snapshot.
+        AgentCostSnapshot? truncated = null;
+        AgentCostSnapshot? huge = null;
+        AgentCostSnapshot? wrongType = null;
+        AgentCostSnapshot? negative = null;
         var ex = Record.Exception(() =>
         {
-            Extractor.TryExtract("{\"type\":\"complete\",\"total_tokens\":", "[[[");
-            Extractor.TryExtract(new string('x', 100_000), new string('y', 100_000));
-            Extractor.TryExtract("{\"type\":\"complete\",\"total_tokens\":\"lots\"}", null);
-            Extractor.TryExtract("{\"type\":\"complete\",\"total_tokens\":-5,\"input_tokens\":-5}", null);
+            truncated = Extractor.TryExtract("{\"type\":\"complete\",\"total_tokens\":", "[[[");
+            huge = Extractor.TryExtract(new string('x', 100_000), new string('y', 100_000));
+            wrongType = Extractor.TryExtract("{\"type\":\"complete\",\"total_tokens\":\"lots\"}", null);
+            negative = Extractor.TryExtract("{\"type\":\"complete\",\"total_tokens\":-5,\"input_tokens\":-5}", null);
         });
 
         Assert.Null(ex);
+        Assert.Null(truncated);
+        Assert.Null(huge);
+        Assert.Null(wrongType);
+        Assert.Null(negative);
     }
 }

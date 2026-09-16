@@ -248,14 +248,16 @@ The equivalent Incus executable provisioning is provider-local:
 Pick the subset that matches the agents you have registered. For Gemini,
 reasoning level is encoded in the model id (e.g. `gemini-3-flash-preview`),
 not a CLI flag — there is no `--thinking` flag to pin a version against.
-For Goose, add the shell-installer line to the selected provider's runcmd
-and pin a release tag for reproducible bakes (verified against `v1.50.1`):
+For Goose, add the shell-installer line to the selected provider's runcmd,
+pinning the installer script by tag with a SHA256 check before executing
+(verified `GOOSE_VERSION=v1.50.1`; the installer honors `GOOSE_VERSION` to
+pin the binary download too, with no `stable` fallback when it is set):
 
 ```json
 {
   "CodeyBox": {
     "MultipassExtraRuncmd": [
-      "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash",
+      "set -eux\nGOOSE_VERSION=v1.50.1\nGOOSE_INSTALLER=/tmp/goose-download_cli.sh\ncurl -fsSL -o \"$GOOSE_INSTALLER\" \"https://github.com/aaif-goose/goose/releases/download/${GOOSE_VERSION}/download_cli.sh\"\nprintf '%s  %s\\n' \"ab5ae40513348ec4e6047cc7338040aab2df5246800c111d22065766ba6013f0\" \"$GOOSE_INSTALLER\" | sha256sum -c -\nGOOSE_VERSION=\"${GOOSE_VERSION}\" bash \"$GOOSE_INSTALLER\"\nrm \"$GOOSE_INSTALLER\"",
       "goose --version"
     ]
   }

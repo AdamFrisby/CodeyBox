@@ -90,13 +90,21 @@ public sealed class GooseTerminalDiagnoserTests
     [Fact]
     public void NeverThrows_OnHostileInput()
     {
+        // Every hostile shape must return normally with null (no terminal
+        // error), never throw and never fabricate a diagnostic.
+        string? truncated = null;
+        string? huge = null;
+        string? wrongType = null;
         var ex = Record.Exception(() =>
         {
-            GooseTerminalDiagnoser.TryExtractTerminalError("{\"type\":\"message\",\"message\":");
-            GooseTerminalDiagnoser.TryExtractTerminalError(new string('z', 100_000));
-            GooseTerminalDiagnoser.TryExtractTerminalError("{\"message\":{\"content\":[42]}}");
+            truncated = GooseTerminalDiagnoser.TryExtractTerminalError("{\"type\":\"message\",\"message\":");
+            huge = GooseTerminalDiagnoser.TryExtractTerminalError(new string('z', 100_000));
+            wrongType = GooseTerminalDiagnoser.TryExtractTerminalError("{\"message\":{\"content\":[42]}}");
         });
 
         Assert.Null(ex);
+        Assert.Null(truncated);
+        Assert.Null(huge);
+        Assert.Null(wrongType);
     }
 }

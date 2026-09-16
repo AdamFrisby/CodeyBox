@@ -759,13 +759,19 @@ providers add that provider's list prices there (or under
 selected provider (verified against goose 1.50.1, 2026-09-16):
 
 ```sh
-curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+GOOSE_VERSION=v1.50.1
+GOOSE_INSTALLER=/tmp/goose-download_cli.sh
+curl -fsSL -o "$GOOSE_INSTALLER" "https://github.com/aaif-goose/goose/releases/download/${GOOSE_VERSION}/download_cli.sh"
+printf '%s  %s\n' "ab5ae40513348ec4e6047cc7338040aab2df5246800c111d22065766ba6013f0" "$GOOSE_INSTALLER" | sha256sum -c -
+GOOSE_VERSION="${GOOSE_VERSION}" bash "$GOOSE_INSTALLER"
+rm "$GOOSE_INSTALLER"
 ```
 
 Apache-2.0 ([repo](https://github.com/aaif-goose/goose)). Shell installer for
 macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux).
-Pin a release tag (e.g. `.../download/v1.50.1/download_cli.sh`) rather than
-`stable` for reproducible bakes. The installer drops the `goose` binary
+The installer script is pinned by release tag with its SHA256 verified before
+execution (mirroring the gitleaks baseline entry), and `GOOSE_VERSION`
+pins the binary download too — never `stable` for reproducible bakes. The installer drops the `goose` binary
 (verified at `~/.local/bin/goose`); the baseline bake's `--version` check
 catches a missing binary before first dispatch.
 

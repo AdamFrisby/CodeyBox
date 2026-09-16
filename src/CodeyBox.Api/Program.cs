@@ -1214,8 +1214,8 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new PiAgentRunner(
 // OPENROUTER_API_KEY; thirteen provider variables honored — see
 // GooseSmokeProbe.ProviderApiKeyEnvironmentVariables). Provider selection
 // and the turn bound come from CodeyBox:Goose (hot-reloadable). The binary
-// must be installed in the sandbox image
-// (`curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash`);
+// must be installed in the sandbox image at bake time (tag-pinned installer
+// with SHA256 verification — see docs/reference/sandbox-baselines.md);
 // see docs/concepts/agents.md and docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new GooseAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
