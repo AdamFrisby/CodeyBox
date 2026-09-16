@@ -107,6 +107,14 @@ public interface ICodeyBoxApiClient
     /// </summary>
     Task<WorkItemDiffDto?> GetWorkItemDiffAsync(string id, CancellationToken ct = default);
 
+    // ── Dossier ───────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Fetches the shareable delivery dossier for a work item.
+    /// Returns null when the work item does not exist (404).
+    /// </summary>
+    Task<WorkItemDossierDto?> GetWorkItemDossierAsync(string id, CancellationToken ct = default)
+        => Task.FromResult<WorkItemDossierDto?>(null);
+
     // ── Suggestions ───────────────────────────────────────────────────────────
     Task<List<SuggestionDto>> GetSuggestionsAsync(
         string? projectId = null, string? category = null, string? severity = null,

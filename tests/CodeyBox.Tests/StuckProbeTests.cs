@@ -25,8 +25,10 @@ public sealed class StuckProbeTests
 
     /// <summary>
     /// Builds a StuckProbe whose poll interval is 0 (instant) and feeds it
-    /// the given samples by overriding Task.Delay via the probe's poll loop.
-    /// We do this by subclassing StuckProbe to inject an instant-delay variant.
+    /// the given samples. The probe returns once the script is exhausted
+    /// without reaching the threshold, so not-stuck tests complete in
+    /// milliseconds; the cancellation token is only a backstop against a
+    /// regression that stops consuming input.
     /// </summary>
     private static async Task<(bool stuck, StuckContext ctx)> RunProbeAsync(
         IEnumerable<ActivitySample?> samples,
@@ -41,7 +43,7 @@ public sealed class StuckProbeTests
 
         var source = new ScriptedActivitySource(samples);
         var probe = new FastProbe(source, thresholdSamples, ctx, phaseCts);
-        using var probeCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var probeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await probe.RunAsync(probeCts.Token);
 
         return (ctx.Detected, ctx);
@@ -55,13 +57,13 @@ public sealed class StuckProbeTests
     /// </summary>
     private sealed class FastProbe
     {
-        private readonly IAgentActivitySource _source;
+        private readonly ScriptedActivitySource _source;
         private readonly int _thresholdSamples;
         private readonly StuckContext _ctx;
         private readonly CancellationTokenSource _phaseCts;
 
         public FastProbe(
-            IAgentActivitySource source,
+            ScriptedActivitySource source,
             int thresholdSamples,
             StuckContext ctx,
             CancellationTokenSource phaseCts)
@@ -72,7 +74,10 @@ public sealed class StuckProbeTests
             _phaseCts = phaseCts;
         }
 
-        // Same logic as StuckProbe.RunAsync but with no Task.Delay.
+        // Same logic as StuckProbe.RunAsync but with no Task.Delay. Returns
+        // once the scripted source is exhausted: a finite script that never
+        // reaches the threshold means "not stuck". The token stays purely a
+        // backstop so a consumption regression fails fast instead of hanging.
         public async Task RunAsync(CancellationToken ct)
         {
             ActivitySample? prev = null;
@@ -80,6 +85,9 @@ public sealed class StuckProbeTests
 
             while (!ct.IsCancellationRequested)
             {
+                if (_source.IsExhausted)
+                    return;
+
                 await Task.Yield(); // yield to allow cancellation checks
 
                 ActivitySample? sample;

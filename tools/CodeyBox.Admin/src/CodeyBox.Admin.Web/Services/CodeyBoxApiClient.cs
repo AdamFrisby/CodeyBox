@@ -395,6 +395,14 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<WorkItemTimingsDto>(JsonOptions, ct);
     }
 
+    public async Task<WorkItemDossierDto?> GetWorkItemDossierAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/dossier", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<WorkItemDossierDto>(JsonOptions, ct);
+    }
+
     public async Task<AggregateTimingsDto?> GetAggregateTimingsAsync(int? n = null, CancellationToken ct = default)
     {
         var url = n.HasValue ? $"/workitems/timings/aggregate?n={n}" : "/workitems/timings/aggregate";
