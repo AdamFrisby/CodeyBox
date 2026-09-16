@@ -294,6 +294,34 @@ transport; a build that dropped it is benched at bake time, not first
 dispatch). Provider credentials are NOT baked: the runner seeds the guest
 `~/.autohand/config.json` from the `CODEYBOX_AUTOHAND_API_KEY` bundle at
 dispatch time.
+
+For Vibe, add the installer line to the selected provider's runcmd and pin
+the version for deterministic bakes (verified `mistral-vibe==2.25.4` via
+`uv`; bump the pin when re-verifying against a newer vibe — the runner
+asserts `--output streaming` support at smoke time, so a CLI that drops the
+flag benches loudly instead of dispatching into plaintext):
+
+```json
+{
+  "CodeyBox": {
+    "MultipassExtraRuncmd": [
+      "set -eux\ncurl -LsSf https://mistral.ai/vibe/install.sh -o /tmp/vibe-install.sh\nuv tool install --python python3.12 mistral-vibe==2.25.4\nvibe --version",
+      "mkdir -p ~/.vibe && cat > ~/.vibe/config.toml <<'EOF'\nactive_model = \"nemotron-free\"\n\n[[providers]]\nname = \"openrouter\"\napi_base = \"https://openrouter.ai/api/v1\"\napi_key_env_var = \"OPENROUTER_API_KEY\"\napi_style = \"openai\"\nbackend = \"generic\"\n\n[[models]]\nname = \"nvidia/nemotron-3.5-lightning:free\"\nprovider = \"openrouter\"\nalias = \"nemotron-free\"\nEOF"
+    ]
+  }
+}
+```
+
+Vibe needs no vendor account: the guest `~/.vibe/config.toml` above points
+at OpenRouter with the key arriving per-dispatch as `OPENROUTER_API_KEY`
+(the shipped credential mapping), and the model alias (`nemotron-free`) must
+match the `VIBE_ACTIVE_MODEL` value the runner sends
+(`CodeyBox:AgentDefaults[vibe]`). A baked config whose alias is missing
+fails loudly at dispatch (exit 1, `Active model … not found`), never
+silently. `UV_TOOL_BIN_DIR` advice from the aider entry applies equally:
+bake runcmds run as root, so pin the `vibe` binary onto the sandbox user's
+PATH (e.g. `/usr/local/bin`) or the in-VM smoke probe's `--version` step
+fails the bake.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
 binary on PATH (no runtime needed); the installer resolves the latest stable
