@@ -123,7 +123,8 @@ public sealed partial class PipelineRunner
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                     project,
                     new SandboxTarget(networkProfile, SandboxProfileFlavor.Headless),
-                    item.BaselineImageRef));
+                    item.BaselineImageRef),
+                projectSecretEnvironment: ResolveProjectSecretEnvironment(project, ProjectSandboxSecretScopes.Merge));
             var mergeSandboxStartSw = Stopwatch.StartNew();
             // Release-then-acquire: the merge phase provisions its own sandbox
             // while the work-phase reusable sandbox may still be admitted.

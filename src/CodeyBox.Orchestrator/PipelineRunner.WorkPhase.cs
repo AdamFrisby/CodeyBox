@@ -99,7 +99,8 @@ public sealed partial class PipelineRunner
                 new SandboxTarget(networkProfile, sandboxFlavor),
                 item.BaselineImageRef),
             includeAgentTurnScratchpadTmpfs: true,
-            credentialRunner: runner) with
+            credentialRunner: runner,
+            projectSecretEnvironment: ResolveProjectSecretEnvironment(project, agentPhase)) with
         {
             RecoveryLease = item.AgentTurnRecoveryLease,
         };

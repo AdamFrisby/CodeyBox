@@ -30,7 +30,8 @@ public sealed partial class PipelineRunner
         bool includeCredentialsTmpfs = false,
         bool includeAgentTurnScratchpadTmpfs = false,
         bool agentCredentialScope = false,
-        IAgentRunner? credentialRunner = null)
+        IAgentRunner? credentialRunner = null,
+        IReadOnlyDictionary<string, string>? projectSecretEnvironment = null)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -38,6 +39,15 @@ public sealed partial class PipelineRunner
         };
 
         var env = new Dictionary<string, string>();
+        if (projectSecretEnvironment is not null)
+        {
+            // Project secrets are a separate channel from the agent
+            // credential: they land first so a colliding agent-credential
+            // direct variable still wins, and extraEnvironment stamps win
+            // over both below.
+            foreach (var (k, v) in projectSecretEnvironment)
+                env[k] = v;
+        }
         if (includeAgentCredential is not null)
         {
             if (credentialRunner is null)
@@ -135,6 +145,16 @@ public sealed partial class PipelineRunner
             BaselineImageRef = baselineImageRef,
         });
     }
+
+    /// <summary>
+    /// Resolves the project's sandbox secrets for <paramref name="scope"/>
+    /// from live host environment state. Returns an empty map when the
+    /// project declares nothing for the scope. Values are never logged here;
+    /// the resolver emits names-only warnings for unset host variables.
+    /// </summary>
+    private IReadOnlyDictionary<string, string> ResolveProjectSecretEnvironment(Project project, string scope)
+        => ProjectSandboxSecretResolver.ResolveForScope(
+            project, scope, Environment.GetEnvironmentVariable, _log);
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {

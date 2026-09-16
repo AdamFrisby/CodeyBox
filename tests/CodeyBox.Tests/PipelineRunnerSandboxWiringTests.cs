@@ -638,6 +638,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 false,
                 false,
                 tp.Agent,
+                null,
             ]));
 
         Assert.Contains(MarkerHost, spec.Network.AllowedHosts);

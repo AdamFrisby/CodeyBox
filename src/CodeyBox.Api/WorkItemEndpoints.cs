@@ -2913,7 +2913,12 @@ internal static class WorkItemEndpoints
             p.Upstream.Kind,
             audit.Languages,
             audit.AuditTypes,
-            audit.MaxIterations);
+            audit.MaxIterations,
+            p.SandboxSecrets.Count > 0,
+            p.SandboxSecrets.Select(secret => new ProjectSandboxSecretDto(
+                secret.HostEnvVar,
+                secret.SandboxEnvVar,
+                secret.Scopes)).ToList());
     }
 
     private const int GlobalMinPriority = -1000;
@@ -3403,7 +3408,17 @@ public sealed record ProjectDto(
     string UpstreamKind,
     IReadOnlyList<string> AuditLanguages,
     IReadOnlyList<string> AuditTypes,
-    int AuditMaxIterations);
+    int AuditMaxIterations,
+    bool HasSandboxSecrets = false,
+    IReadOnlyList<ProjectSandboxSecretDto>? SandboxSecrets = null);
+
+/// <summary>
+/// Names-only view of one project sandbox secret. Never carries a value.
+/// </summary>
+public sealed record ProjectSandboxSecretDto(
+    string HostEnvVar,
+    string SandboxEnvVar,
+    IReadOnlyList<string> Scopes);
 
 public sealed record AnswerQuestionRequest(string QuestionId, string Answer);
 

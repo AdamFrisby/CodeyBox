@@ -228,6 +228,17 @@ public sealed record Project
     /// <c>docs/quality/test-cases.md</c>.
     /// </summary>
     public ProjectJobTrackExport JobTrackExport { get; init; } = ProjectJobTrackExport.Disabled;
+
+    /// <summary>
+    /// Project-scoped test secrets injected into this project's sandboxes by
+    /// reference (host variable name → sandbox variable name). Empty (the
+    /// default) means nothing is injected. Each entry defaults to the
+    /// <c>work</c> + <c>rework</c> scopes; audit and merge sandboxes receive
+    /// secrets only when the declaration opts in. This is a separate channel
+    /// from <see cref="AgentCredential"/>: a project secret is never
+    /// selectable as an agent credential.
+    /// </summary>
+    public IReadOnlyList<ProjectSandboxSecret> SandboxSecrets { get; init; } = [];
 }
 
 /// <summary>

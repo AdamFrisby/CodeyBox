@@ -344,6 +344,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             Knobs = ResolveKnobs(pc.Id, pc.Knobs, defaults.Knobs),
             Deployment = ResolveDeployment(pc.Id, pc.Deployment),
             JobTrackExport = ResolveJobTrackExport(pc.Id, pc.JobTrackExport),
+            SandboxSecrets = ResolveSandboxSecrets(pc.Id, pc.SandboxSecrets),
         };
     }
 
@@ -413,6 +414,122 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             RetryBaseDelay = TimeSpan.FromMilliseconds(retryBaseDelayMs),
         };
     }
+
+    /// <summary>
+    /// Binds and validates the per-project sandbox-secret declarations. Names
+    /// are environment-variable references, never values: anything that is not
+    /// a POSIX identifier is rejected as a literal-looking secret with
+    /// guidance to reference a host variable instead. Unknown phases fail the
+    /// load; an omitted phase list resolves to the work+rework default.
+    /// </summary>
+    internal static IReadOnlyList<ProjectSandboxSecret> ResolveSandboxSecrets(
+        string projectId,
+        List<ProjectSandboxSecretConfig>? configs)
+    {
+        if (configs is null || configs.Count == 0)
+            return [];
+        if (configs.Count > ProjectSandboxSecretLimits.MaxSecretsPerProject)
+            throw new InvalidOperationException(
+                $"Project '{projectId}' declares {configs.Count} SandboxSecrets; at most " +
+                $"{ProjectSandboxSecretLimits.MaxSecretsPerProject} are allowed.");
+        var resolved = new List<ProjectSandboxSecret>(configs.Count);
+        var seenSandboxNames = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < configs.Count; index++)
+        {
+            var config = configs[index];
+            var where = $"projects[{projectId}].SandboxSecrets[{index}]";
+            if (config is null)
+                throw new InvalidOperationException($"Project '{projectId}' SandboxSecrets[{index}] is null.");
+            var hostName = config.HostEnvVar?.Trim() ?? string.Empty;
+            var sandboxName = config.SandboxEnvVar?.Trim() ?? string.Empty;
+            if (hostName.Length == 0)
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where}.HostEnvVar is required: name the host environment " +
+                    $"variable holding the secret; the literal value must never appear in project config.");
+            if (sandboxName.Length == 0)
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where}.SandboxEnvVar is required: name the sandbox environment " +
+                    $"variable the secret is injected as.");
+            RejectLiteralSecretValue(projectId, where, "HostEnvVar", hostName);
+            RejectLiteralSecretValue(projectId, where, "SandboxEnvVar", sandboxName);
+            try
+            {
+                SandboxEnvironmentVariableName.Validate(hostName, $"{where}.HostEnvVar");
+                SandboxEnvironmentVariableName.Validate(sandboxName, $"{where}.SandboxEnvVar");
+            }
+            catch (ArgumentException ex)
+            {
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where} names an invalid environment variable: {ex.Message}", ex);
+            }
+            if (!seenSandboxNames.Add(sandboxName))
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where} duplicates SandboxEnvVar '{sandboxName}': each sandbox " +
+                    $"variable may be declared once per project.");
+            var scopes = ResolveSandboxSecretScopes(projectId, where, config.Phases);
+            resolved.Add(new ProjectSandboxSecret
+            {
+                HostEnvVar = hostName,
+                SandboxEnvVar = sandboxName,
+                Scopes = scopes,
+            });
+        }
+        return resolved.AsReadOnly();
+    }
+
+    private static IReadOnlyList<string> ResolveSandboxSecretScopes(
+        string projectId,
+        string where,
+        List<string>? phases)
+    {
+        if (phases is null || phases.Count == 0)
+            return ProjectSandboxSecretScopes.Defaults;
+        var normalized = new List<string>(phases.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var phase in phases)
+        {
+            var scope = ProjectSandboxSecretScopes.TryNormalize(phase);
+            if (scope is null)
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where}.Phases entry '{phase}' is unknown; valid phases: " +
+                    $"{string.Join(", ", ProjectSandboxSecretScopes.All)}.");
+            if (seen.Add(scope))
+                normalized.Add(scope);
+        }
+        return normalized.AsReadOnly();
+    }
+
+    private static void RejectLiteralSecretValue(string projectId, string where, string field, string value)
+    {
+        if (IsEnvironmentVariableReference(value))
+            return;
+        // The rejected text is deliberately NOT echoed: it may be a real
+        // secret the operator pasted, and error text lands in host logs.
+        throw new InvalidOperationException(
+            $"Project '{projectId}' {where}.{field} is not a valid environment variable " +
+            $"name. Declare the secret by reference instead: set {field} to the name of a host environment " +
+            $"variable holding the secret (e.g. HostEnvVar 'CODEYBOX_OPENROUTER_API_KEY'), and keep the " +
+            $"literal value out of project config, which is routinely committed.");
+    }
+
+    private static bool IsEnvironmentVariableReference(string value)
+    {
+        if (value.Length is 0 or > SandboxEnvironmentVariableName.MaximumLength)
+            return false;
+        if (!IsAsciiEnvStart(value[0]))
+            return false;
+        for (var index = 1; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (IsAsciiEnvStart(character) || character is >= '0' and <= '9')
+                continue;
+            return false;
+        }
+        return true;
+    }
+
+    private static bool IsAsciiEnvStart(char value) =>
+        value is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or '_';
 
     /// <summary>
     /// Binds the project's deployment recipe and, when a driver registry is
