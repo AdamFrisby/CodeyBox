@@ -642,8 +642,19 @@ public sealed class ExecutorHostTests
         Assert.True(stub.RegisterCount >= 1);
         Assert.True(stub.HeartbeatCount >= 1);
 
+        // The listener table is machine-global and parallel suites (ACP bridge
+        // TcpListeners, Kestrel probes) hold transient listeners. Poll briefly
+        // for quiescence instead of asserting a single sample: a listener
+        // leaked by the executor would persist and still fail.
         var after = ListeningPorts();
         after.ExceptWith(before);
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!(after.Count == 1 && after.Contains(stubPort)) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+            after = ListeningPorts();
+            after.ExceptWith(before);
+        }
         Assert.Equal(stubPort, Assert.Single(after));
     }
 
