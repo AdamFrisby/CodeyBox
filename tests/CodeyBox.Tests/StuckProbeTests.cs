@@ -43,6 +43,8 @@ public sealed class StuckProbeTests
 
         var source = new ScriptedActivitySource(samples);
         var probe = new FastProbe(source, thresholdSamples, ctx, phaseCts);
+        // Backstop only: FastProbe exits when the script is exhausted, so this
+        // fires solely if the probe logic itself stops making progress.
         using var probeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await probe.RunAsync(probeCts.Token);
 
@@ -76,8 +78,12 @@ public sealed class StuckProbeTests
 
         // Same logic as StuckProbe.RunAsync but with no Task.Delay. Returns
         // once the scripted source is exhausted: a finite script that never
-        // reaches the threshold means "not stuck". The token stays purely a
-        // backstop so a consumption regression fails fast instead of hanging.
+        // reaches the threshold means "not stuck". Past exhaustion the source
+        // returns null forever, and a null poll can neither detect stuck
+        // (detection needs two consecutive non-null samples) nor change any
+        // asserted state, so returning here is observationally identical to
+        // spinning. The token stays purely a backstop so a consumption
+        // regression fails fast instead of hanging.
         public async Task RunAsync(CancellationToken ct)
         {
             ActivitySample? prev = null;
@@ -100,9 +106,9 @@ public sealed class StuckProbeTests
                     // The scripted queue is finite: once every scripted sample
                     // is consumed without reaching the threshold, the probe is
                     // done. Without this exit the loop spins on Task.Yield
-                    // until the 30s bound fires, burning a core per non-stuck
+                    // until the backstop fires, burning a core per non-stuck
                     // test and stalling the suite.
-                    if (_source is ScriptedActivitySource scripted && scripted.IsExhausted)
+                    if (_source.IsExhausted)
                         return;
                     continue;
                 }
