@@ -33,6 +33,16 @@ public sealed class WorkItemDto
     public string? AgentClassId { get; set; }
     public int? AuditIterations { get; set; }
     public int? FinalAuditBlockingFindings { get; set; }
+    public int? AuditMaxIterations { get; set; }
+    public string? FailureKind { get; set; }
+    public DateTimeOffset? QuotaResetAt { get; set; }
+    public DateTimeOffset? NextQuotaRetryAt { get; set; }
+    public DateTimeOffset? NextTransientRetryAt { get; set; }
+    public string? AgentPauseTarget { get; set; }
+    public int ConflictReworkAttempts { get; set; }
+    public int DelegationAttempts { get; set; }
+    public List<AgentInvolvementEntryDto>? AgentHistory { get; set; }
+    public string? WorkAgent { get; set; }
     /// <summary>
     /// GitHub-side authoritative merge commit sha — resolves on
     /// <c>GET /repos/{owner}/{repo}/commits/{sha}</c>. Null until the auto-merge

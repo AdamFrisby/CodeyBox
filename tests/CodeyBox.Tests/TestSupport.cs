@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -118,26 +119,17 @@ internal static class TestSupport
 
         public static AmbientGitConfigScope Clear()
         {
-            var saved = new List<(string Key, string? Value)>();
-            var count = Environment.GetEnvironmentVariable("GIT_CONFIG_COUNT");
-            saved.Add(("GIT_CONFIG_COUNT", count));
-            if (int.TryParse(count, out var n))
+            var environment = new ProcessStringEnvironment();
+            var saved = new List<(string Key, string? Value)>
             {
-                for (var i = 0; i < n; i++)
-                {
-                    saved.Add(($"GIT_CONFIG_KEY_{i}", Environment.GetEnvironmentVariable($"GIT_CONFIG_KEY_{i}")));
-                    saved.Add(($"GIT_CONFIG_VALUE_{i}", Environment.GetEnvironmentVariable($"GIT_CONFIG_VALUE_{i}")));
-                }
-            }
-            Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", null);
-            if (int.TryParse(count, out var parsed))
+                ("GIT_CONFIG_COUNT", environment.Get("GIT_CONFIG_COUNT")),
+            };
+            foreach (var index in IndexedGitConfigSlots(environment))
             {
-                for (var i = 0; i < parsed; i++)
-                {
-                    Environment.SetEnvironmentVariable($"GIT_CONFIG_KEY_{i}", null);
-                    Environment.SetEnvironmentVariable($"GIT_CONFIG_VALUE_{i}", null);
-                }
+                saved.Add(($"GIT_CONFIG_KEY_{index}", environment.Get($"GIT_CONFIG_KEY_{index}")));
+                saved.Add(($"GIT_CONFIG_VALUE_{index}", environment.Get($"GIT_CONFIG_VALUE_{index}")));
             }
+            RemoveGitConfigOverrides(environment);
             return new AmbientGitConfigScope(saved);
         }
 
@@ -146,6 +138,128 @@ internal static class TestSupport
             foreach (var (key, value) in _saved)
                 Environment.SetEnvironmentVariable(key, value);
         }
+    }
+
+    /// <summary>
+    /// Assembly-load hook: strip harness-injected <c>GIT_CONFIG_*</c> overrides
+    /// (e.g. <c>safe.bareRepository=explicit</c>) from this test process once,
+    /// before any test runs. Those overrides change bare-repo discovery and
+    /// break the <see cref="LocalGitHost"/> seed/clone plumbing that pipeline
+    /// tests run through; without this, every such test either fails fast or
+    /// parks on a multi-minute wait for an event that never arrives, which in
+    /// aggregate exhausts the assembly run timeout. Per-test
+    /// <see cref="AmbientGitConfigScope"/> uses remain valid (they are now
+    /// near-no-ops) but are no longer load-bearing for the suite to pass.
+    /// </summary>
+    [ModuleInitializer]
+    internal static void StripAmbientGitConfigOverrides() => ClearAmbientGitConfigOverrides();
+
+    /// <summary>Removes harness-injected git overrides from the process environment.</summary>
+    internal static void ClearAmbientGitConfigOverrides() =>
+        RemoveGitConfigOverrides(new ProcessStringEnvironment());
+
+    /// <summary>
+    /// Upper bound on <c>GIT_CONFIG_COUNT</c>-governed slots enumerated
+    /// directly; pairs actually present are always found by scan.
+    /// </summary>
+    internal const int MaxCountGovernedSlots = 256;
+
+    /// <summary>
+    /// Removes <c>GIT_CONFIG_COUNT</c> and every indexed
+    /// <c>GIT_CONFIG_KEY_&lt;n&gt;</c>/<c>GIT_CONFIG_VALUE_&lt;n&gt;</c> pair —
+    /// both the <c>n</c> governed by <c>COUNT</c> and any stray indexed pairs
+    /// git would otherwise ignore but which must not linger as a partial
+    /// override. Unrelated entries are never touched.
+    /// </summary>
+    internal static void RemoveGitConfigOverrides(IStringEnvironment environment)
+    {
+        ArgumentNullException.ThrowIfNull(environment);
+        var slots = IndexedGitConfigSlots(environment);
+        environment.Set("GIT_CONFIG_COUNT", null);
+        foreach (var index in slots)
+        {
+            environment.Set($"GIT_CONFIG_KEY_{index}", null);
+            environment.Set($"GIT_CONFIG_VALUE_{index}", null);
+        }
+    }
+
+    /// <summary>
+    /// Indices of git-config override slots: those governed by
+    /// <c>GIT_CONFIG_COUNT</c> plus any stray indexed pairs present without
+    /// (or beyond) a valid count, oldest first.
+    /// </summary>
+    internal static IReadOnlyList<int> IndexedGitConfigSlots(IStringEnvironment environment)
+    {
+        ArgumentNullException.ThrowIfNull(environment);
+        var slots = new SortedSet<int>();
+        if (int.TryParse(environment.Get("GIT_CONFIG_COUNT"), out var count))
+        {
+            // Cap the COUNT-driven range: removing COUNT itself already blinds
+            // git's pair discovery, and actually-present pairs are picked up by
+            // the scan below, so an absurd COUNT cannot force a huge loop.
+            for (var i = 0; i < Math.Min(count, MaxCountGovernedSlots); i++)
+                slots.Add(i);
+        }
+        foreach (var key in environment.Keys)
+        {
+            if (key is null)
+                continue;
+            if (key.StartsWith("GIT_CONFIG_KEY_", StringComparison.Ordinal)
+                && int.TryParse(key["GIT_CONFIG_KEY_".Length..], out var fromKey))
+                slots.Add(fromKey);
+            else if (key.StartsWith("GIT_CONFIG_VALUE_", StringComparison.Ordinal)
+                && int.TryParse(key["GIT_CONFIG_VALUE_".Length..], out var fromValue))
+                slots.Add(fromValue);
+        }
+        return [.. slots];
+    }
+
+    /// <summary>Minimal string-environment surface for git-override scrubbing.</summary>
+    internal interface IStringEnvironment
+    {
+        string? Get(string key);
+        void Set(string key, string? value);
+        IReadOnlyList<string> Keys { get; }
+    }
+
+    /// <summary><see cref="IStringEnvironment"/> over the process environment.</summary>
+    internal sealed class ProcessStringEnvironment : IStringEnvironment
+    {
+        public string? Get(string key) => Environment.GetEnvironmentVariable(key);
+
+        public void Set(string key, string? value) => Environment.SetEnvironmentVariable(key, value);
+
+        public IReadOnlyList<string> Keys
+        {
+            get
+            {
+                var keys = new List<string>();
+                foreach (var key in Environment.GetEnvironmentVariables().Keys)
+                {
+                    if (key is string name)
+                        keys.Add(name);
+                }
+                return keys;
+            }
+        }
+    }
+
+    /// <summary><see cref="IStringEnvironment"/> over an in-memory dictionary (tests).</summary>
+    internal sealed class DictionaryStringEnvironment(IDictionary<string, string?> values) : IStringEnvironment
+    {
+        private readonly IDictionary<string, string?> _values = values;
+
+        public string? Get(string key) => _values.TryGetValue(key, out var value) ? value : null;
+
+        public void Set(string key, string? value)
+        {
+            if (value is null)
+                _values.Remove(key);
+            else
+                _values[key] = value;
+        }
+
+        public IReadOnlyList<string> Keys => [.. _values.Keys];
     }
 
     /// <summary>

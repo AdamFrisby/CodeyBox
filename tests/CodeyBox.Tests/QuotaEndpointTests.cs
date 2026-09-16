@@ -180,6 +180,9 @@ public sealed class QuotaEndpointTests
         {
             builder.ConfigureTestServices(services =>
             {
+                // Budgets are the subject here; real quota probes shell out to
+                // agent CLIs and can stall the request on their own timeouts.
+                services.RemoveAll<IAgentQuotaProbe>();
                 services.RemoveAll<IAgentBudgetProvider>();
                 services.AddSingleton<IAgentBudgetProvider>(new FakeBudgetProvider());
             });
@@ -210,6 +213,9 @@ public sealed class QuotaEndpointTests
         {
             builder.ConfigureTestServices(services =>
             {
+                // Budgets are the subject here; real quota probes shell out to
+                // agent CLIs and can stall the request on their own timeouts.
+                services.RemoveAll<IAgentQuotaProbe>();
                 services.RemoveAll<IAgentBudgetProvider>();
                 services.AddSingleton<IAgentBudgetProvider>(new ThrowingBudgetProvider());
             });

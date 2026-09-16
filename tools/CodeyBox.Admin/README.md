@@ -105,6 +105,7 @@ every interactive element, fluid rem layouts that scale to 200%.
 | `/work-items/{id}` | Detail view: full prompt (collapsible), state, error, deps; live stdout panel for in-flight items |
 | `/work-items/{id}/edit` | Edit title/prompt/agent — Queued items only |
 | `/work-items/{id}/timeline` | Audit-replay timeline — chronological log of every agent/audit event. Auto-refreshes every 5 s for in-flight items. Supports `?kind=`, `?since=`, `?iteration=` filter params. |
+| `/work-items/{id}/journey` | Journey graph — phases actually visited with loop counts, audit-cycle convergence (stuck vs. converging), budget remaining, per-phase agent/duration/sandbox links, infra interruptions kept distinct, current position and wait. |
 | `/work-items/{id}/timings` | Per-item timing breakdown — stacked bar of phases, drill-down step table, top-10 slowest steps |
 | `/work-items/{id}/diff` | Diff preview — unified diff of the work branch vs. base branch, with file list, +/- stats, truncation banner, and "Copy as patch" link |
 | `/timings/aggregate` | System-wide aggregate — median and p95 per step across the last N completed work items, configurable N picker |

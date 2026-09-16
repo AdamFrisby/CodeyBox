@@ -1943,3 +1943,122 @@ summary:focus-visible,
     border-top: 1px solid var(--border);
 }
 .map-chain-item { display: inline-flex; gap: 0.35rem; align-items: center; }
+/* ── Work-item journey graph ───────────────────────────────────────────────── */
+
+.journey-banner {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    padding: 0.6rem 0.9rem;
+    border-radius: var(--radius-m);
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    max-width: 60rem;
+}
+
+.journey-banner-glyph {
+    font-size: 1rem;
+}
+
+.journey-banner--stuck {
+    border-color: var(--danger);
+    background: var(--danger-bg);
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.journey-banner--atbudget {
+    border-color: var(--warn, var(--danger));
+    background: var(--danger-bg);
+}
+
+.journey-banner--converged {
+    border-color: var(--ok, var(--accent));
+}
+
+.journey-banner-budget {
+    margin-left: auto;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+}
+
+.journey-nodes {
+    list-style: none;
+    margin: 0 0 1rem;
+    padding: 0;
+    max-width: 60rem;
+}
+
+.journey-node {
+    display: flex;
+    align-items: baseline;
+    gap: 0.7rem;
+    flex-wrap: wrap;
+    padding: 0.45rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-m);
+    background: var(--bg-card);
+    margin-bottom: 0.35rem;
+}
+
+.journey-node--current {
+    border-left: 3px solid var(--accent);
+}
+
+.journey-node-glyph {
+    width: 1.4rem;
+    text-align: center;
+}
+
+.journey-loop-badge,
+.journey-current-badge {
+    font-size: 0.72rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0 0.45rem;
+    margin-left: 0.35rem;
+    white-space: nowrap;
+}
+
+.journey-current-badge {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.journey-node-meta {
+    margin-left: auto;
+    display: flex;
+    gap: 0.8rem;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+}
+
+.journey-node-links {
+    flex-basis: 100%;
+    font-size: 0.78rem;
+    font-family: var(--mono);
+}
+
+.journey-loop-line {
+    font-size: 0.85rem;
+}
+
+.journey-iter-stuck td {
+    font-weight: 600;
+}
+
+.journey-infra {
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-m);
+    padding: 0.6rem 0.9rem;
+    margin-top: 1rem;
+    max-width: 60rem;
+}
+
+.journey-infra-note {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+}

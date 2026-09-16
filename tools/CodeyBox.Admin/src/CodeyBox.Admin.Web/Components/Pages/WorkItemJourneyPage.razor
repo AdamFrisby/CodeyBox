@@ -1,0 +1,350 @@
+@page "/work-items/{Id}/journey"
+@using CodeyBox.Admin.Model
+@using CodeyBox.Admin.Web.Models
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<WorkItemJourneyPage> Logger
+
+<PageTitle>Journey — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_journey is null || _item is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <div class="detail-actions">
+        <a href="/work-items/@Id" class="btn">← Detail</a>
+        <a href="/work-items/@Id/timeline" class="btn">Timeline</a>
+        <a href="/work-items/@Id/audit-reports" class="btn">Audit Reports</a>
+        <a href="/work-items/@Id/timings" class="btn">Timings</a>
+        @if (_journey.DiffAvailable)
+        {
+            <a href="/work-items/@Id/diff" class="btn">Diff</a>
+        }
+    </div>
+
+    <h1>Journey — @_item.Title</h1>
+    <p>
+        <StatusChip Info="@StatusVocabulary.ForWorkItem(_item.State)" />
+        <span>Currently: <strong>@_journey.WaitingFor</strong></span>
+    </p>
+
+    @* ── Convergence banner: the stuck signal must be unmistakable ── *@
+    <section class="journey-banner journey-banner--@_journey.AuditCycle.Convergence.ToString().ToLowerInvariant()">
+        <span class="journey-banner-glyph">@ConvergenceGlyph(_journey.AuditCycle.Convergence)</span>
+        <span>@_journey.AuditCycle.Summary</span>
+        <span class="journey-banner-budget">Audit budget: @_journey.AuditCycle.AttemptsUsed of @_journey.AuditCycle.ConfiguredMax used@(RemainingText(_journey.AuditCycle)).</span>
+    </section>
+
+    @* ── Phase graph: visited phases in pipeline order, loops as loop counts ── *@
+    <section class="journey-graph">
+        <h2>Phases</h2>
+        <ol class="journey-nodes">
+            @foreach (var node in _journey.Nodes)
+            {
+                <li class="journey-node@(node.IsCurrent ? " journey-node--current" : "")">
+                    <span class="journey-node-glyph">@PhaseGlyph(node.Phase)</span>
+                    <span class="journey-node-label">
+                        @node.Label
+                        @if (node.Visits > 1)
+                        {
+                            <span class="journey-loop-badge" title="@node.Label ran @node.Visits times">×@node.Visits@(node.IsLoop ? " loop" : "")</span>
+                        }
+                        @if (node.IsCurrent)
+                        {
+                            <span class="journey-current-badge">● current</span>
+                        }
+                    </span>
+                    <span class="journey-node-meta">
+                        @if (node.Agents.Count > 0)
+                        {
+                            <span title="Agent">@string.Join(", ", node.Agents)</span>
+                        }
+                        @if (node.TotalDurationMs.HasValue)
+                        {
+                            <span title="Total wall-clock">@AdminFormat.FormatDurationMs(node.TotalDurationMs.Value)</span>
+                        }
+                        <span title="Latest outcome">@node.Outcome</span>
+                    </span>
+                    @if (node.HasSandboxLink)
+                    {
+                        <span class="journey-node-links">
+                            @foreach (var file in node.SandboxFiles)
+                            {
+                                <a href="/work-items/@Id/streams/@Uri.EscapeDataString(file)" title="Retained sandbox output for @node.Label">sandbox: @ShortFile(file)</a>
+                            }
+                        </span>
+                    }
+                </li>
+            }
+        </ol>
+        @if (_journey.ConflictLoop.Visits > 0)
+        {
+            <p class="journey-loop-line">
+                ↻ Conflict rework: @_journey.ConflictLoop.Visits visit(s)@LoopAgents(_journey.ConflictLoop)@LoopDuration(_journey.ConflictLoop).
+            </p>
+        }
+        @if (_journey.UpstreamLoop.Visits > 0)
+        {
+            <p class="journey-loop-line">
+                ⬆ Upstream push: @_journey.UpstreamLoop.Visits attempt(s)@LoopAgents(_journey.UpstreamLoop)@LoopDuration(_journey.UpstreamLoop).
+            </p>
+        }
+    </section>
+
+    @* ── Audit cycle: per-iteration convergence detail ── *@
+    <section class="journey-cycle">
+        <h2>Audit cycle</h2>
+        @if (_journey.AuditCycle.Iterations.Count == 0)
+        {
+            <p>No complete audit iteration recorded yet.</p>
+        }
+        else
+        {
+            <table class="detail-table journey-iterations">
+                <thead>
+                    <tr><th>Iter</th><th>Blocking</th><th>Recurring</th><th>New</th><th>Resolved</th><th>Report</th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var iter in _journey.AuditCycle.Iterations)
+                    {
+                        <tr class="@(iter.RecurringIds.Count > 0 && iter.NewIds.Count == 0 ? "journey-iter-stuck" : "")">
+                            <td>@iter.Iteration</td>
+                            <td>@iter.BlockingFindings</td>
+                            <td>@IdList(iter.RecurringIds)</td>
+                            <td>@IdList(iter.NewIds)</td>
+                            <td>@IdList(iter.ResolvedIds)</td>
+                            <td><a href="/work-items/@Id/audit-reports">report</a></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </section>
+
+    @* ── Infra interruptions: distinct from merit iterations ── *@
+    @if (_journey.InfraInterruptions.Count > 0)
+    {
+        <section class="journey-infra">
+            <h2>⚙ Infrastructure interruptions (@_journey.InfraInterruptions.Count)</h2>
+            <p class="journey-infra-note">Retries below are infrastructure, not rework — they are not counted as audit iterations.</p>
+            <ul>
+                @foreach (var evt in _journey.InfraInterruptions)
+                {
+                    <li>
+                        <strong>@evt.Kind</strong> in @evt.Phase at @AdminFormat.FormatDateTime(evt.OccurredAt)
+                        @if (!string.IsNullOrWhiteSpace(evt.SandboxName))
+                        {
+                            <span> (sandbox @evt.SandboxName)</span>
+                        }
+                        @if (!string.IsNullOrWhiteSpace(evt.Detail))
+                        {
+                            <span> — @evt.Detail</span>
+                        }
+                    </li>
+                }
+            </ul>
+        </section>
+    }
+}
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+
+    private WorkItemDto? _item;
+    private WorkItemJourney? _journey;
+    private string? _error;
+    private bool _notFound;
+
+    protected override async Task OnParametersSetAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        _journey = null;
+        try
+        {
+            var item = await ApiClient.GetWorkItemAsync(Id);
+            if (item is null)
+            {
+                _notFound = true;
+                return;
+            }
+            _item = item;
+
+            var progressTask = ApiClient.GetAuditProgressAsync(Id);
+            var historyTask = ApiClient.GetAgentHistoryAsync(Id);
+            var timingsTask = ApiClient.GetWorkItemTimingsAsync(Id);
+            var streamsTask = ApiClient.GetAgentStreamFilesAsync(Id);
+            var projectsTask = ApiClient.GetProjectsAsync();
+            var diffTask = ApiClient.GetWorkItemDiffAsync(Id);
+            await Task.WhenAll(progressTask, historyTask, timingsTask, streamsTask, projectsTask, diffTask);
+
+            _journey = WorkItemJourneyBuilder.Build(ToSnapshot(
+                item,
+                await progressTask,
+                await historyTask,
+                await timingsTask,
+                await streamsTask,
+                (await projectsTask).FirstOrDefault(p => p.Id == item.ProjectId),
+                await diffTask));
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load journey for {Id}", Id.Replace("\r", "").Replace("\n", ""));
+            _error = "Failed to load journey. Check server logs for details.";
+        }
+    }
+
+    private static JourneySnapshot ToSnapshot(
+        WorkItemDto item,
+        AuditProgressListDto? progress,
+        WorkItemAgentHistoryDto? history,
+        WorkItemTimingsDto? timings,
+        List<AgentStreamFileDto> streams,
+        ProjectDto? project,
+        WorkItemDiffDto? diff)
+    {
+        var runs = (history?.AgentHistory ?? item.AgentHistory ?? new List<AgentInvolvementEntryDto>())
+            .Where(r => r is not null)
+            .Select(r => new JourneyPhaseRun
+            {
+                Phase = r.Phase ?? string.Empty,
+                AgentKind = r.AgentKind ?? string.Empty,
+                ModelId = r.ModelId,
+                StartedAt = r.StartedAt,
+                EndedAt = r.EndedAt,
+                Iteration = r.Iteration,
+                Outcome = r.Outcome,
+            })
+            .ToList();
+
+        var timingSums = new List<JourneyPhaseTiming>();
+        if (timings?.ByPhase is not null)
+        {
+            foreach (var (phase, element) in timings.ByPhase)
+            {
+                if (element.ValueKind == System.Text.Json.JsonValueKind.Object
+                    && element.TryGetProperty("durationMs", out var duration)
+                    && duration.TryGetInt64(out var ms)
+                    && ms >= 0)
+                {
+                    timingSums.Add(new JourneyPhaseTiming { Phase = phase, DurationMs = ms });
+                }
+            }
+        }
+
+        var infra = new List<JourneyInfraEvent>();
+        if (string.Equals(item.FailureKind, "infrastructure", StringComparison.Ordinal))
+        {
+            infra.Add(new JourneyInfraEvent
+            {
+                Phase = item.State,
+                Kind = "infrastructure",
+                Detail = item.LastError,
+                OccurredAt = item.UpdatedAt,
+            });
+        }
+
+        return new JourneySnapshot
+        {
+            Item = new JourneyItem
+            {
+                Id = item.Id,
+                Title = item.Title ?? string.Empty,
+                State = item.State ?? string.Empty,
+                Agent = item.Agent ?? string.Empty,
+                AuditMaxIterations = item.AuditMaxIterations,
+                UpstreamPushAttempts = item.UpstreamPushAttempts,
+                ConflictReworkAttempts = item.ConflictReworkAttempts,
+                DelegationAttempts = item.DelegationAttempts,
+                FailureKind = item.FailureKind,
+                LastError = item.LastError,
+                NextQuotaRetryAt = item.NextQuotaRetryAt,
+                NextTransientRetryAt = item.NextTransientRetryAt,
+                QuotaResetAt = item.QuotaResetAt,
+                AgentPauseTarget = item.AgentPauseTarget,
+            },
+            AuditIterations = (progress?.Progress ?? new List<AuditProgressRowDto>())
+                .Where(r => r is not null)
+                .Select(r => new JourneyAuditIteration
+                {
+                    WorkAttemptKey = r.WorkAttemptKey ?? string.Empty,
+                    Iteration = r.Iteration,
+                    MaxIterations = r.MaxIterations,
+                    Status = r.Status ?? "complete",
+                    BlockingFindings = r.BlockingFindings,
+                    NonBlockingFindings = r.NonBlockingFindings,
+                    BlockingFindingIds = r.BlockingFindingIds ?? new List<string>(),
+                    RecordedAt = r.RecordedAt,
+                    WorkBranchTip = r.WorkBranchTip,
+                })
+                .ToList(),
+            PhaseRuns = runs,
+            Timings = timingSums,
+            InfraEvents = infra,
+            StreamFiles = streams
+                .Where(s => s is not null && !string.IsNullOrEmpty(s.FileName))
+                .Select(s => new JourneyStreamFile
+                {
+                    FileName = s.FileName,
+                    Phase = s.Phase ?? string.Empty,
+                    Iteration = s.Iteration,
+                })
+                .ToList(),
+            DiffAvailable = diff is not null,
+            ProjectDefaultMaxIterations =
+                project is not null && project.AuditMaxIterations > 0 ? project.AuditMaxIterations : null,
+        };
+    }
+
+    private static string ConvergenceGlyph(JourneyConvergence convergence) => convergence switch
+    {
+        JourneyConvergence.Stuck => "⛔",
+        JourneyConvergence.AtBudget => "■",
+        JourneyConvergence.Converged => "✓",
+        JourneyConvergence.Converging => "↘",
+        JourneyConvergence.Cycling => "↻",
+        _ => "○",
+    };
+
+    private static string PhaseGlyph(string phase) => phase switch
+    {
+        "work" => "⚒",
+        "audit" => "🔍",
+        "rework" => "↻",
+        "merge" => "⑂",
+        "conflictRework" => "⚔",
+        "upstreamPush" => "⬆",
+        "delegation" => "➦",
+        "planning" => "✎",
+        "check" => "☑",
+        _ => "•",
+    };
+
+    private static string RemainingText(JourneyAuditCycle cycle) =>
+        cycle.Remaining.HasValue ? $" {cycle.Remaining.Value} remaining" : string.Empty;
+
+    private static string IdList(IReadOnlyList<string> ids) =>
+        ids.Count == 0 ? "—" : string.Join(", ", ids);
+
+    private static string ShortFile(string file) =>
+        file.Length <= 40 ? file : string.Concat(file.AsSpan(0, 18), "…", file.AsSpan(file.Length - 12));
+
+    private static string LoopAgents(JourneyLoop loop) =>
+        loop.Agents.Count == 0 ? string.Empty : $" by {string.Join(", ", loop.Agents)}";
+
+    private static string LoopDuration(JourneyLoop loop) =>
+        loop.TotalDurationMs.HasValue
+            ? $", {AdminFormat.FormatDurationMs(loop.TotalDurationMs.Value)} total"
+            : string.Empty;
+}

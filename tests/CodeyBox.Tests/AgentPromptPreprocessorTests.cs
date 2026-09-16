@@ -451,8 +451,11 @@ public sealed class AgentPromptPreprocessorTests
         // Fill content with euro signs (3 UTF-8 bytes each). The cap is not a
         // multiple of 3, so a naive char-index truncation would land inside a
         // surrogate-free multi-byte sequence; verify the result is still valid.
-        var sb = new StringBuilder();
-        while (Encoding.UTF8.GetByteCount(sb.ToString()) < (256 * 1024) + 1024)
+        // Exact-count fill: counting bytes incrementally avoids re-encoding the
+        // whole buffer per append (O(n²), ~11s at this size).
+        const int targetBytes = (256 * 1024) + 1024;
+        var sb = new StringBuilder(targetBytes + 4);
+        for (var bytes = 0; bytes < targetBytes; bytes += 3)
             sb.Append('€');
         var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
             new() { ProjectRulesPath = "AGENTS.md" });
@@ -480,8 +483,10 @@ public sealed class AgentPromptPreprocessorTests
         // A naive char-index truncation can land between the high and low
         // surrogate; assert the truncated prefix never contains an orphan
         // surrogate so downstream re-encoding does not emit U+FFFD.
-        var sb = new StringBuilder();
-        while (Encoding.UTF8.GetByteCount(sb.ToString()) < (256 * 1024) + 1024)
+        // Exact-count fill (see above): the per-append re-encode loop was O(n²).
+        const int targetBytes = (256 * 1024) + 1024;
+        var sb = new StringBuilder(targetBytes + 8);
+        for (var bytes = 0; bytes < targetBytes; bytes += 4)
             sb.Append("😀");
         var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
             new() { ProjectRulesPath = "AGENTS.md" });
