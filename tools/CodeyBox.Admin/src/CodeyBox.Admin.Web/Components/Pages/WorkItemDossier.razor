@@ -1,0 +1,167 @@
+@page "/work-items/{Id}/dossier"
+@using CodeyBox.Admin.Web.Models
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<WorkItemDossier> Logger
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>Dossier — CodeyBox Admin</PageTitle>
+
+@if (_notFound)
+{
+    <p class="error-banner">Work item not found.</p>
+}
+else if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+else if (_dossier is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <h1>Dossier — @_dossier.Title</h1>
+    <p class="dossier-link">
+        Shareable link: <code>@_dossier.DossierLink</code>
+        <button class="btn" @onclick="CopyLinkAsync">Copy link</button>
+        @if (_copied)
+        {
+            <span>Copied.</span>
+        }
+    </p>
+    <p>
+        <strong>Verdict: @_dossier.OverallStatus</strong>
+        <span>(state @_dossier.State, prompt revision @_dossier.PromptRevision)</span>
+    </p>
+
+    <section>
+        <h2>Change</h2>
+        @if (_dossier.Change.Outcome == "not_run")
+        {
+            <p>No diff available yet — the agent has not pushed a change.</p>
+        }
+        else
+        {
+            <p>
+                <code>@_dossier.Change.BaseBranch</code> → <code>@_dossier.Change.WorkBranch</code> —
+                @_dossier.Change.FilesChanged files,
+                +@_dossier.Change.LinesAdded / -@_dossier.Change.LinesRemoved
+            </p>
+            @if (_dossier.Change.ChangedFiles.Count > 0)
+            {
+                <ul>
+                    @foreach (var f in _dossier.Change.ChangedFiles)
+                    {
+                        <li><code>@f</code></li>
+                    }
+                </ul>
+                @if (_dossier.Change.Truncated)
+                {
+                    <p>File list truncated.</p>
+                }
+            }
+        }
+    </section>
+
+    <section>
+        <h2>Publication</h2>
+        <table class="detail-table">
+            <tr><th>Local merge</th><td>@_dossier.Publication.LocalMerge.State @_dossier.Publication.LocalMerge.Sha</td></tr>
+            <tr><th>Open PR</th><td>@_dossier.Publication.OpenPr.State @(FormatPr(_dossier.Publication.OpenPr.Number, _dossier.Publication.OpenPr.Url))</td></tr>
+            <tr><th>Merged PR</th><td>@_dossier.Publication.MergedPr.State @(FormatPr(_dossier.Publication.MergedPr.Number, _dossier.Publication.MergedPr.Url))</td></tr>
+        </table>
+        <p>A local merge is not a published change: each leg above is a distinct fact.</p>
+    </section>
+
+    <section>
+        <h2>Gates</h2>
+        <table class="detail-table">
+            <tr><th>Gate</th><th>Outcome</th><th>Stale</th><th>Summary</th></tr>
+            @foreach (var g in _dossier.Gates)
+            {
+                <tr>
+                    <td>@g.Name</td>
+                    <td>@g.Outcome</td>
+                    <td>@(g.IsStale ? "stale" : "current")</td>
+                    <td>@g.Summary</td>
+                </tr>
+            }
+        </table>
+    </section>
+
+    <section>
+        <h2>Cost</h2>
+        <p>
+            $@_dossier.Costs.EstimatedUsd.ToString("F4", System.Globalization.CultureInfo.InvariantCulture) —
+            @_dossier.Costs.InputTokens input / @_dossier.Costs.OutputTokens output tokens,
+            @_dossier.Costs.InvocationCount invocations.
+        </p>
+    </section>
+
+    <section>
+        <h2>Artifacts (@_dossier.Artifacts.Count)</h2>
+        <table class="detail-table">
+            <tr><th>Name</th><th>Phase</th><th>Produced by</th><th>Outcome</th><th>Stale</th><th>Summary</th></tr>
+            @foreach (var a in _dossier.Artifacts)
+            {
+                <tr>
+                    <td><code>@a.Name</code></td>
+                    <td>@a.Phase</td>
+                    <td>@a.ProducedBy</td>
+                    <td>@a.Outcome</td>
+                    <td>@(a.IsStale ? "stale" : "current")</td>
+                    <td>@a.Summary</td>
+                </tr>
+            }
+        </table>
+    </section>
+
+    <p><a href="/work-items/@Id">Back to work item</a></p>
+}
+
+@code {
+    [Parameter]
+    public string Id { get; set; } = "";
+
+    private WorkItemDossierDto? _dossier;
+    private bool _notFound;
+    private string? _error;
+    private bool _copied;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _dossier = null;
+        _notFound = false;
+        _error = null;
+        try
+        {
+            _dossier = await ApiClient.GetWorkItemDossierAsync(Id);
+            if (_dossier is null) _notFound = true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load dossier for {Id}", Id);
+            _error = "Failed to load dossier.";
+        }
+    }
+
+    private static string FormatPr(int? number, string? url)
+        => number is > 0 ? $"#{number} {url}" : "";
+
+    private async Task CopyLinkAsync()
+    {
+        _copied = false;
+        try
+        {
+            var uri = Nav.ToAbsoluteUri(_dossier?.DossierLink ?? $"/work-items/{Id}/dossier").ToString();
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", uri);
+            _copied = true;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Clipboard write failed");
+            _copied = false;
+        }
+    }
+}

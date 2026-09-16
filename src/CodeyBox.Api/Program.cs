@@ -4462,6 +4462,7 @@ WorkItemCostsEndpoints.Map(app);
 AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
+WorkItemDossierEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 GitHubAppConnectEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
