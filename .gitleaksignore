@@ -21,6 +21,8 @@
 # - The github-refresh-token hit is an OpenAI "encrypted_content" blob inside a
 #   checked-in Codex session transcript, not a GitHub token.
 # Genuine secrets must never be added here; fix the source instead.
+# Verified 2026-09-16: `gitleaks detect --log-opts="HEAD~1..HEAD"` on the goose-agent
+# commit reports no leaks; these 27 findings are all in older commits.
 00679f56d0e55fa0f934e644f88bcc7fa81f7857:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:2309
 0a544b6d2dead6f527cc684f7f7e4442b11906a3:tests/CodeyBox.Tests/ConvergenceBriefComposerTests.cs:github-pat:321
 15911ebee0af227be9d6ca5b5543101141912b66:tests/CodeyBox.Tests/GeminiAgentRunnerTests.cs:generic-api-key:476

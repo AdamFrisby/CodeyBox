@@ -260,6 +260,25 @@ when re-verifying against a newer aider. `UV_TOOL_BIN_DIR` pins the
 `aider` binary onto `/usr/local/bin` because bake runcmds run as root and
 `uv tool install` would otherwise land it in root's home directory, off the
 sandbox user's PATH.
+For Goose, add the shell-installer line to the selected provider's runcmd,
+pinning the installer script by tag with a SHA256 check before executing
+(verified `GOOSE_VERSION=v1.50.1`; the installer honors `GOOSE_VERSION` to
+pin the binary download too, with no `stable` fallback when it is set):
+
+```json
+{
+  "CodeyBox": {
+    "MultipassExtraRuncmd": [
+      "set -eux\nGOOSE_VERSION=v1.50.1\nGOOSE_INSTALLER=/tmp/goose-download_cli.sh\ncurl -fsSL -o \"$GOOSE_INSTALLER\" \"https://github.com/aaif-goose/goose/releases/download/${GOOSE_VERSION}/download_cli.sh\"\nprintf '%s  %s\\n' \"ab5ae40513348ec4e6047cc7338040aab2df5246800c111d22065766ba6013f0\" \"$GOOSE_INSTALLER\" | sha256sum -c -\nGOOSE_VERSION=\"${GOOSE_VERSION}\" bash \"$GOOSE_INSTALLER\"\nrm \"$GOOSE_INSTALLER\"",
+      "goose --version"
+    ]
+  }
+}
+```
+
+Goose runs one-shot headless (`goose run -i - --output-format stream-json
+--no-session`); unlike the interactive TUI some third-party harnesses drive,
+no PTY or keep-alive flag is needed, so nothing else must be baked for it.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. **Antigravity (`agy`) is provisioned via the selected
 provider's executable-provision list, NOT a `curl … | bash` runcmd entry**: the
