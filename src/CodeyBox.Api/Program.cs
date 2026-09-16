@@ -3067,30 +3067,12 @@ builder.Services.AddSingleton<IChangelogGenerator>(sp =>
 });
 
 // Changelog webhook HMAC secret — mirrors the SandboxProvider enforcement pattern.
-// In non-Development environments the secret env-var MUST be configured so that
-// the POST /webhooks/github/release endpoint always validates HMAC signatures.
-{
-    var changelogCfg = builder.Configuration.GetSection("CodeyBox:Changelog");
-    var changelogEnabled = changelogCfg.GetValue<bool>("Enabled", true);
-    var webhookSecretEnvVar = changelogCfg["GitHubWebhookSecretEnvVar"];
-    if (changelogEnabled && string.IsNullOrEmpty(webhookSecretEnvVar))
-    {
-        if (builder.Environment.IsDevelopment())
-        {
-            Log.Warning(
-                "CodeyBox:Changelog:GitHubWebhookSecretEnvVar is not configured. " +
-                "GitHub release webhooks will be rejected with 401 until a secret is set. " +
-                "This is a configuration error in non-Development environments.");
-        }
-        else
-        {
-            throw new InvalidOperationException(
-                "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
-                "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
-                "(see docs/operating/releases.md).");
-        }
-    }
-}
+// Changelog automation is opt-in (ChangelogOptions.Enabled defaults to false):
+// when disabled the secret is not required and an unconfigured install starts
+// cleanly. When enabled outside Development the secret env-var MUST be
+// configured so that the POST /webhooks/github/release endpoint always
+// validates HMAC signatures.
+ValidateChangelogWebhookConfiguration(builder.Configuration, builder.Environment);
 
 // --- SignalR (live agent stdout) ----------------------------------------------
 // AgentStdoutHub requires no additional packages on ASP.NET Core 8+.
@@ -6890,8 +6872,13 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class ChangelogOptions
     {
-        /// <summary>Enable or disable changelog automation globally. Default true.</summary>
-        public bool Enabled { get; set; } = true;
+        /// <summary>
+        /// Enable or disable changelog automation globally. Default false:
+        /// changelog automation is opt-in per project (see
+        /// docs/operating/releases.md), so an unconfigured install starts
+        /// cleanly with the webhook receiver failing closed.
+        /// </summary>
+        public bool Enabled { get; set; } = false;
 
         /// <summary>
         /// LLM agent to use for generation. Currently only "claude" is supported.
@@ -6941,8 +6928,10 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Name of the environment variable holding the HMAC-SHA256 secret for
-        /// validating incoming GitHub release webhooks. Must be set in non-Development
-        /// environments; the webhook endpoint rejects all requests with 401 if not configured.
+        /// validating incoming GitHub release webhooks. Required when
+        /// <see cref="Enabled"/> is true and the host runs outside Development
+        /// (startup fails without it); the webhook endpoint rejects all
+        /// requests with 401 while the secret is missing at runtime.
         /// </summary>
         public string? GitHubWebhookSecretEnvVar { get; set; }
     }
@@ -7796,6 +7785,47 @@ namespace CodeyBox.Api
 // Exposed for WebApplicationFactory<Program> in integration tests.
 public partial class Program
 {
+    /// <summary>
+    /// Enforces the changelog webhook secret requirement at startup.
+    /// Changelog automation is opt-in: when disabled, no secret is required.
+    /// When enabled without a secret, Development logs a warning while other
+    /// environments fail fast so an enabled webhook endpoint can never run
+    /// without HMAC signature verification.
+    /// </summary>
+    /// <param name="configuration">Application configuration.</param>
+    /// <param name="environment">Host environment.</param>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when changelog automation is enabled without
+    /// <c>CodeyBox:Changelog:GitHubWebhookSecretEnvVar</c> outside Development.
+    /// </exception>
+    internal static void ValidateChangelogWebhookConfiguration(
+        IConfiguration configuration, IHostEnvironment environment)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(environment);
+
+        // Bind through ChangelogOptions so the Enabled default lives in exactly
+        // one place (the property initializer).
+        var bound = configuration.GetSection("CodeyBox:Changelog").Get<ChangelogOptions>()
+            ?? new ChangelogOptions();
+        if (!bound.Enabled || !string.IsNullOrEmpty(bound.GitHubWebhookSecretEnvVar))
+            return;
+
+        if (environment.IsDevelopment())
+        {
+            Log.Warning(
+                "CodeyBox:Changelog:GitHubWebhookSecretEnvVar is not configured. " +
+                "GitHub release webhooks will be rejected with 401 until a secret is set. " +
+                "This is a configuration error in non-Development environments.");
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
+            "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
+            "(see docs/operating/releases.md).");
+    }
+
     /// <summary>
     /// Resolve <c>HostOptions.ShutdownTimeout</c> from operator config, the
     /// resolved provider's suspend capability, and the hot-reloadable teardown
