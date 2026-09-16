@@ -199,8 +199,9 @@ public sealed partial class PipelineRunner
             UseShellExecute = false,
             CreateNoWindow = true,
         };
-        psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add($"core.hooksPath={_disabledHostHooksPath}");
+        // Host-owned bare repos (merge-ancestry probes target the bare host
+        // repo): same per-invocation hardening relaxation as LocalGitHost.
+        LocalGitInvocation.ApplyHostConfig(psi, _disabledHostHooksPath);
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 

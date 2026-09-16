@@ -1008,8 +1008,7 @@ public sealed class LocalGitHost : IGitHost
             UseShellExecute = false,
             CreateNoWindow = true,
         };
-        psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add($"core.hooksPath={_disabledHooksPath}");
+        LocalGitInvocation.ApplyHostConfig(psi, _disabledHooksPath);
         psi.ArgumentList.Add("ls-tree");
         psi.ArgumentList.Add("-r");
         psi.ArgumentList.Add("--name-only");
@@ -1504,8 +1503,7 @@ public sealed class LocalGitHost : IGitHost
             UseShellExecute = false,
             CreateNoWindow = true,
         };
-        psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add($"core.hooksPath={_disabledHooksPath}");
+        LocalGitInvocation.ApplyHostConfig(psi, _disabledHooksPath);
         foreach (var a in args) psi.ArgumentList.Add(a);
         if (extraEnv is not null)
             foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
