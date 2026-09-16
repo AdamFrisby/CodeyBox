@@ -20,6 +20,7 @@ tooling, not in the agent runner contract.
 | `crock`     | `crock`           | `CROCK_CONFIG_JSON` (file-materialised to `~/.crockcode/config.json`) | `CODEYBOX_CROCK_CONFIG_JSON` |
 | `pi`        | `pi`              | `ANTHROPIC_API_KEY` (provider API key; other providers use their own variable from pi's provider table — see [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi)) | `CODEYBOX_PI_API_KEY` |
 | `aider`     | `aider`           | `OPENROUTER_API_KEY` (provider API key; other providers use their own variable from aider's litellm provider table — see [Aider quirks](../reference/agent-quirks.md#aider-aider)) | `CODEYBOX_AIDER_API_KEY` |
+| `goose`     | `goose`           | `OPENROUTER_API_KEY` (provider API key; goose honors thirteen provider variables — see [Goose quirks](../reference/agent-quirks.md#goose-cli-goose)) | `CODEYBOX_GOOSE_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -54,6 +55,7 @@ the most common cause of fresh-class dispatch failures.
 | `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it via `CodeyBox:MultipassExecutableProvisions` or `CodeyBox:Incus:ExecutableProvisions`, matching the selected provider* (see [Antigravity quirks](../reference/agent-quirks.md#google-antigravity-cli-agy)). Do not use `curl -fsSL https://antigravity.google/cli/install.sh \| bash`: that URL serves the landing page, not a script, and piping HTML into `bash` fails silently when the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
 | `pi` | `npm install -g --ignore-scripts @earendil-works/pi-coding-agent` | MIT-licensed; needs Node.js on the image. `--ignore-scripts` skips npm lifecycle scripts during install. See [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi). |
 | `aider` | `curl -fsSL https://aider.chat/install.sh \| bash` then `uv tool install aider-chat` (or `uv tool install aider-chat@<version>` to pin) | Apache-2.0; needs Python 3.12 on the image. The install script installs `uv` and then aider via `uv tool install --python python3.12 aider-chat`. See [Aider quirks](../reference/agent-quirks.md#aider-aider). |
+| `goose` | tag-pinned `download_cli.sh` with SHA256 verification (see [sandbox baselines](../reference/sandbox-baselines.md)) | Shell installer for macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux). Installs the `goose` binary. Pinned to `v1.50.1` with `GOOSE_VERSION` (never `stable`) for reproducible bakes. See [Goose quirks](../reference/agent-quirks.md#goose-cli-goose). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake
