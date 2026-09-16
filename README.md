@@ -19,28 +19,47 @@ point is to be able to leave it running — see
 > Built in C#/.NET 10. Managed repos can be any stack — Python, Node, Go, Rust,
 > C#, or your own — through config-driven auditors.
 
-![The work queue — every item, its state, and the controls to steer it](screenshots/01-queue.png)
+![Agnes watching a CodeyBox fleet — vitals, quota to reset, cumulative flow, and what needs a look](screenshots/agnes-01-overview.png)
 
-## The admin UI
+## Want a front end? Use Agnes
 
-Everything the orchestrator is doing is visible and steerable from a web admin
-on your host — pause the queue or a single project, inspect any item's timeline,
-audit reports, timings, costs and diff, and watch agent output live.
+CodeyBox is an **orchestrator**, not an application. It exposes a REST API, a
+SignalR stream and a typed CLI, and it is designed to be left running without
+anyone watching it.
+
+When you do want to watch — or steer from another machine, or from your
+phone — use **[Agnes](https://github.com/AdamFrisby/Agnes)** — a separate product, a
+remote interface to coding CLIs, which ships a first-class CodeyBox client.
+Point it at your orchestrator and you get the screens below. Neither product
+requires the other.
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/agnes-03-now-working.png" alt="Now working"><br><sub><b>Now working</b> — every busy slot, what it is doing this second, and how long it has been doing it. Landed today, in flight, time to drain.</sub></td>
+<td width="50%"><img src="screenshots/agnes-02-work-queue.png" alt="Work queue"><br><sub><b>Work queue</b> — now, next in dispatch order, waiting on you, and landed. A failed item explains itself and offers the three things you can actually do about it.</sub></td>
+</tr>
+</table>
+
+The overview above is the one to leave on a spare monitor: a plain-language
+verdict at the top, quota-to-reset per agent, thirty days of cumulative flow,
+and a "needs a look" list that ranks by how stuck something is rather than by
+age.
+
+## The built-in admin
+
+CodeyBox also ships its own web admin on the host — pause the queue or a single
+project, inspect any item's timeline, audit reports, timings, costs and diff,
+and watch agent output live. It is deliberately plain today and is being
+rebuilt; screenshots of the current state are in
+[`screenshots/`](screenshots), generated against a deterministic seeded
+instance by [`tools/screenshots/`](tools/screenshots).
 
 <table>
 <tr>
 <td width="50%"><img src="screenshots/10-work-item-detail.png" alt="A single work item"><br><sub><b>One item, end to end</b> — state, branches, and tabs for its timeline, audit reports, timings, costs and diff.</sub></td>
 <td width="50%"><img src="screenshots/05-capacity.png" alt="Subscription capacity"><br><sub><b>Capacity</b> — quota snapshots joined against real token consumption, to estimate what each 1% of a window buys.</sub></td>
 </tr>
-<tr>
-<td><img src="screenshots/06-releases.png" alt="Releases"><br><sub><b>Releases</b> — batch changes onto a release branch and track it to landing.</sub></td>
-<td><img src="screenshots/08-plugins.png" alt="Plugins"><br><sub><b>Plugins</b> — what is loaded, from where, and what each one contributes.</sub></td>
-</tr>
 </table>
-
-More in [`screenshots/`](screenshots). They are generated from the real UI
-against a deterministic seeded instance — see
-[`tools/screenshots/`](tools/screenshots) to regenerate them.
 
 ## Why you might want this
 
@@ -260,8 +279,9 @@ Recovery procedures are in
 - **Durable and restartable.** SQLite-backed state, crash/restart tolerance,
   resumable agent turns, and deterministic replay.
   → [`docs/operating/recovery.md`](docs/operating/recovery.md)
-- **Three ways to drive it.** A REST API, a typed CLI, and a Blazor admin
-  dashboard — plus HMAC-signed outbound webhooks.
+- **Four ways to drive it.** A REST API, a SignalR event stream, a typed CLI,
+  and the built-in Blazor admin — plus HMAC-signed outbound webhooks, and
+  [Agnes](https://github.com/AdamFrisby/Agnes) if you want a remote front end.
   → [`docs/reference/api.md`](docs/reference/api.md),
   [`docs/reference/webhooks.md`](docs/reference/webhooks.md)
 - **Pluggable everything.** Ship custom auditors, upstream remotes, credential

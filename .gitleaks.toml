@@ -1,3 +1,18 @@
+# Extends gitleaks' default rules rather than replacing them.
+[extend]
+  useDefault = true
+
+# OpenRouter keys reach this repository's orbit through agent credentials:
+# CavemanCode routes through OpenRouter, and test keys are injected into
+# sandboxes so agents can exercise adapters they write. The default
+# generic-API-key rule would probably catch a 73-character sk- string, but
+# "probably" is not a guarantee for a live credential, so match the shape.
+[[rules]]
+  id = "openrouter-api-key"
+  description = "OpenRouter API key"
+  regex = '''sk-or-v1-[0-9a-f]{64}'''
+  keywords = ["sk-or-v1-"]
+
 [allowlist]
   description = "Test fixture files containing synthetic tokens for redaction unit tests"
   paths = [

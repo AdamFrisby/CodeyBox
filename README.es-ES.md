@@ -22,29 +22,48 @@ host, porque el objetivo es poder dejarlo en ejecución — consulta
 > stack —Python, Node, Go, Rust, C# o el tuyo propio— a través de auditores
 > impulsados por configuración.
 
-![La cola de trabajo: cada elemento, su estado y los controles para dirigirla](screenshots/01-queue.png)
+![Agnes vigilando una flota de CodeyBox: constantes vitales, cuota hasta el reinicio, flujo acumulado y lo que necesita una mirada](screenshots/agnes-01-overview.png)
 
-## La interfaz de administración
+## ¿Quieres una interfaz? Usa Agnes
 
-Todo lo que el orquestador está haciendo es visible y dirigible desde un panel
-de administración web en tu host: pausa la cola o un solo proyecto, inspecciona
-la cronología de cualquier elemento, sus informes de auditoría, tiempos, costos
-y diff, y observa en vivo la salida del agente.
+CodeyBox es un **orquestador**, no una aplicación. Expone una API REST, un flujo
+SignalR y un CLI tipado, y está diseñado para dejarlo en ejecución sin que nadie
+lo vigile.
+
+Cuando sí quieras vigilarlo —o dirigirlo desde otra máquina, o desde tu
+teléfono—, usa **[Agnes](https://github.com/AdamFrisby/Agnes)**: un producto
+aparte, una interfaz remota para CLIs de código, que incluye un cliente de
+CodeyBox de primera clase. Apúntalo a tu orquestador y obtendrás las pantallas
+de abajo. Ninguno de los dos productos requiere al otro.
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/agnes-03-now-working.png" alt="Trabajando ahora"><br><sub><b>Trabajando ahora</b> — cada ranura ocupada, qué está haciendo en este preciso segundo y cuánto tiempo lleva haciéndolo. Aplicados hoy, en vuelo y tiempo hasta drenar.</sub></td>
+<td width="50%"><img src="screenshots/agnes-02-work-queue.png" alt="Cola de trabajo"><br><sub><b>Cola de trabajo</b> — lo que hay ahora, lo siguiente en orden de despacho, lo que te espera a ti y lo ya aplicado. Un elemento fallido se explica solo y ofrece las tres cosas que realmente puedes hacer al respecto.</sub></td>
+</tr>
+</table>
+
+La vista general de arriba es la que conviene dejar en un monitor libre: un
+veredicto en lenguaje llano arriba del todo, la cuota hasta el reinicio de cada
+agente, treinta días de flujo acumulado y una lista de "necesita una mirada" que
+ordena por lo atascado que está algo en lugar de por su antigüedad.
+
+## El panel de administración integrado
+
+CodeyBox también incluye su propio panel de administración web en tu host: pausa
+la cola o un solo proyecto, inspecciona la cronología de cualquier elemento, sus
+informes de auditoría, tiempos, costos y diff, y observa en vivo la salida del
+agente. Hoy es deliberadamente sencillo y se está reconstruyendo; las capturas
+de su estado actual están en [`screenshots/`](screenshots), generadas contra una
+instancia con datos semilla deterministas por
+[`tools/screenshots/`](tools/screenshots).
 
 <table>
 <tr>
 <td width="50%"><img src="screenshots/10-work-item-detail.png" alt="Un único elemento de trabajo"><br><sub><b>Un elemento, de principio a fin</b> — estado, ramas y pestañas para su cronología, informes de auditoría, tiempos, costos y diff.</sub></td>
 <td width="50%"><img src="screenshots/05-capacity.png" alt="Capacidad de la suscripción"><br><sub><b>Capacidad</b> — cruza las instantáneas de cuota con el consumo real de tokens, para estimar qué compra cada 1 % de una ventana.</sub></td>
 </tr>
-<tr>
-<td><img src="screenshots/06-releases.png" alt="Releases"><br><sub><b>Releases</b> — agrupa cambios en una rama de versión y haz su seguimiento hasta que se apliquen.</sub></td>
-<td><img src="screenshots/08-plugins.png" alt="Plugins"><br><sub><b>Plugins</b> — qué está cargado, desde dónde y con qué contribuye cada uno.</sub></td>
-</tr>
 </table>
-
-Hay más en [`screenshots/`](screenshots). Se generan desde la interfaz real
-contra una instancia con datos semilla deterministas; consulta
-[`tools/screenshots/`](tools/screenshots) para regenerarlas.
 
 ## Por qué podrías querer esto
 
@@ -286,8 +305,10 @@ procedimientos de recuperación están en
 - **Durable y reiniciable.** Estado respaldado por SQLite, tolerancia a
   fallos/reinicios, turnos de agente reanudables y reproducción determinista.
   → [`docs/operating/recovery.md`](docs/operating/recovery.md)
-- **Tres formas de controlarlo.** Una API REST, un CLI tipado y un panel de
-  administración Blazor, además de webhooks salientes firmados con HMAC.
+- **Cuatro formas de controlarlo.** Una API REST, un flujo de eventos SignalR,
+  un CLI tipado y el panel de administración Blazor integrado, además de
+  webhooks salientes firmados con HMAC y
+  [Agnes](https://github.com/AdamFrisby/Agnes) si quieres una interfaz remota.
   → [`docs/reference/api.md`](docs/reference/api.md),
   [`docs/reference/webhooks.md`](docs/reference/webhooks.md)
 - **Todo es enchufable.** Distribuye auditores, remotos de upstream, proveedores
