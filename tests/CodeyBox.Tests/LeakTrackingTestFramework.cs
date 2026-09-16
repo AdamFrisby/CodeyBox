@@ -36,7 +36,14 @@ public sealed class LeakTrackingTestFramework : XunitTestFramework
         internal const string RunStallTimeoutEnvironmentVariable = "CODEYBOX_TESTS_RUN_STALL_TIMEOUT_SECONDS";
 
         private const int DefaultCaseTimeoutSeconds = 600;
-        private const int DefaultRunTimeoutSeconds = 2400;
+        // Overall backstop for the assembly run. This must clear the suite's
+        // legitimate serial duration: XunitAssemblyConfig disables all test
+        // parallelization (2-core audit hosts flake under any wider pool), so
+        // ~12k cases execute strictly one at a time and need well over
+        // 40 minutes in Debug. Genuine hangs are still caught quickly by the
+        // stall timeout (no completed test for 10 minutes) and the per-case
+        // timeout, so this stays a backstop, not hang detection.
+        private const int DefaultRunTimeoutSeconds = 5400;
         private const int DefaultRunStallTimeoutSeconds = 600;
         private const int MaxNamedPendingTests = 5;
 
