@@ -21,6 +21,7 @@ tooling, not in the agent runner contract.
 | `pi`        | `pi`              | `ANTHROPIC_API_KEY` (provider API key; other providers use their own variable from pi's provider table — see [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi)) | `CODEYBOX_PI_API_KEY` |
 | `aider`     | `aider`           | `OPENROUTER_API_KEY` (provider API key; other providers use their own variable from aider's litellm provider table — see [Aider quirks](../reference/agent-quirks.md#aider-aider)) | `CODEYBOX_AIDER_API_KEY` |
 | `goose`     | `goose`           | `OPENROUTER_API_KEY` (provider API key; goose honors thirteen provider variables — see [Goose quirks](../reference/agent-quirks.md#goose-cli-goose)) | `CODEYBOX_GOOSE_API_KEY` |
+| `autohand`  | `autohand`        | `AUTOHAND_API_KEY` (bare-mode gate; the runner seeds the same bundle value into guest `~/.autohand/config.json` — the CLI reads the key only from that file — see [Autohand quirks](../reference/agent-quirks.md#autohand-cli-autohand)) | `CODEYBOX_AUTOHAND_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -56,6 +57,7 @@ the most common cause of fresh-class dispatch failures.
 | `pi` | `npm install -g --ignore-scripts @earendil-works/pi-coding-agent` | MIT-licensed; needs Node.js on the image. `--ignore-scripts` skips npm lifecycle scripts during install. See [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi). |
 | `aider` | `curl -fsSL https://aider.chat/install.sh \| bash` then `uv tool install aider-chat` (or `uv tool install aider-chat@<version>` to pin) | Apache-2.0; needs Python 3.12 on the image. The install script installs `uv` and then aider via `uv tool install --python python3.12 aider-chat`. See [Aider quirks](../reference/agent-quirks.md#aider-aider). |
 | `goose` | tag-pinned `download_cli.sh` with SHA256 verification (see [sandbox baselines](../reference/sandbox-baselines.md)) | Shell installer for macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux). Installs the `goose` binary. Pinned to `v1.50.1` with `GOOSE_VERSION` (never `stable`) for reproducible bakes. See [Goose quirks](../reference/agent-quirks.md#goose-cli-goose). |
+| `autohand` | `npm install -g --ignore-scripts autohand-cli@0.9.7` | Apache-2.0; needs Node.js on the image. `--ignore-scripts` skips the postinstall lifecycle script (chmod-only, guarded with `\|\| true` upstream). Version-pinned for reproducible bakes — re-verify the headless contract before bumping. See [Autohand quirks](../reference/agent-quirks.md#autohand-cli-autohand). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake

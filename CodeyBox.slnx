@@ -13,6 +13,7 @@
     <Project Path="src/CodeyBox.Agents.Pi/CodeyBox.Agents.Pi.csproj" />
     <Project Path="src/CodeyBox.Agents.Aider/CodeyBox.Agents.Aider.csproj" />
     <Project Path="src/CodeyBox.Agents.Goose/CodeyBox.Agents.Goose.csproj" />
+    <Project Path="src/CodeyBox.Agents.Autohand/CodeyBox.Agents.Autohand.csproj" />
     <Project Path="src/CodeyBox.Agents.CavemanCode/CodeyBox.Agents.CavemanCode.csproj" />
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
     <Project Path="src/CodeyBox.AdminSeed/CodeyBox.AdminSeed.csproj" />
