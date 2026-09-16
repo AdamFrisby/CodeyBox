@@ -248,6 +248,23 @@ The equivalent Incus executable provisioning is provider-local:
 Pick the subset that matches the agents you have registered. For Gemini,
 reasoning level is encoded in the model id (e.g. `gemini-3-flash-preview`),
 not a CLI flag — there is no `--thinking` flag to pin a version against.
+For Goose, add the shell-installer line to the selected provider's runcmd
+and pin a release tag for reproducible bakes (verified against `v1.50.1`):
+
+```json
+{
+  "CodeyBox": {
+    "MultipassExtraRuncmd": [
+      "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash",
+      "goose --version"
+    ]
+  }
+}
+```
+
+Goose runs one-shot headless (`goose run -i - --output-format stream-json
+--no-session`); unlike the interactive TUI some third-party harnesses drive,
+no PTY or keep-alive flag is needed, so nothing else must be baked for it.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. **Antigravity (`agy`) is provisioned via the selected
 provider's executable-provision list, NOT a `curl … | bash` runcmd entry**: the

@@ -71,6 +71,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Antigravity\CodeyBox.Agents.Antigravity.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Crock\CodeyBox.Agents.Crock.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Pi\CodeyBox.Agents.Pi.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents.Goose\CodeyBox.Agents.Goose.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.CavemanCode\CodeyBox.Agents.CavemanCode.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents\CodeyBox.Agents.csproj" />

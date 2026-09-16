@@ -19,6 +19,7 @@ tooling, not in the agent runner contract.
 | `antigravity` | `agy`           | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` (OAuth bundle, written to `~/.gemini/antigravity-cli/antigravity-oauth-token`) | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` |
 | `crock`     | `crock`           | `CROCK_CONFIG_JSON` (file-materialised to `~/.crockcode/config.json`) | `CODEYBOX_CROCK_CONFIG_JSON` |
 | `pi`        | `pi`              | `ANTHROPIC_API_KEY` (provider API key; other providers use their own variable from pi's provider table — see [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi)) | `CODEYBOX_PI_API_KEY` |
+| `goose`     | `goose`           | `OPENROUTER_API_KEY` (provider API key; goose honors thirteen provider variables — see [Goose quirks](../reference/agent-quirks.md#goose-cli-goose)) | `CODEYBOX_GOOSE_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -52,6 +53,7 @@ the most common cause of fresh-class dispatch failures.
 | `caveman` | `npm install -g @juliusbrussee/caveman-code` | Invoked as `caveman-code` (the unambiguous alias — the successor `caveman wrap` package ships a colliding `caveman` binary). Needs Node.js 20+ on the image. Plaintext stdout only — no structured stream. |
 | `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it via `CodeyBox:MultipassExecutableProvisions` or `CodeyBox:Incus:ExecutableProvisions`, matching the selected provider* (see [Antigravity quirks](../reference/agent-quirks.md#google-antigravity-cli-agy)). Do not use `curl -fsSL https://antigravity.google/cli/install.sh \| bash`: that URL serves the landing page, not a script, and piping HTML into `bash` fails silently when the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
 | `pi` | `npm install -g --ignore-scripts @earendil-works/pi-coding-agent` | MIT-licensed; needs Node.js on the image. `--ignore-scripts` skips npm lifecycle scripts during install. See [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi). |
+| `goose` | `curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh \| bash` | Shell installer for macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux). Installs the `goose` binary. Pin a release tag (verified against `v1.50.1`) rather than `stable` for reproducible bakes. See [Goose quirks](../reference/agent-quirks.md#goose-cli-goose). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake

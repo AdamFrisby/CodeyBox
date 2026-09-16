@@ -4,6 +4,7 @@ using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
+using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Core;
@@ -129,6 +130,25 @@ public sealed class InVmSmokeProbeBuildStepsTests
             Assert.Equal([PiAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
             Assert.Contains(PiAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
             Assert.Contains("--mode", string.Join(" ", steps[1].Argv));
+        }
+    }
+
+    [Fact]
+    public void Goose_EmitsVersionPlusOutputFormatAssertion_PinnedToRunnerBinary()
+    {
+        // Goose's probe has two steps: the --version binary check plus an
+        // --output-format assertion (the runner's only transport). Both pin
+        // to the runner's binary constant so probe/runner drift fails loudly.
+        var probe = new GooseInVmSmokeProbe();
+        Assert.Equal(AgentKind.Goose, probe.Kind);
+
+        foreach (var credential in new AgentCredential?[] { null, Cred(AgentKind.Goose) })
+        {
+            var steps = probe.BuildSteps(credential);
+            Assert.Equal(2, steps.Count);
+            Assert.Equal([GooseAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
+            Assert.Contains(GooseAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
+            Assert.Contains("--output-format", string.Join(" ", steps[1].Argv));
         }
     }
 }

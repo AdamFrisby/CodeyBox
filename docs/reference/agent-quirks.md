@@ -752,6 +752,106 @@ frame and the bare `message.model` id (pi strips the `provider/` qualifier in
 providers add that provider's list prices there (or under
 `CodeyBox:AgentPricing`) keyed by the bare model id.
 
+### Goose CLI (`goose`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against goose 1.50.1, 2026-09-16):
+
+```sh
+curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+```
+
+Apache-2.0 ([repo](https://github.com/aaif-goose/goose)). Shell installer for
+macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux).
+Pin a release tag (e.g. `.../download/v1.50.1/download_cli.sh`) rather than
+`stable` for reproducible bakes. The installer drops the `goose` binary
+(verified at `~/.local/bin/goose`); the baseline bake's `--version` check
+catches a missing binary before first dispatch.
+
+**Non-interactive invocation.** The runner drives a one-shot
+`goose run` with the prompt on stdin and NO positional prompt argument:
+
+```sh
+goose run -i - --output-format stream-json --no-session [--provider <id>] [--model <id>] [--max-turns <n>]
+```
+
+`goose run -t "<text>"` without `-s/--interactive` processes the prompt and
+exits — exactly the headless contract CodeyBox needs. (The
+agent-orchestrator project deliberately forces `-t "" --interactive` because
+it wants a human-steered session in a PTY; one turn is what CodeyBox wants,
+so the runner drops both.) The prompt travels via `-i -` (stdin) rather than
+`-t` argv: Linux's `MAX_ARG_STRLEN` is 128 KiB per argv element and rework
+prompts can exceed it. `--output-format stream-json` is the runner's only
+transport — even when the caller did not ask for structured capture — so
+cost attribution, failure classification, and stream parsing never depend on
+which call path dispatched the run. Plain `text` output carries no token
+totals; whole-doc `json` is one pretty-printed blob, not a stream.
+`--no-session` skips the session store (the VM is ephemeral).
+
+**Approval mode.** Goose reads its approval mode from the `GOOSE_MODE`
+environment variable (`auto / approve / chat / smart_approve`), not a CLI
+flag. The runner always sets `GOOSE_MODE=auto`: the sandbox VM is throwaway
+with no human to approve anything, so any approval prompt would hang or fail
+the run. The turn loop is bounded by `--max-turns` from the hot-reloadable
+`CodeyBox:Goose:MaxTurns` knob (default 100); the provider id comes from
+`CodeyBox:Goose:Provider` (shipped as `openrouter`).
+
+**Exit-zero errors.** Goose exits 0 even when the provider call fails
+(verified: an OpenRouter 401 exits 0 with the cause only in a content
+`type: "error"` block; a missing key exits 1 with plaintext
+`error: Error Configuration value not found: OPENROUTER_API_KEY.`). The
+runner lifts the terminal error into `TerminalDiagnostic`, so the pipeline's
+no-changes branch parks quota/auth give-ups instead of dead-lettering them
+as "produced no changes" — the same shape `agy` has.
+
+**Authentication.** Thirteen provider API-key variables
+(`GOOSE_API_KEY`, `GOOSE_PROVIDER__API_KEY`, `GOOSE_EDITOR_API_KEY`,
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+`OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`,
+`MISTRAL_API_KEY`, `COHERE_API_KEY`) plus `~/.config/goose/config.yaml` and
+`secrets.yaml`. The shipped credential mapping wires host
+`CODEYBOX_GOOSE_API_KEY` to sandbox-side `OPENROUTER_API_KEY`; operators
+fronting other providers add that provider's variable to the mapping. The
+guest also needs `openrouter.ai` on `CodeyBox:AgentAllowedHosts` (shipped in
+the default) for the OpenRouter route.
+
+**Quota probe.** Ships as Unknown-only: goose exposes no meterable quota
+endpoint (it fronts 30+ providers), so no probe is registered and members
+fall through to the `NullQuotaProbe` unknown path. The router's
+`QuotaUnknownPolicy` (default `UseObservedFailures`) gates dispatch via
+observed failure history, and `GooseQuotaFailureDetector` classifies the
+relayed provider errors (401/auth shapes → Unauthorized; 429/rate-limit →
+RateLimitExceeded; 402/billing → LimitReached) with operator-extensible rows
+under `CodeyBox:QuotaFailurePatterns:goose`.
+
+**Smoke probes.** Host-side `GooseSmokeProbe` is a credential-presence check
+only (no network call — no single endpoint validates a multi-provider
+credential, and any provider call would spend real quota). No network probe
+runs for goose for the same reason. `GooseInVmSmokeProbe` execs
+`goose --version` plus a `goose run --help | grep -q -- --output-format`
+assertion, so a goose build that dropped the JSONL event stream benches at
+smoke time instead of failing first dispatch.
+
+**Model-list probe.** The catalog is per provider and server-side, so the
+host-side probe returns the curated `GooseKnownModels` seed instead of
+live-reading it. Operator `ModelId` values absent from the seed surface as a
+startup warning, never a hard reject (goose accepts any provider-native id
+via `--model`).
+
+**Cost attribution.** `GooseCostExtractor` takes the latest terminal
+`type: "complete"` totals frame (`input_tokens`, `cache_read_input_tokens`,
+`output_tokens`) and the dispatch model id from
+`message.metadata.inference.requestedModel` (e.g.
+`nvidia/nemotron-3.5-lightning:free`). All-zero totals (the shape a failed
+run emits) yield null rather than a zero-token snapshot. No fallback rate is
+shipped — goose fronts 30+ providers with unrelated economics — but the
+bundled `goose` bucket in `agent-pricing-defaults.json` records the shipped
+free-tier model's explicit $0 rate (verified live: the CLI's own complete
+frame reports `cost_usd` 0.0). Operators fronting paid models add that
+model's list prices there (or under `CodeyBox:AgentPricing`) keyed by the
+requested-model id.
+
 ### Caveman-code CLI (`caveman-code`)
 
 Caveman-code (`github.com/JuliusBrussee/caveman-code`, npm

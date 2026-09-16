@@ -14,6 +14,7 @@ using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
+using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.AdminSeed;
@@ -1205,6 +1206,20 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 // docs/concepts/agents.md and docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new PiAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
+// Goose: Block's coding agent (github.com/aaif-goose/goose, Apache-2.0).
+// Driven one-shot via `goose run -i - --output-format stream-json
+// --no-session` (prompt on stdin; GOOSE_MODE=auto in the exec environment
+// because approval prompts have no human in the sandbox). Auth is a provider
+// API key from the environment (shipped mapping: CODEYBOX_GOOSE_API_KEY ->
+// OPENROUTER_API_KEY; thirteen provider variables honored — see
+// GooseSmokeProbe.ProviderApiKeyEnvironmentVariables). Provider selection
+// and the turn bound come from CodeyBox:Goose (hot-reloadable). The binary
+// must be installed in the sandbox image
+// (`curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash`);
+// see docs/concepts/agents.md and docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new GooseAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Goose));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1636,6 +1651,15 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // mapping covers the Anthropic path. Operators fronting other
         // providers add that provider's variable here following the same row.
         new AgentCredentialMapping(AgentKind.Pi, "CODEYBOX_PI_API_KEY", "ANTHROPIC_API_KEY"),
+        // Goose: provider API-key auth from the environment. Goose honors
+        // thirteen provider variables (OPENROUTER_API_KEY, OPENAI_API_KEY,
+        // ANTHROPIC_API_KEY, … — full list in
+        // GooseSmokeProbe.ProviderApiKeyEnvironmentVariables) plus
+        // ~/.config/goose/config.yaml / secrets.yaml. The shipped mapping
+        // covers the OpenRouter path the bundled AgentClasses member routes.
+        // Operators fronting other providers add that provider's variable
+        // here following the same row.
+        new AgentCredentialMapping(AgentKind.Goose, "CODEYBOX_GOOSE_API_KEY", "OPENROUTER_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2345,6 +2369,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new PiSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<PiSmokeProbe>()));
+// Goose: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// Goose fronts 30+ providers behind one CLI, so no single endpoint validates
+// the credential and any provider call would spend real quota; the real auth
+// check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new GooseSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<GooseSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2360,6 +2391,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CavemanCodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CrockInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PiInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, GooseInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2450,6 +2482,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, CrockModelListProbe>();
 // PiKnownModels seed is authoritative; operator-configured ids absent from
 // the seed surface as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, PiModelListProbe>();
+// Goose model-list probe: the catalog is per provider and server-side, so it
+// cannot back a host-side startup probe. The curated GooseKnownModels seed is
+// authoritative; operator-configured ids absent from the seed surface as a
+// startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, GooseModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3464,6 +3501,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Antigravity] = new AntigravityCostExtractor(),
         [AgentKind.Crock] = new CrockCostExtractor(),
         [AgentKind.Pi] = new PiCostExtractor(),
+        [AgentKind.Goose] = new GooseCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
@@ -3557,6 +3595,7 @@ builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, PiStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, GooseStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
@@ -3607,6 +3646,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new PiQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Goose detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:goose, mirroring the pi hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Goose.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new GooseQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
@@ -5747,6 +5801,16 @@ namespace CodeyBox.Api
         /// Hot-reloadable through <c>IOptionsMonitor</c>.
         /// </summary>
         public CrockSandboxOptions Crock { get; set; } = new();
+
+        /// <summary>
+        /// Goose runner settings: the <c>--provider</c> id the bundled member
+        /// routes (shipped as <c>openrouter</c>) and the autonomous turn bound
+        /// passed as <c>--max-turns</c>. Hot-reloadable through
+        /// <c>IOptionsMonitor</c>. The provider API key itself is NOT here —
+        /// it arrives through the credential chain as
+        /// <c>CODEYBOX_GOOSE_API_KEY</c> so the secret never sits in config.
+        /// </summary>
+        public GooseOptions Goose { get; set; } = new();
 
         /// <summary>
         /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting
