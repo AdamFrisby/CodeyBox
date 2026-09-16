@@ -1,0 +1,50 @@
+# Gitleaks ignore list — audited false positives (no live credentials).
+#
+# Each line below is a gitleaks fingerprint for a historical finding that was
+# manually reviewed and confirmed synthetic:
+# - "0123456789abcdef0123456789abcdef" sequential-hex test API keys.
+# - "ghp_AAABBBCCC12345678" / "ghp_XYZabc789012345678901234567890" /
+#   "gho_ABCdef123456789012345678901234" obvious placeholder GitHub tokens used
+#   only to exercise secret-redaction unit tests.
+# - "sk-ant-api03-abcdef..." / "sk-proj-test123" placeholder LLM keys in
+#   redaction tests.
+# - "dGhlIHNhbXBsZSBub25jZQ==" is base64("the sample nonce"), the RFC 6455
+#   section 1.3 example, used in WebSocket handshake tests.
+# - "ya29.placeholder" literal placeholder OAuth bundle content.
+# - "integration-test-secret-9876543210ab" / "incus-exec-secret-sentinel-..."
+#   sentinel values used only inside hermetic tests.
+# - "-----BEGIN ... FAKE-PLACEHOLDER ..." PEM blocks whose bodies are explicit
+#   <FAKE-...> placeholders (matched only on BEGIN/END markers by the
+#   redaction regex under test).
+# - "GHSA-4625-4j76-fww9" is a GitHub advisory ID in an audit-suppression note,
+#   not a credential.
+# - The github-refresh-token hit is an OpenAI "encrypted_content" blob inside a
+#   checked-in Codex session transcript, not a GitHub token.
+# Genuine secrets must never be added here; fix the source instead.
+00679f56d0e55fa0f934e644f88bcc7fa81f7857:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:2309
+0a544b6d2dead6f527cc684f7f7e4442b11906a3:tests/CodeyBox.Tests/ConvergenceBriefComposerTests.cs:github-pat:321
+15911ebee0af227be9d6ca5b5543101141912b66:tests/CodeyBox.Tests/GeminiAgentRunnerTests.cs:generic-api-key:476
+15911ebee0af227be9d6ca5b5543101141912b66:tests/CodeyBox.Tests/GeminiAgentRunnerTests.cs:generic-api-key:583
+32f0148b4cb63919960da5532a49c6a3f0e1d675:tests/CodeyBox.Tests/PrometheusEndpointTests.cs:generic-api-key:26
+3c19948242c189229dcbef6d5938c208a6294580:tests/CodeyBox.Tests/IncusSandboxLifecycleTests.cs:generic-api-key:792
+4093b77e63ca3378ee806cf0dadb627c1bbef546:tests/CodeyBox.Tests/AgentStreamPersistenceTests.cs:private-key:312
+4093b77e63ca3378ee806cf0dadb627c1bbef546:tests/CodeyBox.Tests/AgentStreamPersistenceTests.cs:private-key:362
+423a36f7733ea151a682250738720a6dce6f4261:.codeybox/preempt-scratchpad.RsTr5l/home/.codex/sessions/2026/05/16/rollout-2026-05-16T00-15-20-019e2bfd-e6e2-7c33-af1a-2ea10c4ab9d9.jsonl:github-refresh-token:31
+684969d1f41245152f8d8402307ffc4875268d60:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:2222
+684969d1f41245152f8d8402307ffc4875268d60:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:2261
+684969d1f41245152f8d8402307ffc4875268d60:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:280
+684969d1f41245152f8d8402307ffc4875268d60:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:2906
+684969d1f41245152f8d8402307ffc4875268d60:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:2966
+684969d1f41245152f8d8402307ffc4875268d60:tests/CodeyBox.Tests/AcpBridgeUnitTests.cs:generic-api-key:3141
+9967014d29643113084b7901ad2ea1d90db632b8:tests/CodeyBox.Tests/AgentStdoutHubTests.cs:generic-api-key:53
+9a01ccf2224f67c3362bc2f1d1b6253f0f45510e:tests/CodeyBox.Tests/DeploymentDriverTests.cs:generic-api-key:227
+a9664797191b6b1247aa77c6d77ea1cc5cfbea67:.codeybox/suggestions.json:generic-api-key:17
+a9e2ab3d1e159692f0d532a95969c33bdc2c0a0b:tests/CodeyBox.Tests/AdminSeededStandaloneTests.cs:generic-api-key:115
+a9e2ab3d1e159692f0d532a95969c33bdc2c0a0b:tests/CodeyBox.Tests/AdminSeededStandaloneTests.cs:generic-api-key:98
+b92d95401870479eaa2f4aab4a65173b43fb20d2:tests/CodeyBox.Tests/PipelineIntegrationTests.cs:generic-api-key:288
+baa68688d674f39e7b2764f66551bbe31dcc67f2:tests/CodeyBox.Tests/AgentAvailabilityAdminEndpointTests.cs:generic-api-key:149
+d5d0fe66c63fbf487976bb76f709a3f9ba1dcaae:tests/CodeyBox.Tests/ChangelogIntegrationTests.cs:generic-api-key:25
+e287f40fc9f02d437775b563852e1c407f08d632:tests/CodeyBox.Tests/LlmPullRequestDescriptionGeneratorTests.cs:generic-api-key:69
+e35babf5c11334c5317cd137d25dce9fe30dfd1e:tests/CodeyBox.Tests/AuditLogTests.cs:generic-api-key:178
+e6e633f208aa19d7666fdba5e6810cf14ddc8de6:tests/CodeyBox.Tests/Uat/ProjectsAndConfiguration/ApiConfigurationStartupAndHealthUatTests.cs:generic-api-key:192
+ee80b4ddd9b086f55aa67d06a9e949f0e7f988b8:tests/CodeyBox.Tests/PullRequestDescriptionStrategyTests.cs:generic-api-key:230
