@@ -38,11 +38,11 @@ public sealed class DotNetOpencodeSmokeProbe : IAgentSmokeProbe
         // is honest about what was measured, matching the
         // OpencodeSmokeProbe convention a future network-backed probe can
         // build on.
-        var hasConfigJson = credential.EnvironmentVariables.TryGetValue("DOTNETOPENCODE_CONFIG_JSON", out var json)
+        var hasConfigJson = credential.EnvironmentVariables.TryGetValue(DotNetOpencodeAgentRunner.ConfigJsonEnvironmentVariable, out var json)
             && !string.IsNullOrEmpty(json);
         if (!hasConfigJson)
         {
-            _log?.LogDebug("DotNetOpencode smoke probe found no DOTNETOPENCODE_CONFIG_JSON in credential bundle");
+            _log?.LogDebug("DotNetOpencode smoke probe found no {EnvVar} in credential bundle", DotNetOpencodeAgentRunner.ConfigJsonEnvironmentVariable);
             return Task.FromResult(new AgentSmokeResult(
                 false,
                 "no dotnet-opencode credential configured (set host CODEYBOX_DOTNETOPENCODE_CONFIG_JSON)",

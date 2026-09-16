@@ -115,8 +115,8 @@ internal static class DotNetOpencodeTerminalDiagnoser
             if (line.Contains("command not found", StringComparison.OrdinalIgnoreCase)
                 || line.Contains("No such file or directory", StringComparison.OrdinalIgnoreCase)
                 || line.Contains("exit 127", StringComparison.OrdinalIgnoreCase)
-                || line.Contains("You must install or update .NET", StringComparison.Ordinal)
-                || line.Contains("Ripgrep is unavailable", StringComparison.Ordinal)
+                || line.Contains("You must install or update .NET", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("Ripgrep is unavailable", StringComparison.OrdinalIgnoreCase)
                 || line.Contains("listener address is already in use", StringComparison.OrdinalIgnoreCase))
             {
                 return Truncate(line);

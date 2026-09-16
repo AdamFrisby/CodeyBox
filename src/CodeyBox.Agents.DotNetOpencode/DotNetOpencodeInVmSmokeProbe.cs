@@ -20,10 +20,10 @@ namespace CodeyBox.Agents.DotNetOpencode;
 /// live: <c>Error: Ripgrep is unavailable on PATH…</c>, exit 1).</item>
 /// </list>
 ///
-/// <para>When the provider config credential is absent the probe returns only
-/// these environment checks (still exec'd by the prober): a binary missing
-/// from PATH is caught without a false auth-failure exclusion, and no step
-/// spends provider quota. See <see cref="IInVmSmokeProbe"/>.</para>
+/// <para>The probe unconditionally executes only these environment checks: a
+/// binary missing from PATH is caught without a false auth-failure exclusion,
+/// and no step spends provider quota. Credential viability is asserted
+/// out-of-VM by <see cref="DotNetOpencodeSmokeProbe"/>. See <see cref="IInVmSmokeProbe"/>.</para>
 /// </summary>
 public sealed class DotNetOpencodeInVmSmokeProbe : IInVmSmokeProbe
 {

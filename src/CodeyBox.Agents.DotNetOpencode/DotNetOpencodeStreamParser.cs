@@ -51,6 +51,7 @@ public sealed class DotNetOpencodeStreamParser : FlexibleAgentStreamParser
         "text",
         "reasoning",
         "tool_use",
+        "tool_result",
         "step_finish",
         "error",
     };
@@ -79,23 +80,100 @@ public sealed class DotNetOpencodeStreamParser : FlexibleAgentStreamParser
 
     protected override ParsedEvent ParseEvent(JsonElement root)
     {
-        var parsed = base.ParseEvent(root);
+        var type = FirstString(root, "type", "event", "name") ?? "unknown";
+        if (string.Equals(type, CliAgentRunnerBase.StderrEnvelopeType, StringComparison.OrdinalIgnoreCase))
+            return base.ParseEvent(root);
 
-        // Supplement (never override) the base usage parse with the server
-        // token vocabulary, which rides on the step_finish part object.
-        if (TryGet(root, out var part, "part") && part.ValueKind == JsonValueKind.Object
-            && TryGet(part, out var tokens, "tokens") && tokens.ValueKind == JsonValueKind.Object)
+        var parsed = base.ParseEvent(root);
+        var isValidFrame = IsDotNetOpencodeStreamJsonEvent(root);
+
+        var isAssistant = parsed.IsAssistant;
+        var starts = parsed.ToolStarts.ToList();
+        var results = parsed.ToolResults.ToList();
+        var finalText = parsed.FinalText;
+        var input = parsed.InputTokens;
+        var output = parsed.OutputTokens;
+        var cached = parsed.CachedInputTokens;
+        var timestamp = parsed.Timestamp ?? TryTimestamp(root);
+
+        if (TryGet(root, out var part, "part") && part.ValueKind == JsonValueKind.Object)
         {
-            var input = parsed.InputTokens ?? FirstNullableInt(tokens, "input");
-            var output = parsed.OutputTokens ?? FirstNullableInt(tokens, "output");
-            int? cached = parsed.CachedInputTokens;
-            if (cached is null && TryGet(tokens, out var cache, "cache") && cache.ValueKind == JsonValueKind.Object)
-                cached = FirstNullableInt(cache, "read");
-            if (input != parsed.InputTokens || output != parsed.OutputTokens || cached != parsed.CachedInputTokens)
-                parsed = parsed with { InputTokens = input, OutputTokens = output, CachedInputTokens = cached };
+            var partType = FirstString(part, "type", "kind");
+
+            // Extract assistant text / content from part.
+            var text = FirstString(part, "text", "content");
+            if (!string.IsNullOrEmpty(text))
+            {
+                isAssistant = true;
+                finalText = finalText is null ? text : finalText + text;
+            }
+
+            // Extract tool use / tool result from part.
+            if (string.Equals(type, "tool_use", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(partType, "tool_use", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(partType, "tool-use", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(partType, "tool_call", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(partType, "tool-call", StringComparison.OrdinalIgnoreCase))
+            {
+                isAssistant = true;
+                var toolId = FirstString(part, "call_id", "tool_use_id", "id") ?? Guid.NewGuid().ToString("N");
+                var toolName = FirstString(part, "name", "tool_name", "tool") ?? "unknown";
+                starts = [new ToolBuilder(toolId, toolName, InputSummary(part), timestamp)];
+            }
+            else if (string.Equals(type, "tool_result", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(partType, "tool_result", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(partType, "tool-result", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(partType, "tool_response", StringComparison.OrdinalIgnoreCase))
+            {
+                var toolId = FirstString(part, "tool_use_id", "call_id", "id") ?? "unknown";
+                results = [new ToolResultBuilder(toolId, !Bool(part, "is_error", "error"), OutputBytes(part), timestamp, FirstDuration(part))];
+            }
+
+            // Supplement (never override) the base usage parse with the server
+            // token vocabulary, which rides on the step_finish part object.
+            if (TryGet(part, out var tokens, "tokens") && tokens.ValueKind == JsonValueKind.Object)
+            {
+                input ??= FirstNullableInt(tokens, "input");
+                output ??= FirstNullableInt(tokens, "output");
+                if (cached is null && TryGet(tokens, out var cache, "cache") && cache.ValueKind == JsonValueKind.Object)
+                    cached = FirstNullableInt(cache, "read");
+            }
         }
 
-        return parsed;
+        if (string.Equals(type, "text", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, "reasoning", StringComparison.OrdinalIgnoreCase))
+        {
+            isAssistant = true;
+        }
+
+        if (TryGet(root, out var error, "error") && error.ValueKind == JsonValueKind.Object)
+        {
+            var msg = FirstString(error, "message");
+            if (!string.IsNullOrEmpty(msg))
+                finalText ??= msg;
+        }
+
+        var isRecognized = parsed.IsRecognized
+            || isValidFrame
+            || input.HasValue
+            || output.HasValue
+            || cached.HasValue
+            || starts.Count > 0
+            || results.Count > 0
+            || isAssistant;
+
+        return parsed with
+        {
+            IsAssistant = isAssistant,
+            ToolStarts = starts,
+            ToolResults = results,
+            FinalText = finalText,
+            InputTokens = input,
+            OutputTokens = output,
+            CachedInputTokens = cached,
+            IsRecognized = isRecognized,
+            EventType = NormalizeType(type, starts, results, isAssistant),
+        };
     }
 
     private static int? FirstNullableInt(JsonElement obj, string name)

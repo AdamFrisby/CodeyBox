@@ -28,7 +28,7 @@ public sealed class DotNetOpencodeSmokeProbeTests
     {
         var probe = new DotNetOpencodeSmokeProbe();
 
-        var result = await probe.SmokeTestAsync(Cred("DOTNETOPENCODE_CONFIG_JSON"), CancellationToken.None);
+        var result = await probe.SmokeTestAsync(Cred(DotNetOpencodeAgentRunner.ConfigJsonEnvironmentVariable), CancellationToken.None);
 
         Assert.True(result.Ok);
     }

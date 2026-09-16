@@ -58,7 +58,7 @@ namespace CodeyBox.Agents.DotNetOpencode;
 /// </summary>
 public sealed class DotNetOpencodeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
-    private const string ConfigJsonEnvironmentVariable = "DOTNETOPENCODE_CONFIG_JSON";
+    internal const string ConfigJsonEnvironmentVariable = "DOTNETOPENCODE_CONFIG_JSON";
     private static readonly EnvBackedCredentialFile ConfigCredentialFile = new(
         ConfigJsonEnvironmentVariable,
         ".config/opencode/opencode.json",
@@ -90,14 +90,6 @@ public sealed class DotNetOpencodeAgentRunner : CliAgentRunnerBase, IStructuredS
     /// <c>dotnet</c> host wrapper on PATH.)
     /// </summary>
     public const string DefaultBinary = "dotnet-opencode";
-
-    /// <summary>
-    /// Bash materialiser for the global provider config from
-    /// <c>DOTNETOPENCODE_CONFIG_JSON</c>. Shared verbatim with
-    /// <c>DotNetOpencodeInVmSmokeProbe</c> so the env-reading smoke path
-    /// writes to the same destination as a real dispatch.
-    /// </summary>
-    public static readonly string ConfigMaterialiseScript = BuildEnvBackedCredentialScript(ConfigCredentialFile);
 
     /// <summary>Path to the dotnet-opencode binary inside the sandbox. Defaults to <see cref="DefaultBinary"/>.</summary>
     public string Binary { get; init; } = DefaultBinary;
