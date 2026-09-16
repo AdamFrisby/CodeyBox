@@ -98,6 +98,7 @@ every interactive element, fluid rem layouts that scale to 200%.
 | Route | Description |
 |-------|-------------|
 | `/` | Queue overview — all work items, auto-refreshes every 5 s |
+| `/map` | Fleet map — every non-terminal item as one 2D canvas, grouped into chains, with an attention-driven camera. Auto-refreshes every 5 s; idle frames cost nothing. |
 | `/fleet` | Fleet view — one row per project: status dot, current phase, queued/in-flight counts, last-5 outcomes, 30-day spend. Auto-refreshes every 5 s. |
 | `/supervision` | Live multi-session agent supervision and injection. Requires `CodeyBox:AgentSupervision:Enabled=true`. |
 | `/work-items/new` | Create a new work item |
@@ -128,6 +129,40 @@ every interactive element, fluid rem layouts that scale to 200%.
 The top of the page also has an **Agent controls** panel for pausing one
 agent kind with a reason and optional duration, plus a paused-agent table with
 per-agent resume buttons.
+
+## Fleet map
+
+`/map` is the headline screen: the whole fleet as one 2D canvas, left on a
+spare monitor. It derives everything from the pure projection layer
+(`CodeyBox.Admin.Model`) — chains, activity, attention — and adds only
+rendering and camera behaviour:
+
+- **Layout** (`FleetMapLayout`): one lane per chain, one column per
+  dependency depth, rows by id. Positions are sticky across refreshes — an
+  item that did not change does not move.
+- **Camera** (`CameraDirector`): idle, it dwells through the most active
+  chains; failures, parks and conflicts seize it and hold it while
+  unresolved; any drag/zoom takes manual control immediately, with a
+  **Resume auto-follow** button as the way back. Single items fill the frame,
+  busy chains frame the chain, a quiet fleet pulls back to everything.
+- **Nodes** (`MapNodeStyler`): full detail (title, agent, age, attempt count)
+  at working zoom, a short id mid-zoom, a bare shape far out. Text is drawn
+  in screen space, never below the readable minimum. Blocked items are
+  diamonds, running items circles, slot-waiting items squares — shape and
+  tone, never colour alone.
+- **Motion as signal** (`MapTransitionDetector`): only state changes,
+  unblocks, chain completions, arrivals and departures animate. A quiet fleet
+  produces byte-identical frames, so the page skips the JS bridge and the
+  canvas schedules zero animation frames — idle cost is one string comparison
+  per poll.
+- **`prefers-reduced-motion`** is honoured end to end: the director never
+  moves the camera on its own and all travel becomes instant; the map stays
+  fully usable as a static view plus the text-equivalent chain list.
+
+All map knobs live under `CodeyBoxAdmin:FleetMap` in `appsettings.json`
+(bound with reload-on-change): lane/column gaps, dwell seconds, the urgent
+attention threshold, focus zooms, detail thresholds, and the readable-text
+minimum.
 
 **Limitations (pending future work items):**
 

@@ -1,0 +1,314 @@
+@page "/map"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject IJSRuntime JS
+@inject IOptionsMonitor<FleetMapOptions> MapOptions
+@inject ILogger<FleetMap> Logger
+@using CodeyBox.Admin.Model
+@using Microsoft.Extensions.Options
+
+<PageTitle>Fleet map — CodeyBox Admin</PageTitle>
+
+<div class="map-page">
+    <div class="map-toolbar" role="toolbar" aria-label="Fleet map controls">
+        <span class="map-mode-pill @(CameraManual ? "map-mode-manual" : "map-mode-auto")">
+            @(CameraManual ? "✋ Manual view" : "◎ Auto-follow")
+        </span>
+        @if (ReducedMotion)
+        {
+            <span class="map-mode-pill map-mode-still" title="Automatic camera movement is off because your system prefers reduced motion.">
+                Reduced motion
+            </span>
+        }
+        @if (CameraManual)
+        {
+            <button class="btn btn-map-resume" @onclick="ResumeAutoAsync">Resume auto-follow</button>
+        }
+        <span class="map-focus-label">@FocusLabel</span>
+        <span class="map-counts">@ItemCount items · @ChainCount chains</span>
+    </div>
+
+    @if (_error is not null)
+    {
+        <p class="error-banner">Error loading fleet map: @_error</p>
+    }
+
+    <div class="map-canvas-wrap">
+        <canvas id="fleet-map-canvas" class="map-canvas" aria-label="Fleet map canvas. Use the chain list below for a text equivalent."></canvas>
+        <div class="map-legend" aria-label="Map legend">
+            <span><i class="map-glyph map-tone-active">●</i> Running</span>
+            <span><i class="map-glyph map-tone-review">■</i> Ready</span>
+            <span><i class="map-glyph map-tone-queued">■</i> Waiting for slot</span>
+            <span><i class="map-glyph map-tone-rework">◆</i> Blocked</span>
+            <span><i class="map-glyph map-tone-wait">⬢</i> Parked</span>
+            <span><i class="map-glyph map-tone-fail">▲</i> Failed</span>
+        </div>
+    </div>
+
+    <details class="map-fallback">
+        <summary>Chain list (text equivalent of the map)</summary>
+        @if (_projection is null)
+        {
+            <p>Loading…</p>
+        }
+        else
+        {
+            @foreach (var chain in _projection.Chains)
+            {
+                <div class="map-chain-row">
+                    <strong>@(chain.SeriesPrefix ?? chain.Id)</strong>
+                    @foreach (var id in chain.ItemIds)
+                    {
+                        <span class="map-chain-item">
+                            <a href="/work-items/@id"><CopyableId Value="@id" /></a>
+                            <StatusChip Info="@StatusVocabulary.ForWorkItem(ItemState(id))" />
+                        </span>
+                    }
+                </div>
+            }
+        }
+    </details>
+</div>
+
+@code {
+    private FleetProjection? _projection;
+    private FleetMapLayout? _layout;
+    private CameraState? _camera;
+    private FleetSnapshot? _prevSnapshot;
+    private IReadOnlyDictionary<string, ItemActivity>? _prevActivities;
+    private string? _lastPayload;
+    private CameraViewSize _viewSize = CameraViewSize.Default;
+    private bool _reducedMotion;
+    private string _focusLabel = "Loading…";
+    private string? _error;
+    private bool _jsReady;
+    private DotNetObjectReference<FleetMap>? _dotNetRef;
+    private CancellationTokenSource? _cts;
+
+    private bool CameraManual => _camera?.Manual == true;
+    private bool ReducedMotion => _reducedMotion;
+    private int ItemCount => _projection is null ? 0 : _prevSnapshot?.Items.Count ?? 0;
+    private int ChainCount => _projection?.Chains.Count ?? 0;
+    private string FocusLabel => _focusLabel;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        _dotNetRef = DotNetObjectReference.Create(this);
+        await TickAsync();
+        _ = RefreshLoopAsync(_cts.Token);
+    }
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender || _dotNetRef is null)
+        {
+            return;
+        }
+        try
+        {
+            _jsReady = await JS.InvokeAsync<bool>(
+                "codeyboxFleetMap.init", "fleet-map-canvas", _dotNetRef);
+            if (_jsReady && _lastPayload is not null)
+            {
+                await JS.InvokeAsync<bool>(
+                    "codeyboxFleetMap.render", "fleet-map-canvas", _lastPayload);
+            }
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException)
+        {
+            Logger.LogDebug(ex, "Fleet map: canvas init unavailable; showing text equivalent");
+            _jsReady = false;
+        }
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                // A quiet fleet produces an identical frame: skip the render
+                // entirely instead of diffing an unchanged tree every poll.
+                if (await TickAsync())
+                {
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>Polls and rebuilds the frame. Returns true when the UI changed.</summary>
+    private async Task<bool> TickAsync()
+    {
+        var options = MapOptions.CurrentValue;
+        try
+        {
+            var ct = _cts?.Token ?? default;
+            var itemsTask = ApiClient.GetWorkItemsAsync(ct);
+            var pausedTask = ApiClient.GetPausedAgentsAsync(ct);
+            var quotaTask = ApiClient.GetQuotaAsync(ct);
+            var concurrencyTask = ApiClient.GetConcurrencyAsync(ct);
+            await Task.WhenAll(itemsTask, pausedTask, quotaTask, concurrencyTask);
+
+            WorkersStatusDto? workersFallback = null;
+            if (concurrencyTask.Result is null)
+            {
+                try { workersFallback = await ApiClient.GetWorkersStatusAsync(ct); }
+                catch (Exception ex)
+                {
+                    Logger.LogDebug(ex, "Fleet map: workers/status unavailable");
+                }
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var snapshot = FleetMapSnapshotMapper.ToSnapshot(
+                itemsTask.Result, pausedTask.Result, quotaTask.Result,
+                concurrencyTask.Result, workersFallback, now);
+            var projection = FleetProjectionBuilder.Project(snapshot);
+            var layout = _layout is null
+                ? FleetMapBuilder.DeriveInitial(snapshot.Items.ToList(), projection.Chains.ToList(), options)
+                : FleetMapBuilder.Update(_layout, snapshot.Items.ToList(), projection.Chains.ToList(), options);
+            var camera = _camera is null
+                ? CameraDirector.Initial(layout, now, _viewSize, options)
+                : CameraDirector.Next(_camera, projection, layout, now, _viewSize, options, _reducedMotion);
+            var activities = ActivityAnalyzer.AnalyzeAll(snapshot);
+            var transitions = MapTransitionDetector.Detect(
+                _prevSnapshot, _prevActivities, snapshot, activities,
+                projection.Chains.ToList(), options);
+            var badges = MapNodeStyler.StyleAll(snapshot, activities, camera.Viewport.Zoom, options);
+            var payload = FleetMapFrameBuilder.BuildPayload(
+                snapshot, projection, layout, badges, camera, transitions);
+
+            _projection = projection;
+            _layout = layout;
+            _camera = camera;
+            _prevSnapshot = snapshot;
+            _prevActivities = activities;
+            _focusLabel = DescribeFocus(camera, projection);
+            var errorChanged = _error is not null;
+            _error = null;
+
+            // Idle gate: identical payloads skip the JS bridge entirely.
+            if (!string.Equals(payload, _lastPayload, StringComparison.Ordinal))
+            {
+                _lastPayload = payload;
+                if (_jsReady)
+                {
+                    try
+                    {
+                        await JS.InvokeAsync<bool>(
+                            "codeyboxFleetMap.render", "fleet-map-canvas", payload);
+                    }
+                    catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException)
+                    {
+                        Logger.LogDebug(ex, "Fleet map: render skipped, circuit unavailable");
+                        _jsReady = false;
+                    }
+                }
+                return true;
+            }
+            return errorChanged;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Fleet map: failed to load fleet data");
+            var message = "Failed to load fleet data. Check server logs for details.";
+            var changed = !string.Equals(_error, message, StringComparison.Ordinal);
+            _error = message;
+            return changed;
+        }
+    }
+
+    private async Task ResumeAutoAsync()
+    {
+        if (_camera is not null)
+        {
+            _camera = CameraDirector.ResumeAuto(_camera, DateTimeOffset.UtcNow);
+        }
+        await TickAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public void OnManualViewport(double x, double y, double zoom)
+    {
+        var viewport = new CameraViewport
+        {
+            CenterX = double.IsFinite(x) ? x : 0,
+            CenterY = double.IsFinite(y) ? y : 0,
+            Zoom = double.IsFinite(zoom) && zoom > 0 ? Math.Min(4, zoom) : 1,
+        };
+        _camera = _camera is null
+            ? new CameraState { Manual = true, Viewport = viewport, LastChangeAt = DateTimeOffset.UtcNow }
+            : CameraDirector.ApplyManual(_camera, viewport, DateTimeOffset.UtcNow);
+        _focusLabel = DescribeFocus(_camera, _projection);
+        InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public void OnCanvasSize(double width, double height)
+    {
+        if (width > 0 && height > 0 && width <= 16384 && height <= 16384)
+        {
+            _viewSize = new CameraViewSize(width, height);
+        }
+    }
+
+    [JSInvokable]
+    public void OnReducedMotionChanged(bool reduced)
+    {
+        _reducedMotion = reduced;
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+        _dotNetRef?.Dispose();
+    }
+
+    private string ItemState(string id)
+    {
+        foreach (var item in _prevSnapshot?.Items ?? [])
+        {
+            if (string.Equals(item.Id, id, StringComparison.Ordinal))
+            {
+                return item.State;
+            }
+        }
+        return string.Empty;
+    }
+
+    private static string DescribeFocus(CameraState? camera, FleetProjection? projection)
+    {
+        if (camera is null)
+        {
+            return "Loading…";
+        }
+        if (camera.Manual)
+        {
+            return "Manual view — auto-follow suspended.";
+        }
+        return camera.FocusKind switch
+        {
+            CameraFocusKind.Item => $"Focused on {camera.FocusId} — needs attention.",
+            CameraFocusKind.Chain => $"Touring chain {ChainLabel(projection, camera.FocusId)}.",
+            _ => "Overview — fleet is quiet.",
+        };
+    }
+
+    private static string ChainLabel(FleetProjection? projection, string chainId)
+    {
+        foreach (var chain in projection?.Chains ?? [])
+        {
+            if (string.Equals(chain.Id, chainId, StringComparison.Ordinal))
+            {
+                return chain.SeriesPrefix ?? chain.Id;
+            }
+        }
+        return chainId;
+    }
+}

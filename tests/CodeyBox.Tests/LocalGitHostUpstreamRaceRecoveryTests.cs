@@ -269,11 +269,19 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
             $$"""
             #!/usr/bin/env bash
             target='refs/heads/{{workBranch}}'
-            if [ "${3:-}" = "update-ref" ] && [ "${4:-}" = "$target" ]; then
+            # Scan all args: host git children carry leading -c pairs, so the
+            # subcommand is not at a fixed position.
+            is_update_ref=false
+            wants_target=false
+            for arg in "$@"; do
+                if [ "$arg" = "update-ref" ]; then is_update_ref=true; fi
+                if [ "$arg" = "$target" ]; then wants_target=true; fi
+            done
+            if $is_update_ref && $wants_target; then
                 git "$@"
                 rc=$?
                 if [ "$rc" -eq 0 ]; then
-                    git -c core.hooksPath=/dev/null update-ref -d "$target" >/dev/null 2>&1 || true
+                    git -c core.hooksPath=/dev/null -c safe.bareRepository=all update-ref -d "$target" >/dev/null 2>&1 || true
                 fi
                 exit "$rc"
             fi

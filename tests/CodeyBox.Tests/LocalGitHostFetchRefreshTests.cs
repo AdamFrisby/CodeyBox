@@ -480,13 +480,17 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
             new Dictionary<string, string>());
 
         Assert.Equal(await RevParseAsync(seed, "main"), resolvedTip);
+        // Leading -c pairs (hooks path, bare-repo hardening relaxation) precede
+        // the subcommand; locate fetch rather than assuming argv positions.
         var repoFetch = Assert.Single(invocations, i =>
             i.WorkingDirectory == barePath
-            && i.GitArgs.Count >= 4
-            && i.GitArgs[0] == "fetch"
-            && i.GitArgs[1] == "--no-tags");
-        Assert.NotEqual(seed, repoFetch.GitArgs[2]);
-        Assert.StartsWith(mirrorDir, repoFetch.GitArgs[2], StringComparison.Ordinal);
+            && i.GitArgs.Contains("fetch", StringComparer.Ordinal)
+            && i.GitArgs.Contains("--no-tags", StringComparer.Ordinal));
+        var fetchIndex = repoFetch.GitArgs
+            .Select((arg, index) => new { arg, index })
+            .First(entry => entry.arg == "fetch").index;
+        Assert.NotEqual(seed, repoFetch.GitArgs[fetchIndex + 2]);
+        Assert.StartsWith(mirrorDir, repoFetch.GitArgs[fetchIndex + 2], StringComparison.Ordinal);
     }
 
     [Fact]

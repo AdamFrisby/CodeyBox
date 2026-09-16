@@ -85,6 +85,15 @@ internal static class TestSupport
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        // The outer harness may inject GIT_CONFIG_* (e.g.
+        // safe.bareRepository=explicit), which makes git refuse bare-repo
+        // discovery and breaks seed/clone plumbing these helpers run through.
+        // Neutralize just that knob per-invocation — mirroring
+        // LocalGitInvocation.ApplyHostConfig — so test shells observe plain
+        // git behaviour with or without the harness. All other ambient
+        // hardening (e.g. credential.interactive=never) still applies.
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("safe.bareRepository=all");
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         var stdout = await p.StandardOutput.ReadToEndAsync();
