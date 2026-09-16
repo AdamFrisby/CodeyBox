@@ -119,10 +119,11 @@ public sealed partial class AiderCostExtractor : IAgentCostExtractor
                     modelId = raw.Length > MaxModelIdLength ? raw[..MaxModelIdLength] : raw;
             }
 
-            if (!TokensLinePattern.IsMatch(line))
+            var tokensMatch = TokensLinePattern.Match(line);
+            if (!tokensMatch.Success)
                 continue;
 
-            var sent = ParseCount(TokensLinePattern.Match(line));
+            var sent = ParseCount(tokensMatch);
             var cacheHit = ParseCount(CacheHitPattern.Match(line));
             var received = ParseCount(ReceivedPattern.Match(line));
 
@@ -158,6 +159,6 @@ public sealed partial class AiderCostExtractor : IAgentCostExtractor
             value *= 1000;
         if (value < 0 || value > int.MaxValue)
             return 0;
-        return (int)value;
+        return (int)Math.Round(value, MidpointRounding.AwayFromZero);
     }
 }

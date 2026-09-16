@@ -206,7 +206,7 @@ first dispatch can actually run.
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
-      "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat"
+      "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2"
     ],
     "MultipassExecutableProvisions": [
       {
@@ -234,7 +234,7 @@ The equivalent Incus executable provisioning is provider-local:
         "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
-        "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat"
+        "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2"
       ],
       "ExecutableProvisions": [
         {
@@ -253,7 +253,10 @@ Pick the subset that matches the agents you have registered. For Gemini,
 reasoning level is encoded in the model id (e.g. `gemini-3-flash-preview`),
 not a CLI flag — there is no `--thinking` flag to pin a version against.
 The aider lines install via `uv` (the `aider.chat/install.sh` script installs
-`uv` itself, then `uv tool install aider-chat`); `UV_TOOL_BIN_DIR` pins the
+`uv` itself, then `uv tool install aider-chat`); the trailing line re-pins to
+the exact verified version (`aider-chat==0.86.2`) so the baked binary is
+deterministic even though the vendor script tracks `latest` — bump the pin
+when re-verifying against a newer aider. `UV_TOOL_BIN_DIR` pins the
 `aider` binary onto `/usr/local/bin` because bake runcmds run as root and
 `uv tool install` would otherwise land it in root's home directory, off the
 sandbox user's PATH.

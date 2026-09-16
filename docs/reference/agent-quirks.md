@@ -760,7 +760,7 @@ selected provider (verified against aider 0.86.2, 2026-09-16):
 
 ```sh
 curl -fsSL https://aider.chat/install.sh | bash
-uv tool install --python python3.12 aider-chat
+uv tool install --python python3.12 aider-chat==0.86.2
 ```
 
 Apache-2.0 ([repo](https://github.com/Aider-AI/aider), PyPI `aider-chat`).
