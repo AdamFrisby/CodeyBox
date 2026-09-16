@@ -1171,3 +1171,88 @@ keys alone, but with no key visible it prints `No models available…` at exit
 0 — the probe treats zero parsed ids as failure. Set
 `CODEYBOX_CAVEMANCODE_BINARY` to override the binary path. When the CLI is
 missing or keyless on the host, validation is skipped with a warning.
+
+### Autohand CLI (`autohand`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against autohand-cli 0.9.7, 2026-09-16):
+
+```sh
+npm install -g --ignore-scripts autohand-cli@0.9.7
+```
+
+Apache-2.0 ([repo](https://github.com/autohandai/autohand-code)). npm
+package `autohand-cli` (binary `autohand`); needs Node.js on the image.
+`--ignore-scripts` skips the postinstall lifecycle script (it only
+`chmod`s the binary; skipping it keeps bakes hermetic on images where
+`node-pty` cannot compile — the postinstall `|| true` guard means skipping
+is safe). The `@0.9.7` pin keeps the bake deterministic — bump it only after
+re-verifying the headless contract below, because flag names and the auth
+gate have already moved once (the documented `--session`/`--new` flags do
+not exist in 0.9.7).
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with the prompt on stdin and NO positional prompt argument:
+
+```sh
+autohand -p --output-format stream-json --bare --offline --yes --unrestricted [--model <id>]
+```
+
+`autohand -p "<text>"` is documented on the dedicated Headless Mode page as
+*Run a single instruction in command mode*: the agent processes the
+instruction, acts on the repository, and exits — exactly the headless
+contract CodeyBox needs. The prompt travels on stdin with a bare `-p`
+instead of `-p <text>` argv: Linux's `MAX_ARG_STRLEN` is 128 KiB per argv
+element and rework prompts can exceed it. `--output-format stream-json` is
+the runner's only transport — whole-doc `json` is rejected by this CLI
+version (`Invalid --output-format value "json"`). Observed bare stream
+frames: `tool_start` / `tool_end` / `file_modified` / `result` (final text in
+the `content` string) / `error` (terminal failure in `message`). No usage
+frame is emitted, so cost attribution records unknown, never zero.
+`--plan` is never passed (read-only planning produces no changes by design).
+
+**Authentication — `--bare` is mandatory, a vendor account is not.**
+Without `--bare` the CLI forces an interactive Autohand-account device login
+(`Initiating authentication… visit autohand.ai/signin`) even with a valid
+provider key configured — that blocks forever in the sandbox, so `--login`
+being "optional" in the docs does not hold for unattended runs. With
+`--bare` the CLI runs headless with no vendor account, but bare mode
+requires `AUTOHAND_API_KEY` in the environment (the shipped credential
+mapping wires host `CODEYBOX_AUTOHAND_API_KEY` to it). That variable is only
+a gate: the provider credential is read exclusively from the guest
+`~/.autohand/config.json` provider block (`{"provider":"openrouter",
+"openrouter":{"apiKey":…,"baseUrl":…,"model":…}}`), which no environment
+variable backfills (verified: an empty file key fails with `Setup
+cancelled`, a dummy file key with `Authentication failed … User not
+found`, even with both `OPENROUTER_API_KEY` and `AUTOHAND_API_KEY` set).
+The runner therefore seeds the guest config before every dispatch via the
+credential-file writer (stdin transport, mode 0600) and fails fast when the
+bundle carries no key — never dispatching into the blocking first-run
+wizard. The provider id comes from the hot-reloadable
+`CodeyBox:Autohand:Provider` knob (shipped as `openrouter`); the guest also
+needs `openrouter.ai` on `CodeyBox:AgentAllowedHosts` (shipped in the
+default) for the OpenRouter route. A `$0`-spend-limit OpenRouter key only
+serves ids ending `:free` — a paid id fails with `Key limit exceeded (total
+limit)`, which the detector parks as quota exhaustion. Bare mode also skips
+hooks, LSP, attribution, and AGENTS.md auto-discovery: repo instructions in
+`AGENTS.md` are NOT picked up on autohand runs (the prompt itself carries
+everything the run needs).
+
+**Exit-zero errors.** Autohand exits 0 on some terminal failures (verified:
+`{"type":"error","message":"Command did not complete successfully."}`
+exits 0). The runner lifts the terminal error into `TerminalDiagnostic`, so
+the pipeline's no-changes branch parks quota/auth give-ups instead of
+dead-lettering them as "produced no changes" — the same shape `agy` has.
+
+**Quota probe.** Ships as Unknown-only: autohand exposes no meterable quota
+endpoint (it fronts nine providers), so no probe is registered and members
+fall through to the `NullQuotaProbe` unknown path. The router's
+`QuotaUnknownPolicy` (default `UseObservedFailures`) gates dispatch via
+observed failure history, and `AutohandQuotaFailureDetector` classifies the
+relayed provider errors (`Authentication failed` / `verify your OpenRouter
+API key` → Unauthorized; `Key limit exceeded` / `permission for this model`
+→ LimitReached; shared 429 rows → RateLimitExceeded) with
+operator-extensible rows under `CodeyBox:QuotaFailurePatterns:autohand`.
+The generic `Command did not complete successfully.` frame is deliberately
+unmatched — it is a give-up, not quota/auth evidence.
