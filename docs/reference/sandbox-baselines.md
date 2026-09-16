@@ -206,7 +206,8 @@ first dispatch can actually run.
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
-      "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2"
+      "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
+      "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
     ],
     "MultipassExecutableProvisions": [
       {
@@ -234,7 +235,8 @@ The equivalent Incus executable provisioning is provider-local:
         "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
-        "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2"
+        "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
+        "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
       ],
       "ExecutableProvisions": [
         {
@@ -280,7 +282,11 @@ Goose runs one-shot headless (`goose run -i - --output-format stream-json
 --no-session`); unlike the interactive TUI some third-party harnesses drive,
 no PTY or keep-alive flag is needed, so nothing else must be baked for it.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
-on `$PATH` after the bake. **Antigravity (`agy`) is provisioned via the selected
+on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
+binary on PATH (no runtime needed); the installer resolves the latest stable
+release unless `PRIME_AGENT_VERSION` is set, so pin it
+(`PRIME_AGENT_VERSION=0.9.5 curl -fsSL … | sh`) for deterministic bakes and
+bump the pin when re-verifying against a newer prime-agent. **Antigravity (`agy`) is provisioned via the selected
 provider's executable-provision list, NOT a `curl … | bash` runcmd entry**: the
 upstream installer URL (`https://antigravity.google/cli/install.sh`) no longer
 returns a shell script — as of 2026-06-17 it serves the Antigravity landing
