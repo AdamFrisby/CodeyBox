@@ -204,6 +204,7 @@ first dispatch can actually run.
       "apt-get update",
       "apt-get install -y curl ca-certificates nodejs npm python3",
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+      "npm install -g --ignore-scripts autohand-cli@0.9.7",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
       "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -233,6 +234,7 @@ The equivalent Incus executable provisioning is provider-local:
         "apt-get update",
         "apt-get install -y curl ca-certificates nodejs npm python3",
         "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+        "npm install -g --ignore-scripts autohand-cli@0.9.7",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
         "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -281,6 +283,17 @@ pin the binary download too, with no `stable` fallback when it is set):
 Goose runs one-shot headless (`goose run -i - --output-format stream-json
 --no-session`); unlike the interactive TUI some third-party harnesses drive,
 no PTY or keep-alive flag is needed, so nothing else must be baked for it.
+Autohand runs one-shot headless (`autohand -p` with the prompt on stdin,
+`--output-format stream-json --bare --offline --yes --unrestricted`); `--bare`
+is what keeps the run from blocking on the interactive Autohand-account
+device login, and no vendor account, hook toolchain, LSP server, or
+`AGENTS.md` discovery is needed in the image — bare mode skips all of them.
+The post-install in-VM verification runs `autohand --version` plus a
+`--help` assertion for `--output-format stream-json` (the runner's only
+transport; a build that dropped it is benched at bake time, not first
+dispatch). Provider credentials are NOT baked: the runner seeds the guest
+`~/.autohand/config.json` from the `CODEYBOX_AUTOHAND_API_KEY` bundle at
+dispatch time.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
 binary on PATH (no runtime needed); the installer resolves the latest stable

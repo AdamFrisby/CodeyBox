@@ -8,6 +8,7 @@ using OpenTelemetry.Trace;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Aider;
 using CodeyBox.Agents.Antigravity;
+using CodeyBox.Agents.Autohand;
 using CodeyBox.Agents.CavemanCode;
 using CodeyBox.Agents.Crock;
 using CodeyBox.Agents.Claude;
@@ -1246,6 +1247,28 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new PrimeAgentRunner(
 {
     PrimeOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Prime,
 });
+// Autohand: terminal-native coding agent (npm autohand-cli, Apache-2.0).
+// Driven one-shot via `autohand -p` (prompt on stdin — the argv form's twin,
+// dodging the 128 KiB MAX_ARG_STRLEN ceiling) with `--output-format
+// stream-json` (the only structured transport this CLI version accepts),
+// `--bare` (mandatory: without it every headless run blocks on an
+// interactive Autohand-account device login even with a valid provider key;
+// bare instead requires AUTOHAND_API_KEY in the environment — verified live
+// against 0.9.7), `--yes --unrestricted` (no human in the sandbox),
+// `--offline` (no startup catalog/update network), and `--model` from the
+// agent-class member or the config-sourced default. Auth is a provider API
+// key whose value the runner seeds into the guest `~/.autohand/config.json`
+// provider block before dispatch (shipped mapping:
+// CODEYBOX_AUTOHAND_API_KEY -> AUTOHAND_API_KEY): the CLI reads the key
+// exclusively from that file and no environment variable backfills it.
+// Provider selection comes from CodeyBox:Autohand (hot-reloadable). The
+// binary must be installed in the sandbox image
+// (`npm install -g --ignore-scripts autohand-cli`, pinned — see
+// docs/reference/sandbox-baselines.md); see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new AutohandAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Autohand));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1704,6 +1727,14 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // only the Prime Inference provider entry, not a CLI credential,
         // so it is deliberately NOT mapped here.
         new AgentCredentialMapping(AgentKind.Prime, "CODEYBOX_PRIME_API_KEY", "OPENROUTER_API_KEY"),
+        // Autohand: provider API-key auth seeded into the guest config file.
+        // Bare headless mode requires AUTOHAND_API_KEY in the sandbox
+        // environment, and the runner writes that same bundle value into
+        // ~/.autohand/config.json (the CLI reads the key exclusively from
+        // that file — no env var backfills it). Operators fronting other
+        // providers change CodeyBox:Autohand:Provider; the key variable
+        // stays the same.
+        new AgentCredentialMapping(AgentKind.Autohand, "CODEYBOX_AUTOHAND_API_KEY", "AUTOHAND_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2434,6 +2465,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new GooseSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<GooseSmokeProbe>()));
+// Autohand: credential-presence check only (AUTOHAND_API_KEY in the bundle).
+// Autohand is a multi-provider front with no single lightweight "whoami",
+// and any provider call would spend real quota; the real auth check happens
+// on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new AutohandSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AutohandSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2452,6 +2490,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, PiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AiderInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GooseInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PrimeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, AutohandInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2560,6 +2599,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, GooseModelListProbe>();
 // curated PrimeKnownModels seed is authoritative; operator-configured ids
 // absent from the seed surface as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, PrimeModelListProbe>();
+// Autohand model-list probe: the catalog is per provider and server-side, so
+// it cannot back a host-side startup probe. The curated AutohandKnownModels
+// seed is authoritative; operator-configured ids absent from the seed surface
+// as a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, AutohandModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3560,6 +3604,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Goose] = new GooseCostExtractor(),
         [AgentKind.Prime] = new PrimeCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
+        [AgentKind.Autohand] = new AutohandCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3660,6 +3705,7 @@ builder.Services.AddSingleton<IAgentStreamParser, PrimeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AiderStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GooseStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, AutohandStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -3755,6 +3801,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new PrimeQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Autohand detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:autohand, mirroring the goose hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Autohand.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new AutohandQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
@@ -5905,6 +5966,16 @@ namespace CodeyBox.Api
         /// <c>CODEYBOX_GOOSE_API_KEY</c> so the secret never sits in config.
         /// </summary>
         public GooseOptions Goose { get; set; } = new();
+
+        /// <summary>
+        /// Autohand runner settings: the provider id seeded into the guest
+        /// <c>~/.autohand/config.json</c> (shipped as <c>openrouter</c>).
+        /// Hot-reloadable through <c>IOptionsMonitor</c>. The provider API
+        /// key itself is NOT here — it arrives through the credential chain
+        /// as <c>CODEYBOX_AUTOHAND_API_KEY</c> so the secret never sits in
+        /// config.
+        /// </summary>
+        public AutohandOptions Autohand { get; set; } = new();
 
         /// <summary>
         /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting
