@@ -299,7 +299,27 @@ CLI (binary name
 subcommand and will not satisfy the runner. opencode does not yet ship a
 runner in this repo; operators tracking the integration can pre-stage with
 `curl -fsSL https://opencode.ai/install | bash`, but the orchestrator will
-not dispatch to it until a runner is registered. Changing bake-affecting
+not dispatch to it until a runner is registered. dotnet-opencode needs a
+heavier baseline than most agents: the exact .NET 11 preview SDK
+(`11.0.100-preview.7.26381.103` — the tool disables runtime roll-forward, so
+a newer 11.x runtime refuses to launch it), the prerelease global tool
+itself, and ripgrep. All verified against
+`dotnet-opencode 0.1.0-ci.20260905083303.33955573552.1`:
+
+```sh
+# .NET 11 preview SDK first (dotnet-install.sh; apt feeds do not carry previews)
+dotnet-install.sh --channel 11.0 --quality preview --version 11.0.100-preview.7.26381.103 --install-dir /usr/share/dotnet
+dotnet tool install --global dotnet-opencode --prerelease --version 0.1.0-ci.20260905083303.33955573552.1
+export PATH="$PATH:$HOME/.dotnet/tools"
+command -v rg || apt-get install -y ripgrep  # or set OPENCODE_DOTNET_RIPGREP to an absolute rg path
+```
+
+Without the shim on PATH every dispatch fails with exit 127; without the
+pinned runtime the shim fails with "You must install or update .NET"; without
+ripgrep `run` fails fast with "Ripgrep is unavailable on PATH". The in-VM
+smoke probe checks all three (`--version`, `run --help | grep -q -- --format`,
+rg presence), so a missing piece benches the member with a named cause
+instead of surfacing as an empty "no changes" run. Changing bake-affecting
 provisioning values changes that provider's content-addressed baseline identity, so the next
 sandbox creation bakes the corresponding new image rather than reusing another
 provider's baseline.

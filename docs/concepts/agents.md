@@ -21,6 +21,7 @@ tooling, not in the agent runner contract.
 | `pi`        | `pi`              | `ANTHROPIC_API_KEY` (provider API key; other providers use their own variable from pi's provider table — see [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi)) | `CODEYBOX_PI_API_KEY` |
 | `aider`     | `aider`           | `OPENROUTER_API_KEY` (provider API key; other providers use their own variable from aider's litellm provider table — see [Aider quirks](../reference/agent-quirks.md#aider-aider)) | `CODEYBOX_AIDER_API_KEY` |
 | `goose`     | `goose`           | `OPENROUTER_API_KEY` (provider API key; goose honors thirteen provider variables — see [Goose quirks](../reference/agent-quirks.md#goose-cli-goose)) | `CODEYBOX_GOOSE_API_KEY` |
+| `dotnet-opencode` | `dotnet-opencode` | `DOTNETOPENCODE_CONFIG_JSON` (global `opencode.json` provider config, written to `~/.config/opencode/opencode.json`; supports `{env:VAR}` indirection — see [dotnet-opencode quirks](../reference/agent-quirks.md#dotnet-opencode-honadotnet-opencode)) | `CODEYBOX_DOTNETOPENCODE_CONFIG_JSON` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -56,6 +57,7 @@ the most common cause of fresh-class dispatch failures.
 | `pi` | `npm install -g --ignore-scripts @earendil-works/pi-coding-agent` | MIT-licensed; needs Node.js on the image. `--ignore-scripts` skips npm lifecycle scripts during install. See [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi). |
 | `aider` | `curl -fsSL https://aider.chat/install.sh \| bash` then `uv tool install aider-chat` (or `uv tool install aider-chat@<version>` to pin) | Apache-2.0; needs Python 3.12 on the image. The install script installs `uv` and then aider via `uv tool install --python python3.12 aider-chat`. See [Aider quirks](../reference/agent-quirks.md#aider-aider). |
 | `goose` | tag-pinned `download_cli.sh` with SHA256 verification (see [sandbox baselines](../reference/sandbox-baselines.md)) | Shell installer for macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux). Installs the `goose` binary. Pinned to `v1.50.1` with `GOOSE_VERSION` (never `stable`) for reproducible bakes. See [Goose quirks](../reference/agent-quirks.md#goose-cli-goose). |
+| `dotnet-opencode` | `dotnet tool install --global dotnet-opencode --prerelease` (after the exact .NET 11 preview SDK `11.0.100-preview.7.26381.103` — roll-forward is disabled — plus ripgrep on PATH) | Heaviest agent baseline: preview SDK + prerelease tool + `rg`. Pinned version `0.1.0-ci.20260905083303.33955573552.1`. See [dotnet-opencode quirks](../reference/agent-quirks.md#dotnet-opencode-honadotnet-opencode) and [`sandbox-baselines.md`](../reference/sandbox-baselines.md). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake
@@ -177,6 +179,7 @@ credentials before they waste expensive compute.
 | `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` |
 | `pi` | *(no network call — pi fronts 30+ providers, so no single endpoint validates the credential)* — verifies the bundle carries `ANTHROPIC_API_KEY`; real auth check happens on first CLI call | `ANTHROPIC_API_KEY` |
 | `aider` | *(no network call — aider fronts many providers through litellm, so no single endpoint validates the credential)* — verifies the bundle carries `OPENROUTER_API_KEY`; real auth check happens on first CLI call | `OPENROUTER_API_KEY` |
+| `dotnet-opencode` | *(no network call — provider-agnostic BYOK front with an interactive-only device login; any provider call spends real quota)* — verifies the bundle carries `DOTNETOPENCODE_CONFIG_JSON`; real auth check happens on first CLI call | `DOTNETOPENCODE_CONFIG_JSON` |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.

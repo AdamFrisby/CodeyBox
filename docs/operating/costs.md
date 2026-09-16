@@ -95,6 +95,7 @@ events.
 | `goose` | yes, explicit $0 for the shipped free-tier member | goose is a multi-provider front; the bundled bucket records the shipped OpenRouter `:free` model's zero rate keyed by the requested-model id (`message.metadata.inference.requestedModel`). Operators fronting paid models add that model's list prices under `CodeyBox:AgentPricing`. |
 | `opencode` | yes, estimated | OpenCode Go is subscription-priced. Bundled rates are a single subscription-equivalent USD/M per model (same value for input, cached, and output), derived from the $12/5h budget, each model's requests-per-5h limit, and the token mix documented at [opencode.ai/docs/go](https://opencode.ai/docs/go). Keys are `opencode-go/<model-id>`. |
 | `cursor`, `copilot` | no | flat-rate subscriptions with no published per-token price |
+| `dotnet-opencode` | no | BYOK front whose spend bills to the operator's own provider accounts — and the CLI reports tokens with no model id to key rates on, so no bucket would match. Token counts are recorded unattributed rather than priced. |
 
 `_meta.notes` carries those caveats in the file, and `GET /agent-pricing`
 echoes them, so the reasoning is visible at runtime rather than only here.
