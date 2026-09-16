@@ -3,6 +3,7 @@
 @inject ICodeyBoxApiClient ApiClient
 @inject ILogger<WorkItemDossier> Logger
 @inject NavigationManager Nav
+@inject IJSRuntime JS
 
 <PageTitle>Dossier — CodeyBox Admin</PageTitle>
 
@@ -154,11 +155,12 @@ else
         try
         {
             var uri = Nav.ToAbsoluteUri(_dossier?.DossierLink ?? $"/work-items/{Id}/dossier").ToString();
-            await Task.CompletedTask;
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", uri);
             _copied = true;
         }
-        catch
+        catch (Exception ex)
         {
+            Logger.LogWarning(ex, "Clipboard write failed");
             _copied = false;
         }
     }

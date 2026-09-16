@@ -180,6 +180,109 @@ public sealed class WorkItemDossierTests : IDisposable
         Assert.True(auditArtifact.GetProperty("isStale").GetBoolean());
     }
 
+    // ── 3a. Stale evidence cannot carry the overall verdict ─────────────
+
+    [Fact]
+    public void StalePassGate_DoesNotRenderAsFullyPassing()
+    {
+        var id = WorkItemId.New();
+        var t0 = new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+        var t1 = t0.AddHours(1);
+        var item = MakeItem(id, promptRevision: 2);
+        var iterations = new List<WorkItemIteration>
+        {
+            new(id, 1, 1, t0),
+            new(id, 2, 2, t1),
+        };
+        var stalePass = MakeReport(id.ToString(), "csharp:test-pass", t0.AddMinutes(30));
+        var diff = new DossierDiffInput("base", "work", 1, 4, 0, ["a.cs"], false);
+
+        var dossier = WorkItemDossierBuilder.Build(
+            item, [stalePass], [], [], iterations, diff, null, null);
+
+        var testGate = Assert.Single(dossier.Gates, g => g.Name == "test");
+        Assert.True(testGate.IsStale);
+        Assert.NotEqual("fully_passing", dossier.OverallStatus);
+        Assert.Equal("incomplete", dossier.OverallStatus);
+    }
+
+    [Fact]
+    public void StaleOnlyError_IsIncompleteNotFailingButStaysVisible()
+    {
+        var id = WorkItemId.New();
+        var t0 = new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+        var t1 = t0.AddHours(1);
+        var item = MakeItem(id, promptRevision: 2);
+        var iterations = new List<WorkItemIteration>
+        {
+            new(id, 1, 1, t0),
+            new(id, 2, 2, t1),
+        };
+        var staleError = MakeReport(id.ToString(), "csharp:test-pass", t0.AddMinutes(30), "Error");
+        var diff = new DossierDiffInput("base", "work", 1, 4, 0, ["a.cs"], false);
+
+        var dossier = WorkItemDossierBuilder.Build(
+            item, [staleError], [], [], iterations, diff, null, null);
+
+        Assert.Equal("incomplete", dossier.OverallStatus);
+        var artifact = Assert.Single(dossier.Artifacts,
+            a => a.Name.StartsWith("audit:", StringComparison.Ordinal));
+        Assert.Equal("fail", artifact.Outcome);
+        Assert.True(artifact.IsStale);
+    }
+
+    [Fact]
+    public void FreshError_IsFailing()
+    {
+        var id = WorkItemId.New();
+        var now = new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+        var item = MakeItem(id);
+        var error = MakeReport(id.ToString(), "csharp:test-pass", now, "Error");
+        var diff = new DossierDiffInput("base", "work", 1, 4, 0, ["a.cs"], false);
+
+        var dossier = WorkItemDossierBuilder.Build(
+            item, [error], [], [], [], diff, null, null);
+
+        Assert.Equal("failing", dossier.OverallStatus);
+    }
+
+    // ── 3b. Gate attribution follows the {scope}:{role} convention ───────
+
+    [Fact]
+    public void GateMatching_DoesNotFalsePositiveOnTestSubstring()
+    {
+        var id = WorkItemId.New();
+        var now = new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero);
+        var item = MakeItem(id);
+        var reports = new List<AuditReport>
+        {
+            MakeReport(id.ToString(), "audit:latest-check", now),
+            MakeReport(id.ToString(), "audit:contest-rules", now),
+            MakeReport(id.ToString(), "csharp:build-WaE", now),
+            MakeReport(id.ToString(), "csharp:test-pass", now),
+            MakeReport(id.ToString(), "repo-build:test-pass", now),
+        };
+        var diff = new DossierDiffInput("base", "work", 1, 4, 0, ["a.cs"], false);
+
+        var dossier = WorkItemDossierBuilder.Build(
+            item, reports, [], [], [], diff, null, null);
+
+        var testGate = Assert.Single(dossier.Gates, g => g.Name == "test");
+        var buildGate = Assert.Single(dossier.Gates, g => g.Name == "build");
+        Assert.Equal("pass", testGate.Outcome);
+        Assert.Equal("pass", buildGate.Outcome);
+        var testProducer = Assert.Single(dossier.Artifacts, a => a.Name == "gate:test").ProducedBy;
+        var buildProducer = Assert.Single(dossier.Artifacts, a => a.Name == "gate:build").ProducedBy;
+        Assert.DoesNotContain("latest-check", testProducer, StringComparison.Ordinal);
+        Assert.DoesNotContain("contest-rules", testProducer, StringComparison.Ordinal);
+        Assert.DoesNotContain("latest-check", buildProducer, StringComparison.Ordinal);
+        Assert.Contains("csharp:test-pass", testProducer, StringComparison.Ordinal);
+        Assert.Contains("repo-build:test-pass", testProducer, StringComparison.Ordinal);
+        Assert.Contains("csharp:build-WaE", buildProducer, StringComparison.Ordinal);
+        Assert.Contains("repo-build:test-pass", buildProducer, StringComparison.Ordinal);
+        Assert.DoesNotContain("csharp:test-pass", buildProducer, StringComparison.Ordinal);
+    }
+
     // ── 4. Every artifact names its phase and producer ───────────────────
 
     [Fact]

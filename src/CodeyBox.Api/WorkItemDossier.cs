@@ -249,7 +249,7 @@ internal static class WorkItemDossierBuilder
             .Where(t => t.DurationMs.HasValue)
             .Sum(t => t.DurationMs!.Value);
 
-        var overall = ComputeOverall(changeOutcome, gates, orderedReports, publication);
+        var overall = ComputeOverall(changeOutcome, gates, orderedReports, iterations, currentRevision);
 
         return new WorkItemDossierDto(
             item.Id.ToString(),
@@ -271,16 +271,26 @@ internal static class WorkItemDossierBuilder
         string changeOutcome,
         IReadOnlyList<DossierGateDto> gates,
         IReadOnlyList<AuditReport> reports,
-        DossierPublicationDto publication)
+        IReadOnlyList<WorkItemIteration> iterations,
+        int currentRevision)
     {
-        if (gates.Any(g => g.Outcome == DossierOutcomes.Fail))
-            return "failing";
-        if (reports.Any(r => r.WorstSeverity.Equals("Error", StringComparison.OrdinalIgnoreCase)))
+        // Only fresh evidence speaks for the current candidate: a superseded
+        // failure is not proof the current revision fails, and a superseded
+        // pass is not proof it is sound. Stale results stay visible as
+        // artifacts; they just cannot carry the overall verdict.
+        var freshReports = reports
+            .Where(r => !IsStale(r.StartedAt, iterations, currentRevision))
+            .ToList();
+        if (freshReports.Any(r => r.WorstSeverity.Equals("Error", StringComparison.OrdinalIgnoreCase)))
             return "failing";
         if (changeOutcome == DossierOutcomes.NotRun)
             return "incomplete";
         if (gates.Any(g => g.Outcome is DossierOutcomes.NotRun or DossierOutcomes.Skipped
                 or DossierOutcomes.Cancelled or DossierOutcomes.Inconclusive))
+            return "incomplete";
+        if (gates.Any(g => g.IsStale))
+            return "incomplete";
+        if (reports.Any(r => r.WorstSeverity.Equals("Error", StringComparison.OrdinalIgnoreCase)))
             return "incomplete";
         return "fully_passing";
     }
@@ -293,10 +303,7 @@ internal static class WorkItemDossierBuilder
         IReadOnlyList<WorkItemIteration> iterations,
         int currentRevision)
     {
-        var matching = reports
-            .Where(r => r.AuditorName.Contains(gate, StringComparison.OrdinalIgnoreCase)
-                || r.AuditorKind.Contains(gate, StringComparison.OrdinalIgnoreCase))
-            .ToList();
+        var matching = reports.Where(r => NameMatchesGate(r.AuditorName, gate)).ToList();
         if (matching.Count == 0)
         {
             return new GateParts(
@@ -319,6 +326,22 @@ internal static class WorkItemDossierBuilder
             stale,
             $"{matching.Count} {gate} report(s), worst={worst}.");
     }
+
+    /// <summary>
+    /// Matches an auditor to a build/test gate on the <c>{scope}:{role}</c>
+    /// naming convention (<c>csharp:test-pass</c>, <c>csharp:build-WaE</c>,
+    /// <c>repo-build:test-pass</c>). A colon-separated segment matches when it
+    /// is the gate word or carries it before/after a dash, so a bare
+    /// substring cannot false-positive on names like <c>latest</c> or
+    /// <c>contest</c> (both merely end in "test").
+    /// </summary>
+    private static bool NameMatchesGate(string auditorName, string gate) =>
+        auditorName
+            .Split(':', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(segment =>
+                segment.Equals(gate, StringComparison.OrdinalIgnoreCase)
+                || segment.StartsWith(gate + "-", StringComparison.OrdinalIgnoreCase)
+                || segment.EndsWith("-" + gate, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// A result is stale when it started before the dispatch of the current
