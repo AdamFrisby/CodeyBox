@@ -8,6 +8,7 @@ using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
+using CodeyBox.Agents.Prime;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -165,6 +166,28 @@ public sealed class InVmSmokeProbeBuildStepsTests
             Assert.Equal([GooseAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
             Assert.Contains(GooseAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
             Assert.Contains("--output-format", string.Join(" ", steps[1].Argv));
+        }
+    }
+
+    [Fact]
+    public void Prime_EmitsVersionPlusPrintModeAssertion_PinnedToRunnerBinary()
+    {
+        // Prime's probe has two steps: the --version binary check plus a
+        // -p/--print + --mode assertion (the runner's only transport). All
+        // pin to the runner's binary constant so probe/runner drift fails
+        // loudly.
+        var probe = new PrimeInVmSmokeProbe();
+        Assert.Equal(AgentKind.Prime, probe.Kind);
+
+        foreach (var credential in new AgentCredential?[] { null, Cred(AgentKind.Prime) })
+        {
+            var steps = probe.BuildSteps(credential);
+            Assert.Equal(2, steps.Count);
+            Assert.Equal([PrimeAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
+            var transport = string.Join(" ", steps[1].Argv);
+            Assert.Contains(PrimeAgentRunner.DefaultBinary, transport);
+            Assert.Contains("--print", transport);
+            Assert.Contains("--mode", transport);
         }
     }
 }

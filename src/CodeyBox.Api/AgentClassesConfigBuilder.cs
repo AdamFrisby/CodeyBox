@@ -4,6 +4,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Pi;
+using CodeyBox.Agents.Prime;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Logging;
@@ -95,6 +96,8 @@ public static class AgentClassesConfigBuilder
                     AntigravityKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.Pi)
                     PiKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
+                if (agentKind == AgentKind.Prime)
+                    PrimeKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.Aider)
                     AiderKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.Goose)
