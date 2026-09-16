@@ -20,6 +20,7 @@
     <ProjectReference Include="..\CodeyBox.Agents.Goose\CodeyBox.Agents.Goose.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Prime\CodeyBox.Agents.Prime.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Autohand\CodeyBox.Agents.Autohand.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Vibe\CodeyBox.Agents.Vibe.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.CavemanCode\CodeyBox.Agents.CavemanCode.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream.GitHub\CodeyBox.Upstream.GitHub.csproj" />
     <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />

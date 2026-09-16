@@ -20,6 +20,7 @@ using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
+using CodeyBox.Agents.Vibe;
 using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
@@ -1234,6 +1235,19 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new AiderAgentRunner(
 builder.Services.AddSingleton<IAgentRunner>(sp => new GooseAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Goose));
+// Vibe: Mistral's coding agent (PyPI mistral-vibe, binary `vibe`). Driven
+// headless via `vibe -p --trust --output streaming --auto-approve` (the -p
+// programmatic one-shot contract with the NDJSON history-event stream) with
+// the prompt on stdin. Auth is a provider API key from the environment
+// (shipped mapping: CODEYBOX_VIBE_API_KEY -> OPENROUTER_API_KEY; the guest
+// config's [[providers]] api_key_env_var names the variable the CLI reads).
+// Model selection travels as VIBE_ACTIVE_MODEL and must be a guest-config
+// model alias (there is no --model flag). The binary must be installed in
+// the sandbox image (`uv tool install mistral-vibe`); see
+// docs/concepts/agents.md and docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new VibeAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Vibe));
 // Prime: Prime Agent CLI (prime-agent, installed from
 // https://app.primeintellect.ai/prime-agent/install.sh). Driven headless via
 // `prime-agent -p --mode json` (the -p one-shot contract with the JSON event
@@ -1716,6 +1730,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // Operators fronting other providers add that provider's variable
         // here following the same row.
         new AgentCredentialMapping(AgentKind.Goose, "CODEYBOX_GOOSE_API_KEY", "OPENROUTER_API_KEY"),
+        // Vibe: provider API-key auth from the environment. Vibe reads the
+        // variable named by the guest config's [[providers]]
+        // api_key_env_var (shipped guest config uses OPENROUTER_API_KEY for
+        // the openrouter provider); the shipped mapping covers that path.
+        // Operators fronting other providers add that provider's variable
+        // here following the same row.
+        new AgentCredentialMapping(AgentKind.Vibe, "CODEYBOX_VIBE_API_KEY", "OPENROUTER_API_KEY"),
         // Prime: provider API-key auth from the environment. prime-agent
         // reads the provider-native variable (OPENROUTER_API_KEY,
         // ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, … — 26 provider
@@ -2472,6 +2493,14 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new AutohandSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AutohandSmokeProbe>()));
+// Vibe: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// Vibe fronts many providers behind one CLI (the active model selects the
+// provider at dispatch time), so no single endpoint validates the credential
+// and any provider call would spend real quota; the real auth check happens
+// on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new VibeSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<VibeSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2489,6 +2518,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CrockInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AiderInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GooseInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, VibeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PrimeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AutohandInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
@@ -2593,6 +2623,12 @@ builder.Services.AddSingleton<IAgentModelListProbe, AiderModelListProbe>();
 // authoritative; operator-configured ids absent from the seed surface as a
 // startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, GooseModelListProbe>();
+// Vibe model-list probe: the catalog is guest-config [[models]] aliases
+// resolved inside the sandbox, so it cannot back a host-side startup probe.
+// The curated VibeKnownModels seed is authoritative; operator-configured
+// aliases absent from the seed surface as a startup warning, not a hard
+// reject.
+builder.Services.AddSingleton<IAgentModelListProbe, VibeModelListProbe>();
 // Prime model-list probe: `prime-agent model list` needs an authenticated
 // provider plus network and emits a human-readable table rather than
 // machine-readable ids, so it cannot back a host-side startup probe. The
@@ -3602,6 +3638,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Pi] = new PiCostExtractor(),
         [AgentKind.Aider] = new AiderCostExtractor(),
         [AgentKind.Goose] = new GooseCostExtractor(),
+        [AgentKind.Vibe] = new VibeCostExtractor(),
         [AgentKind.Prime] = new PrimeCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
         [AgentKind.Autohand] = new AutohandCostExtractor(),
@@ -3704,6 +3741,7 @@ builder.Services.AddSingleton<IAgentStreamParser, PiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, PrimeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AiderStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GooseStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, VibeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AutohandStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
@@ -3785,6 +3823,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new GooseQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Vibe detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:vibe, mirroring the goose hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Vibe.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new VibeQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
 {
@@ -5996,6 +6049,15 @@ namespace CodeyBox.Api
         /// <c>--provider</c> default. Bound from <c>CodeyBox:Prime</c>.
         /// </summary>
         public PrimeSectionOptions Prime { get; set; } = new();
+
+        /// <summary>
+        /// Vibe (<c>vibe</c>) runner settings, notably the autonomous turn
+        /// bound passed as <c>--max-turns</c>. Bound from <c>CodeyBox:Vibe</c>.
+        /// Hot-reloadable through <c>IOptionsMonitor</c>. The provider API key
+        /// itself is NOT here — it arrives through the credential chain as
+        /// <c>CODEYBOX_VIBE_API_KEY</c> so the secret never sits in config.
+        /// </summary>
+        public VibeOptions Vibe { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
