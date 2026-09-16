@@ -9,6 +9,7 @@ using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
+using CodeyBox.Agents.Vibe;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -151,6 +152,10 @@ public sealed class InVmSmokeProbeBuildStepsTests
             Assert.Equal([AiderAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
             Assert.Contains(AiderAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
             Assert.Contains("--message", string.Join(" ", steps[1].Argv));
+        }
+    }
+
+    [Fact]
     public void Goose_EmitsVersionPlusOutputFormatAssertion_PinnedToRunnerBinary()
     {
         // Goose's probe has two steps: the --version binary check plus an
@@ -188,6 +193,28 @@ public sealed class InVmSmokeProbeBuildStepsTests
             Assert.Contains(PrimeAgentRunner.DefaultBinary, transport);
             Assert.Contains("--print", transport);
             Assert.Contains("--mode", transport);
+        }
+    }
+
+    [Fact]
+    public void Vibe_EmitsVersionPlusOutputStreamingAssertion_PinnedToRunnerBinary()
+    {
+        // Vibe's probe has two steps: the --version binary check plus an
+        // --output/streaming assertion (the runner's only transport). Both
+        // pin to the runner's binary constant so probe/runner drift fails
+        // loudly.
+        var probe = new VibeInVmSmokeProbe();
+        Assert.Equal(AgentKind.Vibe, probe.Kind);
+
+        foreach (var credential in new AgentCredential?[] { null, Cred(AgentKind.Vibe) })
+        {
+            var steps = probe.BuildSteps(credential);
+            Assert.Equal(2, steps.Count);
+            Assert.Equal([VibeAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
+            var transport = string.Join(" ", steps[1].Argv);
+            Assert.Contains(VibeAgentRunner.DefaultBinary, transport);
+            Assert.Contains("--output", transport);
+            Assert.Contains("streaming", transport);
         }
     }
 }

@@ -18,6 +18,7 @@ public readonly record struct AgentKind(string Value)
     public static AgentKind Prime { get; } = new("prime");
     public static AgentKind Aider { get; } = new("aider");
     public static AgentKind Goose { get; } = new("goose");
+    public static AgentKind Vibe { get; } = new("vibe");
     public static AgentKind CavemanCode { get; } = new("caveman");
 
     public override string ToString() => Value;

@@ -10,7 +10,8 @@
       "pi": "https://docs.anthropic.com/en/docs/about-claude/pricing",
       "aider": "https://openrouter.ai/anthropic/claude-haiku-4.5 (OpenRouter list price for the shipped member; mirrors the Anthropic on-demand rate for the same model)",
       "goose": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
-      "prime": "https://openrouter.ai/anthropic/claude-haiku-4.5 (OpenRouter list price for the shipped member; mirrors the Anthropic on-demand rate for the same model)"
+      "prime": "https://openrouter.ai/anthropic/claude-haiku-4.5 (OpenRouter list price for the shipped member; mirrors the Anthropic on-demand rate for the same model)",
+      "vibe": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)"
     },
     "notes": {
       "opencode": "OpenCode Go is subscription-priced ($12 per 5h usage budget on https://opencode.ai/docs/go). Each model entry uses one subscription-equivalent USD/M rate for input, cached input, and output: ($12 ÷ requests-per-5h) ÷ ((typical input + cached + output tokens per request) ÷ 1e6), using the request limits and typical token mix published on that page. Keys use opencode-go/<model-id>. Cost attribution charges the stored non-cached input bucket and cached input bucket separately; public total-input reporting adds them.",
@@ -24,7 +25,8 @@
       "pi":       "Pi is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes Anthropic, so this bucket mirrors the Anthropic on-demand rates for the models operators route through pi. Keys are the bare provider model ids pi reports in message.model (pi strips the provider/ qualifier), so operator overrides use the same bare form. Operators fronting other providers add that provider's list prices here (or under CodeyBox:AgentPricing) keyed by the bare message.model id.",
       "aider":    "Aider is a multi-provider front routed through litellm; rates depend on the backing provider. The shipped AgentClasses member routes OpenRouter, so this bucket mirrors the OpenRouter list price for that model. Keys are the full aider dispatch ids aider reports in its `Model:` run header (provider/ qualifier retained, e.g. openrouter/anthropic/claude-haiku-4.5), so operator overrides use the same qualified form. Cost attribution is an ESTIMATE, not exact spend: aider counts cache-write tokens inside its sent total and OpenRouter may add its own margin over provider list prices.",
       "goose":    "Goose is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly (verified live: the CLI's own complete frame reports cost_usd 0.0). Keys are the provider-native ids goose reports in message.metadata.inference.requestedModel. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same id form.",
-      "prime":    "Prime is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes OpenRouter, so this bucket mirrors the OpenRouter list price for that model. Keys are the provider-catalog ids prime-agent reports verbatim in message.model (e.g. anthropic/claude-haiku-4.5), so operator overrides use the same form. Cost attribution is an ESTIMATE, not exact spend: OpenRouter may add its own margin over provider list prices. The nvidia/nemotron-3.5-lightning:free row is the $0 free tier (rate-limited) used for smoke verification."
+      "prime":    "Prime is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes OpenRouter, so this bucket mirrors the OpenRouter list price for that model. Keys are the provider-catalog ids prime-agent reports verbatim in message.model (e.g. anthropic/claude-haiku-4.5), so operator overrides use the same form. Cost attribution is an ESTIMATE, not exact spend: OpenRouter may add its own margin over provider list prices. The nvidia/nemotron-3.5-lightning:free row is the $0 free tier (rate-limited) used for smoke verification.",
+      "vibe":     "Vibe is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model (guest alias nemotron-free), which bills $0 — the bucket records that zero rate explicitly keyed by the provider id behind the alias (nvidia/nemotron-3.5-lightning:free). Vibe programmatic history entries carry no token counts, so the cost extractor reports unknown and per-run rows fall back to elapsed-time attribution; operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the provider id behind their guest alias."
     }
   },
   "DefaultRates": {
@@ -94,6 +96,9 @@
     "prime": {
       "anthropic/claude-haiku-4.5":             { "inputPerMillion": 1.00, "cachedInputPerMillion": 0.10, "outputPerMillion": 5.00 },
       "nvidia/nemotron-3.5-lightning:free":     { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
+    },
+    "vibe": {
+      "nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
     }
   }
 }

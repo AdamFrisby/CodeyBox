@@ -22,6 +22,7 @@ tooling, not in the agent runner contract.
 | `aider`     | `aider`           | `OPENROUTER_API_KEY` (provider API key; other providers use their own variable from aider's litellm provider table — see [Aider quirks](../reference/agent-quirks.md#aider-aider)) | `CODEYBOX_AIDER_API_KEY` |
 | `goose`     | `goose`           | `OPENROUTER_API_KEY` (provider API key; goose honors thirteen provider variables — see [Goose quirks](../reference/agent-quirks.md#goose-cli-goose)) | `CODEYBOX_GOOSE_API_KEY` |
 | `prime`     | `prime-agent`     | `OPENROUTER_API_KEY` (provider API key; other providers use their own variable from prime's provider table — see [Prime quirks](../reference/agent-quirks.md#prime-agent-prime-agent)) | `CODEYBOX_PRIME_API_KEY` |
+| `vibe`      | `vibe`            | `OPENROUTER_API_KEY` (provider API key; the variable named by the guest config's `[[providers]] api_key_env_var` — see [Vibe quirks](../reference/agent-quirks.md#vibe-vibe)) | `CODEYBOX_VIBE_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -58,6 +59,7 @@ the most common cause of fresh-class dispatch failures.
 | `aider` | `curl -fsSL https://aider.chat/install.sh \| bash` then `uv tool install aider-chat` (or `uv tool install aider-chat@<version>` to pin) | Apache-2.0; needs Python 3.12 on the image. The install script installs `uv` and then aider via `uv tool install --python python3.12 aider-chat`. See [Aider quirks](../reference/agent-quirks.md#aider-aider). |
 | `goose` | tag-pinned `download_cli.sh` with SHA256 verification (see [sandbox baselines](../reference/sandbox-baselines.md)) | Shell installer for macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux). Installs the `goose` binary. Pinned to `v1.50.1` with `GOOSE_VERSION` (never `stable`) for reproducible bakes. See [Goose quirks](../reference/agent-quirks.md#goose-cli-goose). |
 | `prime` | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` (pin with `PRIME_AGENT_VERSION=<version>`, e.g. `PRIME_AGENT_VERSION=0.9.5`) | Self-contained binary (no runtime needed). The installer resolves the latest stable release unless `PRIME_AGENT_VERSION` is set. See [Prime quirks](../reference/agent-quirks.md#prime-agent-prime-agent). |
+| `vibe` | `curl -LsSf https://mistral.ai/vibe/install.sh \| bash`, `uv tool install mistral-vibe`, or `pip install mistral-vibe` (pin with `uv tool install mistral-vibe@<version>`, e.g. `mistral-vibe==2.25.4`) | Needs Python 3.10+ on the image. Installs the `vibe` binary (plus a separate `vibe-acp` binary CodeyBox does not use). The guest also needs a `~/.vibe/config.toml` defining the provider and model alias (see [Vibe quirks](../reference/agent-quirks.md#vibe-vibe) and [sandbox baselines](../reference/sandbox-baselines.md)). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake

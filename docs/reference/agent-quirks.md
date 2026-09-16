@@ -1085,6 +1085,110 @@ OpenRouter-backed member (plus a $0 row for the `:free` smoke tier);
 operators fronting other providers add that provider's list prices there (or
 under `CodeyBox:AgentPricing`) keyed by the verbatim `message.model` id.
 
+### Vibe (`vibe`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against vibe 2.25.4, 2026-09-16):
+
+```sh
+curl -LsSf https://mistral.ai/vibe/install.sh | bash
+uv tool install --python python3.12 mistral-vibe==2.25.4
+```
+
+Mistral's agent ([repo](https://github.com/mistralai/vibe)), but no vendor
+account is required: the guest `~/.vibe/config.toml` points at OpenRouter
+(see [sandbox baselines](sandbox-baselines.md) for the exact baked snippet).
+Prefer the `uv tool install mistral-vibe==<version>` pin for reproducible
+bakes (bump the pin when re-verifying against a newer vibe); the
+`install.sh` form tracks latest. Either way the install drops a `vibe`
+binary on PATH (plus a separate `vibe-acp` ACP binary that CodeyBox does not
+use — it speaks the CLI, not ACP). Needs Python 3.10+ on the image. Bake
+runcmds run as root, so pin the binary onto the sandbox user's PATH or the
+in-VM smoke probe's `--version` step fails the bake.
+
+**Non-interactive invocation.** The runner drives programmatic mode with the
+prompt on stdin and NO `-p` value or positional prompt argument:
+
+```sh
+vibe -p --trust --output streaming --auto-approve [--max-turns <n>]
+```
+
+`-p/--prompt` *"does not start the chat interface and disables interactive
+tools"*: a bare `-p` (argparse `const=""`) plus a piped-stdin prompt enters
+programmatic mode, processes the prompt and exits — exactly the headless
+contract CodeyBox needs. The prompt travels on stdin rather than `-p` argv
+or the positional `PROMPT`: Linux's `MAX_ARG_STRLEN` is 128 KiB per argv
+element and rework prompts can exceed it. `--output streaming` is the
+runner's only transport — one NDJSON history entry per line (`message` /
+`effect` / `reasoning` / `callback` frames with `sessionId` + `turnId`); it
+is used even when the caller did not ask for structured capture, so failure
+classification and stream parsing never depend on the call path. Plain
+`text` prints only the final answer with no framing; whole-doc `json` is one
+pretty-printed blob, not a stream. `--output json` is available in
+programmatic mode only.
+
+**Trust gate.** `--trust` grants *"temporary trust for the current
+invocation"* — exactly right for a disposable sandbox — so the workspace
+trust prompt never stalls the run, and nothing is persisted to
+`trusted_folders.toml`. The setup wizard is skipped non-interactively: a
+missing provider key fails fast with exit 1 (see below), never an
+interactive onboard.
+
+**Approval mode.** Tool approval follows the selected `--agent` (or the
+`default_agent` config, shipped default `accept-edits`) — NOT auto-approve
+by default, despite the programmatic-mode framing. A headless run has no
+human to approve anything, so the runner always passes `--auto-approve`
+(without `--agent`, which selects the `auto-approve` agent outright). The
+turn loop is bounded by `--max-turns` from the hot-reloadable
+`CodeyBox:Vibe:MaxTurns` knob (default 100).
+
+**Model selection is alias-based.** Vibe has NO `--model` flag: the dispatch
+model is the guest config's `active_model`, overridable per-process via
+`VIBE_ACTIVE_MODEL` — but only to a model *alias* defined in the guest
+`~/.vibe/config.toml` `[[models]]`. A provider-native id (e.g.
+`nvidia/nemotron-3.5-lightning:free`) silently falls back to the mistral
+default and fails on its missing key, so `CodeyBox:AgentDefaults[vibe]` and
+the vibe `AgentClass` member `ModelId` must be guest aliases (shipped as
+`nemotron-free`), and the baked guest config must define that alias. Unknown
+aliases only warn at startup (the guest may define any alias), but a dispatch
+against a missing alias fails loudly with exit 1
+(`Active model '…' not found in configuration`), never silently.
+
+**Terminal errors (exit nonzero, stderr).** Unlike pi/goose, vibe exits 1 on
+provider failures with the cause on stderr (verified: a missing key exits 1
+with `Error: Missing OPENROUTER_API_KEY environment variable for openrouter
+provider. … or run \`vibe --setup\` once interactively.`; a $0-limit
+OpenRouter key against a paid model exits 1 with a multi-line
+`Error: API error from openrouter (model: …): LLM backend error …
+status: 403 Forbidden … provider_message: Key limit exceeded (total
+limit) …`). Stdout on a failed run carries only the user-echo history entry.
+The runner lifts the first `Error:` line into `TerminalDiagnostic` so the
+pipeline's no-changes branch parks quota/auth give-ups instead of
+dead-lettering them as "produced no changes".
+
+**Authentication.** The active provider's key arrives via the environment
+variable named in the guest config's `[[providers]]` (`api_key_env_var`;
+shipped guest config uses `OPENROUTER_API_KEY` for the `openrouter`
+provider with `api_base="https://openrouter.ai/api/v1"`,
+`api_style="openai"`, `backend="generic"` — OpenRouter is documented
+verbatim upstream). The shipped credential mapping wires host
+`CODEYBOX_VIBE_API_KEY` to sandbox-side `OPENROUTER_API_KEY`; operators
+fronting other providers add that provider's variable to the mapping.
+Sessions persist under `$VIBE_HOME` inside the throwaway VM and are
+discarded with it (vibe offers no `--no-session` equivalent).
+
+**Cost attribution.** `VibeCostExtractor` always returns null and ships no
+`DefaultPricing`: programmatic history entries carry no token counts
+(verified live across success, tool-use, and provider-failure runs — totals
+exist only in the in-process `AgentStatsSnapshot`, which programmatic mode
+never prints), so per-run rows fall back to elapsed-time attribution rather
+than a fabricated default that looks like data. The `vibe` bucket in
+`agent-pricing-defaults.json` records the shipped free-tier member's $0 rate
+explicitly (keyed by the provider id behind the guest alias); operators
+fronting paid OpenRouter models add that model's list prices there (or under
+`CodeyBox:AgentPricing`) keyed by the provider id behind their guest alias.
+
 ### Caveman-code CLI (`caveman-code`)
 
 Caveman-code (`github.com/JuliusBrussee/caveman-code`, npm
