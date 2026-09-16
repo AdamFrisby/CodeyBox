@@ -40,15 +40,18 @@ public sealed class LeakTrackingTestFramework : XunitTestFramework
         // parallelization on the 2-core audit hosts, by design, to keep
         // wall-clock-sensitive fixtures deterministic); ~12k cases execute
         // strictly one at a time and need well over 40 minutes in Debug.
-        // Serial wall-clock therefore grows with every added test, and a
-        // healthy audited run now reaches past 40 minutes while still making
-        // progress — the old budget axed a run whose sole in-flight test had
-        // started a fraction of a second earlier. Raise the overall budget
-        // with headroom (90 minutes). Hang detection does not rely on this
-        // budget: a single stuck case still fails via the per-case timeout,
-        // and a wedged run (no completions) still fails via the stall
-        // timeout, both at 10 minutes, so this stays a backstop, not hang
-        // detection.
+        // Serial wall-clock therefore grows with every added test: ~6,200 tests
+        // need ~25 min in Debug on an unloaded host even when failures
+        // short-circuit real pipeline work, and a healthy audited run now
+        // reaches past 40 minutes while still making progress — the old
+        // budget axed a run whose sole in-flight test had started a fraction
+        // of a second earlier, and shared-host load variance trips a 40 min
+        // budget on runs that are slow but progressing (the stall guard below
+        // never fires for those). Raise the overall budget with headroom
+        // (90 minutes). Hang detection does not rely on this budget: a single
+        // stuck case still fails via the per-case timeout, and a wedged run
+        // (no completions) still fails via the stall timeout, both at
+        // 10 minutes, so this stays a backstop, not hang detection.
         private const int DefaultRunTimeoutSeconds = 5400;
         private const int DefaultRunStallTimeoutSeconds = 600;
         private const int MaxNamedPendingTests = 5;
