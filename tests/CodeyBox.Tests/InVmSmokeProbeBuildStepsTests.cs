@@ -3,6 +3,7 @@ using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Autohand;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Cline;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
@@ -193,6 +194,27 @@ public sealed class InVmSmokeProbeBuildStepsTests
             Assert.Contains(PrimeAgentRunner.DefaultBinary, transport);
             Assert.Contains("--print", transport);
             Assert.Contains("--mode", transport);
+        }
+    }
+
+    [Fact]
+    public void Cline_EmitsVersionPlusJsonAssertion_PinnedToRunnerBinary()
+    {
+        // Cline's probe has two steps: the --version binary check plus a
+        // --help assertion for --json (the runner's only transport — the CLI
+        // emits no other parseable output, so the value is pinned too). Both
+        // pin to the runner's binary constant so probe/runner drift fails
+        // loudly.
+        var probe = new ClineInVmSmokeProbe();
+        Assert.Equal(AgentKind.Cline, probe.Kind);
+
+        foreach (var credential in new AgentCredential?[] { null, Cred(AgentKind.Cline) })
+        {
+            var steps = probe.BuildSteps(credential);
+            Assert.Equal(2, steps.Count);
+            Assert.Equal([ClineAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
+            Assert.Contains(ClineAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
+            Assert.Contains("--json", string.Join(" ", steps[1].Argv));
         }
     }
 

@@ -205,6 +205,7 @@ first dispatch can actually run.
       "apt-get install -y curl ca-certificates nodejs npm python3",
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "npm install -g --ignore-scripts autohand-cli@0.9.7",
+      "npm install -g cline@3.0.62",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
       "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -235,6 +236,7 @@ The equivalent Incus executable provisioning is provider-local:
         "apt-get install -y curl ca-certificates nodejs npm python3",
         "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
         "npm install -g --ignore-scripts autohand-cli@0.9.7",
+        "npm install -g cline@3.0.62",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
         "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -294,6 +296,16 @@ transport; a build that dropped it is benched at bake time, not first
 dispatch). Provider credentials are NOT baked: the runner seeds the guest
 `~/.autohand/config.json` from the `CODEYBOX_AUTOHAND_API_KEY` bundle at
 dispatch time.
+Cline runs one-shot headless (`cline --json -P <provider> [-m <model>]
+--auto-approve true "<prompt>"` with a positional prompt — the only prompt
+transport this CLI version accepts; piped stdin was probed and rejected).
+The post-install in-VM verification runs `cline --version` plus a `--help`
+assertion for `--json` (the runner's only transport; a build that dropped it
+is benched at bake time, not first dispatch). The provider key is NOT baked:
+it arrives through the `CODEYBOX_CLINE_API_KEY` → `OPENROUTER_API_KEY`
+credential mapping at dispatch time (operators may additionally pre-seed
+`~/.cline/data/settings/providers.json` during provisioning, but the env key
+alone suffices — `cline auth` needs a TTY so it never runs at dispatch).
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
 binary on PATH (no runtime needed); the installer resolves the latest stable

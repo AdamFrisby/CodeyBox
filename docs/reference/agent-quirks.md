@@ -1256,3 +1256,95 @@ API key` → Unauthorized; `Key limit exceeded` / `permission for this model`
 operator-extensible rows under `CodeyBox:QuotaFailurePatterns:autohand`.
 The generic `Command did not complete successfully.` frame is deliberately
 unmatched — it is a give-up, not quota/auth evidence.
+
+### Cline CLI (`cline`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against cline 3.0.62, 2026-09-16):
+
+```sh
+npm install -g cline@3.0.62
+```
+
+Apache-2.0 ([repo](https://github.com/cline/cline)). npm package `cline`
+(binary `cline`); ships platform binaries, needs no runtime. The `@3.0.62`
+pin keeps the bake deterministic — bump it only after re-verifying the
+headless contract below, because the NDJSON envelope and flag set are
+version-sensitive.
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with a positional prompt:
+
+```sh
+cline --json -P <provider> [-m <model>] --auto-approve true "<prompt>"
+```
+
+`cline "prompt"` runs a single turn and exits — exactly the headless
+contract CodeyBox needs (no terminal, no human, throwaway VM). `--json`
+switches the run to NDJSON: `hook_event` lifecycle lines
+(`agent_start` / `tool_call` / `tool_result` / `agent_end` / `agent_error`),
+`agent_event` frames wrapping an inner `event` object (`iteration_start`,
+`content_start` with `contentType: reasoning|text|tool`, per-iteration
+`usage` with camelCase `inputTokens` / `outputTokens` / `cacheReadTokens`,
+`content_end` tool results with `output.success`, terminal `done` with the
+final `text`), and a terminal `run_result` frame (`finishReason:
+completed|error`, cumulative `usage` / `aggregateUsage`, final `text`, and
+the dispatch model in `model.id`). The cost extractor reads that terminal
+usage; completed runs with no usage frame extract to unknown, never zero.
+`--auto-approve true` is passed explicitly (also the CLI default) to pin it
+against a future default flip — approval prompts have no human in the
+sandbox. `--plan` is never passed (read-only planning produces no changes by
+design).
+
+**The prompt travels on argv.** Piped stdin was probed and is rejected by
+this version: with no positional prompt the CLI exits 1 with `JSON output
+mode requires a prompt argument or piped stdin` even when stdin IS piped.
+There is no stdin-prompt transport to fall back to, so long rework prompts
+are bounded by the OS argv ceiling — a known limitation, not a runner bug.
+
+**Authentication — always pass `-P`.** The default provider is `cline` (a
+vendor account): without `-P openrouter` the run ignores
+`OPENROUTER_API_KEY` and fails fast with `Unauthorized: Please make sure
+you're using the latest version of Cline and re-authenticate your Cline
+account` — the most likely cause of a confusing first failure. With `-P`
+the provider key is read from `OPENROUTER_API_KEY` in the environment (the
+shipped credential mapping wires host `CODEYBOX_CLINE_API_KEY` to it); no
+config file is required (verified in clean isolated state: a bad key fails
+with `User not found.`, the real key succeeds). The `-k` key-override flag
+is never emitted — it would place the secret in argv (visible via `ps`).
+`cline auth` and `cline mcp install` require a TTY, so the runner performs
+neither; operators may additionally pre-seed
+`~/.cline/data/settings/providers.json` (which persists `lastUsedProvider`
+and per-provider settings) during provisioning, but the env key alone
+suffices for dispatch. The CLI fails fast rather than opening a browser,
+which is the behaviour the sandbox needs. Arbitrary OpenAI-compatible
+endpoints go through `cline auth --provider openai-compatible --baseurl
+https://…/v1` at bake time; `--acp` also exists but the runner does not use
+it. The guest needs the provider host on `CodeyBox:AgentAllowedHosts`
+(`openrouter.ai` is shipped in the default). A `$0`-spend-limit OpenRouter
+key only serves ids ending `:free` — a paid id fails with `Key limit
+exceeded (total limit)`, which the detector parks as quota exhaustion.
+
+**Failure shapes.** Cline exits non-zero on terminal failures (verified: bad
+key, spend-limit refusal, and vendor-provider miss all exit 1) with the
+cause in the `agent_event` error frame (`event.error.message`, plus an
+`errorClass` such as `auth` — note the spend-limit refusal also carries
+`errorClass: auth`, so the message text, not the class, decides the
+detector kind), repeated in the error `run_result`'s `text`, and echoed as a
+`{"type":"error","message":"…"}` line on stderr. The runner lifts the
+terminal error into `TerminalDiagnostic` so the pipeline's no-changes branch
+parks quota/auth give-ups instead of dead-lettering them.
+
+**Quota probe.** Ships as Unknown-only: cline exposes no meterable quota
+endpoint, so no probe is registered and members fall through to the
+`NullQuotaProbe` unknown path. The router's `QuotaUnknownPolicy` (default
+`UseObservedFailures`) gates dispatch via observed failure history, and
+`ClineQuotaFailureDetector` classifies the error frames (`User not found.`
+/ vendor `Unauthorized … re-authenticate` → Unauthorized; `Key limit
+exceeded` / `permission for this model` → LimitReached; shared 429 rows →
+RateLimitExceeded) with operator-extensible rows under
+`CodeyBox:QuotaFailurePatterns:cline`. Cline-specific phrases match only
+against failure signal (error frames and stderr), never against a completed
+run's assistant prose — a work item about "user not found" handling must not
+false-park.
