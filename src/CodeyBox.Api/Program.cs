@@ -17,6 +17,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
+using CodeyBox.Agents.Kilo;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
@@ -1269,6 +1270,24 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new PrimeAgentRunner(
 builder.Services.AddSingleton<IAgentRunner>(sp => new AutohandAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Autohand));
+// Kilo Code: OpenCode-fork CLI (npm @kilocode/cli, MIT) — a separate runner,
+// not an opencode-adapter mode (different binary, mandatory --auto, explicit
+// --format json transport, seeded kilo.jsonc auth; see KiloAgentRunner).
+// Driven one-shot via `kilo run --auto --format json` (prompt on stdin —
+// dodging the 128 KiB MAX_ARG_STRLEN ceiling) with `-m` from the agent-class
+// member or the config-sourced default. Auth is a provider API key whose
+// value the runner seeds into the guest `~/.config/kilo/kilo.jsonc`
+// openai-compatible provider block before dispatch (shipped mapping:
+// CODEYBOX_KILO_API_KEY -> KILO_API_KEY): the CLI resolves the dispatch
+// model against the seeded `models` map and reads the key exclusively from
+// that file. Inference endpoint comes from CodeyBox:Kilo (hot-reloadable).
+// The binary must be installed in the sandbox image
+// (`npm install -g @kilocode/cli`, pinned — see
+// docs/reference/sandbox-baselines.md); see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new KiloAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Kilo));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1735,6 +1754,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // providers change CodeyBox:Autohand:Provider; the key variable
         // stays the same.
         new AgentCredentialMapping(AgentKind.Autohand, "CODEYBOX_AUTOHAND_API_KEY", "AUTOHAND_API_KEY"),
+        // Kilo: provider API-key auth seeded into the guest config file.
+        // The runner writes the KILO_API_KEY bundle value into
+        // ~/.config/kilo/kilo.jsonc (the CLI reads the key exclusively from
+        // that file on the openai-compatible path — no env var backfills
+        // it). Operators fronting a different OpenAI-compatible backend
+        // change CodeyBox:Kilo:BaseUrl; the key variable stays the same.
+        new AgentCredentialMapping(AgentKind.Kilo, "CODEYBOX_KILO_API_KEY", "KILO_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2472,6 +2498,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new AutohandSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AutohandSmokeProbe>()));
+// Kilo: credential-presence check only (KILO_API_KEY in the bundle).
+// Kilo is a multi-provider front with no single lightweight "whoami",
+// and any provider call would spend real quota; the real auth check happens
+// on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new KiloSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<KiloSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2491,6 +2524,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, AiderInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GooseInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PrimeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AutohandInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, KiloInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2604,6 +2638,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, PrimeModelListProbe>();
 // seed is authoritative; operator-configured ids absent from the seed surface
 // as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, AutohandModelListProbe>();
+// Kilo model-list probe: the catalog is per provider and server-side, so it
+// cannot back a host-side startup probe. The curated KiloKnownModels seed is
+// authoritative; operator-configured ids absent from the seed surface as a
+// startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, KiloModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3605,6 +3644,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Prime] = new PrimeCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
         [AgentKind.Autohand] = new AutohandCostExtractor(),
+        [AgentKind.Kilo] = new KiloCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3706,6 +3746,11 @@ builder.Services.AddSingleton<IAgentStreamParser, AiderStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GooseStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AutohandStreamParser>();
+// Kilo claims the OpenCode-family step_start/step_finish/text envelope
+// (ses_-prefixed sessionID + nested part with sessionID/messageID) no other
+// registered parser claims — opencode's own parser claims nothing, so order
+// against it is irrelevant.
+builder.Services.AddSingleton<IAgentStreamParser, KiloStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -3816,6 +3861,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new AutohandQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Kilo detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:kilo, mirroring the autohand hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Kilo.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new KiloQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
@@ -5976,6 +6036,16 @@ namespace CodeyBox.Api
         /// config.
         /// </summary>
         public AutohandOptions Autohand { get; set; } = new();
+
+        /// <summary>
+        /// Kilo Code runner settings: the OpenAI-compatible inference
+        /// endpoint seeded into the guest <c>~/.config/kilo/kilo.jsonc</c>
+        /// (shipped as OpenRouter v1). Hot-reloadable through
+        /// <c>IOptionsMonitor</c>. The provider API key itself is NOT here —
+        /// it arrives through the credential chain as
+        /// <c>CODEYBOX_KILO_API_KEY</c> so the secret never sits in config.
+        /// </summary>
+        public KiloOptions Kilo { get; set; } = new();
 
         /// <summary>
         /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting

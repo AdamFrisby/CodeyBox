@@ -23,6 +23,7 @@ tooling, not in the agent runner contract.
 | `goose`     | `goose`           | `OPENROUTER_API_KEY` (provider API key; goose honors thirteen provider variables — see [Goose quirks](../reference/agent-quirks.md#goose-cli-goose)) | `CODEYBOX_GOOSE_API_KEY` |
 | `prime`     | `prime-agent`     | `OPENROUTER_API_KEY` (provider API key; other providers use their own variable from prime's provider table — see [Prime quirks](../reference/agent-quirks.md#prime-agent-prime-agent)) | `CODEYBOX_PRIME_API_KEY` |
 | `autohand`  | `autohand`        | `AUTOHAND_API_KEY` (bare-mode gate; the runner seeds the same bundle value into guest `~/.autohand/config.json` — the CLI reads the key only from that file — see [Autohand quirks](../reference/agent-quirks.md#autohand-cli-autohand)) | `CODEYBOX_AUTOHAND_API_KEY` |
+| `kilo`      | `kilo`            | `KILO_API_KEY` (the runner seeds the same bundle value into guest `~/.config/kilo/kilo.jsonc` — the CLI reads the key only from that file on the openai-compatible path — see [Kilo quirks](../reference/agent-quirks.md#kilo-code-kilo)) | `CODEYBOX_KILO_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -60,6 +61,7 @@ the most common cause of fresh-class dispatch failures.
 | `goose` | tag-pinned `download_cli.sh` with SHA256 verification (see [sandbox baselines](../reference/sandbox-baselines.md)) | Shell installer for macOS/Linux (Windows unsupported — irrelevant: CodeyBox sandboxes are Linux). Installs the `goose` binary. Pinned to `v1.50.1` with `GOOSE_VERSION` (never `stable`) for reproducible bakes. See [Goose quirks](../reference/agent-quirks.md#goose-cli-goose). |
 | `prime` | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` (pin with `PRIME_AGENT_VERSION=<version>`, e.g. `PRIME_AGENT_VERSION=0.9.5`) | Self-contained binary (no runtime needed). The installer resolves the latest stable release unless `PRIME_AGENT_VERSION` is set. See [Prime quirks](../reference/agent-quirks.md#prime-agent-prime-agent). |
 | `autohand` | `npm install -g --ignore-scripts autohand-cli@0.9.7` | Apache-2.0; needs Node.js on the image. `--ignore-scripts` skips the postinstall lifecycle script (chmod-only, guarded with `\|\| true` upstream). Version-pinned for reproducible bakes — re-verify the headless contract before bumping. See [Autohand quirks](../reference/agent-quirks.md#autohand-cli-autohand). |
+| `kilo` | `npm install -g @kilocode/cli@7.7.2` | MIT-licensed (Kilo Code Customs LLC); needs Node.js on the image. Version-pinned for reproducible bakes — re-verify the headless contract (`run --auto --format json`) before bumping. See [Kilo quirks](../reference/agent-quirks.md#kilo-code-kilo). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake
@@ -181,6 +183,7 @@ credentials before they waste expensive compute.
 | `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` |
 | `pi` | *(no network call — pi fronts 30+ providers, so no single endpoint validates the credential)* — verifies the bundle carries `ANTHROPIC_API_KEY`; real auth check happens on first CLI call | `ANTHROPIC_API_KEY` |
 | `aider` | *(no network call — aider fronts many providers through litellm, so no single endpoint validates the credential)* — verifies the bundle carries `OPENROUTER_API_KEY`; real auth check happens on first CLI call | `OPENROUTER_API_KEY` |
+| `kilo` | *(no network call — kilo fronts hundreds of models, so no single endpoint validates the credential)* — verifies the bundle carries `KILO_API_KEY`; real auth check happens on first CLI call | `KILO_API_KEY` |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.

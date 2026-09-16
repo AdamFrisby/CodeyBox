@@ -4,6 +4,7 @@ using CodeyBox.Agents.Autohand;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
+using CodeyBox.Agents.Kilo;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
 using CodeyBox.Core;
@@ -105,6 +106,8 @@ public static class AgentClassesConfigBuilder
                     GooseKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.Autohand)
                     AutohandKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
+                if (agentKind == AgentKind.Kilo)
+                    KiloKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 // Capabilities are operator-declared tags. Normalise (trim + drop empties)
                 // and de-duplicate case-insensitively so '"sensitive"' and '"Sensitive"'
                 // don't both end up in the list. Tag values themselves are otherwise

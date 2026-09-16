@@ -205,6 +205,7 @@ first dispatch can actually run.
       "apt-get install -y curl ca-certificates nodejs npm python3",
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "npm install -g --ignore-scripts autohand-cli@0.9.7",
+      "npm install -g @kilocode/cli@7.7.2",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
       "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -235,6 +236,7 @@ The equivalent Incus executable provisioning is provider-local:
         "apt-get install -y curl ca-certificates nodejs npm python3",
         "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
         "npm install -g --ignore-scripts autohand-cli@0.9.7",
+        "npm install -g @kilocode/cli@7.7.2",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
         "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -294,6 +296,17 @@ transport; a build that dropped it is benched at bake time, not first
 dispatch). Provider credentials are NOT baked: the runner seeds the guest
 `~/.autohand/config.json` from the `CODEYBOX_AUTOHAND_API_KEY` bundle at
 dispatch time.
+Kilo runs one-shot headless (`kilo run --auto --format json` with the prompt
+on stdin, `-m openai-compatible/<model-id>`): `--auto` is what keeps the run
+from auto-rejecting its own permission requests and exiting 1, and
+`--format json` is the runner's only transport. The post-install in-VM
+verification runs `kilo --version` plus a `run --help` assertion for
+`--format`/`json` and `--auto` (a build that dropped the transport or the
+autonomy flag is benched at bake time, not first dispatch). Provider
+credentials are NOT baked: the runner seeds the guest
+`~/.config/kilo/kilo.jsonc` (openai-compatible provider block plus the
+mandatory `models` allowlist entry) from the `CODEYBOX_KILO_API_KEY` bundle
+at dispatch time.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
 binary on PATH (no runtime needed); the installer resolves the latest stable

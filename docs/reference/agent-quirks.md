@@ -1256,3 +1256,116 @@ API key` → Unauthorized; `Key limit exceeded` / `permission for this model`
 operator-extensible rows under `CodeyBox:QuotaFailurePatterns:autohand`.
 The generic `Command did not complete successfully.` frame is deliberately
 unmatched — it is a give-up, not quota/auth evidence.
+
+### Kilo Code (`kilo`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against @kilocode/cli 7.7.2, 2026-09-16):
+
+```sh
+npm install -g @kilocode/cli@7.7.2
+```
+
+MIT-licensed ([repo](https://github.com/Kilo-Org/kilocode)). npm package
+`@kilocode/cli` (binary `kilo`); needs Node.js on the image. The `@7.7.2`
+pin keeps the bake deterministic — bump it only after re-verifying the
+headless contract below, because the fork tracks OpenCode upstream and flag
+names move.
+
+Kilo's CLI is explicitly an OpenCode fork sharing its CLI surface and plugin
+runtime, but it is driven by a dedicated `KiloAgentRunner`, not a mode of
+the opencode adapter: the binary name differs, `--auto` is mandatory (see
+below), the structured transport is an explicit `--format json` flag
+(opencode's runner speaks no structured stream at all), and auth is a seeded
+`kilo.jsonc` rather than opencode's `auth.json`. The fork boundary is the
+honest seam — sharing an adapter would couple two CLIs whose flags, config
+schemas, and event vocabularies drift independently.
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with the prompt on stdin and NO positional prompt argument:
+
+```sh
+kilo run --auto --format json [-m openai-compatible/<model-id>]
+```
+
+`run` takes an optional `[message..]` positional, but the prompt travels on
+stdin with no positional instead (verified: a piped-stdin prompt produced
+the reply normally): Linux's `MAX_ARG_STRLEN` is 128 KiB per argv element
+and rework prompts can exceed it. `--auto` is MANDATORY, not best effort —
+*Automatic Exit: the CLI exits automatically when the task completes or
+times out* — and without it a non-interactive run auto-rejects every
+permission request and exits 1, which reads as a refusal rather than a
+configuration error. `--format json` is the runner's only transport:
+`--format default` prints only the final response text (usage and the
+terminal error shape would be unrecoverable). Observed `--format json`
+frames (OpenCode-family envelope): `step_start` / `text` (assistant text on
+the nested `part.text`) / `step_finish` (terminal usage on
+`part.tokens {total, input, output, reasoning, cache:{read, write}}`) /
+`error` (terminal failure in `error.data.message`). Exit codes are 0
+(success), 1 (model/auth failure, with the cause in the `error` frame plus
+an `Error: …` stderr line), and 124 (CLI-side timeout). `--variant`
+(reasoning effort) is deliberately never passed: its vocabulary is
+provider-specific and unverified on the openai-compatible path.
+
+**Authentication — generic OpenAI-compatible only, seeded config, no
+`/connect`.** Kilo publishes no first-class `openrouter` provider id (absent
+from the CLI docs and the published config schema), so the OpenRouter path
+goes through the generic `openai-compatible` provider with
+`options.baseURL` + `apiKey` in `~/.config/kilo/kilo.jsonc`. The interactive
+first-run `/connect` cannot run headless, so the runner seeds the global
+file before every dispatch via the credential-file writer (stdin transport,
+mode 0600) and fails fast when the bundle carries no key. `{env:VAR}`
+interpolation is supported by the CLI but is NOT resolved in repo-local
+config, so the runner seeds the global file (where it does resolve) with
+the literal key from the shipped mapping (host `CODEYBOX_KILO_API_KEY` →
+`KILO_API_KEY`). The inference endpoint comes from the hot-reloadable
+`CodeyBox:Kilo:BaseUrl` knob (shipped as OpenRouter v1); the guest needs
+`openrouter.ai` on `CodeyBox:AgentAllowedHosts` (shipped in the default) for
+the OpenRouter route. A `$0`-spend-limit OpenRouter key only serves ids
+ending `:free` — a paid id fails with `Key limit exceeded (total limit)`,
+which the detector parks as quota exhaustion. Never commit a provider key:
+`gitleaks` CI matches this key's shape.
+
+**The `models` map is a mandatory allowlist.** Verified: a config without a
+`models` entry for the dispatch id fails closed with `Model not found:
+openai-compatible/…` (exit 1) even though the provider catalog carries the
+id. The runner therefore seeds one entry per id from the union of the
+config-sourced default and the curated `KiloKnownModels` seed (map keys drop
+the `openai-compatible/` qualifier — the CLI resolves
+`-m openai-compatible/<id>` against the map entry `<id>` under that
+provider). The shipped `-m` id, the `AgentDefaults` entry, and the seed must
+agree; a per-member `ModelId` outside the seeded map fails with the named
+`Model not found` cause (surfaced via `TerminalDiagnostic`), never silently.
+
+**Terminal failures.** The runner lifts the `type: "error"` frame into
+`TerminalDiagnostic`, so the pipeline's no-changes branch parks quota/auth
+give-ups instead of dead-lettering them as "produced no changes". A missing
+key exits 1 with `No cookie auth credentials found` (`statusCode: 401` —
+the OpenRouter origin when the request carries no usable key). Model
+resolution emits a content-free `Unexpected server error. Check server logs
+for details.` frame ahead of the specific cause; the diagnoser skips the
+generic frame in favour of the specific one. A missing binary surfaces as
+exit 127 + command-not-found, classified as infrastructure — never as "no
+changes".
+
+**Cost.** Unlike its autohand sibling the kilo stream DOES carry usage, so
+cost attribution records real rows (fresh `input`, cached `cache.read`,
+`output`; `reasoning`/`cache.write` have no bucket and are ignored). No
+model id rides the stream, so snapshots record null and pricing falls
+through to the AgentDefaults-derived rate; no built-in fallback rate is
+shipped (no single rate is honest across the hundreds of models kilo
+fronts) — the shipped free-tier member bills $0 via the explicit zero-rate
+bucket.
+
+**Quota probe.** Ships as Unknown-only: `kilo stats` reports local
+historical usage, not a quota balance, so no probe is registered (an agent
+with no readable quota meter must not ship a probe that fabricates one) and
+members fall through to the `NullQuotaProbe` unknown path. The router's
+`QuotaUnknownPolicy` (default `UseObservedFailures`) gates dispatch via
+observed failure history, and `KiloQuotaFailureDetector` classifies the
+relayed provider errors (`No cookie auth credentials found` → Unauthorized;
+`Key limit exceeded` → LimitReached; shared 429 rows → RateLimitExceeded)
+with operator-extensible rows under `CodeyBox:QuotaFailurePatterns:kilo`.
+`Model not found` and `Unexpected server error` are deliberately unmatched —
+configuration and generic give-up shapes, not quota/auth evidence.
