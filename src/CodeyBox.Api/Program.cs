@@ -10,6 +10,7 @@ using CodeyBox.Agents.Aider;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Autohand;
 using CodeyBox.Agents.CavemanCode;
+using CodeyBox.Agents.Cline;
 using CodeyBox.Agents.Crock;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
@@ -1283,6 +1284,26 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new PrimeAgentRunner(
 builder.Services.AddSingleton<IAgentRunner>(sp => new AutohandAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Autohand));
+// Cline: autonomous coding agent CLI (npm cline, Apache-2.0). Driven one-shot
+// via `cline --json -P <provider> [-m <model>] --auto-approve true "<prompt>"`
+// (the positional prompt runs a single turn and exits — the only prompt
+// transport this CLI version accepts: piped stdin was probed and rejected).
+// --json is the runner's only transport (hook_event / agent_event / terminal
+// run_result NDJSON frames). The default provider is the cline vendor account,
+// so -P is always emitted from CodeyBox:Cline (hot-reloadable, shipped as
+// openrouter); without it the run ignores OPENROUTER_API_KEY and fails fast
+// on vendor auth. Auth is a provider API key from the environment (shipped
+// mapping: CODEYBOX_CLINE_API_KEY -> OPENROUTER_API_KEY) — the -k override is
+// never emitted so the secret stays out of argv. cline auth / mcp install
+// need a TTY, so neither runs here; operators may additionally pre-seed
+// ~/.cline/data/settings/providers.json during provisioning, but the env key
+// alone suffices (verified live against 3.0.62). The binary must be installed
+// in the sandbox image (`npm install -g cline`, pinned — see
+// docs/reference/sandbox-baselines.md); see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new ClineAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Cline));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1756,6 +1777,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // providers change CodeyBox:Autohand:Provider; the key variable
         // stays the same.
         new AgentCredentialMapping(AgentKind.Autohand, "CODEYBOX_AUTOHAND_API_KEY", "AUTOHAND_API_KEY"),
+        // Cline: provider API-key auth read from the environment. The CLI
+        // reads the OpenRouter key from OPENROUTER_API_KEY directly (no
+        // config file required — verified in clean state); the runner never
+        // emits -k so the secret never appears in argv. Operators fronting
+        // other providers change CodeyBox:Cline:Provider and add that
+        // provider's variable here following the same row.
+        new AgentCredentialMapping(AgentKind.Cline, "CODEYBOX_CLINE_API_KEY", "OPENROUTER_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2493,6 +2521,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new AutohandSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<AutohandSmokeProbe>()));
+// Autohand: credential-presence check only (AUTOHAND_API_KEY in the bundle).
+// Autohand is a multi-provider front with no single lightweight "whoami",
+// and any provider call would spend real quota; the real auth check happens
+// on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new AutohandSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AutohandSmokeProbe>()));
 // Vibe: credential-presence check only (OPENROUTER_API_KEY in the bundle).
 // Vibe fronts many providers behind one CLI (the active model selects the
 // provider at dispatch time), so no single endpoint validates the credential
@@ -2501,6 +2536,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new VibeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<VibeSmokeProbe>()));
+// Cline: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// Cline is a multi-provider front with no single lightweight "whoami", and
+// any provider call would spend real quota; the real auth check happens on
+// first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new ClineSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClineSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2521,6 +2563,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, GooseInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, VibeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, PrimeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AutohandInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, ClineInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2640,6 +2683,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, PrimeModelListProbe>();
 // seed is authoritative; operator-configured ids absent from the seed surface
 // as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, AutohandModelListProbe>();
+// Cline model-list probe: the catalog is per provider and server-side, so it
+// cannot back a host-side startup probe. The curated ClineKnownModels seed is
+// authoritative; operator-configured ids absent from the seed surface as a
+// startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, ClineModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3642,6 +3690,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Prime] = new PrimeCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
         [AgentKind.Autohand] = new AutohandCostExtractor(),
+        [AgentKind.Cline] = new ClineCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3744,6 +3793,7 @@ builder.Services.AddSingleton<IAgentStreamParser, GooseStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, VibeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AutohandStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, ClineStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -3869,6 +3919,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new AutohandQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Cline detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:cline, mirroring the autohand hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Cline.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new ClineQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
@@ -6029,6 +6094,18 @@ namespace CodeyBox.Api
         /// config.
         /// </summary>
         public AutohandOptions Autohand { get; set; } = new();
+
+        /// <summary>
+        /// Cline runner settings: the provider id passed as <c>-P/--provider</c>
+        /// (shipped as <c>openrouter</c>). Hot-reloadable through
+        /// <c>IOptionsMonitor</c>. The provider API key itself is NOT here —
+        /// it arrives through the credential chain as
+        /// <c>CODEYBOX_CLINE_API_KEY</c> so the secret never sits in config.
+        /// The default matters because cline's built-in default provider is
+        /// the <c>cline</c> vendor account: without <c>-P</c> the run ignores
+        /// the provider key and fails fast on vendor auth.
+        /// </summary>
+        public ClineOptions Cline { get; set; } = new();
 
         /// <summary>
         /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting
