@@ -19,6 +19,7 @@ tooling, not in the agent runner contract.
 | `antigravity` | `agy`           | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` (OAuth bundle, written to `~/.gemini/antigravity-cli/antigravity-oauth-token`) | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` |
 | `crock`     | `crock`           | `CROCK_CONFIG_JSON` (file-materialised to `~/.crockcode/config.json`) | `CODEYBOX_CROCK_CONFIG_JSON` |
 | `pi`        | `pi`              | `ANTHROPIC_API_KEY` (provider API key; other providers use their own variable from pi's provider table — see [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi)) | `CODEYBOX_PI_API_KEY` |
+| `aider`     | `aider`           | `OPENROUTER_API_KEY` (provider API key; other providers use their own variable from aider's litellm provider table — see [Aider quirks](../reference/agent-quirks.md#aider-aider)) | `CODEYBOX_AIDER_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -52,6 +53,7 @@ the most common cause of fresh-class dispatch failures.
 | `caveman` | `npm install -g @juliusbrussee/caveman-code` | Invoked as `caveman-code` (the unambiguous alias — the successor `caveman wrap` package ships a colliding `caveman` binary). Needs Node.js 20+ on the image. Plaintext stdout only — no structured stream. |
 | `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it via `CodeyBox:MultipassExecutableProvisions` or `CodeyBox:Incus:ExecutableProvisions`, matching the selected provider* (see [Antigravity quirks](../reference/agent-quirks.md#google-antigravity-cli-agy)). Do not use `curl -fsSL https://antigravity.google/cli/install.sh \| bash`: that URL serves the landing page, not a script, and piping HTML into `bash` fails silently when the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
 | `pi` | `npm install -g --ignore-scripts @earendil-works/pi-coding-agent` | MIT-licensed; needs Node.js on the image. `--ignore-scripts` skips npm lifecycle scripts during install. See [Pi quirks](../reference/agent-quirks.md#pi-coding-agent-pi). |
+| `aider` | `curl -fsSL https://aider.chat/install.sh \| bash` then `uv tool install aider-chat` (or `uv tool install aider-chat@<version>` to pin) | Apache-2.0; needs Python 3.12 on the image. The install script installs `uv` and then aider via `uv tool install --python python3.12 aider-chat`. See [Aider quirks](../reference/agent-quirks.md#aider-aider). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake
@@ -172,6 +174,7 @@ credentials before they waste expensive compute.
 | `cursor` | *(no HTTP probe — Cursor exposes no public usage endpoint)* — verifies the credential bundle carries `CODEYBOX_CURSOR_AUTH_JSON`; real auth check happens on first CLI call | — |
 | `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` |
 | `pi` | *(no network call — pi fronts 30+ providers, so no single endpoint validates the credential)* — verifies the bundle carries `ANTHROPIC_API_KEY`; real auth check happens on first CLI call | `ANTHROPIC_API_KEY` |
+| `aider` | *(no network call — aider fronts many providers through litellm, so no single endpoint validates the credential)* — verifies the bundle carries `OPENROUTER_API_KEY`; real auth check happens on first CLI call | `OPENROUTER_API_KEY` |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.

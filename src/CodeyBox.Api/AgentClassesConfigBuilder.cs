@@ -1,3 +1,4 @@
+using CodeyBox.Agents.Aider;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
@@ -93,6 +94,8 @@ public static class AgentClassesConfigBuilder
                     AntigravityKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.Pi)
                     PiKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
+                if (agentKind == AgentKind.Aider)
+                    AiderKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 // Capabilities are operator-declared tags. Normalise (trim + drop empties)
                 // and de-duplicate case-insensitively so '"sensitive"' and '"Sensitive"'
                 // don't both end up in the list. Tag values themselves are otherwise
