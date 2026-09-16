@@ -127,7 +127,7 @@ public sealed class ClineStreamParser : FlexibleAgentStreamParser
 
         if (string.Equals(type, "run_result", StringComparison.OrdinalIgnoreCase))
         {
-            var usage = FirstObject(root, "aggregateUsage", "usage");
+            var usage = ClineJson.FirstObject(root, "aggregateUsage", "usage");
             var input = usage is { } u ? FirstInt(u, "inputTokens", "totalInputTokens") : null;
             var output = usage is { } u2 ? FirstInt(u2, "outputTokens", "totalOutputTokens") : null;
             var cached = usage is { } u3 ? FirstInt(u3, "cacheReadTokens", "totalCacheReadTokens") : null;
@@ -230,7 +230,7 @@ public sealed class ClineStreamParser : FlexibleAgentStreamParser
         if (string.Equals(innerType, "done", StringComparison.OrdinalIgnoreCase))
         {
             var text = FirstString(inner, "text");
-            var doneUsage = FirstObject(inner, "usage");
+            var doneUsage = ClineJson.FirstObject(inner, "usage");
             var parsed = ParseScalars(
                 inner, innerType, timestamp, [], [], isAssistant: true, contentText: text);
             return parsed with
@@ -281,17 +281,6 @@ public sealed class ClineStreamParser : FlexibleAgentStreamParser
 
                 return seen;
             }
-        }
-
-        return null;
-    }
-
-    private static JsonElement? FirstObject(JsonElement el, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (el.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Object)
-                return prop;
         }
 
         return null;

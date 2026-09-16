@@ -131,15 +131,21 @@ public sealed class ClineQuotaFailureDetector : IAgentQuotaFailureDetector
         // so model output discussing quota/auth text cannot false-park.
         var failureSignal = ExtractFailureSignal(stderr, stdout);
 
+        List<string?> BuildResetSources()
+        {
+            var resetSources = new List<string?>(2);
+            if (!string.IsNullOrEmpty(stderr)) resetSources.Add(stderr);
+            if (!string.IsNullOrEmpty(stdout)) resetSources.Add(stdout);
+            return resetSources;
+        }
+
         foreach (var entry in _patterns)
         {
             var inSignal = failureSignal.Any(s =>
                 s.Contains(entry.Pattern, StringComparison.OrdinalIgnoreCase));
             if (inSignal)
             {
-                var resetSources = new List<string?>(2);
-                if (!string.IsNullOrEmpty(stderr)) resetSources.Add(stderr);
-                if (!string.IsNullOrEmpty(stdout)) resetSources.Add(stdout);
+                var resetSources = BuildResetSources();
                 return new QuotaDetection(
                     entry.Kind,
                     QuotaResetParser.TryParseResetAt(resetSources)
@@ -156,9 +162,7 @@ public sealed class ClineQuotaFailureDetector : IAgentQuotaFailureDetector
                     && stdout.Contains(entry.Pattern, StringComparison.OrdinalIgnoreCase);
                 if (inStdout)
                 {
-                    var resetSources = new List<string?>(2);
-                    if (!string.IsNullOrEmpty(stderr)) resetSources.Add(stderr);
-                    if (!string.IsNullOrEmpty(stdout)) resetSources.Add(stdout);
+                    var resetSources = BuildResetSources();
                     return new QuotaDetection(
                         entry.Kind,
                         QuotaResetParser.TryParseResetAt(resetSources)

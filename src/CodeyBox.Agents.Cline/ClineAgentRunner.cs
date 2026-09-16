@@ -196,7 +196,13 @@ public sealed class ClineAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         argv.Add("true");
 
         // The prompt is positional and required: without it the CLI exits 1
-        // (it does not fall back to stdin in this version).
+        // (it does not fall back to stdin in this version). `--` ends option
+        // parsing so a prompt beginning with `-` can never be reinterpreted
+        // as CLI flags (verified against cline 3.0.62, commander-based: `--`
+        // stops flag parsing; a dash-prefixed prompt then fails closed with
+        // exit 1 `Unknown command or unquoted prompt` instead of dispatching
+        // as flags, while normal prompts pass through unchanged).
+        argv.Add("--");
         argv.Add(prompt);
 
         // Reasoning effort is deliberately NOT mapped: cline's --thinking

@@ -74,6 +74,24 @@ public sealed class ClineAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_PromptFollowsOptionTerminator()
+    {
+        // A prompt beginning with `-` must travel as data after `--`, never
+        // as CLI flags (verified against cline 3.0.62: `--` ends option
+        // parsing; without it `--help` would print help instead of running).
+        var sandbox = new CapturingSandbox();
+        var runner = Runner();
+
+        await runner.RunAsync(sandbox, "/work", "--help", Cred());
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var sepIdx = argv.IndexOf("--");
+        Assert.True(sepIdx >= 0, "expected -- option terminator");
+        Assert.Equal("--help", argv[sepIdx + 1]);
+        Assert.Equal("--help", argv[^1]);
+    }
+
+    [Fact]
     public async Task RunAsync_ConfiguredProvider_PassedVerbatim()
     {
         var sandbox = new CapturingSandbox();

@@ -83,7 +83,7 @@ public sealed class ClineCostExtractor : IAgentCostExtractor
                     var type = typeProp.GetString();
                     if (string.Equals(type, "run_result", StringComparison.OrdinalIgnoreCase))
                     {
-                        var usage = FirstObject(root, "aggregateUsage", "usage");
+                        var usage = ClineJson.FirstObject(root, "aggregateUsage", "usage");
                         if (usage is { } u && TryReadUsage(u) is { } reading)
                             runResult = reading;
                         if (root.TryGetProperty("model", out var model)
@@ -103,7 +103,7 @@ public sealed class ClineCostExtractor : IAgentCostExtractor
                     {
                         var innerTypeName = innerType.GetString();
                         if (string.Equals(innerTypeName, "done", StringComparison.OrdinalIgnoreCase)
-                            && FirstObject(inner, "usage") is { } doneUsage
+                            && ClineJson.FirstObject(inner, "usage") is { } doneUsage
                             && TryReadUsage(doneUsage) is { } doneReading)
                         {
                             done = doneReading;
@@ -158,17 +158,6 @@ public sealed class ClineCostExtractor : IAgentCostExtractor
             return null;
 
         return new UsageReading(input ?? 0, cached ?? 0, output ?? 0);
-    }
-
-    private static JsonElement? FirstObject(JsonElement el, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (el.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Object)
-                return prop;
-        }
-
-        return null;
     }
 
     private static long? ReadNonNegative(JsonElement root, params string[] names)
