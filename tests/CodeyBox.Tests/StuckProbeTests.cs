@@ -20,6 +20,7 @@ public sealed class StuckProbeTests
             => _samples = new Queue<ActivitySample?>(samples);
         public ActivitySample? TryRead()
             => _samples.Count > 0 ? _samples.Dequeue() : null;
+        public bool IsExhausted => _samples.Count == 0;
     }
 
     /// <summary>
@@ -88,6 +89,13 @@ public sealed class StuckProbeTests
                 if (sample is null)
                 {
                     prev = null;
+                    // The scripted queue is finite: once every scripted sample
+                    // is consumed without reaching the threshold, the probe is
+                    // done. Without this exit the loop spins on Task.Yield
+                    // until the 30s bound fires, burning a core per non-stuck
+                    // test and stalling the suite.
+                    if (_source is ScriptedActivitySource scripted && scripted.IsExhausted)
+                        return;
                     continue;
                 }
 
