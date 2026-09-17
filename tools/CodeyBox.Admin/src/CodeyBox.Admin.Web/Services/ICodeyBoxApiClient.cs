@@ -174,6 +174,71 @@ public interface ICodeyBoxApiClient
     Task<ReleaseDto?> ReopenReleaseAsync(string id, string reason, CancellationToken ct = default);
     Task<ReleaseDto?> AbandonReleaseAsync(string id, CancellationToken ct = default);
     Task<ReleaseDto?> TriggerReleaseAsync(string id, CancellationToken ct = default);
+
+    // ── Composer chains ───────────────────────────────────────────────────────
+    /// <summary>
+    /// Files a reviewed chain preview: sends <paramref name="items"/> in
+    /// order — later items name earlier siblings by external id, which the
+    /// orchestrator resolves at create time, so no reads happen between
+    /// writes. Stops at the first failure and reports the partial chain
+    /// honestly via <see cref="ChainCreateResult"/>; never throws for a
+    /// per-item failure (cancellation still propagates).
+    /// </summary>
+    async Task<ChainCreateResult> CreateWorkItemChainAsync(
+        IReadOnlyList<CreateWorkItemRequest> items, CancellationToken ct = default)
+    {
+        var result = new ChainCreateResult();
+        for (var i = 0; i < items.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var created = await CreateWorkItemAsync(items[i], ct);
+                if (created is null)
+                {
+                    result.FailedIndex = i;
+                    result.Error = $"Item {i + 1} of {items.Count} was not created (empty response).";
+                    break;
+                }
+
+                result.Created.Add(created);
+            }
+            // Broad by design: the chain contract converts any per-item
+            // failure into a typed partial result (index + message) instead
+            // of losing which prefix already exists server-side.
+            // Cancellation is never swallowed — it propagates above.
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                result.FailedIndex = i;
+                result.Error = ex.Message;
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    // ── Task templates ────────────────────────────────────────────────────────    /// <summary>
+    /// Lists orchestrator task templates (<c>GET /templates</c>). Defaults
+    /// to empty when the client does not implement it.
+    /// </summary>
+    Task<List<TaskTemplateDto>> GetTaskTemplatesAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<TaskTemplateDto>());
+
+    /// <summary>
+    /// Queues a task template for a project (<c>POST /templates/queue</c>).
+    /// </summary>
+    Task<QueuedTaskTemplateResponse?> QueueTaskTemplateAsync(
+        QueueTaskTemplateRequest req, CancellationToken ct = default)
+        => Task.FromResult<QueuedTaskTemplateResponse?>(null);
+
+    // ── Agent availability ────────────────────────────────────────────────────
+    /// <summary>
+    /// Live agent availability (<c>GET /admin/agents/availability</c>).
+    /// Defaults to empty; callers fall back to the curated kind list.
+    /// </summary>
+    Task<List<AgentAvailabilityDto>> GetAgentAvailabilityAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<AgentAvailabilityDto>());
 }
 
 /// <summary>Request body for PATCH /workitems/{id}.</summary>

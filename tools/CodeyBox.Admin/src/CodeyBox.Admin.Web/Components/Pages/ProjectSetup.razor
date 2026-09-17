@@ -1,0 +1,199 @@
+@page "/projects/setup"
+@using CodeyBox.Admin.Model
+
+<PageTitle>Project Setup — CodeyBox Admin</PageTitle>
+
+<h1>Project Setup</h1>
+<p class="form-hint">
+    The same questions as the <code>CodeyBox.Wizard</code> terminal wizard, as a form.
+    It writes nothing — copy the snippet into the <code>CodeyBox.Projects</code> array in
+    <code>appsettings.json</code>.
+</p>
+
+<div class="form-group">
+    <label for="setup-id">Project ID (alphanumeric, dash, underscore; 1–64 chars)</label>
+    <input id="setup-id" @bind="_input.ProjectId" class="form-control" placeholder="my-app" />
+</div>
+
+<div class="form-group">
+    <label for="setup-name">Display name</label>
+    <input id="setup-name" @bind="_input.DisplayName" class="form-control" placeholder="My App" />
+</div>
+
+<div class="form-group">
+    <label for="setup-url">Repository URL (https://, http://, git@@, ssh://, or absolute path)</label>
+    <input id="setup-url" @bind="_input.RepositoryUrl" class="form-control"
+           placeholder="https://github.com/me/my-app.git" />
+</div>
+
+<div class="form-group">
+    <label for="setup-branch">Base branch</label>
+    <input id="setup-branch" @bind="_input.BaseBranch" class="form-control" />
+</div>
+
+<div class="form-group">
+    <label for="setup-agent">Agent</label>
+    <select id="setup-agent" @bind="_input.Agent" class="form-control">
+        @foreach (var a in ProjectSetupSnippet.Agents)
+        {
+            <option value="@a">@a</option>
+        }
+    </select>
+</div>
+
+<div class="form-group">
+    <label for="setup-upstream">Upstream kind</label>
+    <select id="setup-upstream" @bind="_input.UpstreamKind" class="form-control">
+        @foreach (var u in ProjectSetupSnippet.UpstreamKinds)
+        {
+            <option value="@u">@u</option>
+        }
+    </select>
+</div>
+
+@if (_input.UpstreamKind == "github")
+{
+    <div class="form-group">
+        <label for="setup-owner">GitHub owner (user or org)</label>
+        <input id="setup-owner" @bind="_input.GitHubOwner" class="form-control" />
+    </div>
+    <div class="form-group">
+        <label for="setup-repo">GitHub repository name</label>
+        <input id="setup-repo" @bind="_input.GitHubRepository" class="form-control" />
+    </div>
+    <div class="form-group">
+        <label for="setup-token">Token env var (env var holding the PAT)</label>
+        <input id="setup-token" @bind="_input.GitHubTokenEnvVar" class="form-control"
+               placeholder="MY_APP_GITHUB_TOKEN" />
+    </div>
+}
+else if (_input.UpstreamKind == "git-generic")
+{
+    <div class="form-group">
+        <label for="setup-generic-url">Generic URL</label>
+        <input id="setup-generic-url" @bind="_input.GenericUrl" class="form-control" />
+    </div>
+    <div class="form-group">
+        <label for="setup-generic-token">Token env var (optional)</label>
+        <input id="setup-generic-token" @bind="_input.GenericTokenEnvVar" class="form-control" />
+    </div>
+}
+
+<fieldset class="setup-fieldset">
+    <legend>Audit languages <span class="form-hint">(can be empty)</span></legend>
+    @foreach (var lang in ProjectSetupSnippet.AuditLanguages)
+    {
+        <div class="form-check">
+            <input type="checkbox" id="setup-lang-@lang" checked="@_languages.Contains(lang)"
+                   @onchange="e => Toggle(_languages, lang, (bool)(e.Value ?? false))" />
+            <label for="setup-lang-@lang">@lang</label>
+        </div>
+    }
+</fieldset>
+
+<fieldset class="setup-fieldset">
+    <legend>Audit types <span class="form-hint">(can be empty)</span></legend>
+    @foreach (var type in ProjectSetupSnippet.AuditTypes)
+    {
+        <div class="form-check">
+            <input type="checkbox" id="setup-type-@type" checked="@_auditTypes.Contains(type)"
+                   @onchange="e => Toggle(_auditTypes, type, (bool)(e.Value ?? false))" />
+            <label for="setup-type-@type">@type</label>
+        </div>
+    }
+</fieldset>
+
+<fieldset class="setup-fieldset">
+    <legend>Network profiles <span class="form-hint">(per phase; blank inherits from Defaults)</span></legend>
+    @foreach (var phase in ProjectSetupSnippet.PipelinePhases)
+    {
+        <div class="form-group">
+            <label for="setup-profile-@phase">@phase profile</label>
+            <input id="setup-profile-@phase" class="form-control" placeholder="(inherit from Defaults)"
+                   value="@_profiles.GetValueOrDefault(phase)" @onchange="e => SetProfile(phase, e.Value?.ToString())" />
+        </div>
+    }
+</fieldset>
+
+@if (_errors.Count > 0)
+{
+    <ul class="validation-errors" id="setup-errors">
+        @foreach (var error in _errors)
+        {
+            <li class="validation-message">@error</li>
+        }
+    </ul>
+}
+
+<div class="form-actions">
+    <button type="button" id="setup-generate" class="btn btn-primary" @onclick="Generate">Generate snippet</button>
+    <a href="/work-items/new" class="btn">Back to composer</a>
+</div>
+
+@if (_snippet is not null)
+{
+    <div class="form-group">
+        <label for="setup-json">Paste into <code>CodeyBox.Projects</code></label>
+        <textarea id="setup-json" class="form-control prompt-input" rows="24" readonly>@_snippet</textarea>
+    </div>
+}
+
+@code {
+    private readonly SetupForm _input = new() { BaseBranch = "main", Agent = "claude", UpstreamKind = "noop" };
+    private readonly HashSet<string> _languages = [];
+    private readonly HashSet<string> _auditTypes = [];
+    private readonly Dictionary<string, string> _profiles = [];
+    private List<string> _errors = [];
+    private string? _snippet;
+
+    private static void Toggle(HashSet<string> set, string value, bool selected)
+    {
+        if (selected)
+        {
+            set.Add(value);
+        }
+        else
+        {
+            set.Remove(value);
+        }
+    }
+
+    private void SetProfile(string phase, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            _profiles.Remove(phase);
+        }
+        else
+        {
+            _profiles[phase] = value.Trim();
+        }
+    }
+
+    private void Generate()
+    {
+        var input = new ProjectSetupInput(
+            _input.ProjectId, _input.DisplayName, _input.RepositoryUrl, _input.BaseBranch, _input.Agent,
+            _input.UpstreamKind, _input.GitHubOwner, _input.GitHubRepository, _input.GitHubTokenEnvVar,
+            _input.GenericUrl, _input.GenericTokenEnvVar,
+            _languages.OrderBy(l => l).ToList(), _auditTypes.OrderBy(t => t).ToList(),
+            _profiles.ToDictionary(kv => kv.Key, kv => (string?)kv.Value));
+        _errors = ProjectSetupSnippet.Validate(input).ToList();
+        _snippet = _errors.Count == 0 ? ProjectSetupSnippet.BuildJson(input) : null;
+    }
+
+    private sealed class SetupForm
+    {
+        public string? ProjectId { get; set; }
+        public string? DisplayName { get; set; }
+        public string? RepositoryUrl { get; set; }
+        public string? BaseBranch { get; set; }
+        public string? Agent { get; set; }
+        public string? UpstreamKind { get; set; }
+        public string? GitHubOwner { get; set; }
+        public string? GitHubRepository { get; set; }
+        public string? GitHubTokenEnvVar { get; set; }
+        public string? GenericUrl { get; set; }
+        public string? GenericTokenEnvVar { get; set; }
+    }
+}
