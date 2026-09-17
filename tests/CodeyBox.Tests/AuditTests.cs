@@ -391,7 +391,7 @@ public sealed class AuditTests
         Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Contains("command exited 0: lint", finding.Title, StringComparison.Ordinal);
+        Assert.Equal("command exited 0", finding.Title);
         Assert.Contains("sandbox process launcher unavailable", finding.Description, StringComparison.Ordinal);
     }
 
@@ -775,7 +775,8 @@ public sealed class AuditTests
         Assert.False(result.Passed);
         Assert.Equal(2, result.Findings.Count);
         Assert.Contains(result.Findings, f => f.Title.Contains("JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals", StringComparison.Ordinal));
-        Assert.Contains(result.Findings, f => f.Title.Contains("command exited 1: dotnet test --no-build", StringComparison.Ordinal));
+        Assert.Contains(result.Findings, f => f.Title.Contains("command exited 1", StringComparison.Ordinal));
+        Assert.Contains(result.Findings, f => f.Description.Contains("dotnet test --no-build", StringComparison.Ordinal));
     }
 
     [Fact]
