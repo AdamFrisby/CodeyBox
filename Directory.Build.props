@@ -48,6 +48,20 @@
     <RestorePackagesPath Condition="'$(RestorePackagesPath)' == '' and '$(_CodeyBoxOriginalDotNetHome)' != ''">$([System.IO.Path]::Combine('$(_CodeyBoxOriginalDotNetHome)', '.nuget', 'packages'))</RestorePackagesPath>
   </PropertyGroup>
 
+  <!-- Release identity. Declared once here so assembly metadata, the admin UI's
+       reported version and scripts/package.sh's tarball name cannot disagree. -->
+  <PropertyGroup>
+    <VersionPrefix>0.7.0</VersionPrefix>
+    <Product>CodeyBox</Product>
+    <Company>Adam Frisby</Company>
+    <Authors>Adam Frisby</Authors>
+    <Copyright>Copyright (c) 2026 Adam Frisby</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/AdamFrisby/CodeyBox</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+
   <!-- Runs BEFORE restore reads the NuGet user config within the SAME dotnet
        process, so a bare `dotnet build` (which inherits none of the
        DOTNET_CLI_HOME/HOME pinning that build.sh and SandboxRequiredBuildVerifier
