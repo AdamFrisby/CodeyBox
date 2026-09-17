@@ -24,6 +24,7 @@ using CodeyBox.Agents.Continue;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
+using CodeyBox.Agents.Qwen;
 using CodeyBox.Agents.Vibe;
 using CodeyBox.AdminSeed;
 using CodeyBox.Api;
@@ -1369,6 +1370,20 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new OmpAgentRunner(
 builder.Services.AddSingleton<IAgentRunner>(sp => new ContinueAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Continue));
+// Qwen: Qwen Code CLI (npm @qwen-code/qwen-code, Apache-2.0; a gemini-cli
+// fork with a Claude-shaped stream-json surface). Driven one-shot via
+// `qwen --approval-mode yolo --auth-type openai --output-format stream-json
+// [-m <model>]` with the prompt on stdin (no positional prompt, never the
+// deprecated -p flag — dodging the 128 KiB MAX_ARG_STRLEN ceiling).
+// --auth-type openai pins env-key routing (Qwen OAuth is discontinued;
+// the unset default would not resolve headless). Auth is provider env
+// (shipped mapping: CODEYBOX_QWEN_API_KEY -> OPENAI_API_KEY plus base URL
+// and model fallbacks). The binary must be installed in the sandbox image
+// (`npm install -g @qwen-code/qwen-code`, pinned — see
+// docs/reference/sandbox-baselines.md); see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new QwenAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1872,6 +1887,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // different OpenAI-compatible backend change
         // CodeyBox:Continue:BaseUrl; the key variable stays the same.
         new AgentCredentialMapping(AgentKind.Continue, "CODEYBOX_CONTINUE_API_KEY", "OPENROUTER_API_KEY"),
+        // Qwen: OpenAI-compatible provider auth read from the environment.
+        // The runner pins --auth-type openai, so the key, base URL, and
+        // model fallback travel as the OPENAI_* variables the CLI reads on
+        // that path; the shipped rows cover the OpenRouter member the
+        // bundled AgentClasses entry routes. Operators fronting another
+        // OpenAI-compatible backend point CODEYBOX_QWEN_BASE_URL at it;
+        // switching the pinned --auth-type itself needs a code change. The
+        // runner never emits --api-key so the secret stays out of argv.
+        new AgentCredentialMapping(AgentKind.Qwen, "CODEYBOX_QWEN_API_KEY", "OPENAI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.Qwen, "CODEYBOX_QWEN_BASE_URL", "OPENAI_BASE_URL"),
+        new AgentCredentialMapping(AgentKind.Qwen, "CODEYBOX_QWEN_MODEL", "OPENAI_MODEL"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2645,6 +2671,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new ContinueSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<ContinueSmokeProbe>()));
+// Qwen: credential-presence check only (OPENAI_API_KEY in the bundle).
+// Qwen fronts many providers behind one CLI with no single lightweight
+// "whoami", and any provider call would spend real quota; the real auth
+// check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new QwenSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<QwenSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2669,6 +2702,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, ClineInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, KiloInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OmpInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, ContinueInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, QwenInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2809,6 +2843,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, OmpModelListProbe>();
 // ContinueKnownModels seed is authoritative; operator-configured ids absent
 // from the seed surface as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, ContinueModelListProbe>();
+// Qwen model-list probe: the catalog is per provider and server-side, so
+// it cannot back a host-side startup probe. The curated QwenKnownModels
+// seed is authoritative; operator-configured ids absent from the seed
+// surface as a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, QwenModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3815,6 +3854,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Kilo] = new KiloCostExtractor(),
         [AgentKind.Omp] = new OmpCostExtractor(),
         [AgentKind.Continue] = new ContinueCostExtractor(),
+        [AgentKind.Qwen] = new QwenCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3932,6 +3972,13 @@ builder.Services.AddSingleton<IAgentStreamParser, OmpStreamParser>();
 // slot claims nothing — it exists so ResolveKind attributes Continue work
 // items to AgentKind.Continue rather than unknown (same as aider/opencode).
 builder.Services.AddSingleton<IAgentStreamParser, ContinueStreamParser>();
+// Qwen emits a Claude-shaped stream-json surface but claims only lines
+// carrying qwen-only markers (qwen_code_version/permission_mode on system,
+// message.usage.total_tokens on assistant, stats/permission_denials/
+// error_during_execution on result, bare stream_event), so registration
+// order against the Claude parser is irrelevant — bare Claude frames are
+// never claimed.
+builder.Services.AddSingleton<IAgentStreamParser, QwenStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -4117,6 +4164,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new ContinueQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Qwen detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:qwen, mirroring the continue hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Qwen.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new QwenQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();

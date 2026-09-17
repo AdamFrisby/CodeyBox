@@ -1791,3 +1791,109 @@ under `CodeyBox:QuotaFailurePatterns:continue`. The onboarding-gate
 interceptor message is deliberately unmatched — an
 environment/provisioning signal, not quota/auth evidence — as is bare
 quota/401 prose from reviewed repository content.
+
+### Qwen Code (`qwen`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against @qwen-code/qwen-code 0.24.0, 2026-09-17):
+
+```sh
+npm install -g @qwen-code/qwen-code@0.24.0
+```
+
+Apache-2.0 ([repo](https://github.com/QwenLM/qwen-code)). A fork of
+gemini-cli, so its surface feels familiar next to the Gemini adapter — but
+the structured surface is Claude-shaped (`system`/`assistant`/`result` with
+`session_id`, `duration_ms`, `num_turns`), not Gemini's. Needs Node.js 22+
+on the image (upstream requirement). The `@0.24.0` pin keeps the bake
+deterministic — bump it only after re-verifying the headless contract
+below, because flag names move (`-p/--prompt` is already deprecated in
+favour of the positional prompt).
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with the prompt on stdin and NO positional prompt argument:
+
+```sh
+qwen --approval-mode yolo --auth-type openai --output-format stream-json [-m <model>]
+```
+
+`--output-format stream-json` emits one JSON event per stdout line and
+exits after the run (the buffered `json` variant emits the same frames as a
+single array — same events, but nothing streams until exit, so a killed run
+leaves no partial signal). Raw text output would lose usage, dispatch
+model, and the terminal error shape, so `stream-json` is the only
+transport. The deprecated `-p/--prompt` flag is never emitted: stdin alone
+is a complete prompt channel (verified live — a piped-stdin prompt with no
+positional argument answered and exited 0), which also dodges the 128 KiB
+`MAX_ARG_STRLEN` ceiling rework prompts can blow through. `--approval-mode
+yolo` auto-approves every tool call (the sandbox VM boundary is the real
+permission boundary); `QWEN_CODE_UNATTENDED_RETRY=1` keeps the run alive
+past transient 429/529 responses and
+`QWEN_CODE_SUPPRESS_YOLO_WARNING=1` silences the yolo-no-sandbox notice that
+would otherwise pollute every capture.
+
+**Authentication — pinned `--auth-type openai`.** The runner pins
+`--auth-type openai` so dispatch routes deterministically to env-key auth:
+the Qwen OAuth path is discontinued upstream and `qwen auth` has been
+removed, so the unset default would not resolve headless. Credentials
+travel as direct process env — `OPENAI_API_KEY` (shipped mapping: host
+`CODEYBOX_QWEN_API_KEY`), `OPENAI_BASE_URL` (host
+`CODEYBOX_QWEN_BASE_URL` — the OpenRouter endpoint for the shipped member),
+and `OPENAI_MODEL` (host `CODEYBOX_QWEN_MODEL` — fallback when neither the
+member nor the default names a model) — plus `-m/--model` when the dispatch
+names one. Operators fronting a non-OpenAI-compatible provider extend the
+mapping with that provider's variable; switching the pinned `--auth-type`
+itself needs a code change. A `$0`-spend-limit OpenRouter key only serves
+ids ending `:free` (verified: the CLI's own paid default fails with `Key
+limit exceeded (total limit)`); the runner pins `-m` to the member/default
+model and never injects a hardcoded id. The guest needs `openrouter.ai` on
+`CodeyBox:AgentAllowedHosts` for the shipped route. Never commit a provider
+key: `gitleaks` CI matches this key's shape. `~/.qwen/settings.json` and
+`.env` files are the interactive/operator escape hatches — the runner
+needs neither.
+
+**No trust dialog to defeat.** Trusted Folders are disabled by default
+upstream, so no trust override is passed (the sandbox tree is untrusted
+repo content either way). There is no CLI reasoning-effort flag (tiers live
+in per-model settings), so `ReasoningMode` is accepted and ignored like the
+Gemini runner.
+
+**Terminal failures.** Qwen exits non-zero on terminal run errors
+(verified: provider 401 and paid-model-on-`$0`-key both exit 1 with a
+`result/subtype:"error_during_execution"` frame plus an
+`AlreadyReportedError` object on stderr — no exit-zero masquerade), so the
+runner lifts the terminal error into `TerminalDiagnostic` via
+`QwenTerminalDiagnoser` (which scans BOTH streams) and the pipeline's
+no-changes branch parks quota/auth give-ups instead of dead-lettering them
+as "produced no changes". The documented non-zero codes are mapped rather
+than treated as generic failure: 55 (wall-time/tool-call budget) and 53
+(session-turn cap) annotate `TerminalDiagnostic` and classify as Normal
+with a budget/turn-cap reason, and 130 (SIGINT) classifies as
+Infrastructure (external interruption, not a work failure). A missing
+binary surfaces as exit 127 + command-not-found, classified as
+infrastructure — never as "no changes".
+
+**Cost.** Every assistant frame carries provider-reported
+`message.usage {input_tokens, output_tokens, cache_read_input_tokens,
+total_tokens}` with the dispatch model in `message.model`, and the terminal
+`result` frame repeats the run total in its own `usage` object plus a
+per-model breakdown in `stats.models.<id>.tokens` (verified: the result
+totals exceed the intermediate assistant frame's — usage grows across
+turns, so the latest frame is the run total). `QwenCostExtractor` keeps the
+latest usage frame; error runs report all-zero usage and yield null
+(unknown), never a zero that looks like data. No built-in fallback rate is
+shipped (multi-provider front, unrelated per-token economics) — the shipped
+free-tier member bills $0 via the explicit zero-rate bucket.
+
+**Quota probe.** Ships as Unknown-only: no CLI surface reports the env-key
+path's remaining budget, so no probe is registered (an agent with no
+readable quota meter must not ship a probe that fabricates one) and members
+fall through to the `NullQuotaProbe` unknown path. The router's
+`QuotaUnknownPolicy` (default `UseObservedFailures`) gates dispatch via
+observed failure history, and `QwenQuotaFailureDetector` classifies the
+relayed provider errors (`Key limit exceeded` → LimitReached; shared 429
+rows → RateLimitExceeded; standard relay auth vocabulary →
+Unauthorized) with operator-extensible rows under
+`CodeyBox:QuotaFailurePatterns:qwen`. Bare quota/401 prose from reviewed
+repository content is deliberately unmatched.
