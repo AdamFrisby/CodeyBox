@@ -246,7 +246,26 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
     public void ProjectSecret_NeverFlowsThroughAgentCredentialSelection()
     {
         var hostName = UniqueEnvName("CODEYBOX_TEST_PS_HOST");
-        using var _ = new HostEnvScope(hostName, "project-secret-value");
+        const string SandboxName = "OPENROUTER_API_KEY";
+        const string SecretValue = "project-secret-value-must-stay-in-own-channel";
+        using var _ = new HostEnvScope(hostName, SecretValue);
+        var project = new Project
+        {
+            Id = new ProjectId("p"),
+            DisplayName = "P",
+            RepositoryUrl = "https://example.com/x.git",
+            SandboxSecrets =
+            [
+                new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = SandboxName },
+            ],
+        };
+
+        // The project-secret channel resolves the value; the credential
+        // channel must never be able to produce it from the same declaration.
+        var resolved = ProjectSandboxSecretResolver.ResolveForScope(
+            project, "work", Environment.GetEnvironmentVariable);
+        Assert.Equal(SecretValue, resolved[SandboxName]);
+
         var credential = new AgentCredential(
             AgentKind.Claude,
             new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "claude-key" },
@@ -255,8 +274,23 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
         var direct = SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
             credential, new ScriptedAgent([]), "credential");
 
-        Assert.DoesNotContain("OPENROUTER_API_KEY", direct.Keys);
+        Assert.Equal("claude-key", direct["ANTHROPIC_API_KEY"]);
+        Assert.DoesNotContain(SandboxName, direct.Keys);
         Assert.DoesNotContain(hostName, direct.Keys);
+        Assert.DoesNotContain(SecretValue, direct.Values);
+
+        // Smuggling the project secret name through an AgentCredential must
+        // fail: ScriptedAgent classifies no OPENROUTER_API_KEY, so the policy
+        // rejects it instead of selecting it. If the gate or the
+        // exactly-one-of-direct-or-file-backed classification is removed, this
+        // throws nothing and the test goes red.
+        var smuggled = new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string> { [SandboxName] = SecretValue },
+            new Dictionary<string, string>());
+        Assert.Throws<ArgumentException>(() =>
+            SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
+                smuggled, new ScriptedAgent([]), "credential"));
     }
 
     // ── Config load ───────────────────────────────────────────────────────
@@ -641,14 +675,85 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             "audit DTO must not gain a value-carrying property");
     }
 
+    [Fact]
+    public void AuditListing_MarksProjectInjectingSecrets()
+    {
+        var withSecrets = new Project
+        {
+            Id = new ProjectId("p"),
+            DisplayName = "P",
+            RepositoryUrl = "https://example.com/x.git",
+            SandboxSecrets =
+            [
+                new ProjectSandboxSecret
+                {
+                    HostEnvVar = "HOST_KEY",
+                    SandboxEnvVar = "SANDBOX_KEY",
+                    Scopes = ["work"],
+                },
+            ],
+        };
+        var withoutSecrets = new Project
+        {
+            Id = new ProjectId("q"),
+            DisplayName = "Q",
+            RepositoryUrl = "https://example.com/x.git",
+        };
+
+        var toDto = typeof(WorkItemEndpoints).GetMethod(
+            "ToProjectDto",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(nameof(WorkItemEndpoints), "ToProjectDto");
+
+        var withDto = Assert.IsType<ProjectDto>(toDto.Invoke(null, [withSecrets]));
+        Assert.True(withDto.HasSandboxSecrets);
+        Assert.Single(withDto.SandboxSecrets!);
+
+        var withoutDto = Assert.IsType<ProjectDto>(toDto.Invoke(null, [withoutSecrets]));
+        Assert.False(withoutDto.HasSandboxSecrets);
+        Assert.Empty(withoutDto.SandboxSecrets!);
+    }
+
     // ── No leakage into instance config, cloud-init, or logs ──────────────
 
     [Fact]
     public void SecretValue_AbsentFromCloudInitRenderings()
     {
-        const string SecretValue = "or-cloud-init-must-not-contain-9f2c";
+        var hostName = UniqueEnvName("CODEYBOX_TEST_PS_HOST");
+        const string SandboxName = "OPENROUTER_API_KEY";
+        var secretValue = $"or-cloud-init-must-not-contain-{Guid.NewGuid():N}";
+        using var _ = new HostEnvScope(hostName, secretValue);
+        var project = new Project
+        {
+            Id = new ProjectId("p"),
+            DisplayName = "P",
+            RepositoryUrl = "https://example.com/x.git",
+            SandboxSecrets =
+            [
+                new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = SandboxName },
+            ],
+        };
+
+        // Drive the real channel: the value is resolved and placed into the
+        // SandboxSpec environment exactly as PipelineRunner does, so deleting
+        // the secret plumbing empties the spec and trips the presence guard.
+        var resolved = ProjectSandboxSecretResolver.ResolveForScope(
+            project, "work", Environment.GetEnvironmentVariable);
+        Assert.Equal(secretValue, resolved[SandboxName]);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "test-image",
+            Environment = resolved,
+        };
+        Assert.Equal(secretValue, spec.Environment[SandboxName]);
+
+        // Instance configuration and cloud-init carry only provider-owned keys
+        // (limits.cpu/limits.memory, user.user-data); the secret travels via
+        // the per-exec tmpfs env file instead. Render the exact cloud-init
+        // payloads the providers send through `config set ... user.user-data`
+        // and prove the live value is absent from both.
         var multipassInit = MultipassSandboxProvider.BuildCloudInit(null, null);
-        Assert.DoesNotContain(SecretValue, multipassInit, StringComparison.Ordinal);
+        Assert.DoesNotContain(secretValue, multipassInit, StringComparison.Ordinal);
 
         var incusOptions = new IncusSandboxOptions
         {
@@ -656,7 +761,59 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             StoragePoolName = "test",
         };
         var incusInit = IncusCloudInit.Build(incusOptions, SandboxProfileFlavor.Headless);
-        Assert.DoesNotContain(SecretValue, incusInit, StringComparison.Ordinal);
+        Assert.DoesNotContain(secretValue, incusInit, StringComparison.Ordinal);
+
+        // Control: the value DOES travel on the intended per-exec env channel
+        // (tmpfs env file), proving the absence above is separation rather
+        // than the value never existing.
+        var envPayload = IncusSandbox.SerializeEnvironment(spec.Environment);
+        Assert.Contains(secretValue, envPayload, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SecretValue_AbsentFromInstanceConfigKeys()
+    {
+        var hostName = UniqueEnvName("CODEYBOX_TEST_PS_HOST");
+        const string SandboxName = "OPENROUTER_API_KEY";
+        var secretValue = $"or-instance-config-must-not-contain-{Guid.NewGuid():N}";
+        using var _ = new HostEnvScope(hostName, secretValue);
+        var project = new Project
+        {
+            Id = new ProjectId("p"),
+            DisplayName = "P",
+            RepositoryUrl = "https://example.com/x.git",
+            SandboxSecrets =
+            [
+                new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = SandboxName },
+            ],
+        };
+
+        var resolved = ProjectSandboxSecretResolver.ResolveForScope(
+            project, "work", Environment.GetEnvironmentVariable);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "test-image",
+            Environment = resolved,
+        };
+        Assert.Equal(secretValue, spec.Environment[SandboxName]);
+
+        // The Incus provider only ever writes provider-owned instance config
+        // keys (limits.cpu, limits.memory, user.user-data, devices). None of
+        // those payloads is derived from spec.Environment, so render the
+        // user-data payload actually sent via `config set` and prove the live
+        // value is absent while the env channel carries it.
+        var incusOptions = new IncusSandboxOptions
+        {
+            ProjectName = "test",
+            StoragePoolName = "test",
+        };
+        var userData = IncusCloudInit.Build(incusOptions, SandboxProfileFlavor.Headless);
+        var representativeConfigShow = string.Join("\n",
+            "limits.cpu: 2",
+            "limits.memory: 4GiB",
+            $"user.user-data:\n{userData}");
+        Assert.DoesNotContain(secretValue, representativeConfigShow, StringComparison.Ordinal);
+        Assert.Contains(secretValue, IncusSandbox.SerializeEnvironment(spec.Environment), StringComparison.Ordinal);
     }
 
     [Fact]
