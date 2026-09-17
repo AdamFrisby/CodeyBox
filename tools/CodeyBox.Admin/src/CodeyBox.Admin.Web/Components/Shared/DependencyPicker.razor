@@ -1,0 +1,54 @@
+@using CodeyBox.Admin.Model
+
+<div class="form-group dependency-picker">
+    <label for="@SearchInputId">Depends on</label>
+    <input id="@SearchInputId" value="@Search" @oninput="e => SearchChanged.InvokeAsync(e.Value?.ToString() ?? string.Empty)"
+           class="form-control" placeholder="Search queued items…" autocomplete="off" />
+    @if (Candidates.Count == 0)
+    {
+        <p class="form-hint">No matching items.</p>
+    }
+    @foreach (var c in Candidates)
+    {
+        <div class="form-check">
+            <input type="checkbox"
+                   id="@(IdPrefix + c.Id)"
+                   checked="@Selected.Contains(c.Id)"
+                   @onchange="e => Toggle(c.Id, (bool)(e.Value ?? false))" />
+            <label for="@(IdPrefix + c.Id)" title="@c.Title">
+                <span class="dep-shortid">@ShortId(c.Id)</span>
+                <span class="dep-title">@DependencyProximity.DisplayTitle(c.Title)</span>
+                <span class="dep-state">@c.State</span>
+                <span class="dep-project">@ProjectName(c.ProjectId)</span>
+            </label>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter]
+    public IReadOnlyList<DependencyCandidate> Candidates { get; set; } = [];
+
+    [Parameter]
+    public IReadOnlySet<string> Selected { get; set; } = new HashSet<string>(StringComparer.Ordinal);
+
+    [Parameter]
+    public string Search { get; set; } = "";
+
+    [Parameter]
+    public EventCallback<string> SearchChanged { get; set; }
+
+    [Parameter]
+    public Action<string, bool> Toggle { get; set; } = (_, _) => { };
+
+    [Parameter]
+    public string IdPrefix { get; set; } = "dep-";
+
+    [Parameter]
+    public string SearchInputId { get; set; } = "dep-search";
+
+    [Parameter]
+    public Func<string, string> ProjectName { get; set; } = id => id;
+
+    private static string ShortId(string id) => id.Length >= 8 ? id[..8] : id;
+}

@@ -388,6 +388,17 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
 
     public Task<WorkItemDto?> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default)
     {
+        if (CreateHandler is not null)
+        {
+            var handled = CreateHandler(req);
+            if (handled is not null)
+            {
+                _items.Add(handled);
+            }
+
+            return Task.FromResult(handled);
+        }
+
         var item = new WorkItemDto
         {
             Id = Guid.NewGuid().ToString(),
@@ -401,6 +412,29 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         };
         _items.Add(item);
         return Task.FromResult<WorkItemDto?>(item);
+    }
+
+    /// <summary>
+    /// Test hook: when set, creates go through this handler (which may
+    /// throw to simulate a mid-chain failure). Null results simulate an
+    /// empty orchestrator response.
+    /// </summary>
+    public Func<CreateWorkItemRequest, WorkItemDto?>? CreateHandler { get; set; }
+
+    public List<TaskTemplateDto> TemplatesOverride { get; set; } = [];
+
+    public Task<List<TaskTemplateDto>> GetTaskTemplatesAsync(CancellationToken ct = default)
+        => Task.FromResult(TemplatesOverride);
+
+    public QueueTaskTemplateRequest? LastQueueTemplateRequest { get; private set; }
+
+    public QueuedTaskTemplateResponse? QueueTemplateResponse { get; set; }
+
+    public Task<QueuedTaskTemplateResponse?> QueueTaskTemplateAsync(
+        QueueTaskTemplateRequest req, CancellationToken ct = default)
+    {
+        LastQueueTemplateRequest = req;
+        return Task.FromResult(QueueTemplateResponse);
     }
 
     public Task<WorkItemDto?> PatchWorkItemAsync(string id, PatchWorkItemRequest req, CancellationToken ct = default)

@@ -1,4 +1,5 @@
 @page "/work-items/new"
+@using CodeyBox.Admin.Model
 @inject ICodeyBoxApiClient ApiClient
 @inject NavigationManager Nav
 
@@ -19,115 +20,430 @@
     </div>
 }
 
+@if (_followUpItem is not null)
+{
+    <div class="followup-context">
+        <p>
+            Filing a follow-up to
+            <a href="/work-items/@_followUpItem.Id"><strong>@_followUpItem.Title</strong></a>
+            (@_followUpItem.ShortId).
+            The relationship is inferred — it will wait for that item — but the words are yours.
+        </p>
+    </div>
+}
+
 @if (_error is not null)
 {
     <p class="error-banner">@_error</p>
 }
 
-<EditForm Model="_form" OnValidSubmit="SubmitAsync">
-    <DataAnnotationsValidator />
-
-    <div class="form-group">
-        <label for="project">Project</label>
-        <InputSelect id="project" @bind-Value="_form.ProjectId" class="form-control">
-            <option value="">— select —</option>
-            @foreach (var p in _projects)
-            {
-                <option value="@p.Id">@p.DisplayName</option>
-            }
-        </InputSelect>
-        <ValidationMessage For="() => _form.ProjectId" />
-    </div>
-
-    <div class="form-group">
-        <label for="externalId">External ID <span class="form-hint">(optional — e.g. JIRA-1234, GH-#456)</span></label>
-        <InputText id="externalId" @bind-Value="_form.ExternalId" class="form-control"
-                   placeholder="e.g. JIRA-1234" />
-    </div>
-
-    <div class="form-group">
-        <label for="title">Title</label>
-        <InputText id="title" @bind-Value="_form.Title" class="form-control" />
-        <ValidationMessage For="() => _form.Title" />
-    </div>
-
-    <div class="form-group">
-        <label for="prompt">@(_fromSuggestionId is not null ? "Additional instructions (optional)" : "Prompt")</label>
-        <InputTextArea id="prompt" @bind-Value="_form.Prompt" class="form-control prompt-input" rows="20" />
-        @if (_fromSuggestionId is null)
-        {
-            <ValidationMessage For="() => _form.Prompt" />
-        }
-    </div>
-
-    <div class="form-group">
-        <label for="agent">Agent</label>
-        <InputSelect id="agent" @bind-Value="_form.Agent" class="form-control">
-            <option value="">(project default)</option>
-            <option value="claude">claude</option>
-            <option value="copilot">copilot</option>
-            <option value="codex">codex</option>
-        </InputSelect>
-    </div>
-
-    <div class="form-group">
-        <label for="workBranch">Work branch</label>
-        <InputText id="workBranch" @bind-Value="_form.WorkBranch" class="form-control"
-                   placeholder="(auto-generated)" />
-    </div>
-
-    <div class="form-group form-check">
-        <InputCheckbox id="pushUpstream" @bind-Value="_form.PushUpstream" />
-        <label for="pushUpstream">Push upstream after merge</label>
-    </div>
-
-    @if (_queuedItems.Count > 0 && _fromSuggestionId is null)
-    {
+@if (!_loaded)
+{
+    <p>Loading…</p>
+}
+else
+{
+    @* ── Inferred context: everything the interface already knows, shown ── *@
+    <section aria-label="Inferred context" class="composer-context">
         <div class="form-group">
-            <label>Depends on (queued items)</label>
-            @foreach (var qi in _queuedItems)
+            <label for="project">
+                Project
+                @InferenceBadge(_projectId.Source, _projectId.Overridden)
+            </label>
+            <select id="project" value="@(_projectId.Value ?? string.Empty)"
+                    @onchange="e => OnProjectSelected(e.Value?.ToString())" class="form-control">
+                <option value="">— select —</option>
+                @foreach (var p in _projects)
+                {
+                    <option value="@p.Id">@p.DisplayName</option>
+                }
+            </select>
+            @if (_projectError is not null)
             {
-                <div class="form-check">
-                    <input type="checkbox"
-                           id="dep-@qi.Id"
-                           checked="@_selectedDeps.Contains(qi.Id)"
-                           @onchange="e => ToggleDep(qi.Id, (bool)(e.Value ?? false))" />
-                    <label for="dep-@qi.Id">@qi.ShortId — @qi.Title</label>
+                <div class="validation-message">@_projectError</div>
+            }
+            <div class="form-hint">
+                <a href="/projects/setup">New project? Open the setup wizard</a> — it writes the config snippet for you.
+            </div>
+        </div>
+
+        <div class="composer-chips" role="group" aria-label="Inferred fields">
+            <div class="form-group composer-control">
+                <label for="agent">
+                    Agent
+                    @InferenceBadge(_agent.Source, _agent.Overridden)
+                </label>
+                <select id="agent" value="@(_agent.Value ?? string.Empty)"
+                        @onchange="e => OnAgentSelected(e.Value?.ToString())" class="form-control">
+                    <option value="">(project default)</option>
+                    @foreach (var a in AgentOptions)
+                    {
+                        <option value="@a.Value">@a.Label</option>
+                    }
+                </select>
+                @if (_agent.Overridden)
+                {
+                    <button type="button" id="reset-agent" class="btn btn-xs" @onclick="ResetAgent">↺ inferred</button>
+                }
+            </div>
+
+            <div class="form-group composer-control">
+                <label for="baseBranch">
+                    Base branch
+                    @InferenceBadge(_baseBranch.Source, _baseBranch.Overridden)
+                </label>
+                <input id="baseBranch" value="@(_baseBranch.Value ?? string.Empty)"
+                       @onchange="e => OnBaseBranchChanged(e.Value?.ToString() ?? string.Empty)"
+                       class="form-control" placeholder="(project default)" />
+                @if (_baseBranch.Overridden)
+                {
+                    <button type="button" id="reset-baseBranch" class="btn btn-xs" @onclick="ResetBaseBranch">↺ inferred</button>
+                }
+            </div>
+
+            @foreach (var chip in new[] { ("agentclass", "Class", _agentClassId), ("budget", "Audit ×", _auditBudgetText), ("profile", "Auditors", _auditorProfile) })
+            {
+                var key = chip.Item1;
+                <div class="form-group composer-control">
+                    <button type="button" id="chip-@key" class="composer-chip" aria-expanded="@(_editingChip == key ? "true" : "false")"
+                            @onclick="() => ToggleChipEditor(key)">
+                        <span class="chip-label">@chip.Item2</span>:
+                        <strong>@(string.IsNullOrWhiteSpace(chip.Item3.Value) ? "—" : chip.Item3.Value)</strong>
+                        <span class="chip-source">@SourceLabel(chip.Item3.Source)</span>
+                    </button>
                 </div>
             }
         </div>
+
+        @if (_editingChip is not null)
+        {
+            <div class="chip-editor" id="chip-editor">
+                @if (_editingChip == "agentclass")
+                {
+                    <label for="chip-agentclass-input">Agent class (optional)</label>
+                    <input id="chip-agentclass-input" @bind="_chipStaging" class="form-control"
+                           placeholder="e.g. default-class" />
+                }
+                else if (_editingChip == "budget")
+                {
+                    <label for="chip-budget-input">Audit iterations (optional)</label>
+                    <input id="chip-budget-input" @bind="_chipStaging" class="form-control"
+                           inputmode="numeric" placeholder="e.g. 5" />
+                }
+                else
+                {
+                    <label for="chip-profile-input">Auditor profile (optional)</label>
+                    <input id="chip-profile-input" @bind="_chipStaging" class="form-control"
+                           placeholder="e.g. strict" />
+                }
+                @if (_chipError is not null)
+                {
+                    <div class="validation-message">@_chipError</div>
+                }
+                <div class="form-actions">
+                    <button type="button" id="chip-save" class="btn btn-primary btn-sm" @onclick="SaveChipEditor">Save</button>
+                    <button type="button" id="chip-clear" class="btn btn-sm" @onclick="ClearChipEditor">Clear</button>
+                    <button type="button" id="chip-cancel" class="btn btn-sm" @onclick="CancelChipEditor">Cancel</button>
+                </div>
+            </div>
+        }
+    </section>
+
+    @if (_fromSuggestionId is null)
+    {
+        <div class="composer-modes" role="radiogroup" aria-label="Composer mode">
+            <label>
+                <input type="radio" id="mode-single" name="composer-mode" value="single"
+                       checked="@(_mode == "single")" @onchange='() => _mode = "single"' />
+                Single item
+            </label>
+            <label>
+                <input type="radio" id="mode-plan" name="composer-mode" value="plan"
+                       checked="@(_mode == "plan")" @onchange='() => _mode = "plan"' />
+                Paste a plan
+            </label>
+        </div>
     }
 
-    <div class="form-actions">
-        @if (_fromSuggestionId is not null)
+    @if (_mode == "single" || _fromSuggestionId is not null)
+    {
+        <EditForm Model="_form" OnValidSubmit="SubmitAsync" OnInvalidSubmit="HandleInvalidSubmit">
+            <DataAnnotationsValidator />
+
+            <div class="form-group">
+                <label for="externalId">External ID <span class="form-hint">(optional — e.g. JIRA-1234, GH-#456)</span></label>
+                <InputText id="externalId" @bind-Value="_form.ExternalId" class="form-control"
+                           placeholder="e.g. JIRA-1234" />
+            </div>
+
+            <div class="form-group">
+                <label for="title">Title</label>
+                <InputText id="title" @bind-Value="_form.Title" class="form-control" />
+                <ValidationMessage For="() => _form.Title" />
+            </div>
+
+            <div class="form-group">
+                <label for="prompt">@(_fromSuggestionId is not null ? "Additional instructions (optional)" : "Prompt")</label>
+                <InputTextArea id="prompt" @bind-Value="_form.Prompt" class="form-control prompt-input" rows="20" />
+                @if (_fromSuggestionId is null)
+                {
+                    <ValidationMessage For="() => _form.Prompt" />
+                }
+            </div>
+
+            <details class="composer-advanced" id="advanced">
+                <summary>More options — priority, model floor, audit, knobs, release</summary>
+                @AdvancedFields()
+            </details>
+
+            @if (_fromSuggestionId is null)
+            {
+                <DependencyPicker
+                    Candidates="OrderedCandidates(_selectedDeps)"
+                    Selected="_selectedDeps"
+                    Search="_depSearch"
+                    SearchChanged="v => _depSearch = v"
+                    Toggle="ToggleDep"
+                    IdPrefix="dep-"
+                    SearchInputId="dep-search"
+                    ProjectName="ProjectDisplayName" />
+            }
+
+            <div class="form-actions">
+                @if (_fromSuggestionId is not null)
+                {
+                    <button type="button" class="btn btn-primary" disabled="@_submitting" @onclick="PromoteSuggestionAsync">
+                        @(_submitting ? "Promoting…" : "Promote to work item")
+                    </button>
+                    <a href="/suggestions/@_fromSuggestionId" class="btn">Cancel</a>
+                }
+                else
+                {
+                    <button type="submit" class="btn btn-primary" disabled="@_submitting">
+                        @(_submitting ? "Submitting…" : "Create")
+                    </button>
+                    <a href="/" class="btn">Cancel</a>
+                }
+            </div>
+        </EditForm>
+    }
+    else
+    {
+        <section aria-label="Plan composer">
+            <div class="form-group">
+                <label for="plan-input">Pasted plan</label>
+                <textarea id="plan-input" class="form-control prompt-input" rows="12"
+                          placeholder="Paste a numbered plan — headings, 1. 2. 3., explicit “depends on: 1, 3” — and review the chain before anything is created."
+                          @bind="_planText" @bind:event="oninput"></textarea>
+                <div class="form-hint">Headings and numbering become items; “depends on: 1, 3” becomes edges; otherwise a straight line. Plain prose files one item.</div>
+            </div>
+            <div class="form-actions">
+                <button type="button" id="parse-plan" class="btn" disabled="@_submitting"
+                        @onclick="ParsePlan" @onkeydown="ParsePlanKeyDown">Parse plan</button>
+            </div>
+
+            @if (_previewInfo is not null)
+            {
+                <p class="preview-info" id="preview-info">@_previewInfo</p>
+            }
+
+            @if (_preview.Count > 0)
+            {
+                <ol class="chain-preview" id="chain-preview">
+                    @for (var i = 0; i < _preview.Count; i++)
+                    {
+                        var index = i;
+                        var item = _preview[index];
+                        <li class="chain-item">
+                            <div class="chain-item-head">
+                                <span class="chain-number">@(index + 1)</span>
+                                <input id="chain-title-@(index + 1)" class="form-control" aria-label="Item @(index + 1) title"
+                                       value="@item.Title" @onchange="e => item.Title = e.Value?.ToString() ?? string.Empty" />
+                                <button type="button" id="chain-remove-@(index + 1)" class="btn btn-xs btn-danger"
+                                        aria-label="Remove item @(index + 1)" @onclick="() => RemovePreviewItem(index)">✕</button>
+                            </div>
+                            <textarea id="chain-body-@(index + 1)" class="form-control prompt-input" rows="4"
+                                      aria-label="Item @(index + 1) prompt"
+                                      value="@item.Body" @onchange="e => item.Body = e.Value?.ToString() ?? string.Empty"></textarea>
+                            <div class="chain-edges">
+                                <span class="chain-edges-label">Waits for:</span>
+                                @for (var m = 0; m < _preview.Count; m++)
+                                {
+                                    var depNum = m + 1;
+                                    var self = depNum == index + 1;
+                                    <label class="@(self ? "chain-dep-self" : "chain-dep")" title="@(self ? "An item cannot wait for itself" : $"Item {depNum}")">
+                                        <input type="checkbox" id="chain-dep-@(index + 1)-@depNum"
+                                               disabled="@self" checked="@item.Deps.Contains(depNum)"
+                                               @onchange="e => TogglePreviewDep(index, depNum, (bool)(e.Value ?? false))" />
+                                        @depNum
+                                    </label>
+                                }
+                                <span class="chain-edges-summary">@EdgeSummary(index)</span>
+                            </div>
+                        </li>
+                    }
+                </ol>
+
+                <details class="composer-advanced" id="advanced-chain">
+                    <summary>More options — priority, model floor, audit, knobs, release</summary>
+                    @AdvancedFields()
+                </details>
+
+                <h3>Also wait for existing items <span class="form-hint">(added to the first item)</span></h3>
+                <DependencyPicker
+                    Candidates="OrderedCandidates(_chainExternalDeps)"
+                    Selected="_chainExternalDeps"
+                    Search="_depSearch"
+                    SearchChanged="v => _depSearch = v"
+                    Toggle="ToggleChainExtDep"
+                    IdPrefix="chain-ext-dep-"
+                    SearchInputId="chain-dep-search"
+                    ProjectName="ProjectDisplayName" />
+
+                <div class="form-actions">
+                    <button type="button" id="file-chain" class="btn btn-primary" disabled="@(_submitting || _preview.Count == 0)"
+                            @onclick="SubmitChainAsync" @onkeydown="SubmitChainKeyDown">
+                        @(_submitting ? "Filing…" : $"File {_preview.Count} {(_preview.Count == 1 ? "item" : "items")}")
+                    </button>
+                    <a href="/" class="btn">Cancel</a>
+                </div>
+            }
+        </section>
+    }
+
+    <details class="composer-templates" id="templates">
+        <summary>Task templates (@_templates.Count)</summary>
+        @if (_templates.Count == 0)
         {
-            <button type="button" class="btn btn-primary" disabled="@_submitting" @onclick="PromoteSuggestionAsync">
-                @(_submitting ? "Promoting…" : "Promote to work item")
-            </button>
-            <a href="/suggestions/@_fromSuggestionId" class="btn">Cancel</a>
+            <p class="form-hint">No templates on the orchestrator, or they failed to load.</p>
         }
         else
         {
-            <button type="submit" class="btn btn-primary" disabled="@_submitting">
-                @(_submitting ? "Submitting…" : "Create")
-            </button>
-            <a href="/" class="btn">Cancel</a>
+            <ul class="template-list">
+                @for (var t = 0; t < _templates.Count; t++)
+                {
+                    var template = _templates[t];
+                    var templateIndex = t;
+                    <li>
+                        <strong>@template.Name</strong>
+                        @if (template.CheckCount is not null)
+                        {
+                            <span class="form-hint">@template.CheckCount checks</span>
+                        }
+                        @if (template.Error is not null)
+                        {
+                            <span class="validation-message">@template.Error</span>
+                        }
+                        else
+                        {
+                            <button type="button" id="queue-template-@templateIndex" class="btn btn-sm"
+                                    disabled="@(_submitting || string.IsNullOrWhiteSpace(_projectId.Value))"
+                                    title="@(string.IsNullOrWhiteSpace(_projectId.Value) ? "Select a project first" : $"Queue {template.Name} for the selected project")"
+                                    @onclick="() => QueueTemplateAsync(template)">Queue for this project</button>
+                        }
+                    </li>
+                }
+            </ul>
         }
-    </div>
-</EditForm>
+        @if (_templateMessage is not null)
+        {
+            <p class="template-message" id="template-message">@_templateMessage</p>
+        }
+    </details>
+}
 
 @code {
     [SupplyParameterFromQuery]
     public string? FromSuggestion { get; set; }
 
-    private readonly NewItemForm _form = new();
+    [SupplyParameterFromQuery(Name = "projectId")]
+    public string? QueryProjectId { get; set; }
+
+    [SupplyParameterFromQuery(Name = "agent")]
+    public string? QueryAgent { get; set; }
+
+    [SupplyParameterFromQuery(Name = "baseBranch")]
+    public string? QueryBaseBranch { get; set; }
+
+    [SupplyParameterFromQuery(Name = "followUp")]
+    public string? QueryFollowUp { get; set; }
+
+    [SupplyParameterFromQuery(Name = "agentClassId")]
+    public string? QueryAgentClassId { get; set; }
+
+    [SupplyParameterFromQuery(Name = "auditorProfile")]
+    public string? QueryAuditorProfile { get; set; }
+
+    [SupplyParameterFromQuery(Name = "auditBudget")]
+    public int? QueryAuditBudget { get; set; }
+
+    [SupplyParameterFromQuery(Name = "mode")]
+    public string? QueryMode { get; set; }
+
+    private static readonly IReadOnlyList<(string Value, string Label)> CuratedAgents =
+    [
+        ("claude", "claude"),
+        ("copilot", "copilot"),
+        ("codex", "codex"),
+        ("gemini", "gemini"),
+        ("cursor", "cursor"),
+        ("opencode", "opencode"),
+    ];
+
+    private bool _loaded;
+    private string _mode = "single";
     private List<ProjectDto> _projects = [];
-    private List<WorkItemDto> _queuedItems = [];
+    private List<WorkItemDto> _candidates = [];
+    private List<TaskTemplateDto> _templates = [];
+    private List<ReleaseDto> _openReleases = [];
+    private List<AgentAvailabilityDto> _availableAgents = [];
+
+    private InferredField<string> _projectId = InferredField<string>.Empty;
+    private InferredField<string> _agent = InferredField<string>.Empty;
+    private InferredField<string> _baseBranch = InferredField<string>.Empty;
+    private InferredField<string> _agentClassId = InferredField<string>.Empty;
+    private InferredField<string> _auditorProfile = InferredField<string>.Empty;
+    private InferredField<string> _auditBudgetText = InferredField<string>.Empty;
+
+    private string? _editingChip;
+    private string _chipStaging = "";
+    private string? _chipError;
+
+    private readonly NewItemForm _form = new();
     private readonly HashSet<string> _selectedDeps = [];
+    private readonly HashSet<string> _chainExternalDeps = [];
+    private string _depSearch = "";
+    private string? _projectError;
     private string? _error;
     private bool _submitting;
     private string? _fromSuggestionId;
     private SuggestionDto? _fromSuggestionData;
+    private WorkItemDto? _followUpItem;
+
+    private string _planText = "";
+    private string _lastParsedText = "";
+    private string? _previewInfo;
+    private readonly List<PreviewDraft> _preview = [];
+
+    private string _priorityText = "";
+    private string _minModelScoreText = "";
+    private string _requiredCapabilitiesText = "";
+    private string _auditComplexity = "";
+    private string _knobsText = "";
+    private string _releaseId = "";
+    private string? _templateMessage;
+
+    private IReadOnlyList<(string Value, string Label)> AgentOptions =>
+        _availableAgents.Count == 0
+            ? CuratedAgents
+            : _availableAgents
+                .OrderBy(a => a.Excluded)
+                .ThenBy(a => a.Agent, StringComparer.Ordinal)
+                .Select(a => (a.Agent, a.Excluded ? $"{a.Agent} (unavailable)" : a.Agent))
+                .ToList();
+
+    private string ProjectDisplayName(string projectId) =>
+        _projects.FirstOrDefault(p => p.Id == projectId)?.DisplayName ?? projectId;
 
     protected override async Task OnInitializedAsync()
     {
@@ -135,7 +451,10 @@
         {
             _projects = await ApiClient.GetProjectsAsync();
             var all = await ApiClient.GetWorkItemsAsync();
-            _queuedItems = all.Where(i => i.IsQueued).OrderBy(i => i.QueuePosition).ToList();
+            _candidates = all.Where(i => !i.IsTerminal).ToList();
+            _templates = await ApiClient.GetTaskTemplatesAsync();
+            _openReleases = await ApiClient.GetReleasesAsync(state: "Open", limit: 100);
+            _availableAgents = await ApiClient.GetAgentAvailabilityAsync();
 
             if (!string.IsNullOrEmpty(FromSuggestion))
             {
@@ -145,7 +464,7 @@
                 {
                     _fromSuggestionData = suggestion;
                     _form.Title = suggestion.Title;
-                    _form.ProjectId = suggestion.ProjectId;
+                    _projectId = _projectId.ApplyInferred(suggestion.ProjectId, ComposerFieldSource.Suggestion);
                 }
                 else
                 {
@@ -153,6 +472,351 @@
                     _fromSuggestionId = null;
                 }
             }
+
+            if (!string.IsNullOrWhiteSpace(QueryFollowUp))
+            {
+                _followUpItem = _candidates.FirstOrDefault(i => i.Id == QueryFollowUp)
+                    ?? await ApiClient.GetWorkItemAsync(QueryFollowUp);
+                if (_followUpItem is not null)
+                {
+                    if (string.IsNullOrWhiteSpace(_projectId.Value))
+                    {
+                        _projectId = _projectId.ApplyInferred(_followUpItem.ProjectId, ComposerFieldSource.FollowUp);
+                    }
+
+                    _selectedDeps.Add(_followUpItem.Id);
+                    _chainExternalDeps.Add(_followUpItem.Id);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(QueryProjectId)
+                && _projects.Any(p => p.Id == QueryProjectId))
+            {
+                _projectId = _projectId.ApplyInferred(QueryProjectId, ComposerFieldSource.Query);
+            }
+
+            ApplyProjectDefaults();
+            if (!string.IsNullOrWhiteSpace(QueryAgent))
+            {
+                _agent = _agent.ApplyInferred(QueryAgent.Trim(), ComposerFieldSource.Query);
+            }
+
+            if (!string.IsNullOrWhiteSpace(QueryBaseBranch))
+            {
+                _baseBranch = _baseBranch.ApplyInferred(QueryBaseBranch.Trim(), ComposerFieldSource.Query);
+            }
+
+            if (!string.IsNullOrWhiteSpace(QueryAgentClassId))
+            {
+                _agentClassId = _agentClassId.ApplyInferred(QueryAgentClassId.Trim(), ComposerFieldSource.Query);
+            }
+
+            if (!string.IsNullOrWhiteSpace(QueryAuditorProfile))
+            {
+                _auditorProfile = _auditorProfile.ApplyInferred(
+                    QueryAuditorProfile.Trim(), ComposerFieldSource.Query);
+            }
+
+            if (QueryAuditBudget is { } budget && budget > 0)
+            {
+                _auditBudgetText = _auditBudgetText.ApplyInferred(
+                    budget.ToString(), ComposerFieldSource.Query);
+            }
+
+            if (string.Equals(QueryMode, "plan", StringComparison.OrdinalIgnoreCase)
+                && _fromSuggestionId is null)
+            {
+                _mode = "plan";
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _loaded = true;
+        }
+    }
+
+    private void ApplyProjectDefaults()
+    {
+        var project = _projects.FirstOrDefault(p => p.Id == _projectId.Value);
+        if (project is null)
+        {
+            return;
+        }
+
+        _agent = _agent.ApplyInferred(BlankToNull(project.DefaultAgent), ComposerFieldSource.ProjectDefault);
+        _baseBranch = _baseBranch.ApplyInferred(
+            BlankToNull(project.DefaultBaseBranch), ComposerFieldSource.ProjectDefault);
+        _agentClassId = _agentClassId.ApplyInferred(
+            BlankToNull(project.DefaultAgentClass), ComposerFieldSource.ProjectDefault);
+        if (project.AuditMaxIterations > 0)
+        {
+            _auditBudgetText = _auditBudgetText.ApplyInferred(
+                project.AuditMaxIterations.ToString(), ComposerFieldSource.ProjectDefault);
+        }
+    }
+
+    private void OnProjectSelected(string? value)
+    {
+        _projectId = _projectId.SetOperator(BlankToNull(value));
+        _projectError = null;
+        ApplyProjectDefaults();
+    }
+
+    private void OnAgentSelected(string? value) =>
+        _agent = _agent.SetOperator(BlankToNull(value));
+
+    private void OnBaseBranchChanged(string value) =>
+        _baseBranch = _baseBranch.SetOperator(BlankToNull(value));
+
+    private void ResetAgent()
+    {
+        var inference = TextInference(QueryAgent, p => p.DefaultAgent);
+        _agent = _agent.ResetToInferred(inference.Value, inference.Source);
+    }
+
+    private void ResetBaseBranch()
+    {
+        var inference = TextInference(QueryBaseBranch, p => p.DefaultBaseBranch);
+        _baseBranch = _baseBranch.ResetToInferred(inference.Value, inference.Source);
+    }
+
+    private void OnAdvancedAgentClassChanged(string? value)
+    {
+        var v = BlankToNull(value);
+        if (v is null)
+        {
+            var inference = TextInference(QueryAgentClassId, p => p.DefaultAgentClass);
+            _agentClassId = _agentClassId.ResetToInferred(inference.Value, inference.Source);
+        }
+        else
+        {
+            _agentClassId = _agentClassId.SetOperator(v);
+        }
+    }
+
+    private void OnAdvancedBudgetChanged(string? value)
+    {
+        var v = BlankToNull(value);
+        if (v is null)
+        {
+            _auditBudgetText = _auditBudgetText.ResetToInferred(
+                CurrentProjectBudget() ?? (QueryAuditBudget is { } b && b > 0 ? b.ToString() : null),
+                QueryAuditBudget is { } qb && qb > 0 ? ComposerFieldSource.Query : ComposerFieldSource.ProjectDefault);
+        }
+        else
+        {
+            _auditBudgetText = _auditBudgetText.SetOperator(v);
+        }
+    }
+
+    private (string? Value, ComposerFieldSource Source) TextInference(
+        string? queryValue, Func<ProjectDto, string?> pick)
+    {
+        var q = BlankToNull(queryValue);
+        if (q is not null)
+        {
+            return (q, ComposerFieldSource.Query);
+        }
+
+        return (CurrentProjectDefault(pick), ComposerFieldSource.ProjectDefault);
+    }
+
+    private string? CurrentProjectDefault(Func<ProjectDto, string?> pick) =>
+        BlankToNull(_projects.FirstOrDefault(p => p.Id == _projectId.Value) is { } project
+            ? pick(project)
+            : null);
+
+    private void ToggleChipEditor(string key)
+    {
+        _chipError = null;
+        if (_editingChip == key)
+        {
+            _editingChip = null;
+            return;
+        }
+
+        _editingChip = key;
+        _chipStaging = ChipValue(key) ?? string.Empty;
+    }
+
+    private InferredField<string> ChipField(string key) => key switch
+    {
+        "agentclass" => _agentClassId,
+        "budget" => _auditBudgetText,
+        _ => _auditorProfile,
+    };
+
+    private string? ChipValue(string key) => ChipField(key).Value;
+
+    private void SaveChipEditor()
+    {
+        if (_editingChip is null)
+        {
+            return;
+        }
+
+        var staged = BlankToNull(_chipStaging);
+        if (_editingChip == "budget" && staged is not null
+            && (!int.TryParse(staged, out var n) || n <= 0))
+        {
+            _chipError = "Audit budget must be a positive number of iterations.";
+            return;
+        }
+
+        if (_editingChip == "agentclass")
+        {
+            _agentClassId = _agentClassId.SetOperator(staged);
+        }
+        else if (_editingChip == "budget")
+        {
+            _auditBudgetText = _auditBudgetText.SetOperator(staged);
+        }
+        else
+        {
+            _auditorProfile = _auditorProfile.SetOperator(staged);
+        }
+
+        _editingChip = null;
+        _chipError = null;
+    }
+
+    private void ClearChipEditor()
+    {
+        if (_editingChip is null)
+        {
+            return;
+        }
+
+        if (_editingChip == "agentclass")
+        {
+            var inference = TextInference(QueryAgentClassId, p => p.DefaultAgentClass);
+            _agentClassId = _agentClassId.ResetToInferred(inference.Value, inference.Source);
+        }
+        else if (_editingChip == "budget")
+        {
+            _auditBudgetText = _auditBudgetText.ResetToInferred(
+                (QueryAuditBudget is { } b && b > 0 ? b.ToString() : null) ?? CurrentProjectBudget(),
+                QueryAuditBudget is { } qb && qb > 0 ? ComposerFieldSource.Query : ComposerFieldSource.ProjectDefault);
+        }
+        else
+        {
+            _auditorProfile = _auditorProfile.ResetToInferred(
+                BlankToNull(QueryAuditorProfile), ComposerFieldSource.Query);
+        }
+
+        _editingChip = null;
+        _chipError = null;
+    }
+
+    private string? CurrentProjectBudget()
+    {
+        var project = _projects.FirstOrDefault(p => p.Id == _projectId.Value);
+        return project is not null && project.AuditMaxIterations > 0
+            ? project.AuditMaxIterations.ToString()
+            : null;
+    }
+
+    private void CancelChipEditor()
+    {
+        _editingChip = null;
+        _chipError = null;
+    }
+
+    private static string SourceLabel(ComposerFieldSource source) => source switch
+    {
+        ComposerFieldSource.Query => "from link",
+        ComposerFieldSource.ProjectDefault => "project default",
+        ComposerFieldSource.FollowUp => "follow-up",
+        ComposerFieldSource.Suggestion => "suggestion",
+        ComposerFieldSource.Operator => "you",
+        _ => "not set",
+    };
+
+    private RenderFragment InferenceBadge(ComposerFieldSource source, bool overridden) =>
+        builder =>
+        {
+            builder.OpenElement(0, "span");
+            builder.AddAttribute(1, "class", "infer-badge");
+            builder.AddContent(2, overridden ? "set by you" : SourceLabel(source));
+            builder.CloseElement();
+        };
+
+    private List<DependencyCandidate> OrderedCandidates(IReadOnlySet<string> selected)
+    {
+        var query = _depSearch;
+        return DependencyProximity.Order(
+                _candidates
+                    .Where(c => DependencyProximity.Matches(ToCandidate(c), query))
+                    .Select(ToCandidate),
+                _projectId.Value,
+                selected)
+            .ToList();
+    }
+
+    private static DependencyCandidate ToCandidate(WorkItemDto item) =>
+        new(item.Id, item.ProjectId, item.Title, item.State, item.CreatedAt, item.ExternalId);
+
+    private void ToggleDep(string id, bool selected)
+    {
+        if (selected)
+        {
+            _selectedDeps.Add(id);
+        }
+        else
+        {
+            _selectedDeps.Remove(id);
+        }
+    }
+
+    private void ToggleChainExtDep(string id, bool selected)
+    {
+        if (selected)
+        {
+            _chainExternalDeps.Add(id);
+        }
+        else
+        {
+            _chainExternalDeps.Remove(id);
+        }
+    }
+
+    private void ParsePlan()
+    {
+        // Idempotent: re-firing (keyboard + native button activation both
+        // land here) must not wipe preview edits, so a repeated parse of
+        // unchanged text is a no-op.
+        if (_planText == _lastParsedText && _preview.Count > 0)
+        {
+            return;
+        }
+
+        _error = null;
+        try
+        {
+            var parsed = PlanChainParser.Parse(_planText);
+            _preview.Clear();
+            foreach (var item in parsed.Items)
+            {
+                _preview.Add(new PreviewDraft
+                {
+                    Title = item.Title,
+                    Body = item.Body,
+                    Deps = item.DependsOn.ToHashSet(),
+                });
+            }
+
+            _lastParsedText = _planText;
+            _previewInfo = _preview.Count == 0
+                ? "Nothing to file — paste a plan first."
+                : _preview.Count == 1
+                    ? "Parsed 1 item. Review it below — nothing is created until you file it."
+                    : parsed.HadExplicitEdges
+                        ? $"Parsed {_preview.Count} items with explicit dependencies. Review the edges — nothing is created until you file."
+                        : $"Parsed {_preview.Count} items as a straight-line chain. Adjust the edges if needed — nothing is created until you file.";
         }
         catch (Exception ex)
         {
@@ -160,43 +824,382 @@
         }
     }
 
-    private void ToggleDep(string id, bool selected)
+    private Task ParsePlanKeyDown(KeyboardEventArgs e)
     {
-        if (selected) _selectedDeps.Add(id);
-        else _selectedDeps.Remove(id);
+        if (e.Key is "Enter" or " ")
+        {
+            ParsePlan();
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void TogglePreviewDep(int itemIndex, int depNumber, bool selected)
+    {
+        var item = _preview[itemIndex];
+        if (selected)
+        {
+            item.Deps.Add(depNumber);
+        }
+        else
+        {
+            item.Deps.Remove(depNumber);
+        }
+    }
+
+    private void RemovePreviewItem(int index)
+    {
+        var removedNumber = index + 1;
+        _preview.RemoveAt(index);
+        foreach (var item in _preview)
+        {
+            item.Deps.Remove(removedNumber);
+            item.Deps = item.Deps
+                .Select(d => d > removedNumber ? d - 1 : d)
+                .ToHashSet();
+        }
+    }
+
+    private string EdgeSummary(int index)
+    {
+        var item = _preview[index];
+        var parts = new List<string>();
+        if (item.Deps.Count > 0)
+        {
+            parts.Add("chain: " + string.Join(", ", item.Deps.OrderBy(d => d)));
+        }
+
+        if (index == 0 && _chainExternalDeps.Count > 0)
+        {
+            var titles = _chainExternalDeps
+                .Select(id => _candidates.FirstOrDefault(c => c.Id == id))
+                .Where(c => c is not null)
+                .Select(c => c!.ShortId)
+                .ToList();
+            parts.Add("existing: " + (titles.Count > 0 ? string.Join(", ", titles) : $"{_chainExternalDeps.Count} items"));
+        }
+
+        return parts.Count == 0 ? "first in chain" : "waits for " + string.Join("; ", parts);
+    }
+
+    private ComposerDefaults ComposerDefaults() => new(
+        ProjectId: _projectId.Value ?? string.Empty,
+        Agent: BlankToNull(_agent.Value),
+        AgentClassId: BlankToNull(_agentClassId.Value),
+        BaseBranch: BlankToNull(_baseBranch.Value),
+        WorkBranch: BlankToNull(_form.WorkBranch),
+        PushUpstream: _form.PushUpstream,
+        Priority: ParseOptionalInt(_priorityText, "Priority"),
+        MinModelScore: ParseOptionalInt(_minModelScoreText, "Min model score"),
+        RequiredCapabilities: ParseCapabilities(_requiredCapabilitiesText),
+        AuditMaxIterations: ParseBudget(),
+        AuditComplexity: BlankToNull(_auditComplexity),
+        AuditorProfile: BlankToNull(_auditorProfile.Value),
+        Knobs: ParseKnobs(_knobsText),
+        ReleaseId: BlankToNull(_releaseId));
+
+    private int? ParseBudget()
+    {
+        var text = BlankToNull(_auditBudgetText.Value);
+        if (text is null)
+        {
+            return null;
+        }
+
+        if (!int.TryParse(text, out var n) || n <= 0)
+        {
+            throw new FormatException("Audit iterations must be a positive whole number.");
+        }
+
+        return n;
+    }
+
+    private static int? ParseOptionalInt(string text, string fieldName)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        if (!int.TryParse(text.Trim(), out var n))
+        {
+            throw new FormatException($"{fieldName} must be a whole number.");
+        }
+
+        return n;
+    }
+
+    private static List<string>? ParseCapabilities(string text)
+    {
+        var tags = text.Split([',', ';', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(t => t.Trim())
+            .Where(t => t.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return tags.Count == 0 ? null : tags;
+    }
+
+    private static Dictionary<string, string>? ParseKnobs(string text)
+    {
+        Dictionary<string, string>? knobs = null;
+        foreach (var rawLine in text.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0)
+            {
+                continue;
+            }
+
+            var eq = line.IndexOf('=');
+            if (eq <= 0 || eq == line.Length - 1)
+            {
+                throw new FormatException($"Knob line '{line}' must look like key=value.");
+            }
+
+            knobs ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            knobs[line[..eq].Trim()] = line[(eq + 1)..].Trim();
+        }
+
+        return knobs;
+    }
+
+    private RenderFragment AdvancedFields() =>
+        @<div class="advanced-grid">
+            <div class="form-group">
+                <label for="workBranch">Work branch</label>
+                <input id="workBranch" @bind="_form.WorkBranch" class="form-control"
+                       placeholder="(auto-generated)" />
+            </div>
+            <div class="form-group form-check">
+                <input type="checkbox" id="pushUpstream" @bind="_form.PushUpstream" />
+                <label for="pushUpstream">Push upstream after merge</label>
+            </div>
+            <div class="form-group">
+                <label for="priority">Priority</label>
+                <input id="priority" @bind="_priorityText" class="form-control" inputmode="numeric" placeholder="(server default)" />
+            </div>
+            <div class="form-group">
+                <label for="minModelScore">Min model score</label>
+                <input id="minModelScore" @bind="_minModelScoreText" class="form-control" inputmode="numeric" placeholder="(server default)" />
+            </div>
+            <div class="form-group">
+                <label for="agentClass">Agent class</label>
+                <input id="agentClass" value="@(_agentClassId.Value ?? string.Empty)"
+                       @onchange="e => OnAdvancedAgentClassChanged(e.Value?.ToString())"
+                       class="form-control" placeholder="(project default)" />
+            </div>
+            <div class="form-group">
+                <label for="requiredCapabilities">Required capabilities <span class="form-hint">(comma-separated)</span></label>
+                <input id="requiredCapabilities" @bind="_requiredCapabilitiesText" class="form-control" placeholder="e.g. gpu, large-mem" />
+            </div>
+            <div class="form-group">
+                <label for="auditMaxIterations">Audit iterations</label>
+                <input id="auditMaxIterations" value="@(_auditBudgetText.Value ?? string.Empty)"
+                       @onchange="e => OnAdvancedBudgetChanged(e.Value?.ToString())"
+                       class="form-control" inputmode="numeric" placeholder="(project default)" />
+            </div>
+            <div class="form-group">
+                <label for="auditComplexity">Audit complexity</label>
+                <input id="auditComplexity" @bind="_auditComplexity" class="form-control" placeholder="(server default)" />
+            </div>
+            <div class="form-group">
+                <label for="knobs">Knobs <span class="form-hint">(one key=value per line)</span></label>
+                <textarea id="knobs" @bind="_knobsText" class="form-control prompt-input" rows="3"></textarea>
+            </div>
+            <div class="form-group">
+                <label for="release">Release</label>
+                <select id="release" @bind="_releaseId" class="form-control">
+                    <option value="">(none)</option>
+                    @foreach (var r in _openReleases.Where(r => r.ProjectId == _projectId.Value))
+                    {
+                        <option value="@r.Id">@r.Name</option>
+                    }
+                </select>
+            </div>
+        </div>;
+
+    private CreateWorkItemRequest ToRequest(PlannedCreate planned, IEnumerable<string>? extraDependsOn = null) =>
+        new()
+        {
+            ProjectId = planned.ProjectId,
+            ExternalId = planned.ExternalId,
+            Title = planned.Title,
+            Prompt = planned.Prompt,
+            Agent = planned.Agent,
+            AuditorProfile = planned.AuditorProfile,
+            AgentClassId = planned.AgentClassId,
+            BaseBranch = planned.BaseBranch,
+            WorkBranch = planned.WorkBranch,
+            PushUpstream = planned.PushUpstream,
+            Priority = planned.Priority,
+            MinModelScore = planned.MinModelScore,
+            RequiredCapabilities = planned.RequiredCapabilities?.ToList(),
+            AuditMaxIterations = planned.AuditMaxIterations,
+            AuditComplexity = planned.AuditComplexity,
+            Knobs = planned.Knobs is null ? null : new Dictionary<string, string>(planned.Knobs, StringComparer.Ordinal),
+            ReleaseId = planned.ReleaseId,
+            DependsOn = [.. (extraDependsOn ?? []), .. planned.DependsOn],
+        };
+
+    private void HandleInvalidSubmit()
+    {
+        if (string.IsNullOrWhiteSpace(_projectId.Value))
+        {
+            _projectError = "Project is required.";
+        }
     }
 
     private async Task SubmitAsync()
     {
         _submitting = true;
         _error = null;
+        _projectError = null;
         try
         {
+            if (string.IsNullOrWhiteSpace(_projectId.Value))
+            {
+                _projectError = "Project is required.";
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(_form.Title))
+            {
+                _error = "Title is required.";
+                return;
+            }
+
             if (string.IsNullOrWhiteSpace(_form.Prompt))
             {
                 _error = "Prompt is required.";
                 return;
             }
-            var req = new CreateWorkItemRequest
-            {
-                ProjectId = _form.ProjectId,
-                ExternalId = string.IsNullOrWhiteSpace(_form.ExternalId) ? null : _form.ExternalId.Trim(),
-                Title = _form.Title,
-                Prompt = _form.Prompt,
-                Agent = string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
-                WorkBranch = string.IsNullOrWhiteSpace(_form.WorkBranch) ? null : _form.WorkBranch,
-                PushUpstream = _form.PushUpstream,
-                DependsOn = [.. _selectedDeps],
-            };
-            var created = await ApiClient.CreateWorkItemAsync(req);
+
+            var defaults = ComposerDefaults();
+            var planned = WorkItemChainBuilder.Build(
+                defaults,
+                [new ChainItemDraft(_form.Title.Trim(), _form.Prompt, [], BlankToNull(_form.ExternalId))],
+                NewChainKey());
+            var created = await ApiClient.CreateWorkItemAsync(ToRequest(planned[0], _selectedDeps));
             if (created is not null)
+            {
                 Nav.NavigateTo($"/work-items/{created.Id}");
+            }
             else
+            {
                 _error = "Failed to create work item.";
+            }
+        }
+        catch (FormatException ex)
+        {
+            _error = ex.Message;
         }
         catch (Exception ex)
         {
             _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private async Task SubmitChainAsync()
+    {
+        _submitting = true;
+        _error = null;
+        _projectError = null;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_projectId.Value))
+            {
+                _projectError = "Project is required.";
+                return;
+            }
+
+            if (_preview.Count == 0)
+            {
+                _error = "Parse a plan first — there is nothing to file.";
+                return;
+            }
+
+            var empty = _preview.FindIndex(d => string.IsNullOrWhiteSpace(d.Title));
+            if (empty >= 0)
+            {
+                _error = $"Item {empty + 1} needs a title before filing.";
+                return;
+            }
+
+            var defaults = ComposerDefaults();
+            var drafts = _preview
+                .Select(d => new ChainItemDraft(
+                    d.Title.Trim(), d.Body, d.Deps.OrderBy(n => n).ToList()))
+                .ToList();
+            var planned = WorkItemChainBuilder.Build(defaults, drafts, NewChainKey());
+            var requests = planned
+                .Select((p, i) => ToRequest(p, i == 0 ? _chainExternalDeps : null))
+                .ToList();
+            var result = await ApiClient.CreateWorkItemChainAsync(requests);
+            if (result.Succeeded)
+            {
+                Nav.NavigateTo($"/work-items/{result.Created[0].Id}");
+                return;
+            }
+
+            var createdIds = string.Join(", ", result.Created.Select(c => c.ShortId));
+            _error = result.FailedIndex is null
+                ? $"Chain failed: {result.Error}"
+                : $"Filed {result.Created.Count} of {requests.Count} before item {result.FailedIndex + 1} failed: {result.Error}"
+                  + (result.Created.Count > 0 ? $" Created: {createdIds}. The preview is untouched — fix and re-file the remainder." : string.Empty);
+        }
+        catch (FormatException ex)
+        {
+            _error = ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private async Task SubmitChainKeyDown(KeyboardEventArgs e)
+    {
+        if ((e.Key is "Enter" or " ") && !_submitting && _preview.Count > 0)
+        {
+            await SubmitChainAsync();
+        }
+    }
+
+    private async Task QueueTemplateAsync(TaskTemplateDto template)
+    {
+        _submitting = true;
+        _templateMessage = null;
+        _error = null;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_projectId.Value))
+            {
+                _projectError = "Project is required.";
+                return;
+            }
+
+            var response = await ApiClient.QueueTaskTemplateAsync(new QueueTaskTemplateRequest
+            {
+                Template = template.Name,
+                ProjectId = _projectId.Value,
+                Agent = BlankToNull(_agent.Value),
+                AgentClassId = BlankToNull(_agentClassId.Value),
+            });
+            _templateMessage = response is null
+                ? $"Queueing '{template.Name}' failed."
+                : $"Queued {response.Enqueued} {(response.Enqueued == 1 ? "item" : "items")} from '{template.Name}'.";
+        }
+        catch (Exception ex)
+        {
+            _templateMessage = $"Queueing '{template.Name}' failed: {ex.Message}";
         }
         finally
         {
@@ -213,14 +1216,18 @@
             var workItemId = await ApiClient.PromoteSuggestionAsync(
                 _fromSuggestionId!,
                 extraInstructions: string.IsNullOrWhiteSpace(_form.Prompt) ? null : _form.Prompt,
-                agent: string.IsNullOrWhiteSpace(_form.Agent) ? null : _form.Agent,
+                agent: BlankToNull(_agent.Value),
                 workBranch: string.IsNullOrWhiteSpace(_form.WorkBranch) ? null : _form.WorkBranch,
                 pushUpstream: _form.PushUpstream,
                 externalId: string.IsNullOrWhiteSpace(_form.ExternalId) ? null : _form.ExternalId.Trim());
             if (workItemId is not null)
+            {
                 Nav.NavigateTo($"/work-items/{workItemId}");
+            }
             else
+            {
                 _error = "Failed to promote suggestion.";
+            }
         }
         catch (Exception ex)
         {
@@ -232,11 +1239,21 @@
         }
     }
 
+    private static string NewChainKey() =>
+        Guid.NewGuid().ToString("N")[..8];
+
+    private static string? BlankToNull(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private sealed class PreviewDraft
+    {
+        public string Title { get; set; } = "";
+        public string Body { get; set; } = "";
+        public HashSet<int> Deps { get; set; } = [];
+    }
+
     private sealed class NewItemForm
     {
-        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Project is required.")]
-        public string ProjectId { get; set; } = "";
-
         [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Title is required.")]
         [System.ComponentModel.DataAnnotations.MaxLength(200, ErrorMessage = "Title must be ≤ 200 chars.")]
         public string Title { get; set; } = "";
@@ -245,7 +1262,6 @@
         public string Prompt { get; set; } = "";
 
         public string? ExternalId { get; set; }
-        public string? Agent { get; set; }
         public string? WorkBranch { get; set; }
         public bool PushUpstream { get; set; } = true;
     }

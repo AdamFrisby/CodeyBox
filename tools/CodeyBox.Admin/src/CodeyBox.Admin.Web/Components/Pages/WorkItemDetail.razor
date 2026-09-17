@@ -43,6 +43,7 @@ else
             <button class="btn" @onclick="OpenReplayModal">Replay</button>
         }
         <a href="/work-items/@_item.Id/diff" class="btn">Diff</a>
+        <a href="/work-items/new?followUp=@_item.Id" class="btn" title="File a follow-up that waits for this item">Follow-up</a>
         @if (!_item.IsTerminal)
         {
             <button class="btn btn-danger" @onclick="CancelAsync">Cancel</button>

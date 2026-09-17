@@ -651,4 +651,34 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<ReleaseDto>(JsonOptions, ct);
     }
+
+    public async Task<List<TaskTemplateDto>> GetTaskTemplatesAsync(CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<TaskTemplateDto>>("/templates", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<QueuedTaskTemplateResponse?> QueueTaskTemplateAsync(
+        QueueTaskTemplateRequest req, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync("/templates/queue", req, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<QueuedTaskTemplateResponse>(JsonOptions, ct);
+    }
+
+    public async Task<List<AgentAvailabilityDto>> GetAgentAvailabilityAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await _http.GetFromJsonAsync<AgentAvailabilityPage>(
+                "/admin/agents/availability", JsonOptions, ct);
+            return result?.Agents ?? [];
+        }
+        catch (HttpRequestException)
+        {
+            return [];
+        }
+    }
+
+    private sealed record AgentAvailabilityPage(List<AgentAvailabilityDto> Agents);
 }
