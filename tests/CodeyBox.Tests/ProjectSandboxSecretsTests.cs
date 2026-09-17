@@ -846,6 +846,8 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
+        var workSpec = Assert.Single(recorder.SpecsForPhase("work"));
+        Assert.Equal(secretValue, workSpec.Environment["OPENROUTER_API_KEY"]);
         Assert.DoesNotContain(logs.Lines, line =>
             line.Message.Contains(secretValue, StringComparison.Ordinal));
     }
