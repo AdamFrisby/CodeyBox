@@ -9,7 +9,7 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class ExecutorPlacementTests
 {
-    private static ExecutorRegistration Host(
+    private static SandboxPlacementMember Host(
         string id = "exec-1",
         int? capacity = 4,
         bool cordoned = false,
@@ -18,13 +18,13 @@ public sealed class ExecutorPlacementTests
         string[]? credentials = null,
         string[]? capabilities = null) => new()
         {
-            HostId = id,
+            MemberId = id,
             MaxConcurrentSandboxes = capacity,
             Cordoned = cordoned,
             Healthy = healthy,
-            AllowedNetworkProfiles = profiles ?? [],
-            DeclaredCredentials = credentials ?? [],
-            DeclaredCapabilities = capabilities ?? [],
+            NetworkProfiles = profiles ?? [],
+            Credentials = credentials ?? [],
+            Capabilities = capabilities ?? [],
         };
 
     private static ExecutorPlacementRequirements NoRequirements() => new()

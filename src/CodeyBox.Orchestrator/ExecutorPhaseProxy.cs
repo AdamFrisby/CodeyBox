@@ -441,6 +441,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
                 Cordoned = w.Cordoned,
                 Healthy = w.Healthy,
             })
+            .Select(SandboxPlacementMember.FromExecutorRegistration)
             .ToList();
 
         if (hosts.Count == 0)

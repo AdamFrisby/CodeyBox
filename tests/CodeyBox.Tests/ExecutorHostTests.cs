@@ -727,9 +727,9 @@ public sealed class ExecutorHostTests
         try { File.Delete(path + "-shm"); } catch { }
     }
 
-    private static ExecutorRegistration ToEligibility(JsonElement row) => new()
+    private static SandboxPlacementMember ToEligibility(JsonElement row) => new()
     {
-        HostId = row.GetProperty("executorHostId").GetString()!,
+        MemberId = row.GetProperty("executorHostId").GetString()!,
         MaxConcurrentSandboxes = row.TryGetProperty("maxConcurrentSandboxes", out var cap) && cap.ValueKind == JsonValueKind.Number
             ? cap.GetInt32()
             : null,

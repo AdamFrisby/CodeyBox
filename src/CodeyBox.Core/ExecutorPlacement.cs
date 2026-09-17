@@ -129,25 +129,25 @@ public sealed record ExecutorPlacementDecision
 }
 
 /// <summary>
-/// Pure executor-host placement decider. Matches a phase's requirements
+/// Pure sandbox placement decider. Matches a phase's requirements
 /// (agent credential, network profile, required capabilities) against each
-/// host's declared attributes, excluding cordoned and unhealthy hosts and
-/// hosts at capacity. Deterministic: among eligible hosts the least-loaded
-/// wins, ties broken by fewest in-flight reservations then ordinal host id —
+/// member's declared attributes, excluding cordoned and unhealthy members and
+/// members at capacity. Deterministic: among eligible members the least-loaded
+/// wins, ties broken by fewest in-flight reservations then ordinal member id —
 /// mirroring the multipass-remote sandbox placement ordering so the two
 /// placement paths cannot drift apart.
 /// </summary>
 public static class ExecutorPlacement
 {
     /// <summary>
-    /// Decides placement over the given hosts. <paramref name="loads"/>
-    /// carries the current live load per host id (missing means zero);
-    /// <paramref name="runtimeUnhealthy"/> lists host ids under runtime
-    /// backoff (skipped like unhealthy hosts). Never throws for empty input:
-    /// with no registered hosts the decision simply selects nothing.
+    /// Decides placement over the given members. <paramref name="loads"/>
+    /// carries the current live load per member id (missing means zero);
+    /// <paramref name="runtimeUnhealthy"/> lists member ids under runtime
+    /// backoff (skipped like unhealthy members). Never throws for empty input:
+    /// with no registered members the decision simply selects nothing.
     /// </summary>
     public static ExecutorPlacementDecision Decide(
-        IReadOnlyList<ExecutorRegistration> hosts,
+        IReadOnlyList<SandboxPlacementMember> hosts,
         ExecutorPlacementRequirements requirements,
         IReadOnlyDictionary<string, int>? loads = null,
         ISet<string>? runtimeUnhealthy = null)
@@ -160,29 +160,29 @@ public static class ExecutorPlacement
         var selectedLoad = double.MaxValue;
         var selectedUsed = int.MaxValue;
 
-        foreach (var host in hosts.OrderBy(h => h.HostId, StringComparer.Ordinal))
+        foreach (var host in hosts.OrderBy(h => h.MemberId, StringComparer.Ordinal))
         {
             var used = 0;
-            if (loads is not null && loads.TryGetValue(host.HostId, out var load))
+            if (loads is not null && loads.TryGetValue(host.MemberId, out var load))
                 used = Math.Max(0, load);
             var reason = ExcludeReason(host, requirements, used, runtimeUnhealthy);
             if (reason is null)
             {
                 var capacity = host.MaxConcurrentSandboxes is { } cap ? cap : int.MaxValue;
                 var loadRatio = capacity == int.MaxValue ? 0.0d : (double)used / capacity;
-                outcomes.Add(new ExecutorPlacementCandidateOutcome { HostId = host.HostId, Eligible = true, Reason = "eligible" });
+                outcomes.Add(new ExecutorPlacementCandidateOutcome { HostId = host.MemberId, Eligible = true, Reason = "eligible" });
                 if (selected is null
                     || loadRatio < selectedLoad
                     || (Math.Abs(loadRatio - selectedLoad) < double.Epsilon && used < selectedUsed))
                 {
-                    selected = host.HostId;
+                    selected = host.MemberId;
                     selectedLoad = loadRatio;
                     selectedUsed = used;
                 }
             }
             else
             {
-                outcomes.Add(new ExecutorPlacementCandidateOutcome { HostId = host.HostId, Eligible = false, Reason = reason });
+                outcomes.Add(new ExecutorPlacementCandidateOutcome { HostId = host.MemberId, Eligible = false, Reason = reason });
             }
         }
 
@@ -213,7 +213,7 @@ public static class ExecutorPlacement
     }
 
     private static string? ExcludeReason(
-        ExecutorRegistration host,
+        SandboxPlacementMember host,
         ExecutorPlacementRequirements requirements,
         int used,
         ISet<string>? runtimeUnhealthy)
@@ -222,7 +222,7 @@ public static class ExecutorPlacement
             return "cordoned";
         if (!host.Healthy)
             return "unhealthy";
-        if (runtimeUnhealthy is not null && runtimeUnhealthy.Contains(host.HostId))
+        if (runtimeUnhealthy is not null && runtimeUnhealthy.Contains(host.MemberId))
             return "runtime-unhealthy";
         if (host.MaxConcurrentSandboxes is { } capacity)
         {
@@ -248,7 +248,7 @@ public static class ExecutorPlacement
     }
 
     private static string FirstMissingCapability(
-        ExecutorRegistration host,
+        SandboxPlacementMember host,
         IReadOnlyList<string> required)
     {
         foreach (var tag in required)
@@ -257,7 +257,7 @@ public static class ExecutorPlacement
                 continue;
             var wanted = tag.Trim();
             var hit = false;
-            foreach (var have in host.DeclaredCapabilities)
+            foreach (var have in host.Capabilities)
             {
                 if (string.Equals(have?.Trim(), wanted, StringComparison.OrdinalIgnoreCase))
                 {

@@ -8,7 +8,7 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class ExecutorEligibilityTests
 {
-    private static ExecutorRegistration Host(
+    private static SandboxPlacementMember Host(
         int? capacity = 4,
         bool cordoned = false,
         bool healthy = true,
@@ -16,13 +16,13 @@ public sealed class ExecutorEligibilityTests
         string[]? credentials = null,
         string[]? capabilities = null) => new()
         {
-            HostId = "exec-1",
+            MemberId = "exec-1",
             MaxConcurrentSandboxes = capacity,
             Cordoned = cordoned,
             Healthy = healthy,
-            AllowedNetworkProfiles = profiles ?? [],
-            DeclaredCredentials = credentials ?? [],
-            DeclaredCapabilities = capabilities ?? [],
+            NetworkProfiles = profiles ?? [],
+            Credentials = credentials ?? [],
+            Capabilities = capabilities ?? [],
         };
 
     [Fact]
@@ -113,9 +113,9 @@ public sealed class ExecutorEligibilityTests
     [Fact]
     public void WorkerId_IsStableAndPrefixed()
     {
-        var host = Host();
-        Assert.Equal("executor:exec-1", host.WorkerId);
-        Assert.Equal(host.WorkerId, ExecutorRegistration.WorkerIdFor("  exec-1 "));
+        var registration = new ExecutorRegistration { HostId = "exec-1" };
+        Assert.Equal("executor:exec-1", registration.WorkerId);
+        Assert.Equal(registration.WorkerId, ExecutorRegistration.WorkerIdFor("  exec-1 "));
     }
 
     [Fact]
@@ -149,8 +149,8 @@ public sealed class ExecutorEligibilityTests
     {
         var hosts = new[]
         {
-            new ExecutorRegistration { HostId = "a", DeclaredCapabilities = ["general"] },
-            new ExecutorRegistration { HostId = "b", DeclaredCapabilities = ["sensitive"] },
+            new SandboxPlacementMember { MemberId = "a", Capabilities = ["general"] },
+            new SandboxPlacementMember { MemberId = "b", Capabilities = ["sensitive"] },
         };
         Assert.Null(ExecutorEligibility.FindCapabilityNoHostProvides(hosts, []));
         Assert.Null(ExecutorEligibility.FindCapabilityNoHostProvides(hosts, ["sensitive"]));

@@ -1,31 +1,31 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// Pure placement-eligibility predicate for executor hosts. This is the single
-/// place that decides whether a registered executor may receive new work, so
-/// the "registers but is never selected" contract for zero-capacity and
-/// cordoned executors cannot drift between call sites. Dispatch itself is a
+/// Pure placement-eligibility predicate for sandbox placement members. This is
+/// the single place that decides whether a registered member may receive new
+/// work, so the "registers but is never selected" contract for zero-capacity
+/// and cordoned members cannot drift between call sites. Dispatch itself is a
 /// separate item; this predicate is what dispatch will consult.
 /// </summary>
 public static class ExecutorEligibility
 {
     /// <summary>
-    /// True when the executor may be selected for a new placement given its
+    /// True when the member may be selected for a new placement given its
     /// current live load (<paramref name="currentLoad"/> sandboxes already
-    /// running on it). An executor declaring zero capacity, declaring itself
+    /// running on it). A member declaring zero capacity, declaring itself
     /// cordoned, or reporting unhealthy is registered but never selected.
     /// </summary>
-    /// <param name="registration">The executor's declared attributes.</param>
+    /// <param name="member">The member's placement attributes.</param>
     /// <param name="currentLoad">
     /// Sandboxes currently running on the host. Negative values are treated
     /// as zero (a caller bug must not make a full host eligible).
     /// </param>
-    public static bool IsEligibleForPlacement(ExecutorRegistration registration, int currentLoad)
+    public static bool IsEligibleForPlacement(SandboxPlacementMember member, int currentLoad)
     {
-        ArgumentNullException.ThrowIfNull(registration);
-        if (registration.Cordoned || !registration.Healthy)
+        ArgumentNullException.ThrowIfNull(member);
+        if (member.Cordoned || !member.Healthy)
             return false;
-        if (registration.MaxConcurrentSandboxes is not { } capacity)
+        if (member.MaxConcurrentSandboxes is not { } capacity)
             return true;
         if (capacity <= 0)
             return false;
@@ -33,16 +33,16 @@ public static class ExecutorEligibility
     }
 
     /// <summary>
-    /// True when the executor accepts the given sandbox network profile.
+    /// True when the member accepts the given sandbox network profile.
     /// Mirrors <c>MultipassRemoteSandboxOptions.AllowedNetworkProfiles</c>
     /// semantics: an empty declaration or a "*" entry accepts every profile;
     /// otherwise the profile must match a declared entry by exact ordinal
     /// equality (never substring).
     /// </summary>
-    public static bool AcceptsNetworkProfile(ExecutorRegistration registration, string? profileName)
+    public static bool AcceptsNetworkProfile(SandboxPlacementMember member, string? profileName)
     {
-        ArgumentNullException.ThrowIfNull(registration);
-        var declared = registration.AllowedNetworkProfiles;
+        ArgumentNullException.ThrowIfNull(member);
+        var declared = member.NetworkProfiles;
         if (declared.Count == 0)
             return true;
         var profile = string.IsNullOrWhiteSpace(profileName) ? "(default)" : profileName.Trim();
@@ -58,17 +58,17 @@ public static class ExecutorEligibility
     }
 
     /// <summary>
-    /// True when the executor declares holding the credential set required by
+    /// True when the member declares holding the credential set required by
     /// the given agent class. Credential names are opaque: matched by exact
     /// ordinal equality, never by substring, so "codex" never implies
     /// "codex-admin".
     /// </summary>
-    public static bool HoldsCredential(ExecutorRegistration registration, string credentialName)
+    public static bool HoldsCredential(SandboxPlacementMember member, string credentialName)
     {
-        ArgumentNullException.ThrowIfNull(registration);
+        ArgumentNullException.ThrowIfNull(member);
         ArgumentException.ThrowIfNullOrWhiteSpace(credentialName);
         var wanted = credentialName.Trim();
-        foreach (var entry in registration.DeclaredCredentials)
+        foreach (var entry in member.Credentials)
         {
             if (string.Equals(entry?.Trim(), wanted, StringComparison.Ordinal))
                 return true;
@@ -77,19 +77,19 @@ public static class ExecutorEligibility
     }
 
     /// <summary>
-    /// True when the executor's declared capabilities cover every required
+    /// True when the member's declared capabilities cover every required
     /// tag. Uses the same vocabulary and comparison as the agent-class
     /// router's <c>RequiredCapabilities</c> gate: ordinal, case-insensitive,
-    /// exact equality per tag. An empty required set is covered by any host.
+    /// exact equality per tag. An empty required set is covered by any member.
     /// </summary>
     public static bool CoversRequiredCapabilities(
-        ExecutorRegistration registration,
+        SandboxPlacementMember member,
         IReadOnlyList<string>? required)
     {
-        ArgumentNullException.ThrowIfNull(registration);
+        ArgumentNullException.ThrowIfNull(member);
         if (required is null || required.Count == 0)
             return true;
-        if (registration.DeclaredCapabilities.Count == 0)
+        if (member.Capabilities.Count == 0)
             return false;
         foreach (var tag in required)
         {
@@ -97,7 +97,7 @@ public static class ExecutorEligibility
                 continue;
             var wanted = tag.Trim();
             var hit = false;
-            foreach (var have in registration.DeclaredCapabilities)
+            foreach (var have in member.Capabilities)
             {
                 if (string.Equals(have?.Trim(), wanted, StringComparison.OrdinalIgnoreCase))
                 {
@@ -112,15 +112,15 @@ public static class ExecutorEligibility
     }
 
     /// <summary>
-    /// First required capability no host in <paramref name="hosts"/> declares
+    /// First required capability no member in <paramref name="members"/> declares
     /// (ordinal, case-insensitive), or null when every required tag is held
-    /// by at least one host. Blank required entries are ignored.
+    /// by at least one member. Blank required entries are ignored.
     /// </summary>
     public static string? FindCapabilityNoHostProvides(
-        IEnumerable<ExecutorRegistration> hosts,
+        IEnumerable<SandboxPlacementMember> members,
         IReadOnlyList<string>? required)
     {
-        ArgumentNullException.ThrowIfNull(hosts);
+        ArgumentNullException.ThrowIfNull(members);
         if (required is null || required.Count == 0)
             return null;
         foreach (var tag in required)
@@ -129,10 +129,10 @@ public static class ExecutorEligibility
                 continue;
             var wanted = tag.Trim();
             var provided = false;
-            foreach (var host in hosts)
+            foreach (var member in members)
             {
-                ArgumentNullException.ThrowIfNull(host);
-                foreach (var have in host.DeclaredCapabilities)
+                ArgumentNullException.ThrowIfNull(member);
+                foreach (var have in member.Capabilities)
                 {
                     if (string.Equals(have?.Trim(), wanted, StringComparison.OrdinalIgnoreCase))
                     {
