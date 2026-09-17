@@ -224,6 +224,36 @@ public sealed class CodeyBoxApiClientTests
     }
 
     [Fact]
+    public async Task DelegateWorkItemAsync_PostsToDelegateEndpoint()
+    {
+        var (client, handler) = Build("{}", HttpStatusCode.Accepted);
+        await client.DelegateWorkItemAsync("id1", "focus on the failing auditor");
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        Assert.Equal("/workitems/id1/delegate", handler.LastPath);
+        var body = JsonSerializer.Deserialize<JsonElement>(handler.LastBody ?? "{}");
+        Assert.Equal("focus on the failing auditor", body.GetProperty("note").GetString());
+    }
+
+    [Fact]
+    public async Task DelegateWorkItemAsync_WithoutNote_PostsNoBody()
+    {
+        var (client, handler) = Build("{}", HttpStatusCode.Accepted);
+        await client.DelegateWorkItemAsync("id1");
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        Assert.Equal("/workitems/id1/delegate", handler.LastPath);
+        Assert.Null(handler.LastBody);
+    }
+
+    [Fact]
+    public async Task GetDependentsAsync_CallsCorrectEndpoint()
+    {
+        var (client, handler) = Build("[]");
+        await client.GetDependentsAsync("id1");
+        Assert.Equal(HttpMethod.Get, handler.LastMethod);
+        Assert.Equal("/workitems/id1/dependents", handler.LastPath);
+    }
+
+    [Fact]
     public async Task ReorderWorkItemsAsync_PostsToReorderEndpoint()
     {
         var (client, handler) = Build("{}", HttpStatusCode.NoContent);

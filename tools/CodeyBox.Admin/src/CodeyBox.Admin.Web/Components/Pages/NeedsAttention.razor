@@ -1,0 +1,366 @@
+@page "/needs-attention"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<NeedsAttention> Logger
+@using CodeyBox.Admin.Model
+@using CodeyBox.Admin.Web.Models
+@using CodeyBox.Admin.Web.Services
+
+<PageTitle>Needs you — CodeyBox Admin</PageTitle>
+
+<h1>Needs you</h1>
+<p class="needs-sub">
+    Everything awaiting a human, ordered by attention score — with the evidence inline,
+    so the decision (retry, delegate, cancel) happens here, not three tabs away.
+</p>
+
+@if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+@if (_notice is not null)
+{
+    <p class="notice-banner">@_notice</p>
+}
+
+@if (_entries is null)
+{
+    <p>Loading…</p>
+}
+else if (_entries.Count == 0)
+{
+    <section class="empty-state">
+        <p class="empty-state-title">All clear — nothing needs you right now.</p>
+        <p>Failed, audit-rejected, conflict-blocked, abandoned, and parked items will appear here
+            with their findings the moment they need a human.</p>
+    </section>
+}
+else
+{
+    <p class="needs-count">@_entries.Count item(s) need you.</p>
+    @foreach (var entry in _entries)
+    {
+        var id = entry.Item.Id;
+        <section class="needs-card" aria-label="Needs attention: @entry.Item.Title">
+            <header class="needs-card-head">
+                <a href="/work-items/@id"><strong>@entry.Item.Title</strong></a>
+                <StatusChip Info="@StatusVocabulary.ForWorkItem(entry.Item.State)" />
+                <span class="needs-score" title="Attention score 0–100 from the fleet model">score @entry.AttentionScore.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)</span>
+            </header>
+            <p class="needs-id"><CopyableId Value="@id" /> · @entry.Item.State · @entry.Item.AttemptsMade attempt(s)</p>
+
+            @* What happened: infrastructure failure reads differently from a rejected change. *@
+            <p class="needs-headline needs-@(entry.IsInfrastructureFailure ? "infra" : "rejected")">
+                <span class="needs-kind">@(entry.IsInfrastructureFailure ? "⚙ Infrastructure failure" : "✋ Rejected change")</span>
+                — @entry.Headline
+            </p>
+
+            @* Blocking findings with the auditor that raised each; zero is labelled, never blank. *@
+            <div class="needs-findings">
+                <h2>Blocking findings</h2>
+                @if (entry.Item.BlockingFindings.Count == 0)
+                {
+                    <p class="needs-no-findings">Parked with no blocking findings — nothing in the audit record explains the park. Read the park text, then decide.</p>
+                }
+                else
+                {
+                    <ul>
+                        @foreach (var finding in entry.Item.BlockingFindings)
+                        {
+                            <li><strong>@finding.Auditor</strong>: @finding.Title</li>
+                        }
+                    </ul>
+                }
+            </div>
+
+            @* Attempts + repeat/shrink signal. *@
+            <p class="needs-trend needs-trend--@entry.Trend.ToString().ToLowerInvariant()">
+                @entry.Item.AttemptsMade attempt(s) · @entry.TrendSummary
+            </p>
+
+            @if (entry.Item.OpenQuestions.Count > 0)
+            {
+                <p class="needs-questions">
+                    ⌨ @entry.Item.OpenQuestions.Count open question(s):
+                    @string.Join(", ", entry.Item.OpenQuestions.Take(5)) —
+                    <a href="/work-items/@id">answer on the detail page</a>
+                    (delegation stays locked until they are answered or dismissed).
+                </p>
+            }
+
+            @if (entry.CancelWarning is not null)
+            {
+                <p class="needs-dependants">⚠ @entry.CancelWarning</p>
+            }
+
+            @if (string.Equals(entry.Item.State, "MergeConflictResolutionFailed", StringComparison.Ordinal))
+            {
+                <p class="needs-conflict-path">
+                    Resolution path: retry from <strong>merge</strong> re-runs the conflict ladder
+                    (preventive auto-rebase → LLM rerun → one focused conflict-rework), or delegate a
+                    one-shot repair turn below. <a href="/work-items/@id/diff">Diff</a> ·
+                    <a href="/work-items/@id/journey">Journey</a>
+                </p>
+            }
+
+            <div class="detail-actions needs-actions">
+                <button class="btn" disabled="@IsBusy(id)" @onclick="() => RetryAsync(entry)">
+                    @(entry.RecommendedRetryFrom is null ? "Retry" : "Retry from merge")
+                </button>
+                <button class="btn" disabled="@IsBusy(id)" @onclick="() => ToggleDelegate(id)">
+                    Delegate to one-shot
+                </button>
+                <button class="btn btn-danger" disabled="@IsBusy(id)" @onclick="() => AskCancel(id)">
+                    Cancel
+                </button>
+                <a href="/work-items/@id" class="btn">Detail</a>
+            </div>
+            <p class="needs-consequence">
+                Retry re-enqueues the item@(entry.RecommendedRetryFrom is null ? " from the retrier's auto-picked phase" : " from merge").
+                Delegation spends exactly one repair turn, then audit and merge gates re-verify.
+                Cancel is terminal@(entry.CancelWarning is null ? "" : " and strands the dependants above").
+            </p>
+
+            @if (_delegateOpen.Contains(id))
+            {
+                <div class="needs-delegate-box">
+                    <label>
+                        Direction for the delegate turn (optional)
+                        <input type="text" @bind="_delegateNotes[id]" maxlength="500"
+                               placeholder="e.g. focus on the security auditor's finding" class="modal-input" />
+                    </label>
+                    <div class="modal-actions">
+                        <button class="btn" disabled="@IsBusy(id)" @onclick="() => DelegateAsync(id)">Delegate</button>
+                        <button class="btn" @onclick="() => ToggleDelegate(id)">Close</button>
+                    </div>
+                </div>
+            }
+        </section>
+    }
+}
+
+@* Cancel confirmation: the consequence (stranded dependants) shows BEFORE the action. *@
+@if (_cancelId is not null)
+{
+    var pending = _entries?.FirstOrDefault(e => string.Equals(e.Item.Id, _cancelId, StringComparison.Ordinal));
+    <div class="modal-overlay">
+        <div class="modal-box">
+            <h2>Cancel @(pending?.Item.Title ?? _cancelId)?</h2>
+            @if (pending?.CancelWarning is not null)
+            {
+                <p class="error-banner">@pending.CancelWarning</p>
+            }
+            else
+            {
+                <p>No items depend on this one — cancelling strands nothing.</p>
+            }
+            <p>Cancelling is terminal. The item leaves the pipeline immediately.</p>
+            <div class="modal-actions">
+                <button class="btn btn-danger" disabled="@IsBusy(_cancelId)" @onclick="CancelConfirmedAsync">Cancel item</button>
+                <button class="btn" @onclick="CloseCancel">Keep item</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private const int MaxEvidenceItems = 100;
+
+    private IReadOnlyList<NeedsAttentionEntry>? _entries;
+    private string? _error;
+    private string? _notice;
+    private string? _cancelId;
+    private readonly HashSet<string> _delegateOpen = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _delegateNotes = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _busy = new(StringComparer.Ordinal);
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await LoadAsync();
+        _ = RefreshLoopAsync(_cts.Token);
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                if (_cancelId is null)
+                {
+                    await LoadAsync();
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private bool IsBusy(string id) => _busy.Contains(id);
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            var ct = _cts?.Token ?? default;
+            var items = await ApiClient.GetWorkItemsAsync(ct);
+            var scores = NeedsAttentionEvidenceMapper.ScoreAll(items, DateTimeOffset.UtcNow);
+
+            // Preliminary pass without evidence: finds the ordered queue so
+            // per-item evidence calls stay bounded to what is on screen.
+            var preliminary = items
+                .Where(i => i is not null && !string.IsNullOrEmpty(i.Id))
+                .Select(i => NeedsAttentionEvidenceMapper.ToModelItem(i!, null, null, 0, null, null))
+                .ToList();
+            var queuedIds = NeedsAttentionQueue.Build(preliminary, scores)
+                .Take(MaxEvidenceItems)
+                .Select(e => e.Item.Id)
+                .ToList();
+            var byId = items
+                .Where(i => i is not null && queuedIds.Contains(i.Id, StringComparer.Ordinal))
+                .ToDictionary(i => i!.Id, StringComparer.Ordinal);
+
+            var modelItems = await Task.WhenAll(queuedIds.Select(id => LoadEvidenceAsync(byId[id], ct)));
+            _entries = NeedsAttentionQueue.Build(modelItems.ToList(), scores);
+            _error = null;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "NeedsAttention: failed to load queue");
+            _error = "Failed to load the needs-you queue. Check server logs for details.";
+        }
+    }
+
+    private async Task<NeedsAttentionItem> LoadEvidenceAsync(WorkItemDto item, CancellationToken ct)
+    {
+        var reportsTask = ApiClient.GetAuditReportsAsync(item.Id, ct);
+        var progressTask = ApiClient.GetAuditProgressAsync(item.Id, ct);
+        var questionsTask = ApiClient.GetQuestionsAsync(item.Id, ct);
+        var dependentsTask = ApiClient.GetDependentsAsync(item.Id, ct);
+        await Task.WhenAll(reportsTask, progressTask, questionsTask, dependentsTask);
+
+        var findings = NeedsAttentionEvidenceMapper.LatestBlockingFindings(reportsTask.Result);
+        var history = NeedsAttentionEvidenceMapper.BlockingHistory(progressTask.Result);
+        var complete = history.Count;
+        var dependants = (dependentsTask.Result ?? [])
+            .Where(d => d is not null && !string.IsNullOrEmpty(d.Id))
+            .Select(d => d!.Id)
+            .ToList();
+        var openQuestions = (questionsTask.Result ?? [])
+            .Where(q => q is not null && q.IsOpen)
+            .Select(q => q!.QuestionId)
+            .ToList();
+        return NeedsAttentionEvidenceMapper.ToModelItem(item, findings, history, complete, dependants, openQuestions);
+    }
+
+    private async Task RetryAsync(NeedsAttentionEntry entry)
+    {
+        _busy.Add(entry.Item.Id);
+        try
+        {
+            if (await ApiClient.RetryWorkItemAsync(entry.Item.Id, entry.RecommendedRetryFrom))
+            {
+                _notice = $"Retry accepted for {entry.Item.Title}.";
+                await LoadAsync();
+            }
+            else
+            {
+                _error = $"Retry refused for {entry.Item.Title} — it may have left the retryable state.";
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "NeedsAttention: retry failed for {Id}", entry.Item.Id);
+            _error = "Retry failed. Check server logs for details.";
+        }
+        finally
+        {
+            _busy.Remove(entry.Item.Id);
+        }
+    }
+
+    private void ToggleDelegate(string id)
+    {
+        if (!_delegateOpen.Add(id))
+        {
+            _delegateOpen.Remove(id);
+        }
+        else
+        {
+            _delegateNotes.TryAdd(id, string.Empty);
+        }
+    }
+
+    private async Task DelegateAsync(string id)
+    {
+        _busy.Add(id);
+        try
+        {
+            _delegateNotes.TryGetValue(id, out var note);
+            if (await ApiClient.DelegateWorkItemAsync(id, string.IsNullOrWhiteSpace(note) ? null : note))
+            {
+                _notice = "Delegation accepted: one repair turn, then audit and merge gates re-verify.";
+                _delegateOpen.Remove(id);
+                await LoadAsync();
+            }
+            else
+            {
+                _error = "Delegation refused — answer or dismiss open questions first, or the item left a delegable state.";
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "NeedsAttention: delegate failed for {Id}", id);
+            _error = "Delegation failed. Check server logs for details.";
+        }
+        finally
+        {
+            _busy.Remove(id);
+        }
+    }
+
+    private void AskCancel(string id) => _cancelId = id;
+
+    private void CloseCancel() => _cancelId = null;
+
+    private async Task CancelConfirmedAsync()
+    {
+        if (_cancelId is null)
+        {
+            return;
+        }
+        var id = _cancelId;
+        _busy.Add(id);
+        try
+        {
+            if (await ApiClient.DeleteWorkItemAsync(id))
+            {
+                _notice = "Item cancelled.";
+                _cancelId = null;
+                await LoadAsync();
+            }
+            else
+            {
+                _error = "Cancel failed. Check server logs for details.";
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "NeedsAttention: cancel failed for {Id}", id);
+            _error = "Cancel failed. Check server logs for details.";
+        }
+        finally
+        {
+            _busy.Remove(id);
+        }
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+}

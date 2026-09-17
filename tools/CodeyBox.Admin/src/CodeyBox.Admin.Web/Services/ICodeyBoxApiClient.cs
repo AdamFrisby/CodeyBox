@@ -18,6 +18,21 @@ public interface ICodeyBoxApiClient
     Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default);
     Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default);
 
+    // ── Inline queue actions (all map to existing orchestrator endpoints) ─────
+    /// <summary>
+    /// Arms one unconstrained delegation turn: <c>POST /workitems/{id}/delegate</c>.
+    /// Same call the detail page would issue; no new endpoint.
+    /// </summary>
+    Task<bool> DelegateWorkItemAsync(string id, string? note = null, CancellationToken ct = default)
+        => Task.FromResult(false);
+    /// <summary>
+    /// Items whose <c>DependsOn</c> includes this item:
+    /// <c>GET /workitems/{id}/dependents</c>. Same call the detail page would
+    /// issue; no new endpoint.
+    /// </summary>
+    Task<List<WorkItemDto>> GetDependentsAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(new List<WorkItemDto>());
+
     // ── Queue control ─────────────────────────────────────────────────────────
     Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default);
     Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default);
