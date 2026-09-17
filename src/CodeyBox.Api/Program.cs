@@ -61,6 +61,12 @@ using Serilog.Formatting.Compact;
 // declaring the alias keeps local function signatures unambiguous.
 using ILogger = Microsoft.Extensions.Logging.ILogger;
 
+// Converts a missing-required-setting startup failure into a clean
+// diagnostic (message on stderr, conventional non-zero exit, no stack trace,
+// no core dump). Scoped to RequiredConfigurationException only — every other
+// unhandled exception keeps the runtime's existing crash behaviour.
+RequiredConfigurationValidator.RegisterUnhandledExceptionHandler();
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Optional extra-config file pointed at by CODEYBOX_EXTRA_CONFIG. Lets
@@ -546,10 +552,10 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         }
         else
         {
-            throw new InvalidOperationException(
-                "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: incus, multipass, multipass-remote, sprites, bubblewrap, process " +
-                "(see docs/concepts/sandboxes.md for trade-offs).");
+            throw RequiredConfigurationValidator.CreateAggregateException(
+                sp.GetRequiredService<IConfiguration>(),
+                environment,
+                RequiredConfigurationValidator.MissingSandboxProviderMessage);
         }
     }
 
@@ -582,18 +588,20 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         && workloadTrust == WorkloadTrust.Untrusted
         && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel)
     {
-        throw new InvalidOperationException(
-            $"Untrusted workloads require a dedicated-kernel sandbox; provider '{inner.Name}' " +
-            $"advertises {inner.IsolationLevel} isolation.");
+        throw RequiredConfigurationValidator.CreateAggregateException(
+            sp.GetRequiredService<IConfiguration>(),
+            environment,
+            RequiredConfigurationValidator.UntrustedWorkloadMessage(inner.Name, inner.IsolationLevel));
     }
     if (!environment.IsDevelopment()
         && workloadTrust == WorkloadTrust.Trusted
         && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel
         && !opts.AcknowledgeSharedKernelRisk)
     {
-        throw new InvalidOperationException(
-            $"Trusted workloads using provider '{inner.Name}' ({inner.IsolationLevel}) require " +
-            "CodeyBox:AcknowledgeSharedKernelRisk=true.");
+        throw RequiredConfigurationValidator.CreateAggregateException(
+            sp.GetRequiredService<IConfiguration>(),
+            environment,
+            RequiredConfigurationValidator.TrustedSharedKernelMessage(inner.Name, inner.IsolationLevel));
     }
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
@@ -669,7 +677,7 @@ static ISandboxProvider BuildSandboxProviderInner(
 {
     return kind switch
     {
-        "process" => BuildProcess(opts, environment, startupLog, loggerFactory),
+        "process" => BuildProcess(sp, opts, environment, startupLog, loggerFactory),
         "bubblewrap" => new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
@@ -702,8 +710,10 @@ static IE2eExecutionPool BuildE2eExecutionPool(IServiceProvider sp)
     var startupOptions = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
     if (poolKind == "local" && !environment.IsDevelopment())
     {
-        throw new InvalidOperationException(
-            "CodeyBox:E2eExecution:PoolKind=local is development-only. Use remote-ssh for production E2E replay execution.");
+        throw RequiredConfigurationValidator.CreateAggregateException(
+            sp.GetRequiredService<IConfiguration>(),
+            environment,
+            RequiredConfigurationValidator.E2eLocalPoolMessage);
     }
 
     if (poolKind == "remote-ssh" && e2eOptions.CurrentValue.Enabled)
@@ -875,14 +885,14 @@ static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILogge
     return BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
 }
 
-static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
+static ISandboxProvider BuildProcess(IServiceProvider sp, CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
 {
     if (!env.IsDevelopment() && !opts.DangerouslyAllowProcessSandbox)
     {
-        throw new InvalidOperationException(
-            "CodeyBox:SandboxProvider=process is UNSAFE outside Development. " +
-            "Set CodeyBox:DangerouslyAllowProcessSandbox=true to override (NOT recommended), " +
-            "or pick incus | multipass | bubblewrap.");
+        throw RequiredConfigurationValidator.CreateAggregateException(
+            sp.GetRequiredService<IConfiguration>(),
+            env,
+            RequiredConfigurationValidator.ProcessSandboxUnsafeMessage);
     }
     startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
     return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
@@ -4959,6 +4969,30 @@ preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration
 
 var app = builder.Build();
 
+// Required-configuration gate. Validates every setting that is mandatory in
+// non-Development environments (plus the API-key secret, which is mandatory
+// everywhere unless auth is disabled) before the host starts resolving
+// services, so the failure is attributable to configuration rather than to a
+// DI call site. A missing setting used to surface as an unhandled
+// InvalidOperationException escaping from a DI factory during host startup:
+// a DI stack trace, SIGABRT/core dump, and exit 134, indistinguishable from a
+// crash-loop. The gate reports ALL missing settings in one pass instead.
+// The DI-time guards stay in place as defense in depth for direct
+// resolutions. Development defaults (e.g. the implicit 'process' provider)
+// are unaffected: the validator only reports failures that would actually
+// throw in the current environment.
+//
+// The gate throws (rather than exiting here) so test hosts observe the same
+// failure the DI guards would raise. The real binary converts this exact
+// exception to a clean stderr diagnostic with a conventional non-zero exit
+// code via the unhandled-exception handler registered at the top of Main;
+// genuine crashes keep their existing behaviour.
+{
+    var requiredFailures = RequiredConfigurationValidator.Validate(app.Configuration, app.Environment);
+    if (requiredFailures.Count > 0)
+        throw new RequiredConfigurationException(app.Environment.EnvironmentName, requiredFailures);
+}
+
 // Force the immutable-options baseline and retaining monitor cache to exist
 // before the host starts observing file-change reloads.
 _ = app.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
@@ -8422,10 +8456,10 @@ public partial class Program
             return;
         }
 
-        throw new InvalidOperationException(
-            "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
-            "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
-            "(see docs/operating/releases.md).");
+        throw RequiredConfigurationValidator.CreateAggregateException(
+            configuration,
+            environment,
+            RequiredConfigurationValidator.ChangelogSecretMessage);
     }
 
     /// <summary>

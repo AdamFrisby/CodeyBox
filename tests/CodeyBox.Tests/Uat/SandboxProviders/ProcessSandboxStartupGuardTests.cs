@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -17,7 +18,7 @@ public sealed class ProcessSandboxStartupGuardTests
         using var env = ConfigureRequiredProductionChangelogSecret();
         using var factory = new SandboxProviderApiFactory(environment: "Production");
 
-        var ex = Assert.Throws<InvalidOperationException>(() =>
+        var ex = Assert.Throws<RequiredConfigurationException>(() =>
             factory.Services.GetRequiredService<ISandboxProvider>());
 
         Assert.Contains("SandboxProvider must be set", ex.Message);
@@ -36,7 +37,7 @@ public sealed class ProcessSandboxStartupGuardTests
                 ["CodeyBox:DangerouslyAllowProcessSandbox"] = "false",
             });
 
-        var ex = Assert.Throws<InvalidOperationException>(() =>
+        var ex = Assert.Throws<RequiredConfigurationException>(() =>
             factory.Services.GetRequiredService<ISandboxProvider>());
 
         Assert.Contains("UNSAFE outside Development", ex.Message);

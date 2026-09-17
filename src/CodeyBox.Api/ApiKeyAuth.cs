@@ -31,6 +31,7 @@ internal static class ApiKeyAuth
         builder.Services.AddSingleton(sp =>
         {
             var configuration = sp.GetRequiredService<IConfiguration>();
+            var environment = sp.GetRequiredService<IHostEnvironment>();
             var disabled = configuration.GetValue<bool>(DisableConfigKey);
 
             if (disabled)
@@ -38,11 +39,15 @@ internal static class ApiKeyAuth
 
             var key = Environment.GetEnvironmentVariable(EnvVarName);
             if (string.IsNullOrWhiteSpace(key))
-                throw new InvalidOperationException(
-                    $"{EnvVarName} must be set, or set {DisableConfigKey}=true to opt out of auth (dev only).");
+                throw RequiredConfigurationValidator.CreateAggregateException(
+                    configuration,
+                    environment,
+                    RequiredConfigurationValidator.ApiKeyMissingMessage);
             if (key.Length < 32)
-                throw new InvalidOperationException(
-                    $"{EnvVarName} must be at least 32 characters of high-entropy random data.");
+                throw RequiredConfigurationValidator.CreateAggregateException(
+                    configuration,
+                    environment,
+                    RequiredConfigurationValidator.ApiKeyTooShortMessage);
 
             var clients = configuration.GetSection("CodeyBox:ApiClients")
                 .Get<List<ApiClientOptions>>() ?? [];
@@ -52,12 +57,16 @@ internal static class ApiKeyAuth
                 if (string.IsNullOrWhiteSpace(client.Name)
                     || string.IsNullOrWhiteSpace(client.TokenEnvVar)
                     || client.Principal is null)
-                    throw new InvalidOperationException(
-                        "Each CodeyBox:ApiClients entry requires Name, TokenEnvVar, and Principal.");
+                    throw RequiredConfigurationValidator.CreateAggregateException(
+                        configuration,
+                        environment,
+                        RequiredConfigurationValidator.ApiClientsEntryMessage);
                 var token = Environment.GetEnvironmentVariable(client.TokenEnvVar);
                 if (string.IsNullOrWhiteSpace(token) || token.Length < 32)
-                    throw new InvalidOperationException(
-                        $"{client.TokenEnvVar} must contain at least 32 characters of high-entropy random data.");
+                    throw RequiredConfigurationValidator.CreateAggregateException(
+                        configuration,
+                        environment,
+                        RequiredConfigurationValidator.ApiClientTokenMessage(client.TokenEnvVar));
                 ValidateInitiator(client.Principal);
                 var executorHostId = NormalizeExecutorHostId(client);
                 resolved.Add(new ResolvedApiClient(
