@@ -98,6 +98,7 @@ every interactive element, fluid rem layouts that scale to 200%.
 | Route | Description |
 |-------|-------------|
 | `/` | Queue overview — all work items, auto-refreshes every 5 s |
+| `/needs-attention` | Needs-you queue — everything awaiting a human ordered by attention score, with inline evidence (infra vs. rejected change, blocking findings with auditors, repeat/shrink signal), in-place retry/delegate/cancel, and a cancel confirmation that names stranded dependants. Auto-refreshes every 30 s. |
 | `/map` | Fleet map — every non-terminal item as one 2D canvas, grouped into chains, with an attention-driven camera. Auto-refreshes every 5 s; idle frames cost nothing. |
 | `/fleet` | Fleet view — one row per project: status dot, current phase, queued/in-flight counts, last-5 outcomes, 30-day spend. Auto-refreshes every 5 s. |
 | `/supervision` | Live multi-session agent supervision and injection. Requires `CodeyBox:AgentSupervision:Enabled=true`. |

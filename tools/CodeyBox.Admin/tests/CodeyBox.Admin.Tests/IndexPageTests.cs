@@ -414,10 +414,37 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     }
 
     public Task<bool> DeleteWorkItemAsync(string id, CancellationToken ct = default)
-        => Task.FromResult(true);
+    {
+        CancelledIds.Add(id);
+        return Task.FromResult(true);
+    }
+
+    public List<string> RetriedIds { get; } = [];
+    public List<string?> RetriedFrom { get; } = [];
 
     public Task<bool> RetryWorkItemAsync(string id, string? from = null, CancellationToken ct = default)
-        => Task.FromResult(true);
+    {
+        RetriedIds.Add(id);
+        RetriedFrom.Add(from);
+        return Task.FromResult(true);
+    }
+
+    public List<(string Id, string? Note)> DelegatedCalls { get; } = [];
+
+    public Task<bool> DelegateWorkItemAsync(string id, string? note = null, CancellationToken ct = default)
+    {
+        DelegatedCalls.Add((id, note));
+        return Task.FromResult(true);
+    }
+
+    public List<string> CancelledIds { get; } = [];
+
+    public Dictionary<string, List<WorkItemDto>> DependentsOverride { get; } = [];
+
+    public Task<List<WorkItemDto>> GetDependentsAsync(string id, CancellationToken ct = default)
+        => Task.FromResult(DependentsOverride.TryGetValue(id, out var d) ? d : new List<WorkItemDto>());
+
+    public Dictionary<string, AuditReportsDto> AuditReportsByItem { get; } = [];
 
     public Task<bool> ReorderWorkItemsAsync(IReadOnlyList<string> ids, CancellationToken ct = default)
         => Task.FromResult(true);
@@ -521,7 +548,10 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
     public Dictionary<(string, int, string), string?> RawOutputOverrides { get; set; } = [];
 
     public Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
-        => Task.FromResult(AuditReportsOverride);
+        => Task.FromResult(
+            AuditReportsByItem.TryGetValue(workItemId, out var per)
+                ? (AuditReportsDto?)per
+                : AuditReportsOverride);
 
     public Task<string?> GetAuditReportRawOutputAsync(
         string workItemId, string target, int iteration, string auditorName, CancellationToken ct = default)

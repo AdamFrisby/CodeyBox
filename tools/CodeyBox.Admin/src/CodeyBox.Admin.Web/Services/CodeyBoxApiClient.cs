@@ -79,6 +79,23 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return resp.IsSuccessStatusCode;
     }
 
+    public async Task<bool> DelegateWorkItemAsync(string id, string? note = null, CancellationToken ct = default)
+    {
+        var path = $"/workitems/{Uri.EscapeDataString(id)}/delegate";
+        var trimmed = string.IsNullOrWhiteSpace(note) ? null : note;
+        var resp = trimmed is null
+            ? await _http.PostAsync(path, content: null, ct)
+            : await _http.PostAsJsonAsync(path, new { Note = trimmed }, JsonOptions, ct);
+        return resp.IsSuccessStatusCode;
+    }
+
+    public async Task<List<WorkItemDto>> GetDependentsAsync(string id, CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<WorkItemDto>>(
+            $"/workitems/{Uri.EscapeDataString(id)}/dependents", JsonOptions, ct);
+        return result ?? [];
+    }
+
     public async Task<string?> GetStdoutTailAsync(string workItemId, CancellationToken ct = default)
     {
         var resp = await _http.GetAsync($"/workitems/{Uri.EscapeDataString(workItemId)}/stdout-tail", ct);
