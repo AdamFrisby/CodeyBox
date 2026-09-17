@@ -82,6 +82,8 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// </summary>
 public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, ISandboxHostPoolSnapshot
 {
+    public IReadOnlyList<string> DeclaredCapabilities => [];
+
     private const string PurposeMarkerFile = ".codeybox-purpose";
 
     private readonly Func<MultipassRemoteSandboxOptions> _optsAccessor;

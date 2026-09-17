@@ -86,6 +86,12 @@ internal sealed class ReloadableSandboxProvider :
     public bool CapturesResourceMetrics =>
         SelectedProvider.ResourceMetrics.CapturesResourceMetrics;
 
+    public IReadOnlyList<string> DeclaredCapabilities =>
+        SelectedProvider.Provider.DeclaredCapabilities;
+
+    internal IReadOnlyList<ISandboxProvider> RegisteredProviders =>
+        _providers.Select(p => p.Provider).ToArray();
+
     internal ISandboxProvider GetProvider(string providerId) =>
         ProviderByScopedId(providerId).Provider;
 

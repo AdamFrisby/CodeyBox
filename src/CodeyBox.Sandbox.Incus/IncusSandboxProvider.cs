@@ -61,6 +61,17 @@ public sealed class IncusSandboxProvider :
     IResourceMetricsCapturingProvider
 {
     public const string ProviderId = "incus";
+
+    private static readonly string[] Capabilities =
+    [
+        SandboxCapabilities.BaselineBake,
+        SandboxCapabilities.CacheSeeding,
+        SandboxCapabilities.DiskGuard,
+        SandboxCapabilities.Teardown,
+    ];
+
+    public IReadOnlyList<string> DeclaredCapabilities => Capabilities;
+
     internal const string ManagedKey = "user.codeybox.managed";
     internal const string KindKey = "user.codeybox.kind";
     internal const string CreatedAtKey = "user.codeybox.created_at";
