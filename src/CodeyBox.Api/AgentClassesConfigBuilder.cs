@@ -11,6 +11,7 @@ using CodeyBox.Agents.Omp;
 using CodeyBox.Agents.Continue;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
+using CodeyBox.Agents.Qwen;
 using CodeyBox.Agents.Vibe;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -121,6 +122,8 @@ public static class AgentClassesConfigBuilder
                     OmpKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.Continue)
                     ContinueKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
+                if (agentKind == AgentKind.Qwen)
+                    QwenKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 // Capabilities are operator-declared tags. Normalise (trim + drop empties)
                 // and de-duplicate case-insensitively so '"sensitive"' and '"Sensitive"'
                 // don't both end up in the list. Tag values themselves are otherwise

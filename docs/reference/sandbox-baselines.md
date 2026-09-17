@@ -204,6 +204,7 @@ first dispatch can actually run.
       "apt-get update",
       "apt-get install -y curl ca-certificates nodejs npm python3",
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+      "npm install -g @qwen-code/qwen-code@0.24.0",
       "npm install -g --ignore-scripts autohand-cli@0.9.7",
       "npm install -g cline@3.0.62",
       "npm install -g @kilocode/cli@7.7.2",
@@ -239,6 +240,7 @@ The equivalent Incus executable provisioning is provider-local:
         "apt-get update",
         "apt-get install -y curl ca-certificates nodejs npm python3",
         "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+        "npm install -g @qwen-code/qwen-code@0.24.0",
         "npm install -g --ignore-scripts autohand-cli@0.9.7",
         "npm install -g cline@3.0.62",
         "npm install -g @kilocode/cli@7.7.2",
@@ -383,6 +385,19 @@ provisioning `runcmd` runs as root, so `~` would be the wrong home):
 seeds the guest `~/.continue/config.yaml` (single-model `openrouter` entry
 with `apiBase` + literal `apiKey`, mode 0600) from the
 `CODEYBOX_CONTINUE_API_KEY` bundle at dispatch time.
+Qwen runs one-shot headless (`qwen --approval-mode yolo --auth-type openai
+--output-format stream-json -m <model-id>` with the prompt on stdin — no
+positional prompt argument, never the deprecated `-p` flag):
+`--approval-mode yolo` auto-approves every tool call (the sandbox VM is the
+permission boundary), `--auth-type openai` pins env-key routing (Qwen OAuth
+is discontinued), and `--output-format stream-json` is the runner's only
+transport. The post-install in-VM verification runs `qwen --version` plus a
+`--help` assertion for `--output-format`/`stream-json` (a build that dropped
+the transport is benched at bake time, not first dispatch). Pin the install
+(`@qwen-code/qwen-code@0.24.0` — needs Node.js 22+ on the image) and
+re-verify the headless contract before bumping. Provider credentials are NOT
+baked: the key, base URL, and model fallback arrive through the
+`CODEYBOX_QWEN_*` → `OPENAI_*` credential mappings at dispatch time.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
 binary on PATH (no runtime needed); the installer resolves the latest stable
