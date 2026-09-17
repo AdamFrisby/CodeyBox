@@ -207,6 +207,7 @@ first dispatch can actually run.
       "npm install -g --ignore-scripts autohand-cli@0.9.7",
       "npm install -g cline@3.0.62",
       "npm install -g @kilocode/cli@7.7.2",
+      "curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.2.2",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
       "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -239,6 +240,7 @@ The equivalent Incus executable provisioning is provider-local:
         "npm install -g --ignore-scripts autohand-cli@0.9.7",
         "npm install -g cline@3.0.62",
         "npm install -g @kilocode/cli@7.7.2",
+        "curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.2.2",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
         "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -348,6 +350,18 @@ autonomy flag is benched at bake time, not first dispatch). Provider
 credentials are NOT baked: the runner seeds the guest
 `~/.config/kilo/kilo.jsonc` (openai-compatible provider block plus the
 mandatory `models` allowlist entry) from the `CODEYBOX_KILO_API_KEY` bundle
+at dispatch time.
+
+OMP runs one-shot headless (`omp -p --mode json --no-session` with the prompt
+on stdin, `--model <model-id>`): a bare `omp "prompt"` is interactive, so the
+`-p/--print` flag is the one-shot contract, and `--mode json` is the runner's
+only transport. The post-install in-VM verification runs `omp --version` plus
+a `--help` assertion for `--mode`/`json` and `-p`/`--print` (a build that
+dropped the transport or the one-shot flag is benched at bake time, not
+first dispatch). Pin the install (`--binary --ref v18.2.2` — the oh-my-pi
+binary, not the `oh-omp` fork) and re-verify the headless contract before
+bumping. Provider credentials are NOT baked: the provider API key arrives
+through the `CODEYBOX_OMP_API_KEY` → `OPENROUTER_API_KEY` credential mapping
 at dispatch time.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. Prime installs a self-contained `prime-agent`

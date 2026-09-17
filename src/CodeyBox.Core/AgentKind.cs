@@ -23,6 +23,7 @@ public readonly record struct AgentKind(string Value)
     public static AgentKind Autohand { get; } = new("autohand");
     public static AgentKind Cline { get; } = new("cline");
     public static AgentKind Kilo { get; } = new("kilo");
+    public static AgentKind Omp { get; } = new("omp");
 
     public override string ToString() => Value;
 }

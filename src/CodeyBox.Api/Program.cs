@@ -19,6 +19,7 @@ using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Kilo;
+using CodeyBox.Agents.Omp;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
@@ -1323,6 +1324,20 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClineAgentRunner(
 builder.Services.AddSingleton<IAgentRunner>(sp => new KiloAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Kilo));
+// OMP: oh-my-pi fork of pi (npm @oh-my-pi/pi-coding-agent, MIT; binary
+// `omp` — not the `oh-omp` fork, which is a different project). Driven
+// one-shot via `omp -p --mode json --no-session` (the -p one-shot contract
+// with the JSON event stream; a bare `omp "prompt"` is interactive) with
+// the prompt on stdin and `--model` from the agent-class member or the
+// config-sourced default. Auth is a provider API key from the environment
+// (shipped mapping: CODEYBOX_OMP_API_KEY -> OPENROUTER_API_KEY;
+// OPENAI_BASE_URL is the documented fallback and custom providers live in
+// ~/.omp/agent/models.yml). tools.approvalMode already defaults to yolo so
+// no approval flag is emitted. The binary must be installed in the sandbox
+// image (pinned installer — see docs/reference/sandbox-baselines.md); see
+// docs/concepts/agents.md and docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new OmpAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1810,6 +1825,14 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // it). Operators fronting a different OpenAI-compatible backend
         // change CodeyBox:Kilo:BaseUrl; the key variable stays the same.
         new AgentCredentialMapping(AgentKind.Kilo, "CODEYBOX_KILO_API_KEY", "KILO_API_KEY"),
+        // OMP: provider API-key auth read from the environment. The CLI
+        // documents OPENROUTER_API_KEY directly (OPENAI_BASE_URL as a
+        // fallback; custom providers in ~/.omp/agent/models.yml); the
+        // shipped mapping covers the OpenRouter path the bundled
+        // AgentClasses member routes. Operators fronting other providers
+        // add that provider's variable here following the same row. The
+        // runner never emits --api-key so the secret stays out of argv.
+        new AgentCredentialMapping(AgentKind.Omp, "CODEYBOX_OMP_API_KEY", "OPENROUTER_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2569,6 +2592,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new KiloSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<KiloSmokeProbe>()));
+// OMP: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// OMP fronts ~60 providers behind one CLI, so no single endpoint validates
+// the credential and any provider call would spend real quota; the real auth
+// check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new OmpSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<OmpSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2591,6 +2621,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, PrimeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AutohandInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, ClineInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, KiloInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, OmpInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2720,6 +2751,12 @@ builder.Services.AddSingleton<IAgentModelListProbe, ClineModelListProbe>();
 // authoritative; operator-configured ids absent from the seed surface as a
 // startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, KiloModelListProbe>();
+// OMP model-list probe: the catalog is per provider and server-side, and
+// `omp models --json` returns an empty set without login state, so it cannot
+// back a host-side startup probe. The curated OmpKnownModels seed is
+// authoritative; operator-configured ids absent from the seed surface as a
+// startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, OmpModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3724,6 +3761,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Autohand] = new AutohandCostExtractor(),
         [AgentKind.Cline] = new ClineCostExtractor(),
         [AgentKind.Kilo] = new KiloCostExtractor(),
+        [AgentKind.Omp] = new OmpCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3832,6 +3870,11 @@ builder.Services.AddSingleton<IAgentStreamParser, ClineStreamParser>();
 // registered parser claims — opencode's own parser claims nothing, so order
 // against it is irrelevant.
 builder.Services.AddSingleton<IAgentStreamParser, KiloStreamParser>();
+// OMP never claims by shape (byte-identical to pi — see OmpStreamParser):
+// attribution flows through ResolveKind's work-item / cost-row resolution
+// via CanEmitShapeOf. Registered after pi/prime so the shape owner's claim
+// order is untouched.
+builder.Services.AddSingleton<IAgentStreamParser, OmpStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -3987,6 +4030,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new KiloQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // OMP detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:omp, mirroring the kilo hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Omp.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new OmpQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
