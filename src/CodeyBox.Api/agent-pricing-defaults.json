@@ -15,7 +15,8 @@
       "vibe": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
       "cline": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
       "kilo": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
-      "omp": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)"
+      "omp": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
+      "cmd": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)"
     },
     "notes": {
       "opencode": "OpenCode Go is subscription-priced ($12 per 5h usage budget on https://opencode.ai/docs/go). Each model entry uses one subscription-equivalent USD/M rate for input, cached input, and output: ($12 ÷ requests-per-5h) ÷ ((typical input + cached + output tokens per request) ÷ 1e6), using the request limits and typical token mix published on that page. Keys use opencode-go/<model-id>. Cost attribution charges the stored non-cached input bucket and cached input bucket separately; public total-input reporting adds them.",
@@ -34,7 +35,8 @@
       "vibe":     "Vibe is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model (guest alias nemotron-free), which bills $0 — the bucket records that zero rate explicitly keyed by the provider id behind the alias (nvidia/nemotron-3.5-lightning:free). Vibe programmatic history entries carry no token counts, so the cost extractor reports unknown and per-run rows fall back to elapsed-time attribution; operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the provider id behind their guest alias.",
       "cline":  "Cline is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched -m id (verified live: the run_result frame reports totalCost 0 and the model id in model.id). Keys are the provider-native ids cline reports verbatim in run_result.model.id. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same id form.",
       "kilo":      "Kilo is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched -m id (verified live: the step-finish frame reports cost 0). Keys are the full -m dispatch ids (provider/ qualifier retained, e.g. openai-compatible/nvidia/nemotron-3.5-lightning:free) because the stream carries no model id and attribution falls through to the AgentDefaults-derived rate. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same -m id form.",
-      "omp":       "OMP is a multi-provider front (oh-my-pi fork of pi); rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly keyed by the bare message.model id omp reports (verified live: the usage frame reports cost.total 0 and message.model strips the openrouter/ qualifier). Operators fronting paid models add that model's list prices here (or under CodeyBox:AgentPricing) keyed by the bare message.model id."
+      "omp":       "OMP is a multi-provider front (oh-my-pi fork of pi); rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly keyed by the bare message.model id omp reports (verified live: the usage frame reports cost.total 0 and message.model strips the openrouter/ qualifier). Operators fronting paid models add that model's list prices here (or under CodeyBox:AgentPricing) keyed by the bare message.model id.",
+      "cmd":       "Command Code is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly keyed by the full dispatch id cmd echoes in model_request_start.model (verified live: the result line reports cost_usd 0). Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the qualified -m id form."
     }
   },
   "DefaultRates": {
@@ -119,6 +121,9 @@
     },
     "omp": {
       "nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
+    },
+    "cmd": {
+      "openrouter/nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
     }
   }
 }

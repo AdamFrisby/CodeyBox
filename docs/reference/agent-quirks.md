@@ -1668,3 +1668,133 @@ unknown path. The router's `QuotaUnknownPolicy` (default
 (`No API key found` → Unauthorized; `Key limit exceeded` → LimitReached;
 shared 429 rows → RateLimitExceeded) with operator-extensible rows under
 `CodeyBox:QuotaFailurePatterns:omp`.
+
+### Command Code (`cmd`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against command-code 1.54.2, 2026-09-17):
+
+```sh
+npm install -g command-code@1.54.2
+```
+
+Node-based ([repo](https://github.com/CommandCodeAI/command-code)), binary
+`cmd`, runs on Linux. The `@1.54.2` pin keeps the bake deterministic —
+bump it only after re-verifying the headless contract below (the CLI
+itself warns that `--output-format` is almost certainly coming to
+interactive mode next, which would change the help text the in-VM probe
+asserts).
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with the prompt on stdin and NO positional prompt argument:
+
+```sh
+cmd --local-only -p --output-format json --no-session --skip-onboarding --yolo [--model <provider/model-id>]
+```
+
+`-p/--print` is the documented headless contract ("outputs the response to
+stdout, and exits"); a bare `cmd "prompt"` starts an interactive session.
+Multi-word queries on argv **must** be quoted (unquoted queries fail
+argument parsing), which is one reason the prompt travels on stdin with no
+positional instead (verified: piped-stdin prompts produced replies
+normally, including a file-creating repo-edit run): Linux's
+`MAX_ARG_STRLEN` is 128 KiB per argv element and rework prompts can exceed
+it. Raw `-p` prints only the final response text (usage, the dispatch
+model id, and the terminal error shape would be unrecoverable), so
+`--output-format json` is the runner's only transport. Observed JSON frames
+(NDJSON): `{"type":"event","event":{"type":"run_start"|"turn_start"|
+"message_start"|"model_request_start"|"thinking_start"|"thinking_delta"|
+"thinking_end"|"message_update"|"text_delta"|"model_request_end"|
+"message_end"|"turn_end"|"run_end"|"run_error"|"tool_use"|"tool_queued"|
+"tool_running"|"tool_completed"|"tool_hook_blocked"|…}}` plus a terminal
+`{"type":"result","subtype":"success"|"error"|"max_turns",…}` line.
+Per-turn frames carry per-turn
+`usage {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}`;
+the terminal frames (`run_end.result.usage`, the result line) carry the run
+total (verified: turn usages sum to the result total). The full dispatch id
+rides `model_request_start.model` (the `openrouter/` qualifier is kept —
+unlike omp, which strips it). Exit codes are 0 success, 1 model/key/config
+error, 3 no auth, 4 spend-cap refusal, 8 max-turns hit (partial response on
+stderr with an empty-text result line — spend is spend), and 127 for a
+missing binary.
+
+**The autonomy trap.** Headless mode blocks file writes, file edits, and
+shell commands by default (reads, grep, and glob stay allowed): without a
+permission flag the agent reads and talks but changes nothing — exit 0,
+`subtype: "success"`, no diff. The runner always passes `--yolo` (alias for
+`--dangerously-skip-permissions`): the sandbox VM is disposable and sits
+behind the host-enforced egress allowlist, which is exactly the trusted
+environment the vendor docs require for that flag. The fail-closed
+`dont-ask` allowlist mode was evaluated and rejected for the coding path —
+it denies prompt-gated requests, which would block the writes a work item
+exists to produce. `--tools-all` is deliberately not passed (the withheld
+headless tools are interactive-oriented; the verified write path needs only
+`--yolo`). A run that ended with `tool_hook_blocked` frames exits 0 with
+success subtype, so the runner lifts the blocked-call count into
+`TerminalDiagnostic` — a run without the permission flag is never
+misreported as a successful empty result.
+
+**Reasoning effort is never mapped.** `--effort` exists, but the shipped
+free-tier model rejects it (`… has no adjustable reasoning effort`, exit 1
+— verified live), so emitting it could fail dispatches. `ReasoningMode` on
+the agent-class member is ignored (same rationale as kilo's `--variant`).
+
+**Authentication — BYOK without a plan, no TTY.** Browser OAuth or a pasted
+key is unusable headless, and the interactive `/connect` flow only writes
+two files — so the runner pre-seeds both during provisioning instead (see
+`CmdConfigBuilder`, whose shape matches the vendor's own `/connect`
+template byte-for-byte and the file the CLI auto-creates on first run):
+`~/.commandcode/providers.json` (the `openrouter` entry — a prefilled
+provider id, so endpoint and wire come preconfigured — with
+`apiKey: "$OPENROUTER_API_KEY"`, an environment *reference* per the vendor
+template's own "reference — never a raw key") and `~/.commandcode/auth.json`
+(`{"apiKey": "<placeholder>"}`). The key arrives through the shipped mapping
+(host `CODEYBOX_CMD_API_KEY` → `OPENROUTER_API_KEY`); the runner never emits
+it on argv and never writes it into the guest files. The runner always
+passes `--local-only` ("no Command Code traffic", same as
+`CMD_LOCAL_ONLY=1`): billing reads never run, the Command Code transport
+refuses, and telemetry is off — so the `auth.json` value is never
+transmitted and no Command Code plan is required (verified live: placeholder
++ `--local-only` + real OpenRouter key completed real runs with zero
+vendor-side traffic; `cmd status` still reports no account, but billing keys
+are never read in this mode). Command Code catalog (plan) models are out of
+scope — `--local-only` blocks that route by design. The guest needs
+`openrouter.ai` on `CodeyBox:AgentAllowedHosts` (shipped in the default) for
+the OpenRouter route. A `$0`-spend-limit OpenRouter key only serves ids
+ending `:free` — a paid id fails with `Key limit exceeded (total limit)`,
+which the detector parks as quota exhaustion. Models are provider-qualified
+on `--model` (`openrouter/…`), and undeclared ids are "sent anyway"
+(verified — advisory note, exit 0), so config validation only warns. Never
+commit a provider key: `gitleaks` CI matches this key's shape.
+
+**Terminal failures.** The runner lifts the terminal `type: "result"` error
+(`subtype: error|max_turns`, plus the empty-`finalText` success marker), the
+`run_error` companion, and the stderr plaintext pre-harness failures
+(`Error: …` lines — config-shape rejections exit 1 with empty stdout) into
+`TerminalDiagnostic`, so the pipeline's no-changes branch parks quota/auth
+give-ups instead of dead-lettering them as "produced no changes".
+
+**Cost.** The stream carries usage, so cost attribution records real rows
+(fresh `input`, cached `cacheRead`, `output`; `cacheWriteTokens` has no
+bucket and is ignored). The dispatch model id rides the same frames, so
+snapshots record it and pricing resolves per model; no built-in fallback
+rate is shipped (no single rate is honest across the 150+ providers cmd
+fronts) — the shipped free-tier member bills $0 via the explicit zero-rate
+bucket (verified live: the result line reports `cost_usd` 0).
+
+**Quota probe.** Ships as Unknown-only: `cmd status` reports Command Code
+plan state — not the BYOK provider balance the `--local-only` path spends —
+so no probe is registered (an agent with no readable quota meter must not
+ship a probe that fabricates one) and members fall through to the
+`NullQuotaProbe` unknown path. The router's `QuotaUnknownPolicy` (default
+`UseObservedFailures`) gates dispatch via observed failure history, and
+`CmdQuotaFailureDetector` classifies the relayed provider errors
+(`No auth credentials found` / `API key environment variable …` →
+Unauthorized; `Key limit exceeded` / `API key spend cap reached` →
+LimitReached; shared 429 rows → RateLimitExceeded) with operator-extensible
+rows under `CodeyBox:QuotaFailurePatterns:cmd`. Deliberately unmatched: the
+undeclared-model advisory (exit 0, sent anyway), `Model not found` without a
+provider shape (configuration, not quota), the `tool_hook_blocked` gate
+(dispatch configuration, not spend), and the `--effort` refusal (the runner
+never emits `--effort`).
