@@ -56,6 +56,7 @@ untrusted prompts, untrusted repositories, or untrusted upstream content.
 | Credential                         | Lives in                                    | Visible to sandbox? |
 |------------------------------------|---------------------------------------------|---------------------|
 | Agent API key (Anthropic, OpenAI…) | Host env, mounted to work / rework / merge / audit-LLM sbx | Only those sandboxes, only their own agent |
+| Project test secrets               | Host env, injected by reference into opted-in phases only | Only the declared phases of that project — never via the agent-credential path |
 | GitHub PAT / generic git creds     | Orchestrator process only                   | **Never**           |
 | Host SSH keys, cloud creds         | Host                                        | **Never**           |
 
@@ -106,7 +107,12 @@ for the threat model and setup. The Process and Bubblewrap providers do
 
 Agent secrets are written to a tmpfs mount (`/run/codeybox/creds`) that
 exists for the lifetime of the sandbox and is destroyed with it. The
-secret never lands on a persistent disk inside the VM.
+secret never lands on a persistent disk inside the VM. Project-scoped
+test secrets get the same treatment: they travel only through
+`SandboxSpec.Environment` (the per-exec guest channel), never appear in
+instance configuration, cloud-init, or logs, and are declared by host
+variable name — the value never sits in committed config. See
+[Project sandbox secrets](projects.md#project-sandbox-secrets).
 
 ### 5. Resource bounds
 

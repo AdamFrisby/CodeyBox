@@ -425,6 +425,71 @@ A profile referenced in project config but not configured in
 `SandboxNetworkProfiles` makes the provider fail loudly at sandbox
 creation — never silently degrades to "no enforcement."
 
+### Project sandbox secrets
+
+A project can declare **test secrets** that are injected into that
+project's sandboxes, so an agent can exercise code it just wrote against a
+real external service (for example, a new coding-agent adapter making its
+first real CLI request). Secrets reach a sandbox through exactly two
+channels: the running agent's own credential, and the project-secret
+channel described here. The agent-credential gate is unchanged — one
+agent's credential never reaches another agent's sandbox — and a project
+secret is never selectable as an agent credential.
+
+**Declared by reference, never by value.** Config names a *host*
+environment variable; the literal secret never appears in project config,
+which is routinely committed. A literal-looking value is rejected at
+config load:
+
+```json
+{
+  "Id": "adapter-work",
+  "SandboxSecrets": [
+    { "HostEnvVar": "CODEYBOX_OPENROUTER_API_KEY", "SandboxEnvVar": "OPENROUTER_API_KEY" },
+    {
+      "HostEnvVar": "CODEYBOX_TEST_SERVICE_TOKEN",
+      "SandboxEnvVar": "TEST_SERVICE_TOKEN",
+      "Phases": ["work", "rework", "audit"]
+    }
+  ]
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `HostEnvVar` | `string` | required | Name of the host environment variable holding the secret. Read at sandbox-provisioning time. Must be a POSIX identifier — anything else is rejected as a literal value. |
+| `SandboxEnvVar` | `string` | required | Name of the sandbox environment variable the value is injected as. Must be a POSIX identifier, must not be a reserved shell name (`PATH`, `LD_PRELOAD`, …), and must be unique per project. |
+| `Phases` | `string[]` | `["work", "rework"]` | Phases receiving the secret: `work`, `rework`, `audit` (both audit-agent and audit-tool sandboxes), `audit-agent`, `audit-tool`, `merge`. |
+
+**Scope is explicit, not everywhere-by-default.** Work and rework clearly
+need test keys; merge only when the merge agent runs the suite. Audit
+phases are the real question: a tool-only audit runs with no egress and
+should not hold a live key, but a test-running audit may legitimately need
+one — so audit sandboxes receive secrets only when the declaration opts
+in (`audit` covers both, or pick `audit-agent` / `audit-tool`
+separately). Check, rebase, planning, agent-control, and mechanical-edit
+sandboxes never receive project secrets. A host variable that is unset or
+empty at provisioning time injects nothing for that phase (logged with
+names only); a collision with the agent credential's own direct variable
+resolves in the credential's favour.
+
+**Same handling as credentials where it matters.** Values travel only
+through `SandboxSpec.Environment` — the per-exec guest channel — so they
+never appear in instance configuration readable via `incus config show`,
+in cloud-init, or in host logs (only names are ever logged). Guest-side
+storage stays on the non-persistent tmpfs, never the VM's disk, and
+existing secret-pattern redaction applies to recorded agent output.
+
+**Auditable.** `GET /projects` and `GET /projects/{id}` report
+`hasSandboxSecrets` plus the `sandboxSecrets` list — names and scopes
+only, never values.
+
+**Egress reality.** A secret is only useful if the sandbox can reach the
+service: pair each secret with a network profile that allows the egress.
+A hostname-allowlist profile limited to the service in question (e.g.
+`openrouter.ai`) is the tighter configuration — see the profile-mode
+table above — versus blanket `internet-only`.
+
 ### Graphical sandboxes
 
 Set `GraphicalSandbox: true` on a project to run GUI-capable sandboxes for
@@ -768,6 +833,11 @@ POST /workitems            — body now requires "projectId" instead of "reposit
   "pushUpstream": true     // optional — gates phase 4 push
 }
 ```
+
+Project records also carry `hasSandboxSecrets` (whether the project
+injects project-scoped test secrets) and `sandboxSecrets` (each entry's
+host variable name, sandbox variable name, and phases — names only, never
+values). See [Project sandbox secrets](#project-sandbox-secrets).
 
 ## Credential provider priority
 

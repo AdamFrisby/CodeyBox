@@ -531,11 +531,15 @@ public sealed partial class PipelineRunner
                 group.Key.Caps);
             SandboxSpec BuildAuditSandboxSpec(SandboxRepositoryAccess repositoryAccess)
             {
+                var auditSecretScope = needsCreds
+                    ? ProjectSandboxSecretScopes.AuditAgent
+                    : ProjectSandboxSecretScopes.AuditTool;
                 var built = BuildSandboxSpec(repositoryAccess, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
                     hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
                     flavor: sandboxTarget.Flavor,
                     baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
-                    credentialRunner: credential is null ? null : groupRunner);
+                    credentialRunner: credential is null ? null : groupRunner,
+                    projectSecretEnvironment: ResolveProjectSecretEnvironment(project, auditSecretScope));
                 return built with
                 {
                     Mounts = [.. built.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }],
@@ -766,7 +770,10 @@ public sealed partial class PipelineRunner
                         timingPhase: "audit",
                         flavor: sandboxTarget.Flavor,
                         baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
-                        credentialRunner: candidateCredential is null ? null : candidateRunner);
+                        credentialRunner: candidateCredential is null ? null : candidateRunner,
+                        projectSecretEnvironment: ResolveProjectSecretEnvironment(
+                            project,
+                            needsCreds ? ProjectSandboxSecretScopes.AuditAgent : ProjectSandboxSecretScopes.AuditTool));
                     var dotnetShim = AuditReviewDotnetShim.From(_pipelineTuning.Current);
                     var specWithAuditMount = candidateSpec with
                     {

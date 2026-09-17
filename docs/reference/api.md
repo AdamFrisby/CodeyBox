@@ -1202,10 +1202,21 @@ Response: `200 OK` with a JSON array of project records:
     "upstreamKind": "None",
     "auditLanguages": [],
     "auditTypes": [],
-    "auditMaxIterations": 3
+    "auditMaxIterations": 3,
+    "hasSandboxSecrets": true,
+    "sandboxSecrets": [
+      {
+        "hostEnvVar": "CODEYBOX_OPENROUTER_API_KEY",
+        "sandboxEnvVar": "OPENROUTER_API_KEY",
+        "scopes": ["work", "rework"]
+      }
+    ]
   }
 ]
 ```
+
+`sandboxSecrets` carries names and scopes only — never values. See
+[Project sandbox secrets](../concepts/projects.md#project-sandbox-secrets).
 
 ### `GET /projects/{id}`
 

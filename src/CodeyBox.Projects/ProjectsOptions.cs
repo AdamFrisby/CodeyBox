@@ -85,6 +85,37 @@ public sealed class ProjectConfig
     /// <see cref="CodeyBox.Core.ProjectJobTrackExport"/> after resolution.
     /// </summary>
     public ProjectJobTrackExportConfig? JobTrackExport { get; set; }
+
+    /// <summary>
+    /// Project-scoped test secrets injected into this project's sandboxes.
+    /// Each entry names a host environment variable (the value source) and a
+    /// sandbox environment variable (the injection target); the literal secret
+    /// never appears here. Null/empty = nothing is injected. Maps to
+    /// <see cref="CodeyBox.Core.Project.SandboxSecrets"/> after resolution.
+    /// </summary>
+    public List<ProjectSandboxSecretConfig>? SandboxSecrets { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for one <see cref="CodeyBox.Core.ProjectSandboxSecret"/>.
+/// Lives under <c>CodeyBox:Projects:&lt;id&gt;:SandboxSecrets</c> as a list.
+/// Both names are validated at config load; a literal-looking value is
+/// rejected with guidance to reference a host environment variable instead.
+/// </summary>
+public sealed class ProjectSandboxSecretConfig
+{
+    /// <summary>Name of the host environment variable holding the secret value.</summary>
+    public string? HostEnvVar { get; set; }
+
+    /// <summary>Name of the sandbox environment variable the value is injected as.</summary>
+    public string? SandboxEnvVar { get; set; }
+
+    /// <summary>
+    /// Sandbox phases receiving this secret (<c>work</c>, <c>rework</c>,
+    /// <c>audit</c>, <c>audit-agent</c>, <c>audit-tool</c>, <c>merge</c>).
+    /// Null/empty = <c>work</c> + <c>rework</c>.
+    /// </summary>
+    public List<string>? Phases { get; set; }
 }
 
 /// <summary>
