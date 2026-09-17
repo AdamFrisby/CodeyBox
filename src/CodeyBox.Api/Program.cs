@@ -13,6 +13,7 @@ using CodeyBox.Agents.CavemanCode;
 using CodeyBox.Agents.Cline;
 using CodeyBox.Agents.Crock;
 using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Cmd;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
@@ -1394,6 +1395,23 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ContinueAgentRunner(
 // docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new QwenAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
+// Command Code: BYOK coding-agent CLI (npm command-code, binary `cmd`).
+// Driven one-shot via `cmd --local-only -p --output-format json
+// --no-session --skip-onboarding --yolo` (the -p one-shot contract with the
+// JSON event stream; a bare `cmd "prompt"` is interactive) with the prompt
+// on stdin (no positional query arg) and `--model` from the agent-class
+// member or the config-sourced default. Auth is a provider API key from the
+// environment (shipped mapping: CODEYBOX_CMD_API_KEY -> OPENROUTER_API_KEY,
+// resolved through the seeded providers.json `$OPENROUTER_API_KEY`
+// reference) plus a non-credential auth.json presence placeholder for
+// plan-less --local-only runs (see CmdAgentRunner/CmdConfigBuilder).
+// --yolo is mandatory (headless mode blocks writes without it) and
+// --local-only is mandatory (plan-less BYOK posture). The binary must be
+// installed in the sandbox image (pinned installer — see
+// docs/reference/sandbox-baselines.md); see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new CmdAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1908,6 +1926,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.Qwen, "CODEYBOX_QWEN_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Qwen, "CODEYBOX_QWEN_BASE_URL", "OPENAI_BASE_URL"),
         new AgentCredentialMapping(AgentKind.Qwen, "CODEYBOX_QWEN_MODEL", "OPENAI_MODEL"),
+        // Cmd: provider API-key auth read from the environment through the
+        // seeded providers.json `$OPENROUTER_API_KEY` reference (the file
+        // carries the reference, never the raw key — see CmdConfigBuilder).
+        // The shipped mapping covers the OpenRouter path the bundled
+        // AgentClasses member routes. Operators fronting other providers
+        // add that provider's variable here following the same row and seed
+        // the matching providers.json entry. The runner never emits the key
+        // on argv, and the auth.json presence placeholder is a
+        // non-credential constant (no Command Code plan is required for
+        // --local-only BYOK runs).
+        new AgentCredentialMapping(AgentKind.Cmd, "CODEYBOX_CMD_API_KEY", "OPENROUTER_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2688,6 +2717,16 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new QwenSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<QwenSmokeProbe>()));
+// Cmd: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// Cmd fronts 150+ providers behind one CLI, so no single endpoint validates
+// the credential and any provider call would spend real quota; the real auth
+// check happens on first CLI call in-VM. The Command Code account key is
+// deliberately not probed: plan-less --local-only BYOK runs satisfy the gate
+// with a non-credential placeholder, so absence of a vendor account is not
+// a failure.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new CmdSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CmdSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2713,6 +2752,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, KiloInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OmpInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, ContinueInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, QwenInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CmdInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2858,6 +2898,12 @@ builder.Services.AddSingleton<IAgentModelListProbe, ContinueModelListProbe>();
 // seed is authoritative; operator-configured ids absent from the seed
 // surface as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, QwenModelListProbe>();
+// Cmd model-list probe: the catalog is per provider and server-side, so it
+// cannot back a host-side startup probe. The curated CmdKnownModels seed is
+// served instead (warn-only validation); no quota-meter probe exists (cmd
+// status reports Command Code plan state, not the BYOK provider balance),
+// so members fall through to the NullQuotaProbe unknown path.
+builder.Services.AddSingleton<IAgentModelListProbe, CmdModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3865,6 +3911,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Omp] = new OmpCostExtractor(),
         [AgentKind.Continue] = new ContinueCostExtractor(),
         [AgentKind.Qwen] = new QwenCostExtractor(),
+        [AgentKind.Cmd] = new CmdCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3989,6 +4036,13 @@ builder.Services.AddSingleton<IAgentStreamParser, ContinueStreamParser>();
 // order against the Claude parser is irrelevant — bare Claude frames are
 // never claimed.
 builder.Services.AddSingleton<IAgentStreamParser, QwenStreamParser>();
+// Cmd claims its {"type":"event","event":{"type":…}} envelope (no other
+// registered CLI emits it) plus result lines carrying the cmd markers
+// (subtype vocabulary + usage + finalText — see CmdStreamParser); the claim
+// is narrow enough that registration order against Claude (which claims
+// every type:result line) needs no adjustment. Registered after Omp so the
+// shape owners' claim order is untouched.
+builder.Services.AddSingleton<IAgentStreamParser, CmdStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -4164,11 +4218,14 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
 {
     // Continue detector accepts operator-extensible patterns from
     // CodeyBox:QuotaFailurePatterns:continue, mirroring the kilo hook above.
+    // Cmd detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:cmd, mirroring the omp hook above.
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var extras = cbOpts.QuotaFailurePatterns is null
         ? null
         : cbOpts.QuotaFailurePatterns
             .Where(kvp => string.Equals(kvp.Key, AgentKind.Continue.Value, StringComparison.OrdinalIgnoreCase))
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Cmd.Value, StringComparison.OrdinalIgnoreCase))
             .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
             .Where(p => !string.IsNullOrEmpty(p.Pattern))
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
@@ -4189,6 +4246,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new QwenQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Cmd detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:cmd, mirroring the qwen hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Cmd.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new CmdQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();

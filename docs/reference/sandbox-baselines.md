@@ -208,6 +208,7 @@ first dispatch can actually run.
       "npm install -g --ignore-scripts autohand-cli@0.9.7",
       "npm install -g cline@3.0.62",
       "npm install -g @kilocode/cli@7.7.2",
+      "npm install -g command-code@1.54.2",
       "curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.2.2",
       "npm install -g @continuedev/cli@1.5.47",
       "mkdir -p /home/ubuntu/.continue && touch /home/ubuntu/.continue/.onboarding_complete && chown -R ubuntu:ubuntu /home/ubuntu/.continue",
@@ -244,6 +245,7 @@ The equivalent Incus executable provisioning is provider-local:
         "npm install -g --ignore-scripts autohand-cli@0.9.7",
         "npm install -g cline@3.0.62",
         "npm install -g @kilocode/cli@7.7.2",
+        "npm install -g command-code@1.54.2",
         "curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.2.2",
         "npm install -g @continuedev/cli@1.5.47",
         "mkdir -p /home/ubuntu/.continue && touch /home/ubuntu/.continue/.onboarding_complete && chown -R ubuntu:ubuntu /home/ubuntu/.continue",
@@ -447,4 +449,46 @@ keep equivalent pinned install steps so `security:gitleaks` and
     ]
   }
 }
+```
+
+Command Code runs one-shot headless (`cmd --local-only -p --output-format
+json --no-session --skip-onboarding --yolo` with the prompt on stdin,
+`-m openrouter/<model-id>`): `-p` is the one-shot contract (a bare
+`cmd "prompt"` is interactive), `--output-format json` is the runner's only
+transport, `--yolo` is what keeps headless mode from silently changing
+nothing (it blocks writes/edits/shell by default), and `--local-only` keeps
+BYOK traffic provider-side with no Command Code plan required. The
+post-install in-VM verification runs `cmd --version` plus a `-p --help`
+assertion for `--output-format`/`json` and `--yolo` (a build that dropped
+the transport or the autonomy flag is benched at bake time, not first
+dispatch). Provider credentials are NOT baked: the provider key arrives
+through the `CODEYBOX_CMD_API_KEY` → `OPENROUTER_API_KEY` credential mapping
+at dispatch time (resolved through the seeded `providers.json`
+`$OPENROUTER_API_KEY` reference — never a raw key), and the runner seeds the
+guest `~/.commandcode/` files during provisioning (`providers.json`:
+openrouter entry plus the model metadata; `auth.json`: a non-credential
+presence placeholder the print-mode gate requires for plan-less
+`--local-only` runs — see `CmdConfigBuilder`). The baseline image should
+pre-seed the same two files (same shapes, same placeholder, no secrets) so
+ad-hoc runs work:
+
+```sh
+mkdir -p ~/.commandcode
+cat > ~/.commandcode/providers.json << 'JSON'
+{
+  "provider": {
+    "openrouter": {
+      "name": "OpenRouter",
+      "baseURL": "https://openrouter.ai/api/v1",
+      "apiKey": "$OPENROUTER_API_KEY",
+      "models": { "nvidia/nemotron-3.5-lightning:free": {} }
+    }
+  }
+}
+JSON
+cat > ~/.commandcode/auth.json << 'JSON'
+{
+  "apiKey": "codeybox-local-only"
+}
+JSON
 ```
