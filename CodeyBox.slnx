@@ -18,6 +18,7 @@
     <Project Path="src/CodeyBox.Agents.Vibe/CodeyBox.Agents.Vibe.csproj" />
     <Project Path="src/CodeyBox.Agents.Cline/CodeyBox.Agents.Cline.csproj" />
     <Project Path="src/CodeyBox.Agents.Kilo/CodeyBox.Agents.Kilo.csproj" />
+    <Project Path="src/CodeyBox.Agents.Continue/CodeyBox.Agents.Continue.csproj" />
     <Project Path="src/CodeyBox.Agents.CavemanCode/CodeyBox.Agents.CavemanCode.csproj" />
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
     <Project Path="src/CodeyBox.AdminSeed/CodeyBox.AdminSeed.csproj" />

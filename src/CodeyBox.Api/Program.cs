@@ -19,6 +19,7 @@ using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Kilo;
+using CodeyBox.Agents.Continue;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
@@ -1323,6 +1324,23 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClineAgentRunner(
 builder.Services.AddSingleton<IAgentRunner>(sp => new KiloAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Kilo));
+// Continue: terminal-native CLI (npm @continuedev/cli, Apache-2.0; binary
+// `cn`, not `continue`) — no vendor account, provider API-key auth. Driven
+// one-shot via `cn --print --auto` (prompt on stdin — dodging the 128 KiB
+// MAX_ARG_STRLEN ceiling). --format json is deliberately NOT passed: it
+// coerces the model's answer into JSON rather than framing the transport.
+// Auth is a provider API key whose value the runner seeds into the guest
+// `~/.continue/config.yaml` single-model openrouter entry before dispatch
+// (shipped mapping: CODEYBOX_CONTINUE_API_KEY -> OPENROUTER_API_KEY): the
+// CLI selects the first models[] entry and reads the key exclusively from
+// that file. Inference endpoint comes from CodeyBox:Continue
+// (hot-reloadable). The binary must be installed in the sandbox image
+// (`npm install -g @continuedev/cli`, pinned — see
+// docs/reference/sandbox-baselines.md); see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new ContinueAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Continue));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1810,6 +1828,14 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // it). Operators fronting a different OpenAI-compatible backend
         // change CodeyBox:Kilo:BaseUrl; the key variable stays the same.
         new AgentCredentialMapping(AgentKind.Kilo, "CODEYBOX_KILO_API_KEY", "KILO_API_KEY"),
+        // Continue: provider API-key auth seeded into the guest config file.
+        // The runner writes the OPENROUTER_API_KEY bundle value into the
+        // single-model openrouter entry of ~/.continue/config.yaml (the CLI
+        // selects the first models[] entry and reads the key exclusively
+        // from that file — no env var backfills it). Operators fronting a
+        // different OpenAI-compatible backend change
+        // CodeyBox:Continue:BaseUrl; the key variable stays the same.
+        new AgentCredentialMapping(AgentKind.Continue, "CODEYBOX_CONTINUE_API_KEY", "OPENROUTER_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2569,6 +2595,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new KiloSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<KiloSmokeProbe>()));
+// Continue: credential-presence check only (OPENROUTER_API_KEY in the
+// bundle). Continue is a multi-provider front with no single lightweight
+// "whoami", and any provider call would spend real quota; the real auth
+// check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new ContinueSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<ContinueSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2591,6 +2624,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, PrimeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AutohandInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, ClineInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, KiloInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, ContinueInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2720,6 +2754,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, ClineModelListProbe>();
 // authoritative; operator-configured ids absent from the seed surface as a
 // startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, KiloModelListProbe>();
+// Continue model-list probe: the catalog is per provider and server-side,
+// so it cannot back a host-side startup probe. The curated
+// ContinueKnownModels seed is authoritative; operator-configured ids absent
+// from the seed surface as a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, ContinueModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3724,6 +3763,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Autohand] = new AutohandCostExtractor(),
         [AgentKind.Cline] = new ClineCostExtractor(),
         [AgentKind.Kilo] = new KiloCostExtractor(),
+        [AgentKind.Continue] = new ContinueCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -3832,6 +3872,10 @@ builder.Services.AddSingleton<IAgentStreamParser, ClineStreamParser>();
 // registered parser claims — opencode's own parser claims nothing, so order
 // against it is irrelevant.
 builder.Services.AddSingleton<IAgentStreamParser, KiloStreamParser>();
+// Continue emits plaintext in one-shot mode (no structured stream), so the
+// slot claims nothing — it exists so ResolveKind attributes Continue work
+// items to AgentKind.Continue rather than unknown (same as aider/opencode).
+builder.Services.AddSingleton<IAgentStreamParser, ContinueStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -3987,6 +4031,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new KiloQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Continue detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:continue, mirroring the kilo hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Continue.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new ContinueQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
@@ -6167,6 +6226,14 @@ namespace CodeyBox.Api
         /// <c>CODEYBOX_KILO_API_KEY</c> so the secret never sits in config.
         /// </summary>
         public KiloOptions Kilo { get; set; } = new();
+        /// Continue runner settings: the OpenAI-compatible inference
+        /// endpoint seeded into the guest <c>~/.continue/config.yaml</c>
+        /// single-model entry as <c>apiBase</c> (shipped as OpenRouter v1).
+        /// Hot-reloadable through <c>IOptionsMonitor</c>. The provider API
+        /// key itself is NOT here — it arrives through the credential chain
+        /// as <c>CODEYBOX_CONTINUE_API_KEY</c> so the secret never sits in
+        /// config.
+        public ContinueOptions Continue { get; set; } = new();
 
         /// <summary>
         /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting

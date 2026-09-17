@@ -14,7 +14,8 @@
       "autohand": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
       "vibe": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
       "cline": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
-      "kilo": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)"
+      "kilo": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
+      "continue": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)"
     },
     "notes": {
       "opencode": "OpenCode Go is subscription-priced ($12 per 5h usage budget on https://opencode.ai/docs/go). Each model entry uses one subscription-equivalent USD/M rate for input, cached input, and output: ($12 ÷ requests-per-5h) ÷ ((typical input + cached + output tokens per request) ÷ 1e6), using the request limits and typical token mix published on that page. Keys use opencode-go/<model-id>. Cost attribution charges the stored non-cached input bucket and cached input bucket separately; public total-input reporting adds them.",
@@ -32,7 +33,8 @@
       "autohand":  "Autohand is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched --model id. The bare headless stream carries no machine-readable usage frame, so cost attribution records no row (unknown) until a build emits usage events; the bucket exists so a future usage-bearing build prices the shipped model correctly. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same --model id form.",
       "vibe":     "Vibe is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model (guest alias nemotron-free), which bills $0 — the bucket records that zero rate explicitly keyed by the provider id behind the alias (nvidia/nemotron-3.5-lightning:free). Vibe programmatic history entries carry no token counts, so the cost extractor reports unknown and per-run rows fall back to elapsed-time attribution; operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the provider id behind their guest alias.",
       "cline":  "Cline is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched -m id (verified live: the run_result frame reports totalCost 0 and the model id in model.id). Keys are the provider-native ids cline reports verbatim in run_result.model.id. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same id form.",
-      "kilo":      "Kilo is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched -m id (verified live: the step-finish frame reports cost 0). Keys are the full -m dispatch ids (provider/ qualifier retained, e.g. openai-compatible/nvidia/nemotron-3.5-lightning:free) because the stream carries no model id and attribution falls through to the AgentDefaults-derived rate. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same -m id form."
+      "kilo":      "Kilo is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched -m id (verified live: the step-finish frame reports cost 0). Keys are the full -m dispatch ids (provider/ qualifier retained, e.g. openai-compatible/nvidia/nemotron-3.5-lightning:free) because the stream carries no model id and attribution falls through to the AgentDefaults-derived rate. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same -m id form.",
+      "continue":  "Continue is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the seeded guest-config model id. The headless transport carries no machine-readable usage frame (only usage lives in the guest session files the extractor cannot reach), so the cost extractor reports unknown and per-run rows fall back to elapsed-time attribution; the bucket exists so a future usage-bearing build prices the shipped model correctly. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same model id form."
     }
   },
   "DefaultRates": {
@@ -114,6 +116,9 @@
     },
     "kilo": {
       "openai-compatible/nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
+    },
+    "continue": {
+      "nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
     }
   }
 }

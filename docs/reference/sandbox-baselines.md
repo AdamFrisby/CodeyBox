@@ -207,6 +207,8 @@ first dispatch can actually run.
       "npm install -g --ignore-scripts autohand-cli@0.9.7",
       "npm install -g cline@3.0.62",
       "npm install -g @kilocode/cli@7.7.2",
+      "npm install -g @continuedev/cli@1.5.47",
+      "mkdir -p /home/ubuntu/.continue && touch /home/ubuntu/.continue/.onboarding_complete && chown -R ubuntu:ubuntu /home/ubuntu/.continue",
       "curl -fsSL https://cursor.com/install | bash",
       "curl -fsSL https://aider.chat/install.sh | bash",
       "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -239,6 +241,8 @@ The equivalent Incus executable provisioning is provider-local:
         "npm install -g --ignore-scripts autohand-cli@0.9.7",
         "npm install -g cline@3.0.62",
         "npm install -g @kilocode/cli@7.7.2",
+        "npm install -g @continuedev/cli@1.5.47",
+        "mkdir -p /home/ubuntu/.continue && touch /home/ubuntu/.continue/.onboarding_complete && chown -R ubuntu:ubuntu /home/ubuntu/.continue",
         "curl -fsSL https://cursor.com/install | bash",
         "curl -fsSL https://aider.chat/install.sh | bash",
         "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python python3.12 aider-chat==0.86.2",
@@ -349,6 +353,22 @@ credentials are NOT baked: the runner seeds the guest
 `~/.config/kilo/kilo.jsonc` (openai-compatible provider block plus the
 mandatory `models` allowlist entry) from the `CODEYBOX_KILO_API_KEY` bundle
 at dispatch time.
+Continue runs one-shot headless (`cn --print --auto` with the prompt on
+stdin — no positional prompt argument): `--auto` allows every tool (the
+sandbox VM is throwaway with no human to approve anything), and `--print`
+is the runner's only transport — `--format json` is deliberately NOT passed
+(it coerces the model's answer into JSON rather than framing the transport).
+The post-install in-VM verification runs `cn --version` plus a `--help`
+assertion for `--print` and `--auto` (a build that dropped the transport or
+the autonomy flag is benched at bake time, not first dispatch). The bake
+must also create the first-run onboarding marker for the sandbox user (the
+provisioning `runcmd` runs as root, so `~` would be the wrong home):
+`mkdir -p /home/ubuntu/.continue && touch
+/home/ubuntu/.continue/.onboarding_complete && chown -R ubuntu:ubuntu
+/home/ubuntu/.continue`. Provider credentials are NOT baked: the runner
+seeds the guest `~/.continue/config.yaml` (single-model `openrouter` entry
+with `apiBase` + literal `apiKey`, mode 0600) from the
+`CODEYBOX_CONTINUE_API_KEY` bundle at dispatch time.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
 on `$PATH` after the bake. Prime installs a self-contained `prime-agent`
 binary on PATH (no runtime needed); the installer resolves the latest stable
