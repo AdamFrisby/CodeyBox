@@ -1565,3 +1565,106 @@ relayed provider errors (`No cookie auth credentials found` → Unauthorized;
 with operator-extensible rows under `CodeyBox:QuotaFailurePatterns:kilo`.
 `Model not found` and `Unexpected server error` are deliberately unmatched —
 configuration and generic give-up shapes, not quota/auth evidence.
+
+### OMP (`omp`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against omp 18.2.2, 2026-09-16):
+
+```sh
+curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.2.2
+```
+
+MIT-licensed ([repo](https://github.com/can1357/oh-my-pi)). npm package
+`@oh-my-pi/pi-coding-agent` (binary `omp`); the prebuilt binary needs no
+runtime, while the `bun install -g @oh-my-pi/pi-coding-agent` path needs
+Bun ≥ 1.3.14. The `--binary --ref v18.2.2` pin keeps the bake
+deterministic — bump it only after re-verifying the headless contract
+below. Beware the fork `@oh-labs/oh-omp` (binary `oh-omp`): it is a
+different project and does NOT satisfy the runner or its in-VM probe.
+
+OMP is the oh-my-pi fork of pi, sharing its lineage, event vocabulary, and
+`--mode json` / `-p` surface — but it is driven by a dedicated
+`OmpAgentRunner`, not a mode of the pi adapter: the binary name differs, pi's
+`--offline` flag is absent (emitting it would fail the dispatch), exit codes
+are non-zero on terminal failures (pi exits 0), the `agent_end` frame nests
+the assistant message in a `messages` array rather than a `message`
+envelope, and `--thinking` accepts an additional `auto` level. The fork
+boundary is the honest seam — sharing an adapter would couple two CLIs
+whose flags, exit contracts, and event envelopes drift independently.
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with the prompt on stdin and NO positional prompt argument:
+
+```sh
+omp -p --mode json --no-session [--model <model-id>] [--thinking <level>]
+```
+
+A bare `omp "prompt"` is **interactive** — the `-p/--print` flag is what
+makes the run process the prompt, stream to stdout, and exit without
+entering the TUI. The prompt travels on stdin with no positional instead
+(verified: piped-stdin prompts produced replies normally, including a
+file-creating repo-edit run): Linux's `MAX_ARG_STRLEN` is 128 KiB per argv
+element and rework prompts can exceed it. `--mode json` is the runner's only
+transport: raw `-p` prints only the final response text (usage, the dispatch
+model id, and the terminal error shape would be unrecoverable), and
+`--mode rpc` needs a driver loop for no additional one-shot signal.
+Observed `--mode json` frames (pi-family envelope): `session` (v3) /
+`agent_start` / `turn_start` / `message_start` / `message_update` (thinking
+and text deltas) / `message_end` (terminal usage on
+`message.usage {input, output, cacheRead, cacheWrite, totalTokens,
+reasoningTokens}` plus the dispatch model on `message.model` and — on
+failure — `stopReason: "error"` with `errorMessage`) / `turn_end` /
+`agent_end` (`messages` array with `isTerminal: true`). Exit codes are 0
+(success) and 1 (model/auth failure). `--thinking` maps 1:1 from the
+agent-class member's reasoning mode (verified levels: `off`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, `max`, `auto`); anything else is ignored
+so a typo cannot fail a dispatch. Deliberately never passed: `--offline`
+(absent from `omp --help`), `--provider` (legacy — the model id plus the
+provider env key resolves the route for both `openrouter/…`-qualified and
+bare ids), `--approval-mode`/`--auto-approve` (`tools.approvalMode` already
+defaults to `yolo`, so nothing needs defeating for unattended use), and any
+trust override.
+
+**Authentication — provider env keys, no config seeding.** `OPENROUTER_API_KEY`
+is documented directly, with `OPENAI_BASE_URL` as a fallback; custom
+providers live in `~/.omp/agent/models.yml` (`baseUrl`, `api: openai-completions`,
+`apiKey` taking an env-var name or a literal). The runner passes no
+`--api-key`, so the secret never appears in argv — it arrives through the
+shipped mapping (host `CODEYBOX_OMP_API_KEY` → `OPENROUTER_API_KEY`). The
+guest needs `openrouter.ai` on `CodeyBox:AgentAllowedHosts` (shipped in the
+default) for the OpenRouter route. A `$0`-spend-limit OpenRouter key only
+serves ids ending `:free` — a paid id fails with `Key limit exceeded (total
+limit)`, which the detector parks as quota exhaustion. The `openrouter/`
+qualifier is accepted on `--model` but the stream reports `message.model` in
+bare provider-catalog form, so pricing keys and the shipped default use the
+bare form. Never commit a provider key: `gitleaks` CI matches this key's shape.
+
+**Terminal failures.** The runner lifts the `stopReason: "error"` frame into
+`TerminalDiagnostic`, so the pipeline's no-changes branch parks quota/auth
+give-ups instead of dead-lettering them as "produced no changes". A missing
+key exits 1 with `No API key found for <provider>.` on stderr (stdout
+carries only the session header — both streams are scanned). A missing
+binary surfaces as exit 127 + command-not-found, classified as
+infrastructure — never as "no changes".
+
+**Cost.** The stream carries usage, so cost attribution records real rows
+(fresh `input`, cached `cacheRead`, `output`; `reasoningTokens`/`cacheWrite`
+have no bucket and are ignored). The dispatch model id rides the same
+frames, so snapshots record it and pricing resolves per model; no built-in
+fallback rate is shipped (no single rate is honest across the ~60 providers
+omp fronts) — the shipped free-tier member bills $0 via the explicit
+zero-rate bucket.
+
+**Quota probe.** Ships as Unknown-only: `omp usage` only reports
+login-account balances (verified: with an env-key-only credential it prints
+"No credentials found"), not the env-key path the runner uses — so no probe
+is registered (an agent with no readable quota meter must not ship a probe
+that fabricates one) and members fall through to the `NullQuotaProbe`
+unknown path. The router's `QuotaUnknownPolicy` (default
+`UseObservedFailures`) gates dispatch via observed failure history, and
+`OmpQuotaFailureDetector` classifies the relayed provider errors
+(`No API key found` → Unauthorized; `Key limit exceeded` → LimitReached;
+shared 429 rows → RateLimitExceeded) with operator-extensible rows under
+`CodeyBox:QuotaFailurePatterns:omp`.

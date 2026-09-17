@@ -26,6 +26,7 @@ tooling, not in the agent runner contract.
 | `vibe`      | `vibe`            | `OPENROUTER_API_KEY` (provider API key; the variable named by the guest config's `[[providers]] api_key_env_var` — see [Vibe quirks](../reference/agent-quirks.md#vibe-vibe)) | `CODEYBOX_VIBE_API_KEY` |
 | `cline`     | `cline`           | `OPENROUTER_API_KEY` (provider API key read directly from the environment — no config file required; other providers use their own variable matching `CodeyBox:Cline:Provider` — see [Cline quirks](../reference/agent-quirks.md#cline-cli-cline)) | `CODEYBOX_CLINE_API_KEY` |
 | `kilo`      | `kilo`            | `KILO_API_KEY` (the runner seeds the same bundle value into guest `~/.config/kilo/kilo.jsonc` — the CLI reads the key only from that file on the openai-compatible path — see [Kilo quirks](../reference/agent-quirks.md#kilo-code-kilo)) | `CODEYBOX_KILO_API_KEY` |
+| `omp`       | `omp`             | `OPENROUTER_API_KEY` (provider API key documented directly by the CLI; `OPENAI_BASE_URL` is the fallback and custom providers live in `~/.omp/agent/models.yml` — see [OMP quirks](../reference/agent-quirks.md#omp-omp)) | `CODEYBOX_OMP_API_KEY` |
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
@@ -66,6 +67,7 @@ the most common cause of fresh-class dispatch failures.
 | `vibe` | `curl -LsSf https://mistral.ai/vibe/install.sh \| bash`, `uv tool install mistral-vibe`, or `pip install mistral-vibe` (pin with `uv tool install mistral-vibe@<version>`, e.g. `mistral-vibe==2.25.4`) | Needs Python 3.10+ on the image. Installs the `vibe` binary (plus a separate `vibe-acp` binary CodeyBox does not use). The guest also needs a `~/.vibe/config.toml` defining the provider and model alias (see [Vibe quirks](../reference/agent-quirks.md#vibe-vibe) and [sandbox baselines](../reference/sandbox-baselines.md)). |
 | `cline` | `npm install -g cline@3.0.62` | Apache-2.0; ships platform binaries, needs no runtime. Version-pinned for reproducible bakes — re-verify the headless contract before bumping. See [Cline quirks](../reference/agent-quirks.md#cline-cli-cline). |
 | `kilo` | `npm install -g @kilocode/cli@7.7.2` | MIT-licensed (Kilo Code Customs LLC); needs Node.js on the image. Version-pinned for reproducible bakes — re-verify the headless contract (`run --auto --format json`) before bumping. See [Kilo quirks](../reference/agent-quirks.md#kilo-code-kilo). |
+| `omp` | `curl -fsSL https://omp.sh/install \| sh -s -- --binary --ref v18.2.2` (or `bun install -g @oh-my-pi/pi-coding-agent`) | MIT-licensed (oh-my-pi fork of pi); installs the `omp` binary. NOT the `oh-omp` fork, which is a different project shipping a different binary. Version-pinned for reproducible bakes — re-verify the headless contract (`-p --mode json`) before bumping. See [OMP quirks](../reference/agent-quirks.md#omp-omp). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. Multipass and Incus keep independent bake
@@ -188,6 +190,7 @@ credentials before they waste expensive compute.
 | `pi` | *(no network call — pi fronts 30+ providers, so no single endpoint validates the credential)* — verifies the bundle carries `ANTHROPIC_API_KEY`; real auth check happens on first CLI call | `ANTHROPIC_API_KEY` |
 | `aider` | *(no network call — aider fronts many providers through litellm, so no single endpoint validates the credential)* — verifies the bundle carries `OPENROUTER_API_KEY`; real auth check happens on first CLI call | `OPENROUTER_API_KEY` |
 | `kilo` | *(no network call — kilo fronts hundreds of models, so no single endpoint validates the credential)* — verifies the bundle carries `KILO_API_KEY`; real auth check happens on first CLI call | `KILO_API_KEY` |
+| `omp` | *(no network call — omp fronts ~60 providers, so no single endpoint validates the credential)* — verifies the bundle carries `OPENROUTER_API_KEY`; real auth check happens on first CLI call | `OPENROUTER_API_KEY` |
 
 Each probe sends the minimal possible request (`max_tokens=1`). A 2xx response
 means the credential is valid. 401/403 is classified as `"auth"` failure.
