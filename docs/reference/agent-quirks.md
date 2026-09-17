@@ -1668,3 +1668,126 @@ unknown path. The router's `QuotaUnknownPolicy` (default
 (`No API key found` → Unauthorized; `Key limit exceeded` → LimitReached;
 shared 429 rows → RateLimitExceeded) with operator-extensible rows under
 `CodeyBox:QuotaFailurePatterns:omp`.
+
+### Continue (`cn`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against @continuedev/cli 1.5.47, 2026-09-16):
+
+```sh
+npm install -g @continuedev/cli@1.5.47
+```
+
+Apache-2.0 ([repo](https://github.com/continuedev/continue)). npm package
+`@continuedev/cli` installs the binary as **`cn`**, not `continue`; needs
+Node.js on the image. The `@1.5.47` pin keeps the bake deterministic — bump
+it only after re-verifying the headless contract below, because flag names
+move (upstream puts tool approval behind `--allow`/`--auto` variants).
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with the prompt on stdin and NO positional prompt argument:
+
+```sh
+cn --print --auto
+```
+
+`--print` is the one-shot contract the agent-orchestrator project bans in
+its tests precisely because it exits after one turn — one turn is exactly
+what CodeyBox wants (non-interactive, throwaway VM, no terminal, no human).
+The prompt travels on stdin (verified: a piped-stdin prompt produced the
+reply normally): Linux's `MAX_ARG_STRLEN` is 128 KiB per argv element and
+rework prompts can exceed it. `--auto` allows every tool without approval —
+headless mode already forces auto mode internally, so the flag pins the
+behaviour rather than enabling it; without tool approval the agent can talk
+but cannot change anything, which reads as "no changes" and is
+misdiagnosed. `--format json` is deliberately NOT passed: it is not a
+machine envelope but a prompt-level coercion forcing the MODEL's final
+response to be JSON (`{"message": "…"}` on a plain reply, `{"status": "…"}`
+when the model answers in kind — verified live), which would corrupt work
+output. Success output is the model's plain text on stdout (which may
+legitimately be empty when the work landed in files); provider failures
+surface as a `{"status":"error","message":"…"}` envelope on stdout. Exit
+codes are 0 either way — including on failure — so the runner lifts the
+envelope into `TerminalDiagnostic` (see below). `cn` exposes no reasoning
+flag on the headless path, so reasoning effort is never mapped, and
+`--model` (a hub-slug adder) cannot select a config entry, so no model flag
+is emitted. `--resume`/`--fork` session handling is irrelevant one-shot.
+
+**Authentication — provider key in seeded config, no Continue account.**
+Verified live with no Continue login: the CLI reads the provider key from
+`config.yaml` (`~/.continue/config.yaml` by default). The runner seeds that
+file before every dispatch via the credential-file writer (stdin transport,
+mode 0600) with a single model entry — first-class `provider: openrouter`
+with `apiBase` + the literal `apiKey` from the shipped mapping (host
+`CODEYBOX_CONTINUE_API_KEY` → `OPENROUTER_API_KEY`). The `${{ secrets.X }}`
+template form also resolves against process env (verified live), but the
+runner writes the literal key instead — one fewer resolution mechanism to
+drift — and there is no `OPENROUTER_API_KEY` env-var shortcut (only
+`ANTHROPIC_API_KEY` is special-cased, for config auto-creation when no
+`--config` is given). The inference endpoint comes from the hot-reloadable
+`CodeyBox:Continue:BaseUrl` knob (shipped as OpenRouter v1); the guest needs
+`openrouter.ai` on `CodeyBox:AgentAllowedHosts` (shipped in the default) for
+the OpenRouter route. A `$0`-spend-limit OpenRouter key only serves ids
+ending `:free` — the CLI picks its own paid default when unpinned, so the
+runner always pins the entry to the dispatch model; a paid id fails with
+`Key limit exceeded (total limit)`, which the detector parks as quota
+exhaustion. Never commit a provider key: `gitleaks` CI matches this key's
+shape.
+
+**Model selection is first-entry-wins.** Verified live with two different
+free models in one file: the run served the FIRST `models[]` entry, and
+`--model <entry-name>` did not switch entries. The runner therefore seeds
+exactly ONE entry — the explicit member model, else the config-sourced
+default — so a per-member `ModelId` can never silently dispatch the wrong
+model; with neither, dispatch fails fast naming the missing model instead
+of writing a modelless file the CLI rejects.
+
+**The first-run onboarding gate.** Continue issue #12258 (still open):
+first-run onboarding fires even with a valid config. The bake creates the
+marker for the sandbox user as part of provisioning (the provisioning
+`runcmd` runs as root, so `~` would be the wrong home — and a root-owned
+`~/.continue` would additionally block the CLI's session writes):
+
+```sh
+mkdir -p /home/ubuntu/.continue && touch /home/ubuntu/.continue/.onboarding_complete && chown -R ubuntu:ubuntu /home/ubuntu/.continue
+```
+
+With the seeded config in place headless runs skip onboarding regardless,
+so the marker is belt-and-braces. The CLI also phones home to
+`api.continue.dev` on startup for an update check; when unreachable the
+check degrades to idle (caught in-code) and the pinned bake version runs —
+no `NODE_ENV` override is set to suppress it, because that flag's side
+effects on model behaviour are unverified.
+
+**Terminal failures.** The runner lifts the `{"status":"error",…}` envelope
+into `TerminalDiagnostic`, so the pipeline's no-changes branch parks
+quota/auth give-ups instead of dead-lettering them as "produced no
+changes". A $0-spend-limit key against a paid model exits 0 with
+`403 Key limit exceeded (total limit)…`; the onboarding-gate interceptor
+failure shares the envelope shape with a different message and classifies
+the same way (it is deliberately NOT a quota signal — see below). A missing
+binary surfaces as exit 127 + command-not-found, classified as
+infrastructure — never as "no changes".
+
+**Cost.** The headless transport carries no token counts (verified:
+plain-text replies, empty replies, and the error envelope alike), and usage
+lives only in the guest's `~/.continue/sessions/*.json` history files,
+which the extractor cannot reach (and must not chase by recency —
+concurrent runs would cross-attribute). Cost attribution therefore records
+unknown (null — never a zero snapshot that looks like measured data) and no
+built-in fallback rate is shipped — the shipped free-tier member bills $0
+via the explicit zero-rate bucket.
+
+**Quota probe.** Ships as Unknown-only: `cn` exposes no quota-balance
+endpoint, so no probe is registered (an agent with no readable quota meter
+must not ship a probe that fabricates one) and members fall through to the
+`NullQuotaProbe` unknown path. The router's `QuotaUnknownPolicy` (default
+`UseObservedFailures`) gates dispatch via observed failure history, and
+`ContinueQuotaFailureDetector` classifies the relayed provider errors (`Key
+limit exceeded` → LimitReached; shared 429 rows → RateLimitExceeded;
+standard relay auth vocabulary → Unauthorized) with operator-extensible rows
+under `CodeyBox:QuotaFailurePatterns:continue`. The onboarding-gate
+interceptor message is deliberately unmatched — an
+environment/provisioning signal, not quota/auth evidence — as is bare
+quota/401 prose from reviewed repository content.
