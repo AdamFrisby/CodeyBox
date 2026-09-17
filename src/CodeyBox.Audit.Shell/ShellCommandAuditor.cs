@@ -186,18 +186,56 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         // makes invocation refusals (e.g. VSTest rejecting a test source) much
         // harder to identify.
         var execArgv = BuildExecArgv();
-        var result = await sandbox.ExecAsync(new SandboxExec
+        var maxAttempts = Math.Max(1, _opts.TransportRetryMaxAttempts);
+        var timeProvider = _opts.TimeProvider ?? TimeProvider.System;
+        for (var attempt = 1; ; attempt++)
         {
-            Argv = execArgv,
-            WorkingDirectory = workingDirectory,
-            ExtraEnvironment = environment,
-        }, ct);
+            var result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = execArgv,
+                WorkingDirectory = workingDirectory,
+                ExtraEnvironment = environment,
+            }, ct);
 
-        var combinedOutput = CombinedOutput(result);
+            var combinedOutput = CombinedOutput(result);
 
-        if (result.ExitCode == 0 && !result.ExecutionUnavailable)
-            return new AuditResult(true, [], RawOutput: combinedOutput);
+            if (result.ExitCode == 0 && !result.ExecutionUnavailable)
+                return new AuditResult(true, [], RawOutput: combinedOutput);
 
+            // A dropped exec channel produced no verdict: the command did not
+            // run to completion, so there is nothing attributable to the code
+            // under review. Retry with backoff rather than recording a finding
+            // against the diff — a transport-shaped finding would burn a rework
+            // iteration on an unfixable outcome and park the item as though the
+            // diff were at fault. Only when the bounded retries are exhausted
+            // does this surface, as infrastructure (AuditUnavailableException),
+            // with no finding recorded from any attempt.
+            if (ExecTransportFailure.IsTransportFailure(result))
+            {
+                if (attempt < maxAttempts)
+                {
+                    await Task.Delay(ComputeTransportRetryDelay(attempt), timeProvider, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                throw TransportFailureExhausted(result, combinedOutput, maxAttempts);
+            }
+
+            return await ClassifyFailedCommandAsync(
+                sandbox, workingDirectory, context, toolName, execArgv, result, combinedOutput, ct);
+        }
+    }
+
+    private async Task<AuditResult> ClassifyFailedCommandAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        string toolName,
+        IReadOnlyList<string> execArgv,
+        SandboxExecResult result,
+        string combinedOutput,
+        CancellationToken ct)
+    {
         var finding = BuildCommandFinding(result, toolName, execArgv);
         if (_opts.ResultClassifier is not null)
         {
@@ -232,6 +270,50 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         }
 
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
+    }
+
+    /// <summary>
+    /// Exponential backoff between exec-transport retries: the base delay
+    /// doubling per attempt, capped at the configured maximum. Overflow-safe:
+    /// doubling stops before it could exceed <see cref="long.MaxValue"/>.
+    /// </summary>
+    private TimeSpan ComputeTransportRetryDelay(int attempt)
+    {
+        var baseDelay = _opts.TransportRetryBaseDelay;
+        if (baseDelay <= TimeSpan.Zero)
+            return TimeSpan.Zero;
+        var maxDelay = _opts.TransportRetryMaxDelay > TimeSpan.Zero
+            ? _opts.TransportRetryMaxDelay
+            : baseDelay;
+        var delayTicks = baseDelay.Ticks;
+        for (var i = 1; i < attempt && delayTicks <= long.MaxValue / 2; i++)
+            delayTicks *= 2;
+        return new TimeSpan(Math.Min(delayTicks, maxDelay.Ticks));
+    }
+
+    /// <summary>
+    /// Builds the infrastructure failure for exhausted exec-transport retries.
+    /// Deliberately non-deterministic (a plain retry may succeed), so the
+    /// pipeline routes it to the infrastructure failure path instead of
+    /// spending deterministic-configuration handling on it — and, crucially,
+    /// records no finding, so the audit record distinguishes "this auditor
+    /// could not run" from "this auditor ran and found a problem".
+    /// </summary>
+    private AuditUnavailableException TransportFailureExhausted(
+        SandboxExecResult result,
+        string combinedOutput,
+        int maxAttempts)
+    {
+        var diagnostic = ExecTransportFailure.FirstDiagnosticLine(combinedOutput);
+        var evidence = diagnostic.Length == 0
+            ? "exec-transport diagnostic"
+            : $"'{diagnostic}'";
+        return new AuditUnavailableException(
+            $"could-not-verify: auditor '{Name}' could not run: the sandbox exec transport dropped " +
+            $"(exit {ExecTransportFailure.TransportFailureExitCode} with {evidence}) on all {maxAttempts} attempt(s). " +
+            "No verdict was produced, so no finding was recorded.",
+            result.ExitCode,
+            combinedOutput);
     }
 
     /// <summary>
@@ -305,15 +387,34 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         var severity = missingTool
             ? MissingToolSeverity()
             : AuditSeverity.Error;
+        // The title is a bounded summary, never the command: a wrapped
+        // invocation (e.g. the NuGet-home self-heal preamble) would otherwise
+        // dump a multi-line script into every audit-progress record. The exact
+        // executed command belongs in the description, where the transcript
+        // already lives.
         var title = missingTool
             ? $"tool not installed in sandbox: {toolName} (auditor skipped — install the tool in MultipassExtraRuncmd)"
-            : $"command exited {result.ExitCode}: {string.Join(' ', execArgv)}";
+            : $"command exited {result.ExitCode}";
 
+        if (missingTool)
+        {
+            return new AuditFinding(
+                AuditorName: Name,
+                Severity: severity,
+                Title: title,
+                Description: description.TrimEnd());
+        }
+
+        var commandLine = string.Join(' ', execArgv);
+        var output = description.TrimEnd();
+        var fullDescription = output.Length == 0
+            ? $"Command: {commandLine}"
+            : $"Command: {commandLine}\n\n{output}";
         return new AuditFinding(
             AuditorName: Name,
             Severity: severity,
             Title: title,
-            Description: description.TrimEnd());
+            Description: fullDescription);
     }
 
     private static string CombinedOutput(SandboxExecResult result)
@@ -412,4 +513,32 @@ public sealed record ShellCommandAuditorOptions
     /// no-op on a healthy home and for non-dotnet commands.
     /// </summary>
     public bool SelfHealNuGetHome { get; init; }
+
+    /// <summary>
+    /// Total exec attempts (initial try plus retries) when the sandbox exec
+    /// transport drops mid-command (exit 255 with an abnormal-closure
+    /// diagnostic). A dropped channel produced no verdict, so a plain retry
+    /// usually recovers; only when every attempt drops does the run surface as
+    /// infrastructure with no finding recorded. Must be at least 1; smaller
+    /// values behave as 1.
+    /// </summary>
+    public int TransportRetryMaxAttempts { get; init; } = 3;
+
+    /// <summary>
+    /// Base delay between exec-transport retries. The actual wait doubles per
+    /// attempt (base, 2x base, ...) up to <see cref="TransportRetryMaxDelay"/>.
+    /// </summary>
+    public TimeSpan TransportRetryBaseDelay { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Cap for the exponential exec-transport retry backoff.
+    /// </summary>
+    public TimeSpan TransportRetryMaxDelay { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Clock used for exec-transport retry backoff delays. Null (the default)
+    /// uses <see cref="TimeProvider.System"/>; tests inject a fake to keep
+    /// retry tests deterministic.
+    /// </summary>
+    public TimeProvider? TimeProvider { get; init; }
 }

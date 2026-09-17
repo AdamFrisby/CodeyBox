@@ -122,7 +122,8 @@ public sealed class DotnetTestInvocationRegressionTests
         Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
         var expected = string.Join(' ', sandbox.Captured.Single().Argv);
-        Assert.Equal($"command exited 1: {expected}", finding.Title);
+        Assert.Equal("command exited 1", finding.Title);
+        Assert.Contains(expected, finding.Description, StringComparison.Ordinal);
         Assert.Equal("dotnet test --no-build", expected);
     }
 
@@ -141,7 +142,8 @@ public sealed class DotnetTestInvocationRegressionTests
         var executed = sandbox.Captured.Single().Argv;
         Assert.Equal("sh", executed[0]);
         Assert.NotEqual<string>(["dotnet", "test", "--no-build"], [.. executed]);
-        Assert.Equal($"command exited 1: {string.Join(' ', executed)}", finding.Title);
+        Assert.Equal("command exited 1", finding.Title);
+        Assert.Contains(string.Join(' ', executed), finding.Description, StringComparison.Ordinal);
     }
 
     [Theory]

@@ -146,8 +146,9 @@ public sealed class AuditPresetsAndDeterministicAuditorsTests
         Assert.Equal("format stdout\nformat stderr", result.RawOutput);
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Contains("command exited 2", finding.Title, StringComparison.Ordinal);
-        Assert.Equal("format stderr", finding.Description);
+        Assert.Equal("command exited 2", finding.Title);
+        Assert.Contains("Command: dotnet format --verify-no-changes", finding.Description, StringComparison.Ordinal);
+        Assert.Contains("format stderr", finding.Description, StringComparison.Ordinal);
         Assert.Equal(AuditCapabilities.None, auditor.Required);
     }
 
