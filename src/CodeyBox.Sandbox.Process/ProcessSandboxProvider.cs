@@ -24,6 +24,7 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
     }
 
     public string Name => "process";
+    public IReadOnlyList<string> DeclaredCapabilities => [];
 
     /// <inheritdoc/>
     /// <remarks>

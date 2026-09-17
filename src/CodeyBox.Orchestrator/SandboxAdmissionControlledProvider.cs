@@ -204,6 +204,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public SandboxIsolationLevel IsolationLevel => _inner.IsolationLevel;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+    public virtual IReadOnlyList<string> DeclaredCapabilities => _inner.DeclaredCapabilities;
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {

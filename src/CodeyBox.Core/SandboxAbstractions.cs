@@ -120,6 +120,13 @@ public interface ISandboxProvider : IManagedSandboxLifecycle
     SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Attached;
 
     /// <summary>
+    /// Capabilities declared by this provider implementation. Matched using
+    /// exact ordinal (case-insensitive) equality against placement requirements.
+    /// Default implementation returns empty so providers are not forced to change.
+    /// </summary>
+    IReadOnlyList<string> DeclaredCapabilities => [];
+
+    /// <summary>
     /// Provisions a sandbox according to the given spec. The returned handle
     /// holds the running sandbox until disposed; disposal must tear it down
     /// regardless of state.

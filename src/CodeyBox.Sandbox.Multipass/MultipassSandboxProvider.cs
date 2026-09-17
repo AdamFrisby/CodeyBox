@@ -54,6 +54,18 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 {
     public const string ProviderId = "multipass";
 
+    private static readonly string[] Capabilities =
+    [
+        SandboxCapabilities.BaselineBake,
+        SandboxCapabilities.CacheSeeding,
+        SandboxCapabilities.DiskGuard,
+        SandboxCapabilities.PortPublishing,
+        SandboxCapabilities.SuspendResume,
+        SandboxCapabilities.Teardown,
+    ];
+
+    public IReadOnlyList<string> DeclaredCapabilities => Capabilities;
+
     private const string PurposeMarkerFile = ".codeybox-purpose";
 
     // Options are resolved through a delegate once per public operation so an
