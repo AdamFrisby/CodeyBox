@@ -117,7 +117,7 @@ public sealed class SandboxStartupConfigurationUatTests
             },
             projects: new InMemoryProjectRepository());
 
-        var ex = Assert.Throws<InvalidOperationException>(() =>
+        var ex = Assert.Throws<RequiredConfigurationException>(() =>
             factory.Services.GetRequiredService<ISandboxProvider>());
 
         Assert.Contains("SandboxProvider must be set", ex.Message);
@@ -138,7 +138,7 @@ public sealed class SandboxStartupConfigurationUatTests
             },
             projects: new InMemoryProjectRepository());
 
-        var ex = Assert.Throws<InvalidOperationException>(() =>
+        var ex = Assert.Throws<RequiredConfigurationException>(() =>
             factory.Services.GetRequiredService<ISandboxProvider>());
 
         Assert.Contains("UNSAFE outside Development", ex.Message);

@@ -48,7 +48,7 @@ public sealed class ChangelogStartupTests
             ["CodeyBox:Changelog:Enabled"] = "true",
         });
 
-        var ex = Assert.Throws<InvalidOperationException>(() =>
+        var ex = Assert.Throws<RequiredConfigurationException>(() =>
             Program.ValidateChangelogWebhookConfiguration(config, new StubHostEnvironment("Production")));
 
         Assert.Contains("CodeyBox:Changelog:GitHubWebhookSecretEnvVar", ex.Message);

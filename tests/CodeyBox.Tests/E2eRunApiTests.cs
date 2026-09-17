@@ -271,7 +271,7 @@ public sealed class E2eRunApiTests : IDisposable
         using var env = ConfigureRequiredProductionChangelogSecret();
         using var factory = new E2ePoolWiringFactory("local", environment: "Production");
 
-        var ex = Assert.Throws<InvalidOperationException>(() =>
+        var ex = Assert.Throws<RequiredConfigurationException>(() =>
             factory.Services.GetRequiredService<IE2eExecutionPool>());
 
         Assert.Contains("PoolKind=local", ex.Message);

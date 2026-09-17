@@ -346,6 +346,14 @@ internal sealed class QuotaReportAuthFactory : WebApplicationFactory<Program>
             var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
+                // The startup required-configuration gate validates the
+                // settings the real ApiKeyState factory would consume. This
+                // factory replaces ApiKeyState wholesale with a hand-built
+                // enabled state (so no process environment variable is
+                // touched), which the gate cannot see — opting out here keeps
+                // the gate satisfied without changing the middleware under
+                // test, which resolves the replaced ApiKeyState from DI.
+                ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
