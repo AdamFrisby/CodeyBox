@@ -4393,6 +4393,10 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // edits applied via config hot-reload take effect on the next bounded
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
+    // Resolve through the live IOptionsMonitor so DefaultWorkTimeoutMinutes
+    // edits applied via config hot-reload take effect for subsequently
+    // dispatched work without restart, mirroring the watchdog's own sweep accessor.
+    defaultWorkTimeoutMinutesAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DefaultWorkTimeoutMinutes,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
     toolchainFaultClassifier: sp.GetRequiredService<IToolchainFaultClassifier>(),
     toolchainFaultRecords: sp.GetRequiredService<IToolchainFaultRecordStore>(),
@@ -6506,6 +6510,20 @@ namespace CodeyBox.Api
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
+
+        /// <summary>
+        /// Global default work-phase wall-clock budget in minutes, applied to
+        /// work items that carry neither a per-item timeout nor a per-project
+        /// <c>WorkTimeoutMinutes</c> (see <see cref="Core.WorkTimeoutPolicy"/>
+        /// for the precedence rules). Read live from the options monitor at
+        /// every dispatch, so edits hot-reload: the value in force for
+        /// subsequently dispatched work changes without a rebuild or restart.
+        /// In-flight iterations keep the budget they started with. Values
+        /// outside 1..480 are clamped at resolution time so a typo cannot
+        /// disable the timeout. The shipped default stays 240 — the defect
+        /// was that the value was unreachable, not that 240 is wrong.
+        /// </summary>
+        public int DefaultWorkTimeoutMinutes { get; set; } = Core.WorkTimeoutPolicy.DefaultMinutes;
 
         /// <summary>
         /// Hard ceiling (seconds) on a single required-build verification

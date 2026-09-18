@@ -74,6 +74,16 @@ public sealed record Project
     public AgentKind DefaultAgent { get; init; } = AgentKind.Claude;
 
     /// <summary>
+    /// Default work-phase wall-clock budget in minutes for this project's items
+    /// that carry no per-item <see cref="WorkItem.WorkTimeout"/>. Null means
+    /// inherit the global default <c>CodeyBox:DefaultWorkTimeoutMinutes</c>.
+    /// Merged from the project entry with fallback to <c>Defaults</c>; values
+    /// outside 1..480 are clamped at resolution time (see
+    /// <see cref="WorkTimeoutPolicy"/>) so a typo cannot disable the timeout.
+    /// </summary>
+    public int? WorkTimeoutMinutes { get; init; }
+
+    /// <summary>
     /// Default agent class for work items that don't set their own
     /// <see cref="WorkItem.AgentClassId"/>. When set, quota routing applies to all
     /// items in this project. May be overridden per-item by setting

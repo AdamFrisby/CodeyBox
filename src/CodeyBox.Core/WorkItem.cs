@@ -89,8 +89,14 @@ public sealed record WorkItem
     /// </summary>
     public string? AuditorProfile { get; init; }
 
-    /// <summary>Wall-clock budget for the work phase (also applied per rework iteration).</summary>
-    public TimeSpan WorkTimeout { get; init; } = TimeSpan.FromMinutes(240);
+    /// <summary>
+    /// Wall-clock budget for the work phase (also applied per rework iteration).
+    /// Null means inherit: the per-project <c>WorkTimeoutMinutes</c> wins when set,
+    /// otherwise the global default <c>CodeyBox:DefaultWorkTimeoutMinutes</c>
+    /// (240 minutes). Set at creation, by PATCH while queued, or by a retry
+    /// request; see <see cref="WorkTimeoutPolicy"/> for the resolution rules.
+    /// </summary>
+    public TimeSpan? WorkTimeout { get; init; }
 
     /// <summary>Wall-clock budget for the merge phase.</summary>
     public TimeSpan MergeTimeout { get; init; } = TimeSpan.FromMinutes(60);

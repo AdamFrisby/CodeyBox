@@ -117,6 +117,15 @@ public static class ConfigReloadClassification
             return true;
         }
 
+        // The global work-timeout default is read live from the options
+        // monitor at every dispatch, so edits take effect for subsequently
+        // dispatched work without a restart.
+        if (string.Equals(key, "CodeyBox:DefaultWorkTimeoutMinutes", StringComparison.OrdinalIgnoreCase))
+        {
+            effect = ConfigReloadEffect.HotReload;
+            return true;
+        }
+
         if (ValidatorGuardedKeyPaths.Contains(key, StringComparer.OrdinalIgnoreCase))
         {
             effect = ConfigReloadEffect.RestartRequired;

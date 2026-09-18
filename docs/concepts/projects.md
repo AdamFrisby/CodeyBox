@@ -106,12 +106,25 @@ project. The global API bound of `[-1000, 1000]` still applies; leaving
 `MaxPriority` unset means there is no additional project-level cap. Negative
 priorities remain allowed so callers can always lower a work item's priority.
 
+### `WorkTimeoutMinutes`
+
+Set `WorkTimeoutMinutes` to give this project's items a default work-phase
+wall-clock budget in minutes without stamping every item individually — for
+repositories whose work items are routinely long. A per-item timeout still
+wins when set; when both the project entry and `Defaults` omit it, items
+fall through to the global `CodeyBox:DefaultWorkTimeoutMinutes` (240).
+Values outside 1–480 are clamped at resolution time so a typo cannot
+disable the timeout. Hot-reloadable through the normal project-config
+reload. See [work-items.md](work-items.md#work-phase-timeout-budget) for the
+full precedence chain.
+
 ### Inheritance from `Defaults`
 
 Anything a project omits comes from `Defaults` (shallow merge):
 
 * `Agent` — default agent for new work items
 * `BaseBranch` — default integration branch
+* `WorkTimeoutMinutes` — default work-phase budget in minutes
 * `Audit.*` — every field in `ProjectAudit` falls through individually
 
 `Languages` is list-typed and not append-merged: if a project sets it, it

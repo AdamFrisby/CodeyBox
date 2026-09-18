@@ -119,7 +119,7 @@ internal static class PersistenceAndRecoveryHelpers
         cmd.Parameters.AddWithValue("$base", (object?)item.BaseBranch ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$work", (object?)item.WorkBranch ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent", (object?)item.Agent?.Value ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$work_timeout", item.WorkTimeout.Ticks);
+        cmd.Parameters.AddWithValue("$work_timeout", item.WorkTimeout?.Ticks ?? TimeSpan.FromMinutes(CodeyBox.Core.WorkTimeoutPolicy.DefaultMinutes).Ticks);
         cmd.Parameters.AddWithValue("$merge_timeout", item.MergeTimeout.Ticks);
         cmd.Parameters.AddWithValue("$push_upstream", item.PushUpstream ? 1 : 0);
         cmd.Parameters.AddWithValue("$state", (int)item.State);

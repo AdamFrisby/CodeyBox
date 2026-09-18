@@ -43,6 +43,11 @@ public sealed partial class PipelineRunner
     private readonly IWorkItemTerminalTransition _terminalTransitions;
     private readonly IWorkItemTerminalRevisionBuilder _terminalRevisionBuilder;
     private readonly PipelineOptions _opts;
+    // Live accessor for the global default work-timeout (CodeyBox:DefaultWorkTimeoutMinutes).
+    // Read at every dispatch through ResolveEffectiveWorkTimeout so config reloads take
+    // effect for subsequently dispatched work without a restart; null means the shipped
+    // default. Mirrors watchdogOptionsAccessor below.
+    private readonly Func<int?>? _defaultWorkTimeoutMinutesAccessor;
     private readonly ILogger<PipelineRunner> _log;
     private readonly AuditorTelemetryEmitter _auditorTelemetry;
     private readonly CredentialSmokeGate? _smokeGate;
@@ -402,7 +407,12 @@ public sealed partial class PipelineRunner
         // Per-branch pickup-rebase lock table. Optional: production DI shares
         // one instance process-wide (matching the pre-extraction static
         // behavior); tests inject a fresh instance per fixture for isolation.
-        PickupRebaseLockRegistry? rebaseLockRegistry = null)
+        PickupRebaseLockRegistry? rebaseLockRegistry = null,
+        // Live accessor for the global default work-timeout minutes
+        // (CodeyBox:DefaultWorkTimeoutMinutes). Optional: production DI reads
+        // IOptionsMonitor so reloads apply to subsequently dispatched work;
+        // tests inject a lambda or leave null for the shipped default.
+        Func<int?>? defaultWorkTimeoutMinutesAccessor = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -417,6 +427,7 @@ public sealed partial class PipelineRunner
         _store = store;
         _webhooks = webhooks;
         _opts = opts;
+        _defaultWorkTimeoutMinutesAccessor = defaultWorkTimeoutMinutesAccessor;
         _timings = timingStore;
         _costStore = costStore;
         _usageStore = usageStore;

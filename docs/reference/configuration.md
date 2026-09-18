@@ -294,6 +294,7 @@ startup); we add explicit guards as we tighten the contract.
 | `DeepAuditFailurePersistence.RetryDelay` | TimeSpan | `00:00:00.100` | Delay between terminal-failure persistence attempts. Must be non-negative and no greater than one minute; hot-reloadable for the next reconciliation. |
 | `Shutdown.SandboxTeardownMode` | enum | `Stop` | Graceful-shutdown sandbox teardown mode: `Stop` cleanly stops and preserves the VM without a RAM snapshot; `Suspend` preserves RAM state via `multipass suspend` and is opt-in; `Dispose` purges the VM. |
 | `PhaseAbsoluteTimeoutMultiplier` | number | `3.0` | Multiplier applied to a phase's per-attempt timeout to bound fallback chains. Work/rework attempts each get the full `WorkTimeout`; merge attempts each get the full `MergeTimeout`; the whole fallback chain is capped at this multiplier times that per-attempt timeout. |
+| `DefaultWorkTimeoutMinutes` | int | `240` | Global default work-phase wall-clock budget in minutes for items with neither a per-item timeout nor a per-project `WorkTimeoutMinutes`. Hot-reloadable: edits apply to subsequently dispatched work without a restart. Clamped to 1–480 at resolution time. The default stays 240 — see [work-items.md](../concepts/work-items.md#work-phase-timeout-budget) for the full precedence chain and how to raise a timed-out item. |
 
 ## `SandboxProviderCutover`
 

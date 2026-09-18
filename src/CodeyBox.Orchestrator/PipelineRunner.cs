@@ -539,9 +539,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     item = item with { State = WorkItemState.Working };
                 }
                 string? workAgentStdout = null;
+                var (workTimeout, _) = ResolveEffectiveWorkTimeout(item, project);
                 using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
                 {
-                    workPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+                    workPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(workTimeout));
                     workPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                     // In-iteration quota fallback: if the chosen agent hits quota
                     // mid-flight, swap to the next class member and retry. Audit,
@@ -571,7 +572,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: workPhase,
-                            attemptTimeout: item.WorkTimeout);
+                            attemptTimeout: workTimeout);
                     }
                     catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
                     {
@@ -609,9 +610,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var resumeReworkStart = DateTimeOffset.UtcNow;
                 await Transition(item, WorkItemState.Reworking, ct, project);
                 string? reworkStdout = null;
+                var (resumeWorkTimeout, _) = ResolveEffectiveWorkTimeout(item, project);
                 using (var reworkPhase = new PhaseCancellation("rework-resume", ct, _opts.TimeProvider))
                 {
-                    reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+                    reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(resumeWorkTimeout));
                     reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                     var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
                     try
@@ -638,7 +640,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: reworkPhase,
-                            attemptTimeout: item.WorkTimeout);
+                            attemptTimeout: resumeWorkTimeout);
                     }
                     catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
                     {
@@ -978,8 +980,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} hit configured timeout in phase '{Phase}' (source={Source})",
                 item.Id, pex.Phase, pex.Source);
+            // A work-phase timeout names the budget that was in force, where
+            // that value came from (item, project, or global default), and how
+            // to raise it — the budget is unreachable after the fact through
+            // PATCH (Failed items are not editable), so the message must carry
+            // the remedy. Other phases keep the terse form.
+            string timeoutError;
+            if (string.Equals(pex.Source, CancellationSources.PhaseTimeout("work"), StringComparison.Ordinal))
+            {
+                var (timeoutBudget, timeoutSource) = ResolveEffectiveWorkTimeout(item, project);
+                timeoutError = WorkTimeoutPolicy.FormatTimeoutError(
+                    pex.Phase, item.Id, timeoutBudget, timeoutSource, project.Id.Value);
+            }
+            else
+            {
+                timeoutError = $"phase '{pex.Phase}' exceeded configured timeout ({pex.Source})";
+            }
             await TransitionFailed(item,
-                $"phase '{pex.Phase}' exceeded configured timeout ({pex.Source})",
+                timeoutError,
                 CancellationToken.None, project,
                 failureKind: "timeout",
                 cancellationSource: pex.Source);

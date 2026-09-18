@@ -470,7 +470,8 @@ internal static class WorkItemEndpoints
             item,
             requestedFrom,
             trigger: "manual",
-            ct: ct);
+            ct: ct,
+            workTimeoutMinutes: body?.WorkTimeoutMinutes);
 
         if (!success)
         {
@@ -3195,7 +3196,7 @@ public sealed record AgentControlDto(
     int? DurationSeconds = null,
     DateTimeOffset? ExpiresAt = null);
 
-public sealed record RetryWorkItemRequest(string? From);
+public sealed record RetryWorkItemRequest(string? From, int? WorkTimeoutMinutes = null);
 
 public sealed record DelegateWorkItemRequest(string? Note = null);
 

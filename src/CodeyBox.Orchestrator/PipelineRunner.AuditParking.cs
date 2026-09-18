@@ -541,7 +541,8 @@ public sealed partial class PipelineRunner
         {
             using (var delegationPhase = new PhaseCancellation("delegation", ct, _opts.TimeProvider))
             {
-                delegationPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(current.WorkTimeout));
+                var (delegationTimeout, _) = ResolveEffectiveWorkTimeout(current, project);
+                delegationPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(delegationTimeout));
                 delegationPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
                 // In-iteration quota fallback mirrors the work phase: a quota
                 // hit mid-turn swaps members and retries; quota exhaustion
@@ -582,7 +583,7 @@ public sealed partial class PipelineRunner
                         },
                         ct,
                         phaseCancellation: delegationPhase,
-                        attemptTimeout: current.WorkTimeout);
+                        attemptTimeout: delegationTimeout);
                 }
                 catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
                 {
