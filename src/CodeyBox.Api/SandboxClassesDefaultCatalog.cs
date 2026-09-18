@@ -25,18 +25,24 @@ public static class SandboxClassesDefaultCatalog
     /// <see cref="ISandboxProvider.DeclaredCapabilities"/>, so work needing
     /// an operation the provider implements keeps placing while work needing
     /// one it does not is refused as unplaceable naming the operation.
-    /// Capacity is <see cref="int.MaxValue"/>: placement never cap-excludes
-    /// the default member; the existing global admission gate still owns real
-    /// throttling until per-member gates replace it.
+    /// Capacity is <paramref name="capacity"/>: callers pass the resolved
+    /// <c>WorkerPool:MaxConcurrentSandboxes</c> ceiling so the single member's
+    /// admission gate behaves identically to the former process-wide gate.
     /// </summary>
     public static IReadOnlyList<SandboxClass> Synthesize(
         string providerKind,
         IReadOnlyList<string> providerCapabilities,
-        ILogger log)
+        ILogger log,
+        int capacity)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(providerKind);
         ArgumentNullException.ThrowIfNull(providerCapabilities);
         ArgumentNullException.ThrowIfNull(log);
+        if (capacity < 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(capacity),
+                capacity,
+                "Default sandbox member capacity must be >= 1.");
         var kind = providerKind.Trim().ToLowerInvariant();
 
         var capabilities = providerCapabilities
@@ -61,7 +67,7 @@ public static class SandboxClassesDefaultCatalog
                     {
                         MemberId = DefaultMemberId,
                         ProviderKind = kind,
-                        Capacity = int.MaxValue,
+                        Capacity = capacity,
                         Capabilities = capabilities,
                         PreferenceScore = 100,
                     },

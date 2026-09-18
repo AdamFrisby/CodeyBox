@@ -541,11 +541,12 @@ cordon/drain flag, configured health flag, and optional network-profile
 allowlist. New VMs are placed only on hosts that are healthy, not
 cordoned, allowed for the requested network profile, and below their
 `MaxConcurrentSandboxes` cap. Placement picks the lowest load ratio so
-VMs spread across hosts without oversubscribing any host. The normal
-global gates still apply: effective fan-out is bounded by
-`min(MaxConcurrentWorkers, MaxConcurrentSandboxes, sum(host caps))`. When
-configured host capacity exceeds the global cap, startup logs a warning
-instead of silently hiding the bottleneck.
+VMs spread across hosts without oversubscribing any host. Capacity accounting
+lives on the members: the process-wide ceiling is derived as the sum of host
+caps, so adding a host adds real throughput with no global scalar to raise.
+Startup reports the derived ceiling with per-host headroom
+(`capacity − reservations`) instead of clamping host capacity against a global
+cap.
 
 **Cordon/drain and health.** Set `Cordoned=true` on a host to stop new VM
 placements there while existing VMs finish and release their reservations.
@@ -754,12 +755,17 @@ network profile and credential, picks the highest-`PreferenceScore` eligible
 member, creates the sandbox on that member's provider (each kind constructed
 once and shared), and logs the decision's `Describe()` output. A required
 capability no member declares fails the item operator-visible naming the
-capability; a transient refusal (capacity, cordon, health, credential or
-profile mismatch) requeues under the `PlacementRecheckIn` backoff. With no
+capability; a transient refusal (cordon, health, credential or profile
+mismatch) requeues under the `PlacementRecheckIn` backoff, while a
+capacity-only refusal waits for member headroom through a true async wait.
+With no
 classes configured, a default single-member class is synthesized from
 `CodeyBox:SandboxProvider` so single-provider deployments behave as before.
-Capacity gating still lives in the global admission wrapper; per-member gates
-replace it in a later item.
+Capacity gating lives on the members: each member owns an admission gate
+sized from its `Capacity` (held for the sandbox's lifetime, released exactly
+once on dispose), the process ceiling is the derived member sum, member
+capacities are hot-reloadable, and every reload re-checks the `2 * workers`
+deadlock minimum per member.
 
 ## Adding a new provider
 

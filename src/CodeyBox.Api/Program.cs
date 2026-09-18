@@ -513,10 +513,15 @@ builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 // named by a SandboxClass member is constructed once here (via the same
 // BuildSandboxProviderInner the singleton uses) and shared across the members
 // naming it; lookup is by normalised kind so registration order never affects
-// resolution. Every instance carries the same global admission gate the
-// singleton has — capacity gating does not move in this item; per-member
-// gates replace these in the next one. No provider kind is named anywhere
-// outside this factory: core and pipeline code resolve through the registry.
+// resolution. Each instance carries an admission wrapper whose gate is
+// DERIVED from the member catalog (see ISandboxProviderRegistry
+// .SyncKindCapacities): the gate target is the sum of member capacities
+// naming the kind, so the kind gate always fits the member gates beneath it
+// and never clamps them — real admission happens once, at the member gate
+// inside SandboxPlacementAcquirer, while the kind wrapper keeps owning
+// lifecycle tracking, metrics, and capability preservation. No provider kind
+// is named anywhere outside this factory: core and pipeline code resolve
+// through the registry.
 builder.Services.AddSingleton<ISandboxProviderRegistry>(sp => new SandboxProviderRegistry(
     kind => BuildRegistrySandboxProvider(sp, kind),
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<SandboxProviderRegistry>()));
@@ -613,7 +618,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         inner.Name,
         orchestratorOptions.MaxConcurrentSandboxes);
     if (inner is ISandboxHostPoolSnapshot hostPool)
-        RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
+        RemoteHostPoolCapacityLogger.Log(hostPool, startupLog);
     LogSandboxProviderCapabilities(inner, startupLog);
     var pipelineTuning = sp.GetRequiredService<PipelineTuningSnapshot>();
     return SandboxAdmissionControlledProvider.Wrap(
@@ -666,7 +671,7 @@ static ISandboxProvider BuildRegistrySandboxProvider(IServiceProvider sp, string
         inner.Name,
         orchestratorOptions.MaxConcurrentSandboxes);
     if (inner is ISandboxHostPoolSnapshot hostPool)
-        RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
+        RemoteHostPoolCapacityLogger.Log(hostPool, startupLog);
     LogSandboxProviderCapabilities(inner, startupLog);
     startupLog.LogInformation(
         "Sandbox provider registry: constructed kind '{Kind}' (provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes})",
@@ -2548,16 +2553,15 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
 // SandboxClassesSnapshot — validated sandbox class catalog. Built once here
 // so a bad CodeyBox:SandboxClasses edit fails the host fast at startup;
 // AgentConfigHotReload rebuilds through the same builder on every reload and
-// keeps the prior catalog when the new one is rejected. Nothing routes
-// through this catalog yet (provider registry, per-member gates, and
-// call-site rewiring are separate items) — this holder is the seam they
-// will consume. The existing CodeyBox:SandboxProvider setting keeps working
-// until a later item replaces it.
+// keeps the prior catalog when the new one is rejected. The work-phase
+// sandbox acquisition routes through this catalog, and each member's capacity
+// owns a per-member admission gate inside SandboxPlacementAcquirer (the
+// process-wide ceiling is the derived sum of member capacities).
 builder.Services.AddSingleton<SandboxClassesSnapshot>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.SandboxClasses");
-    var (maxWorkers, _) = OrchestratorOptionsFactory.ResolveSandboxCounts(
+    var (maxWorkers, maxSandboxes) = OrchestratorOptionsFactory.ResolveSandboxCounts(
         cbOpts.Concurrency, cbOpts.WorkerPool, startupLog);
     var registry = sp.GetRequiredService<ISandboxProviderRegistry>();
     IReadOnlyList<SandboxClass> catalog;
@@ -2566,15 +2570,17 @@ builder.Services.AddSingleton<SandboxClassesSnapshot>(sp =>
         // No SandboxClasses configured: synthesize the default single-member
         // class from CodeyBox:SandboxProvider so placement has a member to
         // select without requiring new configuration. Single-member behaviour
-        // matches the legacy single-provider path; the member carries the
-        // provider's own declared capabilities.
+        // matches the legacy single-provider path: the member's capacity is
+        // the resolved WorkerPool:MaxConcurrentSandboxes ceiling, so its
+        // admission gate behaves identically to the former process-wide gate.
+        // The member carries the provider's own declared capabilities.
         var kind = SandboxProviderSelection.ResolveConfiguredKind(
             cbOpts.SandboxProvider,
             sp.GetRequiredService<IConfiguration>(),
             sp.GetRequiredService<IHostEnvironment>(),
             startupLog);
         var provider = registry.EnsureKind(kind);
-        catalog = SandboxClassesDefaultCatalog.Synthesize(kind, provider.DeclaredCapabilities, startupLog);
+        catalog = SandboxClassesDefaultCatalog.Synthesize(kind, provider.DeclaredCapabilities, startupLog, maxSandboxes);
     }
     else
     {
@@ -2588,6 +2594,10 @@ builder.Services.AddSingleton<SandboxClassesSnapshot>(sp =>
                  .Select(static m => m.ProviderKind)
                  .Distinct(StringComparer.OrdinalIgnoreCase))
         registry.EnsureKind(memberKind);
+    // Derive the constructed kind gates from the catalog: each kind gate
+    // becomes the sum of member capacities naming it, so kind gates fit the
+    // member gates beneath them instead of clamping them.
+    registry.SyncKindCapacities(catalog);
     startupLog.LogInformation("SandboxClasses loaded: {Count} class(es)", catalog.Count);
     return new SandboxClassesSnapshot(catalog);
 });
@@ -5105,7 +5115,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         deployConsistency: sp.GetRequiredService<DeployConsistencyService>(),
         sandboxClasses: sp.GetRequiredService<SandboxClassesSnapshot>(),
         sandboxProviderRegistry: sp.GetRequiredService<ISandboxProviderRegistry>(),
-        hostEnvironment: sp.GetRequiredService<IHostEnvironment>());
+        hostEnvironment: sp.GetRequiredService<IHostEnvironment>(),
+        sandboxPlacer: sp.GetRequiredService<SandboxPlacementAcquirer>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(

@@ -70,4 +70,34 @@ public sealed class SandboxProviderRegistry : ISandboxProviderRegistry
             .OrderBy(static kvp => kvp.Key, StringComparer.Ordinal)
             .Select(static kvp => new SandboxProviderRegistration(kvp.Key, kvp.Value.Value))
             .ToList();
+
+    /// <inheritdoc/>
+    public void SyncKindCapacities(IReadOnlyList<SandboxClass> catalog)
+    {
+        ArgumentNullException.ThrowIfNull(catalog);
+
+        var sums = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var sandboxClass in catalog)
+        {
+            foreach (var member in sandboxClass.Members)
+            {
+                if (!seen.Add(member.MemberId))
+                    continue;
+                var kind = member.ProviderKind.Trim().ToLowerInvariant();
+                var sum = sums.TryGetValue(kind, out var current) ? current : 0;
+                sums[kind] = Math.Min((long)int.MaxValue, sum + member.Capacity);
+            }
+        }
+
+        foreach (var registration in ListRegistered())
+        {
+            if (!sums.TryGetValue(registration.Kind, out var sum) || sum < 1)
+                continue;
+            var target = sum >= int.MaxValue ? int.MaxValue : (int)sum;
+            if (registration.Provider is CodeyBox.Orchestrator.SandboxAdmissionControlledProvider wrapper
+                && wrapper.MaxConcurrentSandboxes != target)
+                wrapper.ApplyKindCapacityReload(target, registration.Kind);
+        }
+    }
 }

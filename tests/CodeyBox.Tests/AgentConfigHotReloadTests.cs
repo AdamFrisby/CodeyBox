@@ -2270,7 +2270,7 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
-    public async Task Coordinator_OnChange_RemoteHostCapacityLogsFanoutCapWhenPoolGrows()
+    public async Task Coordinator_OnChange_RemoteHostCapacityLogsDerivedCapacityWhenPoolGrows()
     {
         var initial = new CodeyBoxOptions
         {
@@ -2313,11 +2313,66 @@ public sealed class AgentConfigHotReloadTests
 
         await coordinator.StopAsync(CancellationToken.None);
 
-        var warning = Assert.Single(log.Entries, e =>
-            e.Level == LogLevel.Warning
-            && e.Properties.TryGetValue("HostCapacity", out var capacity)
+        // The pool reporter derives the ceiling from the hosts and never
+        // warns about "excess" capacity: there is no global scalar left to
+        // clamp against.
+        Assert.DoesNotContain(log.Entries, e => e.Level == LogLevel.Warning);
+        var info = Assert.Single(log.Entries, e =>
+            e.Level == LogLevel.Information
+            && e.Properties.TryGetValue("Capacity", out var capacity)
             && Equals(capacity, "6"));
-        Assert.Equal(4, warning.Properties["GlobalCap"]);
+        Assert.Equal(2, info.Properties["HostCount"]);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_WorkerRaiseBelowMemberMinimum_RejectsWholeReloadKeepingPriorValues()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions { MaxConcurrentWorkers = 2 },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var registry = new PlacementFakeSandboxProviderRegistry([new PlacementFakeSandboxProvider("a")]);
+        var snapshot = SandboxPlacementTestMembers.Snapshot(
+            SandboxPlacementTestMembers.Member("a", "a", capacity: 8));
+        var placer = new SandboxPlacementAcquirer(snapshot, registry);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+        var log = new CapturingLogger<AgentConfigHotReload>();
+        var coordinator = new AgentConfigHotReload(
+            monitor,
+            orchFixture.Orchestrator,
+            router,
+            burnEstimator,
+            log,
+            sandboxClasses: snapshot,
+            sandboxPlacer: placer);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Raising workers 2 → 8 needs member "a" at 16, but it holds 8: the
+        // whole WorkerPool reload is refused before any live gate moves, so
+        // every prior value stays in force.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions { MaxConcurrentWorkers = 8 },
+        });
+
+        await coordinator.StopAsync(CancellationToken.None);
+
+        Assert.Equal(4, orchFixture.Orchestrator.MaxConcurrent);
+        Assert.Equal(8, placer.MaxConcurrent);
+        var error = Assert.Single(log.Entries, e =>
+            e.Level == LogLevel.Error
+            && e.Message.Contains("Hot-reload of WorkerPool rejected", StringComparison.Ordinal));
+        Assert.Contains("'a'", error.Exception?.Message ?? string.Empty, StringComparison.Ordinal);
+        Assert.Contains("16", error.Exception?.Message ?? string.Empty, StringComparison.Ordinal);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

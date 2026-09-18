@@ -111,4 +111,65 @@ public sealed class SandboxProviderRegistryTests
 
     private static SandboxMember Member(string memberId, string providerKind) =>
         SandboxPlacementTestMembers.Member(memberId, providerKind);
+
+    [Fact]
+    public void SyncKindCapacities_DerivesKindGateAsMemberSum()
+    {
+        var registry = new SandboxProviderRegistry(kind =>
+            CodeyBox.Orchestrator.SandboxAdmissionControlledProvider.Wrap(
+                new PlacementFakeSandboxProvider(kind),
+                2,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<
+                    CodeyBox.Orchestrator.SandboxAdmissionControlledProvider>.Instance));
+        registry.EnsureKind("r");
+        var wrapper = Assert.IsAssignableFrom<
+            CodeyBox.Orchestrator.SandboxAdmissionControlledProvider>(registry.EnsureKind("r"));
+        Assert.Equal(2, wrapper.MaxConcurrentSandboxes);
+
+        registry.SyncKindCapacities(SandboxPlacementTestMembers.Snapshot(
+            SandboxPlacementTestMembers.Member("a", "r", capacity: 3),
+            SandboxPlacementTestMembers.Member("b", "r", capacity: 5)).Current);
+
+        Assert.Equal(8, wrapper.MaxConcurrentSandboxes);
+    }
+
+    [Fact]
+    public void SyncKindCapacities_SumsPerKindAndLeavesUnnamedKindsAlone()
+    {
+        var registry = new SandboxProviderRegistry(kind =>
+            CodeyBox.Orchestrator.SandboxAdmissionControlledProvider.Wrap(
+                new PlacementFakeSandboxProvider(kind),
+                2,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<
+                    CodeyBox.Orchestrator.SandboxAdmissionControlledProvider>.Instance));
+        var r = Assert.IsAssignableFrom<
+            CodeyBox.Orchestrator.SandboxAdmissionControlledProvider>(registry.EnsureKind("r"));
+        var other = Assert.IsAssignableFrom<
+            CodeyBox.Orchestrator.SandboxAdmissionControlledProvider>(registry.EnsureKind("other"));
+
+        registry.SyncKindCapacities(SandboxPlacementTestMembers.Snapshot(
+            SandboxPlacementTestMembers.Member("a", "r", capacity: 3),
+            SandboxPlacementTestMembers.Member("b", "R", capacity: 5)).Current);
+
+        Assert.Equal(8, r.MaxConcurrentSandboxes);
+        Assert.Equal(2, other.MaxConcurrentSandboxes);
+    }
+
+    [Fact]
+    public void SyncKindCapacities_UnchangedTargetsAreSilentNoOps()
+    {
+        var logger = new CapturingLogger<CodeyBox.Orchestrator.SandboxAdmissionControlledProvider>();
+        var registry = new SandboxProviderRegistry(
+            kind => CodeyBox.Orchestrator.SandboxAdmissionControlledProvider.Wrap(
+                new PlacementFakeSandboxProvider(kind), 8, logger),
+            log: Microsoft.Extensions.Logging.Abstractions.NullLogger<SandboxProviderRegistry>.Instance);
+        registry.EnsureKind("r");
+
+        var catalog = SandboxPlacementTestMembers.Snapshot(
+            SandboxPlacementTestMembers.Member("a", "r", capacity: 8)).Current;
+        registry.SyncKindCapacities(catalog);
+        registry.SyncKindCapacities(catalog);
+
+        Assert.Empty(logger.Entries);
+    }
 }

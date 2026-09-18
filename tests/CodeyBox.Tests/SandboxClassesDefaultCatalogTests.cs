@@ -17,7 +17,8 @@ public sealed class SandboxClassesDefaultCatalogTests
         var catalog = SandboxClassesDefaultCatalog.Synthesize(
             "multipass",
             ["baseline-bake", "teardown"],
-            NullLogger.Instance);
+            NullLogger.Instance,
+            6);
 
         var sandboxClass = Assert.Single(catalog);
         Assert.Equal(SandboxClassesDefaultCatalog.DefaultClassId, sandboxClass.Id);
@@ -32,7 +33,8 @@ public sealed class SandboxClassesDefaultCatalogTests
         var catalog = SandboxClassesDefaultCatalog.Synthesize(
             "  Multipass ",
             [" suspend-resume ", "SUSPEND-RESUME", "", "  "],
-            NullLogger.Instance);
+            NullLogger.Instance,
+            4);
 
         var member = Assert.Single(Assert.Single(catalog).Members);
         Assert.Equal("multipass", member.ProviderKind);
@@ -43,7 +45,7 @@ public sealed class SandboxClassesDefaultCatalogTests
     public void Synthesize_AcceptsEveryProfileAndCredential()
     {
         var catalog = SandboxClassesDefaultCatalog.Synthesize(
-            "incus", [], NullLogger.Instance);
+            "incus", [], NullLogger.Instance, 2);
 
         var member = Assert.Single(Assert.Single(catalog).Members);
         Assert.Empty(member.NetworkProfiles);
@@ -51,19 +53,28 @@ public sealed class SandboxClassesDefaultCatalogTests
     }
 
     [Fact]
-    public void Synthesize_CapacityNeverCapExcludes()
+    public void Synthesize_CapacityCarriesResolvedSandboxCeiling()
     {
         var catalog = SandboxClassesDefaultCatalog.Synthesize(
-            "process", [], NullLogger.Instance);
+            "process", [], NullLogger.Instance, 8);
 
         var member = Assert.Single(Assert.Single(catalog).Members);
-        Assert.True(member.Capacity > 0);
+        Assert.Equal(8, member.Capacity);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-3)]
+    public void Synthesize_NonPositiveCapacity_Throws(int capacity)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            SandboxClassesDefaultCatalog.Synthesize("process", [], NullLogger.Instance, capacity));
     }
 
     [Fact]
     public void Synthesize_BlankKind_Throws()
     {
         Assert.Throws<ArgumentException>(() =>
-            SandboxClassesDefaultCatalog.Synthesize("  ", [], NullLogger.Instance));
+            SandboxClassesDefaultCatalog.Synthesize("  ", [], NullLogger.Instance, 2));
     }
 }

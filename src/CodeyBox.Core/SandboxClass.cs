@@ -6,7 +6,8 @@ namespace CodeyBox.Core;
 /// <see cref="SandboxMember.PreferenceScore"/> that is eligible (covers the
 /// work item's <see cref="WorkItem.RequiredCapabilities"/> and accepts its
 /// network profile and credential needs), then spills to the next member when
-/// one is at its cap, and defers when all are exhausted.
+/// one is at its cap, waits for member headroom when all are exhausted by
+/// capacity alone, and defers when no member can serve for another reason.
 /// </summary>
 /// <remarks>
 /// Mirrors <see cref="AgentClass"/> deliberately: sandbox capacity is modelled
