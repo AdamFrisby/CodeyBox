@@ -25,4 +25,44 @@
       IgnoreStandardErrorWarningFormat="true" />
   </Target>
 
+  <!--
+    Stamp the built commit into the API assembly so the running service can
+    tell whether the checkout it reads configuration from has moved ahead of
+    what was compiled into bin/. The orchestrator deploys without rebuilding, so
+    a git pull advances appsettings.json without advancing bin/; the next
+    restart then fails closed in UnboundConfigKeyHostedValidator with no hint
+    that the cause is a stale build. DeployConsistencyService reads this
+    metadata back at startup and warns while the service is still healthy.
+
+    Runs only for CodeyBox.Api (one git invocation per build, not per
+    project). Never fails the build: without git, or outside a checkout, the
+    revision is "unknown" and the consistency check reports unknown instead
+    of diverged.
+  -->
+  <Target
+    Name="CodeyBoxEmbedBuildRevision"
+    BeforeTargets="GetAssemblyAttributes"
+    Condition="'$(MSBuildProjectName)' == 'CodeyBox.Api' and '$(DesignTimeBuild)' != 'true' and '$(CodeyBoxBuildRevision)' == ''">
+    <Exec
+      Command="git rev-parse HEAD"
+      WorkingDirectory="$(MSBuildThisFileDirectory)"
+      ConsoleToMSBuild="true"
+      StandardOutputImportance="Low"
+      StandardErrorImportance="Low"
+      IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CodeyBoxBuildRevision" />
+    </Exec>
+    <PropertyGroup>
+      <CodeyBoxBuildRevision Condition="'$(CodeyBoxBuildRevision)' == ''">unknown</CodeyBoxBuildRevision>
+      <CodeyBoxBuildRevision>$(CodeyBoxBuildRevision.Trim())</CodeyBoxBuildRevision>
+      <CodeyBoxBuildRevision Condition="'$(CodeyBoxBuildRevision)' == ''">unknown</CodeyBoxBuildRevision>
+    </PropertyGroup>
+    <ItemGroup>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>CodeyBoxBuildRevision</_Parameter1>
+        <_Parameter2>$(CodeyBoxBuildRevision)</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
+
 </Project>

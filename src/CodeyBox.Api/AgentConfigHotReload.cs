@@ -145,6 +145,10 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     // tests that only exercise the typed-options path, which skips the check.
     private readonly IConfiguration? _configuration;
 
+    // Deploy-consistency probe for the reload-time divergence check. Null in
+    // tests that only exercise the typed-options path, which skips the check.
+    private readonly DeployConsistencyService? _deployConsistency;
+
     // Unbound keys already reported, so each new key is named once.
     private HashSet<string> _lastUnboundKeys = new(StringComparer.OrdinalIgnoreCase);
 
@@ -177,7 +181,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         TransitionHealthOptionsSnapshot? transitionHealth = null,
         ISandboxHostPoolSnapshot? hostPoolSnapshot = null,
         SandboxAdmissionControlledProvider? sandboxAdmission = null,
-        IConfiguration? configuration = null)
+        IConfiguration? configuration = null,
+        DeployConsistencyService? deployConsistency = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -212,6 +217,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _hostPoolSnapshot = hostPoolSnapshot;
         _sandboxAdmission = sandboxAdmission;
         _configuration = configuration;
+        _deployConsistency = deployConsistency;
         _log = log;
     }
 
@@ -276,6 +282,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyWorkerPoolIfChanged(opts);
             ReportRestartRequiredIfChanged(opts);
             ReportUnboundIfChanged();
+            ReportDeployDivergenceIfChanged();
             LogRemoteHostCapacityIfChanged(opts);
             ApplyConcurrencyIfChanged(opts);
             ApplySmokeIfChanged(opts);
@@ -369,6 +376,38 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         return UnboundConfigKeyHostedValidator.Inspect(_configuration)
             .Select(static report => report.Path)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Re-checks built-vs-checkout agreement on every configuration reload.
+    /// A <c>git pull</c> that moves the checkout ahead of <c>bin/</c> is
+    /// otherwise invisible until the next restart turns it into a fatal
+    /// unbound-key failure; warning here gives the operator the signal while
+    /// the service is still healthy. Never throws.
+    /// </summary>
+    private void ReportDeployDivergenceIfChanged()
+    {
+        if (_deployConsistency is null)
+            return;
+
+        try
+        {
+            var report = _deployConsistency.Refresh();
+            if (!report.IsDiverged)
+                return;
+
+            AuditLog.ConfigDeployDiverged(report.BuiltRevision, report.CheckoutRevision);
+            _log.LogWarning(
+                "Configuration reload observed while the working tree ({CheckoutRevision}) is ahead of the " +
+                "built output ({BuiltRevision}). New configuration keys may fail startup validation on the " +
+                "next restart. Rebuild the service (dotnet build) and restart so bin/ matches the checkout.",
+                report.CheckoutRevision,
+                report.BuiltRevision);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Could not evaluate deploy consistency; keeping prior baseline.");
+        }
     }
 
     /// <summary>

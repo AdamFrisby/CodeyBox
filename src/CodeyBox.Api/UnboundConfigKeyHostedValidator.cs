@@ -109,13 +109,16 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
 
     private readonly IConfiguration _config;
     private readonly ILogger<UnboundConfigKeyHostedValidator> _log;
+    private readonly DeployConsistencyService? _consistency;
 
     public UnboundConfigKeyHostedValidator(
         IConfiguration config,
-        ILogger<UnboundConfigKeyHostedValidator> log)
+        ILogger<UnboundConfigKeyHostedValidator> log,
+        DeployConsistencyService? consistency = null)
     {
         _config = config;
         _log = log;
+        _consistency = consistency;
     }
 
     public Task StartAsync(CancellationToken ct)
@@ -146,10 +149,17 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
         if (reports.Count == 0)
             return Task.CompletedTask;
 
+        // When the working tree has moved ahead of bin/ (git pull under a
+        // --no-build deploy), keys that bind fine in the checkout fail here
+        // because the running binaries predate them. Name that cause and its
+        // fix (rebuild) so the operator does not reach for the downgrade
+        // switch instead. A genuinely unknown key keeps the original message.
+        var staleNote = RefreshStaleBuildNote();
+
         var summary = UnboundConfigKeyInspector.FormatReports(reports);
         if (IsWarnMode(mode))
         {
-            _log.LogWarning("Unbound CodeyBox configuration keys detected: {Reports}", summary);
+            _log.LogWarning("Unbound CodeyBox configuration keys detected: {Reports}{StaleNote}", summary, staleNote);
             return Task.CompletedTask;
         }
 
@@ -168,10 +178,26 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
             "Unbound CodeyBox configuration keys detected (no matching CodeyBoxOptions / " +
             "ProjectsOptions property). Fix or remove these keys, or downgrade to a warning " +
             "via CodeyBox:ConfigValidation:UnboundKeys:Mode=\"warn\":" +
-            Environment.NewLine + summary);
+            Environment.NewLine + summary + staleNote);
     }
 
     public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+
+    private string RefreshStaleBuildNote()
+    {
+        try
+        {
+            var report = _consistency?.Refresh();
+            if (report?.IsDiverged != true)
+                return string.Empty;
+            return Environment.NewLine + DeployConsistency.FormatStaleBuildNote(report);
+        }
+        catch (Exception)
+        {
+            // The cause hint must never mask the underlying validation result.
+            return string.Empty;
+        }
+    }
 
     private static bool GetBool(IConfiguration section, string key, bool defaultValue)
     {

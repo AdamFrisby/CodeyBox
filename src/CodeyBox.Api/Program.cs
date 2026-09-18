@@ -439,6 +439,14 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new CodeyBoxOptionsValidator(sp.GetRequiredService<E2eRemotePoolConfigValidation>()));
 
+// Deploy-consistency probe. Refreshes the built-vs-checkout comparison at
+// startup and warns while the service is still healthy when the working tree
+// has moved ahead of bin/. Registered before UnboundConfigKeyHostedValidator
+// so the unbound-key failure can name a stale build as its cause. Never
+// throws; unknown revisions report unknown, not diverged.
+builder.Services.AddSingleton<DeployConsistencyService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DeployConsistencyService>());
+
 // Unbound-key startup check. Walks the CodeyBox:* configuration sub-tree
 // and surfaces any key that does not bind to a property on the typed
 // options graph (the .NET binder silently drops these, which makes a
@@ -4840,7 +4848,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
         hostPoolSnapshot: sp.GetService<ISandboxProvider>() as ISandboxHostPoolSnapshot,
         sandboxAdmission: sp.GetService<ISandboxProvider>() as SandboxAdmissionControlledProvider,
-        configuration: builder.Configuration);
+        configuration: builder.Configuration,
+        deployConsistency: sp.GetRequiredService<DeployConsistencyService>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -5165,6 +5174,7 @@ ReleaseEndpoints.Map(app);
 AgentPauseEndpoints.Map(app);
 TestSelectionSoundnessEndpoints.Map(app);
 ConfigReloadEndpoints.Map(app);
+DeployConsistencyEndpoints.Map(app);
 
 // Prometheus scrape endpoint — registered only when the exporter is enabled
 // so the surface is invisible (route not on the table) by default. Mapped
@@ -5598,7 +5608,7 @@ app.MapGet("/admin/agents/availability", (IAgentAvailabilityRegistry registry) =
 
 app.MapGet("/events/schema", () => Results.Ok(EventSchema.GetSchema()));
 
-app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
+app.MapGet("/healthz", (ISandboxProvider sandboxes, DeployConsistencyService consistency) =>
 {
     // Surface free-disk metrics for each path the disk-guard monitors so
     // dashboards can alert before the orchestrator starts deferring or the
@@ -5615,6 +5625,11 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
             belowThreshold = s.FreeBytes is long b && b < s.ThresholdBytes,
         }).ToArray()
         : [];
+
+    // Deploy consistency is refreshed on every probe so operators can observe
+    // a git pull moving the checkout ahead of bin/ without restarting. The
+    // refresh is a few capped file reads and never throws.
+    var report = consistency.Refresh();
     return Results.Ok(new
     {
         status = "ok",
@@ -5623,7 +5638,8 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
             provider = sandboxes.Name,
             isolation = sandboxes.IsolationLevel.ToString()
         },
-        disk
+        disk,
+        deploy = DeployConsistencyEndpoints.BuildPayload(report),
     });
 });
 
@@ -6939,6 +6955,11 @@ namespace CodeyBox.Api
         public ConfigValidationOptions ConfigValidation { get; set; } = new();
 
         /// <summary>
+        /// Deploy-consistency probing. Bound from <c>CodeyBox:DeployConsistency</c>.
+        /// </summary>
+        public DeployConsistencyOptions DeployConsistency { get; set; } = new();
+
+        /// <summary>
         /// Between-iteration incremental rebase toggle. When enabled,
         /// <see cref="CodeyBox.Orchestrator.PipelineRunner"/> runs the
         /// pickup-time rebase flow as best-effort between audit iterations
@@ -7021,6 +7042,24 @@ namespace CodeyBox.Api
         /// otherwise drop silently.
         /// </summary>
         public UnboundKeyValidationOptions UnboundKeys { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Deploy-consistency probing. Bound from <c>CodeyBox:DeployConsistency</c>.
+    /// The check compares the commit stamped into the binaries at build time
+    /// against the commit checked out on disk and warns when the working tree
+    /// has moved ahead of <c>bin/</c>. Read live from configuration on every
+    /// refresh so edits take effect without a restart.
+    /// </summary>
+    public sealed class DeployConsistencyOptions
+    {
+        /// <summary>
+        /// Optional override for the checkout root the consistency check
+        /// probes for <c>.git/HEAD</c>. When unset, the root is auto-detected
+        /// by walking up from the application base directory. Set this when
+        /// the service runs from binaries copied outside the checkout.
+        /// </summary>
+        public string? RepoRoot { get; set; }
     }
 
     /// <summary>
