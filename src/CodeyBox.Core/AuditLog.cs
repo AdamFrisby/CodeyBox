@@ -1505,6 +1505,18 @@ public static class AuditLog
             .Warning("Configuration reload contains keys that bind to no option: keys={Keys}",
                 string.Join(", ", keys));
 
+    /// <summary>
+    /// Emitted by <c>AgentConfigHotReload</c> when a reload finds the working
+    /// tree ahead of the built output. The mismatch is harmless while the
+    /// current configuration still binds, but new keys will fail startup
+    /// validation on the next restart — the audit trail should show when the
+    /// divergence was first observed.
+    /// </summary>
+    public static void ConfigDeployDiverged(string builtRevision, string checkoutRevision) =>
+        Audit("config_deploy_diverged")
+            .Warning("Working tree is ahead of the built output: built={Built} checkout={Checkout}",
+                builtRevision, checkoutRevision);
+
     // ── Test failure attribution ────────────────────────────────────────────
 
     public static void TestFailureAttributionSkipped(
