@@ -477,6 +477,14 @@ public sealed partial class PipelineRunner
         var triedCount = 0;
         DateTimeOffset? earliestReset = null;
         var sawQuotaBlockedCandidate = false;
+        // Armed by every successful runner swap and consumed by the next
+        // attempt's outcome: an authentication failure on the first attempt
+        // immediately after a swap is classified as infrastructure (the
+        // swapped-in agent likely executed without its own credentials),
+        // never as an agent re-authentication requirement. Disarmed by any
+        // completed post-swap attempt or by the conversion itself, so genuine
+        // credential expiry on later attempts still fails as auth-required.
+        var postSwapAuthGuardArmed = false;
         var currentRunner = initialRunner;
         var currentItem = initialItem;
         AgentKind? pausedFallbackAgent = null;
@@ -551,6 +559,7 @@ public sealed partial class PipelineRunner
             // Find the next candidate that we haven't already tried this run.
             var candidates = await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct, fallbackSmokeTarget);
             AgentMembership? nextMember = null;
+            IAgentRunner? nextRunner = null;
             foreach (var candidate in candidates)
             {
                 var key = TriedMemberKey(candidate);
@@ -568,13 +577,65 @@ public sealed partial class PipelineRunner
                         classId, candidate.Agent.Value, requireCapability, item.Id);
                     continue;
                 }
-                if (!_agents.TryGet(candidate.Agent, out _))
+                if (!_agents.TryGet(candidate.Agent, out var candidateRunner))
                 {
                     // Audible misconfiguration: class declares this agent kind but
                     // no runner is wired in DI; skipping silently would hide the gap.
                     _log.LogWarning(
                         "Class '{ClassId}' member {Agent} has no registered runner; skipping for fallback (work item {WorkItemId})",
                         classId, candidate.Agent.Value, item.Id);
+                    continue;
+                }
+                // Agent-switch credential gate (the same seam the
+                // conflict-resolver path uses): the incoming runner must be
+                // dispatchable with its OWN credentials before it is
+                // selected. A swap that cannot work is not a fallback —
+                // dispatching it would run the agent unauthenticated and
+                // 401, so the candidate is refused and the search continues.
+                // When every candidate is refused, the no-candidate branch
+                // below keeps the original failure with no dispatch attempted.
+                var candidateTrialItem = item with
+                {
+                    Agent = candidate.Agent,
+                    AgentInstanceId = candidate.RouteKey,
+                    ModelId = candidate.ModelId,
+                    ReasoningMode = candidate.ReasoningMode,
+                };
+                IAgentRunner boundCandidateRunner;
+                try
+                {
+                    boundCandidateRunner = BindMemberRunner(candidateRunner, candidate);
+                }
+                catch (Exception bindEx) when (bindEx is not OperationCanceledException)
+                {
+                    _log.LogWarning(bindEx,
+                        "Class '{ClassId}' member {Agent}/{Model} cannot bind its runner configuration; refusing for fallback (work item {WorkItemId})",
+                        classId, candidate.Agent.Value, candidate.ModelId ?? "(default)", item.Id);
+                    triedKeys.Add(key);
+                    continue;
+                }
+                AgentCredential? candidateCredential;
+                try
+                {
+                    candidateCredential = await ResolveAgentCredentialForInvocationAsync(
+                        boundCandidateRunner, project, candidateTrialItem, ct);
+                }
+                catch (Exception credEx) when (credEx is not OperationCanceledException)
+                {
+                    _log.LogWarning(credEx,
+                        "Class '{ClassId}' member {Agent}/{Model} credential could not be resolved; refusing for fallback (work item {WorkItemId})",
+                        classId, candidate.Agent.Value, candidate.ModelId ?? "(default)", item.Id);
+                    triedKeys.Add(key);
+                    continue;
+                }
+                var switchAssessment = AgentRunnerSwitchGate.AssessSwitch(boundCandidateRunner, candidateCredential);
+                if (!switchAssessment.Allowed)
+                {
+                    _log.LogWarning(
+                        "Class '{ClassId}' member {Agent}/{Model} refused for fallback (work item {WorkItemId}): {Reason}",
+                        classId, candidate.Agent.Value, candidate.ModelId ?? "(default)", item.Id,
+                        switchAssessment.RefusalReason ?? "credential cannot be materialised");
+                    triedKeys.Add(key);
                     continue;
                 }
                 // The router's in-process exhausted-cache filters most stale
@@ -627,6 +688,10 @@ public sealed partial class PipelineRunner
                     continue;
                 }
                 nextMember = candidate;
+                // Assessed (and member-bound) above by the agent-switch
+                // credential gate; carried out so the swap below dispatches
+                // exactly the runner that was validated.
+                nextRunner = boundCandidateRunner;
                 break;
             }
 
@@ -692,11 +757,23 @@ public sealed partial class PipelineRunner
                         terminalException);
                 }
 
+                // A terminal authentication failure with the post-swap guard
+                // still armed means the swapped-in agent 401d on its very
+                // first attempt: infrastructure (missing credential
+                // materialisation), not an agent re-authentication
+                // requirement. Without a preceding swap the guard is disarmed
+                // and genuine credential expiry still fails as auth-required.
+                if (terminalException is AgentAuthRequiredException terminalAuth && postSwapAuthGuardArmed)
+                {
+                    postSwapAuthGuardArmed = false;
+                    throw AgentRunnerSwitchGate.ToPostSwapInfrastructureFailure(terminalAuth, phase);
+                }
+
                 throw terminalException;
             }
 
-            if (!_agents.TryGet(nextMember.Agent, out var nextRunner))
-                throw new InvalidOperationException($"No runner registered for fallback agent '{nextMember.Agent}'");
+            if (nextRunner is null)
+                throw new InvalidOperationException($"No runner resolved for fallback agent '{nextMember.Agent}'");
 
             if (quotaExhausted)
             {
@@ -820,10 +897,23 @@ public sealed partial class PipelineRunner
             currentMember = nextMember;
             currentRunner = nextRunner;
             currentItem = trialItem;
-            // The fallback member brings its own configuration (e.g. a
-            // different Copilot BYOK provider or the native subscription), so
-            // the retry must run bound to the NEW member, not the exhausted one.
-            currentRunner = BindMemberRunner(currentRunner, currentMember);
+            // nextRunner was already bound to the NEW member by the
+            // agent-switch credential gate during candidate selection (the
+            // fallback member brings its own configuration, e.g. a different
+            // Copilot BYOK provider or the native subscription), so the retry
+            // runs bound to the incoming member, not the exhausted one.
+            // The swap arms the post-swap auth guard: a 401 on the very next
+            // attempt is infrastructure, not re-authentication.
+            postSwapAuthGuardArmed = true;
+            // The retry must execute with the incoming member's credential
+            // environment. Direct credential variables are baked into the
+            // sandbox spec at creation, so a warm reusable sandbox still
+            // carries the exhausted member's environment — the incoming
+            // agent's CLI would run without its own credentials and 401.
+            // Surrender it so the retry provisions a fresh sandbox from the
+            // incoming trial item's spec. No-op when reuse is disabled or no
+            // reusable sandbox is held; same-member retries never reach here.
+            await ReleaseAmbientWorkSandboxAsync();
         }
 
         while (true)
@@ -865,7 +955,13 @@ public sealed partial class PipelineRunner
 
             try
             {
-                return await InvokeAttemptAsync(currentRunner, currentItem);
+                var attemptResult = await InvokeAttemptAsync(currentRunner, currentItem);
+                // A completed post-swap attempt (success or a failure the
+                // catches below do not convert) consumes the guard: later
+                // auth failures are genuine credential events, not swap
+                // artefacts.
+                postSwapAuthGuardArmed = false;
+                return attemptResult;
             }
             catch (TerminalQuotaError quotaEx)
             {
@@ -887,6 +983,18 @@ public sealed partial class PipelineRunner
                     AgentFallbackTrigger.AuthRequired,
                     quotaResetAt: null,
                     terminalException: authEx);
+            }
+            catch (AgentAuthRequiredException authEx) when (postSwapAuthGuardArmed)
+            {
+                // The swapped-in runner 401d on its very first attempt. The
+                // swap was assessed as materialisable before dispatch, so
+                // this is infrastructure (the agent likely executed without
+                // its own credentials), not an agent re-authentication
+                // requirement. Without a preceding swap the guard is disarmed
+                // and the auth failure propagates unchanged, so a genuinely
+                // expired credential still fails the item as auth-required.
+                postSwapAuthGuardArmed = false;
+                throw AgentRunnerSwitchGate.ToPostSwapInfrastructureFailure(authEx, phase);
             }
             catch (AgentAttemptTimeoutException timeoutEx)
             {
