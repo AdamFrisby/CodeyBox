@@ -107,6 +107,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly IAgentRegistry? _agents;
     private readonly ISandboxHostPoolSnapshot? _hostPoolSnapshot;
     private readonly SandboxAdmissionControlledProvider? _sandboxAdmission;
+    private readonly SandboxClassesSnapshot? _sandboxClasses;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -134,6 +135,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastAgentPauses = "";
     private string _lastNetworkTolerance = "";
     private string _lastHostPoolCapacity = "";
+    private string _lastSandboxClasses = "";
 
     // Last-reported restart-required values (partial copy of the compared
     // fields only — all scalars/strings, so later mutation of the monitored
@@ -182,7 +184,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         ISandboxHostPoolSnapshot? hostPoolSnapshot = null,
         SandboxAdmissionControlledProvider? sandboxAdmission = null,
         IConfiguration? configuration = null,
-        DeployConsistencyService? deployConsistency = null)
+        DeployConsistencyService? deployConsistency = null,
+        SandboxClassesSnapshot? sandboxClasses = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -216,6 +219,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _agents = agents;
         _hostPoolSnapshot = hostPoolSnapshot;
         _sandboxAdmission = sandboxAdmission;
+        _sandboxClasses = sandboxClasses;
         _configuration = configuration;
         _deployConsistency = deployConsistency;
         _log = log;
@@ -248,6 +252,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastTransitionHealth = SerializeTransitionHealth(initial.TransitionHealth);
         _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
         _lastHostPoolCapacity = SerializeHostPoolCapacity(initial);
+        _lastSandboxClasses = SerializeSandboxClasses(initial.SandboxClasses);
         _restartBaseline = CaptureRestartBaseline(initial);
         _lastUnboundKeys = InspectUnboundKeys();
 
@@ -290,6 +295,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyToolchainFaultsIfChanged(opts);
             ApplyTransitionHealthIfChanged(opts);
             ApplyRouterIfChanged(opts);
+            ApplySandboxClassesIfChanged(opts);
             ApplyBurnIfChanged(opts);
             ApplyPricingIfChanged(opts);
             ApplyBudgetsIfChanged(opts);
@@ -882,6 +888,45 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         }
     }
 
+    /// <summary>
+    /// Rebuilds the validated sandbox class catalog when
+    /// <c>CodeyBox:SandboxClasses</c> (or the worker count it is checked
+    /// against) changes. A rejected edit keeps the prior catalog so running
+    /// placements never observe a half-validated model.
+    /// </summary>
+    private void ApplySandboxClassesIfChanged(CodeyBoxOptions opts)
+    {
+        var next = SerializeSandboxClasses(opts.SandboxClasses);
+        if (string.Equals(_lastSandboxClasses, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastSandboxClasses;
+        if (_sandboxClasses is null)
+        {
+            _lastSandboxClasses = next;
+            return;
+        }
+
+        try
+        {
+            var (maxWorkers, _) = OrchestratorOptionsFactory.ResolveSandboxCounts(
+                opts.Concurrency, opts.WorkerPool, _log);
+            var catalog = SandboxClassesConfigBuilder.Build(
+                opts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, _log);
+            _sandboxClasses.Replace(catalog);
+            _lastSandboxClasses = next;
+            AuditLog.ConfigReloaded("SandboxClasses", prev, next);
+            _log.LogInformation("Hot-reloaded SandboxClasses: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of SandboxClasses rejected; keeping prior catalog ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
     private void EnforceProbeCoverage(CodeyBoxOptions opts)
     {
         if (_coverage is null) return;
@@ -1213,6 +1258,42 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                     })
                     .ToArray(),
             },
+            JsonOpts);
+
+    /// <summary>
+    /// Change fingerprint for <c>CodeyBox:SandboxClasses</c>. Every settable
+    /// field on the class/member config POCOs is projected here so no edit
+    /// goes unnoticed; the fingerprint-coverage test fails when a new field
+    /// is added without being covered.
+    /// </summary>
+    internal static string SerializeSandboxClasses(List<SandboxClassOptions> classes) =>
+        JsonSerializer.Serialize(
+            classes
+                .Select(c => new
+                {
+                    c.Id,
+                    c.DisplayName,
+                    Members = c.Members
+                        .Select(m => new
+                        {
+                            m.MemberId,
+                            m.ProviderKind,
+                            m.HostId,
+                            m.Capacity,
+                            Capabilities = m.Capabilities
+                                .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+                                .ToArray(),
+                            NetworkProfiles = m.NetworkProfiles
+                                .OrderBy(t => t, StringComparer.Ordinal)
+                                .ToArray(),
+                            Credentials = m.Credentials
+                                .OrderBy(t => t, StringComparer.Ordinal)
+                                .ToArray(),
+                            m.PreferenceScore,
+                        })
+                        .ToArray(),
+                })
+                .ToArray(),
             JsonOpts);
 
     private static string SerializeNetworkTolerance(Dictionary<string, AgentNetworkToleranceOptions?> tolerance) =>

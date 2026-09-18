@@ -38,6 +38,7 @@ namespace CodeyBox.Api;
 public static class AgentClassesOverrideResolver
 {
     private const string SectionPath = "CodeyBox:AgentClasses";
+    private const string SandboxSectionPath = "CodeyBox:SandboxClasses";
 
     /// <summary>
     /// If a higher-precedence configuration provider supplies any key under
@@ -57,7 +58,7 @@ public static class AgentClassesOverrideResolver
         ArgumentNullException.ThrowIfNull(configuration);
         if (configuration is not IConfigurationRoot root) return;
 
-        var winner = FindHighestPrecedenceProvider(root);
+        var winner = FindHighestPrecedenceProvider(root, SectionPath);
         if (winner is null) return;
 
         // Empty snapshot can mean the winning provider stored the section key
@@ -78,28 +79,56 @@ public static class AgentClassesOverrideResolver
         options.AgentClasses = replacement;
     }
 
-    private static IConfigurationProvider? FindHighestPrecedenceProvider(IConfigurationRoot root)
+    /// <summary>
+    /// Same REPLACE-on-override semantics as <see cref="ApplyTo"/> for
+    /// <c>CodeyBox:SandboxClasses</c>. Sandbox classes are the same shape of
+    /// data (a list of classes each holding a member array), so the same
+    /// positional-merge footgun applies: without this, a shorter operator
+    /// override would resurrect the base layer's trailing members.
+    /// </summary>
+    public static void ApplySandboxClassesTo(CodeyBoxOptions options, IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (configuration is not IConfigurationRoot root) return;
+
+        var winner = FindHighestPrecedenceProvider(root, SandboxSectionPath);
+        if (winner is null) return;
+
+        var snapshot = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        EnumerateInto(winner, SandboxSectionPath, snapshot);
+
+        var subRoot = new ConfigurationBuilder()
+            .Add(new MemoryConfigurationSource { InitialData = snapshot })
+            .Build();
+
+        var replacement = new List<SandboxClassOptions>();
+        subRoot.GetSection(SandboxSectionPath).Bind(replacement);
+        options.SandboxClasses = replacement;
+    }
+
+    private static IConfigurationProvider? FindHighestPrecedenceProvider(IConfigurationRoot root, string sectionPath)
     {
         // Providers are listed in registration (precedence-low → precedence-high)
         // order; iterate in reverse so the highest-precedence supplier wins.
         foreach (var provider in root.Providers.Reverse())
         {
-            if (ProviderSuppliesSection(provider))
+            if (ProviderSuppliesSection(provider, sectionPath))
                 return provider;
         }
         return null;
     }
 
-    private static bool ProviderSuppliesSection(IConfigurationProvider provider)
+    private static bool ProviderSuppliesSection(IConfigurationProvider provider, string sectionPath)
     {
-        // Populated case: provider has indexed child keys under AgentClasses.
-        if (provider.GetChildKeys(Array.Empty<string>(), SectionPath).Any())
+        // Populated case: provider has indexed child keys under the section.
+        if (provider.GetChildKeys(Array.Empty<string>(), sectionPath).Any())
             return true;
         // Explicit-empty case: provider stored the section key itself (JSON
-        // "AgentClasses": [] / null records a key with no children). Without
+        // "Section": [] / null records a key with no children). Without
         // this branch a deliberate clear is silently ignored — the original
         // 2026-06-04 footgun in inverted form.
-        return provider.TryGet(SectionPath, out _);
+        return provider.TryGet(sectionPath, out _);
     }
 
     private static void EnumerateInto(

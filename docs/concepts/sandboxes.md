@@ -716,6 +716,41 @@ download during sync-back.
 | Persistent, high-throughput headless host with a ZFS/Btrfs pool | `incus`          |
 | No local KVM available, hosted VMs acceptable               | `sprites`           |
 
+## Sandbox classes (`CodeyBox:SandboxClasses`)
+
+Sandbox capacity is modelled the way agent capacity is modelled in
+`docs/concepts/agent-classes.md`: a `SandboxClass` is a named group of
+interchangeable `SandboxMember` hosts, each declaring a provider kind, a
+capacity, capability tags, network profiles, credentials, and a
+`PreferenceScore`. Higher score wins; ties spill deterministically — so
+"prefer local, spill to remote" is expressed as scores, not a hardcoded
+ratio. A member projects to `SandboxPlacementMember` for the placement
+decider.
+
+```json
+{ "CodeyBox": { "SandboxClasses": [
+  { "Id": "default", "DisplayName": "Local first, remote spillover",
+    "Members": [
+      { "MemberId": "local", "ProviderKind": "incus",
+        "Capacity": 8, "PreferenceScore": 100,
+        "Capabilities": ["baseline-bake"],
+        "NetworkProfiles": ["default"], "Credentials": ["codex"] },
+      { "MemberId": "overflow", "ProviderKind": "multipass-remote",
+        "HostId": "gpu-host-01",
+        "Capacity": 8, "PreferenceScore": 10 }
+    ] }
+] } }
+```
+
+The catalog is validated fail-closed at load and on hot-reload (a rejected
+edit keeps the prior catalog): unknown provider kinds, `Capacity <= 0`,
+memberless classes, and duplicate `MemberId`s are refused, with the reason
+naming the member and the offending value. Each member must also satisfy the
+worker/sandbox deadlock invariant — `Capacity >= 2 × MaxConcurrentWorkers`,
+because a worker holds its work sandbox while acquiring a second sandbox
+for audit. **Nothing routes through this catalog yet** and
+`CodeyBox:SandboxProvider` keeps working until a later item replaces it.
+
 ## Adding a new provider
 
 1. New project: `CodeyBox.Sandbox.<Name>` referencing `CodeyBox.Core` and
