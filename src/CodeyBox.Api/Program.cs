@@ -314,9 +314,12 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 // (a shorter operator override exposes the base array's trailing element).
 // The post-configure step REPLACES AgentClasses with the highest-precedence
 // provider's view, and re-runs on every IOptionsMonitor reload.
+// SandboxClasses gets the same treatment: it is the same shape of data
+// (classes each holding a member array) with the same footgun.
 builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
-    .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
+    .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration))
+    .PostConfigure(opts => AgentClassesOverrideResolver.ApplySandboxClassesTo(opts, builder.Configuration));
 builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
     sp.GetRequiredService<ILoggerFactory>(),
@@ -422,6 +425,7 @@ builder.Services.AddSingleton(sp =>
     var config = sp.GetRequiredService<IConfiguration>();
     var snapshot = config.GetSection("CodeyBox").Get<CodeyBoxOptions>() ?? new CodeyBoxOptions();
     AgentClassesOverrideResolver.ApplyTo(snapshot, config);
+    AgentClassesOverrideResolver.ApplySandboxClassesTo(snapshot, config);
     AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(snapshot.TransientNetworkFailurePatterns);
     return new CodeyBoxOptionsStartupSnapshot(snapshot);
 });
@@ -686,8 +690,8 @@ static ISandboxProvider BuildSandboxProviderInner(
 {
     return kind switch
     {
-        "process" => BuildProcess(sp, opts, environment, startupLog, loggerFactory),
-        "bubblewrap" => new BubblewrapSandboxProvider(
+        SandboxProviderKinds.Process => BuildProcess(sp, opts, environment, startupLog, loggerFactory),
+        SandboxProviderKinds.Bubblewrap => new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
             sp.GetService<ITimingStore>()),
@@ -703,10 +707,10 @@ static ISandboxProvider BuildSandboxProviderInner(
             loggerFactory,
             sp.GetService<ITimingStore>(),
             sp.GetService<ISandboxResourceUsageStore>()),
-        "multipass-remote" => BuildMultipassRemote(sp, loggerFactory),
-        "sprites" => BuildSprites(sp, loggerFactory, startupLog),
+        SandboxProviderKinds.MultipassRemote => BuildMultipassRemote(sp, loggerFactory),
+        SandboxProviderKinds.Sprites => BuildSprites(sp, loggerFactory, startupLog),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: incus, multipass, multipass-remote, sprites, bubblewrap, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: {string.Join(", ", SandboxProviderKinds.All.OrderBy(static s => s, StringComparer.Ordinal))}"),
     };
 }
 
@@ -2430,6 +2434,26 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<AgentCircuitBreaker>(),
         sp.GetRequiredService<QuotaReservationLedger>(),
         sp.GetRequiredService<ExecutorQuotaReportStore>());
+});
+
+// SandboxClassesSnapshot — validated sandbox class catalog. Built once here
+// so a bad CodeyBox:SandboxClasses edit fails the host fast at startup;
+// AgentConfigHotReload rebuilds through the same builder on every reload and
+// keeps the prior catalog when the new one is rejected. Nothing routes
+// through this catalog yet (provider registry, per-member gates, and
+// call-site rewiring are separate items) — this holder is the seam they
+// will consume. The existing CodeyBox:SandboxProvider setting keeps working
+// until a later item replaces it.
+builder.Services.AddSingleton<SandboxClassesSnapshot>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.SandboxClasses");
+    var (maxWorkers, _) = OrchestratorOptionsFactory.ResolveSandboxCounts(
+        cbOpts.Concurrency, cbOpts.WorkerPool, startupLog);
+    var catalog = SandboxClassesConfigBuilder.Build(
+        cbOpts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, startupLog);
+    startupLog.LogInformation("SandboxClasses loaded: {Count} class(es)", catalog.Count);
+    return new SandboxClassesSnapshot(catalog);
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -4853,7 +4877,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         hostPoolSnapshot: sp.GetService<ISandboxProvider>() as ISandboxHostPoolSnapshot,
         sandboxAdmission: sp.GetService<ISandboxProvider>() as SandboxAdmissionControlledProvider,
         configuration: builder.Configuration,
-        deployConsistency: sp.GetRequiredService<DeployConsistencyService>());
+        deployConsistency: sp.GetRequiredService<DeployConsistencyService>(),
+        sandboxClasses: sp.GetRequiredService<SandboxClassesSnapshot>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -6816,6 +6841,18 @@ namespace CodeyBox.Api
         /// more agent members in preference order. See docs/concepts/agent-classes.md.
         /// </summary>
         public List<AgentClassOptions> AgentClasses { get; set; } = [];
+
+        /// <summary>
+        /// Sandbox class definitions modelling sandbox capacity the way agent
+        /// classes model agent capacity. Each class lists one or more sandbox
+        /// members with a preference score, capacity, and capability tags.
+        /// Empty by default: nothing routes through the catalog yet (the
+        /// provider registry, per-member gates, and call-site rewiring are
+        /// separate items), and the existing
+        /// <c>CodeyBox:SandboxProvider</c> setting keeps working until a
+        /// later item replaces it.
+        /// </summary>
+        public List<SandboxClassOptions> SandboxClasses { get; set; } = [];
 
         /// <summary>
         /// Optional reusable agent instances. AgentClass members can reference
