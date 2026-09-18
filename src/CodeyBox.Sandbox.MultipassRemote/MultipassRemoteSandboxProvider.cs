@@ -1335,27 +1335,28 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
     }
 
+    /// <summary>
+    /// Hosts worth spending a remote <c>multipass list</c> inventory RPC on:
+    /// the members the shared <see cref="ExecutorPlacement"/> decider holds
+    /// eligible with zero load. Capacity is deliberately ignored here (live
+    /// counts are what this inventory produces); everything else the decider
+    /// excludes — cordon, configured or runtime SSH health, hosts that
+    /// already failed this create attempt, network-profile mismatch — is not
+    /// probed, matching the previous hand-rolled pre-filter exactly.
+    /// </summary>
     private IReadOnlyList<MultipassRemoteSandboxOptions> GetPlacementInventoryCandidates(
         SandboxSpec spec,
         ISet<string> skippedHosts,
         IReadOnlyList<MultipassRemoteSandboxOptions> hosts)
     {
         var now = DateTimeOffset.UtcNow;
-        var candidates = new List<MultipassRemoteSandboxOptions>(hosts.Count);
-        foreach (var host in hosts)
-        {
-            if (skippedHosts.Contains(host.HostId))
-                continue;
-            if (!host.Healthy || host.Cordoned)
-                continue;
-            if (!HostAllowsNetworkProfile(host, spec.Network.ProfileName))
-                continue;
-            if (!IsRuntimeHealthy(host.HostId, now, out _, removeExpired: true))
-                continue;
-            candidates.Add(host);
-        }
-
-        return candidates;
+        var members = ProjectPlacementMembers(hosts, now, skippedHosts, out var runtimeUnhealthy);
+        var requirements = BuildPlacementRequirements(spec);
+        var decision = ExecutorPlacement.Decide(members, requirements, loads: null, runtimeUnhealthy);
+        var eligible = new HashSet<string>(
+            decision.Candidates.Where(static c => c.Eligible).Select(static c => c.HostId),
+            StringComparer.Ordinal);
+        return hosts.Where(h => eligible.Contains(h.HostId)).ToArray();
     }
 
     private async Task<PlacementInventory> CountManagedByHostForPlacementAsync(
@@ -1407,6 +1408,17 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         return new PlacementInventory(counts, lastFailure);
     }
 
+    /// <summary>
+    /// Selects the executor host through the shared
+    /// <see cref="ExecutorPlacement"/> decider over projected members and
+    /// reserves a slot on it. Host-specific state the decider does not model
+    /// feeds it as inputs — live reservations plus untracked managed VMs as
+    /// the load map, SSH runtime backoff (and hosts that already failed this
+    /// create attempt) as <c>runtimeUnhealthy</c> — never as a parallel
+    /// selection path. Among eligible members the least-loaded wins, ties
+    /// broken by fewest in-flight reservations then ordinal host id, which
+    /// the convergence test enforces against the decider directly.
+    /// </summary>
     private HostReservation ReserveHost(
         SandboxSpec spec,
         ISet<string> skippedHosts,
@@ -1415,73 +1427,34 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     {
         var profile = NormalizeNetworkProfile(spec.Network.ProfileName);
         var now = DateTimeOffset.UtcNow;
-        var blocked = new List<string>(hosts.Count);
 
         lock (_placementLock)
         {
-            MultipassRemoteSandboxOptions? selected = null;
-            int selectedReserved = 0;
-            double selectedLoad = double.MaxValue;
-
+            var members = ProjectPlacementMembers(hosts, now, skippedHosts, out var runtimeUnhealthy);
+            var requirements = BuildPlacementRequirements(spec);
+            var byId = new Dictionary<string, MultipassRemoteSandboxOptions>(StringComparer.Ordinal);
+            var loads = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (var host in hosts)
             {
+                byId[host.HostId] = host;
                 var reserved = _hostReservations.TryGetValue(host.HostId, out var count) ? count : 0;
                 var activeForHost = _active.Values.Count(sb => string.Equals(sb.HostId, host.HostId, StringComparison.Ordinal));
                 var retainedForHost = _retainedReservations.Values.Count(r => string.Equals(r.HostOptions.HostId, host.HostId, StringComparison.Ordinal));
                 var managedCount = managedCounts.TryGetValue(host.HostId, out var managed) ? managed : 0;
                 var untrackedManaged = Math.Max(0, managedCount - activeForHost - retainedForHost);
-                var used = reserved + untrackedManaged;
-                var capacity = MultipassRemoteSandboxOptions.EffectiveCapacity(host);
-
-                if (skippedHosts.Contains(host.HostId))
-                {
-                    blocked.Add($"{host.HostId}=tried");
-                    continue;
-                }
-                if (!host.Healthy)
-                {
-                    blocked.Add($"{host.HostId}=configured-unhealthy");
-                    continue;
-                }
-                if (host.Cordoned)
-                {
-                    blocked.Add($"{host.HostId}=cordoned");
-                    continue;
-                }
-                if (!HostAllowsNetworkProfile(host, spec.Network.ProfileName))
-                {
-                    blocked.Add($"{host.HostId}=profile");
-                    continue;
-                }
-                if (!IsRuntimeHealthy(host.HostId, now, out var unhealthy, removeExpired: true))
-                {
-                    blocked.Add($"{host.HostId}=runtime-unhealthy-until-{unhealthy!.Until:O}");
-                    continue;
-                }
-                if (used >= capacity)
-                {
-                    blocked.Add($"{host.HostId}=full({used}/{FormatCapacity(capacity)})");
-                    continue;
-                }
-
-                var load = capacity == int.MaxValue ? 0.0d : (double)used / capacity;
-                if (selected is null
-                    || load < selectedLoad
-                    || (Math.Abs(load - selectedLoad) < double.Epsilon
-                        && used < selectedReserved)
-                    || (Math.Abs(load - selectedLoad) < double.Epsilon
-                        && used == selectedReserved
-                        && string.CompareOrdinal(host.HostId, selected.HostId) < 0))
-                {
-                    selected = host;
-                    selectedReserved = used;
-                    selectedLoad = load;
-                }
+                loads[host.HostId] = reserved + untrackedManaged;
             }
+
+            var decision = ExecutorPlacement.Decide(members, requirements, loads, runtimeUnhealthy);
+            var selected = decision.SelectedHostId is null ? null : byId[decision.SelectedHostId];
 
             if (selected is null)
             {
-                var reason = blocked.Count == 0 ? "no-hosts" : string.Join(", ", blocked);
+                var reason = string.Join(
+                    ", ",
+                    decision.Candidates.Select(static c => $"{c.HostId}={c.Reason}"));
+                if (decision.Candidates.Count == 0)
+                    reason = "no-hosts";
                 CodeyBoxMeters.SandboxRemotePlacementDeferrals.Add(
                     1,
                     new KeyValuePair<string, object?>("reason", "no-eligible-host"),
@@ -1513,6 +1486,50 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             return new HostReservation(this, selected);
         }
     }
+
+    /// <summary>
+    /// Projects resolved executor hosts to the placement members the shared
+    /// decider consumes. SSH runtime backoff (plus hosts that already failed
+    /// this create attempt) feeds the decider as the
+    /// <c>runtimeUnhealthy</c> input rather than a parallel selection path;
+    /// profile allowlists pass through the shared comparison seam so the
+    /// documented case-insensitive matching is preserved without touching
+    /// the decider.
+    /// </summary>
+    private IReadOnlyList<SandboxPlacementMember> ProjectPlacementMembers(
+        IReadOnlyList<MultipassRemoteSandboxOptions> hosts,
+        DateTimeOffset now,
+        ISet<string> skippedHosts,
+        out HashSet<string> runtimeUnhealthy)
+    {
+        runtimeUnhealthy = new HashSet<string>(StringComparer.Ordinal);
+        var members = new List<SandboxPlacementMember>(hosts.Count);
+        foreach (var host in hosts)
+        {
+            if (skippedHosts.Contains(host.HostId)
+                || !IsRuntimeHealthy(host.HostId, now, out _, removeExpired: true))
+            {
+                runtimeUnhealthy.Add(host.HostId);
+            }
+
+            members.Add(new SandboxPlacementMember
+            {
+                MemberId = host.HostId,
+                MaxConcurrentSandboxes = host.MaxConcurrentSandboxes,
+                NetworkProfiles = ExecutorEligibility.NormalizeNetworkProfilesForComparison(host.AllowedNetworkProfiles),
+                Cordoned = host.Cordoned,
+                Healthy = host.Healthy,
+            });
+        }
+
+        return members;
+    }
+
+    private static ExecutorPlacementRequirements BuildPlacementRequirements(SandboxSpec spec) =>
+        ExecutorPlacementRequirements.FromValues(
+            null,
+            ExecutorEligibility.NormalizeRequiredNetworkProfile(NormalizeNetworkProfile(spec.Network.ProfileName)),
+            requiredCapabilities: []);
 
     private void ReleaseHostReservation(string hostId)
     {
@@ -1628,25 +1645,6 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
 
         unhealthy = state;
-        return false;
-    }
-
-    private static bool HostAllowsNetworkProfile(MultipassRemoteSandboxOptions host, string? profileName)
-    {
-        if (host.AllowedNetworkProfiles.Count == 0)
-            return true;
-
-        var profile = NormalizeNetworkProfile(profileName);
-        foreach (var configured in host.AllowedNetworkProfiles)
-        {
-            if (string.IsNullOrWhiteSpace(configured))
-                continue;
-            var value = configured.Trim();
-            if (value == "*")
-                return true;
-            if (string.Equals(value, profile, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
         return false;
     }
 
