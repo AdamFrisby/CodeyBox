@@ -27,6 +27,7 @@ using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
 using CodeyBox.Agents.Qwen;
 using CodeyBox.Agents.Vibe;
+using CodeyBox.Agents.DotNetOpencode;
 using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
@@ -1424,6 +1425,17 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new QwenAgentRunner(
 // docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new CmdAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
+// dotnet-opencode: .NET port of OpenCode V2 (Hona/dotnet-opencode) driven via
+// `dotnet-opencode run --format json --standalone --auto` with the prompt on
+// stdin. A separate adapter from sst/opencode (different binary, transport,
+// credential file, quota shapes — see DotNetOpencodeAgentRunner). Auth is the
+// global opencode.json provider config from DOTNETOPENCODE_CONFIG_JSON in the
+// bundle (verbatim host mapping CODEYBOX_DOTNETOPENCODE_CONFIG_JSON). The
+// binary must be installed in the sandbox image alongside the .NET 11 preview
+// SDK and ripgrep; see docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new DotNetOpencodeAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -1949,6 +1961,13 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // non-credential constant (no Command Code plan is required for
         // --local-only BYOK runs).
         new AgentCredentialMapping(AgentKind.Cmd, "CODEYBOX_CMD_API_KEY", "OPENROUTER_API_KEY"),
+        // dotnet-opencode: global opencode.json provider config shipped
+        // verbatim (cursor-style). The CLI ignores bare provider env vars and
+        // performs no shared-auth import, so the whole config file is the
+        // credential; operators keeping keys out of the bundle use
+        // {env:VAR} indirection inside the JSON and add that provider's
+        // variable as a second mapping row.
+        new AgentCredentialMapping(AgentKind.DotNetOpencode, "CODEYBOX_DOTNETOPENCODE_CONFIG_JSON", "DOTNETOPENCODE_CONFIG_JSON"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2759,6 +2778,13 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new CmdSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CmdSmokeProbe>()));
+// dotnet-opencode: credential-presence check only (DOTNETOPENCODE_CONFIG_JSON
+// in the bundle). Provider-agnostic BYOK front with no single usage endpoint
+// and an interactive-only device login; any provider call would spend real
+// quota. The real auth check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new DotNetOpencodeSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<DotNetOpencodeSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2785,6 +2811,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, OmpInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, ContinueInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, QwenInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CmdInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, DotNetOpencodeInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -2936,6 +2963,11 @@ builder.Services.AddSingleton<IAgentModelListProbe, QwenModelListProbe>();
 // status reports Command Code plan state, not the BYOK provider balance),
 // so members fall through to the NullQuotaProbe unknown path.
 builder.Services.AddSingleton<IAgentModelListProbe, CmdModelListProbe>();
+// dotnet-opencode model-list probe: the CLI exposes no non-interactive model
+// catalog, so it cannot back a host-side startup probe. The curated
+// DotNetOpencodeKnownModels seed is authoritative; operator-configured ids
+// absent from the seed surface as a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, DotNetOpencodeModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -3936,6 +3968,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Goose] = new GooseCostExtractor(),
         [AgentKind.Vibe] = new VibeCostExtractor(),
         [AgentKind.Prime] = new PrimeCostExtractor(),
+        [AgentKind.DotNetOpencode] = new DotNetOpencodeCostExtractor(),
         [AgentKind.CavemanCode] = new CavemanCodeCostExtractor(),
         [AgentKind.Autohand] = new AutohandCostExtractor(),
         [AgentKind.Cline] = new ClineCostExtractor(),
@@ -4044,6 +4077,7 @@ builder.Services.AddSingleton<IAgentStreamParser, PrimeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AiderStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GooseStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, VibeStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, DotNetOpencodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CavemanCodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, AutohandStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, ClineStreamParser>();
@@ -4159,11 +4193,15 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
 {
     // Vibe detector accepts operator-extensible patterns from
     // CodeyBox:QuotaFailurePatterns:vibe, mirroring the goose hook above.
+    // dotnet-opencode detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:dotnet-opencode, mirroring the pi/cursor
+    // hook above.
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var extras = cbOpts.QuotaFailurePatterns is null
         ? null
         : cbOpts.QuotaFailurePatterns
             .Where(kvp => string.Equals(kvp.Key, AgentKind.Vibe.Value, StringComparison.OrdinalIgnoreCase))
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.DotNetOpencode.Value, StringComparison.OrdinalIgnoreCase))
             .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
             .Where(p => !string.IsNullOrEmpty(p.Pattern))
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
@@ -4293,6 +4331,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new CmdQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // DotNetOpencode detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:dotnet-opencode, mirroring the cmd hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.DotNetOpencode.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new DotNetOpencodeQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();

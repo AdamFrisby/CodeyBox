@@ -1190,7 +1190,138 @@ fronting paid OpenRouter models add that model's list prices there (or under
 `CodeyBox:AgentPricing`) keyed by the provider id behind their guest alias.
 
 ### Caveman-code CLI (`caveman-code`)
+### dotnet-opencode (`Hona/dotnet-opencode`)
 
+**Install in the sandbox image** — add the install lines to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against
+`0.1.0-ci.20260905083303.33955573552.1`, upstream commit `e0c1c9d`, on
+2026-09-16 — see `sandbox-baselines.md` for the full block). This is the
+heaviest agent baseline: the exact .NET 11 preview SDK
+(`11.0.100-preview.7.26381.103`), the prerelease global tool, and ripgrep:
+
+```sh
+dotnet tool install --global dotnet-opencode --prerelease
+```
+
+The tool command is `dotnet-opencode` (the runner invokes the shim, not
+`dotnet opencode`, so no `dotnet` host wrapper is needed on PATH). A complete
+rewrite of OpenCode V2 in C#/.NET maintaining protocol compatibility
+(`ses_`/`prt_`/`msg_` ids, the V2 event vocabulary); the .NET stack (ASP.NET
+Core server, System.CommandLine tree, SQLite channel database) is an
+implementation detail that leaks in exactly the places below.
+
+**Adapter decision: a new adapter, not the existing opencode one.** The CLIs
+share command names but differ in every integration dimension — binary and
+runtime, transport (`--format json` event envelope vs unverified plaintext),
+credentials (global `opencode.json` with `{env:}` indirection vs the
+Go-subscription `auth.json` file; bare provider env vars are ignored),
+quota (provider HTTP shapes only, no subscription windows), and baseline
+(preview SDK + ripgrep vs the install script). Folding both behind one
+`AgentKind` would couple the existing opencode path to flags it never
+verified.
+
+**Non-interactive invocation.** The runner drives headless `run` with the
+prompt on stdin and no positional prompt argument:
+
+```sh
+dotnet-opencode run --format json --standalone --auto [--model <provider/model>]
+```
+
+`--format json` is the runner's only transport: one JSON event per stdout
+line (`{"type":…,"timestamp":…,"sessionID":"ses_…","part"|"error":…}` with
+`step_start`, `text`, `reasoning`, `tool_use`, `step_finish`, `error`).
+`--standalone` selects a private scoped server — the default managed service
+binds a port and outlives the run, so a second dispatch in the same VM fails
+with "listener address is already in use"; the sandbox VM is discarded
+anyway, making daemon reuse pure overhead. `--auto` approves asked
+permissions once — without it headless runs cancel forms and reject
+permission-gated tool calls, which would turn every dispatch into an empty
+run; explicit denials are still honoured. `ReasoningMode` is intentionally
+NOT mapped: the CLI's `--thinking` is a show-reasoning boolean, not an
+effort level.
+
+**Standalone log pollution.** `--standalone` mode interleaves ASP.NET hosting
+logs (`info: Microsoft.Hosting.Lifetime…`) with the event lines on stdout.
+The stream parser and cost extractor skip non-JSON lines, but operators
+tailing raw `.jsonl` captures will see them.
+
+**Exit-zero answers.** Upstream documents that permission/form rejection
+paths can return normally (exit 0) without a model answer. The runner lifts
+the terminal `type:error` frame (first one wins: `error.type` +
+`error.message` + numeric `error.status`) into `TerminalDiagnostic`, so the
+pipeline's no-changes branch parks auth/config give-ups instead of
+dead-lettering them as "produced no changes" — the same shape `pi` has.
+Shell/runtime failures that prevent startup (`command not found` / exit 127,
+`You must install or update .NET`, `Ripgrep is unavailable`, the port
+collision) are lifted from stderr with the same cap, so a broken install is
+never recorded as the model declining to act.
+
+**Authentication.** Headless auth is ONLY the global config file's
+`provider.<id>.options.apiKey`, which supports `{env:VAR}` indirection.
+Verified live: bare `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in the environment
+are ignored (`provider.auth` / "Selected provider has no usable credential.
+Shared auth files and databases are not consulted."); a global
+`~/.config/opencode/opencode.json` with
+`{"provider":{"anthropic":{"options":{"apiKey":"{env:PROBE_KEY}"}}}}` reached
+api.anthropic.com (bogus key → provider HTTP 401). The shipped credential
+mapping wires host `CODEYBOX_DOTNETOPENCODE_CONFIG_JSON` verbatim to
+sandbox-side `DOTNETOPENCODE_CONFIG_JSON` (cursor-style), which the runner
+materialises to `~/.config/opencode/opencode.json` — never into the repo
+tree. Operators keeping keys out of the bundle use `{env:…}` indirection in
+the JSON and add that provider's variable as a second mapping row. The
+interactive `auth login` device/browser flows write the dotnet-channel SQLite
+database and are unusable headless.
+
+**Quota probe.** Ships as Unknown-only: the CLI is a provider-agnostic BYOK
+front with no subscription meter (`stats` reports local aggregates, not a
+quota window). The router's `QuotaUnknownPolicy` (default
+`UseObservedFailures`) gates dispatch via observed failure history, and
+`DotNetOpencodeQuotaFailureDetector` classifies the provider error shapes
+(`provider.auth` / 401 shapes → Unauthorized; 429/rate-limit → 
+RateLimitExceeded; 402/billing → LimitReached) with operator-extensible rows
+under `CodeyBox:QuotaFailurePatterns:dotnet-opencode`. There are deliberately
+NO rolling-window rows: the sst/opencode Go "N hour usage limit reached"
+vocabulary was never observed here and shipping it would fabricate a quota
+meter this CLI does not expose.
+
+**Smoke probes.** Host-side `DotNetOpencodeSmokeProbe` is a
+credential-presence check only (no network call — no single endpoint
+validates a multi-provider credential and any provider call spends real
+quota). `DotNetOpencodeInVmSmokeProbe` execs `dotnet-opencode --version`, a
+`run --help | grep -q -- --format` transport assertion, and a ripgrep
+presence check, so a missing binary, a dropped JSON transport, or a missing
+`rg` benches at smoke time instead of failing first dispatch.
+
+**Model-list probe.** The CLI exposes no non-interactive model catalog, so
+the host-side probe returns the curated `DotNetOpencodeKnownModels` seed
+(one live-verified id: `anthropic/claude-haiku-4-5` reached the provider).
+Operator `ModelId` values absent from the seed surface as a startup warning,
+never a hard reject. Prefer `provider/model`-qualified ids — that is the
+`--model` form the CLI documents (`provider/model#variant`).
+
+**Cost attribution.** `DotNetOpencodeCostExtractor` sums the per-step
+`step_finish` `part.tokens {input, output, cache.read}` frames (the server
+token vocabulary, confirmed live via `stats --json`; `cache.write` and
+`reasoning` have no cost bucket and are ignored). No run frame echoes the
+dispatch model id, so snapshots record tokens with a null model — cost
+attribution stays at raw token counts and there is deliberately NO pricing
+bucket in `agent-pricing-defaults.json`: any rate would be fabricated data.
+The success-path `step_finish` shape itself is source-derived (the CLI's
+run-output layer copies `cost`/`tokens` onto the step part), not
+live-captured — no funded provider credential was available, so no
+authenticated success run has been observed end to end.
+
+**Not yet proven.** The headless edit loop (prompt in → file changes in
+`/work` → merge) has NOT been exercised against a live provider from this
+repo: it needs a funded provider credential plus a sandbox backend, neither
+of which was available at integration time. For that reason no
+`dotnet-opencode` member ships in the default agent classes — operators opt
+in explicitly after confirming one real dispatch. `dotnet-opencode --version`
+prints the application version (`10.0.0` at integration time), not the
+NuGet package version pinned above.
+
+### Caveman-code CLI (`caveman-code`)
 Caveman-code (`github.com/JuliusBrussee/caveman-code`, npm
 `@juliusbrussee/caveman-code`, **MIT**) is a standalone terminal coding agent
 in the pi-mono family whose pitch is token compression (~2× fewer tokens than

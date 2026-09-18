@@ -8,6 +8,7 @@ using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
+using CodeyBox.Agents.DotNetOpencode;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
@@ -242,6 +243,29 @@ public sealed class InVmSmokeProbeBuildStepsTests
     }
 
     [Fact]
+    public void DotNetOpencode_EmitsVersionFormatAndRipgrepSteps_PinnedToRunnerBinary()
+    {
+        // Three steps: the --version binary check (exit 127 here names the
+        // missing binary, so a broken install benches as infrastructure
+        // instead of an empty "no changes" run), the --format assertion (the
+        // runner's only transport), and the ripgrep prerequisite the CLI
+        // fails fast without. All pin to the runner's binary constant so
+        // probe/runner drift fails loudly.
+        var probe = new DotNetOpencodeInVmSmokeProbe();
+        Assert.Equal(AgentKind.DotNetOpencode, probe.Kind);
+
+        foreach (var credential in new AgentCredential?[] { null, Cred(AgentKind.DotNetOpencode) })
+        {
+            var steps = probe.BuildSteps(credential);
+            Assert.Equal(3, steps.Count);
+            Assert.Equal([DotNetOpencodeAgentRunner.DefaultBinary, "--version"], steps[0].Argv);
+            Assert.Contains(DotNetOpencodeAgentRunner.DefaultBinary, string.Join(" ", steps[1].Argv));
+            Assert.Contains("--format", string.Join(" ", steps[1].Argv));
+            Assert.Contains("rg", string.Join(" ", steps[2].Argv));
+        }
+    }
+
+    [Fact]
     public void Vibe_EmitsVersionPlusOutputStreamingAssertion_PinnedToRunnerBinary()
     {
         // Vibe's probe has two steps: the --version binary check plus an
@@ -261,5 +285,19 @@ public sealed class InVmSmokeProbeBuildStepsTests
             Assert.Contains("--output", transport);
             Assert.Contains("streaming", transport);
         }
+    }
+
+    [Fact]
+    public void DotNetOpencode_FirstStepNamesBinaryForExit127()
+    {
+        // The task's infrastructure-vs-no-change contract: when the CLI is
+        // absent inside the guest the shell reports argv[0], so the first
+        // step must BE the bare binary invocation — that is what turns exit
+        // 127 into a failure naming the cause.
+        var steps = new DotNetOpencodeInVmSmokeProbe().BuildSteps(null);
+
+        Assert.Equal("dotnet-opencode", steps[0].Argv[0]);
+        Assert.NotNull(steps[0].FailureHint);
+        Assert.Contains("dotnet-opencode", steps[0].FailureHint!, StringComparison.Ordinal);
     }
 }

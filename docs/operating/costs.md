@@ -103,6 +103,7 @@ events.
 | `qwen` | yes, explicit $0 for the shipped free-tier member | qwen is a multi-provider front (native Qwen, OpenAI-, Anthropic-, and Gemini-compatible endpoints); the bundled bucket records the shipped OpenRouter `:free` model's zero rate keyed by the verbatim `message.model` id (`nvidia/nemotron-3.5-lightning:free` — verified live). The result frame reports `input_tokens`, `output_tokens`, and cached `cache_read_input_tokens` (plus a per-model breakdown in `stats.models`); all-zero usage on a failure run yields unknown, never a fabricated zero. Operators fronting paid models add that model's list prices under `CodeyBox:AgentPricing`. |
 | `opencode` | yes, estimated | OpenCode Go is subscription-priced. Bundled rates are a single subscription-equivalent USD/M per model (same value for input, cached, and output), derived from the $12/5h budget, each model's requests-per-5h limit, and the token mix documented at [opencode.ai/docs/go](https://opencode.ai/docs/go). Keys are `opencode-go/<model-id>`. |
 | `cursor`, `copilot` | no | flat-rate subscriptions with no published per-token price |
+| `dotnet-opencode` | no | BYOK front whose spend bills to the operator's own provider accounts — and the CLI reports tokens with no model id to key rates on, so no bucket would match. Token counts are recorded unattributed rather than priced. |
 
 `_meta.notes` carries those caveats in the file, and `GET /agent-pricing`
 echoes them, so the reasoning is visible at runtime rather than only here.

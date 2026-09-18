@@ -19,6 +19,7 @@ public readonly record struct AgentKind(string Value)
     public static AgentKind Aider { get; } = new("aider");
     public static AgentKind Goose { get; } = new("goose");
     public static AgentKind Vibe { get; } = new("vibe");
+    public static AgentKind DotNetOpencode { get; } = new("dotnet-opencode");
     public static AgentKind CavemanCode { get; } = new("caveman");
     public static AgentKind Autohand { get; } = new("autohand");
     public static AgentKind Cline { get; } = new("cline");

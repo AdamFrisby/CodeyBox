@@ -22,6 +22,7 @@
     <Project Path="src/CodeyBox.Agents.Continue/CodeyBox.Agents.Continue.csproj" />
     <Project Path="src/CodeyBox.Agents.Qwen/CodeyBox.Agents.Qwen.csproj" />
     <Project Path="src/CodeyBox.Agents.Cmd/CodeyBox.Agents.Cmd.csproj" />
+    <Project Path="src/CodeyBox.Agents.DotNetOpencode/CodeyBox.Agents.DotNetOpencode.csproj" />
     <Project Path="src/CodeyBox.Agents.CavemanCode/CodeyBox.Agents.CavemanCode.csproj" />
     <Project Path="src/CodeyBox.Agents/CodeyBox.Agents.csproj" />
     <Project Path="src/CodeyBox.AdminSeed/CodeyBox.AdminSeed.csproj" />
