@@ -14,6 +14,11 @@ namespace CodeyBox.Orchestrator;
 /// opts into lifecycle callbacks. Plugins implementing
 /// <see cref="IAsyncDisposable"/> are disposed automatically by the DI container
 /// at shutdown.
+///
+/// <para>Also emits the plugin startup report: which plugins are enabled and
+/// loaded, which stayed unloaded (and why), and which enabled plugins declare
+/// external tools missing from the host — so an operator sees that an enabled
+/// plugin will fail before it fails inside a sandbox.</para>
 /// </summary>
 internal sealed class PluginInitializationService : IHostedService
 {
@@ -22,19 +27,28 @@ internal sealed class PluginInitializationService : IHostedService
     private readonly IConfiguration _configuration;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<PluginInitializationService> _logger;
+    private readonly IPluginToolAvailabilityProbe _toolProbe;
+
+    /// <summary>
+    /// Unmet external-tool requirements observed by the last
+    /// <see cref="StartAsync"/> run. Exposed for tests and diagnostics.
+    /// </summary>
+    public IReadOnlyList<PluginToolRequirement> UnmetToolRequirements { get; private set; } = [];
 
     public PluginInitializationService(
         IPluginLoader loader,
         IServiceProvider serviceProvider,
         IConfiguration configuration,
         ILoggerFactory loggerFactory,
-        ILogger<PluginInitializationService> logger)
+        ILogger<PluginInitializationService> logger,
+        IPluginToolAvailabilityProbe? toolProbe = null)
     {
         _loader = loader;
         _serviceProvider = serviceProvider;
         _configuration = configuration;
         _loggerFactory = loggerFactory;
         _logger = logger;
+        _toolProbe = toolProbe ?? new PathPluginToolAvailabilityProbe();
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -48,9 +62,75 @@ internal sealed class PluginInitializationService : IHostedService
             foreach (var type in plugin.RegisteredTypes)
                 await InitializeTypeAsync(plugin, type, cancellationToken);
         }
+
+        ReportStartupState(plugins);
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <summary>
+    /// Logs the enabled/disabled/loaded state of every discovered plugin and
+    /// probes the external tools required by loaded plugins, recording the
+    /// unmet ones on <see cref="UnmetToolRequirements"/>. A missing binary is
+    /// a loud startup warning — never a silent bake failure later.
+    /// </summary>
+    private void ReportStartupState(IReadOnlyList<LoadedPlugin> plugins)
+    {
+        foreach (var status in _loader.GetDiscoveryStatuses())
+        {
+            if (status.Loaded)
+            {
+                _logger.LogInformation(
+                    "Plugin {PluginId} enabled and loaded ({DisplayName})",
+                    status.PluginId, status.DisplayName);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Plugin {PluginId} not loaded: {Reason}",
+                    status.PluginId, DescribeSkip(status.SkipReason));
+            }
+        }
+
+        var unmet = new List<PluginToolRequirement>();
+        foreach (var plugin in plugins)
+        {
+            foreach (var tool in plugin.RequiredTools ?? (IReadOnlyList<PluginToolRequirement>)[])
+            {
+                bool available;
+                try
+                {
+                    available = _toolProbe.IsAvailable(tool.Binary);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex, "Plugin {PluginId}: tool probe for '{Binary}' failed; treating as unmet",
+                        tool.PluginId, tool.Binary);
+                    available = false;
+                }
+                if (available)
+                    continue;
+                unmet.Add(tool);
+                AuditLog.PluginToolRequirementUnmet(tool.PluginId, tool.Binary, tool.InstallHint);
+                _logger.LogWarning(
+                    "Plugin {PluginId} requires binary '{Binary}' which was not found on host PATH{Hint}; " +
+                    "sandbox baselines carrying this plugin will fail verification until it is provisioned",
+                    tool.PluginId, tool.Binary,
+                    tool.InstallHint is null ? string.Empty : $" ({tool.InstallHint})");
+            }
+        }
+        UnmetToolRequirements = unmet;
+    }
+
+    private static string DescribeSkip(PluginSkipReason reason) => reason switch
+    {
+        PluginSkipReason.Disabled => "disabled — not in Plugins:Enabled (assembly not loaded)",
+        PluginSkipReason.NotAllowlisted => "not in Plugins:Allowlist",
+        PluginSkipReason.ApiVersionMismatch => "requires a newer host API version",
+        PluginSkipReason.InvalidToolDeclaration => "invalid external-tool declaration (failed closed)",
+        _ => "unknown reason",
+    };
 
     private async Task InitializeTypeAsync(LoadedPlugin plugin, Type type, CancellationToken ct)
     {

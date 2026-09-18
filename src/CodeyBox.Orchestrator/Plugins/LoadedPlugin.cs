@@ -16,4 +16,11 @@ public sealed record LoadedPlugin(
     /// plugin entry type. The loader registers each element under the
     /// <c>CodeyBox.Core</c> interfaces it implements.
     /// </summary>
-    IReadOnlyList<Type> RegisteredTypes);
+    IReadOnlyList<Type> RegisteredTypes,
+    /// <summary>
+    /// Validated external-tool requirements declared by this plugin. Only
+    /// tools of loaded (enabled + allowlisted) plugins are contributed to
+    /// the sandbox baseline and the startup availability report.
+    /// Null (the default for callers without tool requirements) means none.
+    /// </summary>
+    IReadOnlyList<PluginToolRequirement>? RequiredTools = null);

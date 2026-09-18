@@ -1459,6 +1459,21 @@ public static class AuditLog
             .Information("Plugin {PluginId} skipped: not in Plugins.Allowlist (path: {AssemblyPath})",
                 pluginId, assemblyPath);
 
+    public static void PluginSkippedDisabled(string pluginId, string assemblyPath) =>
+        Audit("plugin.skipped_disabled")
+            .Information("Plugin {PluginId} skipped: not in Plugins:Enabled (path: {AssemblyPath}); assembly not loaded",
+                pluginId, assemblyPath);
+
+    public static void PluginSkippedInvalidTool(string pluginId, string reason) =>
+        Audit("plugin.skipped_invalid_tool")
+            .Error("Plugin {PluginId} skipped: invalid external-tool declaration ({Reason}); failing closed",
+                pluginId, reason);
+
+    public static void PluginToolRequirementUnmet(string pluginId, string binary, string? hint) =>
+        Audit("plugin.tool_unmet")
+            .Warning("Plugin {PluginId} requires binary '{Binary}' which was not found on host PATH{Hint}; sandbox bakes carrying this plugin will fail until it is provisioned",
+                pluginId, binary, hint is null ? string.Empty : $": {hint}");
+
     public static void PluginSkippedApiVersion(string pluginId, string required, string current) =>
         Audit("plugin.skipped_api_version")
             .Error("Plugin {PluginId} requires host API version {Required} but this host provides {Current}; plugin not loaded",

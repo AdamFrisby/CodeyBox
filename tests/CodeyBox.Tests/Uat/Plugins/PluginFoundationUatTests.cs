@@ -32,6 +32,7 @@ public sealed class PluginFoundationUatTests
         {
             PackageDirectories = [pluginDirectory.Path],
             Allowlist = ["sample.auditor"],
+            Enabled = ["sample.auditor"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -96,6 +97,7 @@ public sealed class PluginFoundationUatTests
         {
             AssemblyPaths = [PluginTestHelpers.GetSamplePluginAssemblyPath()],
             Allowlist = ["*"],
+            Enabled = ["*"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -113,16 +115,18 @@ public sealed class PluginFoundationUatTests
         pluginDirectory.CopyIn(PluginTestHelpers.GetSamplePluginAssemblyPath());
         var logger = new CapturingLogger<PluginLoader>();
         var loader = new PluginLoader(
-            new PluginOptions { PackageDirectories = [pluginDirectory.Path], Allowlist = ["sample.auditor"] },
+            new PluginOptions { PackageDirectories = [pluginDirectory.Path], Allowlist = ["sample.auditor"], Enabled = ["sample.auditor"] },
             PluginsUatHelpers.EmptyConfig(),
             logger);
 
         var plugins = loader.DiscoverPlugins();
 
         Assert.Single(plugins);
+        // Non-assemblies now fail at the metadata-inspection gate (before any
+        // load is attempted), but the scan still continues to the valid file.
         Assert.Contains(logger.Entries, e =>
             e.Level == LogLevel.Error &&
-            e.Message.Contains("Failed to load plugin assembly", StringComparison.Ordinal));
+            e.Message.Contains("Failed to inspect plugin assembly metadata", StringComparison.Ordinal));
     }
 }
 
@@ -216,6 +220,15 @@ internal sealed class StaticPluginLoader(IReadOnlyList<LoadedPlugin> plugins) : 
 {
     public Task<IReadOnlyList<LoadedPlugin>> DiscoverAndLoadAsync(CancellationToken ct)
         => Task.FromResult(plugins);
+
+    public IReadOnlyList<PluginDiscoveryStatus> GetDiscoveryStatuses() =>
+        plugins.Select(static p => new PluginDiscoveryStatus(
+            p.PluginId, p.DisplayName, p.AssemblyPath,
+            Enabled: true, Allowlisted: true, Loaded: true,
+            SkipReason: PluginSkipReason.None, p.RequiredTools ?? [])).ToList();
+
+    public IReadOnlyList<PluginToolRequirement> GetEnabledPluginTools() =>
+        plugins.SelectMany(static p => p.RequiredTools ?? []).ToList();
 }
 
 internal sealed class EndpointCredentialPlugin : ICredentialProvider

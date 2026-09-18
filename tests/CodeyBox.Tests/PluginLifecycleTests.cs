@@ -20,7 +20,7 @@ public sealed class PluginLifecycleTests
     public async Task InitializeAsync_CalledAtStartup()
     {
         var samplePath = PluginTestHelpers.GetSamplePluginAssemblyPath();
-        var opts = new PluginOptions { AssemblyPaths = [samplePath], Allowlist = ["sample.auditor"] };
+        var opts = new PluginOptions { AssemblyPaths = [samplePath], Allowlist = ["sample.auditor"], Enabled = ["sample.auditor"] };
         var config = EmptyConfig();
 
         var services = new ServiceCollection();

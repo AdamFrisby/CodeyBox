@@ -23,9 +23,11 @@ Operator drops MyOrg.CustomAuditor.dll into /etc/codeybox/plugins/
        ▼
 PluginLoader scans all *.dll in PackageDirectories + AssemblyPaths
        │
-       ├─ Reads [CodeyBoxPlugin] attributes
+       ├─ Inspects [CodeyBoxPlugin] attributes from metadata only (no code runs)
+       ├─ Validates Enabled (disabled → assembly never loaded)
        ├─ Validates Allowlist
        ├─ Validates MinHostApiVersion
+       ├─ Validates [CodeyBoxPluginRequiresTool] declarations (fail closed)
        └─ Registers types under their CodeyBox.Core interface(s)
               │
               ▼
@@ -191,6 +193,10 @@ Bind from `CodeyBox:Plugins` in `appsettings.json`:
       "Allowlist": [
         "myorg.custom-auditor",
         "myorg.custom-upstream"
+      ],
+      "Enabled": [
+        "myorg.custom-auditor",
+        "myorg.custom-upstream"
       ]
     }
   }
@@ -202,9 +208,91 @@ Bind from `CodeyBox:Plugins` in `appsettings.json`:
 | `AssemblyPaths` | `string[]` | Absolute paths to specific DLL files. |
 | `PackageDirectories` | `string[]` | Directories scanned for `*.dll` (non-recursive). |
 | `Allowlist` | `string[]` | Plugin IDs allowed to load. Empty = load nothing. `["*"]` = load all (not recommended). |
+| `Enabled` | `string[]` | Plugin IDs switched on. A plugin loads only when it is **both allowlisted and enabled**; an allowlisted-but-disabled plugin stays unloaded — its assembly is never loaded, its types never registered, its instances never constructed. `["*"]` = enable all (not recommended: every future plugin would switch itself on by being present). |
 
 **Important:** an empty `Allowlist` is the safe default — no plugins load unless
 the operator explicitly opts in. This is intentional.
+
+## Enablement and defaults
+
+Enablement is a separate axis from the allowlist. Both gates must pass:
+
+- **Allowlist** answers "is this assembly permitted to load at all?"
+- **Enabled** answers "is this plugin switched on?"
+
+**Default: disabled.** A plugin that is not named in `Enabled` does nothing
+until an operator turns it on — with a large catalogue this is the difference
+between an opt-in capability and an unusable default install.
+
+The one exception is backward compatibility: the four bundled plugins that
+predate the switch — `codeybox.file-size-limits`, `codeybox.statistics`,
+`codeybox.quota-reset-notifier`, `codeybox.opencode-go-quota` — are enabled
+by default so deployments that allowlisted them keep working with no config
+change. Everything else — including the bundled
+`codeybox.dotnet-test-runner` / `codeybox.pytest-test-runner` entries and any
+plugin added later — is disabled until the operator names it in `Enabled`.
+Explicitly configuring `"Enabled": []` disables everything, including the
+four defaults.
+
+Changing `Enabled` requires a host **restart**. Unloading a live plugin is
+not safe (assemblies live in non-collectible load contexts; instances are
+already constructed as DI singletons), so a runtime edit is logged as
+restart-required and otherwise ignored. Per-plugin settings under
+`CodeyBox:Plugins:<plugin-id>:` remain hot-reloadable as before.
+
+## Declaring external tools
+
+A plugin that shells out to an external binary must declare it with the
+repeatable `[CodeyBoxPluginRequiresTool]` attribute — the binary it invokes
+and how an operator would provision it:
+
+```csharp
+[CodeyBoxPluginRequiresTool(
+    "dotnet",
+    AptPackage = "dotnet-sdk-10.0",
+    InstallHint = "install the .NET SDK from your toolchain feed")]
+public sealed class MyTestRunner : ITestRunnerAuditor
+{
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `Binary` (required) | Bare executable name (`dotnet`, `pytest`). No paths, no whitespace, no shell metacharacters — anything else fails closed and the plugin is skipped at load. |
+| `AptPackage` (optional) | Debian package name the host installs into sandbox baselines for enabled plugins. Omit when the tool is not apt-installable. |
+| `InstallHint` (optional) | Operator-facing guidance shown in startup warnings and bake failures. Display text only — never executed. |
+
+This is plugin metadata, not operator configuration, and the host treats it
+as untrusted input: names are validated against a strict allowlist before
+they reach any sink, and the host constructs every baseline command itself
+(see below). A plugin can never inject an arbitrary command through its
+tool declaration.
+
+### Baseline provisioning
+
+For **enabled** plugins only, the host translates validated tool
+requirements into sandbox baseline contributions:
+
+- **Verification** — a host-owned presence probe appended after the
+  agent-CLI probes (`BaselineVerificationCommands`). The bake fails if the
+  binary is not on sandbox PATH.
+- **Installation** — a single host-constructed `apt-get install` line
+  appended after operator `ExtraRuncmd` (only for tools declaring
+  `AptPackage`; tools without one are verify-only and the operator
+  provisions them via their own baseline steps).
+
+Both lists join the Incus/Multipass baseline-identity hashes, so a change in
+the enabled set produces a fresh baseline ref and the stale image is
+reaped through the normal orphan/grace path. The baseline for an operator
+who enables three auditors carries the tooling for exactly those three.
+
+### Startup report
+
+At startup the host logs every plugin's enabled/disabled/loaded state and
+probes the host `PATH` for each enabled plugin's binaries. An enabled plugin
+with an unmet requirement is reported loudly (`plugin.tool_unmet` audit
+event plus a warning naming the missing binary and its install hint) —
+before it can fail inside a sandbox.
 
 ## API-version contract
 
@@ -245,7 +333,9 @@ Host startup
            DI container disposes singletons → IAsyncDisposable.DisposeAsync()
 ```
 
-**No hot-reload in v1.** Plugin changes require a host restart.
+**No hot-reload of membership in v1.** Plugin changes require a host restart.
+Per-plugin settings remain hot-reloadable; only the enabled set is
+restart-gated (see [Enablement and defaults](#enablement-and-defaults)).
 
 ## Threat model
 
@@ -269,6 +359,10 @@ way you treat authors of the orchestrator itself.
   (which the operator must configure).
 - Load without appearing in the allowlist — every plugin ID must be explicitly
   listed in `Plugins.Allowlist`.
+- Load while disabled — every plugin ID must also be switched on in
+  `Plugins:Enabled`. A disabled plugin's assembly is never loaded: the host
+  inspects assembly metadata without executing any plugin code and only then
+  decides whether the file may be loaded at all.
 - Load without an audit-tier event — the host emits `plugin.loaded` for every
   successfully loaded plugin.
 

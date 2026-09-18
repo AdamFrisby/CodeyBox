@@ -78,7 +78,7 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
     /// <para><c>AllowsExtensionKeys</c> is set on <c>CodeyBox:Plugins</c>
     /// because its sub-tree mixes typed
     /// <see cref="PluginOptions.AssemblyPaths"/>/<see cref="PluginOptions.PackageDirectories"/>/
-    /// <see cref="PluginOptions.Allowlist"/> properties with operator-defined
+    /// <see cref="PluginOptions.Allowlist"/>/<see cref="PluginOptions.Enabled"/> properties with operator-defined
     /// <c>&lt;plugin-id&gt;</c> sub-trees that plugins read via
     /// <c>IPluginHost.ScopedConfig</c>. Non-matching keys at that level are
     /// treated as opaque plugin ids rather than flagged. The trade-off is

@@ -61,6 +61,13 @@
       which would interfere with the AssemblyLoadContext isolation under test.
     -->
     <ProjectReference Include="..\CodeyBox.PluginSdk.SampleTests\CodeyBox.PluginSdk.SampleTests.csproj" ReferenceOutputAssembly="false" />
+    <!--
+      Same arrangement for the tool-declaration fixture assembly used by the
+      plugin enablement / external-tool tests. Separate from SampleTests so
+      tool declarations (including a deliberately invalid one) cannot disturb
+      the count-sensitive sample-assembly tests.
+    -->
+    <ProjectReference Include="..\CodeyBox.PluginSdk.ToolSampleTests\CodeyBox.PluginSdk.ToolSampleTests.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Claude.AcpBridge\CodeyBox.Agents.Claude.AcpBridge.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Codex\CodeyBox.Agents.Codex.csproj" />

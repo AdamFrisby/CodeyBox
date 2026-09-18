@@ -64,6 +64,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
     <Project Path="tests/CodeyBox.PluginSdk.SampleTests/CodeyBox.PluginSdk.SampleTests.csproj" />
+    <Project Path="tests/CodeyBox.PluginSdk.ToolSampleTests/CodeyBox.PluginSdk.ToolSampleTests.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/CodeyBox.SampleGiteaUpstreamPlugin/CodeyBox.SampleGiteaUpstreamPlugin.csproj" />

@@ -39,6 +39,39 @@ internal static class PluginTestHelpers
         return samplePath;
     }
 
+    /// <summary>
+    /// Returns the path to the tool-declaration fixture assembly
+    /// (<c>CodeyBox.PluginSdk.ToolSampleTests.dll</c>). Same resolution rules
+    /// as <see cref="GetSamplePluginAssemblyPath"/>.
+    /// </summary>
+    public static string GetToolSamplePluginAssemblyPath()
+    {
+        var baseDir = AppContext.BaseDirectory;
+        var solutionRoot = FindAncestorContaining(baseDir, "CodeyBox.slnx")
+            ?? throw new InvalidOperationException(
+                $"Cannot locate solution root from '{baseDir}'. " +
+                "Ensure CodeyBox.slnx exists in an ancestor directory.");
+
+        var config = baseDir.Contains("Release", StringComparison.OrdinalIgnoreCase)
+            ? "Release"
+            : "Debug";
+
+        var samplePath = Path.Combine(
+            solutionRoot,
+            "tests",
+            "CodeyBox.PluginSdk.ToolSampleTests",
+            "bin", config, "net10.0",
+            "CodeyBox.PluginSdk.ToolSampleTests.dll");
+
+        if (!File.Exists(samplePath))
+            throw new FileNotFoundException(
+                $"Tool sample plugin assembly not found at '{samplePath}'. " +
+                "Build the solution (including CodeyBox.PluginSdk.ToolSampleTests) before running plugin tests.",
+                samplePath);
+
+        return samplePath;
+    }
+
     private static string? FindAncestorContaining(string start, string fileName)
     {
         var dir = start;

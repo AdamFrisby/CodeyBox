@@ -24,6 +24,7 @@ public sealed class PluginLoaderTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["*"],
+            Enabled = ["*"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -57,6 +58,7 @@ public sealed class PluginLoaderTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["sample.auditor"],   // only the primary auditor
+            Enabled = ["sample.auditor"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -90,7 +92,8 @@ public sealed class PluginLoaderTests
         var loader = MakeLoader(new PluginOptions
         {
             AssemblyPaths = [samplePath],
-            Allowlist = ["*"],   // allow all IDs so rejection is purely from version mismatch
+            Allowlist = ["*"],
+            Enabled = ["*"],   // allow all IDs so rejection is purely from version mismatch
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -113,6 +116,7 @@ public sealed class PluginLoaderTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["sample.auditor"],
+            Enabled = ["sample.auditor"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -147,6 +151,7 @@ public sealed class PluginLoaderTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["sample.auditor"],
+            Enabled = ["sample.auditor"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -169,6 +174,7 @@ public sealed class PluginLoaderTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["*"],
+            Enabled = ["*"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -201,7 +207,7 @@ public sealed class PluginLoaderTests
     {
         var samplePath = PluginTestHelpers.GetSamplePluginAssemblyPath();
         var loader = new PluginLoader(
-            new PluginOptions { AssemblyPaths = [samplePath], Allowlist = ["*"] },
+            new PluginOptions { AssemblyPaths = [samplePath], Allowlist = ["*"], Enabled = ["*"] },
             EmptyConfig(),
             NullLogger<PluginLoader>.Instance);
 
