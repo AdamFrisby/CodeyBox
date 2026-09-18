@@ -11,7 +11,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class SqliteWorkItemStoreClearBaselinePinsTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-clearpins-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-clearpins-");
+    private string _dbPath => _scratch.DbPath("clearpins.db");
     private readonly SqliteWorkItemStore _store;
 
     public SqliteWorkItemStoreClearBaselinePinsTests()
@@ -23,6 +24,8 @@ public sealed class SqliteWorkItemStoreClearBaselinePinsTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Sample(

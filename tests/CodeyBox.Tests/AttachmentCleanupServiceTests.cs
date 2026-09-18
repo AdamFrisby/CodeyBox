@@ -51,6 +51,7 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
         _store.Dispose();
         _rawConn.Dispose();
         try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
         try { if (Directory.Exists(_rootDir)) Directory.Delete(_rootDir, recursive: true); } catch { /* best-effort */ }
     }
 

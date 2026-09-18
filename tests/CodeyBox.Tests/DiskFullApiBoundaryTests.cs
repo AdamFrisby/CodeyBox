@@ -61,6 +61,7 @@ public sealed class DiskFullApiBoundaryTests
         finally
         {
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -127,6 +128,8 @@ public sealed class DiskFullApiBoundaryTests
 
     private sealed class DiskFullApiFactory : WebApplicationFactory<Program>
     {
+        private readonly TestScratchDirectory _scratch =
+            TestScratchDirectory.Create("codeybox-diskfull-api-");
         private readonly string _dbPath;
         private readonly bool _ownsDbPath;
         private readonly IWorkItemStore _store;
@@ -136,8 +139,7 @@ public sealed class DiskFullApiBoundaryTests
         {
             _store = store;
             _sandboxProvider = sandboxProvider;
-            _dbPath = dbPathOverride ?? Path.Combine(
-                Path.GetTempPath(), $"codeybox-diskfull-api-{Guid.NewGuid():N}.db");
+            _dbPath = dbPathOverride ?? _scratch.DbPath("diskfull-api.db");
             _ownsDbPath = dbPathOverride is null;
         }
 
@@ -146,15 +148,15 @@ public sealed class DiskFullApiBoundaryTests
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -177,6 +179,11 @@ public sealed class DiskFullApiBoundaryTests
             if (disposing && _ownsDbPath)
             {
                 try { File.Delete(_dbPath); } catch { }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            }
+            if (disposing)
+            {
+                _scratch.Dispose();
             }
             base.Dispose(disposing);
         }

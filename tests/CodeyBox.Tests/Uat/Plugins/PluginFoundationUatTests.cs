@@ -161,24 +161,23 @@ public sealed class PluginEndpointUatTests : IDisposable
 
 internal sealed class PluginEndpointFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = System.IO.Path.Combine(
-        System.IO.Path.GetTempPath(),
-        $"codeybox-plugin-uat-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-plugin-uat-");
+    private string _dbPath => _scratch.DbPath("plugin-uat.db");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = System.IO.Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:SandboxProvider"] = "process",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = System.IO.Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = System.IO.Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = System.IO.Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = System.IO.Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = System.IO.Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = System.IO.Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
             });
         });
         builder.ConfigureTestServices(services =>
@@ -206,6 +205,8 @@ internal sealed class PluginEndpointFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

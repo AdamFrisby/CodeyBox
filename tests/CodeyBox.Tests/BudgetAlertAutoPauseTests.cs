@@ -10,11 +10,14 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class BudgetAlertAutoPauseTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-ba-pause-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-ba-pause-");
+    private string _dbPath => _scratch.DbPath("ba-pause.db");
 
     public void Dispose()
     {
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static readonly ProjectId ProjectB = new("proj-b");

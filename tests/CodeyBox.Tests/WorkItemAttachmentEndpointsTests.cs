@@ -690,8 +690,8 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
 
 internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-attachment-api-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-attachment-api-");
+    private string _dbPath => _scratch.DbPath("attachment-api.db");
     private readonly string _rootDir = Path.Combine(
         Path.GetTempPath(), $"codeybox-attachment-blobs-{Guid.NewGuid():N}");
     private readonly HashSet<string> _attachmentRoots = new(StringComparer.Ordinal);
@@ -729,15 +729,15 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             var attachments = _optionsMonitor.CurrentValue.Attachments;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-bsl-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-bsl-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-bsl-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-bsl-audit.json"),
                 ["CodeyBox:Attachments:RootDirectory"] = attachments.RootDirectory,
                 ["CodeyBox:Attachments:MaxFileSizeBytes"] = attachments.MaxFileSizeBytes.ToString(),
                 ["CodeyBox:Attachments:MaxAttachmentsPerWorkItem"] = attachments.MaxAttachmentsPerWorkItem.ToString(),
@@ -774,6 +774,8 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
             WorkItemStore.Dispose();
             AttachmentStore.Dispose();
             try { File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
             foreach (var root in _attachmentRoots)
             {
                 try { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); } catch { }
@@ -797,15 +799,14 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
 
     private CodeyBoxOptions BuildCodeyBoxOptions(AttachmentsOptions attachments)
     {
-        var tmp = Path.GetTempPath();
         return new CodeyBoxOptions
         {
             StateDatabasePath = _dbPath,
-            GitRootDirectory = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+            GitRootDirectory = Path.Combine(_scratch.DirectoryPath, "test-git"),
             AuditLog = new AuditLogOptions
             {
-                Path = Path.Combine(tmp, $"test-bsl-log-{Guid.NewGuid():N}-.json"),
-                AuditPath = Path.Combine(tmp, $"test-bsl-audit-{Guid.NewGuid():N}-.json"),
+                Path = Path.Combine(_scratch.DirectoryPath, "test-bsl-log.json"),
+                AuditPath = Path.Combine(_scratch.DirectoryPath, "test-bsl-audit.json"),
             },
             Attachments = attachments,
         };

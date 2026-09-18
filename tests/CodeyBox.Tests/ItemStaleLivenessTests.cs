@@ -46,6 +46,7 @@ public sealed class ItemStaleLivenessTests : IDisposable
         _store.Dispose();
         _registry.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private ItemStaleProgressWatchdog BuildWatchdog(

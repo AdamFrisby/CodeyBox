@@ -37,6 +37,7 @@ public sealed class QuotaReservationEscrowLifecycleTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static QuotaRouterOptions EscrowOptions(double estimate = 4.0) => new()

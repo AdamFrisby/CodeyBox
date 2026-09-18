@@ -28,6 +28,7 @@ public sealed class BudgetResetTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem Started(string projectId, DateTimeOffset at) => new()

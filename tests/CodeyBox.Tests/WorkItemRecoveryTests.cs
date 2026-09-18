@@ -25,6 +25,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem Item(WorkItemState state, int recoveryAttempts = 0) => new()

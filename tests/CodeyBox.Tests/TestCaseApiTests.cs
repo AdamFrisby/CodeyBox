@@ -566,8 +566,11 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
 {
     public const string ProjectId = "test-project";
 
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-testcaseshttp-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch;
+    private readonly string _dbPath;
+    private readonly string _gitRootDirectory;
+    private readonly string _auditLogPath;
+    private readonly string _auditPath;
 
     public SqliteTestCaseStore TestCaseStore { get; }
     public SqliteE2eRunStore E2eRunStore { get; }
@@ -575,6 +578,11 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
 
     public TestCaseApiFactory()
     {
+        _scratch = TestScratchDirectory.Create("codeybox-testcaseshttp-");
+        _dbPath = _scratch.DbPath("testcases.db");
+        _gitRootDirectory = Path.Combine(_scratch.DirectoryPath, "git");
+        _auditLogPath = Path.Combine(_scratch.DirectoryPath, "test-log.json");
+        _auditPath = Path.Combine(_scratch.DirectoryPath, "test-audit.json");
         WorkItemStore = new SqliteWorkItemStore(_dbPath);
         TestCaseStore = new SqliteTestCaseStore(_dbPath);
         E2eRunStore = new SqliteE2eRunStore(_dbPath);
@@ -585,14 +593,14 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = _gitRootDirectory,
+                ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
             });
         });
         builder.ConfigureTestServices(services =>
@@ -629,6 +637,8 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
             E2eRunStore.Dispose();
             WorkItemStore.Dispose();
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

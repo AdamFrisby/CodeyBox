@@ -330,7 +330,7 @@ public sealed class PipelineIntegrationTests : IDisposable
     public async Task WorkPhaseInfrastructureLoss_RetainsThenConvertsSandboxBeforeResumedDispatch()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var provider = new RetainableProcessSandboxProvider();
+        await using var provider = new RetainableProcessSandboxProvider();
         var involvement = new InMemoryAgentInvolvementStore();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -432,7 +432,7 @@ public sealed class PipelineIntegrationTests : IDisposable
     public async Task RetainedSandboxConversion_WhenExecutionIsStillUnavailable_ReleasesPreparationClaim()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var provider = new RetainableProcessSandboxProvider
+        await using var provider = new RetainableProcessSandboxProvider
         {
             RestoreExecutionOnAdoption = false,
         };
@@ -493,7 +493,7 @@ public sealed class PipelineIntegrationTests : IDisposable
     public async Task RetainedSandboxAdoption_WhenProviderIsStillUnavailable_PreservesLeaseAndReleasesPreparationClaim()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var provider = new RetainableProcessSandboxProvider();
+        await using var provider = new RetainableProcessSandboxProvider();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
@@ -844,7 +844,7 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final.State);
     }
 
-    private sealed class RetainableProcessSandboxProvider : ISandboxProvider
+    private sealed class RetainableProcessSandboxProvider : ISandboxProvider, IAsyncDisposable
     {
         private readonly ProcessSandboxProvider _inner = new(
             Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance);
@@ -969,6 +969,35 @@ public sealed class PipelineIntegrationTests : IDisposable
             }
 
             await sandbox.DisposeAsync();
+        }
+
+        // Test-end cleanup for flows that intentionally leave a sandbox
+        // retained (preserved for a resume that never comes in the test).
+        // Disables preservation first so the temp root is actually removed.
+        // Deliberately bypasses DisposeInnerAsync so the disposal counters —
+        // which the tests assert — are untouched.
+        public async ValueTask DisposeAsync()
+        {
+            ISandbox? sandbox;
+            lock (_gate)
+            {
+                sandbox = _retained?.Sandbox;
+                _retained = null;
+            }
+
+            if (sandbox is null)
+                return;
+
+            if (sandbox is IPreserveOnDisposeSandbox preservable)
+                preservable.DisablePreserveOnDispose();
+            try
+            {
+                await sandbox.DisposeAsync();
+            }
+            catch
+            {
+                // Best-effort test teardown: never fail the run on cleanup.
+            }
         }
 
         private sealed record RetainedSandbox(

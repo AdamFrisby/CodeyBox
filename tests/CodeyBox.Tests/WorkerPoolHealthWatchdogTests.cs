@@ -41,6 +41,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         _orchestrator.Dispose();
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     [Fact]

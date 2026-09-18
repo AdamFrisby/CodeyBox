@@ -1080,7 +1080,8 @@ public sealed class ThinkingVsExecutingSplitTests
 
 public sealed class StreamAnalysisServiceTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-stream-analysis-");
+    private string _dbPath => _scratch.DbPath("stream-analysis.db");
     private readonly string _streamRoot = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-{Guid.NewGuid():N}");
     private readonly SqliteWorkItemStore _workItems;
     private readonly AgentStreamStore _streams;
@@ -1511,6 +1512,8 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         _costs.Dispose();
         _workItems.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
         try { Directory.Delete(_streamRoot, recursive: true); } catch { }
     }
 }
@@ -2158,8 +2161,9 @@ public sealed class OnDemandAnalysisEndpointTests
 
 public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-api-{Guid.NewGuid():N}.db");
-    private readonly string _streamRoot = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-api-{Guid.NewGuid():N}");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-stream-analysis-api-");
+    private string _dbPath => _scratch.DbPath("stream-analysis-api.db");
+    private string _streamRoot => Path.Combine(_scratch.DirectoryPath, "streams");
 
     public SqliteWorkItemStore Store { get; }
     public SqliteAgentStreamSummaryStore Summaries { get; }
@@ -2183,9 +2187,10 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(Path.GetTempPath(), $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(Path.GetTempPath(), $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 ["CodeyBox:AgentStreams:Path"] = _streamRoot,
             });
         });
@@ -2231,6 +2236,8 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
             Summaries.Dispose();
             Store.Dispose();
             try { File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
             try { Directory.Delete(_streamRoot, recursive: true); } catch { }
         }
         base.Dispose(disposing);

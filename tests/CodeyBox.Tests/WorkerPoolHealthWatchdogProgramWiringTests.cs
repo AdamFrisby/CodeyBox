@@ -73,8 +73,8 @@ public sealed class WorkerPoolHealthWatchdogProgramWiringTests
     private sealed class WorkerPoolHealthWatchdogWiringFactory : WebApplicationFactory<Program>
     {
         private readonly MutableOptionsMonitor<CodeyBoxOptions> _monitor;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-pool-health-wiring-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-pool-health-wiring-");
+        private string _dbPath => _scratch.DbPath("pool-health-wiring.db");
 
         public WorkerPoolHealthWatchdogWiringFactory(MutableOptionsMonitor<CodeyBoxOptions> monitor)
             => _monitor = monitor;
@@ -85,15 +85,15 @@ public sealed class WorkerPoolHealthWatchdogProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                     ["CodeyBox:WorkerPoolHealthWatchdog:StallTimeout"] = "00:03:00",
                     ["CodeyBox:WorkerPoolHealthWatchdog:CheckInterval"] = "00:01:00",
                 });
@@ -109,6 +109,8 @@ public sealed class WorkerPoolHealthWatchdogProgramWiringTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }

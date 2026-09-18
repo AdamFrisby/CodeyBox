@@ -1942,10 +1942,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     {
         var time = new ManualTimeProvider();
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await using var tracker = TrackingSandboxProvider.ForProcessSandbox();
         using var fix = BuildPipeline(
             seed,
             timeProvider: time,
-            phaseAbsoluteTimeoutMultiplier: 10.0);
+            phaseAbsoluteTimeoutMultiplier: 10.0,
+            sandboxProvider: tracker);
 
         fix.Codex.WorkDelays.Enqueue(TimeSpan.FromSeconds(11));
         fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fallback should not run"));
@@ -2449,14 +2451,16 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         IAgentAuthFailureClassifier? authFailureClassifier = null,
         IAgentAvailabilityRegistry? availability = null,
         PipelineTuningSnapshot? pipelineTuning = null,
-        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null,
+        ISandboxProvider? sandboxProvider = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
-        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var sandboxes = sandboxProvider
+            ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var webhooks = new CapturingWebhookDispatcher();
 

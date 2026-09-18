@@ -17,6 +17,7 @@ namespace CodeyBox.Tests;
 public sealed class AgentControlWorkItemApiTests : IDisposable
 {
     private readonly WorkItemApiFactory _factory = new();
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-agent-control-api-");
     private readonly HttpClient _client;
 
     public AgentControlWorkItemApiTests()
@@ -28,6 +29,8 @@ public sealed class AgentControlWorkItemApiTests : IDisposable
     {
         _client.Dispose();
         _factory.Dispose();
+        TestScratchDirectory.ClearSqlitePools();
+        _scratch.Dispose();
     }
 
     [Fact]
@@ -272,12 +275,12 @@ public sealed class AgentControlWorkItemApiTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, conflictingDuration.StatusCode);
     }
 
-    private static PipelineRunner BuildRealAgentControlPipeline(
+    private PipelineRunner BuildRealAgentControlPipeline(
         IWorkItemStore store,
         IAgentPauseController pauses,
         IWebhookDispatcher webhooks)
     {
-        var gitRoot = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-api-git-{Guid.NewGuid():N}");
+        var gitRoot = Path.Combine(_scratch.DirectoryPath, $"git-{Guid.NewGuid():N}");
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);

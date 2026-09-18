@@ -13,7 +13,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class PerModelObservedFailureBreakerTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-permodel-breaker-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-permodel-breaker-");
+    private string _dbPath => _scratch.DbPath("permodel-breaker.db");
     private readonly SqliteQuotaFailureStore _failures;
 
     public PerModelObservedFailureBreakerTests() => _failures = new SqliteQuotaFailureStore(_dbPath);
@@ -22,6 +23,8 @@ public sealed class PerModelObservedFailureBreakerTests : IDisposable
     {
         _failures.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     [Fact]

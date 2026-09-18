@@ -303,8 +303,9 @@ public sealed class AdminSeedTests
     [Fact]
     public async Task Seeder_WritesReadableRowsThroughRealStores()
     {
-        var root = Path.Combine(Path.GetTempPath(), "codeybox-tests", Guid.NewGuid().ToString("N"));
-        var db = Path.Combine(root, "seed.db");
+        using var scratch = TestScratchDirectory.Create("codeybox-admin-seed-test-");
+        var root = scratch.DirectoryPath;
+        var db = scratch.DbPath("seed.db");
 
         var seeder = new AdminSeeder();
         var summary = await seeder.SeedAsync(db, root, new AdminSeedSpec { Seed = 42, Now = FixedNow });
@@ -324,8 +325,9 @@ public sealed class AdminSeedTests
     [Fact]
     public async Task Seeder_ReseedIsIdempotent()
     {
-        var root = Path.Combine(Path.GetTempPath(), "codeybox-tests", Guid.NewGuid().ToString("N"));
-        var db = Path.Combine(root, "seed.db");
+        using var scratch = TestScratchDirectory.Create("codeybox-admin-seed-test-");
+        var root = scratch.DirectoryPath;
+        var db = scratch.DbPath("seed.db");
         var seeder = new AdminSeeder();
         var spec = new AdminSeedSpec { Seed = 42, Now = FixedNow };
 
@@ -343,7 +345,8 @@ public sealed class AdminSeedTests
     [Fact]
     public async Task Seeder_EscapingDbPath_Throws()
     {
-        var root = Path.Combine(Path.GetTempPath(), "codeybox-tests", Guid.NewGuid().ToString("N"));
+        using var scratch = TestScratchDirectory.Create("codeybox-admin-seed-test-");
+        var root = scratch.DirectoryPath;
         var seeder = new AdminSeeder();
         await Assert.ThrowsAsync<ArgumentException>(() =>
             seeder.SeedAsync(Path.Combine("..", "evil.db"), root));

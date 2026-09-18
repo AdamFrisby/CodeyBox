@@ -9,11 +9,14 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class QueueControllerTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-qc-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-qc-");
+    private string _dbPath => _scratch.DbPath("qc.db");
 
     public void Dispose()
     {
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private SqliteQueueController Make() => new(_dbPath, NullLogger<SqliteQueueController>.Instance);

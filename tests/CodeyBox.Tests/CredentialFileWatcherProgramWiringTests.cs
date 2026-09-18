@@ -144,6 +144,7 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     [CredentialFileWatcherSettings.ConfigurationKey] = _credentialFileWatchers,
                     ["CodeyBox:StateDatabasePath"] = Path.Combine(_root, "state.db"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_root, "github-apps"),
                     ["CodeyBox:GitRootDirectory"] = Path.Combine(_root, "git"),
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(_root, "logs", "api-.json"),
                     ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_root, "logs", "audit-.json"),

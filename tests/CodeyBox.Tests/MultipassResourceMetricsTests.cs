@@ -16,9 +16,8 @@ namespace CodeyBox.Tests;
 public sealed class MultipassResourceMetricsTests : IDisposable
 {
     private readonly TestSink _sink = new();
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(),
-        $"codeybox-resource-metrics-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-resource-metrics-");
+    private string _dbPath => _scratch.DbPath("resource-metrics.db");
 
     public MultipassResourceMetricsTests()
     {
@@ -31,9 +30,8 @@ public sealed class MultipassResourceMetricsTests : IDisposable
     public void Dispose()
     {
         Log.CloseAndFlush();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        try { File.Delete(_dbPath + "-wal"); } catch { /* best-effort */ }
-        try { File.Delete(_dbPath + "-shm"); } catch { /* best-effort */ }
+        TestScratchDirectory.ClearSqlitePools();
+        _scratch.Dispose();
     }
 
     [Fact]
@@ -575,12 +573,12 @@ public sealed class MultipassResourceMetricsTests : IDisposable
             resourceUsageStore: resourceUsageStore,
             baselineRef: "cb-baseline-claude");
 
-    private static MultipassSandboxOptions CaptureOptions(
+    private MultipassSandboxOptions CaptureOptions(
         bool enabled = true,
         TimeSpan? timeout = null) => new()
         {
             MultipassBinary = "multipass",
-            StagingDirectory = Path.Combine(Path.GetTempPath(), $"codeybox-test-staging-{Guid.NewGuid():N}"),
+            StagingDirectory = Path.Combine(_scratch.DirectoryPath, "staging"),
             CaptureResourceMetrics = enabled,
             ResourceMetricsCaptureTimeout = timeout ?? TimeSpan.FromSeconds(5),
         };

@@ -6,7 +6,8 @@ namespace CodeyBox.Tests;
 
 public sealed class QuotaUnknownPolicyTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-quota-policy-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-quota-policy-");
+    private string _dbPath => _scratch.DbPath("quota-policy.db");
     private readonly SqliteQuotaFailureStore _failures;
 
     public QuotaUnknownPolicyTests() => _failures = new SqliteQuotaFailureStore(_dbPath);
@@ -15,6 +16,8 @@ public sealed class QuotaUnknownPolicyTests : IDisposable
     {
         _failures.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     [Fact]

@@ -24,6 +24,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
         Log.CloseAndFlush();
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     [Fact]

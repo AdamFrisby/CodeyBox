@@ -14,7 +14,8 @@ namespace CodeyBox.Tests.Uat.QuotaAndRouting;
 /// </summary>
 public sealed class AgentClassRouterTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-uat-router-failures-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-uat-router-failures-");
+    private string _dbPath => _scratch.DbPath("uat-router-failures.db");
     private readonly string _workDbPath = Path.Combine(Path.GetTempPath(), $"codeybox-uat-router-items-{Guid.NewGuid():N}.db");
     private readonly SqliteQuotaFailureStore _failures;
     private readonly SqliteWorkItemStore _items;
@@ -30,7 +31,10 @@ public sealed class AgentClassRouterTests : IDisposable
         _items.Dispose();
         _failures.Dispose();
         File.Delete(_dbPath);
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
         File.Delete(_workDbPath);
+        TestScratchDirectory.DeleteSqliteCompanions(_workDbPath);
+        _scratch.Dispose();
     }
 
     [Fact]

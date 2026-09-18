@@ -1279,7 +1279,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         // Wrap the default sandbox provider to force kill/dispose timeouts
         var defaultProvider = new ProcessSandboxProvider(Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance);
-        var timeoutProvider = new TimeoutSandboxProvider(defaultProvider, forceKillTimeout: true, forceDisposeTimeout: true);
+        await using var timeoutProvider = new TimeoutSandboxProvider(defaultProvider, forceKillTimeout: true, forceDisposeTimeout: true);
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -1947,11 +1947,12 @@ file sealed class AuditCredentialLaunchTimeoutSandboxProvider : ISandboxProvider
         => _inner.DisposeLeakedAsync(sandboxId, ct);
 }
 
-file sealed class TimeoutSandboxProvider : ISandboxProvider
+file sealed class TimeoutSandboxProvider : ISandboxProvider, IAsyncDisposable
 {
     private readonly ISandboxProvider _inner;
     private readonly bool _forceKillTimeout;
     private readonly bool _forceDisposeTimeout;
+    private readonly System.Collections.Concurrent.ConcurrentBag<ISandbox> _created = new();
 
     public TimeoutSandboxProvider(ISandboxProvider inner, bool forceKillTimeout, bool forceDisposeTimeout)
     {
@@ -1965,6 +1966,7 @@ file sealed class TimeoutSandboxProvider : ISandboxProvider
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct)
     {
         var sb = await _inner.CreateAsync(spec, ct);
+        _created.Add(sb);
         if (spec.TimingPhase == "audit" && spec.Environment.ContainsKey("OPENAI_API_KEY"))
         {
             return new TimeoutSandbox(sb, _forceKillTimeout, _forceDisposeTimeout);
@@ -1977,6 +1979,27 @@ file sealed class TimeoutSandboxProvider : ISandboxProvider
 
     public Task DisposeLeakedAsync(string sandboxId, CancellationToken ct)
         => _inner.DisposeLeakedAsync(sandboxId, ct);
+
+    // Test-end cleanup: sandboxes whose disposal was forced to time out are
+    // abandoned by the pipeline (that is the scenario under test). Dispose
+    // the real inners directly so no codeybox-sandbox-* root leaks.
+    // Disposal is idempotent, so already-disposed sandboxes are safe.
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var sb in _created)
+        {
+            if (sb is IPreserveOnDisposeSandbox preservable)
+                preservable.DisablePreserveOnDispose();
+            try
+            {
+                await sb.DisposeAsync();
+            }
+            catch
+            {
+                // Best-effort test teardown.
+            }
+        }
+    }
 }
 
 file sealed class TimeoutSandbox : ISandbox

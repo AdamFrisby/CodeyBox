@@ -13,7 +13,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class PatchWorkItemTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-patch-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-patch-");
+    private string _dbPath => _scratch.DbPath("patch.db");
     private readonly SqliteWorkItemStore _store;
 
     public PatchWorkItemTests()
@@ -25,6 +26,8 @@ public sealed class PatchWorkItemTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Sample(WorkItemState state = WorkItemState.Queued) => new()

@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Tests;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -29,6 +30,7 @@ internal sealed class CostTelemetryWorkspace : IDisposable
 
 internal sealed class CostTelemetryApiFactory : WebApplicationFactory<Program>
 {
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-uat-cost-telemetry-");
     private readonly string _dbPath;
     private readonly string _streamRoot;
     private readonly Project[] _projects;
@@ -61,9 +63,10 @@ internal sealed class CostTelemetryApiFactory : WebApplicationFactory<Program>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(Path.GetTempPath(), $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(Path.GetTempPath(), $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 ["CodeyBox:AgentStreams:Path"] = _streamRoot,
             });
         });
@@ -105,6 +108,7 @@ internal sealed class CostTelemetryApiFactory : WebApplicationFactory<Program>
             Timings.Dispose();
             Costs.Dispose();
             WorkItems.Dispose();
+            _scratch.Dispose();
         }
 
         base.Dispose(disposing);

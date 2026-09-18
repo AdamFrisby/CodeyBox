@@ -67,9 +67,9 @@ public sealed class SandboxResourceUsageEndpointTests : IClassFixture<SandboxRes
 
     public sealed class Factory : WebApplicationFactory<Program>
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(),
-            $"codeybox-resource-endpoint-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch =
+            TestScratchDirectory.Create("codeybox-resource-endpoint-");
+        private string _dbPath => _scratch.DbPath("resource-endpoint.db");
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -77,15 +77,15 @@ public sealed class SandboxResourceUsageEndpointTests : IClassFixture<SandboxRes
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -98,9 +98,11 @@ public sealed class SandboxResourceUsageEndpointTests : IClassFixture<SandboxRes
         {
             if (disposing)
             {
+                TestScratchDirectory.ClearSqlitePools();
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
                 try { File.Delete(_dbPath + "-wal"); } catch { /* best-effort */ }
                 try { File.Delete(_dbPath + "-shm"); } catch { /* best-effort */ }
+                _scratch.Dispose();
             }
             base.Dispose(disposing);
         }

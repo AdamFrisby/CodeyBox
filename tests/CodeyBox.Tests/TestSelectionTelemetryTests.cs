@@ -14,8 +14,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class TestSelectionTelemetryTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-ts-telemetry-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-ts-telemetry-");
+    private string _dbPath => _scratch.DbPath("ts-telemetry.db");
     private readonly SqliteAuditReportStore _store;
 
     public TestSelectionTelemetryTests()
@@ -28,6 +28,8 @@ public sealed class TestSelectionTelemetryTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static TestSelectionShadowRecord ShadowRecord(

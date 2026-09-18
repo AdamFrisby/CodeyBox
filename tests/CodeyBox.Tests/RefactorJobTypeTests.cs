@@ -32,6 +32,7 @@ public sealed class RefactorJobTypeTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem MakeQueued(string projectId = "proj-a", JobType jobType = JobType.Normal)
@@ -622,6 +623,7 @@ public sealed class RefactorJobTypeTests : IDisposable
         finally
         {
             try { File.Delete(releaseDbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(releaseDbPath);
         }
     }
 

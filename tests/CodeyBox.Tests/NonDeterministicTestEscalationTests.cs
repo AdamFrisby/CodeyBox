@@ -23,6 +23,7 @@ public sealed class NonDeterministicTestEscalationTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static TestFailureAttributionResult Flaky(string name) => new(

@@ -222,6 +222,23 @@ public sealed partial class PipelineRunner
     private readonly IHumanDeploymentReviewStore? _humanReviews;
     private readonly IMergeScopeResolver _mergeScopeResolver;
     private readonly Func<Guid> _dispatchClaimIdFactory;
+    // Shared host-hooks suppression directory. It holds no per-instance
+    // state — it is only handed to git as core.hooksPath so host-side
+    // commands never execute repo hooks — so all instances reuse one
+    // well-known directory created once per host. A per-instance
+    // GUID-suffixed directory here leaked one temp entry per construction
+    // (nothing ever deleted it); on a tmpfs /tmp that growth sits in RAM.
+    internal static string SharedDisabledHostHooksPath => SharedDisabledHostHooks.Value;
+
+    private static readonly Lazy<string> SharedDisabledHostHooks = new(
+        () =>
+        {
+            var path = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks");
+            Directory.CreateDirectory(path);
+            return path;
+        },
+        LazyThreadSafetyMode.ExecutionAndPublication);
+
     private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the
     // default for tests / minimal compositions). Composed with the global
@@ -542,8 +559,7 @@ public sealed partial class PipelineRunner
                 authFailureClassifier: _authFailureClassifier);
         _promptComposer = new PromptComposer();
         _costUsageRecorder = new CostUsageRecorder(_costStore, _usageStore, _costCalculator, _costExtractors, _log);
-        _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_disabledHostHooksPath);
+        _disabledHostHooksPath = SharedDisabledHostHooksPath;
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
         // The session-runner abstraction is the single seam: production
         // hands in the per-provider concrete session runner

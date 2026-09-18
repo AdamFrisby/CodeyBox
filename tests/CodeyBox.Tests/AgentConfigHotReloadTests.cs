@@ -361,6 +361,7 @@ public sealed class AgentConfigHotReloadTests
         {
             await coordinator.StopAsync(CancellationToken.None);
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -406,6 +407,7 @@ public sealed class AgentConfigHotReloadTests
         {
             await coordinator.StopAsync(CancellationToken.None);
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -450,6 +452,7 @@ public sealed class AgentConfigHotReloadTests
         {
             await coordinator.StopAsync(CancellationToken.None);
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -505,6 +508,7 @@ public sealed class AgentConfigHotReloadTests
         {
             await coordinator.StopAsync(CancellationToken.None);
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -2399,7 +2403,11 @@ public sealed class AgentConfigHotReloadTests
         public void Dispose()
         {
             _store?.Dispose();
-            if (_dbPath is not null) { try { File.Delete(_dbPath); } catch { } }
+            if (_dbPath is not null)
+            {
+                try { File.Delete(_dbPath); } catch { }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            }
         }
     }
 

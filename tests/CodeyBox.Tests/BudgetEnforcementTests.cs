@@ -22,6 +22,7 @@ public sealed class BudgetEnforcementTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem MakeQueued(string projectId = "proj-a") => new()

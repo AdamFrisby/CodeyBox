@@ -15,8 +15,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class WorkerProgressWatchdogTests : IDisposable
 {
-    private readonly string _dbPath =
-        Path.Combine(Path.GetTempPath(), $"codeybox-watchdog-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-watchdog-");
+    private readonly string _dbPath;
     private readonly SqliteWorkItemStore _store;
     private readonly SqliteWorkerRegistry _registry;
     private readonly InMemoryTaskQueue _queue;
@@ -28,6 +28,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
 
     public WorkerProgressWatchdogTests()
     {
+        _dbPath = _scratch.DbPath("watchdog.db");
         _store = new SqliteWorkItemStore(_dbPath);
         _registry = new SqliteWorkerRegistry(_dbPath);
         _queue = new InMemoryTaskQueue();
@@ -52,6 +53,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         _store.Dispose();
         _registry.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     [Theory]

@@ -135,9 +135,8 @@ public sealed class QuotaHistoryEndpointTests
     private sealed class QuotaHistoryApiFactory : WebApplicationFactory<Program>
     {
         private readonly IQuotaTimeSeriesStore? _store;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(),
-            $"codeybox-qh-test-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-qh-test-");
+        private string _dbPath => _scratch.DbPath("qh-test.db");
 
         public QuotaHistoryApiFactory(IQuotaTimeSeriesStore? store)
         {
@@ -150,16 +149,16 @@ public sealed class QuotaHistoryEndpointTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 var config = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:SandboxProvider"] = "process",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"qh-test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"qh-test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"qh-test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"qh-test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "qh-test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "qh-test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "qh-test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "qh-test-agent-streams"),
                     ["CodeyBox:Changelog:Enabled"] = "false",
                 };
                 cfg.AddInMemoryCollection(config);
@@ -183,6 +182,8 @@ public sealed class QuotaHistoryEndpointTests
             if (disposing)
             {
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             }
             base.Dispose(disposing);
         }

@@ -250,6 +250,7 @@ public sealed class SqliteConnectionDisposalTests
         finally
         {
             try { File.Delete(path); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(path);
         }
     }
 

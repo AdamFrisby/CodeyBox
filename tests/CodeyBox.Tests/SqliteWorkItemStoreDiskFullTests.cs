@@ -26,7 +26,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-diskfull-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-diskfull-");
+    private string _dbPath => _scratch.DbPath("diskfull.db");
     private readonly TestSink _sink = new();
 
     private Serilog.ILogger ConfigureLogger()
@@ -38,9 +39,11 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
 
     public void Dispose()
     {
+        TestScratchDirectory.ClearSqlitePools();
         try { File.Delete(_dbPath); } catch { }
         try { File.Delete(_dbPath + "-wal"); } catch { }
         try { File.Delete(_dbPath + "-shm"); } catch { }
+        _scratch.Dispose();
     }
 
     [Fact]

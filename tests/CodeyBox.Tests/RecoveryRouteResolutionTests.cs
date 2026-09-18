@@ -53,6 +53,7 @@ public sealed class RecoveryRouteResolutionTests : IDisposable
         _auditLogger.Dispose();
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     /// <summary>

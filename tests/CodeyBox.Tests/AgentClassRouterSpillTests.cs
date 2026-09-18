@@ -278,6 +278,7 @@ public sealed class AgentClassRouterSpillTests
         finally
         {
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 

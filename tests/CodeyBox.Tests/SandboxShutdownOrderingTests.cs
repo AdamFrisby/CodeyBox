@@ -41,8 +41,8 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class SandboxShutdownOrderingTests : IDisposable
 {
-    private readonly string _dbPath =
-        Path.Combine(Path.GetTempPath(), $"codeybox-shutdown-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-shutdown-");
+    private string _dbPath => _scratch.DbPath("shutdown.db");
     private readonly SqliteWorkItemStore _store;
 
     public SandboxShutdownOrderingTests()
@@ -53,7 +53,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.ClearSqlitePools();
+        _scratch.Dispose();
     }
 
     private static WorkItem MakeItem(WorkItemState state = WorkItemState.Working) => new()
@@ -1457,7 +1458,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         new MultipassSandboxOptions
         {
             MultipassBinary = "/bin/false",
-            StagingDirectory = Path.Combine(Path.GetTempPath(), $"codeybox-test-staging-{Guid.NewGuid():N}"),
+            StagingDirectory = Path.Combine(_scratch.DirectoryPath, "staging"),
         },
         NullLogger<MultipassSandboxProvider>.Instance,
         timings: null,
@@ -1839,8 +1840,8 @@ public sealed class SandboxShutdownProgramWiringTests
 
     private sealed class SandboxShutdownProgramFactory : WebApplicationFactory<Program>
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-shutdown-program-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-shutdown-program-");
+        private string _dbPath => _scratch.DbPath("shutdown-program.db");
 
         public SandboxShutdownProgramFactory() => Store = new SqliteWorkItemStore(_dbPath);
 
@@ -1856,15 +1857,15 @@ public sealed class SandboxShutdownProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                     ["CodeyBox:Shutdown:SandboxTeardownMode"] = nameof(SandboxTeardownMode.Suspend),
                 });
             });
@@ -1900,6 +1901,8 @@ public sealed class SandboxShutdownProgramWiringTests
                 {
                     Store.Dispose();
                     try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                    TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                    _scratch.Dispose();
                 }
             }
         }

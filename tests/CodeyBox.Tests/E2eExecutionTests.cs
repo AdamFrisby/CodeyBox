@@ -28,6 +28,7 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class E2eExecutionTests : IDisposable
 {
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-e2e-");
     private readonly string _dbPath;
     private readonly SqliteWorkItemStore _itemStore;
     private readonly SqliteTestCaseStore _testCases;
@@ -35,7 +36,7 @@ public sealed class E2eExecutionTests : IDisposable
 
     public E2eExecutionTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-e2e-{Guid.NewGuid():N}.db");
+        _dbPath = _scratch.DbPath("e2e.db");
         _itemStore = new SqliteWorkItemStore(_dbPath);
         _testCases = new SqliteTestCaseStore(_dbPath);
         _runs = new SqliteE2eRunStore(_dbPath);
@@ -47,6 +48,8 @@ public sealed class E2eExecutionTests : IDisposable
         _testCases.Dispose();
         _itemStore.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     // --------------------------------------------------------------------

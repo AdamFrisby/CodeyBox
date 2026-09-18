@@ -108,10 +108,9 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
     private readonly IManagedSandboxLifecycle? _managedLifecycle;
     private readonly SandboxLeakReaper? _reaper;
     private readonly IWebhookDispatcher? _webhooks;
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-uat-sandbox-api-{Guid.NewGuid():N}.db");
-    private readonly string _githubAppStorePath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-github-apps-uat-{Guid.NewGuid():N}");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-uat-sandbox-api-");
+    private string _dbPath => _scratch.DbPath("uat-sandbox-api.db");
+    private string _githubAppStorePath => Path.Combine(_scratch.DirectoryPath, "github-apps");
 
     public SandboxProviderApiFactory(
         string environment = "Development",
@@ -134,15 +133,14 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment(_environment);
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             var defaults = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 ["CodeyBox:GitHubAppStorePath"] = _githubAppStorePath,
                 ["CodeyBox:Changelog:Enabled"] = "false",
             };
@@ -204,7 +202,8 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { }
-            try { Directory.Delete(_githubAppStorePath, recursive: true); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
     }
 }

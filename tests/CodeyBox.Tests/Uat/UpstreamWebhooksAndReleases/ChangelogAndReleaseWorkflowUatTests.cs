@@ -129,6 +129,7 @@ public sealed class ChangelogAndReleaseWorkflowUatTests
         Assert.Contains(webhooks.Events, e => e.Event == "release.closed");
         Assert.Contains(webhooks.Events, e => e.Event == "release.has_failed_work_items");
         try { File.Delete(dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(dbPath);
     }
 
     private static Project Project() => new()

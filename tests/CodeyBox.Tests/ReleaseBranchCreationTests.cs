@@ -27,6 +27,7 @@ public sealed class ReleaseBranchCreationTests : IDisposable
         _workItemStore.Dispose();
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     [Fact]

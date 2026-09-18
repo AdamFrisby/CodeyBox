@@ -651,10 +651,9 @@ internal sealed class E2ePoolWiringFactory(
     IReadOnlyList<string>? e2eRemoteTargets = null,
     string environment = "Development") : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-e2epool-{Guid.NewGuid():N}.db");
-    private readonly string _githubAppStorePath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-github-apps-e2e-{Guid.NewGuid():N}");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-e2epool-");
+    private string _dbPath => _scratch.DbPath("e2epool.db");
+    private string _githubAppStorePath => Path.Combine(_scratch.DirectoryPath, "github-apps");
     private readonly IReadOnlyList<string>? _e2eRemoteTargets = e2eRemoteTargets;
     private readonly IReadOnlyList<string>? _globalRemoteExtraSshOptions = globalRemoteExtraSshOptions;
     private readonly IReadOnlyList<string>? _e2eRemoteExtraSshOptions = e2eRemoteExtraSshOptions;
@@ -664,7 +663,6 @@ internal sealed class E2ePoolWiringFactory(
         builder.UseEnvironment(environment);
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             var values = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -680,9 +678,9 @@ internal sealed class E2ePoolWiringFactory(
                 ["CodeyBox:Changelog:GitHubWebhookSecretEnvVar"] = "TEST_CHANGELOG_SECRET",
                 ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = globalRemoteTarget,
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 ["CodeyBox:GitHubAppStorePath"] = _githubAppStorePath,
             };
             if (_globalRemoteExtraSshOptions is { Count: > 0 })
@@ -732,7 +730,8 @@ internal sealed class E2ePoolWiringFactory(
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            try { Directory.Delete(_githubAppStorePath, recursive: true); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -740,15 +739,14 @@ internal sealed class E2ePoolWiringFactory(
 
 internal sealed class E2eHostedServiceWiringFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-e2ehosted-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-e2ehosted-");
+    private string _dbPath => _scratch.DbPath("e2ehosted.db");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -757,9 +755,10 @@ internal sealed class E2eHostedServiceWiringFactory : WebApplicationFactory<Prog
                 ["CodeyBox:E2eExecution:Enabled"] = "false",
                 ["CodeyBox:E2eExecution:PoolKind"] = "local",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
             });
         });
         builder.ConfigureTestServices(services =>
@@ -782,6 +781,8 @@ internal sealed class E2eHostedServiceWiringFactory : WebApplicationFactory<Prog
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

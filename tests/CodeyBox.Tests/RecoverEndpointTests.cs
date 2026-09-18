@@ -119,8 +119,8 @@ public sealed class RecoverEndpointTests : IDisposable
 
 internal sealed class RecoverApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"cb-recover-http-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-recover-http-");
+    private string _dbPath => _scratch.DbPath("recover-http.db");
 
     public SqliteWorkItemStore Store { get; }
 
@@ -134,15 +134,15 @@ internal sealed class RecoverApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"recover-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"recover-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"recover-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"recover-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "recover-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "recover-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "recover-audit.json"),
+                ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "recover-agent-streams"),
                 // Tighten the bounded-attempt cap so the at-cap test exercises
                 // a small recovery budget without inflating other tests.
                 ["CodeyBox:WorkerProgressWatchdog:ItemStaleMaxRecoveryAttempts"] = "3",
@@ -172,6 +172,8 @@ internal sealed class RecoverApiFactory : WebApplicationFactory<Program>
         {
             Store.Dispose();
             try { File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

@@ -17,13 +17,19 @@ namespace CodeyBox.Tests;
 /// </summary>
 internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
 {
+    private readonly TestScratchDirectory _scratch;
     private readonly string _dbPath;
     private readonly bool _ownsDbPath;
+    private readonly string _gitRootDirectory;
+    private readonly string _auditLogPath;
+    private readonly string _auditPath;
+    private readonly string _agentStreamsPath;
     private readonly Project[] _projects;
 
     public SqliteWorkItemStore Store { get; }
-    public List<IKnob> AdditionalKnobs { get; } = new();
-    public string? TemplateDirectory { get; set; }
+    internal string DbPath => _dbPath;
+    internal string ScratchPath => _scratch.DirectoryPath;
+    public List<IKnob> AdditionalKnobs { get; } = new();    public string? TemplateDirectory { get; set; }
     public int? MaxTemplateChecks { get; set; }
 
     /// <summary>
@@ -50,9 +56,16 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
 
     public WorkItemApiFactory(string? dbPath = null, params Project[] projects)
     {
-        _dbPath = dbPath ?? Path.Combine(
-            Path.GetTempPath(), $"codeybox-httptest-{Guid.NewGuid():N}.db");
+        // All temp state (database, git root, audit logs, agent streams)
+        // lives under one scratch directory so disposal removes everything
+        // even when the test body throws — xUnit still calls Dispose.
+        _scratch = TestScratchDirectory.Create("codeybox-httptest-");
+        _dbPath = dbPath ?? _scratch.DbPath("httptest.db");
         _ownsDbPath = dbPath is null;
+        _gitRootDirectory = Path.Combine(_scratch.DirectoryPath, "git");
+        _auditLogPath = Path.Combine(_scratch.DirectoryPath, "audit-log.json");
+        _auditPath = Path.Combine(_scratch.DirectoryPath, "audit.json");
+        _agentStreamsPath = Path.Combine(_scratch.DirectoryPath, "agent-streams");
         _projects = projects.Length > 0
             ? projects
             :
@@ -78,17 +91,17 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             var values = new Dictionary<string, string?>
             {
                 // Disable bearer-token auth so tests don't need to supply a key.
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 // Temp paths so we don't need /var/lib/codeybox to exist.
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = _gitRootDirectory,
+                ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
                 ["CodeyBox:TemplateDirectory"] = TemplateDirectory,
             };
             if (MaxTemplateChecks is { } maxTemplateChecks)
@@ -126,7 +139,15 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
         {
             Store.Dispose();
             if (_ownsDbPath)
+            {
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            }
+
+            // Removes the git root, audit logs and agent streams even when
+            // the test body threw. The store is disposed first so no open
+            // handle keeps the database sidecars alive.
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

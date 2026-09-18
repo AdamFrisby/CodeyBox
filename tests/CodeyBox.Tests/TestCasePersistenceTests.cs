@@ -29,6 +29,7 @@ public sealed class TestCasePersistenceTests : IDisposable
         _store.Dispose();
         _itemStore.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private async Task<string> SeedWorkItemAsync()
@@ -476,6 +477,7 @@ public sealed class TestCasePersistenceTests : IDisposable
         finally
         {
             try { File.Delete(migrationDbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(migrationDbPath);
         }
     }
 }

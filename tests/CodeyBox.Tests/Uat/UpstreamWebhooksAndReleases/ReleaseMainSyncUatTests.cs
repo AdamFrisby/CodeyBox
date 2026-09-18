@@ -12,7 +12,8 @@ namespace CodeyBox.Tests.Uat.UpstreamWebhooksAndReleases;
 /// </summary>
 public sealed class ReleaseMainSyncUatTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-uat-sync-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-uat-sync-");
+    private string _dbPath => _scratch.DbPath("uat-sync.db");
     private readonly SqliteReleaseStore _releaseStore;
     private readonly CapturingWebhookDispatcher _webhooks = new();
 
@@ -22,6 +23,8 @@ public sealed class ReleaseMainSyncUatTests : IDisposable
     {
         _releaseStore.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     [Fact]

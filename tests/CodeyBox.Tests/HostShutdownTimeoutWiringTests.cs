@@ -365,8 +365,8 @@ public sealed class HostShutdownTimeoutWiringTests
         private readonly int _graceSeconds;
         private readonly int _maxConcurrentWorkers;
         private readonly SandboxTeardownMode? _teardownMode;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-hostopts-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-hostopts-");
+        private string _dbPath => _scratch.DbPath("hostopts.db");
 
         public HostOptionsWiringFactory(
             ISandboxProvider provider,
@@ -386,15 +386,15 @@ public sealed class HostShutdownTimeoutWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 var values = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                     ["CodeyBox:Shutdown:GraceSeconds"] = _graceSeconds.ToString(),
                     ["CodeyBox:WorkerPool:MaxConcurrentWorkers"] = _maxConcurrentWorkers.ToString(),
                 };
@@ -419,6 +419,8 @@ public sealed class HostShutdownTimeoutWiringTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }
@@ -428,8 +430,8 @@ public sealed class HostShutdownTimeoutWiringTests
         private readonly ISandboxProvider _provider;
         private readonly SandboxTeardownMode? _teardownMode;
         private readonly int? _graceSeconds;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-shutdownsvc-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-shutdownsvc-");
+        private string _dbPath => _scratch.DbPath("shutdownsvc.db");
 
         public SandboxShutdownServiceWiringFactory(
             ISandboxProvider provider,
@@ -447,15 +449,15 @@ public sealed class HostShutdownTimeoutWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 var values = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 };
                 if (_teardownMode is { } teardownMode)
                     values["CodeyBox:Shutdown:SandboxTeardownMode"] = teardownMode.ToString();
@@ -514,6 +516,8 @@ public sealed class HostShutdownTimeoutWiringTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }

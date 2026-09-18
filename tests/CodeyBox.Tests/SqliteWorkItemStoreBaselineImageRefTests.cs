@@ -12,7 +12,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class SqliteWorkItemStoreBaselineImageRefTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-baseline-ref-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-baseline-ref-");
+    private string _dbPath => _scratch.DbPath("baseline-ref.db");
     private readonly SqliteWorkItemStore _store;
 
     public SqliteWorkItemStoreBaselineImageRefTests()
@@ -24,6 +25,8 @@ public sealed class SqliteWorkItemStoreBaselineImageRefTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Sample(string? baselineRef = null, WorkItemState state = WorkItemState.Queued) => new()

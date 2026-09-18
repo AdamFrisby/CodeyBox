@@ -405,6 +405,7 @@ public sealed class DeployConsistencyTests : IDisposable
             if (_dbPath is not null)
             {
                 try { File.Delete(_dbPath); } catch { }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
             }
         }
     }

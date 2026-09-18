@@ -7,7 +7,8 @@ namespace CodeyBox.Tests;
 
 public sealed class SqliteAgentUsageStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-usage-test-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-usage-test-");
+    private string _dbPath => _scratch.DbPath("usage-test.db");
     private readonly SqliteAgentUsageStore _store;
 
     public SqliteAgentUsageStoreTests()
@@ -19,6 +20,8 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static AgentUsageEvent Event(
@@ -203,6 +206,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
         finally
         {
             try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 

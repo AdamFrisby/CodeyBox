@@ -144,10 +144,9 @@ internal sealed class ChangelogStartupFactory : WebApplicationFactory<Program>
 {
     private readonly string _environment;
     private readonly Dictionary<string, string?> _configuration;
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-changelog-startup-{Guid.NewGuid():N}.db");
-    private readonly string _githubAppStorePath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-github-apps-startup-{Guid.NewGuid():N}");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-changelog-startup-");
+    private string _dbPath => _scratch.DbPath("changelog-startup.db");
+    private string _githubAppStorePath => Path.Combine(_scratch.DirectoryPath, "github-apps");
 
     public ChangelogStartupFactory(
         string environment,
@@ -163,7 +162,6 @@ internal sealed class ChangelogStartupFactory : WebApplicationFactory<Program>
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             cfg.Sources.Clear();
-            var tmp = Path.GetTempPath();
             var config = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -174,10 +172,10 @@ internal sealed class ChangelogStartupFactory : WebApplicationFactory<Program>
                 ["CodeyBox:WorkloadTrust"] = "Trusted",
                 ["CodeyBox:AcknowledgeSharedKernelRisk"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 ["CodeyBox:GitHubAppStorePath"] = _githubAppStorePath,
             };
 
@@ -198,7 +196,8 @@ internal sealed class ChangelogStartupFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { }
-            try { Directory.Delete(_githubAppStorePath, recursive: true); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
     }
 }

@@ -5,8 +5,8 @@ namespace CodeyBox.Tests;
 
 public sealed class SuggestionsPersistenceTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-suggestions-persist-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-suggestions-persist-");
+    private string _dbPath => _scratch.DbPath("suggestions-persist.db");
     private readonly SqliteSuggestionStore _store;
 
     public SuggestionsPersistenceTests() => _store = new SqliteSuggestionStore(_dbPath);
@@ -15,6 +15,8 @@ public sealed class SuggestionsPersistenceTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static Suggestion Make(

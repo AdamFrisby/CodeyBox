@@ -204,6 +204,7 @@ public sealed class AdminSeededStandaloneTests
                 pairs["CodeyBox:AuditLog:Path"] = Path.Combine(_dir, "test-log.json");
                 pairs["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_dir, "test-audit.json");
                 pairs["CodeyBox:AgentStreams:Path"] = Path.Combine(_dir, "agent-streams");
+                pairs["CodeyBox:GitHubAppStorePath"] = Path.Combine(_dir, "github-apps");
                 cfg.AddInMemoryCollection(pairs);
             });
         }
