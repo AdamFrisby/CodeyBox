@@ -11,8 +11,9 @@ namespace CodeyBox.Core;
 /// Mirrors the <c>AgentDefaultsSnapshot</c> pattern: Volatile read/write so a
 /// concurrent <see cref="Replace"/> cannot tear the reference; callers should
 /// bind once into a local for any compound read. The work-phase sandbox
-/// acquisition routes through this catalog; per-member admission gates are a
-/// separate item and still live in the global admission wrapper.
+/// acquisition routes through this catalog; each member's capacity owns a
+/// per-member admission gate inside the placement acquirer, resized in the
+/// same reload step that publishes the new catalog.
 /// </remarks>
 public sealed class SandboxClassesSnapshot
 {

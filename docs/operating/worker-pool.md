@@ -56,19 +56,29 @@ review.
 
 ### MaxConcurrentSandboxes
 
-Controls the total number of live sandboxes admitted by the process. The API
-wraps the selected `ISandboxProvider` with a single admission gate, so every
-`CreateAsync` call path shares this budget. A token is acquired before provider
-provisioning starts and released on the first disposal of the returned sandbox
-handle. The provider therefore never has more than this many concurrently-live
-sandboxes from this orchestrator process, even when several worker items enter audit or
-merge at the same time.
+Controls sandbox admission for the placement path and the non-placement
+fallback. Work-phase acquisitions route through sandbox placement, where each
+`SandboxClass` member owns its own admission gate sized from the member's
+`Capacity`, and the process-wide ceiling is derived as the sum of member
+capacities. Permits are held for the sandbox's whole lifetime and
+released on disposal. Each registry provider kind keeps its admission wrapper
+for lifecycle tracking and metrics, but that kind gate is derived from the
+same catalog (kind target = sum of member capacities naming it) so it never
+clamps what the member gates admit. The legacy single-provider fallback (and
+phase acquisitions that bypass placement) still share an admission gate of
+this size, so every `CreateAsync` call path remains budgeted.
 
 When unset, the default is `2 * MaxConcurrentWorkers`: every worker can hold
 its phase sandbox while acquiring the next phase's sandbox (work → audit,
-audit → merge handoffs) without deadlocking the pool. Set it explicitly on
-hosts with a known VM capacity. Values below `2 * MaxConcurrentWorkers` are
-rejected at startup and on hot-reload.
+audit → merge handoffs) without deadlocking the pool. It also seeds the
+capacity of the default single-member class synthesized when no
+`SandboxClasses` are configured, so single-member behaviour matches the
+former process-wide gate. Set it explicitly on hosts with a known VM
+capacity. Values below `2 * MaxConcurrentWorkers` are rejected at startup
+and on hot-reload, and every member capacity is re-checked against twice the
+worker count on every reload: a resize dropping a member below the minimum
+is refused with an error naming the member and the minimum, leaving prior
+values in force.
 
 This value is hot-reloadable: editing `MaxConcurrentSandboxes` resizes the
 live admission gate without restarting CodeyBox. Raising it admits queued
@@ -77,14 +87,17 @@ new admissions above the new target stay blocked until holders dispose and the
 count converges down. Every change is logged as
 `Hot-reloaded WorkerPool:MaxConcurrentSandboxes: <old> → <new>
 (admitted=<in-flight>)` so operators can confirm the effective VM ceiling.
+Member capacity edits log per member as
+`Hot-reloaded SandboxClasses member '<id>' capacity: <old> → <new>
+(in-flight=<in-flight>)`.
 
 `MaxLlmAuditorParallelism` remains a per-project audit policy. It bounds how
 many LLM auditors one item may try to run concurrently, but those auditor
-sandbox creates still queue behind `MaxConcurrentSandboxes`. The effective VM
-ceiling is:
+sandbox creates still queue behind the sandbox admission budget. The effective VM
+ceiling on the placement path is:
 
 ```
-live sandboxes <= CodeyBox:WorkerPool:MaxConcurrentSandboxes
+live sandboxes <= sum of SandboxClasses member capacities
 ```
 
 not:

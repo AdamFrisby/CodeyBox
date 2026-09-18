@@ -11,11 +11,14 @@ internal interface ISandboxAdmissionSnapshot
 }
 
 /// <summary>
-/// Decorates an <see cref="ISandboxProvider"/> with a process-wide live-sandbox
-/// admission gate. The token is acquired before the inner provider starts
-/// provisioning and is released exactly once when the returned sandbox handle is
-/// disposed, so worker, audit, merge, smoke, and verifier call sites all share
-/// the same VM budget without each call site knowing about the policy.
+/// Decorates an <see cref="ISandboxProvider"/> with a live-sandbox admission
+/// gate. The token is acquired before the inner provider starts provisioning
+/// and is released exactly once when the returned sandbox handle is disposed,
+/// so worker, audit, merge, smoke, and verifier call sites all share the same
+/// VM budget without each call site knowing about the policy. The singleton
+/// provider's gate is the process-wide budget; registry kind instances have
+/// their gate derived from the member catalog instead (see
+/// <see cref="CodeyBox.Core.ISandboxProviderRegistry.SyncKindCapacities"/>).
 /// </summary>
 public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider
 {
@@ -169,7 +172,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     /// Idempotent: a reload with the same value is a no-op (no log, no
     /// resize). All capability-subclass wrappers created by
     /// <see cref="Wrap"/> share the same gate instance, so resizing through
-    /// any of them resizes the single process-wide budget.
+    /// any of them resizes the single budget behind this provider.
     /// </para>
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">
@@ -189,6 +192,44 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
         _log.LogInformation(
             "Hot-reloaded WorkerPool:MaxConcurrentSandboxes: {OldValue} → {NewValue} (admitted={Admitted})",
+            result.OldTarget,
+            result.NewTarget,
+            result.InFlight);
+    }
+
+    /// <summary>
+    /// Hot-reloads this kind's gate to a member-derived target: the sum of
+    /// <c>SandboxClasses</c> member capacities naming the kind, set by
+    /// <see cref="CodeyBox.Core.ISandboxProviderRegistry.SyncKindCapacities"/>
+    /// whenever the catalog changes. The kind gate therefore always fits the
+    /// member gates beneath it and never clamps them — fine-grained admission
+    /// happens once, at the member gate — while this wrapper keeps owning
+    /// lifecycle tracking, metrics, and capability preservation.
+    /// <para>
+    /// Idempotent: a reload with the same value is a no-op (no log, no
+    /// resize). Grow admits queued creations immediately; shrink converges
+    /// down as holders dispose, never aborting in-flight sandboxes.
+    /// </para>
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="newKindCapacity"/> is &lt; 1.
+    /// </exception>
+    public void ApplyKindCapacityReload(int newKindCapacity, string kind)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        if (newKindCapacity < 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(newKindCapacity),
+                newKindCapacity,
+                $"SandboxClasses kind '{kind.Trim()}' derived capacity must be >= 1.");
+
+        var result = _gate.Resize(newKindCapacity);
+        if (result.OldTarget == result.NewTarget)
+            return;
+
+        _log.LogInformation(
+            "Hot-reloaded SandboxClasses kind '{Kind}' capacity: {OldValue} → {NewValue} (admitted={Admitted})",
+            kind.Trim(),
             result.OldTarget,
             result.NewTarget,
             result.InFlight);

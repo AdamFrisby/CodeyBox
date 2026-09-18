@@ -459,18 +459,18 @@ Controls worker concurrency and spawn pacing.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `MaxConcurrentWorkers` | `1` | Hard cap on simultaneously active pipelines. |
-| `MaxConcurrentSandboxes` | `2 * MaxConcurrentWorkers` | Global cap on concurrently live sandboxes/VMs across work, audit, merge, smoke, and verifier phases. Every `ISandboxProvider.CreateAsync` path shares this budget. Values below `2 * MaxConcurrentWorkers` are rejected at startup. |
+| `MaxConcurrentSandboxes` | `2 * MaxConcurrentWorkers` | Sandbox admission ceiling: seeds the default single-member capacity and budgets the fallback/direct (non-placement) `CreateAsync` paths. Work-phase placement admits at per-member gates from the member `Capacity`, with the process ceiling derived as the member sum (registry kind gates are derived to fit and never clamp). Values below `2 * MaxConcurrentWorkers` are rejected at startup, and member capacities are re-checked against twice the worker count on every hot-reload. |
 | `MinSpawnIntervalMs` | `0` | Minimum milliseconds between successive worker spawns. |
 | `DispatchGateAcquisitionBackoff` | `"00:00:01"` | Backoff between dispatch pickups after a SQLite write-gate acquisition timeout. |
 | `MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit). Waits caused by a planned SQLite maintenance hold inside its announced budget do not count toward this threshold; a hold past its budget counts normally. |
 
 `MaxConcurrentWorkers` limits concurrent work items. It does not include
 additional sandboxes created inside an item for audit, merge/rebase, security
-review, smoke, or required-build verification. `MaxConcurrentSandboxes` is the
+review, smoke, or required-build verification. Member capacities are the
 host-capacity ceiling underneath those per-phase policies, so a burst of LLM
 auditors from several items queues at sandbox creation instead of multiplying
-into unbounded VMs. The value is captured at startup; restart CodeyBox to resize
-the live admission gate.
+into unbounded VMs. Both the worker count and the member capacities are
+hot-reloadable (see `docs/operating/worker-pool.md`).
 
 ## `PipelineTuning`
 

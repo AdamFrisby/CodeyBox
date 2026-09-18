@@ -89,6 +89,13 @@ internal sealed class PlacementFakeSandboxProviderRegistry : ISandboxProviderReg
             .OrderBy(static kvp => kvp.Key, StringComparer.Ordinal)
             .Select(static kvp => new SandboxProviderRegistration(kvp.Key, kvp.Value))
             .ToList();
+
+    public void SyncKindCapacities(IReadOnlyList<SandboxClass> catalog)
+    {
+        // Test fake providers carry no admission gate of their own — member
+        // gates inside SandboxPlacementAcquirer own admission in tests — so
+        // there is nothing to derive here.
+    }
 }
 
 internal static class SandboxPlacementTestMembers

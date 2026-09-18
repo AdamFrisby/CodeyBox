@@ -109,6 +109,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly SandboxAdmissionControlledProvider? _sandboxAdmission;
     private readonly SandboxClassesSnapshot? _sandboxClasses;
     private readonly ISandboxProviderRegistry? _sandboxProviderRegistry;
+    private readonly SandboxPlacementAcquirer? _sandboxPlacer;
     private readonly IHostEnvironment? _hostEnvironment;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
@@ -189,7 +190,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         DeployConsistencyService? deployConsistency = null,
         SandboxClassesSnapshot? sandboxClasses = null,
         ISandboxProviderRegistry? sandboxProviderRegistry = null,
-        IHostEnvironment? hostEnvironment = null)
+        IHostEnvironment? hostEnvironment = null,
+        SandboxPlacementAcquirer? sandboxPlacer = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -224,6 +226,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _hostPoolSnapshot = hostPoolSnapshot;
         _sandboxAdmission = sandboxAdmission;
         _sandboxClasses = sandboxClasses;
+        _sandboxPlacer = sandboxPlacer;
         _sandboxProviderRegistry = sandboxProviderRegistry;
         _hostEnvironment = hostEnvironment;
         _configuration = configuration;
@@ -758,6 +761,14 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 resolvedWorkers,
                 resolvedSandboxes,
                 resolvedInterval);
+            // Re-check the per-member deadlock invariant against the new
+            // worker count before mutating any live gate: a member below 2x
+            // the workers that can target it refuses the whole reload (prior
+            // values stay in force) with an error naming the member and the
+            // minimum. With unchanged capacities this is a validation-only
+            // no-op — no resize, no log.
+            if (_sandboxPlacer is not null && _sandboxClasses is not null)
+                _sandboxPlacer.SyncMemberCapacities(_sandboxClasses.Current, resolvedWorkers);
             _orchestrator.ApplyWorkerPoolReload(resolvedWorkers);
             _sandboxAdmission?.ApplyMaxConcurrentSandboxesReload(resolvedSandboxes);
             _orchestrator.ApplyMinSpawnIntervalReload(resolvedInterval);
@@ -817,16 +828,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         var prev = _lastHostPoolCapacity;
         try
         {
-            var maxWorkers = ResolveEffectiveMaxConcurrentWorkers(opts.WorkerPool, opts.Concurrency);
-            var maxSandboxes = ResolveEffectiveMaxConcurrentSandboxes(opts.WorkerPool, maxWorkers);
-            RemoteHostPoolCapacityLogger.Log(
-                _hostPoolSnapshot,
-                new OrchestratorOptions
-                {
-                    MaxConcurrentWorkers = maxWorkers,
-                    MaxConcurrentSandboxes = maxSandboxes,
-                },
-                _log);
+            RemoteHostPoolCapacityLogger.Log(_hostPoolSnapshot, _log);
             _lastHostPoolCapacity = next;
         }
         catch (Exception ex)
@@ -915,7 +917,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
         try
         {
-            var (maxWorkers, _) = OrchestratorOptionsFactory.ResolveSandboxCounts(
+            var (maxWorkers, maxSandboxes) = OrchestratorOptionsFactory.ResolveSandboxCounts(
                 opts.Concurrency, opts.WorkerPool, _log);
             IReadOnlyList<SandboxClass> catalog;
             if (opts.SandboxClasses.Count == 0
@@ -929,7 +931,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 var kind = SandboxProviderSelection.ResolveConfiguredKind(
                     opts.SandboxProvider, _configuration, _hostEnvironment, _log);
                 var provider = _sandboxProviderRegistry.EnsureKind(kind);
-                catalog = SandboxClassesDefaultCatalog.Synthesize(kind, provider.DeclaredCapabilities, _log);
+                catalog = SandboxClassesDefaultCatalog.Synthesize(kind, provider.DeclaredCapabilities, _log, maxSandboxes);
             }
             else
             {
@@ -946,6 +948,14 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                              .Distinct(StringComparer.OrdinalIgnoreCase))
                     _sandboxProviderRegistry.EnsureKind(memberKind);
             }
+            // Resize the member gates before publishing the catalog: the
+            // sync re-checks the per-member deadlock invariant against the
+            // live worker count and refuses the edit (prior catalog and prior
+            // gate targets stay in force) when a member drops below 2x.
+            _sandboxPlacer?.SyncMemberCapacities(catalog, maxWorkers);
+            // Derive the constructed kind gates from the same catalog so a
+            // kind gate always fits its member gates and never clamps them.
+            _sandboxProviderRegistry?.SyncKindCapacities(catalog);
             _sandboxClasses.Replace(catalog);
             _lastSandboxClasses = next;
             AuditLog.ConfigReloaded("SandboxClasses", prev, next);

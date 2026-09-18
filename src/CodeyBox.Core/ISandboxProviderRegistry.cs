@@ -48,4 +48,16 @@ public interface ISandboxProviderRegistry
     /// enumeration is independent of registration order.
     /// </summary>
     IReadOnlyList<SandboxProviderRegistration> ListRegistered();
+
+    /// <summary>
+    /// Derives every constructed kind's admission gate from
+    /// <paramref name="catalog"/>: each kind's gate target becomes the sum of
+    /// member capacities naming it (first member wins for a repeated member
+    /// id, matching placement flattening; sums saturate at
+    /// <see cref="int.MaxValue"/>), so a kind gate always fits the member
+    /// gates beneath it and never clamps them. Kinds with no members keep
+    /// their seed target; kinds with a non-positive derived sum are skipped.
+    /// Idempotent: unchanged targets are a no-op.
+    /// </summary>
+    void SyncKindCapacities(IReadOnlyList<SandboxClass> catalog);
 }

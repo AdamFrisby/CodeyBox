@@ -15,7 +15,11 @@ public sealed class WorkerPoolOptions
     public int? MaxConcurrentWorkers { get; set; }
 
     /// <summary>
-    /// Maximum number of live sandbox instances this process may hold at once.
+    /// Sandbox admission ceiling for the fallback and direct (non-placement)
+    /// paths, and the seed for the default single-member capacity when no
+    /// <c>CodeyBox:SandboxClasses</c> are configured. Work-phase placement
+    /// admits once per member gate from the member <c>Capacity</c> instead,
+    /// with the process ceiling derived as the member sum.
     /// When unset, defaults to <c>2 * MaxConcurrentWorkers</c> so every worker
     /// can hold its phase sandbox while acquiring the next phase's sandbox
     /// (work -&gt; audit, audit -&gt; merge handoffs) without deadlocking the pool.
