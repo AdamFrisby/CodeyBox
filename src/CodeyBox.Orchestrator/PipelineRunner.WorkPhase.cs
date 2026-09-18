@@ -1330,8 +1330,18 @@ public sealed partial class PipelineRunner
                 }
                 catch (Exception ex)
                 {
-                    _log.LogWarning(ex, "Sandbox disposal failed after successful phase {Phase} for work item {Id}", agentPhase, item.Id);
-                    throw;
+                    // Teardown after completed work is an operational event,
+                    // not the item's outcome: the agent's work is durable
+                    // (pushed, synced, checkpointed above), so a cleanup
+                    // failure must not fail the item. The failure stays
+                    // surfaced — logged here with item context (and by the
+                    // sandbox layers below) — while the sandbox remains
+                    // discoverable through the provider's managed inventory
+                    // instead of being silently forgotten, with its capacity
+                    // permit retained until a restart, so shutdown teardown
+                    // or operator reclamation can still reclaim it.
+                    // Never rethrow here.
+                    _log.LogWarning(ex, "Sandbox disposal failed after successful phase {Phase} for work item {Id}; the phase outcome stands and the sandbox remains in the managed inventory for reclamation", agentPhase, item.Id);
                 }
             }
             else if (useClaudeSession)

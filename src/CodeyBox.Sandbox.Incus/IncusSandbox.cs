@@ -509,6 +509,18 @@ internal sealed class IncusSandbox :
                     await EnsurePreemptMarkerOrDeleteAsync(stopError).ConfigureAwait(false);
                 Interlocked.Exchange(ref _preserveOnDispose, 1);
                 _lifecycleState = 2;
+                if (IncusBenignTeardown.IsBenignApparmorProfileTeardown(stopError))
+                {
+                    // The AppArmor profile was already unloaded when incus
+                    // asked to unload it — the desired end state — and the
+                    // probe above proves the VM is stopped and preserved.
+                    // Absorb the failure instead of reporting it.
+                    _log.LogInformation(
+                        "Incus stop for {SandboxId} reported benign already-unloaded AppArmor profile teardown; verified STOPPED, the VM remains preserved",
+                        Id);
+                    return;
+                }
+
                 throw new InvalidOperationException(
                     "Incus stop reported a failure, but the VM is stopped and remains preserved.",
                     stopError);
