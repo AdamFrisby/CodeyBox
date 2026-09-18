@@ -162,6 +162,9 @@ public sealed partial class PipelineRunner
     // built-in values when no accessor is wired.
     private readonly Func<DelegationOptions> _delegationOptionsAccessor;
     private readonly DelegationEscalationService? _delegationEscalation;
+    // Placement-driven sandbox acquisition for the work phase (null keeps the
+    // legacy direct-provider path).
+    private readonly SandboxPlacementAcquirer? _sandboxPlacer;
     // Upper bound for parsed reset-window hints extracted from an agent's stdout/stderr.
     // Without a cap, a maliciously-crafted Retry-After header (or prompt-injected output)
     // could park an item arbitrarily far in the future. 24h is the longest legitimate
@@ -412,7 +415,13 @@ public sealed partial class PipelineRunner
         // (CodeyBox:DefaultWorkTimeoutMinutes). Optional: production DI reads
         // IOptionsMonitor so reloads apply to subsequently dispatched work;
         // tests inject a lambda or leave null for the shipped default.
-        Func<int?>? defaultWorkTimeoutMinutesAccessor = null)
+        Func<int?>? defaultWorkTimeoutMinutesAccessor = null,
+        // Placement-driven sandbox acquisition for the work phase. Optional:
+        // production DI wires the SandboxPlacementAcquirer (default
+        // single-member class when no SandboxClasses are configured); null
+        // keeps the legacy direct-provider path so existing tests and minimal
+        // embeddings are unaffected.
+        SandboxPlacementAcquirer? sandboxPlacer = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -568,6 +577,7 @@ public sealed partial class PipelineRunner
         _delegationEvents = delegationEvents;
         _delegationOptionsAccessor = delegationOptionsAccessor ?? (() => new DelegationOptions());
         _delegationEscalation = delegationEscalation;
+        _sandboxPlacer = sandboxPlacer;
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,

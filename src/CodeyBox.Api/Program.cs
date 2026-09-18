@@ -508,6 +508,18 @@ ApiKeyAuth.Configure(builder);
 //                 SPRITES_TOKEN (or configured token env var).
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
+// Member-keyed provider registry for sandbox placement. Each provider kind
+// named by a SandboxClass member is constructed once here (via the same
+// BuildSandboxProviderInner the singleton uses) and shared across the members
+// naming it; lookup is by normalised kind so registration order never affects
+// resolution. Every instance carries the same global admission gate the
+// singleton has — capacity gating does not move in this item; per-member
+// gates replace these in the next one. No provider kind is named anywhere
+// outside this factory: core and pipeline code resolve through the registry.
+builder.Services.AddSingleton<ISandboxProviderRegistry>(sp => new SandboxProviderRegistry(
+    kind => BuildRegistrySandboxProvider(sp, kind),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<SandboxProviderRegistry>()));
+
 // B1: register baseline-image capabilities as derived views of the selected
 // provider. Providers without baseline support (process / bubblewrap) receive
 // null-object implementations, so consumers can depend on the capability
@@ -552,26 +564,12 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var startupLog = loggerFactory.CreateLogger("CodeyBox.Sandbox");
 
-    var kind = ReloadableSandboxProvider.NormalizeConfiguredProviderId(opts.SandboxProvider);
     var environment = sp.GetRequiredService<IHostEnvironment>();
-
-    if (string.IsNullOrEmpty(kind))
-    {
-        if (environment.IsDevelopment())
-        {
-            startupLog.LogWarning(
-                "CodeyBox:SandboxProvider not set; defaulting to 'process' because environment is Development. " +
-                "DO NOT do this in production.");
-            kind = "process";
-        }
-        else
-        {
-            throw RequiredConfigurationValidator.CreateAggregateException(
-                sp.GetRequiredService<IConfiguration>(),
-                environment,
-                RequiredConfigurationValidator.MissingSandboxProviderMessage);
-        }
-    }
+    var kind = SandboxProviderSelection.ResolveConfiguredKind(
+        opts.SandboxProvider,
+        sp.GetRequiredService<IConfiguration>(),
+        environment,
+        startupLog);
 
     var hostPlatformEarly = CodeyBox.Core.HostPlatformSupport.HostOperatingSystem.Current;
     if (!CodeyBox.Core.HostPlatformSupport.IsProviderSupportedOnHost(kind, hostPlatformEarly))
@@ -581,9 +579,17 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             CodeyBox.Core.HostPlatformSupport.GetUnsupportedReason(kind, hostPlatformEarly));
     }
 
-    var inner = SandboxProviderKinds.SupportsHotReload(kind)
-        ? BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog)
-        : BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    // Plain (non-reloadable) kinds are owned by the member-keyed registry:
+    // the singleton and any member naming the kind share the exact same
+    // admission-wrapped instance, so lifecycle inventory is never split
+    // across two instances of one backend. Reloadable kinds keep their
+    // dedicated cutover router below.
+    if (!SandboxProviderKinds.SupportsHotReload(kind))
+    {
+        return sp.GetRequiredService<ISandboxProviderRegistry>().EnsureKind(kind);
+    }
+
+    ISandboxProvider inner = BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog);
     var hostPlatform = hostPlatformEarly;
     if (CodeyBox.Core.HostPlatformSupport.GetEgressEnforcement(kind)
         == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnRemoteExecutorHost)
@@ -595,28 +601,11 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             kind,
             hostPlatform.Name);
     }
-    var workloadTrust = Enum.TryParse<WorkloadTrust>(opts.WorkloadTrust, true, out var configuredTrust)
-        ? configuredTrust
-        : environment.IsDevelopment() ? WorkloadTrust.Trusted : WorkloadTrust.Untrusted;
-    if (!environment.IsDevelopment()
-        && workloadTrust == WorkloadTrust.Untrusted
-        && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel)
-    {
-        throw RequiredConfigurationValidator.CreateAggregateException(
-            sp.GetRequiredService<IConfiguration>(),
-            environment,
-            RequiredConfigurationValidator.UntrustedWorkloadMessage(inner.Name, inner.IsolationLevel));
-    }
-    if (!environment.IsDevelopment()
-        && workloadTrust == WorkloadTrust.Trusted
-        && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel
-        && !opts.AcknowledgeSharedKernelRisk)
-    {
-        throw RequiredConfigurationValidator.CreateAggregateException(
-            sp.GetRequiredService<IConfiguration>(),
-            environment,
-            RequiredConfigurationValidator.TrustedSharedKernelMessage(inner.Name, inner.IsolationLevel));
-    }
+    SandboxProviderSelection.ValidateWorkloadTrust(
+        inner,
+        opts,
+        sp.GetRequiredService<IConfiguration>(),
+        environment);
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
         "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
@@ -626,6 +615,63 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
     LogSandboxProviderCapabilities(inner, startupLog);
     var pipelineTuning = sp.GetRequiredService<PipelineTuningSnapshot>();
+    return SandboxAdmissionControlledProvider.Wrap(
+        inner,
+        orchestratorOptions.MaxConcurrentSandboxes,
+        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>(),
+        waitWarningThresholdProvider: () => pipelineTuning.Current.SandboxPermitWaitWarningThreshold);
+}
+
+static ISandboxProvider BuildRegistrySandboxProvider(IServiceProvider sp, string kind)
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var startupLog = loggerFactory.CreateLogger("CodeyBox.Sandbox.Registry");
+    var environment = sp.GetRequiredService<IHostEnvironment>();
+    if (!SandboxProviderKinds.IsRegistered(kind))
+    {
+        throw new InvalidOperationException(
+            $"Unregistered sandbox provider kind '{kind}'. Registered providers: " +
+            $"{string.Join(", ", SandboxProviderKinds.All.OrderBy(static s => s, StringComparer.Ordinal))}. " +
+            "The kind is NOT silently falling back to another provider.");
+    }
+    var hostPlatform = CodeyBox.Core.HostPlatformSupport.HostOperatingSystem.Current;
+    if (!CodeyBox.Core.HostPlatformSupport.IsProviderSupportedOnHost(kind, hostPlatform))
+    {
+        throw new InvalidOperationException(
+            $"Sandbox provider kind '{kind}' is not supported on {hostPlatform.Name}: " +
+            CodeyBox.Core.HostPlatformSupport.GetUnsupportedReason(kind, hostPlatform));
+    }
+    var inner = BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    SandboxProviderSelection.ValidateWorkloadTrust(
+        inner,
+        opts,
+        sp.GetRequiredService<IConfiguration>(),
+        environment);
+    if (CodeyBox.Core.HostPlatformSupport.GetEgressEnforcement(kind)
+        == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnRemoteExecutorHost)
+    {
+        startupLog.LogInformation(
+            "Sandbox egress enforcement for provider '{Provider}' lives on the remote Linux executor host; " +
+            "the {Host} orchestrator host needs no packet filter, but the executor must have " +
+            "scripts/setup-host-networks.sh applied (see docs/concepts/host-platforms.md).",
+            kind,
+            hostPlatform.Name);
+    }
+    var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
+    var pipelineTuning = sp.GetRequiredService<PipelineTuningSnapshot>();
+    startupLog.LogInformation(
+        "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
+        inner.Name,
+        orchestratorOptions.MaxConcurrentSandboxes);
+    if (inner is ISandboxHostPoolSnapshot hostPool)
+        RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
+    LogSandboxProviderCapabilities(inner, startupLog);
+    startupLog.LogInformation(
+        "Sandbox provider registry: constructed kind '{Kind}' (provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes})",
+        kind,
+        inner.Name,
+        orchestratorOptions.MaxConcurrentSandboxes);
     return SandboxAdmissionControlledProvider.Wrap(
         inner,
         orchestratorOptions.MaxConcurrentSandboxes,
@@ -793,6 +839,23 @@ static IE2eExecutionPool BuildRemoteE2eExecutionPool(
 static CompositeManagedSandboxProvider BuildManagedSandboxLifecycleProvider(IServiceProvider sp)
 {
     var providers = new List<IManagedSandboxLifecycle> { sp.GetRequiredService<ISandboxProvider>() };
+    // Touch the catalog first: snapshot construction warms every configured
+    // provider kind into the registry, so the registry snapshot below covers
+    // the members placement can actually select. Registry-built providers
+    // would otherwise be invisible to the leak reaper and operator dispose
+    // endpoints whenever the pipeline — rather than the legacy singleton —
+    // created the sandbox. Entries whose backend is already covered (same
+    // provider name as an earlier entry — e.g. the registry's plain
+    // multipass behind the singleton's reloadable multipass router) are
+    // skipped: same backend means identical inventory, and listing it twice
+    // would make name-based disposal ambiguous.
+    _ = sp.GetRequiredService<SandboxClassesSnapshot>();
+    var seenNames = new HashSet<string>(providers.Select(static p => p.Name), StringComparer.Ordinal);
+    foreach (var registration in sp.GetRequiredService<ISandboxProviderRegistry>().ListRegistered())
+    {
+        if (seenNames.Add(registration.Provider.Name))
+            providers.Add(registration.Provider);
+    }
     if (sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
     {
         providers.AddRange(source.ManagedSandboxProviders);
@@ -2469,11 +2532,54 @@ builder.Services.AddSingleton<SandboxClassesSnapshot>(sp =>
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.SandboxClasses");
     var (maxWorkers, _) = OrchestratorOptionsFactory.ResolveSandboxCounts(
         cbOpts.Concurrency, cbOpts.WorkerPool, startupLog);
-    var catalog = SandboxClassesConfigBuilder.Build(
-        cbOpts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, startupLog);
+    var registry = sp.GetRequiredService<ISandboxProviderRegistry>();
+    IReadOnlyList<SandboxClass> catalog;
+    if (cbOpts.SandboxClasses.Count == 0)
+    {
+        // No SandboxClasses configured: synthesize the default single-member
+        // class from CodeyBox:SandboxProvider so placement has a member to
+        // select without requiring new configuration. Single-member behaviour
+        // matches the legacy single-provider path; the member carries the
+        // provider's own declared capabilities.
+        var kind = SandboxProviderSelection.ResolveConfiguredKind(
+            cbOpts.SandboxProvider,
+            sp.GetRequiredService<IConfiguration>(),
+            sp.GetRequiredService<IHostEnvironment>(),
+            startupLog);
+        var provider = registry.EnsureKind(kind);
+        catalog = SandboxClassesDefaultCatalog.Synthesize(kind, provider.DeclaredCapabilities, startupLog);
+    }
+    else
+    {
+        catalog = SandboxClassesConfigBuilder.Build(
+            cbOpts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, startupLog);
+    }
+    // Warm every configured kind now so a bad provider fails the host fast
+    // at startup instead of the first placement.
+    foreach (var memberKind in catalog
+                 .SelectMany(static c => c.Members)
+                 .Select(static m => m.ProviderKind)
+                 .Distinct(StringComparer.OrdinalIgnoreCase))
+        registry.EnsureKind(memberKind);
     startupLog.LogInformation("SandboxClasses loaded: {Count} class(es)", catalog.Count);
     return new SandboxClassesSnapshot(catalog);
 });
+
+// Placement-driven sandbox acquisition for the pipeline work phase: builds
+// requirements from the work item plus the phase's network profile and
+// credential, asks the placement decider for a member, and creates the
+// sandbox on that member's registry provider. Falls back to the legacy
+// single provider only when no class is configured at all (minimal
+// embeddings); production always synthesizes the default single-member class
+// above. The dispatch knobs resolve through the live IOptionsMonitor so a
+// PlacementRecheckIn edit lands on the next deferred placement without
+// restart.
+builder.Services.AddSingleton<SandboxPlacementAcquirer>(sp => new SandboxPlacementAcquirer(
+    sp.GetRequiredService<SandboxClassesSnapshot>(),
+    sp.GetRequiredService<ISandboxProviderRegistry>(),
+    fallbackProvider: sp.GetRequiredService<ISandboxProvider>(),
+    optionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ExecutorPhaseDispatch,
+    log: sp.GetRequiredService<ILoggerFactory>().CreateLogger<SandboxPlacementAcquirer>()));
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
 builder.Services.AddSingleton<AgentConcurrencyOptions>(sp =>
@@ -4528,7 +4634,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     briefComposer: sp.GetRequiredService<ConvergenceBriefComposer>(),
     delegationEvents: sp.GetRequiredService<IDelegationEventStore>(),
     delegationOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation,
-    delegationEscalation: sp.GetService<DelegationEscalationService>()));
+    delegationEscalation: sp.GetService<DelegationEscalationService>(),
+    sandboxPlacer: sp.GetRequiredService<SandboxPlacementAcquirer>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -4931,7 +5038,9 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         sandboxAdmission: sp.GetService<ISandboxProvider>() as SandboxAdmissionControlledProvider,
         configuration: builder.Configuration,
         deployConsistency: sp.GetRequiredService<DeployConsistencyService>(),
-        sandboxClasses: sp.GetRequiredService<SandboxClassesSnapshot>());
+        sandboxClasses: sp.GetRequiredService<SandboxClassesSnapshot>(),
+        sandboxProviderRegistry: sp.GetRequiredService<ISandboxProviderRegistry>(),
+        hostEnvironment: sp.GetRequiredService<IHostEnvironment>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -6899,13 +7008,20 @@ namespace CodeyBox.Api
         /// Sandbox class definitions modelling sandbox capacity the way agent
         /// classes model agent capacity. Each class lists one or more sandbox
         /// members with a preference score, capacity, and capability tags.
-        /// Empty by default: nothing routes through the catalog yet (the
-        /// provider registry, per-member gates, and call-site rewiring are
-        /// separate items), and the existing
-        /// <c>CodeyBox:SandboxProvider</c> setting keeps working until a
-        /// later item replaces it.
+        /// Empty by default: a default single-member class is synthesized
+        /// from <c>CodeyBox:SandboxProvider</c> so the work-phase placement
+        /// path has a member to select without requiring new configuration.
         /// </summary>
         public List<SandboxClassOptions> SandboxClasses { get; set; } = [];
+
+        /// <summary>
+        /// Executor phase dispatch knobs (see
+        /// <see cref="CodeyBox.Orchestrator.ExecutorPhaseDispatchOptions"/>):
+        /// stage-out bounds, payload limits, and the placement recheck
+        /// backoff a transient sandbox-placement refusal requeues under.
+        /// Hot-reloadable.
+        /// </summary>
+        public CodeyBox.Orchestrator.ExecutorPhaseDispatchOptions ExecutorPhaseDispatch { get; set; } = new();
 
         /// <summary>
         /// Optional reusable agent instances. AgentClass members can reference

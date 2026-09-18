@@ -167,7 +167,8 @@ public sealed partial class PipelineRunner
                     sessionLifecycle = null;
                     useClaudeSession = false;
                     var sandboxStartSw = Stopwatch.StartNew();
-                    sandbox = await _sandboxes.CreateAsync(spec, ct);
+                    sandbox = await AcquireWorkPhaseSandboxAsync(
+                        item, agentPhase, credential?.Agent.Value, networkProfile, spec, ct);
                     sandboxStartSw.Stop();
                     CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
                     sandboxOwnedByPhase = true;
@@ -202,8 +203,13 @@ public sealed partial class PipelineRunner
                 // permit across this acquire (it disposes before recreating).
                 using var phaseWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), agentPhase);
                 sandbox = WorkSandboxContext.Current != null
-                    ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
-                    : await _sandboxes.CreateAsync(spec, ct);
+                    ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(
+                        spec,
+                        ct,
+                        acquireAsync: (s, token) => AcquireWorkPhaseSandboxAsync(
+                            item, agentPhase, credential?.Agent.Value, networkProfile, s, token))
+                    : await AcquireWorkPhaseSandboxAsync(
+                        item, agentPhase, credential?.Agent.Value, networkProfile, spec, ct);
                 sandboxStartSw.Stop();
                 CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
                 sandboxOwnedByPhase = true;
