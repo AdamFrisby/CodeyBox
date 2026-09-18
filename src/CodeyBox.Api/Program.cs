@@ -3687,6 +3687,35 @@ builder.Services.AddSingleton<INotificationBuilder, SandboxLeakReapedNotificatio
 builder.Services.AddSingleton<NotificationRulesEngine>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<NotificationRulesEngine>());
 
+// --- Inbound interactions ----------------------------------------------------
+// One generic endpoint (POST /webhooks/interactions/{provider}) verifies an
+// interaction over the raw body before semantic use, then funnels the answer
+// through the same pipeline as POST /workitems/{id}/answer. Disabled by
+// default: outbound-only deployments expose nothing new.
+// Signing secrets resolve from the env var named by each provider's
+// SigningSecretEnvVar — never from config values.
+builder.Services.Configure<InteractionsOptions>(
+    builder.Configuration.GetSection("CodeyBox:Notifications:Interactions"));
+builder.Services.AddSingleton<IInteractionDedupStore, InMemoryInteractionDedupStore>();
+builder.Services.AddSingleton<IInteractionVerifier>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
+    InteractionProviderOptions? Opts(string name) =>
+        monitor.CurrentValue.Providers.FirstOrDefault(p =>
+            string.Equals(p.Provider, name, StringComparison.OrdinalIgnoreCase));
+    // The verifier reads live options per call via the accessor so
+    // hot-reloaded configuration takes effect without a restart.
+    return new HmacInteractionVerifier("generic", () => Opts("generic"));
+});
+builder.Services.AddSingleton<IInteractionVerifier>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
+    InteractionProviderOptions? Opts(string name) =>
+        monitor.CurrentValue.Providers.FirstOrDefault(p =>
+            string.Equals(p.Provider, name, StringComparison.OrdinalIgnoreCase));
+    return new SlackInteractionVerifier("slack", () => Opts("slack"));
+});
+
 // --- Changelog automation ----------------------------------------------------
 // Named HTTP client for direct Anthropic Messages API calls (changelog generation).
 // Reuses api.anthropic.com which is already in AgentAllowedHosts; this client is
@@ -5436,6 +5465,7 @@ AuditProgressEndpoints.Map(app);
 AgentStreamEndpoints.Map(app);
 SseEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
+InteractionEndpoints.Map(app);
 FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);

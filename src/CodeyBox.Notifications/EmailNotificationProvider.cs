@@ -24,6 +24,11 @@ public sealed class EmailNotificationProvider : INotificationProvider
 
     public string Name => "email";
 
+    /// <summary>SMTP carries no interaction path: this provider is
+    /// notification-only. Actionable notifications still surface via the
+    /// <see cref="Notification.AnswerUrl"/> fallback link.</summary>
+    public bool SupportsInteractions => false;
+
     public EmailNotificationProvider(
         EmailProviderOptions opts,
         ILogger<EmailNotificationProvider> log,
@@ -95,9 +100,15 @@ public sealed class EmailNotificationProvider : INotificationProvider
 
         var body = new TextPart("plain")
         {
-            Text = notification.Body
-                ?? notification.Summary
-                ?? notification.Title,
+            // Actions are intentionally not rendered: email is
+            // notification-only, so the answer link below is the route
+            // to decide elsewhere. Core content renders exactly as
+            // before when AnswerUrl is absent.
+            Text = NotificationInteractionHelper.WithAnswerFallback(
+                notification.Body
+                    ?? notification.Summary
+                    ?? notification.Title,
+                notification.AnswerUrl),
         };
         message.Body = body;
 
