@@ -114,7 +114,20 @@ phase discards an immutable checkpoint; a retained lease cannot be discarded by
 selecting another phase because provider cleanup must remain authoritative. If
 private archive capture/storage, source commit/push, or content verification
 fails outside the bounded retained-Incus path, the original error remains
-authoritative and normal phase recovery applies.
+authoritative and normal phase recovery applies. That loss is also
+operator-visible, not just a log line: the pipeline emits an
+`agent_turn.checkpoint_degraded` audit warning and a `degraded` measurement on
+the `codeybox.agent_turn.checkpoints` meter (successful publishes emit
+`committed`), so dashboards can chart the loss of the resumption guarantee.
+
+Checkpoint transfer execs stay inside the sandbox provider's output bounds.
+The scratchpad read derives its stdout/stderr caps from the sandbox's
+advertised `ISandboxExecOutputLimits` instead of hardcoding the base64 maximum,
+and the Incus provider clamps any residual over-bound request to
+`MaxCliStdoutBytes`/`MaxCliStderrBytes` (logging the requested and bound
+values) rather than throwing. An archive larger than the bound therefore fails
+as truncated output — a genuine checkpoint failure with the degraded signal
+above — instead of a guard rejection before any evidence exists.
 
 The item-stale watchdog does not release a live dispatch claim merely because
 `UpdatedAt` is old. It must recovery-cancel a pipeline registered in this

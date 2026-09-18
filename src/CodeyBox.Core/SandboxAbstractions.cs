@@ -327,7 +327,6 @@ public interface ISandbox : IAsyncDisposable
 
     Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default) =>
         Task.FromResult<SandboxAccessibilitySnapshot?>(null);
-
     Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
         Task.FromResult<string?>(null);
 
@@ -335,6 +334,23 @@ public interface ISandbox : IAsyncDisposable
     /// Resource metrics captured at teardown/disposal, or null if not yet captured or not supported.
     /// </summary>
     SandboxResourceMetrics? ResourceMetrics => null;
+}
+
+/// <summary>
+/// Optional capability for sandboxes that enforce a provider-wide per-exec
+/// output bound (for example the Incus CLI output caps). Orchestrator paths
+/// that transfer large bounded payloads through <see cref="ISandbox.ExecAsync"/>
+/// derive their requested <c>MaxStdoutBytes</c>/<c>MaxStderrBytes</c> from these
+/// bounds instead of hardcoding an independent limit, so the two cannot drift
+/// apart and the provider rejects nothing the checkpoint path may request.
+/// </summary>
+public interface ISandboxExecOutputLimits
+{
+    /// <summary>Maximum stdout bytes the provider retains for one exec.</summary>
+    int MaxStdoutBytes { get; }
+
+    /// <summary>Maximum stderr bytes the provider retains for one exec.</summary>
+    int MaxStderrBytes { get; }
 }
 
 /// <summary>

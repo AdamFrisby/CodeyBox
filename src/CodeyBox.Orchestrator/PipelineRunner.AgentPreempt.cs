@@ -243,6 +243,10 @@ public sealed partial class PipelineRunner
                     "Work item changed while its preempt checkpoint was being published.");
             }
             _log.LogInformation("Work item {Id} checkpointed for restart preemption at {Ref}", item.Id, checkpointRef);
+            CodeyBoxMeters.AgentTurnCheckpoints.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "committed"),
+                new KeyValuePair<string, object?>("stage", "publish"));
         }
         catch (OperationCanceledException)
         {
@@ -258,6 +262,8 @@ public sealed partial class PipelineRunner
                 item.Id,
                 scratchpadStoreForRollback,
                 savedCheckpointRef);
+            if (AgentTurnCheckpointLimits.ShouldReportDegraded(ex))
+                AgentTurnCheckpointLimits.ReportDegraded(item.Id, "publish", ex, _log);
             _log.LogError(ex, "Preempt checkpoint commit failed for work item {Id}; not marking checkpoint valid", item.Id);
             throw;
         }

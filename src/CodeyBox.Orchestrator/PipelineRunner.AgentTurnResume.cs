@@ -851,6 +851,13 @@ public sealed partial class PipelineRunner
         CancellationToken ct)
     {
         var maximumEncodedBytes = checked(((AgentTurnScratchpadArchive.MaximumBytes + 2) / 3) * 4 + 16);
+        // Derive the transfer caps from the sandbox's provider-wide output
+        // bounds when advertised: a hardcoded base64 cap exceeds the Incus CLI
+        // bound and the provider rejects the read before any checkpoint
+        // evidence exists. Oversized archives then fail here as truncated
+        // output rather than as a thrown guard violation.
+        var (transferStdoutBytes, transferStderrBytes) =
+            AgentTurnCheckpointLimits.ResolveExecOutputLimits(sandbox, maximumEncodedBytes, 4096);
         var readResult = await sandbox.ExecAsync(new SandboxExec
         {
             Argv =
@@ -959,8 +966,8 @@ public sealed partial class PipelineRunner
                 "scratchpad.tgz",
             ],
             WorkingDirectory = "/",
-            MaxStdoutBytes = maximumEncodedBytes,
-            MaxStderrBytes = 4096,
+            MaxStdoutBytes = transferStdoutBytes,
+            MaxStderrBytes = transferStderrBytes,
             KillOnOutputLimit = true,
         }, ct);
         ThrowIfExecutionUnavailable(readResult);

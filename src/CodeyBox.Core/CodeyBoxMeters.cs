@@ -216,6 +216,17 @@ public static class CodeyBoxMeters
         PipelineMeter.CreateCounter<long>("codeybox.toolchain.faults", unit: "{fault}");
 
     /// <summary>
+    /// One increment per durable agent-turn checkpoint write attempt. Tags:
+    /// <c>outcome</c> (<c>committed</c> | <c>degraded</c>) and <c>stage</c>
+    /// (<c>publish</c> | <c>recoverable-turn</c>). A <c>degraded</c> measurement means
+    /// no valid checkpoint was written and the turn cannot be resumed: the
+    /// original agent failure remains authoritative. Operators chart the
+    /// degraded rate as the loss of the resumption guarantee.
+    /// </summary>
+    public static readonly Counter<long> AgentTurnCheckpoints =
+        PipelineMeter.CreateCounter<long>("codeybox.agent_turn.checkpoints", unit: "{checkpoint}");
+
+    /// <summary>
     /// Registers an observable gauge on the <c>CodeyBox.Pipeline</c> meter. The
     /// returned instrument must be kept alive by the caller (the SDK holds only a
     /// weak reference); store it in a long-lived field. The callback runs only

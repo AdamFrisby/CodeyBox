@@ -787,10 +787,16 @@ public sealed partial class PipelineRunner
         {
             // Checkpointing is recovery evidence, not the original operation.
             // Preserve and classify the real agent failure; a partial/failed
-            // checkpoint is never marked valid by CheckpointPreemptAsync.
+            // checkpoint is never marked valid by CheckpointPreemptAsync. A
+            // checkpoint that genuinely cannot be written is additionally
+            // reported as a degraded resumption guarantee (audit log + meter)
+            // so the loss is operator-visible; the publish path reports first
+            // and this handler skips the duplicate.
+            if (AgentTurnCheckpointLimits.ShouldReportDegraded(ex))
+                AgentTurnCheckpointLimits.ReportDegraded(item.Id, "recoverable-turn", ex, _log);
             _log.LogError(
                 ex,
-                "Failed creating durable agent-turn checkpoint for work item {Id}; the original agent failure will be preserved",
+                "Failed creating durable agent-turn checkpoint for work item {Id}; the original agent failure will be preserved and the missing checkpoint is reported as degraded",
                 item.Id);
             return false;
         }
