@@ -91,8 +91,9 @@ public sealed class WorkItemRetrier
         WorkItem item,
         string? from = null,
         string trigger = "manual",
-        CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.None, agentRestoreClaim: null, ct));
+        CancellationToken ct = default,
+        int? workTimeoutMinutes = null)
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.None, agentRestoreClaim: null, ct, workTimeoutMinutes));
 
     public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryQuotaAutoAsync(
         WorkItem item,
@@ -162,7 +163,8 @@ public sealed class WorkItemRetrier
         string trigger,
         RetryAccounting accounting,
         AgentRestoreRetryClaim? agentRestoreClaim,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? workTimeoutMinutes = null)
     {
         if (item.State == WorkItemState.NeedsOperatorInput && _questions is not null)
         {
@@ -416,6 +418,23 @@ public sealed class WorkItemRetrier
             resumed = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(resumed) with
             {
                 PreserveWorkBranchOnQueuedPickup = false,
+            };
+        }
+
+        // An operator retry may carry a new per-item work timeout for the run
+        // being started (e.g. after a timeout:work failure proved the old
+        // budget too small). Clamped to the same 1..480 window as
+        // create/PATCH and stamped explicitly so the next dispatch observes
+        // it. Applied here — in the same atomic conditional write as the
+        // state transition below — so there is no PATCH window for the
+        // dispatcher to race: by the time the retry responds, the new budget
+        // is already persisted. PATCH stays Queued-only; Failed items are
+        // reachable only through this path.
+        if (workTimeoutMinutes is { } timeoutMinutes)
+        {
+            resumed = resumed with
+            {
+                WorkTimeout = TimeSpan.FromMinutes(WorkTimeoutPolicy.ClampMinutes(timeoutMinutes)),
             };
         }
 

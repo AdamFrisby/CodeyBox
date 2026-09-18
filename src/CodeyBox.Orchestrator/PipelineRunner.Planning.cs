@@ -275,7 +275,8 @@ public sealed partial class PipelineRunner
         IPlanArtifactExtractor? producingExtractor = null;
         using (var planningPhase = new PhaseCancellation("planning", ct, _opts.TimeProvider))
         {
-            planningPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(current.WorkTimeout));
+            var (planningTimeout, _) = ResolveEffectiveWorkTimeout(current, project);
+            planningPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(planningTimeout));
             planningPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
             try
             {
@@ -308,7 +309,7 @@ public sealed partial class PipelineRunner
                             workToken: attemptCt),
                     ct,
                     phaseCancellation: planningPhase,
-                    attemptTimeout: current.WorkTimeout);
+                    attemptTimeout: planningTimeout);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {

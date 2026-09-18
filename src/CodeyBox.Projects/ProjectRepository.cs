@@ -329,6 +329,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             DefaultBaseBranch = pc.BaseBranch ?? defaults.BaseBranch,
             DefaultAgent = ParseAgent(pc.Agent ?? defaults.Agent),
             DefaultAgentClass = pc.DefaultAgentClass,
+            WorkTimeoutMinutes = pc.WorkTimeoutMinutes ?? defaults.WorkTimeoutMinutes,
             Upstream = upstream,
             Audit = ResolveAudit(pc.Id, pc.Audit, defaults.Audit),
             NetworkProfiles = ResolveNetworkProfiles(pc.NetworkProfiles, defaults.NetworkProfiles),

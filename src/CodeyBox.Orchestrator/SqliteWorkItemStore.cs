@@ -302,6 +302,18 @@ public sealed class SqliteWorkItemStore :
             RunMigration("ALTER TABLE work_items ADD COLUMN audit_max_iterations INTEGER;");
             RunMigration("ALTER TABLE work_items ADD COLUMN audit_complexity TEXT;");
 
+            // Explicit per-item work-timeout override in ticks. NULL means inherit:
+            // the project's WorkTimeoutMinutes wins when set, else the global
+            // default (CodeyBox:DefaultWorkTimeoutMinutes). Pre-existing rows are
+            // back-filled from the legacy work_timeout_ticks column in the same
+            // transaction that adds the column, so they behave exactly as before —
+            // a row that baked the old 240-minute default stays pinned to it,
+            // while rows created afterwards with no explicit timeout store NULL
+            // and follow config. The legacy column stays NOT NULL and keeps
+            // receiving the explicit value (or the shipped default as a compat
+            // fallback) so direct DB readers still see a sane budget.
+            EnsureWorkTimeoutOverrideColumn();
+
             // Index for the priority-aware pickup query: state filter first, then priority,
             // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
@@ -609,6 +621,47 @@ public sealed class SqliteWorkItemStore :
         {
             // Column already exists from a previous startup — nothing to do.
         }
+    }
+
+    /// <summary>
+    /// Adds <c>work_timeout_override_ticks</c> and back-fills it from the legacy
+    /// <c>work_timeout_ticks</c> column in a single transaction, so a crash
+    /// between the two steps can never leave legacy rows with a NULL override
+    /// (which would silently flip them from their persisted budget to inherit).
+    /// Runs under the constructor's write gate; later opens are a no-op once
+    /// the column exists, so rows created with NULL (inherit) afterwards are
+    /// never clobbered by a re-run.
+    /// </summary>
+    private void EnsureWorkTimeoutOverrideColumn()
+    {
+        using (var check = _conn.CreateCommand())
+        {
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- PRAGMA takes no parameters; the table name is a compile-time constant, not caller input
+            check.CommandText = "PRAGMA table_info(work_items);";
+            using var reader = check.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), "work_timeout_override_ticks", StringComparison.OrdinalIgnoreCase))
+                    return;
+            }
+        }
+
+        using var tx = _conn.BeginTransaction();
+        using (var add = _conn.CreateCommand())
+        {
+            add.Transaction = tx;
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL literal; no user-supplied input reaches this method
+            add.CommandText = "ALTER TABLE work_items ADD COLUMN work_timeout_override_ticks INTEGER;";
+            add.ExecuteNonQuery();
+        }
+        using (var backfill = _conn.CreateCommand())
+        {
+            backfill.Transaction = tx;
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DML literal; no user-supplied input reaches this method
+            backfill.CommandText = "UPDATE work_items SET work_timeout_override_ticks = work_timeout_ticks WHERE work_timeout_override_ticks IS NULL;";
+            backfill.ExecuteNonQuery();
+        }
+        tx.Commit();
     }
 
     private bool TableExists(string tableName) => TableExists(_conn, tableName);
@@ -1378,7 +1431,7 @@ public sealed class SqliteWorkItemStore :
                 cmd.Transaction = tx;
                 cmd.CommandText = """
                     INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent, agent_instance_id,
-                        work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
+                        work_timeout_ticks, work_timeout_override_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                         local_squash_sha, merged_pr_number, merged_pr_url,
@@ -1400,7 +1453,7 @@ public sealed class SqliteWorkItemStore :
                         knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary, plan_review_attempts,
                         delegation_attempts, delegation_requested, delegation_reason, delegation_note, delegation_auto_escalated, delegation_failed, terminal_failure_count,
                         initiator_json)
-                    VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
+                    VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $wto, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $consecutive_infra_recoveries, $release_id, $preempted_at, $preempt_checkpoint,
@@ -1638,7 +1691,7 @@ public sealed class SqliteWorkItemStore :
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     agent_instance_id = $agent_instance_id,
-                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    work_timeout_ticks = $wt, work_timeout_override_ticks = $wto, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = CASE
                         WHEN prompt_revision <> $prompt_revision
                          AND $state IN ($planning_state, $plan_review_state, $plan_approved_state)
@@ -1753,7 +1806,7 @@ public sealed class SqliteWorkItemStore :
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     agent_instance_id = $agent_instance_id,
-                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    work_timeout_ticks = $wt, work_timeout_override_ticks = $wto, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
@@ -1858,7 +1911,7 @@ public sealed class SqliteWorkItemStore :
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     agent_instance_id = $agent_instance_id,
-                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    work_timeout_ticks = $wt, work_timeout_override_ticks = $wto, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
@@ -2333,7 +2386,7 @@ public sealed class SqliteWorkItemStore :
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
                     agent_instance_id = $agent_instance_id,
-                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    work_timeout_ticks = $wt, work_timeout_override_ticks = $wto, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
                     agent_class_id = $class_id, queue_position = $qpos,
@@ -2773,7 +2826,7 @@ public sealed class SqliteWorkItemStore :
                         project_id = $project_id, title = $title,
                         base_branch = $base, work_branch = $work, agent = $agent,
                         agent_instance_id = $agent_instance_id,
-                        work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                        work_timeout_ticks = $wt, work_timeout_override_ticks = $wto, merge_timeout_ticks = $mt, push_upstream = $pu,
                         state = $state, updated_at = $ua, last_error = $err,
                         upstream_push_attempts = $att, depends_on_json = $deps,
                         agent_class_id = $class_id, queue_position = $qpos,
@@ -4286,7 +4339,11 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$work", (object?)item.WorkBranch ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent", (object?)item.Agent?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_instance_id", (object?)item.AgentInstanceId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$wt", item.WorkTimeout.Ticks);
+        // Legacy column stays populated for direct DB readers: explicit value,
+        // or the shipped default as a compat fallback when the item inherits.
+        cmd.Parameters.AddWithValue("$wt", item.WorkTimeout?.Ticks ?? TimeSpan.FromMinutes(WorkTimeoutPolicy.DefaultMinutes).Ticks);
+        // NULL override = inherit (project, then global default); see EnsureWorkTimeoutOverrideColumn.
+        cmd.Parameters.AddWithValue("$wto", (object?)item.WorkTimeout?.Ticks ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$mt", item.MergeTimeout.Ticks);
         cmd.Parameters.AddWithValue("$pu", item.PushUpstream ? 1 : 0);
         cmd.Parameters.AddWithValue("$state", (int)item.State);
@@ -4440,7 +4497,9 @@ public sealed class SqliteWorkItemStore :
         WorkBranch = r.IsDBNull(r.GetOrdinal("work_branch")) ? null : r.GetString(r.GetOrdinal("work_branch")),
         Agent = r.IsDBNull(r.GetOrdinal("agent")) ? null : new AgentKind(r.GetString(r.GetOrdinal("agent"))),
         AgentInstanceId = ReadNullableString(r, "agent_instance_id"),
-        WorkTimeout = new TimeSpan(r.GetInt64(r.GetOrdinal("work_timeout_ticks"))),
+        WorkTimeout = r.IsDBNull(r.GetOrdinal("work_timeout_override_ticks"))
+            ? null
+            : new TimeSpan(r.GetInt64(r.GetOrdinal("work_timeout_override_ticks"))),
         MergeTimeout = new TimeSpan(r.GetInt64(r.GetOrdinal("merge_timeout_ticks"))),
         PushUpstream = r.GetInt32(r.GetOrdinal("push_upstream")) != 0,
         State = (WorkItemState)r.GetInt32(r.GetOrdinal("state")),

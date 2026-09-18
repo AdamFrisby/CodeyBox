@@ -210,6 +210,46 @@ The resume-state mapping mirrors the dead-worker reaper / startup replay:
 
 Auto-retry events emit `work_item.transient_cancel_retried` (audit-log level Warning) with phase, source, attempt, and max so dashboards can isolate host-hiccup churn from quota or operator-driven retries.
 
+#### Work-phase timeout budget
+
+The wall-clock budget for the work phase (also applied per rework
+iteration) resolves per dispatch, most specific first:
+
+1. Per-item `WorkTimeout` — set at creation (`workTimeoutMinutes`), by
+   `PATCH` while queued, or by a retry request (below). Null means inherit.
+2. Per-project `WorkTimeoutMinutes` — project entry wins over `Defaults`
+   (see [projects.md](projects.md#worktimeoutminutes)). Null means inherit.
+3. Global default `CodeyBox:DefaultWorkTimeoutMinutes` — default 240
+   minutes, hot-reloadable: edits apply to subsequently dispatched work
+   without a restart. In-flight iterations keep the budget they started with.
+
+Project and global values are clamped to 1–480 minutes at resolution time,
+so a typo cannot disable the timeout; per-item values are clamped at the
+API entry points.
+
+When the work phase fails on `timeout:work`, `lastError` names the budget
+that was in force, where it came from (item, project, or global default),
+and how to raise it. `PATCH` cannot help after the fact — `Failed` items
+are not editable — so raise the budget on the retry that starts the next
+run:
+
+```
+POST /workitems/{id}/retry
+{
+  "from": "work",
+  "workTimeoutMinutes": 480   // optional, clamped to 1–480
+}
+```
+
+The value is stamped in the same atomic conditional write as the `Queued`
+transition, so unlike a PATCH-after-retry there is no window for the
+dispatcher to pick the item up with the old budget. Omit the field to keep
+the item's current setting (including inherit).
+
+A longer budget does not weaken stall detection: a wedged agent is caught
+by the stuck probe / progress watchdog (frozen item), never by this
+timeout.
+
 ## Inspecting blast radius
 
 Before cancelling an item, check what depends on it:

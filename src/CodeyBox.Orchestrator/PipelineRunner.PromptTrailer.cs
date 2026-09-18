@@ -172,6 +172,19 @@ public sealed partial class PipelineRunner
     private TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout) =>
         ResolvePhaseAbsoluteTimeout(perAttemptTimeout, _opts.PhaseAbsoluteTimeoutMultiplier);
 
+    /// <summary>
+    /// Resolves the work-phase budget in force for this dispatch: the item's
+    /// own timeout when set, else the project's <c>WorkTimeoutMinutes</c>, else
+    /// the live global default. The global default is read through the
+    /// injected accessor on every call (production wires the options monitor)
+    /// so a config reload changes the value for subsequently dispatched work;
+    /// in-flight iterations are unaffected because each phase resolves once at
+    /// its own entry. Stall detection is independent of this budget — a wedged
+    /// agent is caught by the stuck probe / progress watchdog, never by this timeout.
+    /// </summary>
+    internal (TimeSpan Budget, WorkTimeoutSource Source) ResolveEffectiveWorkTimeout(WorkItem item, Project project) =>
+        WorkTimeoutPolicy.Resolve(item.WorkTimeout, project.WorkTimeoutMinutes, _defaultWorkTimeoutMinutesAccessor?.Invoke());
+
     internal static TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout, double multiplier)
     {
         if (perAttemptTimeout == Timeout.InfiniteTimeSpan || perAttemptTimeout <= TimeSpan.Zero)

@@ -988,7 +988,8 @@ public sealed partial class PipelineRunner
         var baseReworkPrompt = ReworkPromptBuilder.Build(
             freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
         using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
-        reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+        var (reworkTimeout, _) = ResolveEffectiveWorkTimeout(item, project);
+        reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(reworkTimeout));
         reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
 
@@ -1021,7 +1022,7 @@ public sealed partial class PipelineRunner
                         workToken: attemptCt),
                 ct,
                 phaseCancellation: reworkPhase,
-                attemptTimeout: item.WorkTimeout,
+                attemptTimeout: reworkTimeout,
                 allowAuthRequiredFallback: true);
         }
 

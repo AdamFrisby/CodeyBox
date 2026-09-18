@@ -451,7 +451,8 @@ public sealed partial class PipelineRunner
             // original work agent (this method's `runner` parameter); the
             // contract is `IAgentRunner.RunAsync`, identical to the work phase.
             using var phase = new PhaseCancellation(ConflictReworkPhaseKey, ct, _opts.TimeProvider);
-            phase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+            var (conflictWorkTimeout, _) = ResolveEffectiveWorkTimeout(item, project);
+            phase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(conflictWorkTimeout));
             phase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
             AgentResult agentResult;
             var startedAt = DateTimeOffset.UtcNow;

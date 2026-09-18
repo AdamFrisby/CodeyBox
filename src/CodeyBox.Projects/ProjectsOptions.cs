@@ -20,6 +20,15 @@ public sealed class ProjectDefaultsConfig
 {
     public string? Agent { get; set; }
     public string? BaseBranch { get; set; }
+
+    /// <summary>
+    /// Default work-phase wall-clock budget in minutes for projects that do
+    /// not set their own <see cref="ProjectConfig.WorkTimeoutMinutes"/>.
+    /// Null means inherit the global default
+    /// <c>CodeyBox:DefaultWorkTimeoutMinutes</c>. Clamped to 1..480 at
+    /// resolution time so a typo cannot disable the timeout.
+    /// </summary>
+    public int? WorkTimeoutMinutes { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
     public bool? GraphicalSandbox { get; set; }
@@ -41,6 +50,17 @@ public sealed class ProjectConfig
     public string? BaseBranch { get; set; }
     public string? Agent { get; set; }
     public string? DefaultAgentClass { get; set; }
+
+    /// <summary>
+    /// Default work-phase wall-clock budget in minutes for this project's
+    /// items that carry no per-item timeout. Null means inherit
+    /// <c>Defaults:WorkTimeoutMinutes</c>, then the global default
+    /// <c>CodeyBox:DefaultWorkTimeoutMinutes</c>. Maps to
+    /// <see cref="CodeyBox.Core.Project.WorkTimeoutMinutes"/> after
+    /// resolution. Clamped to 1..480 at resolution time so a typo cannot
+    /// disable the timeout.
+    /// </summary>
+    public int? WorkTimeoutMinutes { get; set; }
     public ProjectUpstreamConfig? Upstream { get; set; }
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }

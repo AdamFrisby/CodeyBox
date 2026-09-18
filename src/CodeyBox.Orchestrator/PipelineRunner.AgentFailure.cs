@@ -428,7 +428,8 @@ public sealed partial class PipelineRunner
             var reworkPrompt = _promptComposer.BuildPostActReworkPrompt(item.Prompt, checkSpec, verdict, iteration, maxIterations);
             await Transition(item, WorkItemState.Reworking, ct, project);
             using var reworkPhase = new PhaseCancellation("post-act-rework", ct, _opts.TimeProvider);
-            reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+            var (postActWorkTimeout, _) = ResolveEffectiveWorkTimeout(item, project);
+            reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(postActWorkTimeout));
             reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
             var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
             try
@@ -453,7 +454,7 @@ public sealed partial class PipelineRunner
                             workToken: attemptCt),
                     ct,
                     phaseCancellation: reworkPhase,
-                    attemptTimeout: item.WorkTimeout);
+                    attemptTimeout: postActWorkTimeout);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
