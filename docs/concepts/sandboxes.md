@@ -748,8 +748,18 @@ memberless classes, and duplicate `MemberId`s are refused, with the reason
 naming the member and the offending value. Each member must also satisfy the
 worker/sandbox deadlock invariant — `Capacity >= 2 × MaxConcurrentWorkers`,
 because a worker holds its work sandbox while acquiring a second sandbox
-for audit. **Nothing routes through this catalog yet** and
-`CodeyBox:SandboxProvider` keeps working until a later item replaces it.
+for audit. The work phase routes through this catalog: placement builds its
+requirements from the work item's `RequiredCapabilities` plus the phase's
+network profile and credential, picks the highest-`PreferenceScore` eligible
+member, creates the sandbox on that member's provider (each kind constructed
+once and shared), and logs the decision's `Describe()` output. A required
+capability no member declares fails the item operator-visible naming the
+capability; a transient refusal (capacity, cordon, health, credential or
+profile mismatch) requeues under the `PlacementRecheckIn` backoff. With no
+classes configured, a default single-member class is synthesized from
+`CodeyBox:SandboxProvider` so single-provider deployments behave as before.
+Capacity gating still lives in the global admission wrapper; per-member gates
+replace it in a later item.
 
 ## Adding a new provider
 
@@ -761,7 +771,10 @@ for audit. **Nothing routes through this catalog yet** and
    - `SandboxSpec.Limits` — CPU, memory, disk, wall-clock.
    - `SandboxConventions.WorkDir` and `CredentialsDir` paths inside the sandbox.
 3. Document the new provider in this file.
-4. Register it in the switch in `Program.cs`.
+4. Register it in `Program.BuildSandboxProviderInner` and add its id to
+   `SandboxProviderKinds` — members resolve through the
+   `ISandboxProviderRegistry` (one shared instance per kind), so no other
+   call site needs a provider-kind branch.
 5. Update `docs/concepts/security.md` with any provider-specific caveats.
 
 ## Network allowlist enforcement

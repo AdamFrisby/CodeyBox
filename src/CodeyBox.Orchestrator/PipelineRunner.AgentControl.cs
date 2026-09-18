@@ -127,7 +127,13 @@ public sealed partial class PipelineRunner
             includeAgentTurnScratchpadTmpfs: true,
             credentialRunner: runner);
 
-        var sandbox = await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
+        var sandbox = await AcquireWorkPhaseSandboxAsync(
+            item,
+            "work",
+            credential?.Agent.Value,
+            sandboxTarget.NetworkProfile,
+            spec,
+            ct).ConfigureAwait(false);
         try
         {
             if (credential is not null && credential.Files.Count > 0)

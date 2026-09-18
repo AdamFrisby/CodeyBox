@@ -28,32 +28,66 @@ public sealed record ExecutorPlacementRequirements
     /// credential/profile become null; blank capability entries are dropped.
     /// Throws <see cref="ArgumentException"/> when a bound is exceeded so
     /// misconfigured callers fail fast instead of silently widening placement.
+    /// Shares its normalisation with <see cref="FromValues"/> — there is one
+    /// assembler, used both by executor phase dispatch and by sandbox
+    /// acquisition, so the two placement paths cannot drift apart.
     /// </summary>
     public static ExecutorPlacementRequirements FromRequest(ExecutorPhaseRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var credential = string.IsNullOrWhiteSpace(request.RequiredCredential)
+        try
+        {
+            return FromValues(
+                request.RequiredCredential,
+                request.RequiredNetworkProfile,
+                request.RequiredCapabilities);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new ArgumentException(ex.Message, nameof(request), ex);
+        }
+    }
+
+    /// <summary>
+    /// Builds requirements directly from the credential, network profile and
+    /// capability tags a phase already needs: the work item's
+    /// <see cref="WorkItem.RequiredCapabilities"/> plus the network profile
+    /// and credential of its sandbox target. This is the shared assembler
+    /// behind <see cref="FromRequest"/> — sandbox acquisition calls this
+    /// instead of building a second assembler, so the normalisation and
+    /// bounds live in exactly one place. Trims entries; blank
+    /// credential/profile become null; blank capability entries are dropped.
+    /// Throws <see cref="ArgumentException"/> (naming the offending parameter)
+    /// when a bound is exceeded so misconfigured callers fail fast instead of
+    /// silently widening placement.
+    /// </summary>
+    public static ExecutorPlacementRequirements FromValues(
+        string? requiredCredential,
+        string? requiredNetworkProfile,
+        IReadOnlyList<string>? requiredCapabilities)
+    {
+        var credential = string.IsNullOrWhiteSpace(requiredCredential)
             ? null
-            : request.RequiredCredential.Trim();
+            : requiredCredential.Trim();
         if (credential is not null && credential.Length > MaxEntryLength)
             throw new ArgumentException(
-                $"RequiredCredential must be at most {MaxEntryLength} characters.", nameof(request));
+                $"RequiredCredential must be at most {MaxEntryLength} characters.", nameof(requiredCredential));
         if (credential is not null && credential.Any(char.IsControl))
-            throw new ArgumentException("RequiredCredential must not contain control characters.", nameof(request));
+            throw new ArgumentException("RequiredCredential must not contain control characters.", nameof(requiredCredential));
 
-        var profile = string.IsNullOrWhiteSpace(request.RequiredNetworkProfile)
+        var profile = string.IsNullOrWhiteSpace(requiredNetworkProfile)
             ? null
-            : request.RequiredNetworkProfile.Trim();
+            : requiredNetworkProfile.Trim();
         if (profile is not null && profile.Length > MaxEntryLength)
             throw new ArgumentException(
-                $"RequiredNetworkProfile must be at most {MaxEntryLength} characters.", nameof(request));
+                $"RequiredNetworkProfile must be at most {MaxEntryLength} characters.", nameof(requiredNetworkProfile));
         if (profile is not null && profile.Any(char.IsControl))
-            throw new ArgumentException("RequiredNetworkProfile must not contain control characters.", nameof(request));
+            throw new ArgumentException("RequiredNetworkProfile must not contain control characters.", nameof(requiredNetworkProfile));
 
-        var capabilities = request.RequiredCapabilities ?? [];
+        var capabilities = requiredCapabilities ?? [];
         if (capabilities.Count > MaxRequiredCapabilities)
             throw new ArgumentException(
-                $"RequiredCapabilities may contain at most {MaxRequiredCapabilities} entries.", nameof(request));
+                $"RequiredCapabilities may contain at most {MaxRequiredCapabilities} entries.", nameof(requiredCapabilities));
         var normalised = new List<string>(capabilities.Count);
         foreach (var raw in capabilities)
         {
@@ -62,9 +96,9 @@ public sealed record ExecutorPlacementRequirements
             var tag = raw.Trim();
             if (tag.Length > MaxEntryLength)
                 throw new ArgumentException(
-                    $"RequiredCapabilities entries must be at most {MaxEntryLength} characters.", nameof(request));
+                    $"RequiredCapabilities entries must be at most {MaxEntryLength} characters.", nameof(requiredCapabilities));
             if (tag.Any(char.IsControl))
-                throw new ArgumentException("RequiredCapabilities entries must not contain control characters.", nameof(request));
+                throw new ArgumentException("RequiredCapabilities entries must not contain control characters.", nameof(requiredCapabilities));
             normalised.Add(tag);
         }
 

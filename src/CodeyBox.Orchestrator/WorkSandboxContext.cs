@@ -22,6 +22,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
     private ISandbox? _activeSandbox;
     private string? _activeBaselineImageRef;
     private string? _activeTimingPhase;
+    private string? _activeProviderName;
     private int _reuseCount;
     private DateTimeOffset _createdAt;
 
@@ -36,18 +37,40 @@ public sealed class WorkSandboxContext : IAsyncDisposable
     }
 
     public async Task<ISandbox> GetOrCreateSandboxAsync(SandboxSpec spec, CancellationToken ct)
+        => await GetOrCreateSandboxAsync(spec, ct, acquireAsync: null).ConfigureAwait(false);
+
+    /// <summary>
+    /// Gets the reusable sandbox, creating it through <paramref name="acquireAsync"/>
+    /// when a fresh sandbox is needed (first use, or after the active one was
+    /// discarded). Pass the placement-driven acquisition here so creations on
+    /// the pipeline path go through the placement decider while warm reuse
+    /// keeps working: the provider-change check then compares against the
+    /// actually-placed provider recorded from the previous creation (falling
+    /// back to the configured provider name), so same-kind reuse is
+    /// preserved and a cross-kind switch recreates instead of reusing the
+    /// wrong backend. Null keeps the legacy direct-provider path.
+    /// </summary>
+    public async Task<ISandbox> GetOrCreateSandboxAsync(
+        SandboxSpec spec,
+        CancellationToken ct,
+        Func<SandboxSpec, CancellationToken, Task<ISandbox>>? acquireAsync)
     {
         var options = _tuning.Current;
+        var acquire = acquireAsync ?? _provider.CreateAsync;
         if (!options.EnableSandboxReuse)
         {
             _log.LogDebug("Sandbox reuse is disabled; creating fresh sandbox.");
-            return await _provider.CreateAsync(spec, ct);
+            var fresh = await acquire(spec, ct).ConfigureAwait(false);
+            RecordPlacedProvider(fresh, acquireAsync is not null);
+            return fresh;
         }
 
         var requestedTimingPhase = string.IsNullOrWhiteSpace(spec.TimingPhase)
             ? "work"
             : spec.TimingPhase!;
-        var selectedProviderId = _provider.Name;
+        var selectedProviderId = acquireAsync is null
+            ? _provider.Name
+            : _activeProviderName ?? _provider.Name;
 
         // Check pressure threshold
         if (_provider is ISandboxAdmissionSnapshot snapshot)
@@ -106,7 +129,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         if (_activeSandbox == null)
         {
             _log.LogInformation("Creating fresh sandbox for reuse (BaselineImageRef: {Image}).", spec.BaselineImageRef);
-            _activeSandbox = await _provider.CreateAsync(spec, ct);
+            _activeSandbox = await acquire(spec, ct).ConfigureAwait(false);
+            RecordPlacedProvider(_activeSandbox, acquireAsync is not null);
             _activeBaselineImageRef = spec.BaselineImageRef;
             _activeTimingPhase = requestedTimingPhase;
             _createdAt = DateTimeOffset.UtcNow;
@@ -129,7 +153,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             {
                 _log.LogWarning(ex, "Failed to clean work directory in reused sandbox; recreating sandbox instead.");
                 await DisposeActiveSandboxAsync();
-                _activeSandbox = await _provider.CreateAsync(spec, ct);
+                _activeSandbox = await acquire(spec, ct).ConfigureAwait(false);
+                RecordPlacedProvider(_activeSandbox, acquireAsync is not null);
                 _activeBaselineImageRef = spec.BaselineImageRef;
                 _activeTimingPhase = requestedTimingPhase;
                 _createdAt = DateTimeOffset.UtcNow;
@@ -162,7 +187,16 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _activeSandbox = null;
             _activeBaselineImageRef = null;
             _activeTimingPhase = null;
+            _activeProviderName = null;
         }
+    }
+
+    private void RecordPlacedProvider(ISandbox sandbox, bool placed)
+    {
+        if (!placed)
+            return;
+        _activeProviderName = SandboxCapability.Find<IProviderOwnedSandbox>(sandbox)?.ProviderId
+            ?? _provider.Name;
     }
 
     /// <summary>

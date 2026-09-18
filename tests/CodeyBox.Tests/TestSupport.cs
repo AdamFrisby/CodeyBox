@@ -359,7 +359,10 @@ internal static class TestSupport
         // FakeTimeProvider so sub-second idle budgets are advanced
         // deterministically instead of racing wall-clock scheduling
         // latency under parallel load. Null (default) keeps the system clock.
-        TimeProvider? pipelineTimeProvider = null)
+        TimeProvider? pipelineTimeProvider = null,
+        // Placement-driven sandbox acquisition for the work phase. Null
+        // (default) keeps the legacy direct-provider path.
+        SandboxPlacementAcquirer? sandboxPlacer = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -589,7 +592,8 @@ internal static class TestSupport
             staleBaseReworkRouter: staleBaseReworkRouter,
             briefComposer: briefComposer,
             delegationEvents: delegationEvents,
-            delegationEscalation: delegationEscalation);
+            delegationEscalation: delegationEscalation,
+            sandboxPlacer: sandboxPlacer);
 
         return new TestPipeline(
             pipeline,

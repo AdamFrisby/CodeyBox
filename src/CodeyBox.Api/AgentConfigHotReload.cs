@@ -108,6 +108,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly ISandboxHostPoolSnapshot? _hostPoolSnapshot;
     private readonly SandboxAdmissionControlledProvider? _sandboxAdmission;
     private readonly SandboxClassesSnapshot? _sandboxClasses;
+    private readonly ISandboxProviderRegistry? _sandboxProviderRegistry;
+    private readonly IHostEnvironment? _hostEnvironment;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -185,7 +187,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         SandboxAdmissionControlledProvider? sandboxAdmission = null,
         IConfiguration? configuration = null,
         DeployConsistencyService? deployConsistency = null,
-        SandboxClassesSnapshot? sandboxClasses = null)
+        SandboxClassesSnapshot? sandboxClasses = null,
+        ISandboxProviderRegistry? sandboxProviderRegistry = null,
+        IHostEnvironment? hostEnvironment = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -220,6 +224,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _hostPoolSnapshot = hostPoolSnapshot;
         _sandboxAdmission = sandboxAdmission;
         _sandboxClasses = sandboxClasses;
+        _sandboxProviderRegistry = sandboxProviderRegistry;
+        _hostEnvironment = hostEnvironment;
         _configuration = configuration;
         _deployConsistency = deployConsistency;
         _log = log;
@@ -911,8 +917,35 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         {
             var (maxWorkers, _) = OrchestratorOptionsFactory.ResolveSandboxCounts(
                 opts.Concurrency, opts.WorkerPool, _log);
-            var catalog = SandboxClassesConfigBuilder.Build(
-                opts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, _log);
+            IReadOnlyList<SandboxClass> catalog;
+            if (opts.SandboxClasses.Count == 0
+                && _sandboxProviderRegistry is not null
+                && _configuration is not null
+                && _hostEnvironment is not null)
+            {
+                // No classes configured on reload either: re-synthesize the
+                // default single-member class from CodeyBox:SandboxProvider
+                // (mirroring startup) instead of publishing an empty catalog.
+                var kind = SandboxProviderSelection.ResolveConfiguredKind(
+                    opts.SandboxProvider, _configuration, _hostEnvironment, _log);
+                var provider = _sandboxProviderRegistry.EnsureKind(kind);
+                catalog = SandboxClassesDefaultCatalog.Synthesize(kind, provider.DeclaredCapabilities, _log);
+            }
+            else
+            {
+                catalog = SandboxClassesConfigBuilder.Build(
+                    opts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, _log);
+            }
+            // Warm newly-named kinds so a bad provider keeps the prior
+            // catalog (via the catch below) instead of the first placement.
+            if (_sandboxProviderRegistry is not null)
+            {
+                foreach (var memberKind in catalog
+                             .SelectMany(static c => c.Members)
+                             .Select(static m => m.ProviderKind)
+                             .Distinct(StringComparer.OrdinalIgnoreCase))
+                    _sandboxProviderRegistry.EnsureKind(memberKind);
+            }
             _sandboxClasses.Replace(catalog);
             _lastSandboxClasses = next;
             AuditLog.ConfigReloaded("SandboxClasses", prev, next);

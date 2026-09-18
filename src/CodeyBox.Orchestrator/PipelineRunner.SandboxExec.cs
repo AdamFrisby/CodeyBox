@@ -147,6 +147,40 @@ public sealed partial class PipelineRunner
     }
 
     /// <summary>
+    /// Acquires a work-phase sandbox. When placement is wired (production),
+    /// builds the placement requirements from the work item's
+    /// <see cref="WorkItem.RequiredCapabilities"/> plus the network profile
+    /// and credential the phase's sandbox target already needs, places onto a
+    /// member, and creates the sandbox on that member's registry provider.
+    /// A permanent refusal (capability no member declares) throws
+    /// <see cref="SandboxPlacementUnplaceableException"/> naming the
+    /// capability so the item fails operator-visible; a transient refusal
+    /// throws <see cref="SandboxProvisioningDeferredException"/> so the item
+    /// requeues under the existing backoff. Null placer keeps the legacy
+    /// direct-provider path.
+    /// </summary>
+    private Task<ISandbox> AcquireWorkPhaseSandboxAsync(
+        WorkItem item,
+        string phase,
+        string? credentialName,
+        string? networkProfile,
+        SandboxSpec spec,
+        CancellationToken ct)
+    {
+        if (_sandboxPlacer is null)
+            return _sandboxes.CreateAsync(spec, ct);
+        return _sandboxPlacer.AcquireAsync(
+            new SandboxPlacementAcquisition(
+                item.Id,
+                phase,
+                item.RequiredCapabilities,
+                credentialName,
+                networkProfile,
+                spec),
+            ct);
+    }
+
+    /// <summary>
     /// Resolves the project's sandbox secrets for <paramref name="scope"/>
     /// from live host environment state. Returns an empty map when the
     /// project declares nothing for the scope. Values are never logged here;
