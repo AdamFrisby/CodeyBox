@@ -855,6 +855,12 @@ public sealed class HostShutdownCancellationTests : IDisposable
             harness.Pipeline.RunAsync(item, CancellationToken.None, hostShutdownCts.Token));
 
         await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        // Wait for the turn-start scratchpad capture before signalling host
+        // shutdown: otherwise the shutdown can win the race with the capture
+        // and the checkpoint below would have no archive to read. The turn is
+        // still blocked in its slow hook when the signal arrives, so the
+        // slow-quiesce behavior under test is unchanged.
+        await agent.CaptureCompleted.WaitAsync(TimeSpan.FromSeconds(30));
         await hostShutdownCts.CancelAsync();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
@@ -2122,6 +2128,11 @@ internal sealed class CancellationObservingSlowPreemptAgentRunner : IAgentRunner
     public AgentKind Kind => AgentKind.Claude;
     public bool CancellationObserved { get; private set; }
 
+    private readonly TaskCompletionSource _captureCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    internal Task CaptureCompleted => _captureCompleted.Task;
+
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -2133,6 +2144,14 @@ internal sealed class CancellationObservingSlowPreemptAgentRunner : IAgentRunner
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
+        // Capture the scratchpad up front (the agent produces its scratchpad
+        // state during the turn) so the preempt hook below only exercises the
+        // slow-quiesce behavior under test. Spawning the capture inside the
+        // 2-second preempt-signal window made this test depend on process-spawn
+        // latency under full-suite load; the checkpoint then had no archive to
+        // read and the test failed without the hook being at fault.
+        await TestAgentTurnScratchpadCapture.CaptureAsync(sandbox, ct);
+        _captureCompleted.TrySetResult();
         await Task.Delay(Timeout.InfiniteTimeSpan, ct);
         return new AgentResult(false, "unreachable", null, null);
     }
@@ -2142,7 +2161,19 @@ internal sealed class CancellationObservingSlowPreemptAgentRunner : IAgentRunner
         string workingDirectory,
         CancellationToken ct = default)
     {
-        await TestAgentTurnScratchpadCapture.CaptureAsync(sandbox, ct);
+        try
+        {
+            await TestAgentTurnScratchpadCapture.CaptureAsync(sandbox, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // The signal timeout fired while the refresh capture was still
+            // running: the hook did observe cancellation, and the turn-start
+            // capture above left a valid archive behind (the transfer is
+            // atomic), so quiesce and let the checkpoint proceed.
+            CancellationObserved = true;
+            return;
+        }
 
         try
         {
