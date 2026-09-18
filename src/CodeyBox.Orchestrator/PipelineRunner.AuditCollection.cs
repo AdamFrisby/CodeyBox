@@ -539,7 +539,7 @@ public sealed partial class PipelineRunner
                     flavor: sandboxTarget.Flavor,
                     baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
                     credentialRunner: credential is null ? null : groupRunner,
-                    projectSecretEnvironment: ResolveProjectSecretEnvironment(project, auditSecretScope));
+                    projectSecretEnvironment: ResolveProjectSecretEnvironment(project, item.Id, auditSecretScope));
                 return built with
                 {
                     Mounts = [.. built.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }],
@@ -773,6 +773,7 @@ public sealed partial class PipelineRunner
                         credentialRunner: candidateCredential is null ? null : candidateRunner,
                         projectSecretEnvironment: ResolveProjectSecretEnvironment(
                             project,
+                            item.Id,
                             needsCreds ? ProjectSandboxSecretScopes.AuditAgent : ProjectSandboxSecretScopes.AuditTool));
                     var dotnetShim = AuditReviewDotnetShim.From(_pipelineTuning.Current);
                     var specWithAuditMount = candidateSpec with

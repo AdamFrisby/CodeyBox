@@ -472,7 +472,49 @@ config load:
 |---|---|---|---|
 | `HostEnvVar` | `string` | required | Name of the host environment variable holding the secret. Read at sandbox-provisioning time. Must be a POSIX identifier — anything else is rejected as a literal value. |
 | `SandboxEnvVar` | `string` | required | Name of the sandbox environment variable the value is injected as. Must be a POSIX identifier, must not be a reserved shell name (`PATH`, `LD_PRELOAD`, …), and must be unique per project. |
+| `Group` | `string` | `"default"` | Secret group the entry is declared into. The group is the unit of authorisation — see below. |
 | `Phases` | `string[]` | `["work", "rework"]` | Phases receiving the secret: `work`, `rework`, `audit` (both audit-agent and audit-tool sandboxes), `audit-agent`, `audit-tool`, `merge`. |
+
+**Authorisation is operator-granted, default-deny.** Declaring a secret
+is not enough: each secret is injected only when an operator grant
+authorises its group for the requesting work item. Grants live in project
+configuration under `SecretGrants` and compose with phase scoping — a
+grant decides whether a group applies to an item at all, `Phases`
+decides which sandboxes within it receive the value:
+
+```json
+{
+  "Id": "adapter-work",
+  "SandboxSecrets": [
+    { "HostEnvVar": "CODEYBOX_OPENROUTER_API_KEY", "SandboxEnvVar": "OPENROUTER_API_KEY", "Group": "llm" },
+    { "HostEnvVar": "CODEYBOX_ACME_TOKEN", "SandboxEnvVar": "ACME_TOKEN", "Group": "acme" }
+  ],
+  "SecretGrants": [
+    { "Group": "llm" },
+    { "Group": "acme", "WorkItemId": "3fa85f6457174562b3c9c8f5f6dc0e9a" }
+  ]
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Group` | `string` | required | Secret group this grant authorises. Must name a group used by at least one `SandboxSecrets` entry. |
+| `WorkItemId` | `string` | project-wide | Optional work-item id (GUID) narrowing the grant to a single item. Omitted = every item in the project. |
+
+A group with no matching grant is not injected. A project that declares
+secrets and no grants injects nothing, and says so at config load with a
+per-group warning — a missing grant is never an error for the work item,
+which simply runs without the secret. Grants match on project identity
+(the project declaring them) and exact work-item identity only: nothing
+a work item contains — prompt, title, capabilities, knobs, external ids —
+can cause a grant to match, so an item cannot widen its own access.
+
+**Migration.** Configurations written before grants existed keep working:
+declarations without a `Group` map into the implicit `default` group, and
+the repository synthesises an implicit project-wide grant for it — stated
+explicitly in the load log, never implied. Any declaration that names a
+group, and any project that declares a grant, is under default-deny for
+every group without a matching grant.
 
 **Scope is explicit, not everywhere-by-default.** Work and rework clearly
 need test keys; merge only when the merge agent runs the suite. Audit
@@ -494,8 +536,12 @@ storage stays on the non-persistent tmpfs, never the VM's disk, and
 existing secret-pattern redaction applies to recorded agent output.
 
 **Auditable.** `GET /projects` and `GET /projects/{id}` report
-`hasSandboxSecrets` plus the `sandboxSecrets` list — names and scopes
-only, never values.
+`hasSandboxSecrets` plus the `sandboxSecrets` list — names, groups, and
+scopes only, never values — alongside the `secretGrants` list. Every
+granted injection is also recorded names-only in the host log with the
+group it came from and the grant kind (project-wide, work-item, or
+implicit migration), so "why did this item hold that credential" is
+answerable afterwards.
 
 **Egress reality.** A secret is only useful if the sandbox can reach the
 service: pair each secret with a network profile that allows the egress.

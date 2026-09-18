@@ -240,7 +240,7 @@ public sealed record Project
     public ProjectJobTrackExport JobTrackExport { get; init; } = ProjectJobTrackExport.Disabled;
 
     /// <summary>
-    /// Project-scoped test secrets injected into this project's sandboxes by
+    /// ProjectScoped test secrets injected into this project's sandboxes by
     /// reference (host variable name → sandbox variable name). Empty (the
     /// default) means nothing is injected. Each entry defaults to the
     /// <c>work</c> + <c>rework</c> scopes; audit and merge sandboxes receive
@@ -249,6 +249,19 @@ public sealed record Project
     /// selectable as an agent credential.
     /// </summary>
     public IReadOnlyList<ProjectSandboxSecret> SandboxSecrets { get; init; } = [];
+
+    /// <summary>
+    /// Operator-declared grants authorising secret groups for this project.
+    /// A secret is injected only when its group has a matching grant (default
+    /// deny); a group with no matching grant injects nothing. Grants live on
+    /// the project — nothing a work item contains can widen them. The
+    /// repository synthesises an implicit project-wide grant for the
+    /// <c>default</c> group when the project carries pre-grant flat
+    /// declarations, so those keep working; see
+    /// <see cref="ProjectSandboxSecretGroups"/> and
+    /// <see cref="ProjectSandboxSecretGrant"/>.
+    /// </summary>
+    public IReadOnlyList<ProjectSandboxSecretGrant> SandboxSecretGrants { get; init; } = [];
 }
 
 /// <summary>

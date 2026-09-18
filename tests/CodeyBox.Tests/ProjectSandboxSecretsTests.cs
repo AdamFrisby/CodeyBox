@@ -58,7 +58,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
     private Project TestProject(
         string seed,
         IReadOnlyList<ProjectSandboxSecret>? secrets = null,
-        ProjectAudit? audit = null) => new()
+        ProjectAudit? audit = null)
+    {
+        var resolvedSecrets = secrets ?? [];
+        return new()
         {
             Id = new ProjectId("test-project"),
             DisplayName = "Test Project",
@@ -68,8 +71,14 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             NetworkProfiles = new ProjectNetworkProfiles(),
             Upstream = ProjectUpstream.Noop,
             Audit = audit ?? new ProjectAudit { MaxIterations = 1, AuditTypes = ["scripted"] },
-            SandboxSecrets = secrets ?? [],
+            SandboxSecrets = resolvedSecrets,
+            SandboxSecretGrants = resolvedSecrets
+                .Select(secret => secret.Group)
+                .Distinct(StringComparer.Ordinal)
+                .Select(group => new ProjectSandboxSecretGrant { Group = group })
+                .ToList(),
         };
+    }
 
     // ── Scope matching ────────────────────────────────────────────────────
 
@@ -134,6 +143,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             [
                 new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = "OPENROUTER_API_KEY" },
             ],
+            SandboxSecretGrants =
+            [
+                new ProjectSandboxSecretGrant { Group = "default" },
+            ],
         };
         using var _ = new HostEnvScope(hostName, "live-test-value");
 
@@ -178,6 +191,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
                 new ProjectSandboxSecret { HostEnvVar = missing, SandboxEnvVar = "FIRST_KEY" },
                 new ProjectSandboxSecret { HostEnvVar = empty, SandboxEnvVar = "SECOND_KEY" },
             ],
+            SandboxSecretGrants =
+            [
+                new ProjectSandboxSecretGrant { Group = "default" },
+            ],
         };
 
         var resolved = ProjectSandboxSecretResolver.ResolveForScope(
@@ -199,6 +216,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             [
                 new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = "PATH" },
             ],
+            SandboxSecretGrants =
+            [
+                new ProjectSandboxSecretGrant { Group = "default" },
+            ],
         };
 
         Assert.Throws<ArgumentException>(() =>
@@ -217,6 +238,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             SandboxSecrets =
             [
                 new ProjectSandboxSecret { HostEnvVar = "ANY_HOST", SandboxEnvVar = "TEST_KEY" },
+            ],
+            SandboxSecretGrants =
+            [
+                new ProjectSandboxSecretGrant { Group = "default" },
             ],
         };
 
@@ -257,6 +282,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             SandboxSecrets =
             [
                 new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = SandboxName },
+            ],
+            SandboxSecretGrants =
+            [
+                new ProjectSandboxSecretGrant { Group = "default" },
             ],
         };
 
@@ -664,7 +693,7 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
         Assert.Equal("HOST_KEY", entry.HostEnvVar);
         Assert.Equal("SANDBOX_KEY", entry.SandboxEnvVar);
 
-        var dto = new ProjectSandboxSecretDto(entry.HostEnvVar, entry.SandboxEnvVar, entry.Scopes);
+        var dto = new ProjectSandboxSecretDto(entry.HostEnvVar, entry.SandboxEnvVar, entry.Group, entry.Scopes);
         var json = JsonSerializer.Serialize(dto);
         Assert.Contains("HOST_KEY", json, StringComparison.Ordinal);
         Assert.Contains("SANDBOX_KEY", json, StringComparison.Ordinal);
@@ -732,6 +761,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             [
                 new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = SandboxName },
             ],
+            SandboxSecretGrants =
+            [
+                new ProjectSandboxSecretGrant { Group = "default" },
+            ],
         };
 
         // Drive the real channel: the value is resolved and placed into the
@@ -785,6 +818,10 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
             SandboxSecrets =
             [
                 new ProjectSandboxSecret { HostEnvVar = hostName, SandboxEnvVar = SandboxName },
+            ],
+            SandboxSecretGrants =
+            [
+                new ProjectSandboxSecretGrant { Group = "default" },
             ],
         };
 
