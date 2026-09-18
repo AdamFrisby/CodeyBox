@@ -13,7 +13,8 @@ internal sealed class IncusSandbox :
     IPreserveOnDisposeSandbox,
     IShutdownTeardownSandbox,
     IProviderOwnedSandbox,
-    IResourceMetricsCapturingSandbox
+    IResourceMetricsCapturingSandbox,
+    ISandboxExecOutputLimits
 {
     internal const int MaxExecArguments = 4096;
     internal const int MaxExecEnvironmentEntries = 512;
@@ -159,6 +160,8 @@ internal sealed class IncusSandbox :
 
     public string Id { get; }
     public string ProviderId => IncusSandboxProvider.ProviderId;
+    int ISandboxExecOutputLimits.MaxStdoutBytes => _options.MaxCliStdoutBytes;
+    int ISandboxExecOutputLimits.MaxStderrBytes => _options.MaxCliStderrBytes;
     public bool CapturesResourceMetrics => _options.CaptureResourceMetrics;
     public SandboxResourceMetrics? ResourceMetrics { get; private set; }
     public bool IsOwnedByShutdownHandler => Volatile.Read(ref _ownedByShutdownHandler) != 0;
@@ -194,8 +197,7 @@ internal sealed class IncusSandbox :
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
-        exec = IncusInputSnapshot.CaptureExec(exec);
-        ValidateExec(exec);
+        exec = ClampExecOutputLimits(IncusInputSnapshot.CaptureExec(exec));
         var runId = NextGuid("exec control files").ToString("N");
         var workingDirectory = exec.WorkingDirectory ?? _spec.WorkingDirectory;
         IncusInputValidation.ValidateAbsoluteGuestPath(workingDirectory, nameof(exec.WorkingDirectory));
@@ -1990,7 +1992,7 @@ internal sealed class IncusSandbox :
         return key.Skip(1).All(c => c == '_' || char.IsAsciiLetterOrDigit(c));
     }
 
-    private void ValidateExec(SandboxExec exec)
+    private SandboxExec ClampExecOutputLimits(SandboxExec exec)
     {
         if (exec.Argv.Count is < 1 or > MaxExecArguments)
             throw new ArgumentException($"Exec argv must contain between 1 and {MaxExecArguments} arguments.", nameof(exec));
@@ -2021,11 +2023,27 @@ internal sealed class IncusSandbox :
             ValidateEnvironment(exec.ExtraEnvironment, nameof(exec));
         if (exec.MaxStdoutBytes is <= 0 || exec.MaxStderrBytes is <= 0)
             throw new ArgumentOutOfRangeException(nameof(exec), "Exec output limits must be positive when supplied.");
-        if (exec.MaxStdoutBytes > _options.MaxCliStdoutBytes
-            || exec.MaxStderrBytes > _options.MaxCliStderrBytes)
-            throw new ArgumentOutOfRangeException(
-                nameof(exec),
-                "Exec output limits cannot exceed the provider-wide CLI output bounds.");
+        var stdoutBytes = exec.MaxStdoutBytes;
+        var stderrBytes = exec.MaxStderrBytes;
+        if (stdoutBytes > _options.MaxCliStdoutBytes)
+        {
+            _log.LogWarning(
+                "Exec stdout limit {RequestedBytes} exceeds the provider-wide CLI output bound {BoundBytes}; clamping to the bound.",
+                stdoutBytes,
+                _options.MaxCliStdoutBytes);
+            stdoutBytes = _options.MaxCliStdoutBytes;
+        }
+        if (stderrBytes > _options.MaxCliStderrBytes)
+        {
+            _log.LogWarning(
+                "Exec stderr limit {RequestedBytes} exceeds the provider-wide CLI output bound {BoundBytes}; clamping to the bound.",
+                stderrBytes,
+                _options.MaxCliStderrBytes);
+            stderrBytes = _options.MaxCliStderrBytes;
+        }
+        return stdoutBytes == exec.MaxStdoutBytes && stderrBytes == exec.MaxStderrBytes
+            ? exec
+            : exec with { MaxStdoutBytes = stdoutBytes, MaxStderrBytes = stderrBytes };
     }
 
     private void DeleteStaging() =>

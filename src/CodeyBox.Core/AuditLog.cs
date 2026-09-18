@@ -1693,6 +1693,25 @@ public static class AuditLog
                 "Operator baseline migration: scanned={Scanned} migrated={Migrated} truncated={Truncated} projectFilter={ProjectFilter} baselineFilter={BaselineFilter}",
                 scanned, migrated, truncated, projectFilter ?? "", baselineFilter ?? "");
 
+    /// <summary>
+    /// Emitted by <c>PipelineRunner</c> when a durable agent-turn checkpoint
+    /// genuinely cannot be written (capture, commit, push, or store publish
+    /// failed outside the bounded retained-sandbox fallback). No valid
+    /// checkpoint exists, so an interrupted turn cannot resume and the normal
+    /// phase-retry policy applies with the original agent failure preserved.
+    /// This is the operator-visible degraded-capability signal for the loss of
+    /// the resumption guarantee: it is recorded in the audit log and on the
+    /// <c>codeybox.agent_turn.checkpoints</c> meter, never only as a log line.
+    /// </summary>
+    public static void AgentTurnCheckpointDegraded(WorkItemId workItemId, string stage, string reason) =>
+        Audit("agent_turn.checkpoint_degraded")
+            .Warning(
+                "Durable agent-turn checkpoint unavailable for work item {WorkItemId} stage={Stage}: {Reason}. " +
+                "The turn cannot resume from a checkpoint; the original agent failure remains authoritative.",
+                workItemId.ToString(),
+                stage,
+                TruncateAuditTail(AuditSingleLine(reason)));
+
     // ── Scoped sink override ─────────────────────────────────────────────────
 
     /// <summary>
