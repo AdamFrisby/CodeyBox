@@ -133,17 +133,21 @@ alert on `/tmp` usage the same way you alert on memory.
 
 What CodeyBox does to stay bounded:
 
-* The orchestrator's git-hooks suppression directory is a single well-known
-  path (`$TMPDIR/codeybox-disabled-host-hooks`, created once) — constructing
-  pipeline runners never grows `/tmp`.
+* The orchestrator's git-hooks suppression directory is created once per
+  process under the per-user application-data directory — constructing
+  pipeline runners never grows `/tmp`. It deliberately does not live under
+  a well-known name in the shared temp path: on a multi-user host any
+  other local user could pre-create such a path (as a file, a symlink, or
+  a directory of hostile hook scripts) and have it used with the
+  orchestrator's privileges.
 * At every startup, a bounded sweep removes stale `codeybox-*` temp entries
-  (abandoned test databases, staging dirs, pre-fix per-instance hook dirs)
-  whose newest write is older than `CodeyBox:TempSweep:MaxAge` (default
-  48 h, clamped to a 1 h floor). The sweep only touches top-level
-  `codeybox-*` entries inside the temp path, never follows symlinks, never
-  removes the live shared hooks directory, and never fails startup — sweep
-  faults are logged and the host keeps coming up. Disable with
-  `CodeyBox:TempSweep:Enabled=false`.
+  (abandoned test databases, staging dirs, pre-fix per-instance hook dirs,
+  including the pre-fix predictable shared name once it ages out) whose
+  newest write is older than `CodeyBox:TempSweep:MaxAge` (default 48 h,
+  clamped to a 1 h floor). The sweep only touches top-level `codeybox-*`
+  entries inside the temp path, never follows symlinks, and never fails
+  startup — sweep faults are logged and the host keeps coming up. Disable
+  with `CodeyBox:TempSweep:Enabled=false`.
 * Test fixtures isolate their temp state in per-test scratch directories
   that are removed on disposal, pass or fail.
 

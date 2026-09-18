@@ -151,21 +151,24 @@ public sealed class TempFileSweeperTests
     }
 
     [Fact]
-    public void Sweep_LeavesSharedHooksDirectoryAlone()
+    public void Sweep_RemovesLegacyPredictableHooksDirectory_WhenStale()
     {
+        // The live hooks directory no longer lives under the temp path
+        // (per-user application-data directory instead), so no temp entry
+        // needs an exclusion: the legacy predictable name left behind by
+        // earlier versions is an ordinary candidate, reaped once stale.
         var root = CreateIsolatedRoot();
         try
         {
-            var shared = Path.Combine(root, TempFileSweeper.SharedHooksDirectoryName);
-            Directory.CreateDirectory(shared);
-            Directory.SetLastWriteTimeUtc(shared, DateTime.UtcNow - TimeSpan.FromDays(30));
+            var legacy = Path.Combine(root, "codeybox-disabled-host-hooks");
+            Directory.CreateDirectory(legacy);
+            Directory.SetLastWriteTimeUtc(legacy, DateTime.UtcNow - TimeSpan.FromDays(30));
 
             var summary = new TempFileSweeper(TimeProvider.System, NullLogger<TempFileSweeper>.Instance)
                 .Sweep(OptionsFor(root, TimeSpan.FromHours(48)));
 
-            Assert.True(Directory.Exists(shared), "The live shared hooks directory must survive sweeps.");
-            Assert.Equal(0, summary.Removed);
-            Assert.Equal(1, summary.SkippedExcluded);
+            Assert.False(Directory.Exists(legacy), "A stale legacy hooks directory should be reaped.");
+            Assert.Equal(1, summary.Removed);
         }
         finally
         {

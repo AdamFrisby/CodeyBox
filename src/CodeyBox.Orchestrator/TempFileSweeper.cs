@@ -9,9 +9,15 @@ public sealed class TempSweepSummary
 {
     public int Scanned { get; set; }
     public int Removed { get; set; }
+
+    /// <summary>
+    /// Entries left alone because they were recently written — or because
+    /// staleness could not be proven (enumeration error, freshness-probe
+    /// visit budget hit, nested reparse point). Unprovable entries are
+    /// treated as fresh: the sweep never removes what it cannot prove stale.
+    /// </summary>
     public int SkippedFresh { get; set; }
     public int SkippedSymlink { get; set; }
-    public int SkippedExcluded { get; set; }
     public int Errors { get; set; }
 
     /// <summary>
@@ -37,9 +43,11 @@ public sealed class TempSweepSummary
 /// path.</item>
 /// <item>Every candidate's canonical full path must stay inside the swept
 /// temp root; anything else is skipped.</item>
-/// <item>The live shared hooks directory
-/// (<c>codeybox-disabled-host-hooks</c>, no GUID suffix) is excluded by exact
-/// name — it is recreated on demand and must survive sweeps.</item>
+/// <item>The live hooks suppression directory is not under the temp path
+/// (it lives in the per-user application-data directory), so the sweep
+/// needs no exclusion for it; legacy per-instance leftovers and the old
+/// predictable shared name are ordinary candidates, reaped only once
+/// proven stale.</item>
 /// <item>Entries the sweep cannot prove stale (enumeration errors, freshness
 /// probe hitting its visit budget) are left alone.</item>
 /// </list>
@@ -48,13 +56,6 @@ public sealed class TempFileSweeper
 {
     /// <summary>Only top-level entries starting with this prefix are candidates.</summary>
     public const string EntryPrefix = "codeybox-";
-
-    /// <summary>
-    /// Exact name of the live shared hooks directory, which the sweep must
-    /// never remove. Per-instance leftovers from before the sharing fix carry
-    /// a GUID suffix and remain candidates.
-    /// </summary>
-    public const string SharedHooksDirectoryName = "codeybox-disabled-host-hooks";
 
     // Caps the recursive freshness probe inside one candidate directory, so a
     // single enormous tree cannot stall startup. Hitting the cap means "cannot
@@ -130,9 +131,9 @@ public sealed class TempFileSweeper
         if (summary.Removed > 0 || summary.Errors > 0)
         {
             _log?.LogInformation(
-                "TempFileSweeper: sweep completed — {Removed} removed, {Scanned} scanned, {SkippedFresh} fresh, {SkippedSymlink} symlinks, {SkippedExcluded} excluded, {Errors} errors, truncated={Truncated}",
+                "TempFileSweeper: sweep completed — {Removed} removed, {Scanned} scanned, {SkippedFresh} fresh, {SkippedSymlink} symlinks, {Errors} errors, truncated={Truncated}",
                 summary.Removed, summary.Scanned, summary.SkippedFresh,
-                summary.SkippedSymlink, summary.SkippedExcluded, summary.Errors, summary.Truncated);
+                summary.SkippedSymlink, summary.Errors, summary.Truncated);
         }
 
         return summary;
@@ -154,9 +155,10 @@ public sealed class TempFileSweeper
         {
             fullPath = Path.GetFullPath(entry);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             summary.Errors++;
+            _log?.LogWarning(ex, "TempFileSweeper: cannot resolve temp entry {Entry}; skipping", entry);
             return;
         }
 
@@ -165,12 +167,6 @@ public sealed class TempFileSweeper
         {
             summary.Errors++;
             _log?.LogWarning("TempFileSweeper: temp entry {Entry} resolves outside the temp root; skipping", entry);
-            return;
-        }
-
-        if (string.Equals(name, SharedHooksDirectoryName, StringComparison.Ordinal))
-        {
-            summary.SkippedExcluded++;
             return;
         }
 

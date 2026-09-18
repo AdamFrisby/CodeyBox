@@ -67,10 +67,21 @@ public sealed class TempHygieneTests
     [Fact]
     public void PipelineRunner_Construction_CreatesNoPerInstanceTempDirectory()
     {
-        // The shared hooks path is well-known: no GUID suffix, created once.
-        Assert.Equal(
-            Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks"),
-            PipelineRunner.SharedDisabledHostHooksPath);
+        // Warm up process-lifetime shared state before snapshotting: the
+        // hooks suppression directory is resolved once per process (per-user
+        // location, or a single GUID-suffixed fallback), not once per
+        // PipelineRunner.
+        var shared = PipelineRunner.SharedDisabledHostHooksPath;
+        Assert.True(Directory.Exists(shared), "The shared hooks directory should exist after resolution.");
+        Assert.True(
+            new DirectoryInfo(shared).LinkTarget is null,
+            "The shared hooks path must be a real directory, never a symlink.");
+        Assert.False(
+            string.Equals(
+                Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks"),
+                shared,
+                StringComparison.Ordinal),
+            "The shared hooks path must not be a well-known name in the shared temp path, where any local user could pre-create it.");
 
         var before = PerInstanceHooksDirs();
         using (var scratch = TestScratchDirectory.Create("codeybox-pipelinetemp-"))
@@ -90,10 +101,11 @@ public sealed class TempHygieneTests
         }
 
         // The scratch directory above is disposed before asserting so the
-        // pipeline's own stores cannot pollute the temp-entry count.
+        // pipeline's own stores cannot pollute the temp-entry count. A delta
+        // assertion (not an emptiness assertion) is used: leftover entries
+        // from other runs on the same host must not fail this test.
         var after = PerInstanceHooksDirs();
         Assert.Equal(before.Count, after.Count);
-        Assert.Empty(after);
     }
 
     [Fact]

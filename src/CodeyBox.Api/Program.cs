@@ -3802,7 +3802,8 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
 builder.Services.AddHostedService(sp => new TempSweepStartupService(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.TempSweep,
     sp.GetService<TimeProvider>(),
-    sp.GetRequiredService<ILogger<TempSweepStartupService>>()));
+    sp.GetRequiredService<ILogger<TempSweepStartupService>>(),
+    sp.GetRequiredService<ILogger<TempFileSweeper>>()));
 builder.Services.AddSingleton<WorkItemRepoReaper>(sp =>
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();

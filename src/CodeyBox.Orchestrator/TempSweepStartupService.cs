@@ -18,8 +18,9 @@ public sealed class TempSweepStartupService : IHostedService
     public TempSweepStartupService(
         Func<TempSweepOptions> optionsAccessor,
         TimeProvider? time = null,
-        ILogger<TempSweepStartupService>? log = null)
-        : this(optionsAccessor, new TempFileSweeper(time), log)
+        ILogger<TempSweepStartupService>? log = null,
+        ILogger<TempFileSweeper>? sweeperLog = null)
+        : this(optionsAccessor, new TempFileSweeper(time, sweeperLog), log)
     {
     }
 
@@ -46,9 +47,9 @@ public sealed class TempSweepStartupService : IHostedService
         {
             var summary = _sweeper.Sweep(options, cancellationToken);
             _log.LogInformation(
-                "TempSweepStartupService: startup sweep completed — {Removed} removed, {Scanned} scanned, {SkippedFresh} fresh, {SkippedSymlink} symlinks, {SkippedExcluded} excluded, {Errors} errors, truncated={Truncated}",
+                "TempSweepStartupService: startup sweep completed — {Removed} removed, {Scanned} scanned, {SkippedFresh} fresh, {SkippedSymlink} symlinks, {Errors} errors, truncated={Truncated}",
                 summary.Removed, summary.Scanned, summary.SkippedFresh,
-                summary.SkippedSymlink, summary.SkippedExcluded, summary.Errors, summary.Truncated);
+                summary.SkippedSymlink, summary.Errors, summary.Truncated);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
