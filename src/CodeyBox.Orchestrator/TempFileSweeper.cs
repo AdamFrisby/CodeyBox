@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -28,6 +29,17 @@ public sealed class TempSweepSummary
 }
 
 /// <summary>
+/// How one proven-stale temp entry fared at the deletion sink. Internal so
+/// tests can exercise the sink directly, bypassing the freshness probe.
+/// </summary>
+internal enum TempEntryDeleteOutcome
+{
+    Removed,
+    SkippedSymlink,
+    Failed,
+}
+
+/// <summary>
 /// Bounded startup sweep over the system temp path. Removes top-level
 /// <c>codeybox-*</c> entries whose newest write is older than the configured
 /// threshold — the backlog previous deployments and test runs abandoned
@@ -41,6 +53,13 @@ public sealed class TempSweepSummary
 /// <item>Entries that are symlinks (or any other reparse point) are never
 /// traversed and never deleted — the link target may live outside the temp
 /// path.</item>
+/// <item>Deletion itself never traverses a link either: on Linux every
+/// component is opened <c>O_NOFOLLOW</c> relative to a pinned directory
+/// descriptor and removed with <c>unlinkat</c>, so a path swapped for a
+/// symlink after the freshness probe fails with <c>ELOOP</c> and aborts the
+/// entry instead of diverting deletion outside the temp root. Where native
+/// descriptors are unavailable each node is re-validated immediately before
+/// a non-recursive remove, and any link aborts the whole entry.</item>
 /// <item>Every candidate's canonical full path must stay inside the swept
 /// temp root; anything else is skipped.</item>
 /// <item>The live hooks suppression directory is not under the temp path
@@ -61,6 +80,12 @@ public sealed class TempFileSweeper
     // single enormous tree cannot stall startup. Hitting the cap means "cannot
     // prove stale" — the entry is skipped, never removed.
     private const int FreshnessProbeVisitCap = 10_000;
+
+    // Caps the deletion walk inside one candidate directory, so removing a
+    // single enormous stale tree cannot stall startup either. Tripping the
+    // cap aborts the entry (counted as an error) and leaves the remainder
+    // for the next startup sweep.
+    private const int DeletionVisitCap = 50_000;
 
     private readonly TimeProvider _time;
     private readonly ILogger<TempFileSweeper>? _log;
@@ -205,37 +230,28 @@ public sealed class TempFileSweeper
             return;
         }
 
-        // Re-check the reparse-point bit immediately before the delete so a
-        // path swapped for a symlink after the freshness probe is not
-        // traversed. A residual TOCTOU window is inherent to /tmp sweeping;
-        // the temp path is a trusted-local-operator surface, same as the
-        // rest of the host layout CodeyBox manages.
-        try
+        // Delete without traversing links. The freshness probe above is only a
+        // staleness proof, never a deletion guard: DeleteProvenStaleEntry
+        // re-validates every component at the sink, so a path swapped for a
+        // symlink after the probe aborts the entry instead of diverting
+        // deletion outside the temp root. (A UID-ownership gate was
+        // considered and rejected: the sweep must reap leftovers from prior
+        // deployments and test runs that may have run under a different UID;
+        // link-safety, not ownership, is the guard.)
+        switch (DeleteProvenStaleEntry(root, name, fullPath))
         {
-            if ((File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0)
-            {
+            case TempEntryDeleteOutcome.Removed:
+                summary.Removed++;
+                break;
+            case TempEntryDeleteOutcome.SkippedSymlink:
                 summary.SkippedSymlink++;
-                return;
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            summary.Errors++;
-            return;
-        }
-
-        try
-        {
-            if (isDirectory)
-                Directory.Delete(fullPath, recursive: true);
-            else
-                File.Delete(fullPath);
-            summary.Removed++;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            summary.Errors++;
-            _log?.LogWarning(ex, "TempFileSweeper: failed to remove stale temp entry {Entry}; skipping", fullPath);
+                break;
+            default:
+                summary.Errors++;
+                _log?.LogWarning(
+                    "TempFileSweeper: failed to remove stale temp entry {Entry}; leaving it for the next sweep",
+                    fullPath);
+                break;
         }
     }
 
@@ -329,5 +345,361 @@ public sealed class TempFileSweeper
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Removes one entry already proven stale. Never follows a symbolic link:
+    /// on Linux every component is addressed relative to a pinned directory
+    /// descriptor (<c>O_NOFOLLOW</c> opens, <c>unlinkat</c> removes), so a
+    /// swap after the freshness probe surfaces as <c>ELOOP</c> and aborts the
+    /// entry; elsewhere each node is re-validated immediately before a
+    /// non-recursive remove. Never throws: failures map to
+    /// <see cref="TempEntryDeleteOutcome.Failed"/>.
+    /// </summary>
+    internal TempEntryDeleteOutcome DeleteProvenStaleEntry(string root, string entryName, string fullPath)
+    {
+        if (OperatingSystem.IsLinux() && Directory.Exists("/proc/self/fd"))
+        {
+            try
+            {
+                return DeleteLinuxNoFollow(root, entryName);
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException
+                or NativeSweepUnavailableException)
+            {
+                // No usable libc/statx (exotic runtime or ancient kernel):
+                // fall through to the managed no-follow delete below.
+            }
+        }
+
+        var visits = 0;
+        return DeleteManagedNoFollow(root, fullPath, ref visits);
+    }
+
+    private TempEntryDeleteOutcome DeleteLinuxNoFollow(string root, string entryName)
+    {
+        string name;
+        try
+        {
+            name = ValidateChildName(entryName);
+        }
+        catch (IOException)
+        {
+            return TempEntryDeleteOutcome.Failed;
+        }
+
+        // The root itself is the operator-configured temp directory, opened
+        // without NOFOLLOW so a conventional /tmp symlink still sweeps; every
+        // component beneath it is addressed relative to this descriptor, so a
+        // swap can never redirect removal outside the root.
+        var rootFd = NativeOpen(root, OpenReadOnly | OpenDirectory | OpenCloseOnExec);
+        if (rootFd < 0)
+        {
+            ThrowIfNativeUnavailable(Marshal.GetLastPInvokeError());
+            return TempEntryDeleteOutcome.Failed;
+        }
+
+        try
+        {
+            if (NativeStatx(rootFd, name, AtSymlinkNoFollow, StatxBasicStats, out var status) != 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                ThrowIfNativeUnavailable(error);
+                if (error == ErrorNoEntry)
+                    return TempEntryDeleteOutcome.Removed;
+                return TempEntryDeleteOutcome.Failed;
+            }
+
+            switch (status.Mode & FileTypeMask)
+            {
+                case SymbolicLinkFileType:
+                    return TempEntryDeleteOutcome.SkippedSymlink;
+                case DirectoryFileType:
+                {
+                    var visits = 0;
+                    var linkFound = false;
+                    if (!RemoveDirectoryLinux(rootFd, name, ref visits, ref linkFound))
+                        return linkFound ? TempEntryDeleteOutcome.SkippedSymlink : TempEntryDeleteOutcome.Failed;
+                    return TempEntryDeleteOutcome.Removed;
+                }
+                default:
+                    // Regular files, fifos, sockets, devices: unlinking the
+                    // link itself can never reach a target, even if the entry
+                    // is swapped after the statx above.
+                    if (NativeUnlinkAt(rootFd, name, 0) != 0)
+                    {
+                        var error = Marshal.GetLastPInvokeError();
+                        ThrowIfNativeUnavailable(error);
+                        if (error == ErrorNoEntry)
+                            return TempEntryDeleteOutcome.Removed;
+                        return TempEntryDeleteOutcome.Failed;
+                    }
+
+                    return TempEntryDeleteOutcome.Removed;
+            }
+        }
+        finally
+        {
+            NativeClose(rootFd);
+        }
+    }
+
+    // Removes the directory `name` pinned under `parentFd`: opens it
+    // O_NOFOLLOW (a swapped-in symlink fails ELOOP here, before anything
+    // beneath it is touched), unlinks every child fd-relative, then removes
+    // the now-empty directory itself. Enumeration goes through
+    // /proc/self/fd, which the kernel resolves to the pinned directory
+    // rather than re-resolving the untrusted path.
+    private bool RemoveDirectoryLinux(int parentFd, string name, ref int visits, ref bool linkFound)
+    {
+        var fd = NativeOpenAt(parentFd, name, OpenReadOnly | OpenDirectory | OpenNoFollow | OpenCloseOnExec);
+        if (fd < 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            ThrowIfNativeUnavailable(error);
+            if (error == ErrorNoEntry)
+                return true;
+            if (error == ErrorLoop)
+                linkFound = true;
+            return false;
+        }
+
+        try
+        {
+            string[] children;
+            try
+            {
+                children = [.. Directory
+                    .EnumerateFileSystemEntries("/proc/self/fd/" + fd)
+                    .Select(Path.GetFileName)
+                    .Select(n => ValidateChildName(n!))];
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
+
+            foreach (var child in children)
+            {
+                if (++visits > DeletionVisitCap)
+                    return false;
+                if (!RemoveChildLinux(fd, child, ref visits, ref linkFound))
+                    return false;
+            }
+        }
+        finally
+        {
+            NativeClose(fd);
+        }
+
+        if (NativeUnlinkAt(parentFd, name, AtRemoveDir) != 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            ThrowIfNativeUnavailable(error);
+            return error == ErrorNoEntry;
+        }
+
+        return true;
+    }
+
+    private bool RemoveChildLinux(int dirFd, string child, ref int visits, ref bool linkFound)
+    {
+        if (NativeStatx(dirFd, child, AtSymlinkNoFollow, StatxBasicStats, out var status) != 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            ThrowIfNativeUnavailable(error);
+            return error == ErrorNoEntry;
+        }
+
+        var kind = status.Mode & FileTypeMask;
+        if (kind == DirectoryFileType)
+            return RemoveDirectoryLinux(dirFd, child, ref visits, ref linkFound);
+        if (kind == SymbolicLinkFileType)
+        {
+            linkFound = true;
+            return false;
+        }
+
+        if (NativeUnlinkAt(dirFd, child, 0) != 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            ThrowIfNativeUnavailable(error);
+            return error == ErrorNoEntry;
+        }
+
+        return true;
+    }
+
+    // Managed fallback for non-Linux hosts (and for Linux runtimes without a
+    // usable libc/statx): bottom-up removal where every node is re-validated
+    // immediately before its own mutation and only non-recursive removes are
+    // used, so a link found at any point aborts the whole entry. This still
+    // carries a check-then-act window around directory enumeration that only
+    // pinned descriptors can close; the deployment target (/tmp on Linux)
+    // always takes the descriptor path above.
+    private static TempEntryDeleteOutcome DeleteManagedNoFollow(string root, string fullPath, ref int visits)
+    {
+        if (++visits > DeletionVisitCap)
+            return TempEntryDeleteOutcome.Failed;
+
+        FileAttributes attributes;
+        try
+        {
+            attributes = File.GetAttributes(fullPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Already gone converges to the goal; anything else is a failure.
+            return !File.Exists(fullPath) && !Directory.Exists(fullPath)
+                ? TempEntryDeleteOutcome.Removed
+                : TempEntryDeleteOutcome.Failed;
+        }
+
+        if ((attributes & FileAttributes.ReparsePoint) != 0)
+            return TempEntryDeleteOutcome.SkippedSymlink;
+        if (!IsWithinRoot(root, fullPath))
+            return TempEntryDeleteOutcome.Failed;
+
+        if ((attributes & FileAttributes.Directory) == 0)
+        {
+            try
+            {
+                File.Delete(fullPath);
+                return TempEntryDeleteOutcome.Removed;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return !File.Exists(fullPath) && !Directory.Exists(fullPath)
+                    ? TempEntryDeleteOutcome.Removed
+                    : TempEntryDeleteOutcome.Failed;
+            }
+        }
+
+        List<string> children;
+        try
+        {
+            children = [.. Directory.EnumerateFileSystemEntries(fullPath)];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return TempEntryDeleteOutcome.Failed;
+        }
+
+        foreach (var child in children)
+        {
+            string childFull;
+            try
+            {
+                childFull = Path.GetFullPath(child);
+            }
+            catch (Exception)
+            {
+                return TempEntryDeleteOutcome.Failed;
+            }
+
+            var childOutcome = DeleteManagedNoFollow(root, childFull, ref visits);
+            if (childOutcome != TempEntryDeleteOutcome.Removed)
+                return childOutcome;
+        }
+
+        try
+        {
+            if ((File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0)
+                return TempEntryDeleteOutcome.SkippedSymlink;
+            Directory.Delete(fullPath, recursive: false);
+            return TempEntryDeleteOutcome.Removed;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return !Directory.Exists(fullPath)
+                ? TempEntryDeleteOutcome.Removed
+                : TempEntryDeleteOutcome.Failed;
+        }
+    }
+
+    private static bool IsWithinRoot(string root, string fullPath) =>
+        fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+        || string.Equals(fullPath, root, StringComparison.Ordinal);
+
+    private static string ValidateChildName(string? name)
+    {
+        if (string.IsNullOrEmpty(name)
+            || name is "." or ".."
+            || name.Contains('/')
+            || name.Contains('\0'))
+        {
+            throw new IOException("A swept temp entry returned an invalid child name.");
+        }
+
+        return name;
+    }
+
+    private static void ThrowIfNativeUnavailable(int error)
+    {
+        // statx(2) exists only on Linux 4.11+; without it the descriptor
+        // path cannot classify entries, so the caller falls back to the
+        // managed no-follow delete.
+        if (error == ErrorNoSys)
+            throw new NativeSweepUnavailableException();
+    }
+
+    private sealed class NativeSweepUnavailableException : Exception;
+
+    // Linux constants, mirroring CodeyBox.Sandbox.Incus.IncusSafeFile (the
+    // established fd-relative no-follow seam): the sweeper cannot reference
+    // that provider project without inverting the layer direction, so the
+    // handful of values it needs is repeated here beside their only other
+    // consumer.
+    private const int OpenReadOnly = 0;
+    private const int OpenDirectory = 0x10000;
+    private const int OpenNoFollow = 0x20000;
+    private const int OpenCloseOnExec = 0x80000;
+    private const int AtSymlinkNoFollow = 0x100;
+    private const int AtRemoveDir = 0x200;
+    private const uint StatxBasicStats = 0x7ff;
+    private const ushort FileTypeMask = 0xF000;
+    private const ushort DirectoryFileType = 0x4000;
+    private const ushort SymbolicLinkFileType = 0xA000;
+    private const int ErrorNoEntry = 2;
+    private const int ErrorLoop = 40;
+    private const int ErrorNoSys = 38;
+
+    // Classic DllImport (rather than LibraryImport source generation) so this
+    // project needs no AllowUnsafeBlocks; all signatures are blittable
+    // primitives, which keeps the interop NativeAOT-safe.
+    [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    private static extern int NativeOpen([MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);
+
+    [DllImport("libc", EntryPoint = "openat", SetLastError = true)]
+    private static extern int NativeOpenAt(
+        int dirfd,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        int flags);
+
+    [DllImport("libc", EntryPoint = "unlinkat", SetLastError = true)]
+    private static extern int NativeUnlinkAt(
+        int dirfd,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        int flags);
+
+    [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
+    private static extern int NativeStatx(
+        int dirfd,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        int flags,
+        uint mask,
+        out StatxMode status);
+
+    [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+    private static extern int NativeClose(int fd);
+
+    // Minimal view of struct statx(2): the syscall always writes the full
+    // 256-byte struct, so the buffer keeps its full size and only the mode
+    // word (offset 28) is projected.
+    [StructLayout(LayoutKind.Explicit, Size = 256)]
+    private struct StatxMode
+    {
+        [FieldOffset(28)]
+        internal ushort Mode;
     }
 }

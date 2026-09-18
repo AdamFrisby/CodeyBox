@@ -151,6 +151,100 @@ public sealed class TempFileSweeperTests
     }
 
     [Fact]
+    public void DeleteProvenStaleEntry_RefusesNestedSymlink_AndKeepsOutsideTarget()
+    {
+        // Direct sink test, bypassing the freshness probe: even when the
+        // caller has already proven staleness, a nested link must abort the
+        // whole entry instead of diverting deletion into the link target. A
+        // naive recursive delete would remove the sentinel and go red here.
+        var root = CreateIsolatedRoot();
+        var outside = Path.Combine(
+            Path.GetTempPath(), "codeybox-sweep-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        var sentinel = Path.Combine(outside, "sentinel.txt");
+        File.WriteAllText(sentinel, "must survive");
+        try
+        {
+            var dir = Path.Combine(root, "codeybox-nestedlink-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "payload.bin"), "payload");
+            Directory.CreateSymbolicLink(Path.Combine(dir, "link"), outside);
+
+            var outcome = new TempFileSweeper(TimeProvider.System, NullLogger<TempFileSweeper>.Instance)
+                .DeleteProvenStaleEntry(root, Path.GetFileName(dir), dir);
+
+            Assert.Equal(TempEntryDeleteOutcome.SkippedSymlink, outcome);
+            Assert.True(File.Exists(sentinel), "The delete sink must never traverse a nested symlink.");
+            Assert.True(Directory.Exists(dir), "An entry aborted on a nested link must be left in place.");
+        }
+        finally
+        {
+            DeleteRootBestEffort(root);
+            DeleteRootBestEffort(outside);
+        }
+    }
+
+    [Fact]
+    public void DeleteProvenStaleEntry_RemovesDirectoryTree_WithStaleContents()
+    {
+        var root = CreateIsolatedRoot();
+        try
+        {
+            var dir = Path.Combine(root, "codeybox-deeptree-" + Guid.NewGuid().ToString("N"));
+            var nested = Path.Combine(dir, "a", "b");
+            Directory.CreateDirectory(nested);
+            File.WriteAllText(Path.Combine(nested, "payload.bin"), "payload");
+            File.WriteAllText(Path.Combine(dir, "top.txt"), "top");
+
+            var outcome = new TempFileSweeper(TimeProvider.System, NullLogger<TempFileSweeper>.Instance)
+                .DeleteProvenStaleEntry(root, Path.GetFileName(dir), dir);
+
+            Assert.Equal(TempEntryDeleteOutcome.Removed, outcome);
+            Assert.False(Directory.Exists(dir), "A link-free stale directory must be fully removed.");
+        }
+        finally
+        {
+            DeleteRootBestEffort(root);
+        }
+    }
+
+    [Fact]
+    public void Sweep_LeavesDirectoryContainingNestedSymlink_AndKeepsOutsideTarget()
+    {
+        // End-to-end pin: a stale directory hiding a nested symlink to
+        // outside content must survive the sweep untouched.
+        var root = CreateIsolatedRoot();
+        var outside = Path.Combine(
+            Path.GetTempPath(), "codeybox-sweep-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        var sentinel = Path.Combine(outside, "sentinel.txt");
+        File.WriteAllText(sentinel, "must survive");
+        try
+        {
+            var dir = Path.Combine(root, "codeybox-shady-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            var payload = Path.Combine(dir, "payload.bin");
+            File.WriteAllText(payload, "payload");
+            Directory.CreateSymbolicLink(Path.Combine(dir, "link"), outside);
+            var old = DateTime.UtcNow - TimeSpan.FromDays(3);
+            File.SetLastWriteTimeUtc(payload, old);
+            Directory.SetLastWriteTimeUtc(dir, old);
+
+            var summary = new TempFileSweeper(TimeProvider.System, NullLogger<TempFileSweeper>.Instance)
+                .Sweep(OptionsFor(root, TimeSpan.FromHours(48)));
+
+            Assert.Equal(0, summary.Removed);
+            Assert.True(Directory.Exists(dir), "A directory with a nested link must survive the sweep.");
+            Assert.True(File.Exists(sentinel), "The sweep must never traverse a nested symlink.");
+        }
+        finally
+        {
+            DeleteRootBestEffort(root);
+            DeleteRootBestEffort(outside);
+        }
+    }
+
+    [Fact]
     public void Sweep_RemovesLegacyPredictableHooksDirectory_WhenStale()
     {
         // The live hooks directory no longer lives under the temp path

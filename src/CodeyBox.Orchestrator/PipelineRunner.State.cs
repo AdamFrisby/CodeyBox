@@ -267,12 +267,11 @@ public sealed partial class PipelineRunner
             Directory.CreateDirectory(fallback);
             TryRestrictToOwnerOnly(fallback);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (IsBenignHooksDirFailure(ex))
         {
             // Best effort only: git surfaces an unusable hooks path loudly at
             // the call site. Returning the path (rather than throwing and
             // poisoning the Lazy) keeps the failure local and diagnosable.
-            _ = ex;
         }
 
         return fallback;
@@ -344,11 +343,17 @@ public sealed partial class PipelineRunner
                     path,
                     UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        catch (Exception ex) when (IsBenignHooksDirFailure(ex) || ex is PlatformNotSupportedException)
         {
-            _ = ex;
+            // Best effort only: the per-user parent directory is the real
+            // guard, so a failure here must not fail the whole resolution.
         }
     }
+
+    // Best-effort hooks-directory creation only ever swallows filesystem
+    // access failures; anything else still throws.
+    private static bool IsBenignHooksDirFailure(Exception ex) =>
+        ex is IOException or UnauthorizedAccessException;
 
     private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the

@@ -140,7 +140,16 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
             Store.Dispose();
             if (_ownsDbPath)
             {
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                try
+                {
+                    File.Delete(_dbPath);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Best-effort test cleanup: a locked or already-removed
+                    // database must not fail the test teardown.
+                }
+
                 TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
             }
 
