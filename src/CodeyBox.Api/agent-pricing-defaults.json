@@ -18,7 +18,8 @@
       "omp": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
       "continue": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
       "qwen": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
-      "cmd": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)"
+      "cmd": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)",
+      "crush": "https://openrouter.ai/models (free-tier :free models bill $0; paid OpenRouter models bill OpenRouter list prices)"
     },
     "notes": {
       "opencode": "OpenCode Go is subscription-priced ($12 per 5h usage budget on https://opencode.ai/docs/go). Each model entry uses one subscription-equivalent USD/M rate for input, cached input, and output: ($12 ÷ requests-per-5h) ÷ ((typical input + cached + output tokens per request) ÷ 1e6), using the request limits and typical token mix published on that page. Keys use opencode-go/<model-id>. Cost attribution charges the stored non-cached input bucket and cached input bucket separately; public total-input reporting adds them.",
@@ -40,7 +41,8 @@
       "omp":       "OMP is a multi-provider front (oh-my-pi fork of pi); rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly keyed by the bare message.model id omp reports (verified live: the usage frame reports cost.total 0 and message.model strips the openrouter/ qualifier). Operators fronting paid models add that model's list prices here (or under CodeyBox:AgentPricing) keyed by the bare message.model id.",
       "continue":  "Continue is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the seeded guest-config model id. The headless transport carries no machine-readable usage frame (only usage lives in the guest session files the extractor cannot reach), so the cost extractor reports unknown and per-run rows fall back to elapsed-time attribution; the bucket exists so a future usage-bearing build prices the shipped model correctly. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the same model id form.",
       "qwen":      "Qwen is a multi-provider front (native Qwen, OpenAI-, Anthropic-, and Gemini-compatible endpoints); rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched -m id (verified live: the result frame reports usage with the dispatch id verbatim in message.model, plus a per-model breakdown in stats.models). Keys are the provider-native ids qwen reports verbatim in message.model. Operators fronting paid models add that model's list prices here (or under CodeyBox:AgentPricing) keyed by the same id form.",
-      "cmd":       "Command Code is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly keyed by the full dispatch id cmd echoes in model_request_start.model (verified live: the result line reports cost_usd 0). Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the qualified -m id form."
+      "cmd":       "Command Code is a multi-provider front; rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly keyed by the full dispatch id cmd echoes in model_request_start.model (verified live: the result line reports cost_usd 0). Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the qualified -m id form.",
+      "crush":     "Crush is a multi-provider front (Charm); rates depend on the backing provider. The shipped AgentClasses member routes an OpenRouter free-tier model, which bills $0 — the bucket records that zero rate explicitly for the dispatched -m id. The headless transport carries no machine-readable usage frame (plain-text replies only), so the cost extractor reports unknown and per-run rows fall back to elapsed-time attribution; the bucket exists so a future usage-bearing build prices the shipped model correctly. Operators fronting paid OpenRouter models add that model's OpenRouter list prices here (or under CodeyBox:AgentPricing) keyed by the qualified -m id form."
     }
   },
   "DefaultRates": {
@@ -133,6 +135,9 @@
       "nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
     },
     "cmd": {
+      "openrouter/nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
+    },
+    "crush": {
       "openrouter/nvidia/nemotron-3.5-lightning:free":  { "inputPerMillion": 0.00, "cachedInputPerMillion": 0.00, "outputPerMillion": 0.00 }
     }
   }

@@ -22,6 +22,7 @@ using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Kilo;
 using CodeyBox.Agents.Omp;
 using CodeyBox.Agents.Continue;
+using CodeyBox.Agents.Crush;
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
@@ -1488,6 +1489,23 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new QwenAgentRunner(
 // docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new CmdAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
+// Crush: Charm's coding-agent CLI (npm @charmland/crush, binary `crush`).
+// Driven one-shot via `crush run -q -m <model>` (the run one-shot contract
+// with plain-text output; a bare `crush` is an interactive TUI) with the
+// prompt on stdin (no positional prompt argument) and `-m` from the
+// agent-class member or the config-sourced default. Auth is a provider API
+// key read directly from the environment (shipped mapping:
+// CODEYBOX_CRUSH_API_KEY -> OPENROUTER_API_KEY) — no guest config is
+// seeded. Telemetry is on by default, so every dispatch carries
+// CRUSH_DISABLE_METRICS=1. Permissions are already auto-approved inside
+// `run`, and --yolo is a root-only flag `run` rejects, so no approval flag
+// is emitted. The runner quarantines repo-local .crushrc/crushrc (executed
+// as Bash at startup) before dispatch and restores them afterwards (see
+// CrushAgentRunner). The binary must be installed in the sandbox image
+// (pinned installer — see docs/reference/sandbox-baselines.md); see
+// docs/concepts/agents.md and docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new CrushAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // dotnet-opencode: .NET port of OpenCode V2 (Hona/dotnet-opencode) driven via
 // `dotnet-opencode run --format json --standalone --auto` with the prompt on
 // stdin. A separate adapter from sst/opencode (different binary, transport,
@@ -2024,6 +2042,15 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // non-credential constant (no Command Code plan is required for
         // --local-only BYOK runs).
         new AgentCredentialMapping(AgentKind.Cmd, "CODEYBOX_CMD_API_KEY", "OPENROUTER_API_KEY"),
+        // Crush: provider API-key auth read directly from the environment —
+        // the CLI resolves OPENROUTER_API_KEY from the process environment
+        // with no config file involved, so unlike cmd there is no seeded
+        // providers.json reference and no auth.json placeholder. The shipped
+        // mapping covers the OpenRouter path the bundled AgentClasses member
+        // routes. Operators fronting other providers add that provider's
+        // variable here following the same row. The runner never emits the
+        // key on argv, and every dispatch carries CRUSH_DISABLE_METRICS=1.
+        new AgentCredentialMapping(AgentKind.Crush, "CODEYBOX_CRUSH_API_KEY", "OPENROUTER_API_KEY"),
         // dotnet-opencode: global opencode.json provider config shipped
         // verbatim (cursor-style). The CLI ignores bare provider env vars and
         // performs no shared-auth import, so the whole config file is the
@@ -2884,6 +2911,14 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new CmdSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CmdSmokeProbe>()));
+// Crush: credential-presence check only (OPENROUTER_API_KEY in the bundle).
+// Crush fronts dozens of providers behind one CLI, so no single endpoint
+// validates the credential and any provider call would spend real quota;
+// the real auth check happens on first CLI call in-VM. No guest config is
+// seeded — the CLI reads the key directly from the process environment.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new CrushSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<CrushSmokeProbe>()));
 // dotnet-opencode: credential-presence check only (DOTNETOPENCODE_CONFIG_JSON
 // in the bundle). Provider-agnostic BYOK front with no single usage endpoint
 // and an interactive-only device login; any provider call would spend real
@@ -2917,6 +2952,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, OmpInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, ContinueInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, QwenInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CmdInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CrushInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, DotNetOpencodeInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
@@ -3069,6 +3105,14 @@ builder.Services.AddSingleton<IAgentModelListProbe, QwenModelListProbe>();
 // status reports Command Code plan state, not the BYOK provider balance),
 // so members fall through to the NullQuotaProbe unknown path.
 builder.Services.AddSingleton<IAgentModelListProbe, CmdModelListProbe>();
+// Crush model-list probe: the catalog is per provider and server-side (the
+// `crush models` listing is a static registry, not a live entitlement
+// check), so it cannot back a host-side startup probe. The curated
+// CrushKnownModels seed is served instead (warn-only validation); no
+// quota-meter probe exists (`crush stats` renders HTML with no
+// machine-readable balance), so members fall through to the NullQuotaProbe
+// unknown path.
+builder.Services.AddSingleton<IAgentModelListProbe, CrushModelListProbe>();
 // dotnet-opencode model-list probe: the CLI exposes no non-interactive model
 // catalog, so it cannot back a host-side startup probe. The curated
 // DotNetOpencodeKnownModels seed is authoritative; operator-configured ids
@@ -4083,6 +4127,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Continue] = new ContinueCostExtractor(),
         [AgentKind.Qwen] = new QwenCostExtractor(),
         [AgentKind.Cmd] = new CmdCostExtractor(),
+        [AgentKind.Crush] = new CrushCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -4215,6 +4260,11 @@ builder.Services.AddSingleton<IAgentStreamParser, QwenStreamParser>();
 // every type:result line) needs no adjustment. Registered after Omp so the
 // shape owners' claim order is untouched.
 builder.Services.AddSingleton<IAgentStreamParser, CmdStreamParser>();
+// Crush emits the model's plain text in one-shot mode (no structured
+// stream), so the slot claims nothing — it exists so ResolveKind attributes
+// Crush work items to AgentKind.Crush rather than unknown (same as
+// aider/opencode/continue).
+builder.Services.AddSingleton<IAgentStreamParser, CrushStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -4452,6 +4502,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new DotNetOpencodeQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Crush detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:crush, mirroring the cmd hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Crush.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new CrushQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
