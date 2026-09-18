@@ -503,8 +503,8 @@ public sealed class ResumeEndpointTests : IDisposable
 /// </summary>
 internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"cb-resume-http-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("cb-resume-http-");
+    private string _dbPath => _scratch.DbPath("resume-http.db");
 
     public SqliteWorkItemStore Store { get; }
     public SqliteAuditReportStore AuditReports { get; }
@@ -524,14 +524,14 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"resume-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"resume-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"resume-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "resume-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "resume-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "resume-audit.json"),
             });
         });
         builder.ConfigureTestServices(services =>
@@ -577,6 +577,8 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
             AuditReports.Dispose();
             Store.Dispose();
             try { File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

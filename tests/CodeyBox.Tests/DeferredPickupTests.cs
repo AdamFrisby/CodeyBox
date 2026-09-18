@@ -23,6 +23,7 @@ public sealed class DeferredPickupTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private OrchestratorService BuildOrchestrator(

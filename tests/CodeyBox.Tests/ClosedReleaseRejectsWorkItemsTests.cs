@@ -284,8 +284,8 @@ public sealed class ForceBeginReviewAuthTests : IDisposable
 
 internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"cb-rel-http-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("cb-rel-http-");
+    private string _dbPath => _scratch.DbPath("rel-http.db");
 
     public SqliteReleaseStore ReleaseStore { get; }
     public SqliteWorkItemStore WorkItemStore { get; }
@@ -301,14 +301,14 @@ internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
             });
         });
         builder.ConfigureTestServices(services =>
@@ -340,6 +340,8 @@ internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
             WorkItemStore.Dispose();
             ReleaseStore.Dispose();
             try { File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -347,8 +349,8 @@ internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
 
 internal sealed class DisabledReleaseApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"cb-rel-disabled-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("cb-rel-disabled-");
+    private string _dbPath => _scratch.DbPath("rel-disabled.db");
 
     public SqliteReleaseStore ReleaseStore { get; }
 
@@ -362,14 +364,14 @@ internal sealed class DisabledReleaseApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
             });
         });
         builder.ConfigureTestServices(services =>
@@ -397,6 +399,8 @@ internal sealed class DisabledReleaseApiFactory : WebApplicationFactory<Program>
         {
             ReleaseStore.Dispose();
             try { File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

@@ -6,8 +6,8 @@ namespace CodeyBox.Tests;
 
 public sealed class SqliteAuditReportStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-audit-store-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-audit-store-");
+    private string _dbPath => _scratch.DbPath("audit-store.db");
     private readonly SqliteAuditReportStore _store;
 
     public SqliteAuditReportStoreTests()
@@ -20,6 +20,8 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static AuditReport Make(
@@ -237,6 +239,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         }
         finally
         {
+            TestScratchDirectory.ClearSqlitePools();
             try { File.Delete(path); } catch { }
             try { File.Delete(path + "-wal"); } catch { }
             try { File.Delete(path + "-shm"); } catch { }

@@ -22,8 +22,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class TestSelectionSoundnessTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-ts-soundness-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-ts-soundness-");
+    private string _dbPath => _scratch.DbPath("ts-soundness.db");
     private readonly SqliteAuditReportStore _store;
 
     public TestSelectionSoundnessTests()
@@ -36,6 +36,8 @@ public sealed class TestSelectionSoundnessTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static TestSelectionSoundnessSample Sample(
@@ -397,8 +399,8 @@ public sealed class TestSelectionSoundnessEndpointTests : IDisposable
 
 internal sealed class SoundnessApiFactory : WebApplicationFactory<Program>
 {
-    public string DbPath { get; } = Path.Combine(
-        Path.GetTempPath(), $"codeybox-soundness-api-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-soundness-api-");
+    public string DbPath => _scratch.DbPath("soundness-api.db");
 
     public SqliteWorkItemStore WorkItemStore { get; }
     public SqliteAuditReportStore AuditReportStore { get; }
@@ -414,14 +416,14 @@ internal sealed class SoundnessApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = DbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 ["CodeyBox:Audit:TestSelection:Soundness:CalibrationWindowSize"] = "100",
             });
         });
@@ -444,6 +446,8 @@ internal sealed class SoundnessApiFactory : WebApplicationFactory<Program>
             WorkItemStore.Dispose();
             AuditReportStore.Dispose();
             try { File.Delete(DbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(DbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

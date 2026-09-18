@@ -8,8 +8,8 @@ namespace CodeyBox.Tests;
 [Collection("GlobalSerilog")]
 public sealed class WorkItemAuditorProfileApiTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-profile-api-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-profile-api-");
+    private string _dbPath => _scratch.DbPath("profile-api.db");
     private WorkItemApiFactory? _factory;
     private HttpClient? _client;
 
@@ -18,6 +18,8 @@ public sealed class WorkItemAuditorProfileApiTests : IDisposable
         _client?.Dispose();
         _factory?.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     [Fact]

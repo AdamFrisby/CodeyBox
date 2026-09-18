@@ -11,7 +11,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class PromptRevisionStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-rev-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-rev-");
+    private string _dbPath => _scratch.DbPath("rev.db");
     private readonly SqliteWorkItemStore _store;
 
     public PromptRevisionStoreTests() => _store = new SqliteWorkItemStore(_dbPath);
@@ -20,6 +21,8 @@ public sealed class PromptRevisionStoreTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Sample(WorkItemState state = WorkItemState.Queued) => new()

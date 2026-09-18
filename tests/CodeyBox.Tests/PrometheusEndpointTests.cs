@@ -152,9 +152,8 @@ public sealed class PrometheusEndpointTests
     private sealed class PrometheusFactory : WebApplicationFactory<Program>
     {
         private readonly Dictionary<string, string?> _configuration;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(),
-            $"codeybox-prom-test-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-prom-test-");
+        private string _dbPath => _scratch.DbPath("prom-test.db");
         private readonly List<EnvScope> _envScopes;
 
         public PrometheusFactory(Dictionary<string, string?> configuration)
@@ -184,7 +183,6 @@ public sealed class PrometheusEndpointTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 var config = new Dictionary<string, string?>
                 {
                     // Default to disabled auth; individual tests opt back in to
@@ -192,10 +190,11 @@ public sealed class PrometheusEndpointTests
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:SandboxProvider"] = "process",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"prom-test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"prom-test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"prom-test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"prom-test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "prom-test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "prom-test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "prom-test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "prom-test-agent-streams"),
                     ["CodeyBox:Changelog:Enabled"] = "false",
                 };
                 foreach (var (key, value) in _configuration)
@@ -233,6 +232,8 @@ public sealed class PrometheusEndpointTests
                 foreach (var scope in _envScopes)
                     scope.Dispose();
                 try { File.Delete(_dbPath); } catch { /* best effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             }
             base.Dispose(disposing);
         }

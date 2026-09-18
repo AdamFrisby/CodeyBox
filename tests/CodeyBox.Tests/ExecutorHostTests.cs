@@ -900,23 +900,23 @@ public sealed class ExecutorHostTests
 
     public sealed class ExecutorApiFactory : WebApplicationFactory<Program>
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-executor-endpoint-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-executor-endpoint-");
+        private string _dbPath => _scratch.DbPath("executor-endpoint.db");
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"executor-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"executor-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"executor-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"executor-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "executor-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "executor-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "executor-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "executor-streams"),
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -928,7 +928,10 @@ public sealed class ExecutorHostTests
         protected override void Dispose(bool disposing)
         {
             if (disposing)
+            {
                 TryDelete(_dbPath);
+                _scratch.Dispose();
+            }
             base.Dispose(disposing);
         }
     }

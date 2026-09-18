@@ -7,7 +7,8 @@ namespace CodeyBox.Tests;
 
 public sealed class SqliteWorkItemCostStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cost-test-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-cost-test-");
+    private string _dbPath => _scratch.DbPath("cost-test.db");
     private readonly SqliteConnection _rawConn;
     private readonly SqliteWorkItemCostStore _store;
 
@@ -33,6 +34,8 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         _store.Dispose();
         _rawConn.Dispose();
         try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private void SeedWorkItem(string id, string projectId = "test-project", WorkItemState state = WorkItemState.Queued)
@@ -532,6 +535,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         finally
         {
             try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -797,6 +801,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         finally
         {
             try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -893,6 +898,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         finally
         {
             try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 

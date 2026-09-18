@@ -194,11 +194,43 @@ public sealed class HumanDeploymentReviewTests : IDisposable
     private static HumanDeploymentReviewAuditor HumanAuditor() =>
         new(new HumanDeploymentReviewOptions());
 
-    private static (string DbPath, SqliteWorkItemQuestionStore Questions, SqliteHumanDeploymentReviewStore Reviews) Stores()
+    private sealed class TestStores : IDisposable
     {
-        var db = Path.Combine(
-            Path.GetTempPath(), $"codeybox-human-{Guid.NewGuid():N}.db");
-        return (db, new SqliteWorkItemQuestionStore(db), new SqliteHumanDeploymentReviewStore(db));
+        public required TestScratchDirectory Scratch { get; init; }
+        public required SqliteWorkItemQuestionStore Questions { get; init; }
+        public required SqliteHumanDeploymentReviewStore Reviews { get; init; }
+
+        public string DbPath => Scratch.DbPath("human.db");
+
+        public void Deconstruct(
+            out string dbPath,
+            out SqliteWorkItemQuestionStore questions,
+            out SqliteHumanDeploymentReviewStore reviews)
+        {
+            dbPath = DbPath;
+            questions = Questions;
+            reviews = Reviews;
+        }
+
+        public void Dispose()
+        {
+            Reviews.Dispose();
+            Questions.Dispose();
+            TestScratchDirectory.ClearSqlitePools();
+            Scratch.Dispose();
+        }
+    }
+
+    private static TestStores Stores()
+    {
+        var scratch = TestScratchDirectory.Create("codeybox-human-");
+        var db = scratch.DbPath("human.db");
+        return new TestStores
+        {
+            Scratch = scratch,
+            Questions = new SqliteWorkItemQuestionStore(db),
+            Reviews = new SqliteHumanDeploymentReviewStore(db),
+        };
     }
 
     private async Task<HumanDeploymentReview> ParkAsync(
@@ -248,7 +280,8 @@ public sealed class HumanDeploymentReviewTests : IDisposable
         var probe = new DeploymentProbeAuditor(new Queue<Outcome>([new(true, [])]));
         var manager = new LiveFakeManager();
         var webhooks = new RecordingWebhookDispatcher();
-        var (db, questions, reviews) = Stores();
+        using var stores = Stores();
+        var (db, questions, reviews) = stores;
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [code, probe, HumanAuditor()],
@@ -316,7 +349,8 @@ public sealed class HumanDeploymentReviewTests : IDisposable
         var code = new CodeAuditor(new Queue<Outcome>([new(true, [])]));
         var probe = new DeploymentProbeAuditor(new Queue<Outcome>([new(true, [])]));
         var manager = new LiveFakeManager();
-        var (db, questions, reviews) = Stores();
+        using var stores = Stores();
+        var (db, questions, reviews) = stores;
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [code, probe, HumanAuditor()],
@@ -358,7 +392,8 @@ public sealed class HumanDeploymentReviewTests : IDisposable
         var code = new CodeAuditor(new Queue<Outcome>([new(true, []), new(true, [])]));
         var probe = new DeploymentProbeAuditor(new Queue<Outcome>([new(true, []), new(true, [])]));
         var manager = new LiveFakeManager();
-        var (db, questions, reviews) = Stores();
+        using var stores = Stores();
+        var (db, questions, reviews) = stores;
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [code, probe, HumanAuditor()],
@@ -422,7 +457,8 @@ public sealed class HumanDeploymentReviewTests : IDisposable
         var code = new CodeAuditor(new Queue<Outcome>([new(true, [])]));
         var probe = new DeploymentProbeAuditor(new Queue<Outcome>([new(true, [])]));
         var manager = new LiveFakeManager();
-        var (db, questions, reviews) = Stores();
+        using var stores = Stores();
+        var (db, questions, reviews) = stores;
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [code, probe, HumanAuditor()],
@@ -475,7 +511,8 @@ public sealed class HumanDeploymentReviewTests : IDisposable
         var code = new CodeAuditor(new Queue<Outcome>([new(true, [])]));
         var probe = new DeploymentProbeAuditor(new Queue<Outcome>([new(true, [])]));
         var manager = new LiveFakeManager();
-        var (db, questions, reviews) = Stores();
+        using var stores = Stores();
+        var (db, questions, reviews) = stores;
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [code, probe, HumanAuditor()],
@@ -532,7 +569,8 @@ public sealed class HumanDeploymentReviewTests : IDisposable
         var code = new CodeAuditor(new Queue<Outcome>([new(true, [])]));
         var probe = new DeploymentProbeAuditor(new Queue<Outcome>([new(true, [])]));
         var manager = new LiveFakeManager();
-        var (db, questions, reviews) = Stores();
+        using var stores = Stores();
+        var (db, questions, reviews) = stores;
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [code, probe, HumanAuditor()],
@@ -576,7 +614,8 @@ public sealed class HumanDeploymentReviewTests : IDisposable
         var code = new CodeAuditor(new Queue<Outcome>([new(true, []), new(true, [])]));
         var probe = new DeploymentProbeAuditor(new Queue<Outcome>([new(true, []), new(true, [])]));
         var manager = new LiveFakeManager();
-        var (db, questions, reviews) = Stores();
+        using var stores = Stores();
+        var (db, questions, reviews) = stores;
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             auditors: [code, probe, HumanAuditor()],

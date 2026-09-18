@@ -20,14 +20,15 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class SqliteAgentInstanceColumnMigrationTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-instanceid-migrate-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-instanceid-migrate-");
+    private string _dbPath => _scratch.DbPath("instanceid-migrate.db");
 
     public void Dispose()
     {
         try { File.Delete(_dbPath); } catch { /* best-effort */ }
         try { File.Delete(_dbPath + "-wal"); } catch { /* best-effort */ }
         try { File.Delete(_dbPath + "-shm"); } catch { /* best-effort */ }
+        _scratch.Dispose();
     }
 
     [Fact]

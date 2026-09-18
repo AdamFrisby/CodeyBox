@@ -611,6 +611,58 @@ internal static class TestSupport
 }
 
 /// <summary>Bundle of resources returned by <see cref="TestSupport.BuildPipeline"/>.</summary>
+internal sealed class TrackingSandboxProvider(ISandboxProvider inner) : ISandboxProvider, IAsyncDisposable
+{
+    // Records every sandbox the inner provider creates and returns the real
+    // handles untouched, so pipeline behaviour (casts, capability lookup,
+    // identity) is identical to the unwrapped provider. Tests that
+    // intentionally leave a sandbox preserved/abandoned (host-shutdown
+    // preemption, forced dispose timeouts) dispose the tracker with
+    // `await using` so no codeybox-sandbox-* root leaks. Disposal is
+    // idempotent, so sandboxes the pipeline already tore down are safe.
+    private readonly System.Collections.Concurrent.ConcurrentBag<ISandbox> _created = new();
+
+    public string Name => inner.Name;
+    public SandboxIsolationLevel IsolationLevel => inner.IsolationLevel;
+    public SandboxAgentOutputTransportKind AgentOutputTransportKind => inner.AgentOutputTransportKind;
+    public SandboxBatchLaunchMode BatchLaunchMode => inner.BatchLaunchMode;
+    public IReadOnlyList<string> DeclaredCapabilities => inner.DeclaredCapabilities;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+    {
+        var sandbox = await inner.CreateAsync(spec, ct);
+        _created.Add(sandbox);
+        return sandbox;
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => inner.DisposeLeakedAsync(name, ct);
+
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var sandbox in _created)
+        {
+            if (sandbox is IPreserveOnDisposeSandbox preservable)
+                preservable.DisablePreserveOnDispose();
+            try
+            {
+                await sandbox.DisposeAsync();
+            }
+            catch
+            {
+                // Best-effort test teardown: never fail the run on cleanup.
+            }
+        }
+    }
+
+    /// <summary>Tracker around a real process provider, the common case.</summary>
+    public static TrackingSandboxProvider ForProcessSandbox()
+        => new(new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+}
+
 internal sealed class TestPipeline : IDisposable
 {
     public PipelineRunner Pipeline { get; }

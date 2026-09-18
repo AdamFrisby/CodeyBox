@@ -11,7 +11,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class WorkItemPickupTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-pickup-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-pickup-");
+    private string _dbPath => _scratch.DbPath("pickup.db");
     private readonly SqliteWorkItemStore _store;
 
     public WorkItemPickupTests()
@@ -23,6 +24,8 @@ public sealed class WorkItemPickupTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Sample(WorkItemState state = WorkItemState.Queued, params WorkItemId[] deps) => new()

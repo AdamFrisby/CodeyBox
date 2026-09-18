@@ -16,7 +16,8 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-bsl-pickup-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-bsl-pickup-");
+    private string _dbPath => _scratch.DbPath("bsl-pickup.db");
     private readonly SqliteWorkItemStore _store;
 
     public OrchestratorBaselinePickupStampingTests()
@@ -28,6 +29,8 @@ public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem MakeItem(string projectId = "p") => new()

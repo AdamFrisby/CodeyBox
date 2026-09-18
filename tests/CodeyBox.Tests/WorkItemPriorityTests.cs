@@ -29,6 +29,7 @@ public sealed class WorkItemPriorityTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem MakeItem(int priority = 0, DateTimeOffset? createdAt = null) => new()

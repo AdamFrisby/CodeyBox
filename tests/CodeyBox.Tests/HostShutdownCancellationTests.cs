@@ -782,8 +782,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var logger = new CapturingLogger<PipelineRunner>();
-        var sandboxProvider = new SuspendableSandboxProvider(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        await using var tracker = TrackingSandboxProvider.ForProcessSandbox();
+        var sandboxProvider = new SuspendableSandboxProvider(tracker);
         using var harness = BuildPipeline(
             seed,
             new HangingPreemptAgentRunner(),
@@ -837,6 +837,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new CancellationObservingSlowPreemptAgentRunner();
         var logger = new CapturingLogger<PipelineRunner>();
+        await using var tracker = TrackingSandboxProvider.ForProcessSandbox();
         using var harness = BuildPipeline(
             seed,
             agent,
@@ -846,7 +847,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
                 AgentAllowedHosts = [],
                 ShutdownGrace = TimeSpan.FromSeconds(8),
             },
-            logger);
+            logger,
+            tracker);
 
         var item = NewItem();
         await harness.Store.CreateAsync(item);
@@ -884,8 +886,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new LateRepositoryWritingPreemptAgentRunner(TimeSpan.FromMilliseconds(750));
         var logger = new CapturingLogger<PipelineRunner>();
-        var sandboxProvider = new SuspendableSandboxProvider(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        await using var tracker = TrackingSandboxProvider.ForProcessSandbox();
+        var sandboxProvider = new SuspendableSandboxProvider(tracker);
         using var harness = BuildPipeline(
             seed,
             agent,
@@ -1497,16 +1499,24 @@ public sealed class HostShutdownCancellationTests : IDisposable
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
-        var pwd = await sandbox.ExecAsync(new SandboxExec { Argv = ["pwd"] });
-        Assert.True(pwd.Success);
-        var root = Directory.GetParent(pwd.Stdout.Trim())!.FullName;
+        string? root = null;
+        try
+        {
+            var pwd = await sandbox.ExecAsync(new SandboxExec { Argv = ["pwd"] });
+            Assert.True(pwd.Success);
+            root = Directory.GetParent(pwd.Stdout.Trim())!.FullName;
 
-        await ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync();
-        await sandbox.DisposeAsync();
+            await ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync();
+            await sandbox.DisposeAsync();
 
-        Assert.True(Directory.Exists(root));
-        Assert.True(File.Exists(Path.Combine(root, ".codeybox-preempt")));
-        try { Directory.Delete(root, recursive: true); } catch { }
+            Assert.True(Directory.Exists(root));
+            Assert.True(File.Exists(Path.Combine(root, ".codeybox-preempt")));
+        }
+        finally
+        {
+            try { if (root is not null) Directory.Delete(root, recursive: true); } catch { }
+            await sandbox.DisposeAsync();
+        }
     }
 
     private PipelineRunner BuildResumePipeline(

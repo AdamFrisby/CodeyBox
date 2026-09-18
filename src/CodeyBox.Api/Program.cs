@@ -3306,9 +3306,9 @@ builder.Services.AddSingleton<GitHubAppConnectState>();
 // builder.Configuration here would ignore their isolated writable store path.
 builder.Services.AddSingleton(sp =>
 {
-    var configuration = sp.GetRequiredService<IConfiguration>();
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new GitHubAppStore(
-        configuration["CodeyBox:GitHubAppStorePath"]
+        opts.GitHubAppStorePath
             ?? Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
             ?? (builder.Environment.IsProduction()
                 ? "/var/lib/codeybox/github-apps"
@@ -4008,6 +4008,18 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
         cancellationRegistry: sp.GetRequiredService<CancellationRegistry>());
 });
+// --- Abandoned temp-entry startup sweep ------------------------------------
+// One-shot reap of stale codeybox-* entries in the system temp path left by
+// previous deployments and test runs. Runs once at host startup so a tmpfs
+// /tmp cannot accumulate RAM-pinning backlog across restarts. It only
+// removes entries whose newest write is older than the configured max age,
+// so it never interferes with live dispatch. Never fails startup — sweep
+// faults are logged.
+builder.Services.AddHostedService(sp => new TempSweepStartupService(
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.TempSweep,
+    sp.GetService<TimeProvider>(),
+    sp.GetRequiredService<ILogger<TempSweepStartupService>>(),
+    sp.GetRequiredService<ILogger<TempFileSweeper>>()));
 builder.Services.AddSingleton<WorkItemRepoReaper>(sp =>
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
@@ -6559,6 +6571,14 @@ namespace CodeyBox.Api
         public bool EnableSharedUpstreamMirror { get; set; } = false;
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = CodeyBox.Core.HostPathPolicy.DefaultStateDatabasePath();
+        /// <summary>
+        /// File-store backing GitHub App installations and OAuth state.
+        /// Bound (not ad-hoc) so strict unbound-key validation accepts it in
+        /// every host, including test hosts that isolate it per fixture.
+        /// Null means "use the environment default" (production path or a
+        /// per-process temp directory outside production).
+        /// </summary>
+        public string? GitHubAppStorePath { get; set; } = null;
         public SqliteWriteGateOptions SqliteWriteGate { get; set; } = new();
         public SqliteMaintenanceOptions SqliteMaintenance { get; set; } = new();
         public string TemplateDirectory { get; set; } = "templates";
@@ -7214,6 +7234,16 @@ namespace CodeyBox.Api
         /// sweeps already-terminal clones left behind across restarts.
         /// </summary>
         public RepoRetentionOptions RepoRetention { get; set; } = new();
+
+        /// <summary>
+        /// Startup sweep over the system temp path that removes stale
+        /// <c>codeybox-*</c> entries abandoned by previous deployments and
+        /// test runs. Bind under <c>CodeyBox:TempSweep</c>. Matters most on
+        /// hosts where <c>/tmp</c> is a tmpfs: unreaped entries pin RAM until
+        /// reboot, and an OOM killer resolving that pressure chooses its own
+        /// victim. See <see cref="TempSweepOptions"/>.
+        /// </summary>
+        public TempSweepOptions TempSweep { get; set; } = new();
 
         /// <summary>
         /// Alias for <see cref="RepoRetention"/>.

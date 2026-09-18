@@ -14,7 +14,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class BaselineMigrationServiceTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-migsvc-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-migsvc-");
+    private string _dbPath => _scratch.DbPath("migsvc.db");
     private readonly SqliteWorkItemStore _store;
     private readonly FakeBaselineResolver _resolver = new();
     private readonly BaselineMigrationService _service;
@@ -44,6 +45,8 @@ public sealed class BaselineMigrationServiceTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private WorkItem Sample(string? baselineRef, WorkItemState state = WorkItemState.Working) => new()

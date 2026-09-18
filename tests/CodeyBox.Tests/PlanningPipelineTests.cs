@@ -2824,10 +2824,26 @@ internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner, IPlanAr
     public Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
         => Task.CompletedTask;
 
-    public Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
+    public async Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
     {
         CloseCalls++;
-        return Task.CompletedTask;
+        // Mirror production close (ClaudeSessionWorker.CloseSessionAsync):
+        // closing the session disposes its sandbox. Without this the test
+        // leaks one codeybox-sandbox-* root per session test.
+        var sandbox = Interlocked.Exchange(ref _sandbox, null);
+        if (sandbox is IPreserveOnDisposeSandbox preservable)
+            preservable.DisablePreserveOnDispose();
+        if (sandbox is not null)
+        {
+            try
+            {
+                await sandbox.DisposeAsync();
+            }
+            catch
+            {
+                // Best-effort: close must not fail the test on teardown.
+            }
+        }
     }
 }
 

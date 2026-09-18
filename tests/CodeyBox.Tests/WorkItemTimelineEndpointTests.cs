@@ -310,8 +310,8 @@ public sealed class WorkItemTimelineEndpointTests : IDisposable
 /// </summary>
 internal sealed class TimelineApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-tltest-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-tltest-");
+    private string _dbPath => _scratch.DbPath("tltest.db");
 
     public string AuditDir { get; } = Path.Combine(
         Path.GetTempPath(), $"codeybox-tlogs-{Guid.NewGuid():N}");
@@ -335,7 +335,8 @@ internal sealed class TimelineApiFactory : WebApplicationFactory<Program>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), $"test-git-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(AuditDir, "log-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(AuditDir, "audit-.json"),
             });
@@ -362,7 +363,9 @@ internal sealed class TimelineApiFactory : WebApplicationFactory<Program>
         {
             Store.Dispose();
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
             try { Directory.Delete(AuditDir, recursive: true); } catch { /* best-effort */ }
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

@@ -11,12 +11,14 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class AuditProgressBackfillMigrationTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-apmig-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-apmig-");
+    private string _dbPath => _scratch.DbPath("apmig.db");
 
     public void Dispose()
     {
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Sample() => new()

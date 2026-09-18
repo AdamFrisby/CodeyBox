@@ -550,10 +550,17 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
 
     public ValueTask DisposeAsync()
     {
-        if (_disposed) return ValueTask.CompletedTask;
-        _disposed = true;
-        SandboxLiveCounter.Decrement();
-        KillActiveExecsAsync().GetAwaiter().GetResult();
+        if (!_disposed)
+        {
+            _disposed = true;
+            SandboxLiveCounter.Decrement();
+            KillActiveExecsAsync().GetAwaiter().GetResult();
+        }
+        // Deletion follows the CURRENT preservation flag on every call, not
+        // just the first: DisablePreserveOnDispose after a preserved disposal
+        // (phase disposal reaping a converted retained VM, test teardown of a
+        // preempted sandbox) must still remove the root. A second call after a
+        // completed deletion is a no-op via the existence check below.
         if (_preserved)
             return ValueTask.CompletedTask;
         try

@@ -224,6 +224,9 @@ public sealed class FleetTransitionHealthEndpointTests : IDisposable
     /// </summary>
     private sealed class TransitionHealthApiFactory : WebApplicationFactory<Program>
     {
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-th-");
+        private string _dbPath => _scratch.DbPath("th.db");
+
         public StubTransitionHealthDataSource DataSource { get; } = new();
 
         // Initial options written into the snapshot at host build; tests can
@@ -244,14 +247,14 @@ public sealed class FleetTransitionHealthEndpointTests : IDisposable
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
-                    ["CodeyBox:StateDatabasePath"] = Path.Combine(tmp, $"codeybox-th-{Guid.NewGuid():N}.db"),
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:StateDatabasePath"] = _dbPath,
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -264,6 +267,17 @@ public sealed class FleetTransitionHealthEndpointTests : IDisposable
                 services.RemoveAll<TransitionHealthService>();
                 services.AddSingleton(new TransitionHealthService(DataSource, OptionsSnapshot));
             });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                try { File.Delete(_dbPath); } catch { }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 }

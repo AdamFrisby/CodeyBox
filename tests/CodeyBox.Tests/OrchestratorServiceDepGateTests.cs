@@ -27,6 +27,7 @@ public sealed class OrchestratorServiceDepGateTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem Sample(

@@ -356,8 +356,8 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
     private sealed class QuotaRetrySchedulerWiringFactory : WebApplicationFactory<Program>
     {
         private readonly MutableOptionsMonitor<CodeyBoxOptions> _monitor;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-quota-retry-wiring-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-quota-retry-wiring-");
+        private string _dbPath => _scratch.DbPath("quota-retry-wiring.db");
 
         public QuotaRetrySchedulerWiringFactory(MutableOptionsMonitor<CodeyBoxOptions> monitor)
             => _monitor = monitor;
@@ -368,15 +368,15 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                     ["CodeyBox:AutoRetryOnQuotaFailure:Enabled"] = "false",
                 });
             });
@@ -392,14 +392,16 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }
 
     private sealed class QuotaRecoverySignalWiringFactory : WebApplicationFactory<Program>
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-quota-signal-wiring-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-quota-signal-wiring-");
+        private string _dbPath => _scratch.DbPath("quota-signal-wiring.db");
         private readonly bool _startHostedServices;
 
         public MutableProgramQuotaProbe Probe { get; } = new(AgentKind.Codex, 0);
@@ -413,16 +415,16 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:Smoke:Enabled"] = "false",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                     ["CodeyBox:AutoRetryOnQuotaFailure:Enabled"] = "true",
                     ["CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval"] = "06:00:00",
                     ["CodeyBox:AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem"] = "3",
@@ -467,6 +469,8 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }
@@ -496,6 +500,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
                     ["CodeyBox:Smoke:Enabled"] = "false",
                     [CredentialFileWatcherSettings.ConfigurationKey] = "false",
                     ["CodeyBox:StateDatabasePath"] = Path.Combine(_root, "state.db"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_root, "github-apps"),
                     ["CodeyBox:GitRootDirectory"] = Path.Combine(_root, "git"),
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(_root, "logs", "api-.json"),
                     ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_root, "logs", "audit-.json"),
@@ -547,8 +552,8 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
 
     private sealed class DefaultTransientRetryWiringFactory : WebApplicationFactory<Program>
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-transient-default-wiring-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-transient-default-wiring-");
+        private string _dbPath => _scratch.DbPath("transient-default-wiring.db");
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -556,15 +561,15 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                     ["CodeyBox:AutoRetryOnQuotaFailure:Enabled"] = "false",
                 });
             });
@@ -578,6 +583,8 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }

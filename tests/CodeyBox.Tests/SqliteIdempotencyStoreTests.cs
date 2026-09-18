@@ -10,7 +10,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class SqliteIdempotencyStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-idem-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-idem-");
+    private string _dbPath => _scratch.DbPath("idem.db");
     private readonly SqliteIdempotencyStore _store;
 
     public SqliteIdempotencyStoreTests() => _store = new SqliteIdempotencyStore(_dbPath);
@@ -19,6 +20,8 @@ public sealed class SqliteIdempotencyStoreTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static IdempotencyEntry Entry(

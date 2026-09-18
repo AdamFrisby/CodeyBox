@@ -33,6 +33,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         Log.CloseAndFlush();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     [Fact]

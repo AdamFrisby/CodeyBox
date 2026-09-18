@@ -153,9 +153,8 @@ public sealed class MultipassRemoteProgramWiringTests
         MutableOptionsMonitor<CodeyBoxOptions> monitor,
         IProcessRunner? runner = null) : WebApplicationFactory<Program>
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(),
-            $"codeybox-multipass-remote-hot-reload-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-multipass-remote-hot-reload-");
+        private string _dbPath => _scratch.DbPath("multipass-remote-hot-reload.db");
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -169,10 +168,11 @@ public sealed class MultipassRemoteProgramWiringTests
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:SandboxProvider"] = "multipass-remote",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"multipass-remote-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"multipass-remote-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"multipass-remote-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"multipass-remote-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "multipass-remote-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "multipass-remote-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "multipass-remote-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "multipass-remote-streams"),
                     ["CodeyBox:WorkerPool:MaxConcurrentWorkers"] = "4",
                     ["CodeyBox:WorkerPool:MaxConcurrentSandboxes"] = "8",
                     ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = "initial.example",
@@ -201,6 +201,8 @@ public sealed class MultipassRemoteProgramWiringTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }

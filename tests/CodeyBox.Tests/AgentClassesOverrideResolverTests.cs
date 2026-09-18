@@ -806,8 +806,8 @@ public sealed class AgentClassesOverrideResolverTests
     private sealed class AgentClassesWiringFactory : WebApplicationFactory<Program>
     {
         private readonly Dictionary<string, string?> _override;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-agentclasses-wiring-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-agentclasses-wiring-");
+        private string _dbPath => _scratch.DbPath("agentclasses-wiring.db");
 
         public AgentClassesWiringFactory(Dictionary<string, string?> @override)
         {
@@ -828,10 +828,11 @@ public sealed class AgentClassesOverrideResolverTests
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 });
                 cfg.AddInMemoryCollection(_override);
             });
@@ -847,6 +848,8 @@ public sealed class AgentClassesOverrideResolverTests
         {
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             base.Dispose(disposing);
         }
     }

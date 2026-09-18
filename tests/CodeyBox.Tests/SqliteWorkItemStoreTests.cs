@@ -5,7 +5,8 @@ namespace CodeyBox.Tests;
 
 public sealed class SqliteWorkItemStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-test-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-test-");
+    private string _dbPath => _scratch.DbPath("test.db");
     private readonly SqliteWorkItemStore _store;
 
     public SqliteWorkItemStoreTests()
@@ -17,6 +18,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Sample() => new()

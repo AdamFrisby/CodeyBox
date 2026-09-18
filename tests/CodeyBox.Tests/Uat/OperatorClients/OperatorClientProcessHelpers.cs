@@ -46,12 +46,14 @@ internal static class OperatorClientPaths
 
 internal static partial class OperatorClientProcess
 {
-    // Shared per-test-process to avoid paying dotnet's cold-start cost (NuGet
-    // restore, MSBuild SDK resolution) on every CLI invocation; only the
-    // codeybox-side cliConfig directory needs per-call isolation.
+    // Shared per-test-process (and across runs, via a fixed path) to avoid
+    // paying dotnet's cold-start cost (NuGet restore, MSBuild SDK resolution)
+    // on every CLI invocation; only the codeybox-side cliConfig directory
+    // needs per-call isolation. A fixed path keeps the temp entry count
+    // stable between runs and reuses the warm NuGet cache.
     private static readonly Lazy<string> SharedDotnetCliHome = new(() =>
     {
-        var path = Path.Combine(Path.GetTempPath(), "codeybox-dotnet-home-shared-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(Path.GetTempPath(), "codeybox-dotnet-home-shared");
         Directory.CreateDirectory(path);
         return path;
     });

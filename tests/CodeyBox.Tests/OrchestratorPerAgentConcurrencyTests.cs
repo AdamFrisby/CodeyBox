@@ -30,6 +30,7 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem Item(string title = "t") => new()

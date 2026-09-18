@@ -890,6 +890,7 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             {
                 // Best effort: temp-file cleanup must not fail the test run.
             }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
         }
     }
 

@@ -99,8 +99,8 @@ public sealed class DeploymentProgramWiringTests
     private sealed class DeploymentProgramWiringFactory : WebApplicationFactory<Program>
     {
         private readonly Serilog.ILogger _previousLogger = Log.Logger;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-deployment-wiring-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-deployment-wiring-");
+        private string _dbPath => _scratch.DbPath("deployment-wiring.db");
 
         public bool HadDeploymentLeakReaperHostedRegistration { get; private set; }
 
@@ -110,15 +110,15 @@ public sealed class DeploymentProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                     ["CodeyBox:Projects:0:Id"] = "alpha",
                     ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/alpha.git",
                     ["CodeyBox:Projects:0:Deployment:Kind"] = DeploymentKinds.WebApp,
@@ -185,6 +185,8 @@ public sealed class DeploymentProgramWiringTests
                     // sink even when xUnit constructs collection members early.
                     Log.Logger = _previousLogger;
                     try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                    TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                    _scratch.Dispose();
                 }
             }
         }

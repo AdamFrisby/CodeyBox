@@ -9,7 +9,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class CancellationPropagationTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cancel-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-cancel-");
+    private string _dbPath => _scratch.DbPath("cancel.db");
     private readonly SqliteWorkItemStore _store;
 
     public CancellationPropagationTests()
@@ -21,6 +22,8 @@ public sealed class CancellationPropagationTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Item(WorkItemState state, params WorkItemId[] deps) => new()

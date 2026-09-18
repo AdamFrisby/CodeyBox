@@ -120,6 +120,41 @@ verification sandboxes, so host sizing should use
 on KVM, plan for ~1 GB host RAM per admitted sandbox plus the agent's memory
 needs.
 
+## Temp files and tmpfs (`/tmp` may be RAM)
+
+On many distributions `/tmp` is a **tmpfs**: files there consume RAM, not
+disk. "Temp files are cleaned up eventually" is therefore not a safe
+assumption for a process that runs for weeks — an unbounded temp backlog
+becomes memory pressure, and when RAM and swap are both exhausted the
+kernel OOM-killer picks its own victim (not necessarily the process that
+leaked). Size the host accordingly: either mount `/tmp` on disk, or budget
+RAM + swap for peak temp usage on top of the sandbox ceiling above, and
+alert on `/tmp` usage the same way you alert on memory.
+
+What CodeyBox does to stay bounded:
+
+* The orchestrator's git-hooks suppression directory is created once per
+  process under the per-user application-data directory — constructing
+  pipeline runners never grows `/tmp`. It deliberately does not live under
+  a well-known name in the shared temp path: on a multi-user host any
+  other local user could pre-create such a path (as a file, a symlink, or
+  a directory of hostile hook scripts) and have it used with the
+  orchestrator's privileges.
+* At every startup, a bounded sweep removes stale `codeybox-*` temp entries
+  (abandoned test databases, staging dirs, pre-fix per-instance hook dirs,
+  including the pre-fix predictable shared name once it ages out) whose
+  newest write is older than `CodeyBox:TempSweep:MaxAge` (default 48 h,
+  clamped to a 1 h floor). The sweep only touches top-level `codeybox-*`
+  entries inside the temp path, never follows symlinks, and never fails
+  startup — sweep faults are logged and the host keeps coming up. Disable
+  with `CodeyBox:TempSweep:Enabled=false`.
+* Test fixtures isolate their temp state in per-test scratch directories
+  that are removed on disposal, pass or fail.
+
+What the sweep does *not* cover: temp entries outside the `codeybox-*`
+prefix, however large, are left alone — if `/tmp` still grows, the owner is
+something else on the host.
+
 ## Failure modes you'll actually see
 
 * **Agent produced no changes.** Work phase fails with "Agent produced

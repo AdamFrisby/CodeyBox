@@ -19,6 +19,7 @@ public sealed class WorkerRegistryTests : IDisposable
     {
         _registry.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkerRegistration MakeReg(string? workItemId = null) => new()
@@ -101,6 +102,7 @@ public sealed class WorkerRegistryTests : IDisposable
         finally
         {
             try { File.Delete(path); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(path);
         }
     }
 
@@ -132,6 +134,7 @@ public sealed class WorkerRegistryTests : IDisposable
         finally
         {
             try { File.Delete(path); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(path);
         }
     }
 

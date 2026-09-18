@@ -13,14 +13,16 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class SqliteTransitionHealthDataSourceTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-transition-health-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-transition-health-");
+    private string _dbPath => _scratch.DbPath("transition-health.db");
 
     public void Dispose()
     {
+        TestScratchDirectory.ClearSqlitePools();
         try { File.Delete(_dbPath); } catch { }
         try { File.Delete(_dbPath + "-wal"); } catch { }
         try { File.Delete(_dbPath + "-shm"); } catch { }
+        _scratch.Dispose();
     }
 
     [Fact]

@@ -71,6 +71,7 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         _registry.Dispose();
         _cancellations.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private WorkItem MakeItem(

@@ -13,11 +13,14 @@ namespace CodeyBox.Tests;
 [Collection("Observable metrics")]
 public sealed class ObservableMetricsTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"cb-obs-metrics-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("cb-obs-metrics-");
+    private string _dbPath => _scratch.DbPath("obs-metrics.db");
 
     public void Dispose()
     {
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { /* best effort */ }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItem Item(WorkItemState state) => new()

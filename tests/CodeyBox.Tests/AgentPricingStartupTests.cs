@@ -137,8 +137,8 @@ public sealed class AgentPricingStartupOperatorOverrideTests
 
 public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-pricing-startup-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-pricing-startup-");
+    private string _dbPath => _scratch.DbPath("pricing-startup.db");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -151,14 +151,14 @@ public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
                 .ToList();
             foreach (var s in jsonSources) cfg.Sources.Remove(s);
 
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 ["CodeyBox:AgentDefaults:opencode"] = "deepseek-v4-flash",
             });
         });
@@ -173,6 +173,8 @@ public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -180,8 +182,8 @@ public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
 
 public sealed class AgentPricingStartupOperatorFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-pricing-startup-op-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-pricing-startup-op-");
+    private string _dbPath => _scratch.DbPath("pricing-startup-op.db");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -194,14 +196,14 @@ public sealed class AgentPricingStartupOperatorFactory : WebApplicationFactory<P
                 .ToList();
             foreach (var s in jsonSources) cfg.Sources.Remove(s);
 
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
 
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:inputPerMillion"] = "99.0",
                 ["CodeyBox:AgentPricing:Rates:claude:claude-opus-4-7:cachedInputPerMillion"] = "9.9",
@@ -219,6 +221,8 @@ public sealed class AgentPricingStartupOperatorFactory : WebApplicationFactory<P
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

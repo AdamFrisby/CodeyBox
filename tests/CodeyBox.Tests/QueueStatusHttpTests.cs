@@ -489,8 +489,8 @@ public sealed class QueueStatusHttpTests : IDisposable
 /// </summary>
 internal sealed class QueueApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-queuehttp-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-queuehttp-");
+    private string _dbPath => _scratch.DbPath("queuehttp.db");
 
     public SqliteWorkItemStore Store { get; }
     public SqliteQueueController QueueController { get; }
@@ -506,14 +506,14 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 ["CodeyBox:Smoke:Enabled"] = "false",
                 ["CodeyBox:AgentClasses:0:Id"] = "frontier",
                 ["CodeyBox:AgentClasses:0:DisplayName"] = "Frontier",
@@ -554,6 +554,8 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
             QueueController.Dispose();
             Store.Dispose();
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

@@ -735,8 +735,10 @@ public sealed class AgentClassRouterTests
         var now = DateTimeOffset.UtcNow;
         var pausedReset = now.AddMinutes(10);
         var activeReset = now.AddHours(2);
+        using var scratch = TestScratchDirectory.Create("codeybox-router-pauses-");
+        var pausesDb = scratch.DbPath("pauses.db");
         using var pauses = new SqliteAgentPauseController(
-            Path.Combine(Path.GetTempPath(), $"codeybox-router-pauses-{Guid.NewGuid():N}.db"),
+            pausesDb,
             NullLogger<SqliteAgentPauseController>.Instance);
         await pauses.PauseAsync(Claude, "reserve for oversight", "test");
 

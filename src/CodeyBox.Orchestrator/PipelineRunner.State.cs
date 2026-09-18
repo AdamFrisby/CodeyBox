@@ -230,6 +230,139 @@ public sealed partial class PipelineRunner
     private readonly IHumanDeploymentReviewStore? _humanReviews;
     private readonly IMergeScopeResolver _mergeScopeResolver;
     private readonly Func<Guid> _dispatchClaimIdFactory;
+    // Shared host-hooks suppression directory. It holds no per-instance
+    // state — it is only handed to git as core.hooksPath so host-side
+    // commands never execute repo hooks — so all instances reuse one
+    // directory created once per process. A per-instance GUID-suffixed
+    // directory here leaked one temp entry per construction (nothing ever
+    // deleted it); on a tmpfs /tmp that growth sits in RAM.
+    //
+    // The directory lives under the per-user application-data root, never
+    // under a well-known name in the world-writable shared temp path: any
+    // other local user could pre-create such a path as a plain file (every
+    // later construction would then fail — a persistent local DoS), as a
+    // symlink to an attacker directory, or as a directory containing
+    // hostile hook scripts, all of which git would then use as the
+    // orchestrator user via core.hooksPath. A directory only this user can
+    // write to cannot be pre-created by another user, so no ownership
+    // handshake is needed — the leaf checks below only fail closed on
+    // unexpected local state.
+    internal static string SharedDisabledHostHooksPath => SharedDisabledHostHooks.Value;
+
+    private static readonly Lazy<string> SharedDisabledHostHooks = new(
+        ResolveSharedDisabledHostHooksPath,
+        LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private static string ResolveSharedDisabledHostHooksPath()
+    {
+        // This factory must never throw: Lazy would cache the exception and
+        // every later PipelineRunner construction would fail with it. Every
+        // creation step below fails closed to the next fallback instead.
+        var preferred = PerUserDisabledHostHooksPath();
+        if (preferred is not null && TryEnsureRealDirectory(preferred))
+            return preferred;
+
+        // Fallback for accounts without a resolvable per-user location: one
+        // unpredictable per-process directory in the shared temp path. The
+        // GUID suffix makes the name unguessable so it cannot be
+        // pre-created, and the codeybox- prefix keeps it visible to the
+        // startup sweep, which reaps it once it ages out (it counts as fresh
+        // while this process lives, so the sweep leaves it alone).
+        var fallback = Path.Combine(
+            Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(fallback);
+            TryRestrictToOwnerOnly(fallback);
+        }
+        catch (Exception ex) when (IsBenignHooksDirFailure(ex))
+        {
+            // Best effort only: git surfaces an unusable hooks path loudly at
+            // the call site. Returning the path (rather than throwing and
+            // poisoning the Lazy) keeps the failure local and diagnosable.
+        }
+
+        return fallback;
+    }
+
+    private static string? PerUserDisabledHostHooksPath()
+    {
+        try
+        {
+            var baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrWhiteSpace(baseDir))
+            {
+                var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (string.IsNullOrWhiteSpace(profile))
+                    return null;
+                baseDir = Path.Combine(profile, ".cache");
+            }
+
+            return Path.GetFullPath(Path.Combine(baseDir, "CodeyBox", "disabled-host-hooks"));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+    }
+
+    private static bool TryEnsureRealDirectory(string path)
+    {
+        try
+        {
+            // Refuse links without following them: the target may live
+            // outside this user's directories.
+            if (new DirectoryInfo(path).LinkTarget is not null)
+                return false;
+
+            // A plain file at the path is unexpected state — refuse it rather
+            // than throwing (which the Lazy would cache) or deleting data.
+            if (File.Exists(path) && !Directory.Exists(path))
+                return false;
+
+            Directory.CreateDirectory(path);
+
+            // Re-check after creation so a link swapped in underneath is not
+            // used. The per-user parent is writable only by this user, so a
+            // cross-user swap here is impossible; this only fails closed on
+            // same-user weirdness.
+            var created = new DirectoryInfo(path);
+            if (!created.Exists || created.LinkTarget is not null)
+                return false;
+
+            TryRestrictToOwnerOnly(path);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryRestrictToOwnerOnly(string path)
+    {
+        // Tighten an inherited umask so group/other cannot write. Best
+        // effort: the per-user parent directory is the real guard, so a
+        // failure here must not fail the whole resolution.
+        try
+        {
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(
+                    path,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        catch (Exception ex) when (IsBenignHooksDirFailure(ex) || ex is PlatformNotSupportedException)
+        {
+            // Best effort only: the per-user parent directory is the real
+            // guard, so a failure here must not fail the whole resolution.
+        }
+    }
+
+    // Best-effort hooks-directory creation only ever swallows filesystem
+    // access failures; anything else still throws.
+    private static bool IsBenignHooksDirFailure(Exception ex) =>
+        ex is IOException or UnauthorizedAccessException;
+
     private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the
     // default for tests / minimal compositions). Composed with the global
@@ -562,8 +695,7 @@ public sealed partial class PipelineRunner
                 authFailureClassifier: _authFailureClassifier);
         _promptComposer = new PromptComposer();
         _costUsageRecorder = new CostUsageRecorder(_costStore, _usageStore, _costCalculator, _costExtractors, _log);
-        _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_disabledHostHooksPath);
+        _disabledHostHooksPath = SharedDisabledHostHooksPath;
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
         // The session-runner abstraction is the single seam: production
         // hands in the per-provider concrete session runner

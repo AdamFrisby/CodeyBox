@@ -23,6 +23,7 @@ public sealed class PausePickupTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem MakeItem(string projectId = "test") => new()

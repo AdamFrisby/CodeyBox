@@ -172,8 +172,8 @@ public sealed class ChangelogWebhookTests : IDisposable
 
 internal sealed class ChangelogWebhookFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = System.IO.Path.Combine(
-        System.IO.Path.GetTempPath(), $"codeybox-webhook-test-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-webhook-test-");
+    private string _dbPath => _scratch.DbPath("webhook-test.db");
 
     public SqliteWorkItemStore WorkItemStore { get; }
 
@@ -187,14 +187,14 @@ internal sealed class ChangelogWebhookFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = System.IO.Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = System.IO.Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = System.IO.Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = System.IO.Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 ["CodeyBox:Changelog:GitHubWebhookSecretEnvVar"] = "TEST_CHANGELOG_WEBHOOK_SECRET",
                 ["CodeyBox:Changelog:Enabled"] = "true",
             });
@@ -236,6 +236,8 @@ internal sealed class ChangelogWebhookFactory : WebApplicationFactory<Program>
         {
             WorkItemStore.Dispose();
             try { System.IO.File.Delete(_dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

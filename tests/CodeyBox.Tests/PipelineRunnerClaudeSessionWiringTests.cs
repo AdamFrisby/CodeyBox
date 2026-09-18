@@ -834,12 +834,16 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
             CloseFailuresRemaining = 1,
         };
 
+        // The forced close failure strands the worker VM by design (that is
+        // the scenario under test); track it so teardown removes the root.
+        await using var tracker = TrackingSandboxProvider.ForProcessSandbox();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             projectRepository: new InMemoryProjectRepository(project),
             claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
-            sessionAgentRunnerOverride: sessionRunner);
+            sessionAgentRunnerOverride: sessionRunner,
+            sandboxProvider: tracker);
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);

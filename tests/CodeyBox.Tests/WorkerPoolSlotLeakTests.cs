@@ -32,6 +32,7 @@ public sealed class WorkerPoolSlotLeakTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
     private static WorkItem MakeItem(WorkItemState state = WorkItemState.Queued) => new()

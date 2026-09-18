@@ -5,8 +5,8 @@ namespace CodeyBox.Tests;
 
 public sealed class SqliteQuotaFailureStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-quota-failures-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-quota-failures-");
+    private string _dbPath => _scratch.DbPath("quota-failures.db");
     private readonly SqliteQuotaFailureStore _store;
 
     public SqliteQuotaFailureStoreTests() => _store = new SqliteQuotaFailureStore(_dbPath);
@@ -17,6 +17,7 @@ public sealed class SqliteQuotaFailureStoreTests : IDisposable
         foreach (var path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
         {
             try { File.Delete(path); } catch { }
+            _scratch.Dispose();
         }
     }
 

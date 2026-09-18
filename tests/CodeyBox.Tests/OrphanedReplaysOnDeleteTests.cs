@@ -147,6 +147,7 @@ public sealed class OrphanedReplaysOnDeleteTests : IDisposable
         finally
         {
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 

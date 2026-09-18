@@ -11,8 +11,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class RetentionSweepTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-retention-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-retention-");
+    private string _dbPath => _scratch.DbPath("retention.db");
     private readonly SqliteAuditReportStore _store;
 
     public RetentionSweepTests()
@@ -26,6 +26,8 @@ public sealed class RetentionSweepTests : IDisposable
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static AuditReport MakeAt(DateTimeOffset startedAt) => new()

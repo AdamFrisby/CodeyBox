@@ -6,8 +6,8 @@ namespace CodeyBox.Tests;
 
 public sealed class SqliteTimingStoreTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-timing-test-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-timing-test-");
+    private string _dbPath => _scratch.DbPath("timing-test.db");
     private readonly SqliteConnection _rawConn;
     private readonly SqliteTimingStore _store;
 
@@ -35,6 +35,8 @@ public sealed class SqliteTimingStoreTests : IDisposable
         _store.Dispose();
         _rawConn.Dispose();
         try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     private static WorkItemId NewId() => new(Guid.NewGuid());

@@ -74,6 +74,7 @@ public sealed class ThinkingBlockQuotaClassificationTests
             now));
 
         try { File.Delete(dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(dbPath);
     }
 
     [Fact]

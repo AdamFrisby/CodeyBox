@@ -37,7 +37,8 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class ReleaseE2eRegressionTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"cb-e2e-reg-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("cb-e2e-reg-");
+    private string _dbPath => _scratch.DbPath("e2e-reg.db");
     private readonly SqliteReleaseStore _releaseStore;
     private readonly SqliteWorkItemStore _workItemStore;
     private readonly SqliteTestCaseStore _testCaseStore;
@@ -59,6 +60,8 @@ public sealed class ReleaseE2eRegressionTests : IDisposable
         _workItemStore.Dispose();
         _releaseStore.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     // ── 1. Store persistence tests ──────────────────────────────────────────
@@ -922,8 +925,8 @@ public sealed class ReleaseE2eRegressionTests : IDisposable
 
     private sealed class ReleaseE2eApiFactory : WebApplicationFactory<Program>
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"cb-e2e-api-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("cb-e2e-api-");
+        private string _dbPath => _scratch.DbPath("e2e-api.db");
 
         public SqliteReleaseStore ReleaseStore { get; }
         public SqliteWorkItemStore WorkItemStore { get; }
@@ -939,14 +942,14 @@ public sealed class ReleaseE2eRegressionTests : IDisposable
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -978,6 +981,8 @@ public sealed class ReleaseE2eRegressionTests : IDisposable
                 WorkItemStore.Dispose();
                 ReleaseStore.Dispose();
                 try { File.Delete(_dbPath); } catch { }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
             }
             base.Dispose(disposing);
         }

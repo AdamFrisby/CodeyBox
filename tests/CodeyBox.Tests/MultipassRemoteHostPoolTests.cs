@@ -546,6 +546,7 @@ public sealed class MultipassRemoteHostPoolTests
             await service.StopAsync(CancellationToken.None);
             service.Dispose();
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 

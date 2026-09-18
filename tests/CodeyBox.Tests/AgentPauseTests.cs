@@ -11,13 +11,13 @@ namespace CodeyBox.Tests;
 
 public sealed class AgentPauseTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(),
-        $"codeybox-agent-pause-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-agent-pause-");
+    private string _dbPath => _scratch.DbPath("agent-pause.db");
 
     public void Dispose()
     {
-        try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.ClearSqlitePools();
+        _scratch.Dispose();
     }
 
     [Fact]
@@ -1286,12 +1286,12 @@ public sealed class AgentPauseTests : IDisposable
         Assert.Equal(resumeState, AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom));
     }
 
-    private static PipelineRunner BuildRealAgentControlPipeline(
+    private PipelineRunner BuildRealAgentControlPipeline(
         IWorkItemStore store,
         IAgentPauseController? pauses,
         IWebhookDispatcher webhooks)
     {
-        var gitRoot = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-git-{Guid.NewGuid():N}");
+        var gitRoot = Path.Combine(_scratch.DirectoryPath, $"git-{Guid.NewGuid():N}");
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);

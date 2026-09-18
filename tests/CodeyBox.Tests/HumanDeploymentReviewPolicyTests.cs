@@ -16,12 +16,14 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class HumanDeploymentReviewPolicyTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-human-policy-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-human-policy-");
+    private string _dbPath => _scratch.DbPath("human-policy.db");
 
     public void Dispose()
     {
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     // ── Pure policy ─────────────────────────────────────────────────────────

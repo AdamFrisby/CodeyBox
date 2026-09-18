@@ -666,6 +666,7 @@ public sealed class HotReloadConfigTests
         finally
         {
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 

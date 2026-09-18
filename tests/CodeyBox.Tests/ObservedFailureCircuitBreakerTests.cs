@@ -9,7 +9,8 @@ namespace CodeyBox.Tests;
 
 public sealed class ObservedFailureCircuitBreakerTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-quota-breaker-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-quota-breaker-");
+    private string _dbPath => _scratch.DbPath("quota-breaker.db");
     private readonly SqliteQuotaFailureStore _failures;
     private readonly IQuotaFailureClassifier _classifier = new CompositeQuotaFailureClassifier(
     [
@@ -24,6 +25,8 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     {
         _failures.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     [Fact]

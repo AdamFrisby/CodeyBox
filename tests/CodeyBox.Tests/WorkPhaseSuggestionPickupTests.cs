@@ -153,7 +153,8 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PreemptBlockingAgentLogAgent();
         var logger = new CapturingLogger<PipelineRunner>();
-        using var setup = BuildPipelineWith(agent, _workspace, seed, logger: logger);
+        await using var tracker = TrackingSandboxProvider.ForProcessSandbox();
+        using var setup = BuildPipelineWith(agent, _workspace, seed, logger: logger, sandboxProvider: tracker);
 
         var item = NewItem("feature/agentlog-preempt");
         await setup.Store.CreateAsync(item);
@@ -293,7 +294,8 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
         string workspace,
         string seedRepoUrl,
         IReadOnlyList<IAuditor>? auditors = null,
-        ILogger<PipelineRunner>? logger = null)
+        ILogger<PipelineRunner>? logger = null,
+        ISandboxProvider? sandboxProvider = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -303,7 +305,8 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
-        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var sandboxes = sandboxProvider
+            ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var registry = new AgentRegistry([agent]);
         var webhooks = new CapturingWebhookDispatcher();

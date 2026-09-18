@@ -27,16 +27,22 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     private static readonly TimeSpan SpawnPacingBranchInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan SpawnPacingEarlyExitTimeout = TimeSpan.FromSeconds(4);
 
-    private readonly string _dbPath =
-        Path.Combine(Path.GetTempPath(), $"codeybox-slot-release-wake-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-slot-release-wake-");
+    private readonly string _dbPath;
     private readonly SqliteWorkItemStore _store;
 
-    public WorkerPoolSlotReleaseWakeTests() => _store = new SqliteWorkItemStore(_dbPath);
+    public WorkerPoolSlotReleaseWakeTests()
+    {
+        _dbPath = _scratch.DbPath("slot-release-wake.db");
+        _store = new SqliteWorkItemStore(_dbPath);
+    }
 
     public void Dispose()
     {
         _store.Dispose();
         try { File.Delete(_dbPath); } catch { }
+        TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+        _scratch.Dispose();
     }
 
     [Fact]

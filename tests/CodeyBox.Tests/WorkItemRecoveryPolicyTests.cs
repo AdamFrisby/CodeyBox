@@ -250,6 +250,7 @@ public sealed class WorkItemRecoveryPolicyTests
         finally
         {
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 
@@ -289,6 +290,7 @@ public sealed class WorkItemRecoveryPolicyTests
         finally
         {
             try { File.Delete(dbPath); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(dbPath);
         }
     }
 

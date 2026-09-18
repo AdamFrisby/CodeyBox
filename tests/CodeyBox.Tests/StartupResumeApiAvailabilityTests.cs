@@ -293,8 +293,8 @@ public sealed class StartupResumeApiAvailabilityTests
         private readonly IReadOnlyDictionary<string, string?>? _reloadBeforeStartup;
         private readonly bool _isolateStartupResumeHostedServices;
         private readonly ReloadableConfigurationSource _configSource;
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-startup-resume-api-{Guid.NewGuid():N}.db");
+        private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-startup-resume-api-");
+        private string _dbPath => _scratch.DbPath("startup-resume-api.db");
 
         public SqliteWorkItemStore Store { get; }
         public SqliteWorkerRegistry Registry { get; }
@@ -402,6 +402,8 @@ public sealed class StartupResumeApiAvailabilityTests
                 Store.Dispose();
                 Registry.Dispose();
                 try { File.Delete(_dbPath); } catch { }
+                TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+                _scratch.Dispose();
                 return;
             }
             base.Dispose(disposing);
@@ -409,15 +411,15 @@ public sealed class StartupResumeApiAvailabilityTests
 
         private Dictionary<string, string?> BuildInitialConfig()
         {
-            var tmp = Path.GetTempPath();
             var values = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 ["CodeyBox:Smoke:Enabled"] = "false",
                 ["CodeyBox:Smoke:InVm:Enabled"] = "false",
                 ["CodeyBox:Shutdown:SandboxResumeMode"] = _mode.ToString(),

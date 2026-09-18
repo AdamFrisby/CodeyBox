@@ -256,8 +256,8 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
 /// </summary>
 public sealed class DiffApiFactory : WebApplicationFactory<Program>
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-diff-test-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-diff-test-");
+    private string _dbPath => _scratch.DbPath("diff-test.db");
 
     public readonly string GitRootDir = Path.Combine(
         Path.GetTempPath(), $"diff-git-{Guid.NewGuid():N}");
@@ -275,14 +275,14 @@ public sealed class DiffApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
+                ["CodeyBox:GitHubAppStorePath"] = Path.Combine(_scratch.DirectoryPath, "github-apps"),
                 ["CodeyBox:GitRootDirectory"] = GitRootDir,
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"diff-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"diff-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "diff-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "diff-audit.json"),
             });
         });
         builder.ConfigureTestServices(services =>
@@ -308,7 +308,9 @@ public sealed class DiffApiFactory : WebApplicationFactory<Program>
         {
             Store.Dispose();
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
             try { Directory.Delete(GitRootDir, recursive: true); } catch { /* best-effort */ }
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

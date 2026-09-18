@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Tests;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -18,12 +19,9 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
     private readonly bool _disableAuth;
     private readonly Dictionary<string, string?> _configuration;
     private readonly IProjectRepository? _projects;
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(),
-        $"codeybox-projects-config-uat-{Guid.NewGuid():N}.db");
-    private readonly string _githubAppStorePath = Path.Combine(
-        Path.GetTempPath(),
-        $"codeybox-github-apps-uat-{Guid.NewGuid():N}");
+    private readonly string _dbPath;
+    private readonly TestScratchDirectory _scratch;
+    private readonly string _githubAppStorePath;
 
     public ProjectsAndConfigurationApiFactory(
         string environment = "Development",
@@ -31,6 +29,9 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
         Dictionary<string, string?>? configuration = null,
         IProjectRepository? projects = null)
     {
+        _scratch = TestScratchDirectory.Create("codeybox-projects-config-uat-");
+        _dbPath = _scratch.DbPath("projects-config-uat.db");
+        _githubAppStorePath = Path.Combine(_scratch.DirectoryPath, "github-apps");
         _environment = environment;
         _disableAuth = disableAuth;
         _configuration = configuration ?? [];
@@ -48,16 +49,15 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             cfg.Sources.Clear();
-            var tmp = Path.GetTempPath();
             var config = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = _disableAuth ? "true" : "false",
                 ["CodeyBox:SandboxProvider"] = "process",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-log.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-audit.json"),
+                ["CodeyBox:AgentStreams:Path"] = Path.Combine(_scratch.DirectoryPath, "test-agent-streams"),
                 ["CodeyBox:GitHubAppStorePath"] = _githubAppStorePath,
                 ["CodeyBox:Changelog:Enabled"] = "false",
             };
@@ -91,7 +91,8 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
             WorkItemStore.Dispose();
             ReleaseStore.Dispose();
             try { File.Delete(_dbPath); } catch { }
-            try { Directory.Delete(_githubAppStorePath, recursive: true); } catch { }
+            TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
+            _scratch.Dispose();
         }
         base.Dispose(disposing);
     }

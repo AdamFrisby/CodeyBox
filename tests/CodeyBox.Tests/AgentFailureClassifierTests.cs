@@ -795,6 +795,7 @@ public sealed class AgentFailureClassifierTests
     {
         ["CodeyBox:DangerouslyDisableAuth"] = "true",
         ["CodeyBox:StateDatabasePath"] = Path.Combine(root, "state.db"),
+        ["CodeyBox:GitHubAppStorePath"] = Path.Combine(root, "github-apps"),
         ["CodeyBox:GitRootDirectory"] = Path.Combine(root, "git"),
         ["CodeyBox:AuditLog:Path"] = Path.Combine(root, "logs", "api-.json"),
         ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(root, "logs", "audit-.json"),
