@@ -349,7 +349,7 @@ public sealed partial class PipelineRunner
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, conflictReworkTarget, item.BaselineImageRef),
                 credentialRunner: runner,
-                projectSecretEnvironment: ResolveProjectSecretEnvironment(project, ProjectSandboxSecretScopes.Rework));
+                projectSecretEnvironment: ResolveProjectSecretEnvironment(project, item.Id, ProjectSandboxSecretScopes.Rework));
 
             // Release-then-acquire (same pool-deadlock rationale as the merge
             // phase above): conflict rework provisions its own sandbox while a

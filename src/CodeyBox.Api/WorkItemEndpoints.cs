@@ -2919,7 +2919,13 @@ internal static class WorkItemEndpoints
             p.SandboxSecrets.Select(secret => new ProjectSandboxSecretDto(
                 secret.HostEnvVar,
                 secret.SandboxEnvVar,
-                secret.Scopes)).ToList());
+                secret.Group,
+                secret.Scopes)).ToList(),
+            p.SandboxSecretGrants.Select(grant => new ProjectSandboxSecretGrantDto(
+                grant.Group,
+                grant.WorkItemId?.ToString("N"),
+                grant.IsProjectWide,
+                grant.IsImplicit)).ToList());
     }
 
     private const int GlobalMinPriority = -1000;
@@ -3411,7 +3417,8 @@ public sealed record ProjectDto(
     IReadOnlyList<string> AuditTypes,
     int AuditMaxIterations,
     bool HasSandboxSecrets = false,
-    IReadOnlyList<ProjectSandboxSecretDto>? SandboxSecrets = null);
+    IReadOnlyList<ProjectSandboxSecretDto>? SandboxSecrets = null,
+    IReadOnlyList<ProjectSandboxSecretGrantDto>? SecretGrants = null);
 
 /// <summary>
 /// Names-only view of one project sandbox secret. Never carries a value.
@@ -3419,7 +3426,18 @@ public sealed record ProjectDto(
 public sealed record ProjectSandboxSecretDto(
     string HostEnvVar,
     string SandboxEnvVar,
+    string Group,
     IReadOnlyList<string> Scopes);
+
+/// <summary>
+/// Operator audit view of one secret-group grant. Names the group and,
+/// for work-item grants, the authorised work-item id. Never carries a value.
+/// </summary>
+public sealed record ProjectSandboxSecretGrantDto(
+    string Group,
+    string? WorkItemId,
+    bool IsProjectWide,
+    bool IsImplicit);
 
 public sealed record AnswerQuestionRequest(string QuestionId, string Answer);
 

@@ -321,6 +321,10 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var upstream = ResolveUpstream(pc.Upstream);
         ValidateUpstreamSeedCombination(pc.Id, pc.RepositoryUrl, upstream);
 
+        var sandboxSecrets = ResolveSandboxSecrets(pc.Id, pc.SandboxSecrets);
+        var sandboxSecretGrants = ResolveSecretGrants(pc.Id, pc.SecretGrants, sandboxSecrets);
+        ReportSandboxSecretAuthorisation(pc.Id, sandboxSecrets, sandboxSecretGrants);
+
         return new Project
         {
             Id = new ProjectId(pc.Id),
@@ -345,7 +349,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             Knobs = ResolveKnobs(pc.Id, pc.Knobs, defaults.Knobs),
             Deployment = ResolveDeployment(pc.Id, pc.Deployment),
             JobTrackExport = ResolveJobTrackExport(pc.Id, pc.JobTrackExport),
-            SandboxSecrets = ResolveSandboxSecrets(pc.Id, pc.SandboxSecrets),
+            SandboxSecrets = sandboxSecrets,
+            SandboxSecretGrants = sandboxSecretGrants,
         };
     }
 
@@ -422,6 +427,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     /// a POSIX identifier is rejected as a literal-looking secret with
     /// guidance to reference a host variable instead. Unknown phases fail the
     /// load; an omitted phase list resolves to the work+rework default.
+    /// An omitted group resolves to the implicit <c>default</c> group.
     /// </summary>
     internal static IReadOnlyList<ProjectSandboxSecret> ResolveSandboxSecrets(
         string projectId,
@@ -467,15 +473,145 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 throw new InvalidOperationException(
                     $"Project '{projectId}' {where} duplicates SandboxEnvVar '{sandboxName}': each sandbox " +
                     $"variable may be declared once per project.");
+            string group;
+            try
+            {
+                group = ProjectSandboxSecretGroups.NormalizeOrDefault(config.Group, $"Project '{projectId}' {where}.Group");
+            }
+            catch (ArgumentException ex)
+            {
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where} names an invalid secret group: {ex.Message}", ex);
+            }
             var scopes = ResolveSandboxSecretScopes(projectId, where, config.Phases);
             resolved.Add(new ProjectSandboxSecret
             {
                 HostEnvVar = hostName,
                 SandboxEnvVar = sandboxName,
+                Group = group,
                 Scopes = scopes,
             });
         }
         return resolved.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Binds and validates the operator-declared secret-group grants. A grant
+    /// names a group and applies project-wide unless <c>WorkItemId</c>
+    /// narrows it to one work item. Grants for groups the project declares no
+    /// secrets into fail the load (fail fast on typos); a group with no grant
+    /// is not an error — it simply injects nothing (default deny), reported
+    /// by <see cref="ReportUngrantedSecretGroups"/>. When the project carries
+    /// secrets but no operator grant authorises the <c>default</c> group, a
+    /// synthesised implicit project-wide migration grant keeps pre-grant flat
+    /// declarations working; the synthesis is logged, never silent.
+    /// </summary>
+    internal static IReadOnlyList<ProjectSandboxSecretGrant> ResolveSecretGrants(
+        string projectId,
+        List<ProjectSecretGrantConfig>? configs,
+        IReadOnlyList<ProjectSandboxSecret> secrets)
+    {
+        var resolved = new List<ProjectSandboxSecretGrant>(configs?.Count ?? 0);
+        if (configs is { Count: > 0 })
+        {
+            var declaredGroups = new HashSet<string>(
+                secrets.Select(secret => secret.Group), StringComparer.Ordinal);
+            var seen = new HashSet<(string Group, Guid? WorkItemId)>();
+            for (var index = 0; index < configs.Count; index++)
+            {
+                var config = configs[index];
+                var where = $"projects[{projectId}].SecretGrants[{index}]";
+                if (config is null)
+                    throw new InvalidOperationException($"Project '{projectId}' SecretGrants[{index}] is null.");
+                string group;
+                try
+                {
+                    group = ProjectSandboxSecretGroups.NormalizeOrDefault(config.Group, $"Project '{projectId}' {where}.Group");
+                }
+                catch (ArgumentException ex)
+                {
+                    throw new InvalidOperationException(
+                        $"Project '{projectId}' {where} names an invalid secret group: {ex.Message}", ex);
+                }
+                if (string.Equals(group, ProjectSandboxSecretGroups.Default, StringComparison.Ordinal)
+                    && string.IsNullOrWhiteSpace(config.Group))
+                    throw new InvalidOperationException(
+                        $"Project '{projectId}' {where}.Group is required: name the secret group this grant authorises. " +
+                        $"A grant with no group would silently authorise the migration group, " +
+                        $"so the declaration must be explicit.");
+                if (!declaredGroups.Contains(group))
+                    throw new InvalidOperationException(
+                        $"Project '{projectId}' {where} grants secret group '{group}' which declares no secrets: " +
+                        $"each grant must name a group used by at least one SandboxSecrets entry.");
+                Guid? workItemId = null;
+                var rawItemId = config.WorkItemId?.Trim() ?? string.Empty;
+                if (rawItemId.Length > 0)
+                {
+                    if (!Guid.TryParse(rawItemId, out var parsed))
+                        throw new InvalidOperationException(
+                            $"Project '{projectId}' {where}.WorkItemId is not a valid work-item id (GUID): " +
+                            $"grants match on exact work-item identity, so a non-id value can never match.");
+                    workItemId = parsed;
+                }
+                if (!seen.Add((group, workItemId)))
+                    throw new InvalidOperationException(
+                        $"Project '{projectId}' {where} duplicates a grant for secret group '{group}'" +
+                        (workItemId is null ? " (project-wide)" : " for the same work item") +
+                        ": each (group, work-item) grant may be declared once per project.");
+                resolved.Add(new ProjectSandboxSecretGrant { Group = group, WorkItemId = workItemId });
+            }
+        }
+        if (secrets.Count > 0
+            && secrets.Any(secret => string.Equals(secret.Group, ProjectSandboxSecretGroups.Default, StringComparison.Ordinal))
+            && !resolved.Any(grant => string.Equals(grant.Group, ProjectSandboxSecretGroups.Default, StringComparison.Ordinal)))
+        {
+            resolved.Add(new ProjectSandboxSecretGrant
+            {
+                Group = ProjectSandboxSecretGroups.Default,
+                IsImplicit = true,
+            });
+        }
+        return resolved.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Reports the default-deny outcome at config-load time so a project that
+    /// declares secrets but grants nothing says so in the logs instead of
+    /// silently injecting nothing. Groups without any matching grant are
+    /// listed (names only); the migration grant for the <c>default</c> group
+    /// is reported as an explicit mapping, not implied.
+    /// </summary>
+    private void ReportSandboxSecretAuthorisation(
+        string projectId,
+        IReadOnlyList<ProjectSandboxSecret> secrets,
+        IReadOnlyList<ProjectSandboxSecretGrant> grants)
+    {
+        if (secrets.Count == 0)
+            return;
+        var implicitDefault = grants.FirstOrDefault(grant =>
+            grant.IsImplicit && string.Equals(grant.Group, ProjectSandboxSecretGroups.Default, StringComparison.Ordinal));
+        if (implicitDefault is not null)
+        {
+            _logger.LogInformation(
+                "Project {ProjectId} maps pre-grant SandboxSecrets declarations into secret group '{Group}' " +
+                "with an implicit project-wide grant: existing flat declarations keep working. " +
+                "Declare explicit SecretGrants to move to default-deny.",
+                projectId, ProjectSandboxSecretGroups.Default);
+        }
+        var ungranted = secrets
+            .Select(secret => secret.Group)
+            .Distinct(StringComparer.Ordinal)
+            .Where(group => !grants.Any(grant => string.Equals(grant.Group, group, StringComparison.Ordinal)))
+            .OrderBy(group => group, StringComparer.Ordinal)
+            .ToList();
+        foreach (var group in ungranted)
+        {
+            var count = secrets.Count(secret => string.Equals(secret.Group, group, StringComparison.Ordinal));
+            _logger.LogWarning(
+                "Project {ProjectId} secret group '{Group}' has no matching grant: {Count} secret(s) " +
+                "will not be injected into any sandbox (default deny). Declare a SecretGrants entry to authorise it.",
+                projectId, group, count);
+        }
     }
 
     private static IReadOnlyList<string> ResolveSandboxSecretScopes(

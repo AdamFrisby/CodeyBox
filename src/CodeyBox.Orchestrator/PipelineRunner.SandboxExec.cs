@@ -182,13 +182,17 @@ public sealed partial class PipelineRunner
 
     /// <summary>
     /// Resolves the project's sandbox secrets for <paramref name="scope"/>
-    /// from live host environment state. Returns an empty map when the
-    /// project declares nothing for the scope. Values are never logged here;
-    /// the resolver emits names-only warnings for unset host variables.
+    /// authorised for <paramref name="workItemId"/> from live host
+    /// environment state. Returns an empty map when the project declares
+    /// nothing for the scope or no grant authorises it (default deny — never
+    /// an error). Values are never logged here; the resolver emits
+    /// names-only warnings for unset host variables and names-only records
+    /// of each granted injection.
     /// </summary>
-    private IReadOnlyDictionary<string, string> ResolveProjectSecretEnvironment(Project project, string scope)
+    private IReadOnlyDictionary<string, string> ResolveProjectSecretEnvironment(
+        Project project, WorkItemId workItemId, string scope)
         => ProjectSandboxSecretResolver.ResolveForScope(
-            project, scope, Environment.GetEnvironmentVariable, _log);
+            project, workItemId, scope, Environment.GetEnvironmentVariable, _log);
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {

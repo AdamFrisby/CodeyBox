@@ -100,7 +100,7 @@ public sealed partial class PipelineRunner
                 item.BaselineImageRef),
             includeAgentTurnScratchpadTmpfs: true,
             credentialRunner: runner,
-            projectSecretEnvironment: ResolveProjectSecretEnvironment(project, agentPhase)) with
+            projectSecretEnvironment: ResolveProjectSecretEnvironment(project, item.Id, agentPhase)) with
         {
             RecoveryLease = item.AgentTurnRecoveryLease,
         };

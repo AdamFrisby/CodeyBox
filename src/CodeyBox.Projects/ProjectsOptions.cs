@@ -114,6 +114,17 @@ public sealed class ProjectConfig
     /// <see cref="CodeyBox.Core.Project.SandboxSecrets"/> after resolution.
     /// </summary>
     public List<ProjectSandboxSecretConfig>? SandboxSecrets { get; set; }
+
+    /// <summary>
+    /// Operator-declared grants authorising secret groups for this project.
+    /// A secret is injected only when its group has a matching grant
+    /// (default deny). Each grant names a group and applies project-wide
+    /// unless narrowed to one work item via <see
+    /// cref="ProjectSecretGrantConfig.WorkItemId"/>. Null/empty = no
+    /// operator grants. Maps to <see
+    /// cref="CodeyBox.Core.Project.SandboxSecretGrants"/> after resolution.
+    /// </summary>
+    public List<ProjectSecretGrantConfig>? SecretGrants { get; set; }
 }
 
 /// <summary>
@@ -136,6 +147,36 @@ public sealed class ProjectSandboxSecretConfig
     /// Null/empty = <c>work</c> + <c>rework</c>.
     /// </summary>
     public List<string>? Phases { get; set; }
+
+    /// <summary>
+    /// Secret group this secret is declared into. The group is the unit of
+    /// authorisation: injection requires an operator grant for the group
+    /// (see <see cref="ProjectConfig.SecretGrants"/>). Null/empty = the
+    /// implicit <c>default</c> group, which the repository keeps working via
+    /// a synthesised project-wide grant for pre-grant configurations.
+    /// </summary>
+    public string? Group { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for one <see cref="CodeyBox.Core.ProjectSandboxSecretGrant"/>.
+/// Lives under <c>CodeyBox:Projects:&lt;id&gt;:SecretGrants</c> as a list.
+/// A grant names a group and applies project-wide unless <see cref="WorkItemId"/>
+/// narrows it to a single work item. Only project identity (which project
+/// declares the grant) and work-item identity participate in matching — no
+/// work-item content field is consulted.
+/// </summary>
+public sealed class ProjectSecretGrantConfig
+{
+    /// <summary>Secret group this grant authorises. Required.</summary>
+    public string? Group { get; set; }
+
+    /// <summary>
+    /// Optional work-item id (GUID: <c>N</c>, <c>D</c>, <c>B</c> or <c>P</c>
+    /// format) narrowing this grant to a single work item. Null/empty =
+    /// project-wide: every item in the project.
+    /// </summary>
+    public string? WorkItemId { get; set; }
 }
 
 /// <summary>

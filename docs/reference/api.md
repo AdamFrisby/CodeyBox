@@ -1208,14 +1208,24 @@ Response: `200 OK` with a JSON array of project records:
       {
         "hostEnvVar": "CODEYBOX_OPENROUTER_API_KEY",
         "sandboxEnvVar": "OPENROUTER_API_KEY",
+        "group": "default",
         "scopes": ["work", "rework"]
+      }
+    ],
+    "secretGrants": [
+      {
+        "group": "default",
+        "workItemId": null,
+        "isProjectWide": true,
+        "isImplicit": true
       }
     ]
   }
 ]
 ```
 
-`sandboxSecrets` carries names and scopes only — never values. See
+`sandboxSecrets` carries names, groups, and scopes only — never values —
+and `secretGrants` carries the authorising grants. See
 [Project sandbox secrets](../concepts/projects.md#project-sandbox-secrets).
 
 ### `GET /projects/{id}`
