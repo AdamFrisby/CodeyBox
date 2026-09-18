@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -64,10 +65,15 @@ public sealed class PipelineRunnerSandboxSyncTests : IDisposable
     }
 
     [Fact]
-    public async Task WorkPhase_DisposeFailureAfterSuccessfulPhase_FailsItemInsteadOfSwallowing()
+    public async Task WorkPhase_DisposeFailureAfterSuccessfulPhase_DoesNotFailItemButStaysLogged()
     {
+        // Teardown after completed work is an operational event, not the
+        // item's outcome: a work-sandbox disposal failure must stay surfaced
+        // (logged with item context) without failing the item whose work
+        // already completed.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var sandboxProvider = new DisposeFailingSandboxProvider();
+        var pipelineLog = new CapturingLogger<PipelineRunner>();
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             EnableSandboxReuse = false
@@ -77,6 +83,7 @@ public sealed class PipelineRunnerSandboxSyncTests : IDisposable
             seed,
             sandboxProvider: sandboxProvider,
             pipelineTuning: tuning,
+            logger: pipelineLog,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("dispose-marker.txt", "work completed\n"));
 
@@ -96,8 +103,19 @@ public sealed class PipelineRunnerSandboxSyncTests : IDisposable
         Assert.Equal(1, sandboxProvider.DisposeCalls);
         var persisted = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(persisted);
-        Assert.Equal(WorkItemState.Failed, persisted!.State);
-        Assert.Contains("dispose failed after successful phase", persisted.LastError);
+        Assert.Equal(WorkItemState.Done, persisted!.State);
+        Assert.DoesNotContain("dispose failed after successful phase", persisted.LastError ?? string.Empty);
+
+        var teardownWarning = Assert.Single(
+            pipelineLog.Entries,
+            entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains(
+                    "Sandbox disposal failed after successful phase",
+                    StringComparison.Ordinal));
+        Assert.Contains(
+            "dispose failed after successful phase",
+            teardownWarning.Exception?.Message ?? string.Empty,
+            StringComparison.Ordinal);
     }
 
     private sealed class SyncFailingSandboxProvider : ISandboxProvider

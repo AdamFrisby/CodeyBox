@@ -2575,7 +2575,11 @@ public sealed class IncusSandboxProvider :
             options.OperationTimeout,
             ct).ConfigureAwait(false);
 
-    private async Task StopInstanceAsync(
+    /// <summary>
+    /// Stops an Incus instance. Internal (not private) so teardown-resilience
+    /// tests can drive the exact CLI sequence without provisioning a full VM.
+    /// </summary>
+    internal async Task StopInstanceAsync(
         IncusSandboxOptions options,
         string name,
         bool stateful,
@@ -2584,13 +2588,49 @@ public sealed class IncusSandboxProvider :
         var argv = IncusCommandBuilder.Prefix(options, "stop", name, "--timeout", Math.Max(1, (int)options.VmStopTimeout.TotalSeconds).ToString(CultureInfo.InvariantCulture));
         if (stateful)
             argv.Add("--stateful");
-        await _cli.RunCheckedAsync(
-            stateful ? "stateful VM stop" : "VM stop",
-            options,
-            argv,
-            stdin: null,
-            options.VmStopTimeout + options.OperationTimeout,
-            ct).ConfigureAwait(false);
+        try
+        {
+            await _cli.RunCheckedAsync(
+                stateful ? "stateful VM stop" : "VM stop",
+                options,
+                argv,
+                stdin: null,
+                options.VmStopTimeout + options.OperationTimeout,
+                ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IncusBenignTeardown.IsBenignApparmorProfileTeardown(ex))
+        {
+            // The AppArmor profile was already unloaded when incus asked to
+            // unload it — the desired end state. Absorb the failure only when
+            // a follow-up probe proves the instance actually stopped (or is
+            // gone); any other state, or an unverifiable state, keeps the
+            // original failure so a real teardown problem stays reported and
+            // the instance stays visible in the managed inventory.
+            var stopped = false;
+            try
+            {
+                var instance = await FindInstanceAsync(options, name, ct).ConfigureAwait(false);
+                stopped = instance is null
+                    || string.Equals(instance.Status, "STOPPED", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception probeEx)
+            {
+                _log.LogWarning(
+                    probeEx,
+                    "Incus VM stop for {InstanceName} reported benign already-unloaded AppArmor profile teardown but the instance state could not be verified; keeping the original failure",
+                    name);
+            }
+
+            if (!stopped)
+            {
+                throw;
+            }
+
+            _log.LogInformation(
+                ex,
+                "Incus VM stop for {InstanceName} reported benign already-unloaded AppArmor profile teardown and the instance verified stopped or absent; treating stop as successful",
+                name);
+        }
     }
 
     private async Task DeleteInstanceAsync(IncusSandboxOptions options, string name, CancellationToken ct) =>
