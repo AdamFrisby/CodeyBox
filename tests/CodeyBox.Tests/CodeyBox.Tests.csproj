@@ -81,6 +81,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Omp\CodeyBox.Agents.Omp.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Continue\CodeyBox.Agents.Continue.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Qwen\CodeyBox.Agents.Qwen.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents.Crush\CodeyBox.Agents.Crush.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.DotNetOpencode\CodeyBox.Agents.DotNetOpencode.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.CavemanCode\CodeyBox.Agents.CavemanCode.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Git\CodeyBox.Git.csproj" />

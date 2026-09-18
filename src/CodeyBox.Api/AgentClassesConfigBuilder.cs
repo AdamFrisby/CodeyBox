@@ -10,6 +10,7 @@ using CodeyBox.Agents.Opencode;
 using CodeyBox.Agents.Kilo;
 using CodeyBox.Agents.Omp;
 using CodeyBox.Agents.Continue;
+using CodeyBox.Agents.Crush;
 using CodeyBox.Agents.Pi;
 using CodeyBox.Agents.Prime;
 using CodeyBox.Agents.Qwen;
@@ -128,6 +129,8 @@ public static class AgentClassesConfigBuilder
                     QwenKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.Cmd)
                     CmdKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
+                if (agentKind == AgentKind.Crush)
+                    CrushKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 if (agentKind == AgentKind.DotNetOpencode)
                     DotNetOpencodeKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 // Capabilities are operator-declared tags. Normalise (trim + drop empties)

@@ -2152,3 +2152,151 @@ undeclared-model advisory (exit 0, sent anyway), `Model not found` without a
 provider shape (configuration, not quota), the `tool_hook_blocked` gate
 (dispatch configuration, not spend), and the `--effort` refusal (the runner
 never emits `--effort`).
+
+### Crush (`crush`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against @charmland/crush 0.95.0, 2026-09-18):
+
+```sh
+npm install -g @charmland/crush@0.95.0
+```
+
+Charm's agent CLI ([repo](https://github.com/charmbracelet/crush)).
+Node-based, binary `crush`, runs on Linux (Homebrew via
+`charmbracelet/tap/crush` is the macOS route — irrelevant: CodeyBox
+sandboxes are Linux). The `@0.95.0` pin keeps the bake deterministic —
+bump it only after re-verifying the headless contract below (the CLI warns
+that `crush.json` is deprecated in favour of `crushrc`, and flag names
+move: `--yolo` already exists only on the root command, not on `run`).
+
+**Non-interactive invocation.** The runner drives a one-shot headless run
+with the prompt on stdin and NO positional prompt argument:
+
+```sh
+crush run -q -m <provider/model> [--session <id> | --continue]
+```
+
+`run` is the one-shot contract ("Run a single non-interactive prompt and
+exit"); a bare `crush` starts an interactive TUI. The prior-art
+orchestrator (`Untrivial-ai/agent-orchestrator`) drives that TUI in a PTY
+because it wants a session a human steers — and rejects `run` outright to
+keep the TUI. One turn is exactly what CodeyBox wants (non-interactive,
+throwaway VM, no terminal, no human), so the runner takes the opposite
+branch: `run` only, which also sidesteps their hardcoded no-op activity
+deriver (they scrape the TUI for state; a one-shot run needs no scraping).
+The prompt travels on stdin (verified live: a piped-stdin prompt produced
+the reply normally, including a seeded-bug repo-edit run that fixed the
+file and exited 0): Linux's `MAX_ARG_STRLEN` is 128 KiB per argv element
+and rework prompts can exceed it. `-q/--quiet` hides the spinner so stdout
+carries only the reply. `-m/--model` takes `model` or `provider/model`
+(the shipped member uses the qualified OpenRouter form — `crush models`
+lists it natively). Success output is the model's plain text on stdout
+(which may legitimately be empty when the work landed in files); terminal
+failures exit 1 with a styled `ERROR` block on stderr and empty stdout —
+there is NO structured-output flag on `run`, so failure detection comes
+from the exit code plus text (see below), and cost/quota reads come from
+nowhere. Reasoning effort is never mapped: `--reasoning-effort` exists but
+accepted levels are model-dependent (unsupported values are rejected at
+dispatch), so emitting it could fail dispatches the way kilo's `--variant`
+would. `--session`/`--continue` resume handling is irrelevant one-shot —
+the runner dispatches each attempt fresh.
+
+**The autonomy non-trap.** Permissions are already auto-approved inside
+`run` (verified live: the repo-edit run changed files with no approval
+flag), so NO approval flag is emitted. `--yolo` is deliberately absent: it
+is a root-only flag and `crush run --yolo` hard-fails with `Unknown flag:
+--yolo` (verified live). A run that cannot change files would read as "no
+changes" and be misdiagnosed — the in-VM probe asserts the `run`
+subcommand advertises `--model` and `--quiet` (the runner's exact flags)
+precisely so a build that dropped the one-shot contract benches at smoke
+time instead of mis-failing first dispatch.
+
+**Authentication — bare env var, no config.** The CLI reads provider keys
+directly from the process environment (documented provider table includes
+`OPENROUTER_API_KEY`, plus ~20 others and the AWS/Vertex chains — the
+shipped member routes OpenRouter). Verified live on a bare machine with no
+crush config: the env var alone dispatched real runs. The runner therefore
+seeds NO guest config files; the key arrives through the shipped mapping
+(host `CODEYBOX_CRUSH_API_KEY` → `OPENROUTER_API_KEY`), never appears on
+argv, and rides only the sandbox process environment. `crush.json` is
+deprecated config and `~/.local/share/crush/crush.json` is now *state*,
+not config — the runner touches neither. Telemetry is on by default, so
+every dispatch carries `CRUSH_DISABLE_METRICS=1`. The guest needs
+`openrouter.ai` on `CodeyBox:AgentAllowedHosts` (shipped in the default)
+for the OpenRouter route. A `$0`-spend-limit OpenRouter key only serves ids
+ending `:free` — the CLI picks its own paid default when `-m` is omitted
+(verified: paid default fails with `forbidden: Key limit exceeded (total
+limit)`), so the runner FAILS FAST naming the missing model when neither
+the member nor `CodeyBox:AgentDefaults[crush]` names one, and never
+invents a model id. Never commit a provider key: `gitleaks` CI matches this
+key's shape. `~/.config/crush/crushrc` is the operator-owned global
+config escape hatch — the runner needs nothing there.
+
+**SECURITY — repo-local `crushrc` executes as shell.** Upstream documents
+this plainly ("Both `crushrc` and `crush.json` are trusted code; `crushrc`
+runs in a full shell… Don't launch Crush in a directory whose config you
+haven't reviewed") and CodeyBox launches Crush in exactly such a directory:
+a repository under work. Resolution order is `./.crushrc`, then
+`./crushrc`, then the user-global `~/.config/crush/crushrc` — the first
+two are repo content, and therefore UNTRUSTED. Verified live: a `./.crushrc`
+containing `echo MARKER >> marker.log` executed on `crush run` startup.
+The threat is contained, not catastrophic — dispatch happens in the
+disposable VM behind the host-enforced egress allowlist — but a shipped
+repo file could still exfiltrate the provider key through an allowed
+endpoint, sabotage the run, or fake success, so the decision is deliberate:
+the runner NEUTRALISES both repo-local names before every CLI-touching
+dispatch (`RunAsync`, `RunResumedAsync`, and the sandbox text-only path)
+by moving each present file to a unique
+`<name>.codeybox-quarantined-<run>` sibling (`test -f` probe first, so an
+absent file costs one cheap exec), and restores them afterwards in a
+`finally` so the working tree is left as found. A present file that cannot
+be moved fails the run closed with the named cause instead of dispatching
+with live repo shell; a restore that cannot complete leaves the run's own
+outcome intact and appends a visible `crushrc restore incomplete` note to
+stderr rather than failing the item over repo hygiene (or silently
+dropping the repo's file). The user-global `~/.config/crush/crushrc` is
+NOT touched — it is operator-provisioned baseline content, not repo
+content. Do not "simplify" this away: removing the quarantine re-opens
+arbitrary repo-shell execution on every dispatch.
+
+**Terminal failures.** Crush exits 1 on terminal run errors (verified: no
+key yields `No providers configured - please run 'crush' to set up a
+provider interactively.`; an unknown `-m` id yields `Failed to override
+models: large model "…" not found.`; a paid model on a `$0` key yields
+`Agent processing failed: failed to start agent processing stream:
+forbidden: Key limit exceeded (total limit)…` — all on stderr with empty
+stdout), so the runner lifts the marked line into `TerminalDiagnostic` via
+`CrushTerminalDiagnoser` (which scans BOTH streams — the markers are human
+rendering, not a stream-guaranteed envelope) and the pipeline's no-changes
+branch parks quota/auth give-ups instead of dead-lettering them as
+"produced no changes". A missing binary surfaces as exit 127 +
+command-not-found, classified as infrastructure — never as "no changes".
+Deliberately unmatched: the small-model title-generation advisory (`Error
+generating title with small model; trying next` — non-fatal; the run still
+exits 0 with the reply intact, so lifting it would mislabel success) and
+bare `ERROR` header lines without a marker (no cause).
+
+**Cost.** The transport carries no usage, so `CrushCostExtractor` always
+returns null (unknown) — never a zero that looks like data — and per-run
+rows fall back to elapsed-time attribution. No built-in fallback rate is
+shipped (multi-provider front, unrelated per-token economics) — the
+shipped free-tier member bills $0 via the explicit zero-rate bucket keyed
+by the qualified `-m` dispatch id.
+
+**Quota probe.** Ships as Unknown-only: `crush stats` renders an HTML usage
+report with no machine-readable balance, so no probe is registered (an
+agent with no readable quota meter must not ship a probe that fabricates
+one) and members fall through to the `NullQuotaProbe` unknown path. The
+router's `QuotaUnknownPolicy` (default `UseObservedFailures`) gates
+dispatch via observed failure history, and `CrushQuotaFailureDetector`
+classifies the relayed failures (`Key limit exceeded` → LimitReached;
+`No providers configured` → Unauthorized; shared 429 rows →
+RateLimitExceeded; standard relay auth vocabulary → Unauthorized) with
+operator-extensible rows under `CodeyBox:QuotaFailurePatterns:crush`.
+Deliberately unmatched: `Failed to override models: … not found` (an
+unknown model id is configuration, not quota — mirroring kilo's `Model not
+found` exclusion), `Unknown flag` (dispatch construction, which the
+runner's pinned argv cannot produce), and quota/401 prose from reviewed
+repository content (patterns stay anchored to provider-shaped sentences).
