@@ -17,7 +17,16 @@ public sealed class MultiHostE2eExecutionPool : IE2eExecutionPool, IManagedSandb
     private readonly ILogger<MultiHostE2eExecutionPool> _logger;
     private readonly ResizableConcurrencyGate _globalGate;
     private readonly Func<string?> _fallbackImageReference;
-    private long _nextHost;
+
+    /// <summary>
+    /// Advisory recheck interval carried on the placement-refusal exception.
+    /// The refusal is permanent under the current host registration (no host
+    /// matches the lease requirements even with zero load), so no value here
+    /// would make a retry succeed; the constant only satisfies the deferral
+    /// envelope for retry-aware callers. Deliberately a constant, not a
+    /// config knob: there is nothing operational to tune.
+    /// </summary>
+    private static readonly TimeSpan PlacementRefusalRecheckIn = TimeSpan.FromMinutes(1);
 
     public MultiHostE2eExecutionPool(
         IReadOnlyList<E2eExecutionHost> hosts,
@@ -87,26 +96,132 @@ public sealed class MultiHostE2eExecutionPool : IE2eExecutionPool, IManagedSandb
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var host = TryEnterHost();
+            var host = TryEnterPlacedHost();
             if (host is not null)
                 return host;
 
+            // The pool keeps its 25ms poll rather than waiting on a gate:
+            // ResizableConcurrencyGate.WaitAsync acquires a permit when it
+            // completes, so waiting on every host gate at once would
+            // over-admit. Polling with TryEnter keeps admission exact while
+            // the shared decider picks which host to probe each round.
             await Task.Delay(TimeSpan.FromMilliseconds(25), ct).ConfigureAwait(false);
         }
     }
 
-    private HostEntry? TryEnterHost()
+    /// <summary>
+    /// One placement round: projects the pool hosts to placement members and
+    /// asks the shared <see cref="ExecutorPlacement"/> decider which host
+    /// serves the current lease requirements. Returns null when every
+    /// requirements-matching host is at capacity (the caller polls again);
+    /// throws a placement refusal when no host matches the requirements even
+    /// with zero load, so a mis-profiled lease fails fast instead of hanging
+    /// until cancellation or landing on a host that cannot serve it.
+    /// </summary>
+    /// <exception cref="SandboxProvisioningDeferredException">
+    /// Thrown when no registered host matches the lease requirements.
+    /// </exception>
+    private HostEntry? TryEnterPlacedHost()
     {
-        var start = Interlocked.Increment(ref _nextHost) & long.MaxValue;
-        for (var i = 0; i < _hosts.Count; i++)
+        var members = ProjectMembers();
+        var requirements = BuildRequirements();
+        var loads = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var host in _hosts)
+            loads[host.Name] = host.Gate.CurrentInFlight;
+
+        var decision = ExecutorPlacement.Decide(members, requirements, loads, runtimeUnhealthy: null);
+        if (decision.SelectedHostId is not null)
         {
-            var index = (int)((start + i) % _hosts.Count);
-            var host = _hosts[index];
-            if (host.Gate.TryEnter())
-                return host;
+            var selected = _hosts.First(h => string.Equals(h.Name, decision.SelectedHostId, StringComparison.Ordinal));
+            if (selected.Gate.TryEnter())
+            {
+                _logger.LogDebug(
+                    "E2E multi-host pool placed lease on {Host}: {Decision}",
+                    selected.Name,
+                    decision.Describe());
+                return selected;
+            }
+
+            return null;
         }
-        return null;
+
+        // No eligible host under live load. Re-decide with zero load (the
+        // same transient-vs-permanent split SandboxPlacementAcquirer uses):
+        // a host the zero-load decision selects is only capacity-blocked, so
+        // polling again may succeed; otherwise the requirements themselves
+        // match nothing and waiting cannot help — refuse.
+        var unloaded = ExecutorPlacement.Decide(members, requirements, loads: null, runtimeUnhealthy: null);
+        if (unloaded.SelectedHostId is not null)
+            return null;
+
+        throw new SandboxProvisioningDeferredException(
+            provider: Name,
+            operation: "placement",
+            errorClass: "no-eligible-host",
+            detail: $"networkProfile={DisplayProfile(requirements)}; hosts={string.Join(", ", decision.Candidates.Select(static c => $"{c.HostId}={c.Reason}"))}",
+            recheckIn: PlacementRefusalRecheckIn);
     }
+
+    /// <summary>
+    /// Projects pool hosts to the placement members the shared decider
+    /// consumes. Capacity comes from the pool's own per-host gates (the pool
+    /// keeps its own admission); network profiles come from the provider's
+    /// live host-pool snapshot when it exposes one, defaulting to accept-all,
+    /// normalised through the shared comparison seam so profile matching
+    /// agrees with the multipass-remote path; capabilities come from the
+    /// provider declaration. Cordon and health stay with the inner provider
+    /// that owns the SSH state — the pool does not second-guess them, so a
+    /// single-host pool behaves exactly as before for health-gated hosts
+    /// (the inner placement defers).
+    /// </summary>
+    private IReadOnlyList<SandboxPlacementMember> ProjectMembers()
+    {
+        var members = new List<SandboxPlacementMember>(_hosts.Count);
+        foreach (var host in _hosts)
+        {
+            members.Add(new SandboxPlacementMember
+            {
+                MemberId = host.Name,
+                MaxConcurrentSandboxes = host.Gate.CurrentTarget,
+                NetworkProfiles = SnapshotNetworkProfiles(host.Provider),
+                Capabilities = host.Provider.DeclaredCapabilities ?? [],
+            });
+        }
+
+        return members;
+    }
+
+    private static IReadOnlyList<string> SnapshotNetworkProfiles(ISandboxProvider provider)
+    {
+        if (provider is not ISandboxHostPoolSnapshot snapshot)
+            return [];
+
+        var profiles = new List<string>();
+        foreach (var entry in snapshot.SnapshotHostPool())
+        {
+            foreach (var normalised in ExecutorEligibility.NormalizeNetworkProfilesForComparison(entry.AllowedNetworkProfiles))
+            {
+                if (!profiles.Contains(normalised, StringComparer.Ordinal))
+                    profiles.Add(normalised);
+            }
+        }
+
+        return profiles;
+    }
+
+    private ExecutorPlacementRequirements BuildRequirements()
+    {
+        var opts = _options?.CurrentValue;
+        return ExecutorPlacementRequirements.FromValues(
+            null,
+            ExecutorEligibility.NormalizeRequiredNetworkProfile(opts?.NetworkProfile),
+            requiredCapabilities: []);
+    }
+
+    private static string DisplayProfile(ExecutorPlacementRequirements requirements) =>
+        string.IsNullOrWhiteSpace(requirements.RequiredNetworkProfile)
+            ? "(default)"
+            : requirements.RequiredNetworkProfile.Trim();
 
     private SandboxSpec BuildSpec()
     {

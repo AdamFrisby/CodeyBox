@@ -167,9 +167,12 @@ public sealed record ExecutorPlacementDecision
 /// (agent credential, network profile, required capabilities) against each
 /// member's declared attributes, excluding cordoned and unhealthy members and
 /// members at capacity. Deterministic: among eligible members the least-loaded
-/// wins, ties broken by fewest in-flight reservations then ordinal member id —
-/// mirroring the multipass-remote sandbox placement ordering so the two
-/// placement paths cannot drift apart.
+/// wins, ties broken by fewest in-flight reservations then ordinal member id.
+/// This is the only host-selection implementation: the multipass-remote
+/// provider and the multi-host E2E pool both project their hosts to members
+/// and call <see cref="Decide"/>, and PlacementConvergenceTests proves the
+/// three paths select the same host for identical candidates and
+/// requirements, so the orderings cannot drift apart.
 /// </summary>
 public static class ExecutorPlacement
 {
