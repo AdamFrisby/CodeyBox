@@ -11,6 +11,8 @@ namespace CodeyBox.Api;
 /// <see cref="Lazy{T}"/>) and shares the instance across every member that
 /// names the kind. Lookup is keyed by normalised kind (trimmed, lowercase,
 /// ordinal ignore-case), so registration order never affects resolution.
+/// <see cref="KnownKinds"/> covers built-in kinds plus host-registered
+/// plugin-contributed kinds (see <c>PluginSandboxProviderCatalog</c>).
 /// Unknown or blank kinds fail closed — a member is never silently
 /// re-pointed at another provider.
 /// </summary>
@@ -23,12 +25,20 @@ public sealed class SandboxProviderRegistry : ISandboxProviderRegistry
 
     public SandboxProviderRegistry(
         Func<string, ISandboxProvider> buildKind,
-        ILogger<SandboxProviderRegistry>? log = null)
+        ILogger<SandboxProviderRegistry>? log = null,
+        IReadOnlySet<string>? pluginKinds = null)
     {
         ArgumentNullException.ThrowIfNull(buildKind);
         _buildKind = buildKind;
         _log = log ?? NullLogger<SandboxProviderRegistry>.Instance;
+        var known = new HashSet<string>(SandboxProviderKinds.All, StringComparer.OrdinalIgnoreCase);
+        if (pluginKinds is not null)
+            known.UnionWith(pluginKinds);
+        KnownKinds = known;
     }
+
+    /// <inheritdoc/>
+    public IReadOnlySet<string> KnownKinds { get; }
 
     /// <inheritdoc/>
     public ISandboxProvider Resolve(SandboxMember member)

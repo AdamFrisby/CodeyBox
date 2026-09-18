@@ -68,10 +68,24 @@ public static class HostPlatformSupport
     /// Is this provider supported on this orchestrator host OS?
     /// Comparison is exact (ordinal, lowercase ids); no substring matching.
     /// </summary>
-    public static bool IsProviderSupportedOnHost(string providerId, HostOperatingSystem host)
+    /// <param name="providerId">Provider kind to check (trimmed, lowercased before compare).</param>
+    /// <param name="host">Orchestrator host OS under test.</param>
+    /// <param name="pluginKinds">
+    /// Host-registered plugin-contributed kinds (normalised lowercase ids, e.g. from the
+    /// composition root's plugin catalog). A kind in this set is supported on every host OS:
+    /// the host holds no OS-specific enforcement mechanism for a plugin backend, so there is
+    /// no OS-gated enforcement to check — containment for such kinds is bounded instead by
+    /// the <see cref="EgressEnforcementLocation.NotEnforced"/> classification in
+    /// <see cref="GetEgressEnforcement"/> plus workload-trust validation, both of which run
+    /// for plugin kinds exactly as for built-ins. The set itself is host-owned (built from
+    /// allowlisted plugins); a plugin never asserts its own support. Null means no plugin kinds.
+    /// </param>
+    public static bool IsProviderSupportedOnHost(string providerId, HostOperatingSystem host, IReadOnlySet<string>? pluginKinds = null)
     {
         ArgumentNullException.ThrowIfNull(providerId);
         var id = providerId.Trim().ToLowerInvariant();
+        if (pluginKinds is not null && pluginKinds.Contains(id))
+            return true;
         return (id, host.IsLinux, host.IsMacOS, host.IsWindows) switch
         {
             (Incus, true, _, _) => true,
@@ -91,7 +105,19 @@ public static class HostPlatformSupport
     public static IReadOnlyList<string> SupportedProvidersOnHost(HostOperatingSystem host) =>
         AllProviderIds.Where(id => IsProviderSupportedOnHost(id, host)).ToArray();
 
-    /// <summary>Where egress enforcement lives for a provider. Unknown ids report NotEnforced.</summary>
+    /// <summary>
+    /// Where egress enforcement lives for a provider. Unknown ids report NotEnforced.
+    /// </summary>
+    /// <remarks>
+    /// This classification is host-owned: the switch names exactly the in-tree kinds whose
+    /// enforcement mechanism the host has reviewed (Linux nftables bridges, applied by
+    /// <c>scripts/setup-host-networks.sh</c>). A plugin-contributed kind always falls through
+    /// to <see cref="EgressEnforcementLocation.NotEnforced"/> — a plugin cannot promote itself
+    /// to an enforced classification by configuration or by any value it returns. Promotion to
+    /// an enforced classification is an in-tree change subject to review, never a plugin
+    /// capability. See <see cref="SandboxEgressPolicy"/> for where <c>NotEnforced</c>
+    /// providers may and may not be used.
+    /// </remarks>
     public static EgressEnforcementLocation GetEgressEnforcement(string providerId)
     {
         ArgumentNullException.ThrowIfNull(providerId);
@@ -124,14 +150,21 @@ public static class HostPlatformSupport
     /// Human-readable reason when <see cref="IsProviderSupportedOnHost"/> is false.
     /// Empty string when supported. Never returns null.
     /// </summary>
-    public static string GetUnsupportedReason(string providerId, HostOperatingSystem host)
+    /// <param name="providerId">Provider kind to explain.</param>
+    /// <param name="host">Orchestrator host OS under test.</param>
+    /// <param name="pluginKinds">
+    /// Host-registered plugin-contributed kinds, named alongside built-ins in the
+    /// unknown-kind message. Null means no plugin kinds.
+    /// </param>
+    public static string GetUnsupportedReason(string providerId, HostOperatingSystem host, IReadOnlySet<string>? pluginKinds = null)
     {
         ArgumentNullException.ThrowIfNull(providerId);
         var id = providerId.Trim().ToLowerInvariant();
-        if (IsProviderSupportedOnHost(providerId, host))
+        if (IsProviderSupportedOnHost(providerId, host, pluginKinds))
             return string.Empty;
-        if (!AllProviderIds.Contains(id, StringComparer.Ordinal))
-            return $"Unknown sandbox provider '{providerId}'. Valid: {string.Join(", ", AllProviderIds)}.";
+        if (!AllProviderIds.Contains(id, StringComparer.Ordinal)
+            && (pluginKinds is null || !pluginKinds.Contains(id)))
+            return $"Unknown sandbox provider '{providerId}'. Valid: {FormatKnownProviders(pluginKinds)}.";
         return id switch
         {
             Incus or Multipass or Bubblewrap =>
@@ -144,5 +177,16 @@ public static class HostPlatformSupport
                 $"On {host.Name}, use 'multipass-remote' or 'sprites' with a Linux executor host.",
             _ => $"Provider '{id}' is not supported on {host.Name}.",
         };
+    }
+
+    /// <summary>
+    /// Every known provider kind — built-ins plus host-registered plugin kinds —
+    /// ordered ordinally so messages are independent of registration order.
+    /// </summary>
+    public static string FormatKnownProviders(IReadOnlySet<string>? pluginKinds)
+    {
+        if (pluginKinds is null || pluginKinds.Count == 0)
+            return string.Join(", ", AllProviderIds);
+        return string.Join(", ", AllProviderIds.Concat(pluginKinds).OrderBy(static s => s, StringComparer.Ordinal));
     }
 }

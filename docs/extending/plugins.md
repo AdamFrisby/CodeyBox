@@ -59,10 +59,12 @@ the host's own context so that type-identity checks succeed.
 
 Every extension point in CodeyBox is a `CodeyBox.Core` interface:
 `IAuditor`, `IUpstreamRemote`, `ICredentialProvider`,
-`IAgentPromptPreprocessor`, etc.
+`IAgentPromptPreprocessor`, `ISandboxProvider`, etc.
 Implement whichever one(s) your plugin contributes. The contracts are unchanged
 from built-in implementations — your plugin is just another singleton in the
-same DI container.
+same DI container. Sandbox providers carry an additional trust model (the host
+owns every isolation claim about a plugin backend); read
+[`docs/extending/sandbox-plugins.md`](sandbox-plugins.md) before implementing one.
 
 Prompt preprocessors implement `IAgentPromptPreprocessor` and run before every
 agent prompt is handed to a runner. The host applies them in three segments:
@@ -267,6 +269,10 @@ way you treat authors of the orchestrator itself.
   expose it. A plugin that needs secrets must read them from its own
   configuration section or take `ICredentialProvider` as a DI dependency
   (which the operator must configure).
+- Claim enforced network-egress isolation from a sandbox provider — every
+  plugin-contributed kind is classified `NotEnforced` by the host and refused
+  wherever enforced egress is required. See
+  [`docs/extending/sandbox-plugins.md`](sandbox-plugins.md) for the trust model.
 - Load without appearing in the allowlist — every plugin ID must be explicitly
   listed in `Plugins.Allowlist`.
 - Load without an audit-tier event — the host emits `plugin.loaded` for every

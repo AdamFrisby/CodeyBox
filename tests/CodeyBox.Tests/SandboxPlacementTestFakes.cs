@@ -90,6 +90,9 @@ internal sealed class PlacementFakeSandboxProviderRegistry : ISandboxProviderReg
             .Select(static kvp => new SandboxProviderRegistration(kvp.Key, kvp.Value))
             .ToList();
 
+    public IReadOnlySet<string> KnownKinds =>
+        new HashSet<string>(_byKind.Keys, StringComparer.OrdinalIgnoreCase);
+
     public void SyncKindCapacities(IReadOnlyList<SandboxClass> catalog)
     {
         // Test fake providers carry no admission gate of their own — member

@@ -936,7 +936,10 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             else
             {
                 catalog = SandboxClassesConfigBuilder.Build(
-                    opts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, _log);
+                    opts.SandboxClasses,
+                    maxWorkers,
+                    _sandboxProviderRegistry?.KnownKinds ?? SandboxProviderKinds.All,
+                    _log);
             }
             // Warm newly-named kinds so a bad provider keeps the prior
             // catalog (via the catch below) instead of the first placement.

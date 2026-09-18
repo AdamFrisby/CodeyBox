@@ -50,6 +50,15 @@ public interface ISandboxProviderRegistry
     IReadOnlyList<SandboxProviderRegistration> ListRegistered();
 
     /// <summary>
+    /// Every provider kind this registry can build (normalised, lowercase):
+    /// built-in kinds plus host-registered plugin-contributed kinds. Used to
+    /// validate member references so an unknown kind fails closed with a
+    /// message naming everything registered — a member is never silently
+    /// re-pointed at another provider.
+    /// </summary>
+    IReadOnlySet<string> KnownKinds { get; }
+
+    /// <summary>
     /// Derives every constructed kind's admission gate from
     /// <paramref name="catalog"/>: each kind's gate target becomes the sum of
     /// member capacities naming it (first member wins for a repeated member
