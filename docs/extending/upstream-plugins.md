@@ -124,6 +124,106 @@ the same `Name`. A plugin registering `Name = "github"` is unreachable —
 the orchestrator logs a warning and ignores it. Operators cannot shadow built-ins
 via plugins.
 
+## Readiness surfaces (all optional)
+
+Beyond push/PR/merge, `IUpstreamRemote` exposes five readiness surfaces so a
+forge provider can report what CodeyBox needs to reason about a change's
+readiness. **Every member is default-implemented as "unsupported"** (returning
+`null`), matching the existing `CreateTagAndReleaseAsync` /
+`FetchBaseBranchAsync` pattern: current remotes (`noop`, `github`,
+`git-generic`) compile and behave unchanged, and providers implement only what
+their forge can genuinely report. Do not implement a new forge in the contract
+item — providers follow separately.
+
+### What "unsupported" means
+
+Unsupported is always non-fatal. When a member returns `null`, the caller logs
+and continues without that signal — a missing capability must never fail a
+work item. The convention is:
+
+- Reference results (`UpstreamReviewState`, `UpstreamCheckSummary`,
+  `UpstreamRepositoryMetadata`, posted `UpstreamComment` /
+  `UpstreamWebhookSubscription`) return `null` when unsupported.
+- List results (`ListCommentsAsync`, `ListWebhookSubscriptionsAsync`) return
+  `null` when unsupported, and an **empty list when supported but empty**.
+- `DeleteWebhookSubscriptionAsync` returns `null` when unsupported, `true`
+  when the subscription was removed, `false` when the id is unknown.
+
+Capability is discoverable through this distinction: returning empty for "no
+reviews" and empty for "cannot tell" would be a correctness trap, so callers
+treat `null` as "this provider cannot tell" and a non-null empty result as
+"the provider supports this and there is nothing there".
+
+### 1. Review state — `GetReviewStateAsync`
+
+Returns individual reviews (approvals, change requests, comments), the
+reviewers or rules the forge still requires, and whether the forge considers
+its review requirements satisfied (`RequirementsMet`), plus the quorum
+(`RequiredApprovalCount`) where the forge has one. The provider computes
+`RequirementsMet` with the forge's own rules; callers never re-implement
+quorum logic.
+
+Mapping guidance:
+
+- GitHub reviews map directly to `UpstreamReview` entries.
+- GitLab approval rules: rule names go in `RequiredReviewers`, the quorum in
+  `RequiredApprovalCount`.
+- Azure DevOps reviewer policies: required reviewers in `RequiredReviewers`,
+  the minimum-approver count in `RequiredApprovalCount`; a reject vote is
+  `ChangesRequested`.
+
+Where a concept has no equivalent, leave it at its default (empty list, zero
+count) rather than forcing a translation.
+
+### 2. Checks and statuses — `GetCheckResultsAsync`
+
+Takes a head commit sha and returns each check's identity (`Name`), state,
+human-openable URL (`DetailsUrl`) and whether the forge considers its
+required checks satisfied (`RequiredChecksPassed`) — which is what gates a
+merge. An empty `Checks` list with `RequiredChecksPassed = true` means the
+forge requires nothing for this ref.
+
+Mapping guidance: GitHub check runs + commit statuses, GitLab pipelines,
+Azure DevOps build validations, Gitea/Forgejo commit statuses all collapse to
+the same shape. Check `State` uses the neutral `UpstreamCheckState` values
+(`Pending`, `Passing`, `Failing`, `Neutral`, `Skipped`, `Cancelled`).
+
+### 3. Comments — `ListCommentsAsync` / `PostCommentAsync`
+
+Reads and posts comments on a pull/merge request. Plain discussion comments
+carry only id, author and body; code-anchored review threads additionally
+carry `FilePath` and a 1-based `Line`. To post a file-anchored thread, set
+`FilePath` and `Line` on `NewUpstreamComment`; to reply inside an existing
+thread, set `ReplyToId`. The constructors reject invalid states (empty body,
+line without a file, over-long inputs) before anything is buffered.
+
+The abstraction deliberately uses the neutral noun "comment": GitLab calls
+these discussions, GitHub distinguishes issue comments from review comments —
+providers map their native kinds onto plain vs. file-anchored comments and
+leave unsupported kinds unimplemented rather than mislabelling them.
+
+### 4. Webhook subscriptions — `List` / `Create` / `Delete`
+
+Creates, lists and removes subscriptions on the forge. Scoping differs per
+forge, so scope travels as an opaque string: `UpstreamWebhookScopes` defines
+the shared vocabulary (`repository`, `organization`, `user`, `system` —
+covering Gitea/Forgejo's four scopes), and a forge may additionally accept
+its own native scope names (e.g. Azure DevOps service-hook scopes such as
+`project`). A forge with no equivalent for a requested scope returns `null`
+(unsupported) rather than coercing it. Event names are forge-native and
+passed through untouched — use the target forge's vocabulary.
+
+Note this is unrelated to `IWebhookDispatcher.PublishAsync`, which is CodeyBox
+emitting webhooks outbound; these members manage subscriptions on the forge.
+
+### 5. Repository metadata — `GetRepositoryMetadataAsync`
+
+Returns the default branch, visibility (`public` / `private` / `internal` —
+see `UpstreamRepositoryVisibility`) and branch protection rules (branch
+pattern, required approval count, whether status checks are required).
+Report what the forge has; leave the rest unset. Only metadata merge
+readiness genuinely depends on belongs here.
+
 ## Webhook events
 
 Plugins can emit the same `work_item.pull_request_opened` event as the built-in
