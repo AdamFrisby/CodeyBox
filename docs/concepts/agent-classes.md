@@ -560,6 +560,7 @@ Configured under `CodeyBox:QuotaRouter`:
         }
       },
       "QuotaRecheckIntervalSeconds": 300,
+      "ExhaustionRevalidationAgeSeconds": 900,
       "QuotaCacheTtlSeconds": 60,
       "UnknownPolicy": "UseObservedFailures",
       "IntraKindRoutingPolicy": "MostQuotaFirst",
@@ -590,6 +591,7 @@ Configured under `CodeyBox:QuotaRouter`:
 | `RampWindowSeconds` | `604800` | Global quota-window length used for the time-based floor ramp. |
 | `FloorByAgent` | `{}` | Optional per-agent floor overrides keyed by agent kind. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted agents and omitted fields use the global values. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
+| `ExhaustionRevalidationAgeSeconds` | `900` | Seconds a cached in-process exhaustion verdict is trusted without revalidation. Older verdicts are re-checked against a live probe before they may keep refusing dispatches. Hot-reloadable. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a probe result. Keeps the pickup loop cheap under load. |
 | `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses when no effective floor is in force: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. A non-zero effective floor fails closed before this policy applies. |
 | `IntraKindRoutingPolicy` | `MostQuotaFirst` | How to order quality-eligible members: `MostQuotaFirst`, `RoundRobin`, `Sticky`, or `DeadlineAwareDrain`. Hot-reloadable. |

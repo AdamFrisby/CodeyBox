@@ -3376,7 +3376,10 @@ builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
 builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<IInVmSmokeCache>(),
-    sp.GetRequiredService<IAgentRestorePublisher>()));
+    sp.GetRequiredService<IAgentRestorePublisher>(),
+    sp.GetService<AgentClassRouter>(),
+    sp.GetServices<IAgentQuotaProbe>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentAvailabilityReset>()));
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
@@ -6062,8 +6065,17 @@ app.MapPost("/admin/agent/{name}/reset", (
         return Results.NotFound(new { error = $"unknown agent '{name}'" });
     // Single reset port: clears the registry AND invalidates the in-VM smoke
     // cache together, so a stale cached pass can't reconcile straight back onto
-    // the registry before the operator's fix is re-verified.
+    // the registry before the operator's fix is re-verified. The same call
+    // also clears every cached quota-exhaustion verdict for the agent (router
+    // in-process gates plus probe-side runtime 429 overrides): a bench that
+    // was recorded on stale or misattributed evidence must not survive every
+    // administrative action but a process restart. The clear is audit-logged
+    // with the calling operator.
     reset.Reset(kind);
+    var clearedBy = ApiKeyAuth.TryGetPrincipal(httpContext, out var principal) && principal is not null
+        ? principal.Name
+        : "operator";
+    var exhaustion = reset.ResetQuotaExhaustion(kind, clearedBy);
     var availability = registry.GetAvailability(kind);
     return Results.Ok(new
     {
@@ -6072,6 +6084,12 @@ app.MapPost("/admin/agent/{name}/reset", (
         {
             available = availability.Available,
             reason = availability.Reason,
+        },
+        quotaExhaustion = new
+        {
+            routerCleared = exhaustion.RouterEntriesCleared,
+            probeCleared = exhaustion.ProbeEntriesCleared,
+            evidence = exhaustion.ClearedEvidence,
         },
     });
 });
@@ -8575,6 +8593,12 @@ namespace CodeyBox.Api
             = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
+        /// <summary>
+        /// Seconds a cached in-process exhaustion verdict is trusted without
+        /// revalidation. Older verdicts are re-checked against a live probe
+        /// before they may keep refusing dispatches. Default 900 (15 min).
+        /// </summary>
+        public int ExhaustionRevalidationAgeSeconds { get; set; } = 900;
         /// <summary>
         /// Seconds between event-driven recovery probes for members already
         /// observed as quota-unusable. Default 5.

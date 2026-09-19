@@ -340,7 +340,8 @@ public sealed class WaitingForQuotaResetTests : IDisposable
         router.MarkExhausted(
             classes[0].Members[0],
             TimeSpan.FromHours(5),
-            resetAt: time.GetUtcNow().AddHours(5));
+            resetAt: time.GetUtcNow().AddHours(5),
+            evidence: QuotaTestEvidence.Default);
         var opts = new OrchestratorOptions
         {
             AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions

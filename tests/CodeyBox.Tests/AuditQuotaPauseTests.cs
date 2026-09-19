@@ -408,7 +408,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
         var codexMember = fix.Router
             .GetClassMembers("frontier")
             .Single(m => m.Agent == AgentKind.Codex);
-        fix.Router.MarkExhausted(codexMember, TimeSpan.FromHours(1));
+        fix.Router.MarkExhausted(codexMember, TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var itemId = WorkItemId.New();
         var item = NewItem(AgentKind.Gemini) with

@@ -717,6 +717,7 @@ Tuning knobs for the quota probe and deferred-requeue logic.
     }
   },
   "QuotaRecheckIntervalSeconds": 300,
+  "ExhaustionRevalidationAgeSeconds": 900,
   "QuotaCacheTtlSeconds": 60,
   "PausedQuotaCacheTtlSeconds": 3600,
   "PausedProbeMaxStalenessSeconds": 5400,
@@ -750,6 +751,7 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `Pools` | `{}` | Optional quota pools keyed by pool name. Each pool names one underlying account or subscription; class members join via their `Pool` reference and share one reading, one floor, and one reservation escrow. Each entry sets `Kind` (`ResettingWindow` or `DepletingBalance`), optional `BalanceUnit`, and optional `ReservationEstimate` (native units). Each entry may also set `ProbeSource` (`OrchestratorDirect`, the default, or `ExecutorReported` for accounts whose credential lives on an executor host), `ReportedReadingMaxAgeSeconds` (staleness bound for executor reports, default `300`), and `HolderHostIds` (executor hosts authorised to report for the pool; reports from other hosts are rejected). Hot-reloadable. See `docs/operating/quota.md`. |
 | `FloorByPool` | `{}` | Optional per-pool floor overrides keyed by pool name, alongside `FloorByAgent`. For a pool member the higher of the pool-resolved and agent-resolved floors wins. Resetting-window pools use the percentage fields (`MinQuotaPct`, `StartFloorPct`, `EndFloorPct`, `RampWindowSeconds`); depleting-balance pools use absolute `MinBalance`. Mixing units is rejected at load. Hot-reloadable. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
+| `ExhaustionRevalidationAgeSeconds` | `900` | Seconds a cached in-process exhaustion verdict is trusted without revalidation. Older verdicts are re-checked against a live probe before they may keep refusing dispatches. Hot-reloadable. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
 | `PausedQuotaCacheTtlSeconds` | `3600` | Seconds to cache quota snapshots while an agent is operator-paused. Active/routable agents keep using `QuotaCacheTtlSeconds`. Hot-reloadable. |
 | `PausedProbeMaxStalenessSeconds` | `5400` | Maximum age of a retained last-known-good quota snapshot while an agent is operator-paused. Keep this greater than or equal to `PausedQuotaCacheTtlSeconds` so paused agents serve the last reading between hourly probes instead of falling to unknown. Hot-reloadable. |

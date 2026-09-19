@@ -266,7 +266,11 @@ exclusions remain active while the master switch is true.
   against the new image.
 - `POST /admin/agent/{name}/reset` clears the registry **and** invalidates the
   in-VM cache for that agent, so a reset always forces a fresh re-probe rather
-  than replaying a verdict captured before the fix.
+  than replaying a verdict captured before the fix. The same call also clears
+  every cached quota-exhaustion verdict for the agent (router in-process gates
+  plus probe-side runtime gates) and records the clear in the audit log as
+  `agent.quota_exhaustion_cleared` with the calling operator — see
+  `docs/operating/quota.md`.
 
 ### Verifying it works
 

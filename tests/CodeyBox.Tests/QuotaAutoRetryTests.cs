@@ -569,7 +569,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             NullLogger<AgentClassRouter>.Instance,
             _time,
             quotaFailures: quotaFailures);
-        router.MarkExhausted(member, TimeSpan.FromMinutes(30));
+        router.MarkExhausted(member, TimeSpan.FromMinutes(30), null, QuotaTestEvidence.Default);
 
         var blockedWithoutRetryAdmission = await router.ResolveAsync(new WorkItem
         {
@@ -701,7 +701,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             NullLogger<AgentClassRouter>.Instance,
             _time,
             quotaFailures: quotaFailures);
-        router.MarkExhausted(member, TimeSpan.FromMinutes(30));
+        router.MarkExhausted(member, TimeSpan.FromMinutes(30), null, QuotaTestEvidence.Default);
 
         var blockedWithoutRetryAdmission = await router.ResolveAsync(new WorkItem
         {
@@ -2397,7 +2397,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var signalCount = 0;
         quotaSignal.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
 
-        router.MarkExhausted(member, TimeSpan.FromHours(6), _time.Now.AddDays(7));
+        router.MarkExhausted(member, TimeSpan.FromHours(6), _time.Now.AddDays(7), QuotaTestEvidence.Default);
         Assert.Equal(0, System.Threading.Volatile.Read(ref signalCount));
 
         var stillParked = await store.GetAsync(parked.Id);

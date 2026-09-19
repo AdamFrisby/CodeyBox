@@ -44,8 +44,7 @@ public sealed partial class PipelineRunner
         try
         {
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
-            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
-            var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+            var (repoId, baseBranch) = await EnsurePipelineRepositoryAsync(item, project, configuredBaseBranch, ct);
 
             await Transition(item, WorkItemState.Working, ct, project);
 
@@ -154,6 +153,22 @@ public sealed partial class PipelineRunner
                 project,
                 failureKind: WorkItemFailureKinds.Infrastructure,
                 agent: infraEx.Agent);
+        }
+        catch (GitRepositorySeedingException seedEx)
+        {
+            // Repository seeding runs on the orchestrator host against the git
+            // remote — no agent, no provider quota. Always infrastructure,
+            // never quota evidence.
+            _log.LogWarning(
+                seedEx,
+                "Work item {Id} check-and-act failed during repository {Operation}: {Error}",
+                item.Id, seedEx.Operation, seedEx.Message);
+            await TransitionFailed(
+                item,
+                seedEx.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.Infrastructure);
         }
         catch (Exception ex)
         {

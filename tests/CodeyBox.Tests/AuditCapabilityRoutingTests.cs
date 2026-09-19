@@ -1539,7 +1539,8 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             Router.MarkExhausted(
                 member,
                 ttl ?? TimeSpan.FromHours(1),
-                resetAt: DateTimeOffset.UtcNow.AddHours(1));
+                resetAt: DateTimeOffset.UtcNow.AddHours(1),
+                evidence: QuotaTestEvidence.Default);
         }
     }
 

@@ -734,7 +734,10 @@ public sealed partial class PipelineRunner
                 run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
             var quotaDetection = auditQuotaClassification.Detection;
 
-            if (quotaDetection is not null)
+            // Only genuine quota/rate-limit signals take the quota path — a
+            // 401/403 (Unauthorized) is an auth event and must never bench the
+            // member or park for a reset.
+            if (quotaDetection is { Kind: var auditQuotaKind } && auditQuotaKind.IsExhaustionSignal())
             {
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,

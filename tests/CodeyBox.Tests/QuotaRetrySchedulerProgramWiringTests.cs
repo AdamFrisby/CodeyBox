@@ -210,7 +210,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         var router = factory.Services.GetRequiredService<AgentClassRouter>();
         var member = router.GetClassMembers("quota-signal-class")[0];
         var monitor = factory.Services.GetRequiredService<AgentQuotaRecoveryProbeMonitor>();
-        router.MarkExhausted(member, TimeSpan.FromHours(6), DateTimeOffset.UtcNow.AddDays(7));
+        router.MarkExhausted(member, TimeSpan.FromHours(6), DateTimeOffset.UtcNow.AddDays(7), QuotaTestEvidence.Default);
         factory.Probe.AvailablePct = 90;
         Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
 
@@ -251,7 +251,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
 
         var router = factory.Services.GetRequiredService<AgentClassRouter>();
         var member = router.GetClassMembers("quota-signal-class")[0];
-        router.MarkExhausted(member, TimeSpan.FromHours(6), DateTimeOffset.UtcNow.AddDays(7));
+        router.MarkExhausted(member, TimeSpan.FromHours(6), DateTimeOffset.UtcNow.AddDays(7), QuotaTestEvidence.Default);
         factory.Probe.AvailablePct = 90;
 
         var retried = await WaitForQuotaRetryAttemptAsync(store, parked.Id, TimeSpan.FromSeconds(10));

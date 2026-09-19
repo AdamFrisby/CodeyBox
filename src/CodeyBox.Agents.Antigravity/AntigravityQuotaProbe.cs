@@ -55,7 +55,7 @@ namespace CodeyBox.Agents.Antigravity;
 /// reads), the probe surfaces that exact moment so failed items park cleanly in
 /// <c>WaitingForQuotaReset</c> instead of churning.</para>
 /// </summary>
-public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator, IAgentQuotaRecoveryStateInvalidator
+public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator, IAgentQuotaRecoveryStateInvalidator, IAgentQuotaExhaustionReset
 {
     /// <summary>
     /// The <c>agy</c> gateway host. The <c>daily-</c> prefix is what agy 1.0.7
@@ -258,6 +258,34 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
             _lock.Release();
         }
     }
+
+    /// <summary>
+    /// Operator reset (<c>POST /admin/agent/antigravity/reset</c>): drops every
+    /// runtime 429 override for this agent (all models / credential scopes) so
+    /// a cached verdict never survives every administrative action but a
+    /// process restart. Response-cache snapshots are left alone — the next
+    /// probe refetch decides freshness on its own TTL.
+    /// </summary>
+    public int ClearRuntimeExhaustion(AgentKind kind)
+    {
+        _lock.Wait();
+        try
+        {
+            return _exhausted
+                .ClearWhere(
+                    key => BelongsToAgent(key.RouteKey, kind),
+                    _timeProvider.GetUtcNow())
+                .Count;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    private static bool BelongsToAgent(string routeKey, AgentKind kind) =>
+        string.Equals(routeKey, kind.Value, StringComparison.OrdinalIgnoreCase)
+        || routeKey.StartsWith(kind.Value + "/", StringComparison.OrdinalIgnoreCase);
 
     private const int MaxResponseChars = 64 * 1024;
 

@@ -357,8 +357,8 @@ public sealed class AgentClassRouterCapabilityTests
             Member(Claude, 100, "audit"),
             Member(Codex, 70, "audit"));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
-        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
-        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(minScore: 90), project: null, capability: "audit");
@@ -378,8 +378,8 @@ public sealed class AgentClassRouterCapabilityTests
             Member(Claude, 100, "audit", "sensitive"),
             Member(Codex, 90, "audit"));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
-        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
-        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(required: "sensitive"), project: null, capability: "audit");
@@ -399,8 +399,8 @@ public sealed class AgentClassRouterCapabilityTests
             Member(Claude, 100, "audit"),
             Member(Codex, 90));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
-        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
-        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(), project: null, capability: "audit");
@@ -416,8 +416,8 @@ public sealed class AgentClassRouterCapabilityTests
         var codex = Member(Codex, 100);
         var cls = Class(taggedBelowFloor, inheritedAuditSibling, codex);
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
-        router.MarkExhausted(inheritedAuditSibling, TimeSpan.FromHours(1));
-        router.MarkExhausted(codex, TimeSpan.FromHours(1));
+        router.MarkExhausted(inheritedAuditSibling, TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
+        router.MarkExhausted(codex, TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(minScore: 90), project: null, capability: "audit");
@@ -442,8 +442,8 @@ public sealed class AgentClassRouterCapabilityTests
             Member(Claude, 100),
             Member(Codex, 90));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
-        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
-        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(), project: null, capability: null);
@@ -462,8 +462,8 @@ public sealed class AgentClassRouterCapabilityTests
             Member(Claude, 100),
             Member(Codex, 70));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
-        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
-        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(minScore: 90), project: null, capability: null);
@@ -482,8 +482,8 @@ public sealed class AgentClassRouterCapabilityTests
             Member(Claude, 100, "sensitive"),
             Member(Codex, 90));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
-        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1));
-        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1));
+        router.MarkExhausted(cls.Members[0], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
+        router.MarkExhausted(cls.Members[1], TimeSpan.FromHours(1), null, QuotaTestEvidence.Default);
 
         var count = router.CountEligibleExhaustedClassMembersWithCapability(
             Item(required: "sensitive"), project: null, capability: null);

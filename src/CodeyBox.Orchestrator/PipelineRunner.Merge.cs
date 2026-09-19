@@ -335,7 +335,10 @@ public sealed partial class PipelineRunner
                     chosenMergeRunner.Kind,
                     classificationResult.Stderr,
                     classificationResult.Stdout);
-                if (detection is not null)
+                // Only genuine quota/rate-limit signals take the quota path —
+                // a 401/403 (Unauthorized) is handled by the auth path above
+                // and must never bench the member or park for a reset.
+                if (detection is { Kind: var mergeQuotaKind } && mergeQuotaKind.IsExhaustionSignal())
                 {
                     await _quotaClassifier.RecordIfQuotaFailureAsync(
                         _quotaFailures,

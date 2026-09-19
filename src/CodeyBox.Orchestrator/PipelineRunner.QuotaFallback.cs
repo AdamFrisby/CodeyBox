@@ -341,8 +341,9 @@ public sealed partial class PipelineRunner
             if (classification is not
                 {
                     Kind: QuotaFailureClassificationKind.Quota,
-                    Detection: { } detection,
-                })
+                    Detection: { Kind: var resumeQuotaKind } detection,
+                }
+                || !resumeQuotaKind.IsExhaustionSignal())
             {
                 return null;
             }
@@ -535,19 +536,46 @@ public sealed partial class PipelineRunner
                 var clampedReset = ClampQuotaReset(quotaResetAt, _pipelineTuning.Current.MaxParsedQuotaResetWindow);
 
                 // Mark the member exhausted in the router and the probe so the
-                // next pickup (or the rest of this pipeline) skips it.
-                _classRouter.MarkExhausted(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset);
-                if (ResolveQuotaProbe(currentMember).Probe is { } probe)
+                // next pickup (or the rest of this pipeline) skips it. The mark
+                // carries the provider signal as evidence and is refused unless
+                // the signal is a genuine quota/rate-limit response — a
+                // non-quota fault (git-transport blip, 401) reaching this
+                // trigger falls back to the next member WITHOUT benching.
+                var exhaustionEvidence = terminalException is TerminalQuotaError quotaError
+                    && quotaError.Kind.IsExhaustionSignal()
+                    ? new QuotaExhaustionEvidence(
+                        quotaError.Kind,
+                        $"{phase}:{currentRunner.Kind.Value}/{currentMember.ModelId ?? "default"}",
+                        terminalException.GetType().Name)
+                    : null;
+                if (exhaustionEvidence is not null)
                 {
-                    try
+                    _classRouter.MarkExhausted(
+                        currentMember,
+                        _pipelineTuning.Current.QuotaExhaustionFallbackTtl,
+                        clampedReset,
+                        exhaustionEvidence);
+                    if (ResolveQuotaProbe(currentMember).Probe is { } probe)
                     {
-                        await probe.MarkExhaustedAsync(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset, ct);
+                        try
+                        {
+                            await probe.MarkExhaustedAsync(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset, ct);
+                        }
+                        catch (Exception probeEx) when (probeEx is not OperationCanceledException)
+                        {
+                            // Probe write-back is best-effort; in-process cache still suppresses.
+                            _log.LogDebug(probeEx, "MarkExhaustedAsync failed for {Agent}", currentMember.Agent.Value);
+                        }
                     }
-                    catch (Exception probeEx) when (probeEx is not OperationCanceledException)
-                    {
-                        // Probe write-back is best-effort; in-process cache still suppresses.
-                        _log.LogDebug(probeEx, "MarkExhaustedAsync failed for {Agent}", currentMember.Agent.Value);
-                    }
+                }
+                else
+                {
+                    _log.LogWarning(
+                        "Quota fallback for {Agent}/{Model} carries no provider quota/rate-limit signal ({Exception}); " +
+                        "spilling to the next member without recording an exhaustion verdict",
+                        currentMember.Agent.Value,
+                        currentMember.ModelId ?? "(default)",
+                        terminalException.GetType().Name);
                 }
                 if (clampedReset is { } reset
                     && (earliestReset is null || reset < earliestReset))

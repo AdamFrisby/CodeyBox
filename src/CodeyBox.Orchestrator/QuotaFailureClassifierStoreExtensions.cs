@@ -35,6 +35,15 @@ public static class QuotaFailureClassifierStoreExtensions
         if (detection is null)
             return;
 
+        // Narrowing point: only provider quota/rate-limit signals are
+        // recorded. A 401/403 (Unauthorized) is an auth event, not a quota
+        // event — recording it would let the router's observed-failure
+        // precheck bench a member on an expired credential, converting an
+        // auth fault into a quota verdict. Auth detections keep their own
+        // handling path; they never land here.
+        if (!detection.Kind.IsExhaustionSignal())
+            return;
+
         if (projectId is { } scopedProject)
             await store.RecordForProjectAsync(agent, modelId, scopedProject, detection.Kind, observedAt, ct);
         else

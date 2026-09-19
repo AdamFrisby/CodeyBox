@@ -1321,6 +1321,42 @@ public static class AuditLog
                 id.ToString(), (long)recheckIn.TotalMilliseconds);
 
     /// <summary>
+    /// Emitted when a live probe reading contradicts a cached in-process
+    /// exhaustion verdict and the stale entry is cleared. The recorded
+    /// <paramref name="priorEvidence"/> names the originating failure so the
+    /// clear is attributable; without it a cached verdict would keep refusing
+    /// dispatches long after the underlying condition cleared.
+    /// </summary>
+    public static void QuotaExhaustionStaleCleared(
+        WorkItemId id,
+        AgentKind agent,
+        string? modelId,
+        string priorEvidence,
+        double liveAvailablePct) =>
+        Audit("quota_router.exhaustion_stale_cleared")
+            .Information(
+                "Quota router: cleared stale in-process exhaustion for {Agent}/{ModelId} on work item {WorkItemId} " +
+                "(prior evidence: {PriorEvidence}); live probe reports {AvailablePct:F1}% — routing normally",
+                agent.Value, modelId ?? "(default)", id.ToString(), priorEvidence, liveAvailablePct);
+
+    /// <summary>
+    /// Emitted when an operator clears cached exhaustion verdicts via
+    /// <c>POST /admin/agent/{name}/reset</c>. Records who cleared what,
+    /// including the evidence each verdict carried, so a cleared bench is
+    /// attributable in the audit trail.
+    /// </summary>
+    public static void AgentQuotaExhaustionCleared(
+        AgentKind agent,
+        string clearedBy,
+        IReadOnlyList<string> clearedEvidence) =>
+        Audit("agent.quota_exhaustion_cleared")
+            .ForContext("ClearedEvidence", clearedEvidence)
+            .Warning(
+                "Operator {ClearedBy} cleared {Count} cached quota-exhaustion verdict(s) for agent {Agent}: {Evidence}",
+                clearedBy, clearedEvidence.Count, agent.Value,
+                clearedEvidence.Count == 0 ? "(none active)" : string.Join("; ", clearedEvidence));
+
+    /// <summary>
     /// Emitted by the quota retry scheduler for every quota-shaped item it
     /// evaluates, including no-op outcomes. <paramref name="reason"/> is forced
     /// through an empty-string sentinel so operators can distinguish "no extra

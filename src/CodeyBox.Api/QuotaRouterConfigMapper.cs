@@ -19,6 +19,10 @@ internal static class QuotaRouterConfigMapper
             RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
             RampWindowByAgent = BuildRampWindowOverrides(qr.RampWindowByAgentSeconds),
             QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
+            ExhaustionRevalidationAge = qr.ExhaustionRevalidationAgeSeconds > 0
+                ? TimeSpan.FromSeconds(qr.ExhaustionRevalidationAgeSeconds)
+                : throw new InvalidOperationException(
+                    "CodeyBox:QuotaRouter:ExhaustionRevalidationAgeSeconds must be positive."),
             QuotaRecoveryProbeInterval = BuildPositiveDuration(
                 qr.QuotaRecoveryProbeIntervalSeconds,
                 QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval),
@@ -67,6 +71,8 @@ internal static class QuotaRouterConfigMapper
         dst.RampWindowByAgent = BuildRampWindowOverrides(src.RampWindowByAgentSeconds);
         var paused = BuildPausedQuotaOptions(src);
         dst.QuotaRecheckInterval = TimeSpan.FromSeconds(src.QuotaRecheckIntervalSeconds);
+        if (src.ExhaustionRevalidationAgeSeconds > 0)
+            dst.ExhaustionRevalidationAge = TimeSpan.FromSeconds(src.ExhaustionRevalidationAgeSeconds);
         dst.QuotaRecoveryProbeInterval = BuildPositiveDuration(
             src.QuotaRecoveryProbeIntervalSeconds,
             QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval);

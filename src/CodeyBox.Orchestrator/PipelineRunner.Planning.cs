@@ -1119,7 +1119,10 @@ public sealed partial class PipelineRunner
             "planning",
             sandboxId);
         var detection = _quotaClassifier.Detect(runner.Kind, result.Stderr, result.Stdout);
-        if (detection is not null)
+        // Only genuine quota/rate-limit signals take the quota path — a
+        // 401/403 (Unauthorized) falls through to the auth handling below and
+        // must never bench the member or park for a reset.
+        if (detection is { Kind: var planningQuotaKind } && planningQuotaKind.IsExhaustionSignal())
         {
             await _quotaClassifier.RecordIfQuotaFailureAsync(
                 _quotaFailures,

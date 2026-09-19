@@ -19,6 +19,28 @@ internal sealed class AuditFailedException : Exception
     public AuditFailedException(string message) : base(message) { }
 }
 
+/// <summary>
+/// Seeding or refreshing the bare repo from the git remote failed
+/// (<c>git clone --bare</c> / <c>git fetch</c> against
+/// <c>Project.RepositoryUrl</c>). This runs on the orchestrator host, over the
+/// network, against the git remote: it involves no agent and no provider
+/// quota, so it is always infrastructure. It must never contribute to a
+/// quota-exhaustion verdict (no <c>MarkExhausted</c>, no observed-failure
+/// record, no quota park) — only to an <c>infrastructure</c> work-item
+/// failure with a bounded transient retry.
+/// </summary>
+internal sealed class GitRepositorySeedingException : Exception
+{
+    public GitRepositorySeedingException(string operation, string message, Exception innerException)
+        : base($"repository {operation} failed: {message}", innerException)
+    {
+        Operation = operation;
+    }
+
+    /// <summary>Which git-transport step failed: <c>ensure-repository</c> (seed or refresh) or <c>resolve-default-branch</c>.</summary>
+    public string Operation { get; }
+}
+
 internal sealed class RequiredBuildFailedException : Exception
 {
     public RequiredBuildFailedException(string message) : base(message) { }
