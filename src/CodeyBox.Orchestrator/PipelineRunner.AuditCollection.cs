@@ -529,23 +529,27 @@ public sealed partial class PipelineRunner
             var sandboxTarget = SandboxTargetResolver.ResolveAudit(
                 needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
                 group.Key.Caps);
-            SandboxSpec BuildAuditSandboxSpec(SandboxRepositoryAccess repositoryAccess)
+            async Task<SandboxSpec> BuildAuditSandboxSpecAsync(SandboxRepositoryAccess repositoryAccess)
             {
                 var auditSecretScope = needsCreds
                     ? ProjectSandboxSecretScopes.AuditAgent
                     : ProjectSandboxSecretScopes.AuditTool;
-                var built = BuildSandboxSpec(repositoryAccess, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
+                // Resolved lazily per spec build so a lease issued here is
+                // fresh at sandbox-creation time, not at fan-out planning time.
+                var leasedSecrets = await ResolveLeasedProjectSecretsAsync(project, item, auditSecretScope, ct)
+                    .ConfigureAwait(false);
+                var built = BuildSandboxSpec(WithLeaseBrokerHosts(repositoryAccess, leasedSecrets), includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
                     hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
                     flavor: sandboxTarget.Flavor,
                     baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
                     credentialRunner: credential is null ? null : groupRunner,
-                    projectSecretEnvironment: ResolveProjectSecretEnvironment(project, item.Id, auditSecretScope));
+                    projectSecretEnvironment: leasedSecrets.Environment);
                 return built with
                 {
                     Mounts = [.. built.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }],
                 };
             }
-            var spec = BuildAuditSandboxSpec(access);
+            var spec = await BuildAuditSandboxSpecAsync(access).ConfigureAwait(false);
 
             // Within each capability group, split by Kind so tool auditors stay
             // sequential in a shared sandbox while LLM auditors each get their
@@ -619,7 +623,7 @@ public sealed partial class PipelineRunner
                             {
                                 isolatedRepoPath = await _gitHost.CreateIsolatedRepositoryCloneAsync(repoId, ctx.WorkItemId, ct);
                                 var isolatedAccess = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
-                                var isolatedSpec = BuildAuditSandboxSpec(isolatedAccess);
+                                var isolatedSpec = await BuildAuditSandboxSpecAsync(isolatedAccess).ConfigureAwait(false);
                                 var timeoutAgentKind = AuditorTimeoutAgentKind(auditor, runner);
                                 await using var isolatedSandbox = await CreatePreparedToolSandboxAsync(
                                     isolatedAccess,
@@ -758,11 +762,17 @@ public sealed partial class PipelineRunner
                 var sem = new SemaphoreSlim(maxPar, maxPar);
                 var disposeSemaphoreOnExit = true;
 
-                (SandboxSpec Spec, AuditReviewDotnetShim DotnetShim) BuildLlmSandboxSpec(
+                async Task<(SandboxSpec Spec, AuditReviewDotnetShim DotnetShim)> BuildLlmSandboxSpecAsync(
                     AgentCredential? candidateCredential,
-                    IAgentRunner candidateRunner)
+                    IAgentRunner candidateRunner,
+                    CancellationToken specCt)
                 {
-                    var candidateSpec = BuildSandboxSpec(access,
+                    var leasedSecrets = await ResolveLeasedProjectSecretsAsync(
+                        project,
+                        item,
+                        needsCreds ? ProjectSandboxSecretScopes.AuditAgent : ProjectSandboxSecretScopes.AuditTool,
+                        specCt).ConfigureAwait(false);
+                    var candidateSpec = BuildSandboxSpec(WithLeaseBrokerHosts(access, leasedSecrets),
                         includeAgentCredential: candidateCredential,
                         allowAgentNetwork: needsNetwork,
                         hostNetworkProfile: sandboxTarget.NetworkProfile,
@@ -771,10 +781,7 @@ public sealed partial class PipelineRunner
                         flavor: sandboxTarget.Flavor,
                         baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
                         credentialRunner: candidateCredential is null ? null : candidateRunner,
-                        projectSecretEnvironment: ResolveProjectSecretEnvironment(
-                            project,
-                            item.Id,
-                            needsCreds ? ProjectSandboxSecretScopes.AuditAgent : ProjectSandboxSecretScopes.AuditTool));
+                        projectSecretEnvironment: leasedSecrets.Environment);
                     var dotnetShim = AuditReviewDotnetShim.From(_pipelineTuning.Current);
                     var specWithAuditMount = candidateSpec with
                     {
@@ -796,7 +803,8 @@ public sealed partial class PipelineRunner
                     var candidateCredential = needsCreds
                         ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, trialItem, attemptCt)
                         : null;
-                    var (candidateSpec, dotnetShim) = BuildLlmSandboxSpec(candidateCredential, candidateRunner);
+                    var (candidateSpec, dotnetShim) = await BuildLlmSandboxSpecAsync(candidateCredential, candidateRunner, attemptCt)
+                        .ConfigureAwait(false);
                     await using var sandbox = await CreateAuditSandboxWithIdleTimeoutAsync(
                         candidateSpec,
                         pair.Auditor.Name,

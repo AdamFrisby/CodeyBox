@@ -595,6 +595,34 @@ that were suspended by the previous process.
 | `SandboxTeardownMode` | `Stop` | `Stop`, `Suspend`, or `Dispose` for in-flight worker sandboxes during graceful shutdown. `Suspend` is opt-in because it writes a RAM snapshot. |
 | `SandboxTeardownTimeout` | `00:00:20` | Overall budget for the Stop/Dispose per-VM teardown fan-out. In-flight items are checkpointed to the state DB before any VM call, so VMs still running when the budget expires are left for startup reconciliation on next boot instead of blocking past the service manager's stop timeout. Keep budget + drain (`GraceSeconds`) + reserve under `TimeoutStopSec`. Not applied to `Suspend`. |
 
+## `SecretLeasing`
+
+Controls leased workload secrets: short-lived (or brokered) credentials
+issued by lease-capable providers for grant-authorised project sandbox
+secrets, renewed while the phase runs and revoked on teardown. Secrets
+with no lease-capable provider keep the static host-environment behaviour
+unchanged.
+
+```json
+"SecretLeasing": {
+  "RenewBeforeExpiry": "00:05:00",
+  "SweepInterval": "00:01:00",
+  "DefaultLeaseTtl": "00:20:00",
+  "RevocationTimeout": "00:00:30",
+  "MaxRevocationAttempts": 5,
+  "MaxLeaseLifetime": "08:00:00"
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `RenewBeforeExpiry` | `00:05:00` | How far before expiry a lease is renewed. |
+| `SweepInterval` | `00:01:00` | Background sweep cadence for due renewals and terminal-item revocations. Hot-reloadable. |
+| `DefaultLeaseTtl` | `00:20:00` | TTL requested from the issuer per lease. |
+| `RevocationTimeout` | `00:00:30` | Per renew/revoke attempt timeout. |
+| `MaxRevocationAttempts` | `5` | Revocation attempts before a lease parks as failed loudly (error log + store status) while staying outstanding for the sweep. |
+| `MaxLeaseLifetime` | `08:00:00` | Absolute cap on a lease's lifetime from issuance; renewal never extends past the work item's own deadline or this cap. |
+
 ## `AgentClasses`
 
 Defines named groups of interchangeable agents for quota-aware routing.

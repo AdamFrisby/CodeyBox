@@ -103,8 +103,9 @@ public sealed class ObservableMetricsTests : IDisposable
 
         // The live counter is intentionally process-wide, and other tests may
         // have ephemeral sandboxes alive at the same time or leave a non-zero
-        // (or even negative, after a leaked dispose elsewhere) baseline. Use a
-        // large local contribution so this test proves the gauge is reading the
+        // baseline (parallel tests manipulate the static directly, and a leaked
+        // dispose elsewhere can leave it even negative). Use a large local
+        // contribution so this test proves the gauge is reading/tracking the
         // counter without assuming exclusive ownership of the static value:
         // expectations are relative to the baseline sampled just before the
         // local contribution is added.

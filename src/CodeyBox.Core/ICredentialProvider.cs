@@ -58,6 +58,21 @@ public sealed record AgentCredential
     public DateTimeOffset? ExpiresAt { get; init; }
 
     /// <summary>
+    /// Optional lease handle for credentials issued by vault-style plugins
+    /// with revocation semantics (see <see cref="ILeaseCapableCredentialProvider"/>).
+    /// When set, the orchestrator revokes this lease on teardown. Null means
+    /// a static credential with no issuer-side lifetime — every built-in
+    /// provider leaves this null and is unaffected.
+    /// </summary>
+    public string? LeaseId { get; init; }
+
+    /// <summary>
+    /// Provider identity that owns <see cref="LeaseId"/>; routes revocation
+    /// to the issuing <see cref="ILeaseCapableCredentialProvider"/>.
+    /// </summary>
+    public string? LeaseProviderId { get; init; }
+
+    /// <summary>
     /// Optional bind-mounts the credential provider wants applied to any
     /// sandbox running this agent. The orchestrator merges these into
     /// <c>SandboxSpec.Mounts</c> when the credential is in scope. Do not use

@@ -549,6 +549,21 @@ A hostname-allowlist profile limited to the service in question (e.g.
 `openrouter.ai`) is the tighter configuration — see the profile-mode
 table above — versus blanket `internet-only`.
 
+**Leased secrets.** When a lease-capable secret provider is installed, a
+grant-authorised secret is issued as a time-bound lease instead of a
+static host-environment read: the grant still decides *whether* the
+group applies, the lease decides *how long* its value lives. Leases are
+renewed by the background sweep while the phase runs (capped at the work
+item's own deadline), revoked when the item reaches a terminal state,
+and re-revoked by the reconciliation sweep when teardown failed — lease
+handles (identity only, never values) persist in the state database, so
+an orchestrator restart resumes instead of orphaning live leases. A
+provider may instead broker the credential: the sandbox then receives
+only a non-secret endpoint URL (allowlisted for egress automatically)
+and the value never enters the guest at all. Providers offering only
+static values keep working unchanged. See `SecretLeasing` in
+[configuration reference](../reference/configuration.md#secretleasing).
+
 ### Graphical sandboxes
 
 Set `GraphicalSandbox: true` on a project to run GUI-capable sandboxes for
