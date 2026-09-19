@@ -634,6 +634,68 @@ public sealed class RunloopSandboxProviderTests
     }
 
     [Fact]
+    public async Task ExecAsync_SecretEnvironment_StagesFile_NeverInlinesValues()
+    {
+        const string secret = "s3cr3t-v4lue";
+        var secretBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(secret));
+        var handler = new FakeRunloopHandler();
+        handler.ExecutionResponder = command =>
+        {
+            Assert.DoesNotContain(secret, command, StringComparison.Ordinal);
+            Assert.DoesNotContain(secretBase64, command, StringComparison.Ordinal);
+            return (0, "ok", string.Empty);
+        };
+        var provider = NewProvider(handler);
+
+        await using var sandbox = await provider.CreateAsync(BasicSpec(), CancellationToken.None);
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["printenv", "CODEYBOX_TEST_SECRET"],
+            ExtraEnvironment = new Dictionary<string, string> { ["CODEYBOX_TEST_SECRET"] = secret },
+            EnvironmentVariablesToUnset = ["STALE_VAR"],
+            EnvironmentContainsSecrets = true,
+        }, CancellationToken.None);
+
+        Assert.True(result.Success, result.Stderr);
+
+        var staged = Assert.Single(
+            handler.Requests,
+            r => r.Path.EndsWith("/write_file_contents", StringComparison.Ordinal));
+        Assert.Contains("/tmp/.codeybox-exec-env/env-", staged.Body, StringComparison.Ordinal);
+        Assert.Contains("CODEYBOX_TEST_SECRET", staged.Body, StringComparison.Ordinal);
+        Assert.Contains(secretBase64, staged.Body, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, staged.Body.Replace(secretBase64, string.Empty, StringComparison.Ordinal), StringComparison.Ordinal);
+        Assert.Contains("unset -- STALE_VAR", staged.Body, StringComparison.Ordinal);
+
+        var started = Assert.Single(handler.Requests, r => r.Path.EndsWith("/execute_async", StringComparison.Ordinal));
+        var sentCommand = JsonDocument.Parse(started.Body).RootElement.GetProperty("command").GetString();
+        Assert.NotNull(sentCommand);
+        Assert.Contains(". '/tmp/.codeybox-exec-env/env-", sentCommand, StringComparison.Ordinal);
+        Assert.Contains("rm -f -- '/tmp/.codeybox-exec-env/env-", sentCommand, StringComparison.Ordinal);
+        Assert.DoesNotContain("export CODEYBOX_TEST_SECRET=", sentCommand, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, sentCommand, StringComparison.Ordinal);
+        Assert.DoesNotContain(secretBase64, sentCommand, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ExecAsync_SecretEnvironment_StagingFailure_NeverFallsBackToInline()
+    {
+        var handler = new FakeRunloopHandler { FailWriteStatus = HttpStatusCode.TooManyRequests };
+        var provider = NewProvider(handler);
+
+        await using var sandbox = await provider.CreateAsync(BasicSpec(), CancellationToken.None);
+        await Assert.ThrowsAsync<SandboxExecutionUnavailableException>(
+            () => sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["true"],
+                ExtraEnvironment = new Dictionary<string, string> { ["CODEYBOX_TEST_SECRET"] = "s3cr3t-v4lue" },
+                EnvironmentContainsSecrets = true,
+            }, CancellationToken.None));
+
+        Assert.DoesNotContain(handler.Requests, r => r.Path.EndsWith("/execute_async", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void ShellCommand_RejectsOversizedEnvironment()
     {
         Assert.Throws<ArgumentException>(() => RunloopShellCommand.Build(

@@ -76,13 +76,22 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         var token = _readToken();
         var baseUrl = opts.ApiBaseUrl;
 
-        var command = RunloopShellCommand.Build(
-            _spec.Environment,
-            exec,
-            exec.WorkingDirectory ?? _workingDirectory,
-            opts.MaxEnvironmentBytes,
-            opts.MaxCommandBytes,
-            opts.MaxStdinBytes);
+        string command;
+        if (exec.EnvironmentContainsSecrets && exec.ExtraEnvironment is { Count: > 0 })
+        {
+            command = await BuildSecretCommandAsync(
+                opts, baseUrl, token, exec, exec.WorkingDirectory ?? _workingDirectory, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            command = RunloopShellCommand.Build(
+                _spec.Environment,
+                exec,
+                exec.WorkingDirectory ?? _workingDirectory,
+                opts.MaxEnvironmentBytes,
+                opts.MaxCommandBytes,
+                opts.MaxStdinBytes);
+        }
 
         var maxStdout = exec.MaxStdoutBytes ?? opts.MaxExecOutputBytes;
         var maxStderr = exec.MaxStderrBytes ?? opts.MaxExecOutputBytes;
@@ -113,6 +122,46 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         {
             _inFlightExecutions.TryRemove(started.ExecutionId, out _);
         }
+    }
+
+    /// <summary>
+    /// Guest directory staging per-exec secret environment files. Random
+    /// unguessable file names keep one exec's secrets out of other guests'
+    /// reach; the sourcing command deletes its file before running argv.
+    /// </summary>
+    private const string SecretEnvStagingDirectory = "/tmp/.codeybox-exec-env";
+
+    /// <summary>
+    /// Builds the guest command for a secret-bearing exec without placing
+    /// values in host-visible command argv: the merged environment is staged
+    /// as a sourceable file via <c>write_file_contents</c> and the command
+    /// only sources it. A staging failure is infrastructure (never a diff
+    /// verdict) and never falls back to inline transport — the exec fails
+    /// instead of leaking values into the retained execution record.
+    /// </summary>
+    private async Task<string> BuildSecretCommandAsync(
+        RunloopSandboxOptions opts,
+        string baseUrl,
+        string token,
+        SandboxExec exec,
+        string workingDirectory,
+        CancellationToken ct)
+    {
+        var (merged, removals) = RunloopShellCommand.MergeEnvironment(_spec.Environment, exec);
+        var content = RunloopShellCommand.BuildEnvFileContent(merged, removals, opts.MaxEnvironmentBytes);
+        var envFilePath = $"{SecretEnvStagingDirectory}/env-{Guid.NewGuid():N}";
+
+        try
+        {
+            await _client.WriteFileAsync(baseUrl, token, Id, envFilePath, content, opts.ApiTimeout, ct).ConfigureAwait(false);
+        }
+        catch (RunloopApiException ex)
+        {
+            throw ToUnavailable(ex);
+        }
+
+        return RunloopShellCommand.BuildSourcingCommand(
+            envFilePath, exec, workingDirectory, opts.MaxCommandBytes, opts.MaxStdinBytes);
     }
 
     internal void SetWritableMounts(IReadOnlyList<WritableMountSync> writableMounts)

@@ -46,6 +46,8 @@ internal sealed class FakeRunloopHandler : HttpMessageHandler
 
     public HttpStatusCode? FailExecStatus { get; set; }
 
+    public HttpStatusCode? FailWriteStatus { get; set; }
+
     public string DevboxStatus { get; set; } = "running";
 
     public HttpStatusCode DevboxStatusCode { get; set; } = HttpStatusCode.OK;
@@ -147,6 +149,14 @@ internal sealed class FakeRunloopHandler : HttpMessageHandler
 
         if (path.EndsWith("/write_file_contents", StringComparison.Ordinal))
         {
+            if (FailWriteStatus.HasValue)
+            {
+                return new HttpResponseMessage(FailWriteStatus.Value)
+                {
+                    Content = new StringContent("""{"error":"injected write failure"}""", Encoding.UTF8, "application/json"),
+                };
+            }
+
             return Json("""{"devbox_id":"dbx_1","stdout":"","stderr":"","exit_status":0}""");
         }
 

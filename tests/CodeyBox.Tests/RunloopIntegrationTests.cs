@@ -46,14 +46,11 @@ public sealed class RunloopIntegrationTests
         TimeProvider.System,
         NullLogger.Instance);
 
-    [Fact]
+    [SkippableFact]
     [Trait("requires_runloop", "true")]
     public async Task Live_CreateExecFileSnapshotSuspendResume_Shutdown()
     {
-        if (!LiveAvailable)
-        {
-            return;
-        }
+        Skip.If(!LiveAvailable, "Set CODEYBOX_RUN_RUNLOOP_INTEGRATION=1 and RUNLOOP_API_KEY to run the live Runloop test.");
 
         var provider = NewLiveProvider();
         var spec = new SandboxSpec

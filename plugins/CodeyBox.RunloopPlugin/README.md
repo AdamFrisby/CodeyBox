@@ -20,7 +20,13 @@ What isolation this provider **does** give:
   filesystem with the orchestrator host or with other devboxes.
 - Secrets travel as process environment inside the guest; the Runloop API
   token itself never enters the guest (it stays in the orchestrator process
-  environment and the `Authorization` header).
+  environment and the `Authorization` header). Execs flagged
+  secret-bearing stage their environment as a guest file via
+  `write_file_contents` and source it — secret values never enter the
+  `execute_async` command string the hosted control plane retains, and a
+  staging failure fails the exec instead of falling back to inline
+  transport. The file is deleted before argv runs; non-secret execs keep
+  the plain inline preamble.
 
 What it **does not** give:
 
