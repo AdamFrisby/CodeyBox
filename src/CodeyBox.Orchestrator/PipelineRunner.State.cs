@@ -165,6 +165,10 @@ public sealed partial class PipelineRunner
     // Placement-driven sandbox acquisition for the work phase (null keeps the
     // legacy direct-provider path).
     private readonly SandboxPlacementAcquirer? _sandboxPlacer;
+    // Leased workload secrets (null keeps the static host-environment path).
+    // When wired, grant-authorised secrets are issued as time-bound or
+    // brokered leases and revoked on terminal transitions.
+    private readonly SecretLeaseManager? _secretLeases;
     // Upper bound for parsed reset-window hints extracted from an agent's stdout/stderr.
     // Without a cap, a maliciously-crafted Retry-After header (or prompt-injected output)
     // could park an item arbitrarily far in the future. 24h is the longest legitimate
@@ -554,7 +558,11 @@ public sealed partial class PipelineRunner
         // single-member class when no SandboxClasses are configured); null
         // keeps the legacy direct-provider path so existing tests and minimal
         // embeddings are unaffected.
-        SandboxPlacementAcquirer? sandboxPlacer = null)
+        SandboxPlacementAcquirer? sandboxPlacer = null,
+        // Leased workload secrets. Optional: production DI wires the
+        // SecretLeaseManager; null keeps the static host-environment path
+        // so existing tests and static-only deployments are unaffected.
+        SecretLeaseManager? secretLeases = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -710,6 +718,7 @@ public sealed partial class PipelineRunner
         _delegationOptionsAccessor = delegationOptionsAccessor ?? (() => new DelegationOptions());
         _delegationEscalation = delegationEscalation;
         _sandboxPlacer = sandboxPlacer;
+        _secretLeases = secretLeases;
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,

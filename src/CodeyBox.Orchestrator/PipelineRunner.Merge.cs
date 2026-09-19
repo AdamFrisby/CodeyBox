@@ -115,7 +115,9 @@ public sealed partial class PipelineRunner
                 ct,
                 AgenticConflictResolverOperation.Merge);
             var credentialPlan = BuildResolverCredentialPlan(candidateResult, access);
-            var spec = BuildSandboxSpec(access, includeAgentCredential: null, allowAgentNetwork: true,
+            var mergeSecrets = await ResolveLeasedProjectSecretsAsync(project, item, ProjectSandboxSecretScopes.Merge, ct)
+                .ConfigureAwait(false);
+            var spec = BuildSandboxSpec(WithLeaseBrokerHosts(access, mergeSecrets), includeAgentCredential: null, allowAgentNetwork: true,
                 hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
                 additionalCredentialMounts: credentialPlan.Mounts,
                 includeCredentialsTmpfs: credentialPlan.RequiresCredentialsTmpfs,
@@ -124,7 +126,7 @@ public sealed partial class PipelineRunner
                     project,
                     new SandboxTarget(networkProfile, SandboxProfileFlavor.Headless),
                     item.BaselineImageRef),
-                projectSecretEnvironment: ResolveProjectSecretEnvironment(project, item.Id, ProjectSandboxSecretScopes.Merge));
+                projectSecretEnvironment: mergeSecrets.Environment);
             var mergeSandboxStartSw = Stopwatch.StartNew();
             // Release-then-acquire: the merge phase provisions its own sandbox
             // while the work-phase reusable sandbox may still be admitted.

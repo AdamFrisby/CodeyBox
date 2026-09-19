@@ -194,6 +194,111 @@ public sealed partial class PipelineRunner
         => ProjectSandboxSecretResolver.ResolveForScope(
             project, workItemId, scope, Environment.GetEnvironmentVariable, _log);
 
+    /// <summary>
+    /// Lease-aware variant of <see cref="ResolveProjectSecretEnvironment"/>.
+    /// When no lease manager (or no lease-capable provider) is wired, this
+    /// is exactly the static path — static-only deployments see zero
+    /// behaviour change. Otherwise grant-authorised secrets are issued as
+    /// time-bound (or brokered) leases, persisted for renewal/revocation,
+    /// and broker endpoint hosts are returned for the network allowlist.
+    /// </summary>
+    private async Task<SecretLeaseMaterialization> ResolveLeasedProjectSecretsAsync(
+        Project project, WorkItem item, string scope, CancellationToken ct)
+    {
+        if (_secretLeases is null || !_secretLeases.HasLeaseProviders)
+        {
+            return new SecretLeaseMaterialization
+            {
+                Environment = ResolveProjectSecretEnvironment(project, item.Id, scope),
+            };
+        }
+
+        var (budget, _) = WorkTimeoutPolicy.Resolve(
+            item.WorkTimeout, project.WorkTimeoutMinutes, _defaultWorkTimeoutMinutesAccessor?.Invoke());
+        return await _secretLeases.MaterializeForScopeAsync(
+            project,
+            item.Id,
+            scope,
+            Environment.GetEnvironmentVariable,
+            DateTimeOffset.UtcNow + budget,
+            _log,
+            ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Exact hosts of brokered secret endpoints for the sandbox network
+    /// allowlist. Exact-match only: a broker endpoint that is not an
+    /// absolute URI contributes nothing rather than widening access.
+    /// </summary>
+    internal static IReadOnlyList<string> BrokerEndpointHosts(IEnumerable<string> endpoints)
+    {
+        var hosts = new List<string>();
+        foreach (var endpoint in endpoints)
+        {
+            if (Uri.TryCreate(endpoint, UriKind.Absolute, out var uri)
+                && !string.IsNullOrWhiteSpace(uri.Host)
+                && !hosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase))
+            {
+                hosts.Add(uri.Host);
+            }
+        }
+        return hosts.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Folds brokered secret endpoint hosts into the repository access
+    /// network allowlist so a workload can reach its credential broker
+    /// under the deny-by-default policy. Uses the existing
+    /// <c>access.Network.AllowedHosts</c> channel, so
+    /// <see cref="BuildSandboxSpec"/> needs no broker-specific shape.
+    /// </summary>
+    internal static SandboxRepositoryAccess WithLeaseBrokerHosts(
+        SandboxRepositoryAccess access, SecretLeaseMaterialization material)
+    {
+        ArgumentNullException.ThrowIfNull(access);
+        ArgumentNullException.ThrowIfNull(material);
+        var hosts = BrokerEndpointHosts(material.BrokerEndpoints);
+        if (hosts.Count == 0)
+            return access;
+        return access with
+        {
+            Network = access.Network with
+            {
+                AllowedHosts = [.. access.Network.AllowedHosts,
+                    .. hosts.Except(access.Network.AllowedHosts, StringComparer.OrdinalIgnoreCase)],
+            },
+        };
+    }
+
+    /// <summary>
+    /// Best-effort revocation of a work item's secret leases. Called on
+    /// terminal transitions and teardown paths: the item is already
+    /// terminal and persisted, so a lease-infrastructure failure is
+    /// error-logged (loud) but never fails the transition. Per-lease
+    /// failures are recorded in the store and retried by the
+    /// reconciliation sweep.
+    /// </summary>
+    private async Task RevokeItemSecretLeasesBestEffortAsync(WorkItemId workItemId, CancellationToken ct)
+    {
+        if (_secretLeases is null)
+            return;
+        try
+        {
+            var report = await _secretLeases.RevokeWorkItemLeasesAsync(workItemId, ct).ConfigureAwait(false);
+            if (!report.AllRevoked)
+            {
+                _log.LogError(
+                    "Work item {Id}: {Count} secret lease(s) could not be revoked on teardown and remain outstanding for the reconciliation sweep: {LeaseIds}",
+                    workItemId, report.Failures.Count,
+                    string.Join(", ", report.Failures.Select(f => f.LeaseId)));
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Work item {Id}: secret lease revocation on teardown failed; leases remain outstanding for the reconciliation sweep.", workItemId);
+        }
+    }
+
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {
         SandboxCredentialFileWriter.ValidateMaterializationPlan(credential, []);
