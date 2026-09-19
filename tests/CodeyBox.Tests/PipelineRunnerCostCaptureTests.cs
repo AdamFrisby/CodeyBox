@@ -180,6 +180,11 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         var usageStore = new RecordingUsageStore();
         using var tp = BuildPipelineWithCosts(_workspace, seed, costStore, usageStore: usageStore);
 
+        // Guarantee a measurable agent execution window: the scripted agent can
+        // otherwise complete in under a millisecond, leaving StartedAt == EndedAt
+        // and ElapsedMs == 0 on fast machines. Same convention as the fallback
+        // tests below that assert on elapsed timing.
+        tp.Agent.BeforeWorkAsync = async (_, _, ct) => await Task.Delay(25, ct);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("usage-test.txt", "usage\n"));
 
         var item = NewItem("feature/usage-work");
