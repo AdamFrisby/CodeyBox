@@ -357,7 +357,7 @@ public sealed class AgentClassRouterAvailabilityTests
         var router = BuildRouter(cls, [], reg);
         // Quota-exhaust the healthy member so the main loop skips it and the
         // PayPerApi-only fallback block is the path that selects a member.
-        router.MarkExhausted(Api(Claude), TimeSpan.FromMinutes(5));
+        router.MarkExhausted(Api(Claude), TimeSpan.FromMinutes(5), null, QuotaTestEvidence.Default);
 
         var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
 

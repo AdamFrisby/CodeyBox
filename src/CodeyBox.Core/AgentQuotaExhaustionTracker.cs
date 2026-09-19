@@ -18,13 +18,15 @@ public sealed class AgentQuotaExhaustionTracker
         TimeSpan ttl,
         DateTimeOffset nowUtc,
         DateTimeOffset? resetAt = null,
-        DateTimeOffset? earliestKnownReset = null)
+        DateTimeOffset? earliestKnownReset = null,
+        QuotaExhaustionEvidence? evidence = null)
         => _inner.MarkExhausted(
             AgentQuotaMemberKey.From(member),
             ttl,
             nowUtc,
             resetAt,
-            earliestKnownReset);
+            earliestKnownReset,
+            evidence);
 
     public bool TryGet(AgentMembership member, DateTimeOffset nowUtc, out AgentQuotaExhaustionEntry entry)
         => _inner.TryGet(AgentQuotaMemberKey.From(member), nowUtc, out entry);
@@ -34,6 +36,16 @@ public sealed class AgentQuotaExhaustionTracker
 
     public bool TryShorten(AgentMembership member, DateTimeOffset expiresAt, out AgentQuotaExhaustionEntry previous)
         => _inner.TryShorten(AgentQuotaMemberKey.From(member), expiresAt, out previous);
+
+    /// <summary>
+    /// Clears every active entry for <paramref name="kind"/> (all models /
+    /// instances). Used by the operator reset path. Returns the removed
+    /// entries with their recorded evidence for audit.
+    /// </summary>
+    public IReadOnlyList<KeyValuePair<AgentQuotaMemberKey, AgentQuotaExhaustionEntry>> ClearForAgent(
+        AgentKind kind,
+        DateTimeOffset nowUtc)
+        => _inner.ClearWhere(key => key.Agent == kind, nowUtc);
 
     public void PruneExpired(DateTimeOffset nowUtc) => _inner.PruneExpired(nowUtc);
 }
@@ -53,13 +65,22 @@ public sealed class AgentQuotaExhaustionTracker<TKey>
         TimeSpan ttl,
         DateTimeOffset nowUtc,
         DateTimeOffset? resetAt = null,
-        DateTimeOffset? earliestKnownReset = null)
+        DateTimeOffset? earliestKnownReset = null,
+        QuotaExhaustionEvidence? evidence = null)
     {
         if (ttl <= TimeSpan.Zero)
         {
             _entries.TryRemove(key, out _);
             return false;
         }
+
+        // The sink enforces the narrowing: only provider quota/rate-limit
+        // evidence may install a gate. Anything else (a null-evidence legacy
+        // write is still accepted for probe-internal runtime hints, but the
+        // router-level entry point requires evidence — see AgentClassRouter)
+        // must never bench a member.
+        if (evidence is { Signal: var signal } && !signal.IsExhaustionSignal())
+            return false;
 
         var expiresAt = nowUtc + ttl;
         ConsiderCap(resetAt);
@@ -72,7 +93,7 @@ public sealed class AgentQuotaExhaustionTracker<TKey>
             return false;
         }
 
-        var next = new AgentQuotaExhaustionEntry(expiresAt, storedResetAt);
+        var next = new AgentQuotaExhaustionEntry(expiresAt, storedResetAt, evidence, RecordedAt: nowUtc);
         _entries.AddOrUpdate(key, next, (_, existing) =>
             existing.ExpiresAt <= nowUtc || next.ExpiresAt < existing.ExpiresAt
                 ? next
@@ -102,6 +123,29 @@ public sealed class AgentQuotaExhaustionTracker<TKey>
     public bool TryClear(TKey key, out AgentQuotaExhaustionEntry removed) =>
         _entries.TryRemove(key, out removed);
 
+    /// <summary>
+    /// Clears every active entry matching <paramref name="predicate"/> (e.g. all
+    /// members of one agent kind on operator reset). Expired entries are pruned
+    /// as a side effect. Returns the removed entries with their recorded
+    /// evidence so the caller can audit what was cleared.
+    /// </summary>
+    public IReadOnlyList<KeyValuePair<TKey, AgentQuotaExhaustionEntry>> ClearWhere(
+        Func<TKey, bool> predicate,
+        DateTimeOffset nowUtc)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        var removed = new List<KeyValuePair<TKey, AgentQuotaExhaustionEntry>>();
+        foreach (var entry in _entries)
+        {
+            if (entry.Value.ExpiresAt <= nowUtc || predicate(entry.Key))
+            {
+                if (_entries.TryRemove(entry))
+                    removed.Add(entry);
+            }
+        }
+        return removed;
+    }
+
     public bool TryShorten(TKey key, DateTimeOffset expiresAt, out AgentQuotaExhaustionEntry previous)
     {
         while (_entries.TryGetValue(key, out previous))
@@ -128,4 +172,18 @@ public sealed class AgentQuotaExhaustionTracker<TKey>
     }
 }
 
-public readonly record struct AgentQuotaExhaustionEntry(DateTimeOffset ExpiresAt, DateTimeOffset? ResetAt);
+/// <summary>
+/// An active in-process exhaustion gate. <see cref="Evidence"/> names the
+/// provider quota/rate-limit signal that installed it (null only for
+/// probe-internal runtime hints that carry no pipeline-level provenance);
+/// router-level verdicts always carry evidence. <see cref="RecordedAt"/> is
+/// the moment the verdict was installed: a fresh verdict is trusted without
+/// re-probing (the live probe lags a just-observed 429), while a verdict
+/// older than the router's revalidation age is re-checked against a live
+/// probe before it may keep refusing dispatches.
+/// </summary>
+public readonly record struct AgentQuotaExhaustionEntry(
+    DateTimeOffset ExpiresAt,
+    DateTimeOffset? ResetAt,
+    QuotaExhaustionEvidence? Evidence = null,
+    DateTimeOffset RecordedAt = default);

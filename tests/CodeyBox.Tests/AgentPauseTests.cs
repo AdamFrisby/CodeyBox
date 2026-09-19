@@ -174,7 +174,7 @@ public sealed class AgentPauseTests : IDisposable
                 DisplayName = "Frontier",
                 Members = [claude],
             });
-        router.MarkExhausted(claude, TimeSpan.FromMinutes(5));
+        router.MarkExhausted(claude, TimeSpan.FromMinutes(5), null, QuotaTestEvidence.Default);
 
         var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
 
@@ -254,7 +254,7 @@ public sealed class AgentPauseTests : IDisposable
                     claude,
                 ],
             });
-        router.MarkExhausted(claude, TimeSpan.FromMinutes(5));
+        router.MarkExhausted(claude, TimeSpan.FromMinutes(5), null, QuotaTestEvidence.Default);
 
         var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
 

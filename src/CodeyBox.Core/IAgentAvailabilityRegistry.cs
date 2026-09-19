@@ -90,7 +90,25 @@ public interface IAgentAvailabilityReset
     /// sweep / dispatch re-execs the CLI from scratch.
     /// </summary>
     void Reset(AgentKind kind);
+
+    /// <summary>
+    /// Clears every cached quota-exhaustion verdict for <paramref name="kind"/>
+    /// (router in-process gates plus probe-side runtime 429 overrides) without
+    /// requiring a process restart. The clear is recorded in the audit log with
+    /// <paramref name="clearedBy"/> (the operator who did it) and the evidence
+    /// each verdict carried. Returns what was cleared.
+    /// </summary>
+    QuotaExhaustionResetResult ResetQuotaExhaustion(AgentKind kind, string clearedBy);
 }
+
+/// <summary>
+/// Outcome of <see cref="IAgentAvailabilityReset.ResetQuotaExhaustion"/>: how
+/// many cached exhaustion verdicts were cleared and the evidence they carried.
+/// </summary>
+public sealed record QuotaExhaustionResetResult(
+    int RouterEntriesCleared,
+    int ProbeEntriesCleared,
+    IReadOnlyList<string> ClearedEvidence);
 
 /// <summary>
 /// Narrow read model for runtime auth-required exclusions. Consumers that need

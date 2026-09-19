@@ -101,7 +101,7 @@ public sealed class AgentClassRouterFallbackTests
         var cls = Frontier(Sub(Codex), Sub(Claude), Sub(Gemini, score: 95));
         var router = BuildNoFloor(cls);
 
-        router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30));
+        router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30), null, QuotaTestEvidence.Default);
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
         Assert.Equal([Claude, Gemini], candidates.Select(c => c.Agent).ToArray());
@@ -115,7 +115,7 @@ public sealed class AgentClassRouterFallbackTests
 
         // Reset hints are parsed from less-trusted runtime output. A past hint
         // must not clear the in-process exhaustion gate.
-        router.MarkExhausted(Sub(Codex), TimeSpan.FromHours(1), resetAt: DateTimeOffset.UtcNow.AddSeconds(-1));
+        router.MarkExhausted(Sub(Codex), TimeSpan.FromHours(1), DateTimeOffset.UtcNow.AddSeconds(-1), QuotaTestEvidence.Default);
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
         Assert.Equal([Claude], candidates.Select(c => c.Agent).ToArray());
@@ -129,7 +129,7 @@ public sealed class AgentClassRouterFallbackTests
             Sub(Claude, modelId: "claude-sonnet-4-6"));
         var router = BuildNoFloor(cls);
 
-        router.MarkExhausted(Sub(Claude, modelId: "claude-opus-4-7"), TimeSpan.FromMinutes(30));
+        router.MarkExhausted(Sub(Claude, modelId: "claude-opus-4-7"), TimeSpan.FromMinutes(30), null, QuotaTestEvidence.Default);
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
         Assert.Single(candidates);
@@ -154,7 +154,7 @@ public sealed class AgentClassRouterFallbackTests
             new FakeProbe(Codex, 80.0),  // would normally win on tie + config order
             new FakeProbe(Claude, 50.0));
 
-        router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30));
+        router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30), null, QuotaTestEvidence.Default);
 
         var decision = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
 
@@ -163,26 +163,82 @@ public sealed class AgentClassRouterFallbackTests
     }
 
     [Fact]
-    public async Task ResolveQuotaRetry_RecoveredProbe_ClearsStaleInProcessExhaustion()
+    public async Task ResolveAsync_RevalidatesStaleExhaustionContradictedByHealthyProbe()
     {
+        // The incident shape: a cached exhaustion verdict older than the
+        // revalidation age, contradicted by a current healthy probe reading,
+        // must not keep refusing the dispatch. Fresh verdicts still refuse
+        // without probing (previous test); only stale ones revalidate.
+        var time = new ManualTimeProvider();
+        var cls = Frontier(Sub(Codex), Sub(Claude));
+        var router = BuildWithOptions(
+            cls,
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            time,
+            new FakeProbe(Codex, 80.0),
+            new FakeProbe(Claude, 50.0));
+
+        router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30), null, QuotaTestEvidence.Default);
+
+        var fresh = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.Equal(Claude, fresh.Chosen!.Agent);
+
+        time.Advance(TimeSpan.FromMinutes(16));
+
+        var revalidated = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.NotNull(revalidated.Chosen);
+        Assert.Equal(Codex, revalidated.Chosen!.Agent);
+        Assert.False(router.IsExhausted(Sub(Codex), time.GetUtcNow()));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_StaleExhaustionConfirmedByProbe_KeepsRefusing()
+    {
+        // Revalidation is not a blanket amnesty: when the live probe confirms
+        // the stale verdict, the refusal stands.
+        var time = new ManualTimeProvider();
+        var cls = Frontier(Sub(Codex), Sub(Claude));
+        var router = BuildWithOptions(
+            cls,
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            time,
+            new FakeProbe(Codex, 0.0),
+            new FakeProbe(Claude, 50.0));
+
+        router.MarkExhausted(Sub(Codex), TimeSpan.FromMinutes(30), null, QuotaTestEvidence.Default);
+
+        time.Advance(TimeSpan.FromMinutes(16));
+
+        var decision = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.True(router.IsExhausted(Sub(Codex), time.GetUtcNow()));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_RecoveredProbe_ClearsStaleInProcessExhaustion()
+    {
+        // A cached verdict confirmed by the live probe refuses the dispatch;
+        // once the probe recovers, the next dispatch revalidates, clears the
+        // stale entry, and routes — without needing a quota-retry admission.
+        var time = new ManualTimeProvider();
         var member = Sub(Codex);
         var cls = Frontier(member);
-        var router = Build(cls, new FakeProbe(Codex, 80.0));
+        var probe = new MutableSnapshotProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0.0 });
+        var router = BuildWithOptions(cls, new QuotaRouterOptions { MinQuotaPct = 10.0 }, time, probe);
 
-        router.MarkExhausted(member, TimeSpan.FromDays(10), resetAt: DateTimeOffset.UtcNow.AddDays(6));
+        router.MarkExhausted(member, TimeSpan.FromDays(10), time.GetUtcNow().AddDays(6), QuotaTestEvidence.Default);
 
         var blocked = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
         Assert.Null(blocked.Chosen);
         Assert.True(blocked.ShouldWait);
 
-        var retryDecision = await router.ResolveQuotaRetryAsync(Item(), project: null, CancellationToken.None);
-        Assert.False(retryDecision.ShouldWait);
-
-        // Use a fresh work item id so this cannot pass merely because
-        // ResolveQuotaRetryAsync recorded a one-item admission.
-        var nextRoute = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
-        Assert.Equal(Codex, nextRoute.Chosen!.Agent);
-        Assert.False(nextRoute.ShouldWait);
+        time.Advance(TimeSpan.FromMinutes(16));
+        probe.Snapshot = new AgentQuotaSnapshot { AvailablePct = 80.0 };
+        var recovered = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.Equal(Codex, recovered.Chosen!.Agent);
+        Assert.False(recovered.ShouldWait);
+        Assert.False(router.IsExhausted(member, time.GetUtcNow()));
     }
 
     [Fact]
@@ -212,7 +268,7 @@ public sealed class AgentClassRouterFallbackTests
         var initial = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
         Assert.Equal(Codex, initial.Chosen!.Agent);
 
-        router.MarkExhausted(member, TimeSpan.FromDays(10), resetAt: longReset);
+        router.MarkExhausted(member, TimeSpan.FromDays(10), resetAt: longReset, evidence: QuotaTestEvidence.Default);
         var blocked = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
         Assert.Null(blocked.Chosen);
         Assert.True(blocked.ShouldWait);

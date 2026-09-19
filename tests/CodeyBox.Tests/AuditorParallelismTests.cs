@@ -1149,10 +1149,10 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
 
     // Audit-pool QUOTA exhaustion via the router's in-process MarkExhausted
     // cache — distinct from the probe-floor / mid-iteration-failure paths.
-    // AgentClassRouter.OrderedFallbackCandidatesAsync filters cached-
-    // exhausted members BEFORE running probes, so when every audit-capable
-    // member of the class is in the exhaustion cache the pool walk returns
-    // zero candidates and quotaRejectedCount inside
+    // A FRESH cached verdict is trusted without re-probing (the live probe
+    // lags a just-observed 429), so when every audit-capable member of the
+    // class is freshly in the exhaustion cache the pool walk returns zero
+    // candidates and quotaRejectedCount inside
     // SelectFromAuditCapablePoolAsync stays at 0. The dedicated cached-
     // exhausted helper (CountCachedExhaustedAuditCapableMembers) must
     // reclassify that empty-loop state as quota exhaustion and throw
@@ -1194,11 +1194,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         };
         var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
         // Healthy probe deliberately wired alongside the exhaustion cache:
-        // if a regression dropped the in-cache filter inside
-        // OrderedFallbackCandidatesAsync, the probe would surface Codex
-        // as available and the test would silently pass against a broken
-        // production path. With the probe healthy, the ONLY thing that
-        // can park this item is the cached-exhausted helper.
+        // the verdict is fresh, so it is trusted without re-probing and the
+        // ONLY thing that can park this item is the cached-exhausted helper.
         var router = new AgentClassRouter(
             [frontier],
             [new FakeProbe(AgentKind.Codex, 80.0)],
@@ -1207,7 +1204,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         router.MarkExhausted(
             frontier.Members[1],
             TimeSpan.FromHours(1),
-            resetAt: DateTimeOffset.UtcNow.AddHours(1));
+            resetAt: DateTimeOffset.UtcNow.AddHours(1),
+            evidence: QuotaTestEvidence.Default);
 
         var auditorCalls = 0;
         var auditor = new FakeLlmAuditor(
@@ -1240,6 +1238,171 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         // infrastructure (terminal failure that strands the item until
         // operator intervention) and NOT Done (silent-skip Pass with zero
         // review).
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
+        Assert.NotEqual("infrastructure", final.FailureKind);
+        // The auditor body must never have run — resolution short-circuited
+        // before any dispatch into a sandbox.
+        Assert.Equal(0, auditorCalls);
+    }
+
+    [Fact]
+    public async Task AuditPool_StaleCachedExhaustionContradictedByHealthyProbe_RunsAuditor()
+    {
+        // Sibling to the park test above: the same cached verdict, but stale
+        // (past the revalidation age) and contradicted by a healthy live
+        // probe. The stale entry is cleared, Codex rejoins the pool, and the
+        // auditor runs instead of parking behind a verdict the provider
+        // reading says is unnecessary.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Codex,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 90,
+                    Capabilities = [WellKnownCapabilities.Audit],
+                },
+            ],
+        };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var time = new ManualTimeProvider();
+        var router = new AgentClassRouter(
+            [frontier],
+            [new FakeProbe(AgentKind.Codex, 80.0)],
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            time);
+        router.MarkExhausted(
+            frontier.Members[1],
+            TimeSpan.FromHours(1),
+            resetAt: time.GetUtcNow().AddHours(1),
+            evidence: QuotaTestEvidence.Default);
+        time.Advance(TimeSpan.FromMinutes(16));
+
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor(
+            "stale-exhausted-review",
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref auditorCalls);
+                return Task.FromResult(new AuditResult(true, []));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            maxAuditIterations: 1,
+            classRouter: router,
+            auditQuotaOptions: quotaOptions,
+            // Codex must be registered AND credentialed: the pool walk skips
+            // members with no credentials before it ever reaches the quota
+            // gate, so without this the auditor could never run and the
+            // test would park (or fail infra) for a non-quota reason.
+            // The pipeline-side live probe makes the "healthy probe
+            // contradicts the stale verdict" leg genuine: the audit
+            // candidate gate reads 80% available and lets Codex run.
+            credentials: new GrantCredentialsForProvider(AgentKind.Codex),
+            auditQuotaProbes: [new FakeProbe(AgentKind.Codex, 80.0)],
+            extraAgentRunners: [new PoolPassthroughRunner(AgentKind.Codex)]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.Equal(1, auditorCalls);
+    }
+
+    [Fact]
+    public async Task AuditPool_CachedExhaustedConfirmedByExhaustedProbe_ParksForQuotaReset()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        // Same class layout, but the live probe CONFIRMS the exhaustion (0%
+        // available): the cached verdict stands, the pool walk returns zero
+        // candidates, and the cached-exhausted helper is the only thing
+        // standing between this item and an incorrect infrastructure-failure
+        // verdict.
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                },
+                new AgentMembership
+                {
+                    Agent = AgentKind.Codex,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 90,
+                    Capabilities = [WellKnownCapabilities.Audit],
+                },
+            ],
+        };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var router = new AgentClassRouter(
+            [frontier],
+            [new FakeProbe(AgentKind.Codex, 0.0)],
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance);
+        router.MarkExhausted(
+            frontier.Members[1],
+            TimeSpan.FromHours(1),
+            resetAt: DateTimeOffset.UtcNow.AddHours(1),
+            evidence: QuotaTestEvidence.Default);
+
+        var auditorCalls = 0;
+        var auditor = new FakeLlmAuditor(
+            "confirmed-exhausted-review",
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref auditorCalls);
+                return Task.FromResult(new AuditResult(true, []));
+            },
+            AuditCapabilities.AgentCredentials);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
+            maxAuditIterations: 1,
+            classRouter: router,
+            auditQuotaOptions: quotaOptions,
+            extraAgentRunners: [new PoolPassthroughRunner(AgentKind.Codex)]);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // The single audit-capable member is cached-exhausted AND the live
+        // probe confirms it: the resolver MUST classify this as quota (park
+        // for quota reset), NOT infrastructure (terminal failure that strands
+        // the item until operator intervention) and NOT Done (silent-skip Pass
+        // with zero review).
         Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.NotEqual(WorkItemState.Failed, final.State);
         Assert.NotEqual("infrastructure", final.FailureKind);
@@ -1309,7 +1472,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
         router.MarkExhausted(
             frontier.Members[2],
             TimeSpan.FromHours(1),
-            resetAt: DateTimeOffset.UtcNow.AddHours(1));
+            resetAt: DateTimeOffset.UtcNow.AddHours(1),
+            evidence: QuotaTestEvidence.Default);
 
         var auditorCalls = 0;
         var auditor = new FakeLlmAuditor(

@@ -840,7 +840,13 @@ public sealed partial class PipelineRunner
 
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
-                if (detection is not null)
+                // Only genuine quota/rate-limit signals take the quota path. A
+                // 401/403 (Unauthorized) never clears on a quota window: it must
+                // fall through to the auth handling above/below, never bench the
+                // member via MarkExhausted or park the item for a reset that
+                // will never arrive. RecordIfQuotaFailureAsync applies the same
+                // narrowing before touching the observed-failure store.
+                if (detection is { Kind: var detectedKind } && detectedKind.IsExhaustionSignal())
                 {
                     // The quota record, fallback routing, and park signals below
                     // must fire exactly as before for every detection: peers

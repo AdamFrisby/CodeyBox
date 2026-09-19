@@ -299,8 +299,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
-            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
-            var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+            var (repoId, baseBranch) = await EnsurePipelineRepositoryAsync(item, project, configuredBaseBranch, ct);
             var hadRecordedWorkBranchAtEntry = !string.IsNullOrWhiteSpace(item.WorkBranch);
             var workBranch = item.WorkBranch ?? DefaultWorkBranchFor(item.Id);
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
@@ -1155,6 +1154,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 project,
                 failureKind: WorkItemFailureKinds.Infrastructure,
                 agent: ex.Agent);
+        }
+        catch (GitRepositorySeedingException ex)
+        {
+            // Seeding/refreshing the bare repo runs on the orchestrator host
+            // against the git remote — no agent, no provider quota. It is
+            // always infrastructure and must never feed a quota-exhaustion
+            // verdict (no MarkExhausted, no observed-failure record, no quota
+            // park); the wrapper type guarantees that by construction.
+            _log.LogWarning(
+                ex,
+                "Work item {Id} failed during repository {Operation}: {Error}",
+                item.Id, ex.Operation, ex.Message);
+            await TransitionFailed(
+                item,
+                ex.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.Infrastructure);
         }
         catch (AgentUnavailableException ex)
         {

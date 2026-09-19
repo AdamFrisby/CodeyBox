@@ -448,7 +448,7 @@ public sealed class QuotaRouterRampedFloorTests
         Assert.Equal(1, claudeProbe.CallCount);
         Assert.Equal(1, codexProbe.CallCount);
 
-        router.MarkExhausted(decision.Chosen, TimeSpan.FromMinutes(30), reset);
+        router.MarkExhausted(decision.Chosen, TimeSpan.FromMinutes(30), reset, QuotaTestEvidence.Default);
 
         var reservedCandidates = await router.OrderedFallbackCandidatesAsync(
             item, project: null, CancellationToken.None);

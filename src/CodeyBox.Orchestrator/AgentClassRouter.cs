@@ -624,25 +624,44 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             }
 
             // Mid-iteration fallback may have marked this member exhausted in the
-            // current process. Skip it immediately so we don't burn a probe round-trip
-            // re-discovering what we just learned from a live failure. Operator
-            // pause is checked first so a paused agent remains visibly distinct
-            // from an older in-process exhaustion cache entry.
+            // current process. A FRESH verdict is trusted without burning a
+            // probe round-trip: the live probe lags a just-observed 429, and
+            // spillover must not re-dispatch into the bucket it just left.
+            // A STALE verdict (older than ExhaustionRevalidationAge) is
+            // re-checked against a live probe before it may keep refusing:
+            // the probe is a current measurement, the cache a stale claim, so
+            // a healthy reading clears the entry and routes normally instead
+            // of benching the member until its TTL elapses. Operator pause is
+            // checked first so a paused agent remains visibly distinct from an
+            // older in-process exhaustion cache entry.
             if (!bypassInProcessExhaustion
                 && !quotaRetryAdmissionMatches
                 && TryGetExhaustedUntil(member, nowUtc, out var exhaustedUntil))
             {
-                var reason = $"in-process exhaustion cache until {exhaustedUntil:O}";
-                if (commitDispatchSideEffects)
-                    LogMemberExcluded(item.Id, member, reason);
-                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reason));
-                if (member.Billing == AgentBilling.Subscription)
+                if (!IsExhaustionFresh(member, nowUtc)
+                    && await TryRevalidateExhaustionAsync(
+                        item, member, poolSnapshots, nowUtc, commitDispatchSideEffects, ct).ConfigureAwait(false))
                 {
-                    subscriptionExhaustionCacheExcluded++;
-                    if (earliestExhaustionCacheExpiry is null || exhaustedUntil < earliestExhaustionCacheExpiry.Value)
-                        earliestExhaustionCacheExpiry = exhaustedUntil;
+                    exhaustedUntil = default;
                 }
-                continue;
+                else
+                {
+                    TryGetExhaustedUntil(member, nowUtc, out exhaustedUntil);
+                    var evidence = GetExhaustionEvidence(member, nowUtc);
+                    var reason = evidence is null
+                        ? $"in-process exhaustion cache until {exhaustedUntil:O}"
+                        : $"in-process exhaustion cache until {exhaustedUntil:O} (evidence: {evidence})";
+                    if (commitDispatchSideEffects)
+                        LogMemberExcluded(item.Id, member, reason);
+                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reason));
+                    if (member.Billing == AgentBilling.Subscription)
+                    {
+                        subscriptionExhaustionCacheExcluded++;
+                        if (earliestExhaustionCacheExpiry is null || exhaustedUntil < earliestExhaustionCacheExpiry.Value)
+                            earliestExhaustionCacheExpiry = exhaustedUntil;
+                    }
+                    continue;
+                }
             }
             // Smoke gate / fast-fail circuit breaker excluded this agent? Skip
             // it — the binary or credentials are known-broken and a dispatch
@@ -1468,9 +1487,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var quotaRetryAdmission = GetQuotaRetryAdmission(item.Id, nowUtc);
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
 
-        // Score + order the eligible, non-exhausted members first. Availability
-        // and quota are applied last, in score order, so we never burn a probe
-        // on a member already filtered out by score or in-process exhaustion.
+        // Score + order the eligible members first. Availability and quota are
+        // applied last, in score order. Fresh in-process exhaustion verdicts
+        // pre-filter here so fallback never burns a probe re-discovering what
+        // a live failure just taught it; STALE verdicts stay in the list so
+        // the per-member loop below can revalidate them against its live probe
+        // snapshot (a healthy reading clears the stale entry and keeps the
+        // candidate, a confirming reading drops it). Quota-retry admissions
+        // bypass the pre-filter exactly as the primary path does.
         var ordered = agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
@@ -1479,7 +1503,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 item.RequiredCapabilities,
                 effectiveCapabilities))
             .Where(x => QuotaRetryAdmissionMatches(quotaRetryAdmission, x.Member)
-                || !IsExhausted(x.Member, nowUtc))
+                || !IsExhaustionFresh(x.Member, nowUtc))
             .Select(x => new
             {
                 x.Member,
@@ -1537,7 +1561,33 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 publishRecoverySignal: true,
                 resetAt: gate.Allow || !quota.IsKnown ? null : QuotaGatePolicy.ResolveResetHint(quota, gate));
             if (gate.Allow)
+            {
+                // The live gate just allowed a member carrying an in-process
+                // exhaustion entry: when the verdict is stale (past the
+                // revalidation age) the cached claim is contradicted by a
+                // current measurement, so the entry is cleared and the member
+                // rejoins the list. Fresh verdicts never reach this branch —
+                // the pre-filter above excluded them — but the age check stays
+                // so a verdict recorded concurrently with this pass is not
+                // cleared by a probe that predates it. A quota-retry admission
+                // bypasses this bookkeeping only in the sense that it was
+                // never excluded on the entry.
+                if (!QuotaRetryAdmissionMatches(quotaRetryAdmission, member)
+                    && !IsExhaustionFresh(member, nowUtc)
+                    && _exhausted.TryClear(member, out var stale))
+                {
+                    var evidence = stale.Evidence?.ToString() ?? "(no recorded evidence)";
+                    _log.LogInformation(
+                        "Cleared stale in-process exhaustion for fallback candidate {Agent}/{Model} " +
+                        "(previous evidence: {Evidence}); live probe reports {Available:F1}% — keeping candidate",
+                        member.Agent.Value,
+                        member.ModelId ?? "(default)",
+                        evidence,
+                        quota.AvailablePct);
+                    AuditLog.QuotaExhaustionStaleCleared(item.Id, member.Agent, member.ModelId, evidence, quota.AvailablePct);
+                }
                 result.Add(member);
+            }
         }
         return result;
     }
@@ -1603,11 +1653,29 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// current reset hints are ignored. Subsequent calls to
     /// <see cref="OrderedFallbackCandidatesAsync"/> and
     /// <see cref="ResolveAsync"/> will skip the member while the suppression is
-    /// active. Always combine with <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
+    /// active (unless a live probe contradicts the verdict — see
+    /// <see cref="TryRevalidateExhaustionAsync"/>). Always combine with
+    /// <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
     /// so the suppression also reaches any probe-side cache.
     /// </summary>
-    public void MarkExhausted(AgentMembership member, TimeSpan ttl, DateTimeOffset? resetAt = null)
+    /// <remarks>
+    /// <paramref name="evidence"/> is required and must name a provider
+    /// quota/rate-limit signal: a repository-seeding or git-transport failure,
+    /// a 401/403, or any other non-quota fault can never install this gate
+    /// (the sink refuses it and returns false). This is the narrowing point
+    /// that keeps infrastructure faults from being converted into verdicts
+    /// about agents or quota.
+    /// </remarks>
+    public bool MarkExhausted(
+        AgentMembership member,
+        TimeSpan ttl,
+        DateTimeOffset? resetAt,
+        QuotaExhaustionEvidence evidence)
     {
+        ArgumentNullException.ThrowIfNull(evidence);
+        if (!evidence.Signal.IsExhaustionSignal())
+            return false;
+
         var nowUtc = _time.GetUtcNow();
         var earliestKnownReset = resetAt;
         var key = ExhaustionKey(member);
@@ -1618,12 +1686,114 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             earliestKnownReset = windowReset;
         }
 
-        if (_exhausted.MarkExhausted(member, ttl, nowUtc, resetAt, earliestKnownReset))
+        if (_exhausted.MarkExhausted(member, ttl, nowUtc, resetAt, earliestKnownReset, evidence))
+        {
             RecordQuotaUsability(
                 member,
                 isUsable: false,
                 publishRecoverySignal: true,
                 resetAt: earliestKnownReset ?? resetAt);
+            _log.LogInformation(
+                "Marked {Agent}/{Model} exhausted for {Ttl}: evidence={Evidence}",
+                member.Agent.Value,
+                member.ModelId ?? "(default)",
+                ttl,
+                evidence.ToString());
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Clears the in-process exhaustion gate for <paramref name="member"/>, if
+    /// any. Returns the removed entry (with its recorded evidence) so the
+    /// caller can audit the clear. Used by the operator reset path.
+    /// </summary>
+    public bool ClearExhaustion(AgentMembership member, out AgentQuotaExhaustionEntry removed) =>
+        _exhausted.TryClear(member, out removed);
+
+    /// <summary>
+    /// Clears every in-process exhaustion gate for <paramref name="kind"/> (all
+    /// models / instances). Returns the removed entries with their recorded
+    /// evidence so the caller can audit the clear. Used by the operator reset
+    /// path (<c>POST /admin/agent/{name}/reset</c>) so a cached verdict never
+    /// survives every administrative action but a process restart.
+    /// </summary>
+    public IReadOnlyList<KeyValuePair<AgentQuotaMemberKey, AgentQuotaExhaustionEntry>> ClearExhaustionForAgent(
+        AgentKind kind)
+        => _exhausted.ClearForAgent(kind, _time.GetUtcNow());
+
+    /// <summary>
+    /// Re-validates a cached exhaustion verdict against a live probe reading
+    /// before the router refuses a dispatch on it. Returns true when the probe
+    /// reports quota the gate considers usable — the stale entry is cleared
+    /// (logged, with its recorded evidence) and the caller must evaluate the
+    /// member normally. Returns false when the probe confirms exhaustion, is
+    /// unknown, or throws: the cached verdict stands.
+    /// </summary>
+    private async Task<bool> TryRevalidateExhaustionAsync(
+        WorkItem item,
+        AgentMembership member,
+        Dictionary<string, AgentQuotaSnapshot> poolSnapshots,
+        DateTimeOffset nowUtc,
+        bool commitDispatchSideEffects,
+        CancellationToken ct)
+    {
+        AgentQuotaSnapshot snapshot;
+        try
+        {
+            snapshot = await ProbePoolMemberAsync(member, poolSnapshots, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex,
+                "Exhaustion revalidation probe for {Agent}/{Model} threw; keeping cached verdict",
+                member.Agent.Value, member.ModelId ?? "(default)");
+            return false;
+        }
+
+        var quota = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
+        quota = (await ApplyBudgetAsync(member, quota, ct).ConfigureAwait(false)).Quota;
+        if (!KnownQuotaMeetsFloor(member, quota, nowUtc))
+            return false;
+
+        if (_exhausted.TryClear(member, out var removed))
+        {
+            var evidence = removed.Evidence?.ToString() ?? "(no recorded evidence)";
+            _log.LogInformation(
+                "Work item {Id}: cleared stale in-process exhaustion for {Agent}/{Model} " +
+                "(previous evidence: {Evidence}); live probe reports {Available:F1}% — routing normally",
+                item.Id,
+                member.Agent.Value,
+                member.ModelId ?? "(default)",
+                evidence,
+                quota.AvailablePct);
+            if (commitDispatchSideEffects)
+                AuditLog.QuotaExhaustionStaleCleared(item.Id, member.Agent, member.ModelId, evidence, quota.AvailablePct);
+        }
+
+        return true;
+    }
+
+    private QuotaExhaustionEvidence? GetExhaustionEvidence(AgentMembership member, DateTimeOffset nowUtc) =>
+        _exhausted.TryGet(member, nowUtc, out var entry) ? entry.Evidence : null;
+
+    /// <summary>
+    /// True when the member carries an active exhaustion verdict younger than
+    /// <see cref="QuotaRouterOptions.ExhaustionRevalidationAge"/>. Fresh
+    /// verdicts refuse without a probe round-trip; older ones are re-checked
+    /// against a live probe (see <see cref="TryRevalidateExhaustionAsync"/>).
+    /// An entry with an unknown recording instant is treated as stale — a
+    /// verdict that cannot prove its freshness is not trusted blindly.
+    /// </summary>
+    private bool IsExhaustionFresh(AgentMembership member, DateTimeOffset nowUtc)
+    {
+        if (!_exhausted.TryGet(member, nowUtc, out var entry))
+            return false;
+        if (entry.RecordedAt == default)
+            return false;
+        return nowUtc - entry.RecordedAt < _opts.ExhaustionRevalidationAge;
     }
 
     public bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
@@ -3339,6 +3509,19 @@ public sealed class QuotaRouterOptions
     /// are exhausted. Default 5 minutes.
     /// </summary>
     public TimeSpan QuotaRecheckInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// How long a cached in-process exhaustion verdict is trusted without
+    /// revalidation. A verdict younger than this refuses the member without
+    /// burning a probe round-trip (the live probe lags a just-observed 429,
+    /// and mid-iteration spillover must not re-dispatch into the bucket it
+    /// just left). Once a verdict reaches this age, the next dispatch
+    /// re-checks it against a live probe reading: a healthy reading clears
+    /// the stale entry and routes normally, while a confirming (or unknown)
+    /// reading keeps the refusal. Bounds how long a misattributed verdict can
+    /// bench a member well below its TTL. Default 15 minutes. Hot-reloadable.
+    /// </summary>
+    public TimeSpan ExhaustionRevalidationAge { get; set; } = TimeSpan.FromMinutes(15);
 
     /// <summary>
     /// Cadence for the event-driven quota recovery monitor while it is tracking

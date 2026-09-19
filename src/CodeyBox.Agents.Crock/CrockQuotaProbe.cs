@@ -63,7 +63,7 @@ namespace CodeyBox.Agents.Crock;
 /// in <c>Program.cs</c> does NOT fall back to a subscription OAuth token —
 /// this path uses the CrockCode API key only, per the contract.</para>
 /// </summary>
-public sealed class CrockQuotaProbe : IAgentQuotaProbe
+public sealed class CrockQuotaProbe : IAgentQuotaProbe, IAgentQuotaExhaustionReset
 {
     /// <summary>
     /// Anthropic "list models" endpoint — token-free, returns 200 only when
@@ -202,6 +202,35 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
         try { _cache.Clear(); _exhausted.Clear(); }
         finally { _lock.Release(); }
     }
+
+    /// <summary>
+    /// Operator reset (<c>POST /admin/agent/crock/reset</c>): drops every
+    /// runtime 429 override for this agent (all credential scopes) so a cached
+    /// verdict never survives every administrative action but a process
+    /// restart. Response-cache snapshots are left alone — the next probe
+    /// refetch decides freshness on its own TTL.
+    /// </summary>
+    public int ClearRuntimeExhaustion(AgentKind kind)
+    {
+        _lock.Wait();
+        try
+        {
+            var victims = _exhausted.Keys
+                .Where(key => BelongsToAgent(key.RouteKey, kind))
+                .ToList();
+            foreach (var victim in victims)
+                _exhausted.Remove(victim);
+            return victims.Count;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    private static bool BelongsToAgent(string routeKey, AgentKind kind) =>
+        string.Equals(routeKey, kind.Value, StringComparison.OrdinalIgnoreCase)
+        || routeKey.StartsWith(kind.Value + "/", StringComparison.OrdinalIgnoreCase);
 
     internal async Task<AgentQuotaSnapshot> ProbeListModelsAsync(string token, CancellationToken ct)
     {

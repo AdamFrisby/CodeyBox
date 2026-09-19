@@ -342,6 +342,44 @@ breaker hits apart from probe-derived rejections:
 
 Records are retained for `ObservedFailureRetentionMinutes`.
 
+## Exhaustion verdicts: what counts as evidence
+
+A mid-iteration quota failure also installs an in-process exhaustion verdict
+on the router so the spill loop does not re-dispatch into the bucket it just
+left. Only provider quota/rate-limit signals may install such a verdict —
+`RateLimitExceeded` or `LimitReached`, recorded with evidence naming the
+signal, the phase/route that observed it, and the detail (exception or
+detection) that produced it. The evidence travels with the verdict: it names
+the originating failure in refuse reasons (`in-process exhaustion cache
+until … (evidence: …)`) and in the audit log, so an operator reading a bench
+line can see *why* an agent is being refused rather than only *that* it is.
+
+Anything else is classified where it belongs and never touches quota state:
+
+- Repository-seeding / git-transport failures (clone/fetch of the host bare
+  repo) fail the item as `infrastructure`. They run on the orchestrator host
+  against the git remote — no agent and no provider quota is involved — so a
+  transient network blip can never bench an agent.
+- Provider 401/403 (`Unauthorized`) detections go down the auth path and are
+  never recorded in the quota-observation store, never install a verdict, and
+  never park the item for quota reset.
+
+A fresh verdict is trusted without burning a probe round-trip: the live probe
+lags a just-observed 429, and spillover must not re-dispatch into the bucket
+it just left. Once a verdict is older than
+`CodeyBox:QuotaRouter:ExhaustionRevalidationAgeSeconds` (default 900, 15 min,
+hot-reloadable), the next dispatch re-checks it against a live probe reading
+before it may keep refusing: a healthy reading clears the stale entry and
+routes normally, while a confirming (or unknown) reading keeps the refusal.
+A verdict contradicted by a current healthy reading therefore cannot bench a
+member for the full TTL.
+
+A cached verdict can also be cleared explicitly without a restart:
+`POST /admin/agent/{name}/reset` clears the registry, the in-VM smoke cache,
+**and** every cached quota-exhaustion verdict for the agent (router entries
+plus probe-side runtime gates). The clear is recorded in the audit log as
+`agent.quota_exhaustion_cleared` with the calling operator.
+
 ### Adding quota patterns
 
 `CodeyBox:QuotaFailurePatterns` lets operators append per-agent stderr/stdout

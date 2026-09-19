@@ -781,7 +781,7 @@ public sealed partial class PipelineRunner
             DisplayName = item.ProjectId.Value,
             RepositoryUrl = string.Empty,
         };
-        await RecordDirectQuotaParkAsync(next, effectiveProject, effectiveResetAt, ct);
+        await RecordDirectQuotaParkAsync(next, effectiveProject, effectiveResetAt, ct, quotaKind);
 
         if (_retryScheduler is not null)
             await _retryScheduler.NotifyQuotaFailureAsync(next);
@@ -822,10 +822,25 @@ public sealed partial class PipelineRunner
         WorkItem item,
         Project? project,
         DateTimeOffset? resetAt,
-        CancellationToken ct)
+        CancellationToken ct,
+        QuotaFailureKind? quotaKind = null)
     {
         if (!IsDirectQuotaPark(item, project))
             return;
+
+        // Narrowing point: the probe write-back is an exhaustion verdict, so
+        // it fires only for genuine provider quota/rate-limit signals. A park
+        // that reached here on any other evidence (e.g. an Unauthorized
+        // detection that slipped past the throw-site gates) must not bench
+        // the member's probe gate.
+        if (quotaKind is { } kind && !kind.IsExhaustionSignal())
+        {
+            _log.LogWarning(
+                "Direct quota park for {Agent} carries non-quota signal {Kind}; skipping probe exhaustion write-back",
+                item.Agent?.Value ?? "(none)",
+                kind);
+            return;
+        }
 
         var member = DirectAgentMembership.TryCreate(item, project);
         if (member is null)
