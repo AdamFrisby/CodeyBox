@@ -103,9 +103,11 @@ public sealed class ObservableMetricsTests : IDisposable
 
         // The live counter is intentionally process-wide, and other tests may
         // have ephemeral sandboxes alive at the same time or leave a non-zero
-        // baseline. Use a large local contribution so this test proves the
-        // gauge is reading the counter without assuming exclusive ownership of
-        // the static value.
+        // baseline (parallel tests manipulate the static directly, so it can
+        // even start negative). Capture the baseline and use a large local
+        // contribution so this test proves the gauge tracks the counter
+        // without assuming exclusive ownership of the static value.
+        var baseline = SandboxLiveCounter.Active;
         const int localContribution = 1_000;
         for (var i = 0; i < localContribution; i++)
             SandboxLiveCounter.Increment();
@@ -126,7 +128,7 @@ public sealed class ObservableMetricsTests : IDisposable
             Assert.Contains(observed,
                 m => m.Instrument == "codeybox.sandbox.active"
                     && m.Tag == "inert"
-                    && m.Value >= localContribution);
+                    && m.Value >= baseline + localContribution);
 
             SandboxLiveCounter.Decrement();
             remainingContribution--;
@@ -134,7 +136,7 @@ public sealed class ObservableMetricsTests : IDisposable
             Assert.Contains(observed,
                 m => m.Instrument == "codeybox.sandbox.active"
                     && m.Tag == "inert"
-                    && m.Value >= localContribution - 1);
+                    && m.Value >= baseline + localContribution - 1);
 
             await svc.StopAsync(CancellationToken.None);
         }
