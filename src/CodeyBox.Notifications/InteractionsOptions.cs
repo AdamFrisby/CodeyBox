@@ -16,6 +16,11 @@ public sealed class InteractionsOptions
 
     /// <summary>Per-provider verification and authorisation settings.</summary>
     public List<InteractionProviderOptions> Providers { get; set; } = [];
+
+    /// <summary>Timeout in seconds for the best-effort round-trip POST that
+    /// updates the original platform message after an answer lands.
+    /// Hot-reloadable. Must be &gt;= 1.</summary>
+    public int ResponseUpdateTimeoutSeconds { get; set; } = 10;
 }
 
 /// <summary>

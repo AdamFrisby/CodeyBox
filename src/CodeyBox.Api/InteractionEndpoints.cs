@@ -24,6 +24,10 @@ internal static class InteractionEndpoints
     /// <summary>Upper bound enforced BEFORE buffering the request body.</summary>
     public const int MaxBodyBytes = 64 * 1024;
 
+    /// <summary>HttpClient name for the response_url round-trip POST.
+    /// Must match the registration in Program.cs, which disables redirects.</summary>
+    private const string InteractionResponseClientName = "interactions-response";
+
     private static readonly JsonSerializerOptions PayloadJsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -231,7 +235,9 @@ internal static class InteractionEndpoints
         // lets the original message show what was decided and by whom.
         // Best-effort — delivery problems are logged and swallowed so they
         // can never affect the work item.
-        await TryUpdateOriginalMessageAsync(payload.ResponseUrl, redactedAnswer, answeredBy, httpClients, log, ct);
+        var responseTimeout = TimeSpan.FromSeconds(
+            opts.ResponseUpdateTimeoutSeconds >= 1 ? opts.ResponseUpdateTimeoutSeconds : 10);
+        await TryUpdateOriginalMessageAsync(payload.ResponseUrl, redactedAnswer, answeredBy, httpClients, log, responseTimeout, ct);
 
         return Results.Ok(new { status = "answered", questionState = "answered" });
     }
@@ -262,6 +268,18 @@ internal static class InteractionEndpoints
                 || !Uri.TryCreate(payload.ResponseUrl, UriKind.Absolute, out var uri)
                 || !string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
                 return "responseUrl must be an absolute https URL (max 2048 chars)";
+            // SSRF guard: responseUrl is platform-supplied input. Reject
+            // loopback/private/metadata hosts and DNS-rebinding hostnames.
+            // Signature verification proves who sent the body, not that the
+            // URL is safe to POST to.
+            try
+            {
+                Validation.ValidateWebhookUrl(payload.ResponseUrl, "responseUrl");
+            }
+            catch (ArgumentException)
+            {
+                return "responseUrl must not point to a private or internal host";
+            }
         }
         return null;
     }
@@ -272,27 +290,48 @@ internal static class InteractionEndpoints
         string answeredBy,
         IHttpClientFactory httpClients,
         ILogger log,
+        TimeSpan timeout,
         CancellationToken ct)
     {
         if (string.IsNullOrEmpty(responseUrl))
             return;
+        // Defense in depth: the sink carries its own guard so a future
+        // caller passing an unvalidated URL is still safe.
         try
         {
-            var client = httpClients.CreateClient("notifications-chat");
+            Validation.ValidateWebhookUrl(responseUrl, "responseUrl");
+        }
+        catch (ArgumentException ex)
+        {
+            log.LogWarning(ex, "Interactions: refusing unsafe response_url; decision already recorded");
+            return;
+        }
+        try
+        {
+            // Redirects stay disabled (see client registration): a 3xx to a
+            // private address would otherwise bypass the blocklist above.
+            var client = httpClients.CreateClient(InteractionResponseClientName);
             var body = JsonSerializer.Serialize(
                 new { text = $"Decided: {answer} — by {answeredBy}" },
                 PayloadJsonOpts);
             using var request = new HttpRequestMessage(HttpMethod.Post, responseUrl);
             request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
-            using var response = await client.SendAsync(request, ct);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(timeout);
+            using var response = await client.SendAsync(request, timeoutCts.Token);
             if (!response.IsSuccessStatusCode)
                 log.LogWarning(
                     "Interactions: response_url update returned {Status}; decision already recorded",
                     (int)response.StatusCode);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            // Timeout: best-effort round-trip only; the answer already landed.
+            log.LogWarning(ex, "Interactions: response_url update timed out; decision already recorded");
         }
         catch (Exception ex)
         {

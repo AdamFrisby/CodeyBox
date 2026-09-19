@@ -3640,6 +3640,14 @@ builder.Services.AddSingleton<INotificationProvider>(sp =>
 // Chat provider (Slack / Discord incoming webhooks). Safe no-op when disabled
 // or when no webhooks are configured; URLs are read from env vars at send time.
 builder.Services.AddHttpClient("notifications-chat");
+// Dedicated client for interaction response_url round-trips. The URL comes
+// from the inbound platform payload, so redirects must not be followed:
+// a 3xx to a private address would bypass the ValidateWebhookUrl blocklist.
+builder.Services.AddHttpClient("interactions-response")
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false,
+    });
 builder.Services.AddSingleton<INotificationProvider>(sp =>
 {
     var logger = sp.GetRequiredService<ILogger<ChatNotificationProvider>>();
