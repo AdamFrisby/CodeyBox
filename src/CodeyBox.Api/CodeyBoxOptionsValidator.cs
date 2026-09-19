@@ -8,6 +8,7 @@ namespace CodeyBox.Api;
 public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
 {
     private readonly E2eRemotePoolConfigValidation _e2eRemotePoolConfigValidation;
+    private readonly IReadOnlySet<string>? _pluginKinds;
 
     public CodeyBoxOptionsValidator()
         : this(E2eRemotePoolConfigValidation.Default)
@@ -15,8 +16,16 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
     }
 
     internal CodeyBoxOptionsValidator(E2eRemotePoolConfigValidation e2eRemotePoolConfigValidation)
+        : this(e2eRemotePoolConfigValidation, pluginKinds: null)
+    {
+    }
+
+    internal CodeyBoxOptionsValidator(
+        E2eRemotePoolConfigValidation e2eRemotePoolConfigValidation,
+        IReadOnlySet<string>? pluginKinds)
     {
         _e2eRemotePoolConfigValidation = e2eRemotePoolConfigValidation;
+        _pluginKinds = pluginKinds;
     }
 
     public ValidateOptionsResult Validate(string? name, CodeyBoxOptions options)
@@ -439,15 +448,15 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         }
     }
 
-    private static void ValidateProviderHostSupport(
+    private void ValidateProviderHostSupport(
         string providerId,
         ICollection<string> failures)
     {
         if (string.IsNullOrEmpty(providerId))
             return;
         var host = HostPlatformSupport.HostOperatingSystem.Current;
-        if (!HostPlatformSupport.IsProviderSupportedOnHost(providerId, host))
-            failures.Add($"CodeyBox:SandboxProvider '{providerId}' is not supported on {host.Name}: {HostPlatformSupport.GetUnsupportedReason(providerId, host)}");
+        if (!HostPlatformSupport.IsProviderSupportedOnHost(providerId, host, _pluginKinds))
+            failures.Add($"CodeyBox:SandboxProvider '{providerId}' is not supported on {host.Name}: {HostPlatformSupport.GetUnsupportedReason(providerId, host, _pluginKinds)}");
     }
 
     private static HashSet<string> ValidateRetainedSandboxProviderInventory(

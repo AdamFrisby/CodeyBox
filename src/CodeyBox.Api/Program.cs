@@ -443,7 +443,9 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new ImmutableCodeyBoxOptionsValidator(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
-    sp => new CodeyBoxOptionsValidator(sp.GetRequiredService<E2eRemotePoolConfigValidation>()));
+    sp => new CodeyBoxOptionsValidator(
+        sp.GetRequiredService<E2eRemotePoolConfigValidation>(),
+        sp.GetRequiredService<PluginSandboxProviderCatalog>().Kinds));
 
 // Deploy-consistency probe. Refreshes the built-vs-checkout comparison at
 // startup and warns while the service is still healthy when the working tree
@@ -511,7 +513,8 @@ builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
 // Member-keyed provider registry for sandbox placement. Each provider kind
 // named by a SandboxClass member is constructed once here (via the same
-// BuildSandboxProviderInner the singleton uses) and shared across the members
+// BuildSandboxProviderInner the singleton uses, or via the plugin catalog for
+// plugin-contributed kinds) and shared across the members
 // naming it; lookup is by normalised kind so registration order never affects
 // resolution. Each instance carries an admission wrapper whose gate is
 // DERIVED from the member catalog (see ISandboxProviderRegistry
@@ -524,7 +527,8 @@ builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 // through the registry.
 builder.Services.AddSingleton<ISandboxProviderRegistry>(sp => new SandboxProviderRegistry(
     kind => BuildRegistrySandboxProvider(sp, kind),
-    sp.GetRequiredService<ILoggerFactory>().CreateLogger<SandboxProviderRegistry>()));
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<SandboxProviderRegistry>(),
+    sp.GetRequiredService<PluginSandboxProviderCatalog>().Kinds));
 
 // B1: register baseline-image capabilities as derived views of the selected
 // provider. Providers without baseline support (process / bubblewrap) receive
@@ -578,11 +582,12 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         startupLog);
 
     var hostPlatformEarly = CodeyBox.Core.HostPlatformSupport.HostOperatingSystem.Current;
-    if (!CodeyBox.Core.HostPlatformSupport.IsProviderSupportedOnHost(kind, hostPlatformEarly))
+    var pluginKindsEarly = sp.GetRequiredService<PluginSandboxProviderCatalog>().Kinds;
+    if (!CodeyBox.Core.HostPlatformSupport.IsProviderSupportedOnHost(kind, hostPlatformEarly, pluginKindsEarly))
     {
         throw new InvalidOperationException(
             $"CodeyBox:SandboxProvider '{kind}' is not supported on {hostPlatformEarly.Name}: " +
-            CodeyBox.Core.HostPlatformSupport.GetUnsupportedReason(kind, hostPlatformEarly));
+            CodeyBox.Core.HostPlatformSupport.GetUnsupportedReason(kind, hostPlatformEarly, pluginKindsEarly));
     }
 
     // Plain (non-reloadable) kinds are owned by the member-keyed registry:
@@ -597,16 +602,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
 
     ISandboxProvider inner = BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog);
     var hostPlatform = hostPlatformEarly;
-    if (CodeyBox.Core.HostPlatformSupport.GetEgressEnforcement(kind)
-        == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnRemoteExecutorHost)
-    {
-        startupLog.LogInformation(
-            "Sandbox egress enforcement for provider '{Provider}' lives on the remote Linux executor host; " +
-            "the {Host} orchestrator host needs no packet filter, but the executor must have " +
-            "scripts/setup-host-networks.sh applied (see docs/concepts/host-platforms.md).",
-            kind,
-            hostPlatform.Name);
-    }
+    LogSandboxEgressClassification(kind, hostPlatform, startupLog);
     SandboxProviderSelection.ValidateWorkloadTrust(
         inner,
         opts,
@@ -634,36 +630,43 @@ static ISandboxProvider BuildRegistrySandboxProvider(IServiceProvider sp, string
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var startupLog = loggerFactory.CreateLogger("CodeyBox.Sandbox.Registry");
     var environment = sp.GetRequiredService<IHostEnvironment>();
-    if (!SandboxProviderKinds.IsRegistered(kind))
+    var pluginCatalog = sp.GetRequiredService<PluginSandboxProviderCatalog>();
+    var isPluginKind = pluginCatalog.IsPluginKind(kind);
+    if (!SandboxProviderKinds.IsRegistered(kind) && !isPluginKind)
     {
         throw new InvalidOperationException(
             $"Unregistered sandbox provider kind '{kind}'. Registered providers: " +
-            $"{string.Join(", ", SandboxProviderKinds.All.OrderBy(static s => s, StringComparer.Ordinal))}. " +
+            $"{CodeyBox.Core.HostPlatformSupport.FormatKnownProviders(pluginCatalog.Kinds)}. " +
             "The kind is NOT silently falling back to another provider.");
     }
     var hostPlatform = CodeyBox.Core.HostPlatformSupport.HostOperatingSystem.Current;
-    if (!CodeyBox.Core.HostPlatformSupport.IsProviderSupportedOnHost(kind, hostPlatform))
+    if (!CodeyBox.Core.HostPlatformSupport.IsProviderSupportedOnHost(kind, hostPlatform, pluginCatalog.Kinds))
     {
         throw new InvalidOperationException(
             $"Sandbox provider kind '{kind}' is not supported on {hostPlatform.Name}: " +
-            CodeyBox.Core.HostPlatformSupport.GetUnsupportedReason(kind, hostPlatform));
+            CodeyBox.Core.HostPlatformSupport.GetUnsupportedReason(kind, hostPlatform, pluginCatalog.Kinds));
     }
-    var inner = BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    ISandboxProvider inner;
+    if (isPluginKind && pluginCatalog.TryGetProvider(kind, out var pluginProvider))
+    {
+        inner = pluginProvider;
+        startupLog.LogInformation(
+            "Sandbox provider registry: kind '{Kind}' is plugin-contributed by '{PluginId}' (provider={Provider}); " +
+            "platform support and workload-trust gates apply exactly as for built-in kinds.",
+            kind.Trim().ToLowerInvariant(),
+            pluginCatalog.PluginIdFor(kind),
+            inner.Name);
+    }
+    else
+    {
+        inner = BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    }
     SandboxProviderSelection.ValidateWorkloadTrust(
         inner,
         opts,
         sp.GetRequiredService<IConfiguration>(),
         environment);
-    if (CodeyBox.Core.HostPlatformSupport.GetEgressEnforcement(kind)
-        == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnRemoteExecutorHost)
-    {
-        startupLog.LogInformation(
-            "Sandbox egress enforcement for provider '{Provider}' lives on the remote Linux executor host; " +
-            "the {Host} orchestrator host needs no packet filter, but the executor must have " +
-            "scripts/setup-host-networks.sh applied (see docs/concepts/host-platforms.md).",
-            kind,
-            hostPlatform.Name);
-    }
+    LogSandboxEgressClassification(kind, hostPlatform, startupLog);
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     var pipelineTuning = sp.GetRequiredService<PipelineTuningSnapshot>();
     startupLog.LogInformation(
@@ -683,6 +686,44 @@ static ISandboxProvider BuildRegistrySandboxProvider(IServiceProvider sp, string
         orchestratorOptions.MaxConcurrentSandboxes,
         loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>(),
         waitWarningThresholdProvider: () => pipelineTuning.Current.SandboxPermitWaitWarningThreshold);
+}
+
+/// <summary>
+/// Logs the host-owned egress-enforcement classification for one constructed provider
+/// kind, so an operator can see which of their providers actually contain network
+/// egress and which do not. <c>NotEnforced</c> (every plugin kind, plus bubblewrap
+/// and process) is logged as a warning stating where such a provider may be used.
+/// </summary>
+static void LogSandboxEgressClassification(
+    string kind,
+    CodeyBox.Core.HostPlatformSupport.HostOperatingSystem hostPlatform,
+    ILogger startupLog)
+{
+    var enforcement = CodeyBox.Core.HostPlatformSupport.GetEgressEnforcement(kind);
+    if (enforcement == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnRemoteExecutorHost)
+    {
+        startupLog.LogInformation(
+            "Sandbox egress enforcement for provider '{Provider}' lives on the remote Linux executor host; " +
+            "the {Host} orchestrator host needs no packet filter, but the executor must have " +
+            "scripts/setup-host-networks.sh applied (see docs/concepts/host-platforms.md).",
+            kind,
+            hostPlatform.Name);
+        return;
+    }
+    if (enforcement == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnOrchestratorHost)
+    {
+        startupLog.LogInformation(
+            "Sandbox egress enforcement for provider '{Provider}' lives on the {Host} orchestrator host " +
+            "(Linux nftables bridges; see scripts/setup-host-networks.sh).",
+            kind,
+            hostPlatform.Name);
+        return;
+    }
+    startupLog.LogWarning(
+        "Sandbox provider '{Provider}': {Classification}. " +
+        "It may only serve sandboxes with no named network profile and must never be described as isolation.",
+        kind,
+        CodeyBox.Core.SandboxEgressPolicy.DescribeEgressEnforcement(kind));
 }
 
 static void LogSandboxProviderCapabilities(ISandboxProvider provider, ILogger startupLog)
@@ -2671,7 +2712,7 @@ builder.Services.AddSingleton<SandboxClassesSnapshot>(sp =>
     else
     {
         catalog = SandboxClassesConfigBuilder.Build(
-            cbOpts.SandboxClasses, maxWorkers, SandboxProviderKinds.All, startupLog);
+            cbOpts.SandboxClasses, maxWorkers, registry.KnownKinds, startupLog);
     }
     // Warm every configured kind now so a bad provider fails the host fast
     // at startup instead of the first placement.
@@ -5412,6 +5453,26 @@ builder.Services.AddHostedService(sp =>
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
 // See docs/extending/plugins.md for author guidance, allowlist config, and threat model.
 preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
+
+// Plugin-contributed sandbox provider kinds. Allowlisted plugins implementing
+// ISandboxProvider are indexed here by their normalised Name; the registry
+// factory resolves them, and member validation accepts them. The catalog
+// is host-owned: it validates names and refuses built-in collisions, while
+// egress classification stays in HostPlatformSupport (every plugin kind is
+// NotEnforced). See docs/extending/sandbox-plugins.md for the trust model.
+builder.Services.AddSingleton<PluginSandboxProviderCatalog>(sp =>
+{
+    var entries = new List<(string PluginId, CodeyBox.Core.ISandboxProvider Provider)>();
+    foreach (var plugin in preDiscoveredPlugins ?? [])
+    {
+        foreach (var type in plugin.RegisteredTypes)
+        {
+            if (typeof(CodeyBox.Core.ISandboxProvider).IsAssignableFrom(type))
+                entries.Add((plugin.PluginId, (CodeyBox.Core.ISandboxProvider)sp.GetRequiredService(type)));
+        }
+    }
+    return new PluginSandboxProviderCatalog(entries);
+});
 
 var app = builder.Build();
 

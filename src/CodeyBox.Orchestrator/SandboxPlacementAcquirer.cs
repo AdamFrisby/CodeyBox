@@ -254,6 +254,11 @@ public sealed class SandboxPlacementAcquirer
     /// provider. Throws <see cref="SandboxPlacementUnplaceableException"/> for
     /// permanent refusals and <see cref="SandboxProvisioningDeferredException"/>
     /// (with the configured recheck backoff) for transient ones.
+    /// Acquisitions naming a network profile additionally require enforced
+    /// egress (see <see cref="SandboxEgressPolicy"/>): members on
+    /// <see cref="EgressEnforcementLocation.NotEnforced"/> providers are
+    /// excluded before the decider runs, and the acquisition is unplaceable —
+    /// naming the refused kinds — when none remain.
     /// </summary>
     public async Task<ISandbox> AcquireAsync(
         SandboxPlacementAcquisition acquisition,
@@ -298,14 +303,22 @@ public sealed class SandboxPlacementAcquirer
             candidates.Add((member, provider, SandboxProviderCapabilityGate.ApplyProviderCapabilities(member, provider)));
         }
 
+        // Enforced-egress gate: a member whose provider kind is classified
+        // NotEnforced (every plugin-contributed kind, plus bubblewrap/process)
+        // must not serve work requiring a named network profile, whose
+        // allowlist only exists as host-side nftables rules the provider never
+        // attaches to. Refusal is explicit and names the kinds; enforced
+        // members keep placing for the same profile.
+        var selectable = ApplyEnforcedEgressRequirement(acquisition, candidates);
+
         var loads = SnapshotLoads();
         var decision = ExecutorPlacement.Decide(
-            candidates.Select(static c => c.Placement).ToList(),
+            selectable.Select(static c => c.Placement).ToList(),
             requirements,
             loads,
             runtimeUnhealthy: null);
 
-        var ranked = RankEligible(EligibleCandidates(candidates, decision), loads);
+        var ranked = RankEligible(EligibleCandidates(selectable, decision), loads);
         if (ranked.Count != 0)
         {
             // Fast path: atomically take the first ranked member with headroom.
@@ -327,11 +340,11 @@ public sealed class SandboxPlacementAcquirer
             // refusal analysis below.
             loads = SnapshotLoads();
             decision = ExecutorPlacement.Decide(
-                candidates.Select(static c => c.Placement).ToList(),
+                selectable.Select(static c => c.Placement).ToList(),
                 requirements,
                 loads,
                 runtimeUnhealthy: null);
-            ranked = RankEligible(EligibleCandidates(candidates, decision), loads);
+            ranked = RankEligible(EligibleCandidates(selectable, decision), loads);
             if (ranked.Count != 0)
             {
                 var winner = ranked[0];
@@ -349,7 +362,7 @@ public sealed class SandboxPlacementAcquirer
         if (decision.UnmetCapability is not null)
             throw BuildRefusal(acquisition, decision, options);
 
-        var blocked = CapacityBlockedCandidates(candidates, requirements, decision);
+        var blocked = CapacityBlockedCandidates(selectable, requirements, decision);
         if (blocked.Count != 0)
         {
             var waitLoads = SnapshotLoads();
@@ -378,8 +391,62 @@ public sealed class SandboxPlacementAcquirer
             selected.Provider.Name);
     }
 
-    private static List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> EligibleCandidates(
-        List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> candidates,
+    /// <summary>
+    /// Applies the enforced-egress requirement for one acquisition: when the
+    /// acquisition names a network profile, only members whose provider kind the
+    /// host classifies as enforced may serve it. A <c>NotEnforced</c> member is
+    /// dropped before the decider runs (never quietly used where enforcement was
+    /// required); when no member can serve the profile the acquisition fails
+    /// operator-visible with a reason naming every refused kind. Acquisitions with
+    /// no profile pass through untouched.
+    /// </summary>
+    private List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> ApplyEnforcedEgressRequirement(
+        SandboxPlacementAcquisition acquisition,
+        List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> candidates)
+    {
+        if (!SandboxEgressPolicy.RequiresEnforcedEgress(acquisition.RequiredNetworkProfile))
+            return candidates;
+        var profile = acquisition.RequiredNetworkProfile!.Trim();
+        var selectable = new List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)>(candidates.Count);
+        var refusedKinds = new List<string>();
+        var refusedMembers = new List<string>();
+        foreach (var candidate in candidates)
+        {
+            var kind = candidate.Member.ProviderKind.Trim().ToLowerInvariant();
+            if (SandboxEgressPolicy.IsEnforced(candidate.Member.ProviderKind))
+            {
+                selectable.Add(candidate);
+                continue;
+            }
+            if (!refusedKinds.Contains(kind, StringComparer.Ordinal))
+                refusedKinds.Add(kind);
+            refusedMembers.Add($"'{candidate.Member.MemberId}' (kind '{kind}')");
+        }
+        if (refusedMembers.Count > 0)
+        {
+            _log.LogInformation(
+                "Sandbox placement for work item {WorkItemId} phase {Phase}: network profile '{Profile}' requires enforced egress; " +
+                "excluding {Count} member(s) on NotEnforced providers: {Members}.",
+                acquisition.WorkItemId,
+                acquisition.Phase,
+                profile,
+                refusedMembers.Count,
+                string.Join(", ", refusedMembers));
+        }
+        if (selectable.Count == 0)
+        {
+            throw new SandboxPlacementUnplaceableException(
+                "enforced-egress",
+                $"work item '{acquisition.WorkItemId}' phase '{acquisition.Phase}' requires network profile '{profile}' " +
+                $"which needs enforced egress, but every available member is backed by a NotEnforced provider " +
+                $"({string.Join(", ", refusedMembers)}). A NotEnforced provider (every plugin-contributed kind, " +
+                $"plus bubblewrap/process) may only serve sandboxes with no named network profile. " +
+                $"Add a member on an enforced provider (incus, multipass, multipass-remote, sprites) or drop the profile requirement.");
+        }
+        return selectable;
+    }
+
+    private static List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> EligibleCandidates(        List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> candidates,
         ExecutorPlacementDecision decision)
     {
         var eligible = new List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)>(candidates.Count);

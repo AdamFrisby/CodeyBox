@@ -77,6 +77,7 @@ at anything that matters.
 | [auditor plugins](extending/auditor-plugins.md) | shipping a custom auditor |
 | [upstream plugins](extending/upstream-plugins.md) | shipping a forge integration |
 | [credential plugins](extending/credential-plugins.md) | shipping a credential provider |
+| [sandbox provider plugins](extending/sandbox-plugins.md) | shipping a sandbox backend and its trust model |
 | [statistics plugin](extending/statistics-plugin.md) | the bundled quota-history and capacity plugin |
 | [file-size-limits auditor](extending/file-size-limits-auditor.md) | a small worked example of a deterministic auditor |
 
