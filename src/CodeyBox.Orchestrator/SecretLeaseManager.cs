@@ -110,6 +110,10 @@ public sealed class SecretLeaseManager
         var brokerEndpoints = new List<string>();
         var issued = new List<SecretLeaseRecord>();
         var staticSecrets = new List<ProjectSandboxSecret>();
+        // Shared aggregate budget with the static path: leased, brokered,
+        // and static values land in the same SandboxSpec.Environment sink,
+        // so all three accumulate here via the shared guard.
+        long aggregateBytes = 0;
 
         foreach (var secret in project.SandboxSecrets)
         {
@@ -166,6 +170,10 @@ public sealed class SecretLeaseManager
                 // The endpoint URL is not a secret: it names where the
                 // workload calls, authenticated by sandbox identity. The
                 // value never enters the guest environment, files, or logs.
+                // It still occupies the same Environment sink, so it counts
+                // toward the shared aggregate budget via the shared guard.
+                ProjectSandboxSecretResolver.AccumulateSandboxSecretValue(
+                    project.Id.Value, secret.SandboxEnvVar, material.Endpoint!, ref aggregateBytes);
                 env[secret.SandboxEnvVar] = material.Endpoint!;
                 brokerEndpoints.Add(material.Endpoint!);
             }
@@ -178,18 +186,12 @@ public sealed class SecretLeaseManager
                         project.Id.Value, secret.SandboxEnvVar, provider.ProviderId);
                     continue;
                 }
-                // Guards sit here, adjacent to the SandboxSpec.Environment
-                // sink, so they survive future callers: NUL and per-value
-                // byte budgets apply to leased values exactly as they do to
-                // static ones (the name guard above covers both branches).
-                if (material.Value!.Contains('\0'))
-                    throw new ArgumentException(
-                        $"Project '{project.Id.Value}' leased secret '{secret.SandboxEnvVar}' holds a NUL byte.",
-                        nameof(project));
-                if (System.Text.Encoding.UTF8.GetByteCount(material.Value) > ProjectSandboxSecretLimits.MaxSecretValueUtf8Bytes)
-                    throw new ArgumentException(
-                        $"Project '{project.Id.Value}' leased secret '{secret.SandboxEnvVar}' exceeds the per-value size limit.",
-                        nameof(project));
+                // Shared sink-adjacent guard (NUL, per-value, aggregate):
+                // the same helper the static resolver uses, accumulating
+                // into the merged budget. Checked before persisting the
+                // lease so a budget rejection never orphans a live lease.
+                ProjectSandboxSecretResolver.AccumulateSandboxSecretValue(
+                    project.Id.Value, secret.SandboxEnvVar, material.Value!, ref aggregateBytes);
                 env[secret.SandboxEnvVar] = material.Value!;
             }
 
@@ -217,12 +219,19 @@ public sealed class SecretLeaseManager
         if (staticSecrets.Count > 0)
         {
             // Static-only path: identical guards (reserved names, NUL, byte
-            // budgets) via the existing resolver on the static subset.
+            // budgets) via the existing resolver on the static subset. Each
+            // resolved entry is then accumulated into the merged budget, so
+            // the combined leased + static environment can never exceed the
+            // sandbox credential budget even when each subset fits alone.
             var staticProject = project with { SandboxSecrets = staticSecrets };
             var staticEnv = ProjectSandboxSecretResolver.ResolveForScope(
                 staticProject, workItemId, scope, readHostEnvironment, log ?? _log);
             foreach (var (k, v) in staticEnv)
+            {
+                ProjectSandboxSecretResolver.AccumulateSandboxSecretValue(
+                    project.Id.Value, k, v, ref aggregateBytes);
                 env[k] = v;
+            }
         }
 
         return new SecretLeaseMaterialization

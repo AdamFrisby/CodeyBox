@@ -36,6 +36,8 @@ public sealed class SecretLeaseTests : IDisposable
         public string BrokerSideValue { get; set; } = $"broker-side-{Guid.NewGuid():N}";
         public TimeSpan Ttl { get; set; } = TimeSpan.FromMinutes(20);
         public Func<DateTimeOffset> Clock { get; set; } = () => DateTimeOffset.UtcNow;
+        /// <summary>Overrides the issued value per secret; null selects the default small value.</summary>
+        public Func<ProjectSandboxSecret, string?>? ValueFunc { get; set; }
 
         public int IssueCalls;
         public int RenewCalls;
@@ -58,7 +60,7 @@ public sealed class SecretLeaseTests : IDisposable
             IssueCalls++;
             var id = $"{ProviderId}-lease-{Interlocked.Increment(ref _counter)}";
             var expires = Clock() + Ttl;
-            string? value = Brokered ? null : $"vault-value-{id}";
+            string? value = Brokered ? null : (ValueFunc?.Invoke(secret) ?? $"vault-value-{id}");
             Live[id] = (value, expires);
             return Task.FromResult(new LeasedSecretMaterial
             {
@@ -557,6 +559,48 @@ public sealed class SecretLeaseTests : IDisposable
         ]);
         Assert.Equal(["broker.internal", "other.example.com"], hosts);
         Assert.Empty(PipelineRunner.BrokerEndpointHosts([]));
+    }
+
+    [Fact]
+    public async Task Leased_Value_Over_Per_Value_Cap_Is_Rejected_At_Sink()
+    {
+        var provider = new FakeLeaseProvider("vault")
+        {
+            ValueFunc = _ => new string('v', ProjectSandboxSecretLimits.MaxSecretValueUtf8Bytes + 1),
+        };
+        var store = new MemorySecretLeaseStore();
+        var manager = new SecretLeaseManager(store, [provider]);
+        var project = LeasedProject(LeasedSecret("PAID_API_TOKEN"));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => manager.MaterializeForScopeAsync(
+            project, WorkItemId.New(), ProjectSandboxSecretScopes.Work, _ => null,
+            itemDeadline: null));
+    }
+
+    [Fact]
+    public void Shared_Secret_Guard_Enforces_Aggregate_Budget()
+    {
+        // The static resolver and the leased path share one guard helper:
+        // accumulating 64KB values must trip the 4MB aggregate budget, and
+        // the same helper must reject NUL bytes and over-cap values.
+        long aggregateBytes = 0;
+        var chunk = new string('s', ProjectSandboxSecretLimits.MaxSecretValueUtf8Bytes);
+        var chunks = (int)(AgentCredentialMaterializationPolicy.MaterializationBudgetBytes / chunk.Length);
+        for (var i = 0; i < chunks; i++)
+            ProjectSandboxSecretResolver.AccumulateSandboxSecretValue("p", $"KEY_{i}", chunk, ref aggregateBytes);
+        Assert.Throws<ArgumentException>(() =>
+            ProjectSandboxSecretResolver.AccumulateSandboxSecretValue("p", "ONE_MORE", "x", ref aggregateBytes));
+        Assert.Throws<ArgumentException>(() =>
+        {
+            long b = 0;
+            ProjectSandboxSecretResolver.AccumulateSandboxSecretValue("p", "NUL", "a\0b", ref b);
+        });
+        Assert.Throws<ArgumentException>(() =>
+        {
+            long b = 0;
+            ProjectSandboxSecretResolver.AccumulateSandboxSecretValue(
+                "p", "BIG", new string('v', ProjectSandboxSecretLimits.MaxSecretValueUtf8Bytes + 1), ref b);
+        });
     }
 
     private sealed class CapturingLoggerFactory(CapturingLogger logger) : ILoggerFactory
