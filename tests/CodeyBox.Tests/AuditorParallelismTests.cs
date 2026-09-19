@@ -1308,6 +1308,15 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
             maxAuditIterations: 1,
             classRouter: router,
             auditQuotaOptions: quotaOptions,
+            // Codex must be registered AND credentialed: the pool walk skips
+            // members with no credentials before it ever reaches the quota
+            // gate, so without this the auditor could never run and the
+            // test would park (or fail infra) for a non-quota reason.
+            // The pipeline-side live probe makes the "healthy probe
+            // contradicts the stale verdict" leg genuine: the audit
+            // candidate gate reads 80% available and lets Codex run.
+            credentials: new GrantCredentialsForProvider(AgentKind.Codex),
+            auditQuotaProbes: [new FakeProbe(AgentKind.Codex, 80.0)],
             extraAgentRunners: [new PoolPassthroughRunner(AgentKind.Codex)]);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
