@@ -344,12 +344,14 @@ public sealed partial class PipelineRunner
             var conflictReworkTarget = new SandboxTarget(
                 project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
                 SandboxProfileFlavor.Headless);
-            var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
+            var conflictReworkSecrets = await ResolveLeasedProjectSecretsAsync(project, item, ProjectSandboxSecretScopes.Rework, ct)
+                .ConfigureAwait(false);
+            var spec = BuildSandboxSpec(WithLeaseBrokerHosts(access, conflictReworkSecrets), includeAgentCredential: credential, allowAgentNetwork: true,
                 hostNetworkProfile: conflictReworkTarget.NetworkProfile,
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, conflictReworkTarget, item.BaselineImageRef),
                 credentialRunner: runner,
-                projectSecretEnvironment: ResolveProjectSecretEnvironment(project, item.Id, ProjectSandboxSecretScopes.Rework));
+                projectSecretEnvironment: conflictReworkSecrets.Environment);
 
             // Release-then-acquire (same pool-deadlock rationale as the merge
             // phase above): conflict rework provisions its own sandbox while a

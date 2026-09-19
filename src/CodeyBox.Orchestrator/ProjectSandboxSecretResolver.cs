@@ -77,21 +77,7 @@ public static class ProjectSandboxSecretResolver
                     project.Id.Value, secret.SandboxEnvVar, scope, secret.HostEnvVar);
                 continue;
             }
-            if (value.Contains('\0'))
-                throw new ArgumentException(
-                    $"Project '{project.Id.Value}' sandbox secret '{secret.SandboxEnvVar}' holds a NUL byte.",
-                    nameof(project));
-            var valueBytes = Encoding.UTF8.GetByteCount(value);
-            if (valueBytes > ProjectSandboxSecretLimits.MaxSecretValueUtf8Bytes)
-                throw new ArgumentException(
-                    $"Project '{project.Id.Value}' sandbox secret '{secret.SandboxEnvVar}' exceeds the " +
-                    $"per-value size limit.",
-                    nameof(project));
-            if (valueBytes > AgentCredentialMaterializationPolicy.MaterializationBudgetBytes - aggregateBytes)
-                throw new ArgumentException(
-                    $"Project '{project.Id.Value}' sandbox secrets exceed the sandbox credential budget.",
-                    nameof(project));
-            aggregateBytes += valueBytes;
+            AccumulateSandboxSecretValue(project.Id.Value, secret.SandboxEnvVar, value, ref aggregateBytes);
             result[secret.SandboxEnvVar] = value;
             log?.LogInformation(
                 "Project {ProjectId} injected sandbox secret '{SandboxEnvVar}' for scope '{Scope}' " +
@@ -157,6 +143,38 @@ public static class ProjectSandboxSecretResolver
             });
         }
         return injections.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Single shared sink-adjacent guard for sandbox-secret environment
+    /// values: NUL rejection, per-value 64KB cap, and aggregate 4MB budget
+    /// accumulation. Used by both the static resolver path and the leased
+    /// path (<see cref="SecretLeaseManager"/>) so the two cannot fork.
+    /// </summary>
+    public static void AccumulateSandboxSecretValue(
+        string projectId,
+        string sandboxEnvVar,
+        string value,
+        ref long aggregateBytes)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(projectId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sandboxEnvVar);
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.Contains('\0'))
+            throw new ArgumentException(
+                $"Project '{projectId}' sandbox secret '{sandboxEnvVar}' holds a NUL byte.",
+                nameof(projectId));
+        var valueBytes = Encoding.UTF8.GetByteCount(value);
+        if (valueBytes > ProjectSandboxSecretLimits.MaxSecretValueUtf8Bytes)
+            throw new ArgumentException(
+                $"Project '{projectId}' sandbox secret '{sandboxEnvVar}' exceeds the " +
+                $"per-value size limit.",
+                nameof(projectId));
+        if (valueBytes > AgentCredentialMaterializationPolicy.MaterializationBudgetBytes - aggregateBytes)
+            throw new ArgumentException(
+                $"Project '{projectId}' sandbox secrets exceed the sandbox credential budget.",
+                nameof(projectId));
+        aggregateBytes += valueBytes;
     }
 
     private static string DescribeGrantKind(ProjectSandboxSecretGrant grant)

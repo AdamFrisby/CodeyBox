@@ -91,7 +91,8 @@ public sealed partial class PipelineRunner
         {
             [PromptRevisionEnvVar] = promptRevisionAtDispatch.ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
-        var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
+        var leasedSecrets = await ResolveLeasedProjectSecretsAsync(project, item, agentPhase, ct).ConfigureAwait(false);
+        var spec = BuildSandboxSpec(WithLeaseBrokerHosts(access, leasedSecrets), includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase,
             flavor: sandboxFlavor, extraEnvironment: extraEnv,
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
@@ -100,7 +101,7 @@ public sealed partial class PipelineRunner
                 item.BaselineImageRef),
             includeAgentTurnScratchpadTmpfs: true,
             credentialRunner: runner,
-            projectSecretEnvironment: ResolveProjectSecretEnvironment(project, item.Id, agentPhase)) with
+            projectSecretEnvironment: leasedSecrets.Environment) with
         {
             RecoveryLease = item.AgentTurnRecoveryLease,
         };

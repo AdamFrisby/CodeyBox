@@ -4080,6 +4080,30 @@ builder.Services.AddSingleton<IDelegationEventStore>(sp =>
         optionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation,
         writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
+// Secret-lease handles (identity only, never values). The SQLite table
+// survives orchestrator restarts so the reconciliation sweep resumes
+// renewal/revocation instead of orphaning live leases.
+builder.Services.AddSingleton<ISecretLeaseStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteSecretLeaseStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
+builder.Services.AddSingleton<SecretLeaseManager>(sp => new SecretLeaseManager(
+    sp.GetRequiredService<ISecretLeaseStore>(),
+    sp.GetServices<ILeaseCapableSecretProvider>(),
+    options: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SecretLeasing,
+    log: sp.GetRequiredService<ILogger<SecretLeaseManager>>()));
+// Factory registration (not AddHostedService): the sweep reads its knobs
+// through a hot-reloadable accessor so SecretLeasing edits apply without
+// restart, mirroring the other option-accessor services.
+builder.Services.AddSingleton<IHostedService>(sp => new SecretLeaseReconciliationService(
+    sp.GetRequiredService<SecretLeaseManager>(),
+    sp.GetRequiredService<ISecretLeaseStore>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    options: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SecretLeasing,
+    log: sp.GetRequiredService<ILogger<SecretLeaseReconciliationService>>()));
 builder.Services.AddSingleton<ISandboxResourceUsageStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -4886,7 +4910,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     delegationEvents: sp.GetRequiredService<IDelegationEventStore>(),
     delegationOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation,
     delegationEscalation: sp.GetService<DelegationEscalationService>(),
-    sandboxPlacer: sp.GetRequiredService<SandboxPlacementAcquirer>()));
+    sandboxPlacer: sp.GetRequiredService<SandboxPlacementAcquirer>(),
+    secretLeases: sp.GetService<SecretLeaseManager>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -6880,6 +6905,14 @@ namespace CodeyBox.Api
 
         /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
         public DeadWorkerOptions DeadWorker { get; set; } = new();
+
+        /// <summary>
+        /// Leased workload secrets: TTL, renewal window, sweep cadence, and
+        /// revocation bounds. Hot-reloadable through
+        /// <c>IOptionsMonitor</c>; edits take effect on the next sweep or
+        /// materialisation without restart.
+        /// </summary>
+        public Core.SecretLeasingOptions SecretLeasing { get; set; } = new();
 
         /// <summary>
         /// Lifecycle-wide worker progress watchdog: catches the

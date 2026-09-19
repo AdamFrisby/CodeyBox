@@ -119,6 +119,15 @@ public sealed partial class PipelineRunner
         _log.LogInformation("Work item {Id} → {State}", item.Id, state);
         AuditLog.WorkItemTransitioned(item.Id, state.ToString());
         CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
+        if (WorkItemStates.IsTerminal(state))
+        {
+            // A credential that reached a real service must stop working
+            // when the work stops: revoke the item's secret leases now that
+            // the item is terminal and persisted. Best-effort — a
+            // lease-infrastructure failure is loud but never fails the
+            // transition; the sweep retries whatever stays outstanding.
+            await RevokeItemSecretLeasesBestEffortAsync(item.Id, ct).ConfigureAwait(false);
+        }
         if (project is null)
             return;
 

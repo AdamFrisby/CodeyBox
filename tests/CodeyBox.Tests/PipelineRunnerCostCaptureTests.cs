@@ -212,7 +212,14 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal("work", ev.Phase);
         Assert.Equal(costStore.Recorded[0].StartedAt, ev.StartedUtc);
         Assert.Equal(costStore.Recorded[0].EndedAt, ev.EndedUtc);
-        Assert.True(ev.ElapsedMs > 0);
+        // ElapsedMs is the wall-clock span truncated to whole milliseconds; a
+        // scripted in-process agent can finish in under a millisecond, so pin
+        // the derivation (non-negative span recomputed from the event's own
+        // timestamps) rather than assuming a positive duration.
+        Assert.NotNull(ev.StartedUtc);
+        Assert.NotNull(ev.EndedUtc);
+        Assert.True(ev.EndedUtc >= ev.StartedUtc);
+        Assert.Equal((long)Math.Max(0, (ev.EndedUtc.Value - ev.StartedUtc.Value).TotalMilliseconds), ev.ElapsedMs);
 
         // The legacy cost unit and timestamp must be derived from the same recorded
         // cost row (not a different field or scale): CostMicroCents is the cost
