@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Fixture assembly for plugin enablement / external-tool tests. Like
+    CodeyBox.PluginSdk.SampleTests this is a CLASS LIBRARY, not a test
+    project: the orchestrator test suite loads it at runtime via the plugin
+    loader. Kept separate from SampleTests so tool declarations (including a
+    deliberately invalid one) cannot disturb the count-sensitive tests that
+    assert over the sample assembly.
+
+    Rules (same as SampleTests):
+    - Reference CodeyBox.PluginSdk only (which transitively pulls CodeyBox.Core).
+    - Never reference CodeyBox.Orchestrator or CodeyBox.Api.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+  </ItemGroup>
+
+</Project>

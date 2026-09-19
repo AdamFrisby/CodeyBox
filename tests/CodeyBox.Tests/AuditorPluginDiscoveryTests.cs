@@ -28,6 +28,7 @@ public sealed class AuditorPluginDiscoveryTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["sample.auditor"],
+            Enabled = ["sample.auditor"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -51,6 +52,7 @@ public sealed class AuditorPluginDiscoveryTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["*"],
+            Enabled = ["*"],
         });
 
         var plugins = loader.DiscoverPlugins();
@@ -71,7 +73,7 @@ public sealed class AuditorPluginDiscoveryTests
     [Fact]
     public async Task NoPlugins_DiCollectionIsEmpty()
     {
-        var loader = MakeLoader(new PluginOptions { Allowlist = ["*"] });
+        var loader = MakeLoader(new PluginOptions { Allowlist = ["*"], Enabled = ["*"] });
         var plugins = loader.DiscoverPlugins();
 
         var services = new ServiceCollection();
@@ -91,6 +93,7 @@ public sealed class AuditorPluginDiscoveryTests
         {
             AssemblyPaths = [samplePath],
             Allowlist = ["sample.auditor"],
+            Enabled = ["sample.auditor"],
         });
 
         var plugins = loader.DiscoverPlugins();

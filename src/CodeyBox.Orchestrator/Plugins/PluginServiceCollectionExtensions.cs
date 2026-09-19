@@ -40,12 +40,22 @@ public static class PluginServiceCollectionExtensions
 
         // Register the runtime IPluginLoader so hosted services and tests can
         // query what was loaded. Pre-seed it with the already-discovered list
-        // so DiscoverAndLoadAsync is a cheap cache hit at runtime.
+        // (plus the per-plugin discovery statuses for the startup report) so
+        // DiscoverAndLoadAsync is a cheap cache hit at runtime.
+        var statuses = tempLoader.GetDiscoveryStatuses();
         services.AddSingleton<IPluginLoader>(sp =>
         {
             var logger = sp.GetRequiredService<ILogger<PluginLoader>>();
-            return new PluginLoader(opts, configuration, logger, preloaded: discovered);
+            return new PluginLoader(opts, configuration, logger, preloaded: discovered, preloadedStatuses: statuses);
         });
+
+        services.AddSingleton<IPluginToolAvailabilityProbe, PathPluginToolAvailabilityProbe>();
+
+        // Options-monitor binding exists only so the change watcher can
+        // observe Plugins:Enabled edits and demand a restart; discovery
+        // itself uses the snapshot above and never re-runs at runtime.
+        services.AddOptions<PluginOptions>().Bind(configuration.GetSection("CodeyBox:Plugins"));
+        services.AddHostedService<PluginOptionsChangeWatcher>();
 
         services.AddHostedService<PluginInitializationService>();
 

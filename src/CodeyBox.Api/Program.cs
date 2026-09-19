@@ -1006,10 +1006,12 @@ static IncusSandboxProvider BuildIncus(
                     sp.GetServices<IInVmSmokeProbe>(),
                     sp.GetService<InVmSmokeOptions>())
                 : Array.Empty<BaselineVerificationCommand>();
-            return IncusSandboxConfigMapper.Build(
+            var baseline = IncusSandboxConfigMapper.Build(
                 live,
                 configLog,
                 baselineVerificationCommands);
+            return ApplyPluginBaselineContributions(
+                sp, configLog, baseline, baselineVerificationCommands.Count, providerKind: "incus");
         },
         loggerFactory.CreateLogger<IncusSandboxProvider>(),
         timings,
@@ -1017,6 +1019,87 @@ static IncusSandboxProvider BuildIncus(
 
     LogDiskGuardBanner(provider, configLog);
     return provider;
+}
+
+/// <summary>
+/// Merges enabled plugins' external-tool requirements into an Incus options
+/// snapshot. Install steps go after operator <c>ExtraRuncmd</c> (so operator
+/// repository setup runs first); verification steps go after the agent-CLI
+/// probes. Both lists join the baseline-identity hash, so enabling or
+/// disabling a plugin rebakes the baseline via the normal orphan/grace path.
+/// </summary>
+static IncusSandboxOptions ApplyPluginBaselineContributions(
+    IServiceProvider sp,
+    ILogger log,
+    IncusSandboxOptions baseline,
+    int existingVerificationCount,
+    string providerKind)
+{
+    var contributions = ResolvePluginBaselineContributions(sp, log, existingVerificationCount, providerKind);
+    if (contributions.VerificationCommands.Count == 0 && contributions.InstallCommands.Count == 0)
+        return baseline;
+    return baseline with
+    {
+        ExtraRuncmd = [.. baseline.ExtraRuncmd, .. contributions.InstallCommands],
+        BaselineVerificationCommands = [.. baseline.BaselineVerificationCommands, .. contributions.VerificationCommands],
+    };
+}
+
+static IReadOnlyList<string> AppendPluginInstallCommands(
+    IReadOnlyList<string> extraRuncmd,
+    PluginBaselineContributions contributions) =>
+    contributions.InstallCommands.Count == 0
+        ? extraRuncmd
+        : [.. extraRuncmd, .. contributions.InstallCommands];
+
+static IReadOnlyList<BaselineVerificationCommand> AppendPluginVerificationCommands(
+    IReadOnlyList<BaselineVerificationCommand> existing,
+    PluginBaselineContributions contributions) =>
+    contributions.VerificationCommands.Count == 0
+        ? existing
+        : [.. existing, .. contributions.VerificationCommands];
+
+/// <summary>
+/// Resolves the validated tool requirements of loaded (enabled + allowlisted)
+/// plugins and builds their host-owned baseline contributions. Never throws:
+/// a resolution failure degrades to no plugin contributions (logged) rather
+/// than breaking sandbox creation.
+/// </summary>
+static PluginBaselineContributions ResolvePluginBaselineContributions(
+    IServiceProvider sp,
+    ILogger log,
+    int existingVerificationCount,
+    string providerKind)
+{
+    IReadOnlyList<PluginToolRequirement> tools;
+    try
+    {
+        tools = sp.GetService<IPluginLoader>()?.GetEnabledPluginTools() ?? [];
+    }
+    catch (Exception ex)
+    {
+        log.LogWarning(
+            ex,
+            "Plugin baseline provisioning for {Provider} unavailable: cannot resolve enabled plugin tools; continuing without them",
+            providerKind);
+        return new PluginBaselineContributions([], [], []);
+    }
+    if (tools.Count == 0)
+        return new PluginBaselineContributions([], [], []);
+    var contributions = PluginBaselineProvisioning.BuildContributions(tools, existingVerificationCount);
+    foreach (var dropped in contributions.DroppedTools)
+    {
+        log.LogDebug(
+            "Plugin baseline provisioning for {Provider}: dropped tool {PluginId}:{Binary} (provider verification headroom exhausted)",
+            providerKind, dropped.PluginId, dropped.Binary);
+    }
+    log.LogInformation(
+        "Plugin baseline provisioning for {Provider}: {Verifications} verification steps and {Installs} install steps from {Tools} enabled plugin tools",
+        providerKind,
+        contributions.VerificationCommands.Count,
+        contributions.InstallCommands.Count,
+        tools.Count);
+    return contributions;
 }
 
 static MultipassSandboxProvider BuildMultipass(
@@ -1062,11 +1145,14 @@ static MultipassSandboxProvider BuildMultipass(
                     sp.GetServices<IInVmSmokeProbe>(),
                     sp.GetService<InVmSmokeOptions>())
                 : Array.Empty<BaselineVerificationCommand>();
+            var pluginContributions = ResolvePluginBaselineContributions(
+                sp, startupLog, baselineVerificationCommands.Count, providerKind: "multipass");
             return new MultipassSandboxOptions
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
-                ExtraRuncmd = live.MultipassExtraRuncmd,
-                BaselineVerificationCommands = baselineVerificationCommands,
+                ExtraRuncmd = AppendPluginInstallCommands(live.MultipassExtraRuncmd, pluginContributions),
+                BaselineVerificationCommands = AppendPluginVerificationCommands(
+                    baselineVerificationCommands, pluginContributions),
                 NetworkProfiles = live.SandboxNetworkProfiles,
                 UseBaselineImages = live.MultipassUseBaselineImages,
                 CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,

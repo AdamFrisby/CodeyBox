@@ -941,12 +941,12 @@ subtree skip is **not** applied:
 | `CodeyBox:Plugins` | `PluginOptions` (plus operator-defined `<plugin-id>` sub-trees are opaque) |
 
 `CodeyBox:Plugins` is the only section that mixes typed properties
-(`AssemblyPaths`/`PackageDirectories`/`Allowlist`) with operator-defined
+(`AssemblyPaths`/`PackageDirectories`/`Allowlist`/`Enabled`) with operator-defined
 extension keys (per-plugin sub-trees read via `IPluginHost.ScopedConfig`).
 The inspector treats any non-typed key at `CodeyBox:Plugins` level as an
 opaque plugin id, so a typo of a typed property name there cannot be
 distinguished from a plugin id and stays silent. Typos *inside*
-`AssemblyPaths` / `PackageDirectories` / `Allowlist` are still validated.
+`AssemblyPaths` / `PackageDirectories` / `Allowlist` / `Enabled` are still validated.
 
 A small set of leaf-shaped keys is read directly via `IConfiguration` with
 no matching typed property; these are exempted by exact path:
