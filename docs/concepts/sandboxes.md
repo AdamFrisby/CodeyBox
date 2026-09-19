@@ -15,6 +15,7 @@ operational trade-off matches your deployment.
 | `incus`           | Real VM with COW ZFS/Btrfs roots and virtiofs | Incus 6.3+ (`7.0 LTS`: Linux 6.12+/QEMU 8.2+), `incus-admin`, and a ZFS or Btrfs pool | Opt-in; `requires_incus` tested |
 | `multipass-remote` | Real Ubuntu VM on remote executor hosts     | `ssh` from orchestrator + `snap install multipass` per executor  | Working — distributed executor pool |
 | `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
+| `runloop`         | Hosted VM (plugin, `codeybox.runloop`)       | Runloop account and API key; plugin allowlisted and enabled      | Working — plugin, off by default |
 
 Multipass and Incus are configured independently: selecting Incus is explicit
 and inherits none of Multipass's configuration, baselines, or lifecycle state.
@@ -743,6 +744,29 @@ Transfer sizes are bounded by `MaxSyncArchiveBytes`,
 their base64 counterparts, so a hostile sprite cannot force an unbounded
 download during sync-back.
 
+## `runloop` — hosted VMs via the `codeybox.runloop` plugin
+
+Sandboxes run as Runloop Devboxes (hosted Linux VMs with disk snapshots and
+suspend/resume), contributed as a sandbox provider kind through the plugin
+trust model — off unless the operator allowlists **and** enables
+`codeybox.runloop`. Full operator reference lives in
+[`plugins/CodeyBox.RunloopPlugin/README.md`](../../plugins/CodeyBox.RunloopPlugin/README.md):
+what to configure, what it costs, and what it cannot do.
+
+The posture mirrors `sprites` (hosted guest, staged mounts, provider-owned
+egress) with three differences that matter when choosing between them:
+
+- **Suspend is disk-only.** A suspended devbox keeps its disk but loses
+  running processes; resume restores the disk and the pipeline replays from
+  its checkpoint. There is no RAM checkpoint to adopt.
+- **Snapshots are first-class.** `CreateSnapshotAsync` freezes the devbox
+  disk, and new devboxes can start from `SnapshotId` (or a `BlueprintId` /
+  `BlueprintName`) to pre-install the toolchain — but the checkout itself
+  always follows the pipeline's own clone path, never a provider-baked copy.
+- **No egress mapping at all.** Where `sprites` maps a profile name to
+  allowed hosts through its API, `runloop` refuses any named network profile
+  outright (`NotEnforced`): unprofiled work only.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -753,6 +777,7 @@ download during sync-back.
 | Production where VM throughput needs a separate host        | `multipass-remote`  |
 | Persistent, high-throughput headless host with a ZFS/Btrfs pool | `incus`          |
 | No local KVM available, hosted VMs acceptable               | `sprites`           |
+| Hosted VMs with snapshots/suspend-resume, plugin-managed      | `runloop`           |
 
 ## Sandbox classes (`CodeyBox:SandboxClasses`)
 
@@ -833,6 +858,7 @@ varies by provider:**
 | incus        | Host-side nftables on the same per-profile bridges; one filtered NIC and no NAT NIC    |
 | multipass-remote | Bridges named per profile on the **executor** host; the profile→bridge map is CodeyBox config, but the bridges and their nftables rules must be created on that host |
 | sprites      | Allowed hosts declared per profile through the Sprites API; enforced by the provider, not by you |
+| runloop      | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
