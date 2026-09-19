@@ -40,10 +40,12 @@ public sealed class PluginSandboxProviderTests
         public string Name { get; }
         public SandboxIsolationLevel IsolationLevel { get; }
         public IReadOnlyList<string> DeclaredCapabilities { get; }
+        public int CreateCount { get; private set; }
 
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {
             ArgumentNullException.ThrowIfNull(spec);
+            CreateCount++;
             return Task.FromResult<ISandbox>(new PlacementFakeSandbox(Name + "-sandbox"));
         }
 
@@ -131,7 +133,10 @@ public sealed class PluginSandboxProviderTests
             new SandboxPlacementAcquisition(WorkItemId.New(), "work", [], null, null, SandboxPlacementTestMembers.Spec()),
             CancellationToken.None);
 
-        Assert.NotNull(sandbox);
+        var placed = sandbox;
+        Assert.Equal("acme-vm-sandbox", placed.Id);
+        Assert.Equal(1, plugin.CreateCount);
+        Assert.NotNull(SandboxCapability.Find<PlacementFakeSandbox>(placed));
         await sandbox.DisposeAsync();
     }
 
