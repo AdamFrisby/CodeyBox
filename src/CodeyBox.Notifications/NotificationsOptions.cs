@@ -28,6 +28,12 @@ public sealed class NotificationsOptions
     /// + severity override + debounce cooldown.
     /// </summary>
     public List<NotificationRuleOptions> Rules { get; set; } = [];
+
+    /// <summary>
+    /// Inbound interaction settings for <c>POST /webhooks/interactions/{provider}</c>.
+    /// Disabled by default so outbound-only deployments expose nothing new.
+    /// </summary>
+    public InteractionsOptions Interactions { get; set; } = new();
 }
 
 /// <summary>

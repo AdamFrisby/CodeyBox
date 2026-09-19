@@ -2437,62 +2437,12 @@ internal static class WorkItemEndpoints
             return Results.Ok(new { status = "no-op", questionState = question.State });
 
         var redactedAnswer = RawOutputRedactor.Redact(req.Answer);
-        await questionStore.AnswerAsync(item.Id.ToString(), req.QuestionId, redactedAnswer, answeredBy: null, ct);
-
-        var project = await projects.GetAsync(item.ProjectId, ct);
-        await webhooks.PublishAsync(new WebhookEvent
-        {
-            Event = "work_item.question_answered",
-            WorkItem = item,
-            Project = project,
-            Details = new QuestionAnsweredDetails(item.Id.ToString(), item.ProjectId.Value, req.QuestionId, redactedAnswer, AnsweredBy: null),
-        }, ct);
-
-        // A human-review backing question carries the operator's verdict:
-        // exactly "approve" approves, any other answer rejects with the text
-        // as notes. Recorded here so the generic answer path (API or CLI)
-        // verdicts like the dedicated endpoints below.
-        await TryRecordHumanReviewVerdictAsync(item.Id, req.QuestionId, redactedAnswer, reviews, ct);
-
-        // Transition out of NeedsOperatorInput if all questions are now resolved.
-        await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
+        await QuestionAnswerPipeline.AnswerAndResumeAsync(
+            item, req.QuestionId, redactedAnswer,
+            answeredBy: null, decidedBy: null,
+            questionStore, store, queue, webhooks, projects, reviews, ct);
 
         return Results.Ok(new { status = "answered" });
-    }
-
-    /// <summary>
-    /// Interprets an answer to a human-review backing question as a verdict.
-    /// Best-effort: the answer itself is already persisted, so a missing
-    /// review store, an already-decided review, or an expired review simply
-    /// leaves the verdict unrecorded (the resume path still fails closed on
-    /// expiry).
-    /// </summary>
-    private static async Task TryRecordHumanReviewVerdictAsync(
-        WorkItemId itemId,
-        string questionId,
-        string answer,
-        IHumanDeploymentReviewStore? reviews,
-        CancellationToken ct)
-    {
-        if (reviews is null || !HumanDeploymentReviewPolicy.IsReviewQuestion(questionId))
-            return;
-        var review = await reviews.GetActiveForWorkItemAsync(itemId.ToString(), ct);
-        if (review is null
-            || review.Status != HumanDeploymentReviewStatus.Pending
-            || !string.Equals(review.QuestionId, questionId, StringComparison.Ordinal))
-            return;
-        var now = DateTimeOffset.UtcNow;
-        if (now >= review.Deadline)
-            return;
-        var approved = HumanDeploymentReviewPolicy.IsApprovalAnswer(answer);
-        await reviews.RecordVerdictAsync(
-            review.WorkItemId,
-            review.Iteration,
-            approved,
-            approved ? null : HumanDeploymentReviewPolicy.TruncateNotes(answer),
-            decidedBy: null,
-            now,
-            ct);
     }
 
     private static async Task<IResult> DismissQuestionAsync(
@@ -2540,7 +2490,7 @@ internal static class WorkItemEndpoints
         }, ct);
 
         // Transition out of NeedsOperatorInput if all questions are now resolved.
-        await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
+        await QuestionAnswerPipeline.MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
 
         return Results.Ok(new { status = "dismissed" });
     }
@@ -2686,7 +2636,7 @@ internal static class WorkItemEndpoints
                 Details = new QuestionAnsweredDetails(
                     item.Id.ToString(), item.ProjectId.Value, review.QuestionId, answerText, AnsweredBy: null),
             }, ct);
-            await MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
+            await QuestionAnswerPipeline.MaybeResumeFromNeedsOperatorInputAsync(item, store, questionStore, queue, webhooks, project, ct);
         }
 
         return Results.Ok(new
@@ -2694,43 +2644,6 @@ internal static class WorkItemEndpoints
             status = approved ? "approved" : "rejected",
             iteration = review.Iteration,
         });
-    }
-
-    /// <summary>
-    /// When a work item is in NeedsOperatorInput state and all its questions are now
-    /// resolved (answered or dismissed), transitions back to WorkComplete and re-enqueues.
-    /// </summary>
-    private static async Task MaybeResumeFromNeedsOperatorInputAsync(
-        WorkItem item,
-        IWorkItemStore store,
-        IWorkItemQuestionStore questionStore,
-        ITaskQueue queue,
-        IWebhookDispatcher webhooks,
-        Project? project,
-        CancellationToken ct)
-    {
-        var current = await store.GetAsync(item.Id, ct) ?? item;
-        if (current.State != WorkItemState.NeedsOperatorInput) return;
-
-        var allQuestions = await questionStore.ListByWorkItemAsync(item.Id.ToString(), ct);
-        var hasOpen = allQuestions.Any(q => q.State == "open");
-        if (hasOpen) return;
-
-        var resumed = current.With(WorkItemState.WorkComplete);
-        var transitioned = await store.TryUpdateIfStateAsync(resumed, WorkItemState.NeedsOperatorInput, ct);
-        if (!transitioned) return;
-        AuditLog.WorkItemTransitioned(item.Id, "WorkComplete (resumed from NeedsOperatorInput)");
-        await queue.EnqueueAsync(item.Id, ct);
-
-        if (project is not null)
-        {
-            await webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.work_complete",
-                WorkItem = resumed,
-                Project = project,
-            }, ct);
-        }
     }
 
     // ── Work item resolver ────────────────────────────────────────────────────

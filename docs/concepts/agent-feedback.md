@@ -171,9 +171,12 @@ orchestrator's replay pass deliberately skips `NeedsOperatorInput` items.
 - There is a hard cap of 10 questions per work item regardless of how many
   `<codeybox-question>` blocks the agent emits.
 - `answeredBy` appears in the `work_item.question_answered` payload and in
-  `GET /workitems/{id}/questions`, but is always `null`: the answer endpoint
-  passes `answeredBy: null`, so the named-client principal that authenticated
-  the call is not recorded against the answer.
+  `GET /workitems/{id}/questions`. Answers submitted through
+  `POST /workitems/{id}/answer` record `null` (the named-client principal
+  that authenticated the call is not recorded against the answer), while
+  answers arriving via `POST /webhooks/interactions/{provider}` record the
+  platform identity as `{provider}:{userId} ({login})` — see
+  [`../extending/interactions.md`](../extending/interactions.md).
 
 ## Suggestions
 

@@ -25,6 +25,11 @@ public sealed class ChatNotificationProvider : INotificationProvider
 
     public string Name => "chat";
 
+    /// <summary>Incoming webhooks post one-way messages: this provider is
+    /// notification-only. Actionable notifications still surface via the
+    /// <see cref="Notification.AnswerUrl"/> fallback link.</summary>
+    public bool SupportsInteractions => false;
+
     public ChatNotificationProvider(
         ChatProviderOptions opts,
         HttpClient http,
@@ -122,7 +127,10 @@ public sealed class ChatNotificationProvider : INotificationProvider
     {
         var color = SlackColor(n.Severity);
         var emoji = SeverityEmoji(n.Severity);
-        var fallbackText = $"{emoji} [{n.Severity}] {n.Title}";
+        var body = NotificationInteractionHelper.WithAnswerFallback(
+            n.Body ?? n.Summary ?? n.Title, n.AnswerUrl);
+        var fallbackText = NotificationInteractionHelper.WithAnswerFallback(
+            $"{emoji} [{n.Severity}] {n.Title}", n.AnswerUrl);
 
         var fields = new List<object>();
         if (n.Fields is not null)
@@ -142,7 +150,7 @@ public sealed class ChatNotificationProvider : INotificationProvider
         {
             ["color"] = color,
             ["title"] = n.Title,
-            ["text"] = n.Body ?? n.Summary,
+            ["text"] = body,
             ["ts"] = n.Timestamp.ToUnixTimeSeconds(),
             ["footer"] = $"CodeyBox · {n.ConditionId}",
         };
@@ -163,7 +171,10 @@ public sealed class ChatNotificationProvider : INotificationProvider
     {
         var color = DiscordColor(n.Severity);
         var emoji = SeverityEmoji(n.Severity);
-        var content = $"{emoji} **[{n.Severity}]** {n.Title}";
+        var body = NotificationInteractionHelper.WithAnswerFallback(
+            n.Body ?? n.Summary ?? n.Title, n.AnswerUrl);
+        var content = NotificationInteractionHelper.WithAnswerFallback(
+            $"{emoji} **[{n.Severity}]** {n.Title}", n.AnswerUrl);
 
         var embedFields = new List<object>();
         if (n.Fields is not null)
@@ -182,7 +193,7 @@ public sealed class ChatNotificationProvider : INotificationProvider
         var embed = new Dictionary<string, object?>
         {
             ["title"] = n.Title,
-            ["description"] = n.Body ?? n.Summary,
+            ["description"] = body,
             ["color"] = color,
             ["timestamp"] = n.Timestamp.UtcDateTime.ToString("o"),
             ["footer"] = new { text = $"CodeyBox · {n.ConditionId}" },
