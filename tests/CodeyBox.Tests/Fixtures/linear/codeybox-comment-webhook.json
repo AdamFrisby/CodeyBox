@@ -1,0 +1,17 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "data": {
+    "id": "comment-own-1",
+    "body": "CodeyBox update: 'Login redirect is broken' is now Working (external status: In Progress).\n\n<!-- codeybox-work-item:7a6b5c4d1e2f4a4b9c8d3e4f5a6b7c8d -->",
+    "createdAt": "2026-09-20T17:06:00.000Z",
+    "user": { "email": "bot@example.com", "name": "codeybox" },
+    "issue": {
+      "id": "9d8f2c1a-3b4e-4f5a-8c6d-1e2f3a4b5c6d",
+      "identifier": "ENG-123",
+      "title": "Login redirect is broken",
+      "team": { "id": "team-uuid-eng", "key": "ENG" }
+    }
+  },
+  "createdAt": "2026-09-20T17:06:00.000Z"
+}

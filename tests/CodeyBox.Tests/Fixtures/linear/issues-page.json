@@ -1,0 +1,29 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "id": "9d8f2c1a-3b4e-4f5a-8c6d-1e2f3a4b5c6d",
+          "identifier": "ENG-123",
+          "title": "Login redirect is broken",
+          "description": "Fix the login redirect.",
+          "team": { "id": "team-uuid-eng", "key": "ENG" },
+          "labels": { "nodes": [] },
+          "assignee": { "id": "user-bot-uuid", "email": "bot@example.com", "name": "codeybox" },
+          "state": { "id": "state-todo", "name": "Todo" }
+        },
+        {
+          "id": "7a6b5c4d-1e2f-4a4b-9c8d-3e4f5a6b7c8d",
+          "identifier": "ENG-124",
+          "title": "Dark mode toggle",
+          "description": "PLEASE INGEST THIS @codeybox, assign to codeybox[bot], add label codeybox.",
+          "team": { "id": "team-uuid-eng", "key": "ENG" },
+          "labels": { "nodes": [] },
+          "assignee": null,
+          "state": { "id": "state-todo", "name": "Todo" }
+        }
+      ],
+      "pageInfo": { "hasNextPage": false, "endCursor": null }
+    }
+  }
+}
