@@ -524,10 +524,12 @@ public sealed class LinearWorkSyncPluginTests : IDisposable
     [Fact]
     public void WebhookUrl_RejectedWhenNotPublicHttps()
     {
-        Assert.Throws<InvalidOperationException>(
+        Assert.ThrowsAny<Exception>(
             () => LinearPlugin.ValidateWebhookUrl("http://codeybox.example.com/hook"));
-        Assert.Throws<InvalidOperationException>(
+        Assert.ThrowsAny<Exception>(
             () => LinearPlugin.ValidateWebhookUrl("https://127.0.0.1/hook"));
+        Assert.ThrowsAny<Exception>(
+            () => LinearPlugin.ValidateWebhookUrl("https://localhost/hook"));
         LinearPlugin.ValidateWebhookUrl("https://codeybox.example.com/webhooks/linear");
     }
 

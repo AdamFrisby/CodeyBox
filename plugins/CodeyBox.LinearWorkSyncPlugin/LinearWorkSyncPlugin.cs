@@ -506,39 +506,18 @@ public sealed class LinearWorkSyncPlugin
     private static string NormalizeUrl(string url) => url.Trim().TrimEnd('/');
 
     /// <summary>
-    /// Validates the operator's public webhook URL: absolute https, no embedded
-    /// credentials, and no loopback/private-literal host (SSRF guard — a
-    /// webhook URL pointing at internal infrastructure would hand deliveries
-    /// to the wrong network).
+    /// Validates the operator's public webhook URL. Delegates SSRF policy to
+    /// <see cref="Validation.ValidateWebhookUrl"/> (hostname blocklist,
+    /// IP-literal and DNS-resolved private/reserved rejection) and adds the
+    /// Linear-only requirement that delivery use https (no credentials).
     /// </summary>
     internal static void ValidateWebhookUrl(string url)
     {
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
-            throw new InvalidOperationException($"Linear WebhookUrl '{url}' is not a valid absolute URL.");
-        if (!string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
+        Validation.ValidateWebhookUrl(url, "Linear WebhookUrl");
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || !string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Linear WebhookUrl must use https://.");
         if (!string.IsNullOrEmpty(uri.UserInfo))
             throw new InvalidOperationException("Linear WebhookUrl must not embed credentials.");
-        if (System.Net.IPAddress.TryParse(uri.Host, out var ip)
-            && (System.Net.IPAddress.IsLoopback(ip) || IsPrivateOrLinkLocal(ip)))
-            throw new InvalidOperationException("Linear WebhookUrl must not point to a loopback or private address.");
-    }
-
-    private static bool IsPrivateOrLinkLocal(System.Net.IPAddress ip)
-    {
-        var bytes = ip.GetAddressBytes();
-        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-        {
-            return bytes[0] == 10
-                || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
-                || (bytes[0] == 192 && bytes[1] == 168)
-                || (bytes[0] == 169 && bytes[1] == 254);
-        }
-        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
-        {
-            return (bytes[0] & 0xfe) == 0xfc
-                || (bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80);
-        }
-        return false;
     }
 }
