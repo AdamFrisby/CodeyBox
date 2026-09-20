@@ -1,0 +1,9 @@
+{
+  "action": "remove",
+  "type": "Issue",
+  "data": {
+    "id": "9d8f2c1a-3b4e-4f5a-8c6d-1e2f3a4b5c6d",
+    "identifier": "ENG-123"
+  },
+  "createdAt": "2026-09-20T17:07:00.000Z"
+}

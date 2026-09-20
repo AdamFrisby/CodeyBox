@@ -1,0 +1,16 @@
+{
+  "action": "update",
+  "type": "Issue",
+  "data": {
+    "id": "9d8f2c1a-3b4e-4f5a-8c6d-1e2f3a4b5c6d",
+    "identifier": "ENG-123",
+    "title": "Login redirect is broken",
+    "description": "Fix the login redirect.",
+    "team": { "id": "team-uuid-eng", "key": "ENG" },
+    "labels": { "nodes": [] },
+    "assignee": { "id": "user-bot-uuid", "email": "bot@example.com", "name": "codeybox" },
+    "state": { "id": "state-todo", "name": "Todo" }
+  },
+  "url": "https://linear.app/acme/issue/ENG-123/login-redirect-is-broken",
+  "createdAt": "2026-09-20T17:00:00.000Z"
+}

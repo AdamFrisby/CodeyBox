@@ -60,6 +60,7 @@
     <Project Path="plugins/CodeyBox.OpencodeGoQuotaPlugin/CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <Project Path="plugins/CodeyBox.QuotaResetNotifier/CodeyBox.QuotaResetNotifier.csproj" />
     <Project Path="plugins/CodeyBox.StatisticsPlugin/CodeyBox.StatisticsPlugin.csproj" />
+    <Project Path="plugins/CodeyBox.LinearWorkSyncPlugin/CodeyBox.LinearWorkSyncPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
