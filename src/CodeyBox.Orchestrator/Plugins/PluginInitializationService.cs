@@ -28,6 +28,9 @@ internal sealed class PluginInitializationService : IHostedService
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<PluginInitializationService> _logger;
     private readonly IPluginToolAvailabilityProbe _toolProbe;
+    private readonly bool _failOnInitializationError;
+    private readonly int _startupReportMaxEntries;
+    private readonly List<PluginInitializationFailure> _initializationFailures = [];
 
     /// <summary>
     /// Unmet external-tool requirements observed by the last
@@ -35,13 +38,22 @@ internal sealed class PluginInitializationService : IHostedService
     /// </summary>
     public IReadOnlyList<PluginToolRequirement> UnmetToolRequirements { get; private set; } = [];
 
+    /// <summary>
+    /// Plugin types whose initialisation threw during the last
+    /// <see cref="StartAsync"/> run. Recorded (in addition to the error log
+    /// and audit event) so the administrative surface can report them.
+    /// </summary>
+    public IReadOnlyList<PluginInitializationFailure> InitializationFailures => _initializationFailures;
+
     public PluginInitializationService(
         IPluginLoader loader,
         IServiceProvider serviceProvider,
         IConfiguration configuration,
         ILoggerFactory loggerFactory,
         ILogger<PluginInitializationService> logger,
-        IPluginToolAvailabilityProbe? toolProbe = null)
+        IPluginToolAvailabilityProbe? toolProbe = null,
+        bool? failOnInitializationError = null,
+        int? startupReportMaxEntries = null)
     {
         _loader = loader;
         _serviceProvider = serviceProvider;
@@ -49,18 +61,38 @@ internal sealed class PluginInitializationService : IHostedService
         _loggerFactory = loggerFactory;
         _logger = logger;
         _toolProbe = toolProbe ?? new PathPluginToolAvailabilityProbe();
+        // Failure policy is explicit and configurable (see PluginOptions):
+        // fail closed on initialisation errors by default. An explicit
+        // constructor override wins (tests), then configuration, then the default.
+        _failOnInitializationError = failOnInitializationError
+            ?? configuration.GetSection("CodeyBox:Plugins").GetValue<bool?>("FailOnInitializationError")
+            ?? new PluginOptions().FailOnInitializationError;
+        _startupReportMaxEntries = startupReportMaxEntries
+            ?? configuration.GetSection("CodeyBox:Plugins").GetValue<int?>("StartupReportMaxEntries")
+            ?? new PluginOptions().StartupReportMaxEntries;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         var plugins = await _loader.DiscoverAndLoadAsync(cancellationToken);
 
-        foreach (var plugin in plugins)
+        try
         {
-            AuditLog.PluginLoaded(plugin.PluginId, plugin.DisplayName, plugin.AssemblyPath);
+            foreach (var plugin in plugins)
+            {
+                AuditLog.PluginLoaded(plugin.PluginId, plugin.DisplayName, plugin.AssemblyPath);
 
-            foreach (var type in plugin.RegisteredTypes)
-                await InitializeTypeAsync(plugin, type, cancellationToken);
+                foreach (var type in plugin.RegisteredTypes)
+                    await InitializeTypeAsync(plugin, type, cancellationToken);
+            }
+        }
+        catch when (_failOnInitializationError)
+        {
+            // Fatal path still reports: the discovery outcome and the recorded
+            // initialisation failure are logged before the host aborts, so an
+            // operator never faces a dead host with no reason in the log.
+            ReportStartupState(plugins);
+            throw;
         }
 
         ReportStartupState(plugins);
@@ -73,6 +105,13 @@ internal sealed class PluginInitializationService : IHostedService
     /// probes the external tools required by loaded plugins, recording the
     /// unmet ones on <see cref="UnmetToolRequirements"/>. A missing binary is
     /// a loud startup warning — never a silent bake failure later.
+    ///
+    /// <para>Discovery itself runs before the container is built (with no real
+    /// logger), so this report replays the full discovery outcome — per-plugin
+    /// statuses <em>and</em> per-path assembly reports — with the runtime
+    /// logger. A configured plugin that never became a candidate (missing
+    /// file, unloadable assembly, stale contracts, no plugin entry) is
+    /// reported here, never silently absent.</para>
     /// </summary>
     private void ReportStartupState(IReadOnlyList<LoadedPlugin> plugins)
     {
@@ -80,9 +119,12 @@ internal sealed class PluginInitializationService : IHostedService
         {
             if (status.Loaded)
             {
+                var contracts = status.Contracts is { Count: > 0 }
+                    ? $" [{string.Join(", ", status.Contracts)}]"
+                    : string.Empty;
                 _logger.LogInformation(
-                    "Plugin {PluginId} enabled and loaded ({DisplayName})",
-                    status.PluginId, status.DisplayName);
+                    "Plugin {PluginId} enabled and loaded ({DisplayName}){Contracts}",
+                    status.PluginId, status.DisplayName, contracts);
             }
             else
             {
@@ -90,6 +132,15 @@ internal sealed class PluginInitializationService : IHostedService
                     "Plugin {PluginId} not loaded: {Reason}",
                     status.PluginId, DescribeSkip(status.SkipReason));
             }
+        }
+
+        foreach (var assembly in _loader.GetAssemblyReports().Where(static a => !a.Loaded))
+        {
+            _logger.LogWarning(
+                "Plugin assembly {Path} did not load: {Reason}{Detail}",
+                assembly.AssemblyPath,
+                DescribeSkip(assembly.SkipReason),
+                string.IsNullOrEmpty(assembly.Detail) ? string.Empty : $" ({assembly.Detail})");
         }
 
         var unmet = new List<PluginToolRequirement>();
@@ -121,6 +172,19 @@ internal sealed class PluginInitializationService : IHostedService
             }
         }
         UnmetToolRequirements = unmet;
+
+        var summary = PluginStartupSummary.Build(
+            _loader.GetDiscoveryStatuses(),
+            _loader.GetAssemblyReports(),
+            _initializationFailures,
+            _startupReportMaxEntries);
+        _logger.LogInformation("{Header}", summary.Header);
+        foreach (var detail in summary.Details)
+            _logger.LogInformation("Plugin startup: {Detail}", detail);
+        if (summary.Omitted > 0)
+            _logger.LogInformation(
+                "Plugin startup: …and {Omitted} more (full inventory on GET /plugins/status)",
+                summary.Omitted);
     }
 
     private static string DescribeSkip(PluginSkipReason reason) => reason switch
@@ -129,6 +193,13 @@ internal sealed class PluginInitializationService : IHostedService
         PluginSkipReason.NotAllowlisted => "not in Plugins:Allowlist",
         PluginSkipReason.ApiVersionMismatch => "requires a newer host API version",
         PluginSkipReason.InvalidToolDeclaration => "invalid external-tool declaration (failed closed)",
+        PluginSkipReason.FileMissing => "configured file not found",
+        PluginSkipReason.InspectionFailed => "assembly metadata could not be inspected",
+        PluginSkipReason.LoadFailed => "assembly could not be loaded for execution",
+        PluginSkipReason.NoPluginEntry => "assembly contains no [CodeyBoxPlugin] types",
+        PluginSkipReason.StaleHostContracts =>
+            "built against a different version of the host contracts (CodeyBox.Core/CodeyBox.PluginSdk); rebuild the plugin",
+        PluginSkipReason.InitializationFailed => "initialization threw",
         _ => "unknown reason",
     };
 
@@ -164,9 +235,12 @@ internal sealed class PluginInitializationService : IHostedService
         }
         catch (Exception ex)
         {
+            RecordInitializationFailure(plugin.PluginId, type.Name, ex);
             AuditLog.PluginInitializationFailed(plugin.PluginId, ex);
             _logger.LogError(ex, "Plugin {PluginId}: failed to resolve {TypeName} from DI", plugin.PluginId, type.Name);
-            throw;
+            if (_failOnInitializationError)
+                throw;
+            return;
         }
 
         if (instance is not IPluginInitializer initializer)
@@ -196,9 +270,26 @@ internal sealed class PluginInitializationService : IHostedService
         }
         catch (Exception ex)
         {
+            RecordInitializationFailure(plugin.PluginId, type.Name, ex);
             AuditLog.PluginInitializationFailed(plugin.PluginId, ex);
             _logger.LogError(ex, "Plugin {PluginId}: initialization failed", plugin.PluginId);
-            throw;
+            if (_failOnInitializationError)
+                throw;
         }
+    }
+
+    private void RecordInitializationFailure(string pluginId, string typeName, Exception ex)
+    {
+        var error = ex.GetType().Name + ": " + FirstLine(ex.Message);
+        _initializationFailures.Add(new PluginInitializationFailure(pluginId, typeName, error));
+    }
+
+    private static string FirstLine(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "(no detail)";
+        var line = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        const int maxLength = 256;
+        return line.Length > maxLength ? line[..maxLength] + "…" : line;
     }
 }

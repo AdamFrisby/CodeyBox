@@ -1519,6 +1519,17 @@ public static class AuditLog
         Audit("plugin.initialization_failed")
             .Error(exception, "Plugin {PluginId} initialization failed; plugin not available", pluginId);
 
+    public static void PluginAssemblyFailed(string assemblyPath, string reason) =>
+        Audit("plugin.assembly_failed")
+            .Error("Plugin assembly {AssemblyPath} did not load: {Reason}",
+                assemblyPath, reason);
+
+    public static void PluginStaleContracts(string assemblyPath, string detail) =>
+        Audit("plugin.stale_contracts")
+            .Error("Plugin assembly {AssemblyPath} was built against a different version of the host contracts " +
+                "(CodeyBox.Core/CodeyBox.PluginSdk) and cannot load ({Detail}); rebuild the plugin against the current host",
+                assemblyPath, detail);
+
     // ── Hot-reload config ────────────────────────────────────────────────────
 
     /// <summary>

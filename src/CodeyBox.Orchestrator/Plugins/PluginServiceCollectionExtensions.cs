@@ -40,13 +40,15 @@ public static class PluginServiceCollectionExtensions
 
         // Register the runtime IPluginLoader so hosted services and tests can
         // query what was loaded. Pre-seed it with the already-discovered list
-        // (plus the per-plugin discovery statuses for the startup report) so
-        // DiscoverAndLoadAsync is a cheap cache hit at runtime.
+        // (plus the per-plugin discovery statuses and per-path assembly
+        // reports for the startup report) so DiscoverAndLoadAsync is a cheap
+        // cache hit at runtime.
         var statuses = tempLoader.GetDiscoveryStatuses();
+        var assemblyReports = tempLoader.GetAssemblyReports();
         services.AddSingleton<IPluginLoader>(sp =>
         {
             var logger = sp.GetRequiredService<ILogger<PluginLoader>>();
-            return new PluginLoader(opts, configuration, logger, preloaded: discovered, preloadedStatuses: statuses);
+            return new PluginLoader(opts, configuration, logger, preloaded: discovered, preloadedStatuses: statuses, preloadedAssemblyReports: assemblyReports);
         });
 
         services.AddSingleton<IPluginToolAvailabilityProbe, PathPluginToolAvailabilityProbe>();

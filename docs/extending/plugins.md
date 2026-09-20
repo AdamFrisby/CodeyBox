@@ -211,6 +211,8 @@ Bind from `CodeyBox:Plugins` in `appsettings.json`:
 | `PackageDirectories` | `string[]` | Directories scanned for `*.dll` (non-recursive). |
 | `Allowlist` | `string[]` | Plugin IDs allowed to load. Empty = load nothing. `["*"]` = load all (not recommended). |
 | `Enabled` | `string[]` | Plugin IDs switched on. A plugin loads only when it is **both allowlisted and enabled**; an allowlisted-but-disabled plugin stays unloaded — its assembly is never loaded, its types never registered, its instances never constructed. `["*"]` = enable all (not recommended: every future plugin would switch itself on by being present). |
+| `FailOnInitializationError` | `bool` | Abort host startup when a plugin's initialisation throws (default `true`). Set `false` to log-and-continue without the failed plugin. Load failures are never fatal. See [Failure policy](#failure-policy). |
+| `StartupReportMaxEntries` | `int` | Max plugin entries listed individually in the startup summary log (default `20`); beyond this the summary collapses to counts. Full inventory stays on `GET /plugins/status`. |
 
 **Important:** an empty `Allowlist` is the safe default — no plugins load unless
 the operator explicitly opts in. This is intentional.
@@ -295,6 +297,56 @@ probes the host `PATH` for each enabled plugin's binaries. An enabled plugin
 with an unmet requirement is reported loudly (`plugin.tool_unmet` audit
 event plus a warning naming the missing binary and its install hint) —
 before it can fail inside a sandbox.
+
+The report covers every configured path, not just every discovered plugin:
+for each assembly path the host records whether the file was found, whether
+it loaded, which plugin ids it contributed, and which host contracts
+(`IAuditor`, `IMetricSampler`, …) they registered under. Every skip and
+failure carries its reason — file missing, assembly unloadable, version or
+contract mismatch, not allowlisted, no `[CodeyBoxPlugin]` type found,
+initialisation threw. A configured plugin that does not end up loaded always
+produces a warning naming it and why; with dozens of plugins configured the
+log stays a bounded summary (see `StartupReportMaxEntries`) while the full
+inventory remains queryable below.
+
+A plugin built against a different version of the host contracts
+(`CodeyBox.Core`/`CodeyBox.PluginSdk`) than the running host — typically a
+host rebuild that did not rebuild the plugin projects — is detected
+specifically and reported as a stale-contracts build ("was built against a
+different version of the host contracts …; rebuild the plugin against the
+current host"), not as a generic load failure.
+
+The same inventory is served at runtime, without reading logs or restarting:
+
+```
+GET /plugins/status
+→ { "loaded": [{ "pluginId": "…", "displayName": "…",
+                 "assemblyPath": "…", "contracts": ["IAuditor"] }],
+     "discovery": [{ "pluginId": "…", …, "loaded": true,
+                     "skipReason": "None", "contracts": ["IAuditor"] }],
+     "assemblies": [{ "assemblyPath": "…", "found": true, "loaded": true,
+                      "pluginIds": ["…"], "contracts": ["IAuditor"],
+                      "skipReason": "None" }] }
+```
+
+`GET /plugins` stays auditor-only for the dashboard and project-config
+reference; `/plugins/status` lists every loaded plugin under any contract.
+
+### Failure policy
+
+Silent absence is a failure mode: an auditor that never ran must never look
+like an audit that passed. The host therefore treats the two failure kinds
+differently, and the choice is explicit:
+
+| Failure kind | Behaviour | Configurable? |
+|---|---|---|
+| Load failure: file missing, unloadable assembly, stale host contracts, no `[CodeyBoxPlugin]` type, gate rejection | Non-fatal. Loud warning + audit event (`plugin.assembly_failed` / `plugin.stale_contracts`); host starts without the plugin. | No — a notifier must never take the host down, and an auditor's absence is already loud. |
+| Initialisation failure: `IPluginInitializer.InitializeAsync` (or its DI resolution) throws | Fatal by default: error + `plugin.initialization_failed` audit event, then host startup aborts. A half-initialised auditor that silently never runs is worse than a host that refuses to start. | Yes — `CodeyBox:Plugins:FailOnInitializationError` (default `true`). Set `false` to log-and-continue without the failed plugin; its failure stays on the startup report and `/plugins/status`. |
+
+The policy does not differ by contract today: every contract fails closed on
+initialisation errors and stays up on load failures. If a future contract
+genuinely needs its own policy, it gets its own knob — the default stays
+fail-closed.
 
 ## API-version contract
 

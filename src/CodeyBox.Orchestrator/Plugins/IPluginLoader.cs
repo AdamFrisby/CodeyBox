@@ -21,6 +21,16 @@ public interface IPluginLoader
     IReadOnlyList<PluginDiscoveryStatus> GetDiscoveryStatuses();
 
     /// <summary>
+    /// Per-configured-path discovery outcomes: for each assembly path, whether
+    /// the file was found, whether it loaded, which plugin ids it contributed,
+    /// and which host contracts they registered under. Path-level failures
+    /// (missing file, unloadable assembly, stale host contracts, no plugin
+    /// entry) appear here; per-candidate skips appear in
+    /// <see cref="GetDiscoveryStatuses"/>.
+    /// </summary>
+    IReadOnlyList<PluginAssemblyReport> GetAssemblyReports();
+
+    /// <summary>
     /// Validated external-tool requirements of every loaded (enabled +
     /// allowlisted) plugin, sorted by (plugin ID, binary) for a stable
     /// baseline identity. Disabled plugins contribute nothing.

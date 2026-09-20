@@ -227,6 +227,18 @@ internal sealed class StaticPluginLoader(IReadOnlyList<LoadedPlugin> plugins) : 
             Enabled: true, Allowlisted: true, Loaded: true,
             SkipReason: PluginSkipReason.None, p.RequiredTools ?? [])).ToList();
 
+    public IReadOnlyList<PluginAssemblyReport> GetAssemblyReports() =>
+        plugins
+            .GroupBy(static p => p.AssemblyPath, StringComparer.OrdinalIgnoreCase)
+            .Select(static g => new PluginAssemblyReport(
+                g.Key,
+                Found: true,
+                Loaded: true,
+                PluginIds: g.Select(static p => p.PluginId).Distinct(StringComparer.Ordinal).ToList(),
+                Contracts: [],
+                SkipReason: PluginSkipReason.None))
+            .ToList();
+
     public IReadOnlyList<PluginToolRequirement> GetEnabledPluginTools() =>
         plugins.SelectMany(static p => p.RequiredTools ?? []).ToList();
 }
