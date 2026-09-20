@@ -14,9 +14,11 @@ public static class WorkSyncLoopGuard
 
     private const string MarkerSuffix = " -->";
 
-    /// <summary>Maximum upstream body length the guard scans. Bodies are
+    /// <summary>Maximum upstream body length the guard scans per segment. Bodies are
     /// truncated to the sync cap before they reach the store, so a bounded
-    /// scan is sufficient; over-long bodies are still recognised by prefix.</summary>
+    /// scan is sufficient; over-long bodies are still recognised by prefix
+    /// because the head and tail segments are both scanned (the marker is
+    /// appended at the end, so it lands in the tail).</summary>
     public const int MaxScanChars = 64 * 1024;
 
     /// <summary>Builds the marker identifying content authored by CodeyBox for <paramref name="id"/>.</summary>
@@ -30,7 +32,7 @@ public static class WorkSyncLoopGuard
     public static string Mark(string body, WorkItemId id)
     {
         ArgumentNullException.ThrowIfNull(body);
-        return body.Contains(MarkerPrefix, StringComparison.Ordinal)
+        return body.Contains(MarkerFor(id), StringComparison.Ordinal)
             ? body
             : $"{body}\n\n{MarkerFor(id)}";
     }
@@ -46,12 +48,36 @@ public static class WorkSyncLoopGuard
         string? lastActorLogin,
         IReadOnlySet<string> serviceLogins)
     {
-        if (!string.IsNullOrEmpty(body)
-            && body.Length <= MaxScanChars + MarkerPrefix.Length + 64
-            && body.Contains(MarkerPrefix, StringComparison.Ordinal))
-            return true;
+        if (!string.IsNullOrEmpty(body))
+        {
+            if (body.Length <= MaxScanChars)
+            {
+                if (body.Contains(MarkerPrefix, StringComparison.Ordinal))
+                    return true;
+            }
+            else
+            {
+                // Bounded scan: check the head and tail segments so over-long
+                // bodies carrying the marker (appended at the end) are still
+                // recognised without scanning unbounded input.
+                if (body.AsSpan(0, MaxScanChars).Contains(
+                        MarkerPrefix.AsSpan(), StringComparison.Ordinal))
+                    return true;
+                if (body.AsSpan(body.Length - MaxScanChars, MaxScanChars).Contains(
+                        MarkerPrefix.AsSpan(), StringComparison.Ordinal))
+                    return true;
+            }
+        }
 
-        return !string.IsNullOrWhiteSpace(lastActorLogin)
-            && serviceLogins.Contains(lastActorLogin.Trim());
+        if (string.IsNullOrWhiteSpace(lastActorLogin))
+            return false;
+        string trimmed = lastActorLogin.Trim();
+        foreach (string login in serviceLogins)
+        {
+            if (string.Equals(login, trimmed, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 }
