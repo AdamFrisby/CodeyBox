@@ -56,6 +56,7 @@
   </Folder>
   <Folder Name="/plugins/">
     <Project Path="plugins/auditors-architecture/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <Project Path="plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/CodeyBox.DotnetTestRunnerPlugin.csproj" />
     <Project Path="plugins/quota/CodeyBox.OpencodeGoQuotaPlugin/CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <Project Path="plugins/quota/CodeyBox.QuotaResetNotifier/CodeyBox.QuotaResetNotifier.csproj" />

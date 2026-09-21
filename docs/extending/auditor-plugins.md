@@ -251,6 +251,66 @@ a pytest reference stub ship in `plugins/test-runners/CodeyBox.DotnetTestRunnerP
 See [`docs/extending/test-runner-plugins.md`](test-runner-plugins.md) for the
 packaging, the peer-runner recipe, and the bundling caveat.
 
+## External-tool auditors (`ExternalToolAuditorBase`)
+
+Auditors that wrap a binary (linter, SAST scanner, license checker) share one
+base in `CodeyBox.PluginSdk.Tools`: `ExternalToolAuditorBase`. The author
+supplies four things — the tool name, its arguments, a parser, and a severity
+map — and the base supplies invocation, classification, and configuration:
+
+```csharp
+public sealed class TrivyAuditor : ExternalToolAuditorBase, IPluginInitializer
+{
+    public override string Name => "myorg:trivy";
+    protected override string ToolName => "trivy";
+    protected override IExternalToolOutputParser OutputParser { get; } = new SarifToolOutputParser();
+    protected override ExternalToolSeverityMapping SeverityMapping { get; } = new(
+        new Dictionary<string, AuditSeverity>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CRITICAL"] = AuditSeverity.Error,
+            ["HIGH"] = AuditSeverity.Error,
+            ["MEDIUM"] = AuditSeverity.Warning,
+            ["LOW"] = AuditSeverity.Info,
+        }, AuditSeverity.Warning);
+    protected override Func<ExternalToolAuditorOptions> OptionsAccessor => () => _options;
+    protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
+        => ["fs", "--format", "sarif", "."];
+
+    private ExternalToolAuditorOptions _options = new() { FindingsExitCodes = new HashSet<int> { 0, 1 } };
+
+    public Task InitializeAsync(PluginContext context, CancellationToken ct = default)
+    {
+        _options = ExternalToolAuditorOptions.Bind(context.ScopedConfig, _options);
+        return Task.CompletedTask;
+    }
+}
+```
+
+Behaviour the base guarantees identically for every tool:
+
+- **Invocation** — argv vector (never a shell string) against the work tree,
+  with a bounded timeout and per-stream output caps; stdout/stderr captured
+  separately, truncation reported explicitly in the raw output.
+- **Result mapping** — SARIF is first-class (`SarifToolOutputParser`);
+  anything else gets an `IExternalToolOutputParser` implementation.
+- **Severity mapping** — the tool's levels go through the declared
+  `ExternalToolSeverityMapping`; raw strings never reach findings.
+- **Absent tool** — a declared-but-missing binary throws
+  `AuditUnavailableException` naming the tool: infrastructure, never a pass
+  and never a finding against the diff.
+- **Failure classification** — only exits listed in
+  `FindingsExitCodes` (default `{0}`) are verdicts; anything else — including
+  an unknown convention — fails loudly as infrastructure.
+- **Finding identity** — each finding carries the tool, rule id, and
+  file/line where the tool supplies them.
+- **Configuration** — `ExternalToolAuditorOptions` (severity threshold, rule
+  include/exclude, extra arguments, path excludes, timeout, caps) binds from
+  the plugin's scoped config section; resolve it per invocation so edits apply
+  without a restart.
+
+A worked example lives at
+`plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/`.
+
 ## Sample plugin
 
 A fully working sample is provided at `samples/CodeyBox.SampleAuditorPlugin/`.

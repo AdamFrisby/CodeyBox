@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
@@ -34,12 +35,9 @@ public sealed record PluginToolRequirement
     /// <summary>Maximum characters kept from a plugin-supplied install hint.</summary>
     public const int MaxInstallHintLength = 512;
 
-    // Bare executable name: first char alnum, then alnum/dot/underscore/hyphen.
-    // No slashes (no paths), no whitespace, no shell metacharacters — safe to
-    // pass as a single argv element or as "$1" to a host-owned sh -c script.
-    private static readonly Regex BinaryNamePattern = new(
-        @"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    // Bare-executable-name shape is owned by CodeyBox.Core.ExternalToolNamePolicy
+    // (single source of truth shared with the SDK execution path) so both
+    // boundaries agree on the same input.
 
     // Debian package name shape (lowercase, must not start with a dash so it
     // can never be mistaken for an apt option). Tilde excluded: unnecessary
@@ -72,7 +70,7 @@ public sealed record PluginToolRequirement
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(binary) || !BinaryNamePattern.IsMatch(binary))
+        if (string.IsNullOrWhiteSpace(binary) || !ExternalToolNamePolicy.IsValidBinaryName(binary))
         {
             error = $"binary name '{Truncate(binary)}' is not a bare executable name " +
                     "(letters, digits, dot, underscore, hyphen; no paths or shell characters)";
