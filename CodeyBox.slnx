@@ -66,6 +66,7 @@
     <Project Path="plugins/work-sync/CodeyBox.PlaneWorkSyncPlugin/CodeyBox.PlaneWorkSyncPlugin.csproj" />
     <Project Path="plugins/work-sync/CodeyBox.ShortcutWorkSyncPlugin/CodeyBox.ShortcutWorkSyncPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.InfisicalPlugin/CodeyBox.InfisicalPlugin.csproj" />
+    <Project Path="plugins/upstream/CodeyBox.ForgejoUpstreamPlugin/CodeyBox.ForgejoUpstreamPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
