@@ -822,6 +822,86 @@ public sealed class InfisicalPluginTests : IDisposable
     }
 
     [Fact]
+    public async Task Backend_Redirect_Is_Refused_As_Infrastructure()
+    {
+        var followed = 0;
+        using var http = new HttpClient(new DelegatingHandlerStub((request, ct) =>
+        {
+            Interlocked.Increment(ref followed);
+            var redirect = new HttpResponseMessage(HttpStatusCode.Found);
+            redirect.Headers.Location = new Uri("http://127.0.0.1:9/exfil");
+            return Task.FromResult(redirect);
+        }))
+        { Timeout = TimeSpan.FromSeconds(10) };
+        var api = new InfisicalRestClient(http);
+        var ex = await Assert.ThrowsAsync<InfisicalException>(() =>
+            api.LoginUniversalAuthAsync(
+                "https://infisical.example.com", "test-id", "test-secret", TimeSpan.FromSeconds(30)));
+        // A backend 3xx is never followed: it fails closed as a backend
+        // fault (infrastructure, never a diff verdict), with exactly one
+        // request sent — the client secret goes nowhere else.
+        Assert.Equal(InfisicalFailureKind.InvalidResponse, ex.Kind);
+        Assert.True(ex.IsInfrastructure);
+        Assert.Contains("redirect", ex.Message);
+        Assert.Equal(1, Volatile.Read(ref followed));
+    }
+
+    [Fact]
+    public async Task Production_Http_Client_Never_Follows_Redirects()
+    {
+        // Real loopback wiring: the redirector answers 302 to a sink that
+        // records everything it receives. If the client ever followed, the
+        // sink would see the secret-bearing body and this test would fail.
+        using var sink = new RecordingStub(_ => (200, null, "sink"));
+        using var redirector = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
+        using var client = InfisicalHttpClients.Create(TimeSpan.FromSeconds(10));
+        using var response = await client.PostAsync(
+            redirector.Url,
+            new StringContent("""{"clientSecret":"must-not-leak"}""", Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        Assert.Equal(1, redirector.Hits);
+        Assert.Equal(0, sink.Hits);
+        Assert.False(sink.SawText("must-not-leak"));
+    }
+
+    [Fact]
+    public async Task Broker_Returns_Upstream_Redirect_Without_Following()
+    {
+        using var sink = new RecordingStub(_ => (200, null, "sink"));
+        using var upstream = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
+        using var forward = InfisicalHttpClients.Create(TimeSpan.FromSeconds(10));
+        using var server = new InfisicalBrokerServer(forward, log: NullLogger.Instance);
+        server.Start("127.0.0.1", 0);
+        const string leaseId = "redirect-lease-handle";
+        const string secret = "broker-secret-value-7c1d";
+        server.Register(new InfisicalBrokerEntry
+        {
+            LeaseId = leaseId,
+            Value = secret,
+            UpstreamBaseUrl = upstream.Url.TrimEnd('/'),
+            InjectHeader = "Authorization",
+            InjectScheme = "Bearer",
+            AllowedPaths = [],
+            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+        });
+        using var guest = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false });
+        using var first = await guest.GetAsync(
+            $"http://127.0.0.1:{server.ActualPort}/v1/proxy/{leaseId}/v1/query");
+        // The upstream 3xx reaches the guest untouched — no follow, no
+        // credential at the redirect target, no Location forwarded.
+        Assert.Equal(HttpStatusCode.Found, first.StatusCode);
+        Assert.Null(first.Headers.Location);
+        Assert.Equal(0, sink.Hits);
+        Assert.False(sink.SawText(secret));
+        // The entry survives the redirect: still a proxied 302, not a 404.
+        using var second = await guest.GetAsync(
+            $"http://127.0.0.1:{server.ActualPort}/v1/proxy/{leaseId}/v1/query");
+        Assert.Equal(HttpStatusCode.Found, second.StatusCode);
+        Assert.Equal(2, upstream.Hits);
+        Assert.Equal(0, sink.Hits);
+    }
+
+    [Fact]
     public async Task Static_Only_Path_Still_Works_With_Provider_Present()
     {
         var hostVar = $"CODEYBOX_TEST_INFISICAL_{Guid.NewGuid():N}".ToUpperInvariant();
@@ -1023,5 +1103,97 @@ public sealed class InfisicalPluginTests : IDisposable
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken cancellationToken)
             => handler(request, cancellationToken);
+    }
+
+    /// <summary>
+    /// Minimal loopback HTTP stub: records every request it receives
+    /// (method, path, Authorization header, body) and answers with a
+    /// programmed status, optional redirect Location, and body.
+    /// </summary>
+    private sealed class RecordingStub : IDisposable
+    {
+        private readonly Func<HttpListenerRequest, (int Status, string? Location, string Body)> _respond;
+        private readonly HttpListener _listener = new();
+        private readonly CancellationTokenSource _cts = new();
+        private readonly Task _loop;
+        private int _hits;
+        private readonly List<string> _seen = [];
+        private bool _disposed;
+
+        public string Url { get; }
+
+        public int Hits => Volatile.Read(ref _hits);
+
+        public RecordingStub(
+            Func<HttpListenerRequest, (int Status, string? Location, string Body)> respond)
+        {
+            _respond = respond;
+            Url = $"http://127.0.0.1:{ProbeFreePort()}/";
+            _listener.Prefixes.Add(Url);
+            _listener.Start();
+            _loop = AcceptLoopAsync(_cts.Token);
+        }
+
+        public bool SawText(string text)
+        {
+            lock (_seen)
+                return _seen.Any(s => s.Contains(text, StringComparison.Ordinal));
+        }
+
+        private async Task AcceptLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                HttpListenerContext context;
+                try
+                {
+                    context = await _listener.GetContextAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    break;
+                }
+                Interlocked.Increment(ref _hits);
+                try
+                {
+                    var request = context.Request;
+                    string body = string.Empty;
+                    if (request.HasEntityBody)
+                    {
+                        using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
+                        body = await reader.ReadToEndAsync(ct).ConfigureAwait(false);
+                    }
+                    lock (_seen)
+                        _seen.Add($"{request.HttpMethod} {request.Url?.AbsolutePath} auth={request.Headers["Authorization"]} body={body}");
+                    var (status, location, responseBody) = _respond(request);
+                    context.Response.StatusCode = status;
+                    if (location is not null)
+                        context.Response.RedirectLocation = location;
+                    var bytes = Encoding.UTF8.GetBytes(responseBody);
+                    context.Response.ContentLength64 = bytes.Length;
+                    await context.Response.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best-effort stub: a guest disconnect never fails the test.
+                }
+                finally
+                {
+                    try { context.Response.Close(); } catch { }
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            _cts.Cancel();
+            try { _listener.Stop(); } catch { }
+            try { _loop.GetAwaiter().GetResult(); } catch { }
+            _cts.Dispose();
+            _listener.Close();
+        }
     }
 }

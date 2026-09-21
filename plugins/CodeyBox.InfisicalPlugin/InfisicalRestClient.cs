@@ -280,6 +280,37 @@ public sealed class InfisicalRestClient
                 InfisicalFailureKind.Unreachable, $"Infisical {operation} could not reach the backend.", ex);
         }
 
+        if (InfisicalHttpClients.IsRedirect(response.StatusCode))
+        {
+            // Never follow: the backend's 3xx (and its Location) is
+            // untrusted runtime output, and re-sending would carry the
+            // bearer token or client secret to the redirect target. Fail
+            // closed as a backend fault — never a verdict on the item.
+            var redirect = (int)response.StatusCode;
+            response.Dispose();
+            throw new InfisicalException(
+                InfisicalFailureKind.InvalidResponse,
+                $"Infisical {operation} returned redirect HTTP {redirect}; refusing to follow.",
+                redirect);
+        }
+
+        if (response.RequestMessage?.RequestUri is { } finalUri
+            && request.RequestUri is { } originalUri
+            && !InfisicalHttpClients.IsSameOrigin(finalUri, originalUri))
+        {
+            // The handler followed a redirect before this code saw the
+            // response (only possible with an externally supplied
+            // following client — the plugin builds non-following ones).
+            // The credential may already have been re-sent off-origin,
+            // so fail loudly rather than trusting this response.
+            var followedStatus = (int)response.StatusCode;
+            response.Dispose();
+            throw new InfisicalException(
+                InfisicalFailureKind.InvalidResponse,
+                $"Infisical {operation} was redirected to another origin; refusing the response.",
+                followedStatus);
+        }
+
         if (response.IsSuccessStatusCode)
             return response;
 

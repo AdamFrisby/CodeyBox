@@ -156,7 +156,11 @@ already treats every lease failure this way: the item runs without the
 secret, renewals retry on the next sweep, revocations retry up to
 `MaxRevocationAttempts` and then park loudly. Missing credentials, absent
 secrets/leases, and bad mappings are **configuration** faults (still loud,
-still never a diff verdict). Nothing — logs, lease records, exceptions,
+still never a diff verdict). Backend or upstream **redirects (3xx) are
+never followed** — the HTTP clients are built with redirects disabled, a
+3xx from the backend fails closed as infrastructure, and the broker passes
+an upstream 3xx back to the guest untouched — so a redirect target can
+never receive a token, client secret, or brokered credential. Nothing — logs, lease records, exceptions,
 endpoint URLs — ever carries a value or token; lease ids are the auditable
 unit.
 
@@ -192,7 +196,8 @@ in `tests/CodeyBox.Tests/Fixtures/infisical/`, captured from the live
 OpenAPI + docs): granted-resolves/ungranted-never-fetched, renewal across
 a 240-minute phase, teardown revocation verified against the fake
 backend's server state, sweep-after-failed-teardown, log-leak, failure
-classification, broker proxying without value exposure, static-only
+classification, broker proxying without value exposure, redirect refusal
+(API and broker, verified over loopback with a recording sink), static-only
 unchanged, options validation.
 
 **Live test** (`Live_Fetch_Against_Real_Instance`, opt-in): no live

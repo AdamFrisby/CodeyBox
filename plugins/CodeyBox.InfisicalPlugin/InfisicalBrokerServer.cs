@@ -357,6 +357,29 @@ public sealed class InfisicalBrokerServer : IDisposable
 
         using var upstream = await _forward.SendAsync(
             forward, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        if (upstream.RequestMessage?.RequestUri is { } finalUpstream
+            && !InfisicalHttpClients.IsSameOrigin(finalUpstream, target))
+        {
+            // The forward client followed an upstream redirect (only
+            // possible with an externally supplied following client —
+            // the plugin builds non-following ones). The credential was
+            // re-sent off-origin, so fail loudly instead of trusting
+            // the body, and leave the entry to expire on its own clock.
+            _log.LogError(
+                "Infisical broker for lease '{LeaseId}' was redirected off-origin; refusing the upstream response.",
+                leaseId);
+            await WriteErrorAsync(context.Response, 502, "upstream redirect refused", ct).ConfigureAwait(false);
+            return;
+        }
+        if (InfisicalHttpClients.IsRedirect(upstream.StatusCode))
+        {
+            // Never follow: the upstream 3xx passes through to the guest
+            // untouched (no Location forwarding, no credential attached
+            // anywhere else) so the guest sees a truthful status.
+            _log.LogDebug(
+                "Infisical broker for lease '{LeaseId}' passing through upstream redirect {Status} without following.",
+                leaseId, (int)upstream.StatusCode);
+        }
         var response = context.Response;
         response.StatusCode = (int)upstream.StatusCode;
         if (upstream.Content.Headers.ContentType is not null)

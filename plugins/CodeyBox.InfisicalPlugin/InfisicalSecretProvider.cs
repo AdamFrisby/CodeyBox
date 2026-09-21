@@ -40,7 +40,6 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
     /// <summary>How long an externally supplied token is cached before the env var is re-read.</summary>
     internal const int ExternalTokenCacheMinutes = 5;
 
-    private readonly IHttpClientFactory? _httpFactory;
     private readonly TimeProvider _clock;
     private readonly Func<string, string?> _env;
     private readonly IConfigurationSection? _testConfig;
@@ -49,6 +48,8 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
     private ILogger _logger = NullLogger.Instance;
     private HttpClient? _http;
     private HttpClient? _brokerForward;
+    private bool _ownsHttp;
+    private bool _ownsBrokerForward;
     private InfisicalRestClient? _api;
     private InfisicalBrokerServer? _broker;
     private readonly object _clientLock = new();
@@ -59,10 +60,14 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
     private DateTimeOffset _tokenExpiresAt;
     private bool _disposed;
 
-    /// <summary>Production constructor (DI provides the HTTP factory).</summary>
-    public InfisicalSecretProvider(IHttpClientFactory httpFactory, TimeProvider? clock = null)
+    /// <summary>
+    /// Production constructor. The plugin builds its own redirect-proof
+    /// HTTP clients (see <see cref="InfisicalHttpClients"/>) rather than
+    /// the shared factory's redirect-following defaults, so a backend 3xx
+    /// can never re-send a credential off-origin.
+    /// </summary>
+    public InfisicalSecretProvider(TimeProvider? clock = null)
     {
-        _httpFactory = httpFactory ?? throw new ArgumentNullException(nameof(httpFactory));
         _clock = clock ?? TimeProvider.System;
         _env = Environment.GetEnvironmentVariable;
     }
@@ -300,9 +305,14 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         _disposed = true;
         try { _broker?.Dispose(); } catch (Exception) { }
         _token = string.Empty;
-        if (_httpFactory is not null)
+        // Only provider-built clients are disposed here; test-injected
+        // clients stay owned by their test.
+        if (_ownsHttp)
         {
             try { _http?.Dispose(); } catch (Exception) { }
+        }
+        if (_ownsBrokerForward)
+        {
             try { _brokerForward?.Dispose(); } catch (Exception) { }
         }
     }
@@ -375,12 +385,12 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         {
             if (_broker is { Running: true })
                 return;
-            if (_brokerForward is null && _httpFactory is null)
-                throw new InfisicalException(
-                    InfisicalFailureKind.Misconfigured,
-                    "Infisical broker has no HTTP client for upstream forwards.");
-            _brokerForward ??= _httpFactory!.CreateClient("infisical-broker");
-            _brokerForward.Timeout = TimeSpan.FromSeconds(Math.Clamp(options.TimeoutSeconds, 1, 300));
+            if (_brokerForward is null)
+            {
+                _brokerForward = InfisicalHttpClients.Create(ClientTimeout(options));
+                _ownsBrokerForward = true;
+            }
+            _brokerForward.Timeout = ClientTimeout(options);
             var server = new InfisicalBrokerServer(
                 _brokerForward, _clock, _logger,
                 options.BrokerMaxBodyBytes, options.BrokerMaxConcurrency, options.BrokerMaxPathChars);
@@ -584,6 +594,9 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         return requestedTtl > TimeSpan.Zero && requestedTtl < configured ? requestedTtl : configured;
     }
 
+    private static TimeSpan ClientTimeout(InfisicalOptions options) =>
+        TimeSpan.FromSeconds(Math.Clamp(options.TimeoutSeconds, 1, 300));
+
     private void EnsureClients()
     {
         if (_api is not null)
@@ -592,10 +605,14 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         {
             if (_api is not null)
                 return;
-            _http ??= _httpFactory!.CreateClient("infisical");
+            if (_http is null)
+            {
+                _http = InfisicalHttpClients.Create(ClientTimeout(CurrentOptions()));
+                _ownsHttp = true;
+            }
             try
             {
-                _http.Timeout = TimeSpan.FromSeconds(Math.Clamp(CurrentOptions().TimeoutSeconds, 1, 300));
+                _http.Timeout = ClientTimeout(CurrentOptions());
             }
             catch (InvalidOperationException)
             {
