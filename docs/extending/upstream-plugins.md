@@ -241,6 +241,17 @@ await _webhooks.PublishAsync(new WebhookEvent
 This lets operators subscribe to PR-opened events regardless of which forge is
 in use.
 
+## First-party Azure DevOps plugin
+
+`plugins/upstream/CodeyBox.AzureDevOpsUpstreamPlugin/` is the production
+reference for a full-contract provider: push/PR/merge plus the extended
+surfaces Azure DevOps genuinely supports (reviewer votes, build validations
++ commit statuses, PR threads, service-hook subscriptions, repository/policy
+metadata), with releases and work items left on the contract defaults as
+unsupported. Off unless enabled via the `codeybox.azure-devops-upstream`
+allowlist entry. See its README for the support matrix, config keys and
+instance-version requirements.
+
 ## Sample Gitea plugin
 
 `samples/CodeyBox.SampleGiteaUpstreamPlugin/` provides a complete working example:
