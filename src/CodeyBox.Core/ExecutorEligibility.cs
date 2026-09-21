@@ -99,7 +99,16 @@ public static class ExecutorEligibility
     /// True when the member declares holding the credential set required by
     /// the given agent class. Credential names are opaque: matched by exact
     /// ordinal equality, never by substring, so "codex" never implies
-    /// "codex-admin".
+    /// "codex-admin". A declared <c>"*"</c> entry matches any credential, for
+    /// a member that holds whatever the orchestrator itself holds (the
+    /// synthesized default member); this mirrors the wildcard accepted by
+    /// <see cref="AcceptsNetworkProfile"/>.
+    ///
+    /// <para>An EMPTY declaration means the member holds nothing, and is
+    /// deliberately not read as "holds everything": a remote executor host
+    /// that declares no credentials must not be handed credential-bearing
+    /// work. A member that really does hold everything says so with
+    /// <c>"*"</c>.</para>
     /// </summary>
     public static bool HoldsCredential(SandboxPlacementMember member, string credentialName)
     {
@@ -108,7 +117,10 @@ public static class ExecutorEligibility
         var wanted = credentialName.Trim();
         foreach (var entry in member.Credentials)
         {
-            if (string.Equals(entry?.Trim(), wanted, StringComparison.Ordinal))
+            if (entry is null)
+                continue;
+            var candidate = entry.Trim();
+            if (candidate is "*" || string.Equals(candidate, wanted, StringComparison.Ordinal))
                 return true;
         }
         return false;

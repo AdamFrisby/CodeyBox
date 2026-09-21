@@ -1,3 +1,4 @@
+using CodeyBox.Core;
 using CodeyBox.Api;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -44,12 +45,17 @@ public sealed class SandboxClassesDefaultCatalogTests
     [Fact]
     public void Synthesize_AcceptsEveryProfileAndCredential()
     {
+        // Asserted through the eligibility gate the decider actually calls,
+        // not by shape: an empty Credentials list reads as "holds nothing",
+        // so declaring none excluded the only member from every
+        // credential-bearing phase and left the fleet unplaceable.
         var catalog = SandboxClassesDefaultCatalog.Synthesize(
             "incus", [], NullLogger.Instance, 2);
 
-        var member = Assert.Single(Assert.Single(catalog).Members);
-        Assert.Empty(member.NetworkProfiles);
-        Assert.Empty(member.Credentials);
+        var member = Assert.Single(Assert.Single(catalog).Members).ToPlacementMember();
+        Assert.True(ExecutorEligibility.AcceptsNetworkProfile(member, "restricted"));
+        Assert.True(ExecutorEligibility.HoldsCredential(member, "copilot"));
+        Assert.True(ExecutorEligibility.HoldsCredential(member, "claude"));
     }
 
     [Fact]

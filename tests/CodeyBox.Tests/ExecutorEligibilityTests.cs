@@ -111,6 +111,26 @@ public sealed class ExecutorEligibilityTests
     }
 
     [Fact]
+    public void Credentials_WildcardHoldsEverything()
+    {
+        var host = Host(credentials: ["*"]);
+        Assert.True(ExecutorEligibility.HoldsCredential(host, "codex"));
+        Assert.True(ExecutorEligibility.HoldsCredential(host, "copilot"));
+        Assert.True(ExecutorEligibility.HoldsCredential(host, "anything-at-all"));
+    }
+
+    [Fact]
+    public void Credentials_EmptyDeclarationHoldsNothing()
+    {
+        // Deliberately NOT read as "holds everything": a remote executor host
+        // that declares no credentials must not be handed credential-bearing
+        // work. Contrast AcceptsNetworkProfile, where empty means accept-all.
+        var host = Host(credentials: []);
+        Assert.False(ExecutorEligibility.HoldsCredential(host, "codex"));
+        Assert.True(ExecutorEligibility.AcceptsNetworkProfile(host, "restricted"));
+    }
+
+    [Fact]
     public void WorkerId_IsStableAndPrefixed()
     {
         var registration = new ExecutorRegistration { HostId = "exec-1" };

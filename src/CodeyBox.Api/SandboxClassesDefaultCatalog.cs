@@ -69,6 +69,14 @@ public static class SandboxClassesDefaultCatalog
                         ProviderKind = kind,
                         Capacity = capacity,
                         Capabilities = capabilities,
+                        // The default member IS the orchestrator host, so it
+                        // holds whatever credentials the operator gave the
+                        // process. Declared as the "*" wildcard rather than
+                        // left empty: an empty list means "holds nothing" to
+                        // ExecutorEligibility.HoldsCredential, which would
+                        // exclude this member from every credential-bearing
+                        // phase and leave nothing placeable.
+                        Credentials = ["*"],
                         PreferenceScore = 100,
                     },
                 ],
