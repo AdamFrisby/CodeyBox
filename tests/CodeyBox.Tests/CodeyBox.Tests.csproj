@@ -49,6 +49,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-architecture\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ExampleSarifAuditorPlugin\CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
