@@ -95,13 +95,15 @@ public sealed class DevinModelListProbe : IAgentModelListProbe
     }
 
     /// <summary>
-    /// Parses <c>devin models list --format json</c> output. The emitted shape
-    /// is a JSON array of ClientModelConfig objects whose id field is
-    /// <c>model_or_alias</c> (falling back to <c>model_id</c>/
-    /// <c>modelOrAlias</c> for protojson camelCase output). A bare array of
-    /// strings, or a wrapper object carrying a <c>models</c> array, is
-    /// tolerated so a CLI revision that reshapes the document degrades to a
-    /// smaller list rather than zero ids.
+    /// Parses <c>devin models list --format json</c> output. The emitted
+    /// shape (verified 2026-09-21 against devin 3000.11.1) is
+    /// <c>{"families":[{"slug","aliases":[…],"variants":[{"model_uid"}]}]}</c>
+    /// — every family slug, alias, and variant <c>model_uid</c> is a valid
+    /// <c>--model</c> value, so all three are collected. Older fallbacks
+    /// remain tolerated so a CLI revision that reshapes the document degrades
+    /// to a smaller list rather than zero ids: a bare array of strings or
+    /// ClientModelConfig objects (id field <c>model_or_alias</c>/
+    /// <c>model_id</c>), or a wrapper object carrying a <c>models</c> array.
     /// </summary>
     internal static IReadOnlyList<string> ParseModelsOutput(string stdout, int maxIds = MaxModelIds)
     {
@@ -111,6 +113,11 @@ public sealed class DevinModelListProbe : IAgentModelListProbe
             using var doc = JsonDocument.Parse(stdout);
             var root = doc.RootElement;
             if (root.ValueKind == JsonValueKind.Object
+                && root.TryGetProperty("families", out var families))
+            {
+                CollectFromFamilies(families, ids, maxIds);
+            }
+            else if (root.ValueKind == JsonValueKind.Object
                 && root.TryGetProperty("models", out var models))
             {
                 CollectFromArray(models, ids, maxIds);
@@ -126,6 +133,57 @@ public sealed class DevinModelListProbe : IAgentModelListProbe
             // parsed" — returning an empty list keeps that contract intact.
         }
         return ids;
+    }
+
+    private static void CollectFromFamilies(JsonElement families, List<string> ids, int maxIds)
+    {
+        if (families.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var family in families.EnumerateArray())
+        {
+            if (ids.Count >= maxIds) break;
+            if (family.ValueKind != JsonValueKind.Object)
+                continue;
+
+            AddId(family, "slug", ids, maxIds);
+
+            if (family.TryGetProperty("aliases", out var aliases)
+                && aliases.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var alias in aliases.EnumerateArray())
+                {
+                    if (ids.Count >= maxIds) break;
+                    if (alias.ValueKind == JsonValueKind.String)
+                        AddId(alias.GetString(), ids, maxIds);
+                }
+            }
+
+            if (family.TryGetProperty("variants", out var variants)
+                && variants.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var variant in variants.EnumerateArray())
+                {
+                    if (ids.Count >= maxIds) break;
+                    AddId(variant, "model_uid", ids, maxIds);
+                }
+            }
+        }
+    }
+
+    private static void AddId(JsonElement parent, string property, List<string> ids, int maxIds)
+    {
+        if (ids.Count >= maxIds) return;
+        if (parent.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String)
+            AddId(value.GetString(), ids, maxIds);
+    }
+
+    private static void AddId(string? id, List<string> ids, int maxIds)
+    {
+        if (ids.Count >= maxIds) return;
+        if (string.IsNullOrWhiteSpace(id)) return;
+        if (ids.Contains(id, StringComparer.Ordinal)) return;
+        ids.Add(id);
     }
 
     private static void CollectFromArray(JsonElement element, List<string> ids, int maxIds)

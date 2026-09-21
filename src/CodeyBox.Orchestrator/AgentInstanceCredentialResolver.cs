@@ -237,9 +237,10 @@ public static class AgentInstanceCredentialResolver
 
         if (agent == AgentKind.Devin)
         {
-            // The credentials.toml carries BOTH the api_key and the
-            // login-assigned api_server_url the quota RPC lives on; a member
-            // file without an api_key yields no usable credential.
+            // The credentials.toml carries BOTH the account token (api_key
+            // or windsurf_api_key) and the login-assigned api_server_url the
+            // quota RPC lives on; a member file without either token field
+            // yields no usable credential.
             var (apiKey, apiServerUrl) = CredentialFileTokenExtractor.ExtractDevinCredentials(raw);
             if (string.IsNullOrWhiteSpace(apiKey)) return false;
             credentials = new AgentQuotaCredentials(apiKey, EndpointBaseUrl: apiServerUrl);

@@ -46,7 +46,7 @@ public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
                 FailureHint: "failed to materialise devin credentials.toml"));
             steps.Add(new(
                 [DevinAgentRunner.DefaultBinary, "models", "list", "--format", "json"],
-                FailureHint: "devin models list failed (credentials path drift or invalid api_key)"));
+                FailureHint: "devin models list failed (credentials path drift or invalid token)"));
             steps.Add(new(
                 [.. DevinAgentRunner.FullAutonomyInvocationPrefix(DevinAgentRunner.DefaultBinary),
                     "--prompt-file", "/dev/stdin"],

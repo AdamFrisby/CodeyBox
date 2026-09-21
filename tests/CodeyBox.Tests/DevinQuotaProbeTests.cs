@@ -8,9 +8,10 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Tests for <see cref="DevinQuotaProbe"/> using a fake HTTP message handler.
-/// Field shape from the devin 3000.11.1 binary's Connect-RPC proto
-/// (<c>GetUserStatusResponse.user_status.plan_status</c>); protojson may emit
-/// camelCase so both spellings are exercised.
+/// The wire shape is hand-encoded protobuf matching the live contract
+/// decoded from devin 3000.11.1 traffic (2026-09-21):
+/// <c>GetUserStatusResponse{1: user_status{13: plan_status{14..20}},
+/// 2: plan_info{2: plan_name}}</c>.
 /// </summary>
 public sealed class DevinQuotaProbeTests
 {
@@ -18,27 +19,37 @@ public sealed class DevinQuotaProbeTests
     {
         Agent = AgentKind.Devin,
         Billing = AgentBilling.Subscription,
-        ModelId = "claude-sonnet-4",
+        ModelId = "claude-sonnet-5-medium",
         QualityScore = 90,
     };
 
     private const string Endpoint = "https://devin-api.example";
 
-    private const string SnakeCaseBody = """
+    /// <summary>
+    /// Encodes a GetUserStatusResponse carrying the given plan_status fields
+    /// (proto field numbers as on the wire).
+    /// </summary>
+    private static byte[] QuotaResponse(
+        ulong? dailyPct = 80, ulong? weeklyPct = 40,
+        ulong? dailyReset = 1800000000, ulong? weeklyReset = 1800500000,
+        ulong? overageMicros = null, ulong? acuConsumed = null, ulong? acuLimit = null,
+        string? planName = "Pro")
     {
-      "user_status": {
-        "plan_status": {
-          "daily_quota_remaining_percent": 80,
-          "weekly_quota_remaining_percent": 40,
-          "daily_quota_reset_at_unix": 1800000000,
-          "weekly_quota_reset_at_unix": 1800500000,
-          "available_prompt_credits": 12.5,
-          "available_flex_credits": 3
-        },
-        "plan_info": { "plan_name": "core" }
-      }
+        var planStatus = new DevinProtoWire.MessageWriter();
+        if (dailyPct is { } dp) planStatus.Field(14, dp);
+        if (weeklyPct is { } wp) planStatus.Field(15, wp);
+        if (overageMicros is { } om) planStatus.Field(16, om);
+        if (dailyReset is { } dr) planStatus.Field(17, dr);
+        if (weeklyReset is { } wr) planStatus.Field(18, wr);
+        if (acuConsumed is { } ac) planStatus.Field(19, ac);
+        if (acuLimit is { } al) planStatus.Field(20, al);
+
+        var userStatus = new DevinProtoWire.MessageWriter().Field(13, planStatus);
+        var response = new DevinProtoWire.MessageWriter().Field(1, userStatus);
+        if (planName is not null)
+            response.Field(2, new DevinProtoWire.MessageWriter().Field(2, planName));
+        return response.ToArray();
     }
-    """;
 
     private static DevinQuotaProbe BuildProbe(
         HttpMessageHandler handler,
@@ -56,14 +67,17 @@ public sealed class DevinQuotaProbeTests
     }
 
     private static QuotaUrlRoutingHandler UsageHandler(
-        string body = SnakeCaseBody,
+        byte[]? body = null,
         Action<HttpRequestMessage>? capture = null,
         HttpStatusCode status = HttpStatusCode.OK)
     {
         return new QuotaUrlRoutingHandler(req =>
         {
             capture?.Invoke(req);
-            return new HttpResponseMessage(status) { Content = new StringContent(body) };
+            return new HttpResponseMessage(status)
+            {
+                Content = new ByteArrayContent(body ?? QuotaResponse()),
+            };
         });
     }
 
@@ -92,24 +106,39 @@ public sealed class DevinQuotaProbeTests
     }
 
     [Fact]
-    public async Task Probe_SendsBearerTokenAndJsonBody()
+    public async Task Probe_SendsBasicAuthAndProtoBody()
     {
+        // Verified 2026-09-21 by intercepting the real CLI: Basic scheme with
+        // the credentials token verbatim, application/proto body, Connect
+        // protocol header, and the token echoed inside the metadata envelope
+        // at metadata field 3.
         string? auth = null;
-        string? body = null;
+        string? contentType = null;
+        string? connectVersion = null;
+        byte[]? body = null;
         HttpMethod? method = null;
         var handler = UsageHandler(capture: req =>
         {
             method = req.Method;
             auth = req.Headers.Authorization?.ToString();
-            body = req.Content?.ReadAsStringAsync().GetAwaiter().GetResult();
+            contentType = req.Content?.Headers.ContentType?.ToString();
+            connectVersion = req.Headers.TryGetValues("Connect-Protocol-Version", out var v)
+                ? string.Join(",", v) : null;
+            body = req.Content?.ReadAsByteArrayAsync().GetAwaiter().GetResult();
         });
 
-        var probe = BuildProbe(handler, token: "devin-api-key");
+        var probe = BuildProbe(handler, token: "devin-session-token$test");
         await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
 
         Assert.Equal(HttpMethod.Post, method);
-        Assert.Equal("Bearer devin-api-key", auth);
-        Assert.Equal("{}", body);
+        Assert.Equal("Basic devin-session-token$test", auth);
+        Assert.Equal("application/proto", contentType);
+        Assert.Equal("1", connectVersion);
+        Assert.NotNull(body);
+        var requestMessage = DevinProtoWire.Parse(body!);
+        var metadata = requestMessage.TryGetMessage(1);
+        Assert.NotNull(metadata);
+        Assert.Equal("devin-session-token$test", metadata!.TryGetString(3));
     }
 
     [Fact]
@@ -157,7 +186,7 @@ public sealed class DevinQuotaProbeTests
     }
 
     [Fact]
-    public async Task Parse_SnakeCase_MinWindowWins()
+    public async Task Parse_DailyAndWeekly_MinWindowWins()
     {
         var probe = BuildProbe(UsageHandler());
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
@@ -166,71 +195,47 @@ public sealed class DevinQuotaProbeTests
         Assert.Equal(40, snap.AvailablePct);
         Assert.Equal(2, snap.Windows.Count);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1800500000), snap.ResetAt);
-        Assert.Contains("plan core", snap.Notes);
-        Assert.Contains("top-up credits", snap.Notes);
-        // Credits are surfaced in notes, not BalanceRemaining — the plan
-        // windows are the primary bucket.
+        Assert.Contains("plan Pro", snap.Notes);
+        // The plan windows are the primary bucket — never mapped to
+        // BalanceRemaining.
         Assert.Null(snap.BalanceRemaining);
     }
 
     [Fact]
-    public async Task Parse_CamelCase_SameReading()
+    public async Task Parse_OverageBalance_SurfacedInNotes()
     {
-        const string body = """
-        {
-          "userStatus": {
-            "planStatus": {
-              "dailyQuotaRemainingPercent": 90,
-              "weeklyQuotaRemainingPercent": 55,
-              "weeklyQuotaResetAtUnix": "1800500000"
-            },
-            "planInfo": { "planName": "team" }
-          }
-        }
-        """;
-        var probe = BuildProbe(UsageHandler(body: body));
+        var probe = BuildProbe(UsageHandler(body: QuotaResponse(
+            dailyPct: 100, weeklyPct: 100, overageMicros: 10_000_000, planName: null)));
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
 
         Assert.True(snap.IsKnown);
-        Assert.Equal(55, snap.AvailablePct);
-        Assert.Contains("plan team", snap.Notes);
+        Assert.Equal(100, snap.AvailablePct);
+        Assert.Contains("overage balance $10", snap.Notes);
     }
 
     [Fact]
-    public async Task Parse_StringEncodedNumerics_Accepted()
+    public async Task Parse_UnsetSentinelFields_TreatedAsAbsent()
     {
-        // protojson serialises int64/float fields as strings.
-        const string body = """
-        {
-          "user_status": {
-            "plan_status": {
-              "daily_quota_remaining_percent": "67.5",
-              "daily_quota_reset_at_unix": "1800000000"
-            }
-          }
-        }
-        """;
-        var probe = BuildProbe(UsageHandler(body: body));
+        // proto3 serialises unset int64 fields as -1 (ulong.MaxValue) — those
+        // are absent data, not a 1.8e19 percent quota.
+        var probe = BuildProbe(UsageHandler(body: QuotaResponse(
+            dailyPct: 65, weeklyPct: null, dailyReset: ulong.MaxValue)));
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
 
         Assert.True(snap.IsKnown);
-        Assert.Equal(67.5, snap.AvailablePct);
+        Assert.Equal(65, snap.AvailablePct);
+        Assert.Single(snap.Windows);
+        Assert.Null(snap.Windows[0].ResetAt);
     }
 
     [Fact]
     public async Task Parse_AcuCountersOnly_DerivesRemaining()
     {
-        // Older responses may lack the percent fields but carry ACU
-        // consumption; the probe derives the remaining share rather than
-        // degrading to unknown.
-        const string body = """
-        {
-          "user_status": {
-            "plan_status": { "acu_consumed": 750, "acu_limit": 1000 }
-          }
-        }
-        """;
-        var probe = BuildProbe(UsageHandler(body: body));
+        // Responses lacking the percent fields but carrying ACU counters get
+        // a derived remaining share rather than degrading to unknown.
+        var probe = BuildProbe(UsageHandler(body: QuotaResponse(
+            dailyPct: null, weeklyPct: null, dailyReset: null, weeklyReset: null,
+            acuConsumed: 750, acuLimit: 1000)));
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
 
         Assert.True(snap.IsKnown);
@@ -238,12 +243,23 @@ public sealed class DevinQuotaProbeTests
         Assert.Single(snap.Windows, w => w.Name == "acu");
     }
 
-    [Theory]
-    [InlineData("{}")]
-    [InlineData("""{"user_status":{}}""")]
-    [InlineData("""{"user_status":{"plan_status":{"grace_period_status":"ok"}}}""")]
-    public async Task Parse_NoQuotaFields_UnknownNotZero(string body)
+    [Fact]
+    public async Task Parse_NotProto_UnknownNotZero()
     {
+        var probe = BuildProbe(UsageHandler(body: "not proto \x01\x02\xff"u8.ToArray()));
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        Assert.False(snap.IsKnown);
+        Assert.Equal(QuotaUnknownReason.Permanent, snap.Unknown);
+    }
+
+    [Fact]
+    public async Task Parse_NoQuotaFields_UnknownNotZero()
+    {
+        // Valid proto but no plan_status payload — e.g. a response that only
+        // carries unrelated user fields.
+        var body = new DevinProtoWire.MessageWriter()
+            .Field(1, new DevinProtoWire.MessageWriter().Field(7, "a@b.c"))
+            .ToArray();
         var probe = BuildProbe(UsageHandler(body: body));
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
         Assert.False(snap.IsKnown);

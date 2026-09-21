@@ -15,6 +15,16 @@ namespace CodeyBox.Agents;
 /// </summary>
 public static class DevinCredentialsToml
 {
+    /// <summary>
+    /// Returns the account's auth token: <c>api_key</c> when present, else
+    /// <c>windsurf_api_key</c>. Live-verified 2026-09-21: files written by
+    /// current <c>devin auth login</c> carry only <c>windsurf_api_key</c>
+    /// (a <c>devin-session-token$…</c> bearer) — an <c>api_key</c>-only check
+    /// rejects every real credential.
+    /// </summary>
+    public static string? TryGetToken(string? toml) =>
+        TryGetString(toml, "api_key") ?? TryGetString(toml, "windsurf_api_key");
+
     /// <summary>Reads a top-level string field. Returns null when absent or non-string.</summary>
     public static string? TryGetString(string? toml, string key)
     {

@@ -411,7 +411,10 @@ non-login PATH the dispatcher uses (or symlink `devin` onto PATH).
 
 1. On the host, run `devin auth login` (or `devin auth import`) once. This
    writes `~/.local/share/devin/credentials.toml` — a flat TOML table with
-   `api_key`, `windsurf_api_key`, and the login-assigned `api_server_url`.
+   the account token under `api_key` or `windsurf_api_key` (verified
+   2026-09-21: current logins write only `windsurf_api_key`, a
+   `devin-session-token$…` value — CodeyBox accepts either field) plus the
+   login-assigned `api_server_url`.
    There is NO env-var alternative (`DEVIN_API_KEY` does not exist in the
    binary), and `devin auth status` exits 0 even when logged out — do not
    use it as an auth check.
@@ -445,43 +448,50 @@ non-login PATH the dispatcher uses (or symlink `devin` onto PATH).
   Not logged in` exits 1); `DevinTerminalDiagnoser` lifts the first such
   line into `TerminalDiagnostic`.
 
-**Default model:** `claude-sonnet-4` (the CLI's own documented example and
-`GetCliModelConfigs` recommendation). Override via `ModelId` on the
+**Default model:** `claude-sonnet-5-medium` (verified live catalog variant;
+the documented examples `sonnet`/`opus`/`swe`/`fable` are also accepted
+aliases). Override via `ModelId` on the
 agent-class member.
 
 **Reasoning level:** the CLI exposes no reasoning-effort flag;
 `ReasoningMode` is accepted for schema uniformity but not threaded into
 argv.
 
-**Quota probe:** `DevinQuotaProbe` POSTs `{}` to the Connect-RPC
-`SeatManagementService/GetUserStatus` endpoint with the credential's
-`api_key` as Bearer. The API host is NOT a compile-time constant — it is
-the login-assigned `api_server_url` from credentials.toml (`api.devin.ai`
-returns 404 for this RPC, verified), carried through
+**Quota probe:** `DevinQuotaProbe` POSTs a hand-encoded protobuf
+`GetUserStatusRequest` (the endpoint rejects `application/json`, verified
+live) to the Connect-RPC `SeatManagementService/GetUserStatus` endpoint
+with `Authorization: Basic <token>` (Basic, NOT Bearer — the token is the
+credentials.toml `api_key`/`windsurf_api_key` verbatim) and
+`Connect-Protocol-Version: 1`. The API host is NOT a compile-time
+constant — it is the login-assigned `api_server_url` from credentials.toml
+(`api.devin.ai` returns 404 for this RPC, verified), carried through
 `AgentQuotaCredentials.EndpointBaseUrl`; the probe fails closed when it is
 absent or not an absolute http(s) URL. `user_status.plan_status` provides
 `daily_quota_remaining_percent` / `weekly_quota_remaining_percent` (proto
-names; protojson camelCase tolerated) with per-window Unix-second resets —
-`AvailablePct` is the MINIMUM of the present windows so the binding
-constraint wins, and the ACU counters (`acu_consumed`/`acu_limit`) derive
-a window when the percent fields are absent. Top-up credit fields are
-surfaced in `Notes`, not `BalanceRemaining` — the plan windows are the
-primary bucket. Results cache for `QuotaCacheTtlSeconds` and invalidate on
-credential-file `TokenUpdated`. `DevinQuotaFailureDetector` classifies
+fields 14/15) with per-window Unix-second resets (17/18) — `AvailablePct`
+is the MINIMUM of the present windows so the binding constraint wins, and
+the ACU counters (`acu_consumed`/`acu_limit`, fields 19/20) derive a
+window when the percent fields are absent. `plan_info.plan_name` and the
+overage balance surface in `Notes`, not `BalanceRemaining` — the plan
+windows are the primary bucket. Results cache for `QuotaCacheTtlSeconds`
+and invalidate on credential-file `TokenUpdated`. `DevinQuotaFailureDetector` classifies
 dispatch-time signals (`Quota exhausted`, `Usage limit reached`, `Not
 logged in`, …) and accepts operator extras via
 `CodeyBox:QuotaFailurePatterns:devin`.
 
 **Smoke probes:** the host probe validates that
-`CODEYBOX_DEVIN_AUTH_TOML` parses and carries a non-empty `api_key` — no
-network call. The in-VM probe runs `devin --version`, then (when auth is
+`CODEYBOX_DEVIN_AUTH_TOML` parses and carries a non-empty token field
+(`api_key` or `windsurf_api_key`) — no network call. The in-VM probe runs `devin --version`, then (when auth is
 present) materialises the credentials file with the runner's exact script,
 runs `devin models list --format json` (exits 1 unauthenticated — the real
 auth check), and performs a real print-mode turn with the dispatch argv.
 
 **Model list probe:** `DevinModelListProbe` execs `devin models list
 --format json` on the host (account-scoped catalog; requires the CLI
-installed AND authenticated on the orchestrator host). `CODEYBOX_DEVIN_BINARY`
+installed AND authenticated on the orchestrator host). The emitted shape
+is `{"families":[{slug, aliases[], variants:[{model_uid}]}]}` — family
+slugs, aliases, and variant uids are all valid `--model` values and all
+three are collected. `CODEYBOX_DEVIN_BINARY`
 overrides the binary path. When the probe fails, the `DevinKnownModels`
 seed stays the warn-only validation surface.
 

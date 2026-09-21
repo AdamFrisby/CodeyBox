@@ -1,7 +1,4 @@
 using System.Net.Http.Headers;
-using System.Text;
-using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 
@@ -21,17 +18,21 @@ namespace CodeyBox.Agents.Devin;
 /// (<see cref="AgentQuotaCredentials.EndpointBaseUrl"/>) and fails closed when
 /// it is absent or not an absolute http(s) URL.</para>
 ///
-/// <para><b>Shape.</b> <c>GetUserStatusResponse.user_status.plan_status</c>
-/// carries (proto field names from the devin 3000.11.1 binary; protojson may
-/// emit camelCase, so the parser accepts both):
-/// <c>daily_quota_remaining_percent</c>,
-/// <c>weekly_quota_remaining_percent</c>,
-/// <c>daily_quota_reset_at_unix</c>, <c>weekly_quota_reset_at_unix</c>,
-/// <c>acu_consumed</c>, <c>acu_limit</c>,
-/// <c>available_prompt_credits</c>, <c>available_flow_credits</c>,
-/// <c>available_flex_credits</c>, <c>overage_balance_micros</c>,
-/// <c>grace_period_status</c>, <c>top_up_status</c>;
-/// <c>plan_info.plan_name</c> identifies the plan.</para>
+/// <para><b>Wire contract (verified 2026-09-21 against the live
+/// endpoint).</b> The endpoint speaks binary Connect-RPC only —
+/// <c>application/json</c> bodies are rejected <c>invalid_argument</c> — so
+/// the request is a hand-encoded protobuf <c>GetUserStatusRequest</c>
+/// carrying the credentials token inside a <c>metadata</c> message, with
+/// <c>Authorization: Basic &lt;token&gt;</c> (NOT Bearer) and
+/// <c>Connect-Protocol-Version: 1</c>. The response is
+/// <c>GetUserStatusResponse</c>: field 1 = <c>user_status</c>, whose field 13
+/// = <c>plan_status</c> {14: daily_quota_remaining_percent, 15:
+/// weekly_quota_remaining_percent, 16: overage_balance_micros, 17:
+/// daily_quota_reset_at_unix, 18: weekly_quota_reset_at_unix, 19:
+/// acu_consumed, 20: acu_limit}; response field 2 = <c>plan_info</c> {2:
+/// plan_name}. Field numbers were confirmed by decoding a live response;
+/// unset int64 fields arrive as the proto3 sentinal value
+/// <c>ulong.MaxValue</c> and are treated as absent.</para>
 ///
 /// <para><b>Headline.</b> <see cref="AgentQuotaSnapshot.AvailablePct"/> is the
 /// MINIMUM of the present quota windows (daily / weekly / ACU-derived), so the
@@ -57,17 +58,18 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
     internal const string UsageEndpointPath =
         "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
 
-    private const int MaxResponseChars = 64 * 1024; // 64 KiB
-    private const int UnexpectedShapeLogCapChars = 1024;
+    // The response carries the account's entire model catalog (~110 KiB for a
+    // stock Pro account), so the cap is generous — it exists to bound memory,
+    // not to truncate legitimate payloads.
+    private const int MaxResponseBytes = 4 * 1024 * 1024;
     internal const string UnexpectedShapeNotes = "unexpected response shape";
 
-    // Value class is `(?:[^"\\]|\\.)*` so JSON strings with escaped quotes
-    // are matched in full instead of stopping at the first escape, which
-    // would leave the suffix exposed in the operator log. Field-name class
-    // allows hyphens too, so kebab-case keys don't silently bypass redaction.
-    private static readonly Regex TokenLikeFieldPattern = new(
-        @"(""[A-Za-z0-9_\-]*(?:token|key|secret|password|auth|session|cookie|bearer)[A-Za-z0-9_\-]*"")\s*:\s*""(?:[^""\\]|\\.)*""",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    // Request metadata values mirroring what devin 3000.11.1 sends. The
+    // server accepts an arbitrary version string; the cli's own build stamps
+    // "0.0.0-dev" for local builds, which is honoured fine.
+    private const string RequestIdeName = "chisel";
+    private const string RequestVersion = "0.0.0-dev";
+    private const string RequestLocale = "en";
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
@@ -196,8 +198,13 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         {
             var client = _httpClientFactory.CreateClient("agent-quota");
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+            // Verified live 2026-09-21: the CLI authenticates with the
+            // credentials.toml token verbatim under the Basic scheme (the
+            // value is already a `devin-session-token$…` bearer string).
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", token);
+            request.Headers.Add("Connect-Protocol-Version", "1");
+            request.Content = new ByteArrayContent(BuildRequestBody(token));
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/proto");
 
             using var response = await client.SendAsync(request, ct);
             if (!response.IsSuccessStatusCode)
@@ -211,16 +218,15 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
             if (body is null) return Unknown(QuotaUnknownReason.Permanent, "response too large");
             var snapshot = ParseResponse(body);
 
-            // Log raw body when the parser bailed to Unknown — silent
-            // fallthrough is what makes shape drift invisible. Capped and
-            // token-redacted so bearer-shaped strings never reach operator
-            // logs.
             if (string.Equals(snapshot.Notes, UnexpectedShapeNotes, StringComparison.Ordinal))
             {
+                // Silent fallthrough is what makes shape drift invisible.
+                // The body is binary proto — log only its size, never bytes:
+                // it can carry account PII (name/email) that doesn't belong
+                // in operator logs.
                 _log.LogDebug(
-                    "Devin quota probe: unexpected response shape; raw body (redacted, capped to {Cap} chars): {Body}",
-                    UnexpectedShapeLogCapChars,
-                    RedactAndCap(body, UnexpectedShapeLogCapChars));
+                    "Devin quota probe: unexpected response shape ({Length} bytes)",
+                    body.Length);
             }
 
             return snapshot;
@@ -246,191 +252,150 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         }
     }
 
-    internal static AgentQuotaSnapshot ParseResponse(string json)
+    /// <summary>
+    /// Builds the <c>GetUserStatusRequest</c>: a single field-1
+    /// <c>metadata</c> message mirroring the CLI's own envelope
+    /// (ide/version/token/locale/os fields; the 732-byte machine fingerprint
+    /// the CLI adds at field 31 is optional — the endpoint serves the RPC
+    /// without it).
+    /// </summary>
+    internal static byte[] BuildRequestBody(string token)
     {
+        var metadata = new DevinProtoWire.MessageWriter()
+            .Field(1, RequestIdeName)
+            .Field(2, RequestVersion)
+            .Field(3, token)
+            .Field(4, RequestLocale)
+            .Field(5, HostOsName())
+            .Field(7, RequestVersion)
+            .Field(12, RequestIdeName);
+        return new DevinProtoWire.MessageWriter().Field(1, metadata).ToArray();
+    }
+
+    private static string HostOsName() =>
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows) ? "windows"
+        : System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.OSX) ? "osx"
+        : "linux";
+
+    // Proto field numbers on GetUserStatusResponse / PlanStatus — verified by
+    // decoding a live response (devin 3000.11.1, 2026-09-21). Unset int64
+    // fields arrive as ulong.MaxValue and are filtered by TryGetRealVarint.
+    private const int FieldUserStatus = 1;
+    private const int FieldPlanInfo = 2;
+    private const int PlanStatusField = 13;
+    private const int PlanStatusDailyPctField = 14;
+    private const int PlanStatusWeeklyPctField = 15;
+    private const int PlanStatusOverageMicrosField = 16;
+    private const int PlanStatusDailyResetField = 17;
+    private const int PlanStatusWeeklyResetField = 18;
+    private const int PlanStatusAcuConsumedField = 19;
+    private const int PlanStatusAcuLimitField = 20;
+    private const int PlanInfoNameField = 2;
+
+    /// <summary>Varints carrying the "unset" int64 sentinel (-1) count as absent.</summary>
+    private static ulong? TryGetRealVarint(DevinProtoWire.Message message, int field)
+    {
+        var value = message.TryGetVarint(field);
+        return value is null or ulong.MaxValue ? null : value;
+    }
+
+    internal static AgentQuotaSnapshot ParseResponse(byte[] body)
+    {
+        DevinProtoWire.Message root;
         try
         {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object)
-                return Unknown(QuotaUnknownReason.Permanent, UnexpectedShapeNotes);
-
-            // Response is {user_status|userStatus: {plan_status|planStatus:
-            // {...}, plan_info|planInfo: {...}}}; tolerate the status object
-            // landing at the top level for flatter serialisations.
-            if (!TryGetObject(root, "user_status", out var userStatus)
-                && !TryGetObject(root, "userStatus", out userStatus))
-            {
-                userStatus = root;
-            }
-            if (!TryGetObject(userStatus, "plan_status", out var planStatus)
-                && !TryGetObject(userStatus, "planStatus", out planStatus))
-            {
-                planStatus = userStatus;
-            }
-
-            var windows = new List<WindowQuota>();
-
-            var dailyPct = TryGetPercent(planStatus, "daily_quota_remaining_percent", "dailyQuotaRemainingPercent");
-            var dailyReset = TryGetEpoch(planStatus, "daily_quota_reset_at_unix", "dailyQuotaResetAtUnix");
-            if (dailyPct.HasValue)
-            {
-                windows.Add(new WindowQuota
-                {
-                    Name = "daily",
-                    AvailablePct = ClampAvailable(dailyPct.Value),
-                    ResetAt = EpochToDateTime(dailyReset),
-                    UsedPercent = ClampAvailable(100.0 - dailyPct.Value),
-                    ResetAtEpochSeconds = dailyReset,
-                });
-            }
-
-            var weeklyPct = TryGetPercent(planStatus, "weekly_quota_remaining_percent", "weeklyQuotaRemainingPercent");
-            var weeklyReset = TryGetEpoch(planStatus, "weekly_quota_reset_at_unix", "weeklyQuotaResetAtUnix");
-            if (weeklyPct.HasValue)
-            {
-                windows.Add(new WindowQuota
-                {
-                    Name = "weekly",
-                    AvailablePct = ClampAvailable(weeklyPct.Value),
-                    ResetAt = EpochToDateTime(weeklyReset),
-                    UsedPercent = ClampAvailable(100.0 - weeklyPct.Value),
-                    ResetAtEpochSeconds = weeklyReset,
-                });
-            }
-
-            // When the percent fields are absent but the ACU counters are
-            // present, derive the remaining share from acu_consumed/acu_limit
-            // rather than degrading to unknown.
-            var acuConsumed = TryGetDouble(planStatus, "acu_consumed", "acuConsumed");
-            var acuLimit = TryGetDouble(planStatus, "acu_limit", "acuLimit");
-            if (acuConsumed.HasValue && acuLimit is > 0)
-            {
-                var acuRemaining = ClampAvailable(100.0 * (1.0 - acuConsumed.Value / acuLimit.Value));
-                windows.Add(new WindowQuota
-                {
-                    Name = "acu",
-                    AvailablePct = acuRemaining,
-                    UsedPercent = ClampAvailable(100.0 - acuRemaining),
-                });
-            }
-
-            if (windows.Count == 0)
-                return Unknown(QuotaUnknownReason.Permanent, UnexpectedShapeNotes);
-
-            var binding = windows.OrderBy(w => w.AvailablePct).First();
-            var planName = TryGetObject(userStatus, "plan_info", out var planInfo)
-                || TryGetObject(userStatus, "planInfo", out planInfo)
-                    ? TryGetString(planInfo, "plan_name") ?? TryGetString(planInfo, "planName")
-                    : TryGetString(userStatus, "plan_name") ?? TryGetString(userStatus, "planName");
-
-            var credits = new List<string>(4);
-            AppendCredit(credits, "prompt", TryGetDouble(planStatus, "available_prompt_credits", "availablePromptCredits"));
-            AppendCredit(credits, "flow", TryGetDouble(planStatus, "available_flow_credits", "availableFlowCredits"));
-            AppendCredit(credits, "flex", TryGetDouble(planStatus, "available_flex_credits", "availableFlexCredits"));
-
-            var notes = planName is null && credits.Count == 0
-                ? null
-                : string.Join(
-                    "; ",
-                    (planName is null ? Enumerable.Empty<string>() : new[] { $"plan {planName}" })
-                        .Concat(credits.Count == 0 ? Enumerable.Empty<string>() : new[] { $"top-up credits: {string.Join(", ", credits)}" }));
-
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = binding.AvailablePct,
-                ResetAt = binding.ResetAt,
-                Notes = notes,
-                Windows = windows,
-            };
+            root = DevinProtoWire.Parse(body);
         }
-        catch (JsonException)
+        catch (DevinProtoWire.ProtoWireFormatException)
         {
-            return Unknown(QuotaUnknownReason.Permanent, "invalid JSON");
+            return Unknown(QuotaUnknownReason.Permanent, "invalid protobuf");
         }
-    }
 
-    private static void AppendCredit(List<string> sink, string name, double? value)
-    {
-        if (value.HasValue)
-            sink.Add($"{name}={value.Value:0.##}");
-    }
+        // Tolerate a flatter serialisation where plan_status lands at the top
+        // level (or one wrapper level down under user_status).
+        var userStatus = root.TryGetMessage(FieldUserStatus) ?? root;
+        var planStatus = userStatus.TryGetMessage(PlanStatusField) ?? userStatus;
 
-    private static bool TryGetObject(JsonElement element, string name, out JsonElement value)
-    {
-        value = default;
-        return element.ValueKind == JsonValueKind.Object
-            && element.TryGetProperty(name, out value)
-            && value.ValueKind == JsonValueKind.Object;
-    }
+        var windows = new List<WindowQuota>();
 
-    private static string? TryGetString(JsonElement element, string name)
-        => element.ValueKind == JsonValueKind.Object
-            && element.TryGetProperty(name, out var value)
-            && value.ValueKind == JsonValueKind.String
-                ? value.GetString()
-                : null;
-
-    private static double? TryGetPercent(JsonElement element, params string[] names)
-    {
-        var value = TryGetDouble(element, names);
-        if (value is null || double.IsNaN(value.Value) || double.IsInfinity(value.Value))
-            return null;
-        return value;
-    }
-
-    private static double? TryGetDouble(JsonElement element, params string[] names)
-    {
-        if (element.ValueKind != JsonValueKind.Object)
-            return null;
-        foreach (var name in names)
+        var dailyPct = TryGetRealVarint(planStatus, PlanStatusDailyPctField);
+        var dailyReset = TryGetRealVarint(planStatus, PlanStatusDailyResetField);
+        if (dailyPct.HasValue)
         {
-            if (!element.TryGetProperty(name, out var value))
-                continue;
-            if (value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var d))
-                return d;
-            // protojson serialises int64 fields as strings — accept them.
-            if (value.ValueKind == JsonValueKind.String
-                && double.TryParse(value.GetString(),
-                    System.Globalization.NumberStyles.Float,
-                    System.Globalization.CultureInfo.InvariantCulture,
-                    out var parsed))
+            windows.Add(new WindowQuota
             {
-                return parsed;
-            }
+                Name = "daily",
+                AvailablePct = ClampAvailable(dailyPct.Value),
+                ResetAt = EpochToDateTime(dailyReset),
+                UsedPercent = ClampAvailable(100.0 - dailyPct.Value),
+                ResetAtEpochSeconds = EpochToLong(dailyReset),
+            });
         }
-        return null;
-    }
 
-    private static long? TryGetEpoch(JsonElement element, params string[] names)
-    {
-        if (element.ValueKind != JsonValueKind.Object)
-            return null;
-        foreach (var name in names)
+        var weeklyPct = TryGetRealVarint(planStatus, PlanStatusWeeklyPctField);
+        var weeklyReset = TryGetRealVarint(planStatus, PlanStatusWeeklyResetField);
+        if (weeklyPct.HasValue)
         {
-            if (!element.TryGetProperty(name, out var value))
-                continue;
-            if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var l))
-                return l;
-            if (value.ValueKind == JsonValueKind.String
-                && long.TryParse(value.GetString(),
-                    System.Globalization.NumberStyles.Integer,
-                    System.Globalization.CultureInfo.InvariantCulture,
-                    out var parsed))
+            windows.Add(new WindowQuota
             {
-                return parsed;
-            }
+                Name = "weekly",
+                AvailablePct = ClampAvailable(weeklyPct.Value),
+                ResetAt = EpochToDateTime(weeklyReset),
+                UsedPercent = ClampAvailable(100.0 - weeklyPct.Value),
+                ResetAtEpochSeconds = EpochToLong(weeklyReset),
+            });
         }
-        return null;
+
+        var acuConsumed = TryGetRealVarint(planStatus, PlanStatusAcuConsumedField);
+        var acuLimit = TryGetRealVarint(planStatus, PlanStatusAcuLimitField);
+        if (acuConsumed.HasValue && acuLimit is > 0)
+        {
+            var acuRemaining = ClampAvailable(100.0 * (1.0 - (double)acuConsumed.Value / acuLimit.Value));
+            windows.Add(new WindowQuota
+            {
+                Name = "acu",
+                AvailablePct = acuRemaining,
+                UsedPercent = ClampAvailable(100.0 - acuRemaining),
+            });
+        }
+
+        if (windows.Count == 0)
+            return Unknown(QuotaUnknownReason.Permanent, UnexpectedShapeNotes);
+
+        var binding = windows.OrderBy(w => w.AvailablePct).First();
+        var planName = root.TryGetMessage(FieldPlanInfo)?.TryGetString(PlanInfoNameField);
+
+        var notes = new List<string>(2);
+        if (planName is not null)
+            notes.Add($"plan {planName}");
+        var overageMicros = TryGetRealVarint(planStatus, PlanStatusOverageMicrosField);
+        if (overageMicros is > 0)
+            notes.Add($"overage balance ${overageMicros.Value / 1_000_000.0:0.##}");
+
+        return new AgentQuotaSnapshot
+        {
+            AvailablePct = binding.AvailablePct,
+            ResetAt = binding.ResetAt,
+            Notes = notes.Count == 0 ? null : string.Join("; ", notes),
+            Windows = windows,
+        };
     }
 
-    private static DateTimeOffset? EpochToDateTime(long? epochSeconds)
+    private static long? EpochToLong(ulong? epochSeconds) =>
+        epochSeconds is { } seconds && seconds > 0 && seconds <= long.MaxValue
+            ? (long)seconds
+            : null;
+
+    private static DateTimeOffset? EpochToDateTime(ulong? epochSeconds)
     {
-        if (epochSeconds is not { } seconds || seconds <= 0)
+        var seconds = EpochToLong(epochSeconds);
+        if (seconds is null)
             return null;
         try
         {
-            return DateTimeOffset.FromUnixTimeSeconds(seconds);
+            return DateTimeOffset.FromUnixTimeSeconds(seconds.Value);
         }
         catch (ArgumentOutOfRangeException)
         {
@@ -444,15 +409,9 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
     private static AgentQuotaSnapshot Unknown(QuotaUnknownReason reason, string notes) =>
         AgentQuotaSnapshot.UnknownSnapshot(reason, notes);
 
-    private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
+    private static async Task<byte[]?> ReadCappedAsync(HttpContent content, CancellationToken ct)
     {
-        var raw = await content.ReadAsStringAsync(ct);
-        return raw.Length <= MaxResponseChars ? raw : null;
-    }
-
-    private static string RedactAndCap(string body, int cap)
-    {
-        var redacted = TokenLikeFieldPattern.Replace(body, "$1:\"[REDACTED]\"");
-        return redacted.Length <= cap ? redacted : redacted[..cap] + "…";
+        var raw = await content.ReadAsByteArrayAsync(ct);
+        return raw.Length <= MaxResponseBytes ? raw : null;
     }
 }

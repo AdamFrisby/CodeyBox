@@ -38,10 +38,27 @@ public sealed class DevinSmokeProbeTests
     }
 
     [Fact]
+    public async Task SmokeTest_AuthTomlWithWindsurfKeyOnly_ReturnsOk()
+    {
+        // Live-verified: current `devin auth login` writes only
+        // windsurf_api_key (a devin-session-token$… bearer) — no api_key.
+        var probe = new DevinSmokeProbe();
+        var cred = Cred(new Dictionary<string, string>
+        {
+            [DevinAgentRunner.AuthTomlEnvironmentVariable] =
+                "windsurf_api_key = \"devin-session-token$abc\"\napi_server_url = \"https://u.example\"\n",
+        });
+
+        var result = await probe.SmokeTestAsync(cred, CancellationToken.None);
+
+        Assert.True(result.Ok);
+    }
+
+    [Fact]
     public async Task SmokeTest_TomlWithoutApiKey_ReturnsFail()
     {
-        // A credentials file missing api_key cannot authenticate; catch it
-        // here rather than as a per-item dispatch failure.
+        // A credentials file missing any token field cannot authenticate;
+        // catch it here rather than as a per-item dispatch failure.
         var probe = new DevinSmokeProbe();
         var cred = Cred(new Dictionary<string, string>
         {
@@ -52,7 +69,7 @@ public sealed class DevinSmokeProbeTests
         var result = await probe.SmokeTestAsync(cred, CancellationToken.None);
 
         Assert.False(result.Ok);
-        Assert.Equal("credentials.toml has no api_key", result.FailureReason);
+        Assert.Equal("credentials.toml has no api key", result.FailureReason);
     }
 
     [Fact]

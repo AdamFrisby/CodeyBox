@@ -3021,7 +3021,7 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new OpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
 // Devin: credential-shape check only (CODEYBOX_DEVIN_AUTH_TOML parses and
-// carries api_key). The remote GetUserStatus reading is owned by the quota
+// carries a token field). The remote GetUserStatus reading is owned by the quota
 // probe; the real auth check happens on first CLI call in-VM.
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new DevinSmokeProbe(

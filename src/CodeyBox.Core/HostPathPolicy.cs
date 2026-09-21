@@ -68,7 +68,13 @@ public static class HostPathPolicy
             return path;
         if (path.Length == 1)
             return home;
-        return Path.Combine(home, path.Substring(2));
+        // Normalise the tilde suffix's separators: Path.Combine inserts the
+        // platform separator before the suffix but leaves embedded '/' as-is,
+        // producing a mixed-separator path on Windows.
+        var suffix = path.Substring(2)
+            .Replace('/', Path.DirectorySeparatorChar)
+            .Replace('\\', Path.DirectorySeparatorChar);
+        return Path.Combine(home, suffix);
     }
 
     /// <summary>

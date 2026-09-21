@@ -116,7 +116,9 @@ public static class CredentialFileTokenExtractor
         if (string.IsNullOrWhiteSpace(rawContents))
             return (null, null);
         return (
-            CodeyBox.Agents.DevinCredentialsToml.TryGetString(rawContents, "api_key"),
+            // api_key or windsurf_api_key — current `devin auth login` writes
+            // only the latter (see DevinCredentialsToml.TryGetToken).
+            CodeyBox.Agents.DevinCredentialsToml.TryGetToken(rawContents),
             CodeyBox.Agents.DevinCredentialsToml.TryGetString(rawContents, "api_server_url"));
     }
 

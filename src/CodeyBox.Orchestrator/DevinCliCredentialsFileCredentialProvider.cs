@@ -44,12 +44,13 @@ public sealed class DevinCliCredentialsFileCredentialProvider : ICredentialProvi
     /// <summary>
     /// Torn-write guard for devin's credentials.toml: the file is TOML (the
     /// JSON-shaped default validator would reject it), so well-formedness is
-    /// "carries a non-empty <c>api_key</c>" — the field the CLI cannot
-    /// authenticate without. Shared by <see cref="DevinCredentialFileSource"/>.
+    /// "carries a non-empty token field" (<c>api_key</c> or
+    /// <c>windsurf_api_key</c>) — the field the CLI cannot authenticate
+    /// without. Shared by <see cref="DevinCredentialFileSource"/>.
     /// </summary>
     internal static bool IsUsableCredentialsToml(string contents) =>
         !string.IsNullOrWhiteSpace(
-            CodeyBox.Agents.DevinCredentialsToml.TryGetString(contents, "api_key"));
+            CodeyBox.Agents.DevinCredentialsToml.TryGetToken(contents));
 
     public DevinCliCredentialsFileCredentialProvider(
         CredentialFileSource source,

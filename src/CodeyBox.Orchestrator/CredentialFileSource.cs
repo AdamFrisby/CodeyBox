@@ -65,7 +65,7 @@ public class CredentialFileSource : IDisposable, ICredentialFileReader
     /// cached — the torn-write guard protecting against a writer mid-dump.
     /// Defaults to a JSON parse (all existing credential files are JSON);
     /// sources for non-JSON formats pass their own shape check (e.g. devin's
-    /// credentials.toml validates that an <c>api_key</c> field is present).
+    /// credentials.toml validates that a token field is present).
     /// </param>
     public CredentialFileSource(
         string filePath,
@@ -464,7 +464,7 @@ public sealed class OpencodeCredentialFileSource : CredentialFileSource
 /// <c>devin auth login</c>; CodeyBox ships the raw bytes to the sandbox as
 /// <c>CODEYBOX_DEVIN_AUTH_TOML</c> and the runner materialises them at the
 /// same XDG path inside the VM. The file is TOML, not JSON, so the torn-write
-/// guard checks for a usable <c>api_key</c> field instead of parsing JSON.
+/// guard checks for a usable token field instead of parsing JSON.
 /// </summary>
 public sealed class DevinCredentialFileSource : CredentialFileSource
 {

@@ -73,6 +73,24 @@ public sealed class AgentInstanceCredentialResolverDevinTests : IDisposable
     }
 
     [Fact]
+    public void ResolveQuotaCredentials_WindsurfKeyOnly_ExtractsToken()
+    {
+        // Live-verified: a real credentials.toml from `devin auth login` has
+        // windsurf_api_key, not api_key.
+        const string toml = "windsurf_api_key = \"devin-session-token$abc\"\n" +
+            "api_server_url = \"https://server.codeium.com\"\n";
+        var path = Path.Combine(_tempDir, "credentials.toml");
+        File.WriteAllText(path, toml);
+
+        var creds = AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            NewDevinMember(path), () => null);
+
+        Assert.NotNull(creds);
+        Assert.Equal("devin-session-token$abc", creds!.AccessToken);
+        Assert.Equal("https://server.codeium.com", creds.EndpointBaseUrl);
+    }
+
+    [Fact]
     public void ResolveQuotaCredentials_NoApiKey_FallsThrough()
     {
         // A file without api_key yields no usable credential — the member's

@@ -19,13 +19,16 @@ public static class DevinKnownModels
     /// </summary>
     public static readonly IReadOnlyList<string> All = new[]
     {
-        // Verified 2026-09-21 against `devin --help` (v3000.11.1), which lists
-        // these exact examples for --model: "claude-sonnet-4",
-        // "claude-opus-4.6", "opus", "codex".
-        "claude-sonnet-4",
-        "claude-opus-4.6",
+        // Verified 2026-09-21 against `devin models list --format json`
+        // (v3000.11.1, a live Pro account): family slugs, short aliases, and
+        // the default medium-effort variant uids are all accepted --model
+        // values.
+        "claude-sonnet-5-medium",
+        "claude-opus-5-medium",
+        "sonnet",
         "opus",
-        "codex",
+        "swe",
+        "fable",
     };
 
     public static bool IsKnown(string? modelId)

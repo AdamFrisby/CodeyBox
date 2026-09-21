@@ -66,6 +66,29 @@ public sealed class DevinCredentialsTomlTests
     }
 
     [Fact]
+    public void TryGetToken_PrefersApiKey_FallsBackToWindsurfKey()
+    {
+        Assert.Equal("sk-devin-test", DevinCredentialsToml.TryGetToken(RealisticToml));
+        // Live-verified 2026-09-21: current `devin auth login` writes only
+        // windsurf_api_key (a devin-session-token$… bearer).
+        Assert.Equal(
+            "devin-session-token$abc",
+            DevinCredentialsToml.TryGetToken(
+                "windsurf_api_key = \"devin-session-token$abc\"\napi_server_url = \"https://x\""));
+        Assert.Null(DevinCredentialsToml.TryGetToken("api_server_url = \"https://x\""));
+    }
+
+    [Fact]
+    public void ExtractDevinCredentials_WindsurfKeyOnly_ExtractsToken()
+    {
+        var (apiKey, apiServerUrl) = CredentialFileTokenExtractor.ExtractDevinCredentials(
+            "windsurf_api_key = \"devin-session-token$abc\"\napi_server_url = \"https://server.codeium.com\"");
+
+        Assert.Equal("devin-session-token$abc", apiKey);
+        Assert.Equal("https://server.codeium.com", apiServerUrl);
+    }
+
+    [Fact]
     public void ExtractDevinCredentials_ReturnsApiKeyAndServerUrl()
     {
         var (apiKey, apiServerUrl) = CredentialFileTokenExtractor.ExtractDevinCredentials(RealisticToml);

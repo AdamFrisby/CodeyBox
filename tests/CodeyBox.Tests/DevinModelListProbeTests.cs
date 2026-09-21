@@ -33,6 +33,46 @@ public sealed class DevinModelListProbeTests
         => Assert.Equal(AgentKind.Devin, new DevinModelListProbe(new ScriptedDevinCli()).Kind);
 
     [Fact]
+    public async Task Probe_FamiliesShape_YieldsSlugsAliasesAndVariantUids()
+    {
+        // Live shape (devin 3000.11.1, verified 2026-09-21):
+        // {"families":[{slug, aliases[], variants:[{model_uid}]}]}. Slugs,
+        // aliases and variant uids are all accepted --model values.
+        var cli = new ScriptedDevinCli
+        {
+            Stdout = """
+            {
+              "families": [
+                {
+                  "family_label": "Claude Sonnet 5",
+                  "slug": "claude-sonnet-5",
+                  "aliases": ["claude", "sonnet"],
+                  "variants": [
+                    {"model_uid": "claude-sonnet-5-medium"},
+                    {"model_uid": "claude-sonnet-5-high"}
+                  ]
+                },
+                {
+                  "slug": "claude-opus-5",
+                  "aliases": ["opus"],
+                  "variants": [{"model_uid": "claude-opus-5-medium"}]
+                }
+              ]
+            }
+            """,
+        };
+        var probe = new DevinModelListProbe(cli);
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
+
+        Assert.Null(result.FailureReason);
+        Assert.Equal(
+            ["claude-sonnet-5", "claude", "sonnet", "claude-sonnet-5-medium",
+             "claude-sonnet-5-high", "claude-opus-5", "opus", "claude-opus-5-medium"],
+            result.ModelIds);
+    }
+
+    [Fact]
     public async Task Probe_ClientModelConfigArray_YieldsIds()
     {
         // Shape from the devin 3000.11.1 binary: ClientModelConfig records

@@ -6,13 +6,15 @@ namespace CodeyBox.Agents.Devin;
 /// <summary>
 /// Credential viability check for the devin CLI. Returns Ok when the bundle
 /// carries a <c>CODEYBOX_DEVIN_AUTH_TOML</c> blob that parses as the CLI's
-/// credentials file with a non-empty <c>api_key</c> (materialised into the
-/// sandbox by <see cref="DevinAgentRunner"/>); returns Fail otherwise.
+/// credentials file with a non-empty token field (<c>api_key</c> or
+/// <c>windsurf_api_key</c> — current logins write only the latter;
+/// materialised into the sandbox by <see cref="DevinAgentRunner"/>); returns
+/// Fail otherwise.
 ///
 /// <para>Like the cursor/opencode probes this does NOT issue a network call:
 /// the CLI's auth surface is the credentials file itself, and the remote
 /// quota endpoint (<c>GetUserStatus</c>) is exercised separately by
-/// <see cref="DevinQuotaProbe"/>. Parsing for <c>api_key</c> catches a
+/// <see cref="DevinQuotaProbe"/>. Requiring a token field catches a
 /// malformed or half-written credentials file before dispatch rather than
 /// letting it surface as a per-item auth failure.</para>
 /// </summary>
@@ -41,11 +43,11 @@ public sealed class DevinSmokeProbe : IAgentSmokeProbe
                 false, "no credentials in credential bundle", TimeSpan.Zero, SmokeFailureCategory.Persistent));
         }
 
-        if (string.IsNullOrWhiteSpace(DevinCredentialsToml.TryGetString(toml, "api_key")))
+        if (string.IsNullOrWhiteSpace(DevinCredentialsToml.TryGetToken(toml)))
         {
-            _log?.LogDebug("Devin smoke probe: credentials.toml carries no api_key field");
+            _log?.LogDebug("Devin smoke probe: credentials.toml carries no api_key/windsurf_api_key field");
             return Task.FromResult(new AgentSmokeResult(
-                false, "credentials.toml has no api_key", TimeSpan.Zero, SmokeFailureCategory.Persistent));
+                false, "credentials.toml has no api key", TimeSpan.Zero, SmokeFailureCategory.Persistent));
         }
 
         return Task.FromResult(new AgentSmokeResult(true, null, TimeSpan.Zero, SmokeFailureCategory.None));
