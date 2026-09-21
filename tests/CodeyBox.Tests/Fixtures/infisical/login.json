@@ -1,0 +1,6 @@
+{
+  "accessToken": "test-access-token",
+  "expiresIn": 2592000,
+  "accessTokenMaxTTL": 2592000,
+  "tokenType": "Bearer"
+}

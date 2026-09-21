@@ -62,6 +62,7 @@
     <Project Path="plugins/CodeyBox.StatisticsPlugin/CodeyBox.StatisticsPlugin.csproj" />
     <Project Path="plugins/CodeyBox.LinearWorkSyncPlugin/CodeyBox.LinearWorkSyncPlugin.csproj" />
     <Project Path="plugins/CodeyBox.PlaneWorkSyncPlugin/CodeyBox.PlaneWorkSyncPlugin.csproj" />
+    <Project Path="plugins/CodeyBox.InfisicalPlugin/CodeyBox.InfisicalPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
