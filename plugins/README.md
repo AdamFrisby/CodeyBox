@@ -43,6 +43,7 @@ sit alongside them rather than buried among them.
 | `quota` | Quota probes, reset notifiers, and quota usage telemetry (e.g. `CodeyBox.OpencodeGoQuotaPlugin`, `CodeyBox.QuotaResetNotifier`, `CodeyBox.StatisticsPlugin`) |
 | `telemetry` | Metric samplers (`IMetricSampler`) outside the quota domain |
 | `test-runners` | Test-execution plugins (`ITestRunnerAuditor`, e.g. `CodeyBox.DotnetTestRunnerPlugin`) |
+| `upstream` | Upstream forge remotes (`IUpstreamRemote`, e.g. `CodeyBox.ForgejoUpstreamPlugin`) |
 | `work-sync` | External work-tracker sync (e.g. `CodeyBox.LinearWorkSyncPlugin`, `CodeyBox.PlaneWorkSyncPlugin`) |
 
 The authoritative list is the `RecognisedGroups` set in
