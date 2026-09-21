@@ -26,6 +26,7 @@ public sealed class PluginLayoutConventionTests
         "auditors-secrets",
         "auditors-static-analysis",
         "credentials",
+        "notifications",
         "quota",
         "telemetry",
         "test-runners",

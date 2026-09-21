@@ -391,7 +391,7 @@ internal sealed class CapturingHttpHandler : HttpMessageHandler
 {
     private readonly Func<HttpRequestMessage, HttpResponseMessage>? _responder;
 
-    public sealed record CapturedRequest(HttpMethod Method, string Url, string ContentType, string Body);
+    public sealed record CapturedRequest(HttpMethod Method, string Url, string ContentType, string Body, string Authorization = "");
 
     public List<CapturedRequest> Requests { get; } = new();
 
@@ -408,7 +408,8 @@ internal sealed class CapturingHttpHandler : HttpMessageHandler
             ? string.Empty
             : await request.Content.ReadAsStringAsync(cancellationToken);
         var contentType = request.Content?.Headers.ContentType?.ToString() ?? string.Empty;
-        Requests.Add(new CapturedRequest(request.Method, request.RequestUri!.ToString(), contentType, bodyText));
+        var authorization = request.Headers.Authorization?.ToString() ?? string.Empty;
+        Requests.Add(new CapturedRequest(request.Method, request.RequestUri!.ToString(), contentType, bodyText, authorization));
 
         return _responder is null
             ? new HttpResponseMessage(HttpStatusCode.OK)

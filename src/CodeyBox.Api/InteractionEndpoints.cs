@@ -73,6 +73,7 @@ internal static class InteractionEndpoints
         HttpRequest httpRequest,
         IOptionsMonitor<InteractionsOptions> interactions,
         IEnumerable<IInteractionVerifier> verifiers,
+        IEnumerable<INotificationProvider> renderProviders,
         IWorkItemStore store,
         IWorkItemQuestionStore? questionStore,
         ITaskQueue queue,
@@ -142,21 +143,47 @@ internal static class InteractionEndpoints
             return Results.Unauthorized();
         }
 
-        InteractionPayload? payload;
+        InteractionPayload? payload = null;
+        string? validationError;
         try
         {
             payload = JsonSerializer.Deserialize<InteractionPayload>(bodyBytes, PayloadJsonOpts);
+            validationError = payload is null
+                ? "malformed interaction payload"
+                : ValidatePayload(payload);
         }
         catch (JsonException)
         {
-            return Results.BadRequest(new { error = "malformed interaction payload" });
+            validationError = "malformed interaction payload";
         }
-        if (payload is null)
-            return Results.BadRequest(new { error = "malformed interaction payload" });
 
-        var validationError = ValidatePayload(payload);
+        // Slack posts native `block_actions` form bodies (payload={...}) to
+        // the app's Request URL rather than the canonical JSON shape. When
+        // the canonical parse fails on a slack-v0 provider, map the native
+        // shape before rejecting — verification already passed either way.
+        if (validationError is not null && IsSlackScheme(providerOpts.Scheme))
+        {
+            if (SlackInteractionParser.TryParse(bodyBytes, out var canonical, out _)
+                && canonical is not null)
+            {
+                payload = new InteractionPayload
+                {
+                    InteractionId = canonical.InteractionId,
+                    WorkItemId = canonical.WorkItemId,
+                    QuestionId = canonical.QuestionId,
+                    Answer = canonical.Answer,
+                    User = new InteractionUser { UserId = canonical.UserId, Login = canonical.Login },
+                    ChannelId = canonical.ChannelId,
+                    ResponseUrl = canonical.ResponseUrl,
+                    CorrelationToken = canonical.CorrelationToken,
+                };
+                validationError = ValidatePayload(payload);
+            }
+        }
         if (validationError is not null)
             return Results.BadRequest(new { error = validationError });
+        if (payload is null)
+            return Results.BadRequest(new { error = "malformed interaction payload" });
 
         // Replay guard: platforms retry, so the same interaction delivered
         // twice answers once. The claim happens before any state change.
@@ -239,7 +266,68 @@ internal static class InteractionEndpoints
             opts.ResponseUpdateTimeoutSeconds >= 1 ? opts.ResponseUpdateTimeoutSeconds : 10);
         await TryUpdateOriginalMessageAsync(payload.ResponseUrl, redactedAnswer, answeredBy, httpClients, log, responseTimeout, ct);
 
+        // Provider-owned loop-close runs last so its final state wins: an
+        // interactive provider (e.g. Slack via chat.update) replaces the
+        // plain-text response_url replacement with its rich decided state.
+        // Best-effort likewise — the answer already landed above.
+        await TryProviderDecisionUpdateAsync(
+            providerOpts.Provider, renderProviders, payload, question.QuestionText,
+            redactedAnswer, answeredBy, log, ct);
+
         return Results.Ok(new { status = "answered", questionState = "answered" });
+    }
+
+    private static bool IsSlackScheme(string? scheme) =>
+        string.Equals(scheme, "slack-v0", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Hand a landed decision to the matching render provider when
+    /// it carries interactions itself. Notification-only providers (the
+    /// default) need nothing here — the response_url round-trip above is
+    /// their loop-close. Never throws: the provider contract is
+    /// log-and-swallow by definition.</summary>
+    private static async Task TryProviderDecisionUpdateAsync(
+        string providerName,
+        IEnumerable<INotificationProvider> renderProviders,
+        InteractionPayload payload,
+        string? questionText,
+        string answer,
+        string answeredBy,
+        ILogger log,
+        CancellationToken ct)
+    {
+        INotificationProvider? target = null;
+        foreach (var candidate in renderProviders)
+        {
+            if (string.Equals(candidate.Name, providerName, StringComparison.OrdinalIgnoreCase))
+            {
+                target = candidate;
+                break;
+            }
+        }
+        if (target is null || !target.SupportsInteractions)
+            return;
+        try
+        {
+            var notification = new Notification
+            {
+                ConditionId = "operator_question",
+                Title = string.IsNullOrWhiteSpace(questionText) ? $"Input needed: {payload.QuestionId}" : questionText,
+                Severity = NotificationSeverity.Information,
+                Timestamp = DateTimeOffset.UtcNow,
+                CorrelationToken = payload.CorrelationToken,
+            };
+            await target.UpdateDecisionAsync(notification, $"Decided: {answer} — by {answeredBy}", ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex,
+                "Interactions: provider '{Provider}' decision update failed; decision already recorded",
+                providerName);
+        }
     }
 
     private static string? ValidatePayload(InteractionPayload payload)

@@ -73,23 +73,14 @@ public sealed class InMemoryInteractionDedupStore : IInteractionDedupStore
 public static class NotificationInteractionHelper
 {
     /// <summary>Correlation token binding a notification to one question.
-    /// Exact, parseable, and safe to echo back over the wire.</summary>
+    /// Exact, parseable, and safe to echo back over the wire. Delegates to
+    /// <see cref="NotificationCorrelation"/> (Core) so provider plugins bind
+    /// the same token the inbound endpoint parses.</summary>
     public static string CorrelationTokenFor(string workItemId, string questionId) =>
-        $"{workItemId}:{questionId}";
+        NotificationCorrelation.TokenFor(workItemId, questionId);
 
-    public static bool TryParseCorrelationToken(string? token, out string workItemId, out string questionId)
-    {
-        workItemId = string.Empty;
-        questionId = string.Empty;
-        if (string.IsNullOrEmpty(token))
-            return false;
-        var split = token.IndexOf(':');
-        if (split <= 0 || split == token.Length - 1)
-            return false;
-        workItemId = token[..split];
-        questionId = token[(split + 1)..];
-        return true;
-    }
+    public static bool TryParseCorrelationToken(string? token, out string workItemId, out string questionId) =>
+        NotificationCorrelation.TryParse(token, out workItemId, out questionId);
 
     /// <summary>Builds an actionable notification for an open question.
     /// <paramref name="answerBaseUrl"/> is the public base URL used to form

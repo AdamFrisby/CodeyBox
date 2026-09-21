@@ -67,6 +67,7 @@
     <Project Path="plugins/work-sync/CodeyBox.ShortcutWorkSyncPlugin/CodeyBox.ShortcutWorkSyncPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.InfisicalPlugin/CodeyBox.InfisicalPlugin.csproj" />
     <Project Path="plugins/upstream/CodeyBox.GiteaUpstreamPlugin/CodeyBox.GiteaUpstreamPlugin.csproj" />
+    <Project Path="plugins/notifications/CodeyBox.SlackPlugin/CodeyBox.SlackPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />

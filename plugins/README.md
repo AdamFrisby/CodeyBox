@@ -40,6 +40,7 @@ sit alongside them rather than buried among them.
 | `auditors-secrets` | Auditors scanning for leaked secrets and credentials |
 | `auditors-static-analysis` | Auditors running static analysis (compiler warnings, analysers) |
 | `credentials` | Secret providers and credential brokers (e.g. `CodeyBox.InfisicalPlugin`) |
+| `notifications` | Chat/push notification providers (`INotificationProvider`, e.g. `CodeyBox.SlackPlugin`) |
 | `quota` | Quota probes, reset notifiers, and quota usage telemetry (e.g. `CodeyBox.OpencodeGoQuotaPlugin`, `CodeyBox.QuotaResetNotifier`, `CodeyBox.StatisticsPlugin`) |
 | `telemetry` | Metric samplers (`IMetricSampler`) outside the quota domain |
 | `test-runners` | Test-execution plugins (`ITestRunnerAuditor`, e.g. `CodeyBox.DotnetTestRunnerPlugin`) |
