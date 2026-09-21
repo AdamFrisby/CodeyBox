@@ -1,0 +1,15 @@
+{
+  "id": "evt-2",
+  "action": "create",
+  "entity_type": "story-comment",
+  "actor": { "mention_name": "op", "email": "op@example.com" },
+  "story": {
+    "id": 48,
+    "name": "Login redirect is broken",
+    "project_id": 12
+  },
+  "comment": {
+    "id": 9001,
+    "text": "q-001: use forward-only migrations"
+  }
+}

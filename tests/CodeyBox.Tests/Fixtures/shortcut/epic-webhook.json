@@ -1,0 +1,14 @@
+{
+  "id": "evt-4",
+  "action": "update",
+  "entity_type": "epic",
+  "actor": { "mention_name": "op", "email": "op@example.com" },
+  "epic": {
+    "id": 7,
+    "name": "Q3 launch",
+    "description": "Everything for the Q3 launch.",
+    "labels": [{ "id": 1001, "name": "codeybox" }],
+    "owner_ids": [],
+    "project_ids": [12]
+  }
+}
