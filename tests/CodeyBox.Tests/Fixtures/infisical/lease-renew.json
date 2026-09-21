@@ -1,0 +1,11 @@
+{
+  "lease": {
+    "id": "11111111-2222-4333-8444-555555555555",
+    "version": 2,
+    "externalEntityId": "v1.eyJ1c2VybmFtZSI6InRlc3QifQ",
+    "expireAt": "2030-05-01T00:40:00.000Z",
+    "dynamicSecretId": "99999999-8888-4777-8666-555555555555",
+    "createdAt": "2030-05-01T00:00:00.000Z",
+    "updatedAt": "2030-05-01T00:20:00.000Z"
+  }
+}
