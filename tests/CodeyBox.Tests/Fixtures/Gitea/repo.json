@@ -1,0 +1,14 @@
+{
+  "id": 42,
+  "full_name": "myteam/myproject",
+  "html_url": "https://git.example.com/myteam/myproject",
+  "clone_url": "https://git.example.com/myteam/myproject.git",
+  "default_branch": "main",
+  "private": true,
+  "internal": false,
+  "empty": false,
+  "fork": false,
+  "archived": false,
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-05-01T10:00:00Z"
+}

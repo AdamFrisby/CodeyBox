@@ -1,0 +1,38 @@
+[
+  {
+    "id": 201,
+    "state": "APPROVED",
+    "body": "Looks good.",
+    "dismissed": false,
+    "stale": false,
+    "submitted_at": "2026-05-01T11:00:00Z",
+    "user": { "login": "alice", "id": 11 }
+  },
+  {
+    "id": 202,
+    "state": "REQUEST_CHANGES",
+    "body": "Needs a test.",
+    "dismissed": false,
+    "stale": false,
+    "submitted_at": "2026-05-01T11:05:00Z",
+    "user": { "login": "bob", "id": 12 }
+  },
+  {
+    "id": 203,
+    "state": "APPROVED",
+    "body": "Earlier approval on an old head.",
+    "dismissed": true,
+    "stale": true,
+    "submitted_at": "2026-05-01T09:00:00Z",
+    "user": { "login": "carol", "id": 13 }
+  },
+  {
+    "id": 204,
+    "state": "COMMENT",
+    "body": "Drive-by note.",
+    "dismissed": false,
+    "stale": false,
+    "submitted_at": "2026-05-01T11:10:00Z",
+    "user": { "login": "dave", "id": 14 }
+  }
+]
