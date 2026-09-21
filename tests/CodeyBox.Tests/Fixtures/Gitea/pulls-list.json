@@ -1,0 +1,24 @@
+[
+  {
+    "id": 101,
+    "number": 7,
+    "html_url": "https://git.example.com/myteam/myproject/pulls/7",
+    "state": "open",
+    "title": "Add feature Z",
+    "merged": false,
+    "mergeable": true,
+    "head": { "ref": "codeybox/abc123", "sha": "4b5d3f4b0c1a2b3c4d5e6f708192a3b4c5d6e7f" },
+    "base": { "ref": "main", "sha": "0be8717da52d7b24b5dd3586c8c4b7c8d0dcf0d" }
+  },
+  {
+    "id": 102,
+    "number": 8,
+    "html_url": "https://git.example.com/myteam/myproject/pulls/8",
+    "state": "open",
+    "title": "Unrelated work",
+    "merged": false,
+    "mergeable": true,
+    "head": { "ref": "feature/other", "sha": "1111111111111111111111111111111111111111" },
+    "base": { "ref": "main", "sha": "0be8717da52d7b24b5dd3586c8c4b7c8d0dcf0d" }
+  }
+]

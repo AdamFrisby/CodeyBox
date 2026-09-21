@@ -1,0 +1,31 @@
+{
+  "state": "failure",
+  "sha": "4b5d3f4b0c1a2b3c4d5e6f708192a3b4c5d6e7f",
+  "total_count": 3,
+  "statuses": [
+    {
+      "id": 301,
+      "status": "success",
+      "context": "continuous-integration/drone/push",
+      "description": "Build passed",
+      "target_url": "https://ci.example.com/builds/1",
+      "created_at": "2026-05-01T10:02:00Z"
+    },
+    {
+      "id": 302,
+      "status": "failure",
+      "context": "continuous-integration/drone/pr",
+      "description": "Tests failed",
+      "target_url": "https://ci.example.com/builds/2",
+      "created_at": "2026-05-01T10:03:00Z"
+    },
+    {
+      "id": 303,
+      "status": "pending",
+      "context": "license/cla",
+      "description": "Waiting for contributor",
+      "target_url": "https://cla.example.com/check",
+      "created_at": "2026-05-01T10:04:00Z"
+    }
+  ]
+}

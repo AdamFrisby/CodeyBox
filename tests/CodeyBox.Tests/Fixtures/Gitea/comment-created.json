@@ -1,0 +1,8 @@
+{
+  "id": 403,
+  "body": "Posted from CodeyBox",
+  "created_at": "2026-05-01T10:15:00Z",
+  "updated_at": "2026-05-01T10:15:00Z",
+  "user": { "login": "codeybox-bot", "id": 99 },
+  "html_url": "https://git.example.com/myteam/myproject/issues/7#issuecomment-403"
+}

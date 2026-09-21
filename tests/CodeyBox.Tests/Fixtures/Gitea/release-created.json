@@ -1,0 +1,11 @@
+{
+  "id": 701,
+  "tag_name": "v1.2.3",
+  "target_commitish": "9aa8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0",
+  "name": "v1.2.3",
+  "body": "Release notes",
+  "html_url": "https://git.example.com/myteam/myproject/releases/tag/v1.2.3",
+  "draft": false,
+  "prerelease": false,
+  "created_at": "2026-05-01T13:00:00Z"
+}
