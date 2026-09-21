@@ -1,0 +1,16 @@
+{
+  "id": "evt-1",
+  "action": "update",
+  "entity_type": "story",
+  "actor": { "mention_name": "op", "email": "op@example.com" },
+  "story": {
+    "id": 48,
+    "name": "Login redirect is broken",
+    "description": "Fix the login redirect.",
+    "project_id": 12,
+    "labels": [{ "id": 1001, "name": "codeybox" }],
+    "owner_ids": ["11111111-2222-3333-4444-555555555555"],
+    "workflow_state_id": 500,
+    "workflow_state_name": "Unstarted"
+  }
+}

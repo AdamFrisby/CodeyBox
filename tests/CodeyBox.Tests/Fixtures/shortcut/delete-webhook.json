@@ -1,0 +1,11 @@
+{
+  "id": "evt-5",
+  "action": "delete",
+  "entity_type": "story",
+  "actor": { "mention_name": "op", "email": "op@example.com" },
+  "story": {
+    "id": 48,
+    "name": "Login redirect is broken",
+    "project_id": 12
+  }
+}

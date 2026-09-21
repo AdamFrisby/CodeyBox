@@ -1,0 +1,15 @@
+{
+  "id": "evt-3",
+  "action": "create",
+  "entity_type": "story-comment",
+  "actor": { "mention_name": "codeybox", "email": "bot@example.com" },
+  "story": {
+    "id": 48,
+    "name": "Login redirect is broken",
+    "project_id": 12
+  },
+  "comment": {
+    "id": 9002,
+    "text": "CodeyBox update: 'Login redirect is broken' is now Working (external status: In Progress).\n\n<!-- codeybox-work-item:7a6b5c4d1e2f4a4b9c8d3e4f5a6b7c8d -->"
+  }
+}

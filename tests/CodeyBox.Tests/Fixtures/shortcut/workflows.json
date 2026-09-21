@@ -1,0 +1,12 @@
+[
+  {
+    "id": 10,
+    "name": "Engineering workflow",
+    "states": [
+      { "id": 500, "name": "Unstarted", "type": "unstarted" },
+      { "id": 501, "name": "In Progress", "type": "started" },
+      { "id": 502, "name": "Done", "type": "done" },
+      { "id": 503, "name": "Cancelled", "type": "done" }
+    ]
+  }
+]
