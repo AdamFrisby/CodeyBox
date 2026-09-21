@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="CodeyBox">
+  <defs>
+    <linearGradient id="gTop" gradientUnits="userSpaceOnUse" x1="128" y1="36" x2="128" y2="128">
+      <stop offset="0" stop-color="#6FE8F8"/><stop offset="1" stop-color="#A3AAFF"/>
+    </linearGradient>
+    <linearGradient id="gLeft" gradientUnits="userSpaceOnUse" x1="48.32566285183165" y1="82.0" x2="48.32566285183165" y2="220">
+      <stop offset="0" stop-color="#55B2F9"/><stop offset="1" stop-color="#5330C9"/>
+    </linearGradient>
+    <linearGradient id="gRight" gradientUnits="userSpaceOnUse" x1="207.67433714816835" y1="82.0" x2="128" y2="220">
+      <stop offset="0" stop-color="#8F79F8"/><stop offset="1" stop-color="#EC5FA5"/>
+    </linearGradient>
+
+  </defs>
+  <path d="M 120.03 43.57 Q 128.00 38.97 135.97 43.57 L 194.55 77.40 Q 202.52 82.00 194.55 86.60 L 135.97 120.43 Q 128.00 125.03 120.03 120.43 L 61.45 86.60 Q 53.48 82.00 61.45 77.40 Z" fill="url(#gTop)"/>
+  <path d="M 197.13 91.06 Q 205.10 86.46 205.10 95.66 L 205.10 163.31 Q 205.10 172.51 197.13 177.11 L 138.54 210.94 Q 130.58 215.54 130.58 206.34 L 130.58 138.69 Q 130.58 129.49 138.54 124.89 Z" fill="url(#gRight)"/>
+  <path d="M 50.90 95.66 Q 50.90 86.46 58.87 91.06 L 117.46 124.89 Q 125.42 129.49 125.42 138.69 L 125.42 206.34 Q 125.42 215.54 117.46 210.94 L 58.87 177.11 Q 50.90 172.51 50.90 163.31 Z" fill="url(#gLeft)"/>
+  <polyline points="68.24,118.34 96.93,156.06 68.24,160.66" fill="none"
+    stroke="#FFFFFF" stroke-width="12.88" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="145.53" y1="181.36" x2="178.99" y2="162.04"
+    stroke="#FFFFFF" stroke-width="12.88" stroke-linecap="round"/>
+</svg>

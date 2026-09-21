@@ -9,7 +9,14 @@
    Everything genuinely occasional is behind the menu — present, not shouting. *@
 <div class="shell">
     <header class="shell-topbar">
-        <span class="brand"><span class="brand-mark">CB</span>CodeyBox</span>
+        @* The wordmark ships in a light-ink and a dark-ink cut; CSS shows the one
+           that suits the current theme, and the icon alone once the bar is narrow.
+           The images are decorative — the link carries the name for a screen reader. *@
+        <a class="brand" href="/map" aria-label="CodeyBox — fleet map">
+            <img class="brand-logo brand-logo--dark" src="brand/codeybox-logo-dark.svg" alt="" aria-hidden="true" />
+            <img class="brand-logo brand-logo--light" src="brand/codeybox-logo.svg" alt="" aria-hidden="true" />
+            <img class="brand-icon" src="brand/codeybox-icon.svg" alt="" aria-hidden="true" />
+        </a>
 
         <nav class="tabs" aria-label="Views">
             <NavLink class="tab" href="/map" Match="NavLinkMatch.All">Map view</NavLink>

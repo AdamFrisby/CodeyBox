@@ -186,13 +186,6 @@ summary:focus-visible,
     z-index: 100;
 }
 
-.admin-nav-brand {
-    font-weight: 700;
-    font-size: 0.9rem;
-    letter-spacing: 0.02em;
-    margin-right: 0.5rem;
-    white-space: nowrap;
-}
 
 .admin-nav a {
     color: var(--text-dim);
@@ -2461,12 +2454,16 @@ summary:focus-visible,
     position: sticky; top: 0; z-index: 20;
 }
 
-.brand { display: inline-flex; align-items: center; gap: 0.5rem; color: var(--text); font-weight: 600; font-size: 0.9rem; flex: none; }
-.brand-mark {
-    display: grid; place-items: center; width: 1.5rem; height: 1.5rem;
-    border-radius: var(--radius-m); background: var(--accent); color: var(--bg);
-    font-size: 0.66rem; font-weight: 700;
-}
+/* Brand. The wordmark carries its own colour, so it is never tinted by --text. */
+.brand { display: inline-flex; align-items: center; flex: none; text-decoration: none; }
+.brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--radius-m); }
+.brand-logo { display: block; height: 1.4rem; width: auto; }
+.brand-icon { display: none; height: 1.5rem; width: auto; }
+
+/* Dark is the default theme (the toggle REMOVES data-theme for dark and sets
+   data-theme="light" for light), so the light-ink cut is the one hidden by default. */
+:root:not([data-theme="light"]) .brand-logo--light { display: none; }
+:root[data-theme="light"] .brand-logo--dark { display: none; }
 
 /* Tabs are views of one thing, so they sit together and read as a pair. */
 .tabs { display: flex; gap: 0.15rem; }
@@ -2527,5 +2524,8 @@ summary:focus-visible,
 
 @media (max-width: 40rem) {
     .shell-topbar { gap: 0.6rem; padding: 0 0.6rem; }
-    .brand span:not(.brand-mark) { display: none; }
+    /* !important because the theme rules above select on :root[data-theme] and so
+       outrank a plain class selector here; the wordmark must go at every theme. */
+    .brand-logo { display: none !important; }
+    .brand-icon { display: block; }
 }
