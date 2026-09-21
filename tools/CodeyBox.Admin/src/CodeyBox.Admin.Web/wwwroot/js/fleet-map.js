@@ -446,10 +446,15 @@
                 // The name sits in the gutter above the lane, stays in view when
                 // the lane runs off the left edge, and is plated when the gutter
                 // is too thin for it at this zoom: the chain's name is essential.
-                var lx0 = Math.max(p0.x, 4) + 6, room = p0.x + sw - lx0 - 4;
+                // Pinned: a visible lane's name never rides off an edge or under the legend.
+                var legendTop = st.legendRect ? st.legendRect.y - 4 : st.h, lyTop = 26, lyBot = Math.max(lyTop, legendTop - 14);
+                var lx0 = clamp(p0.x + 6, 4, Math.max(4, st.w - 64)), room = Math.min(p0.x + sw, st.w) - lx0 - 4;
                 ctx.font = "600 11px " + th.sans;
                 var lbl = fitText(ctx, ln.label, Math.max(40, room));
-                var lAt = label(st, lbl, "600 11px " + th.sans, alpha(th.dim, 0.95), [{ x: lx0, y: p0.y - 16 }, { x: lx0, y: p0.y + 3 }], { h: 13, kinds: ["body", "label"] });
+                var topY = clamp(p0.y - 16, lyTop, lyBot), botY = clamp(p0.y + sh - 14, lyTop, lyBot);
+                var lAt = label(st, lbl, "600 11px " + th.sans, alpha(th.dim, 0.95),
+                    [{ x: lx0, y: topY }, { x: lx0, y: clamp(topY + 15, lyTop, lyBot) }, { x: lx0, y: clamp(topY + 30, lyTop, lyBot) }, { x: lx0, y: botY }, { x: lx0, y: clamp(botY - 15, lyTop, lyBot) }],
+                    { h: 13, kinds: ["body", "label", "stub"] });
                 if (lAt && (ln.n > 1 || ln.blocked || ln.running || ln.settled)) {
                     var meta = ln.n + (ln.n === 1 ? " item" : " items") + (ln.blocked ? " · " + ln.blocked + " blocked" : "") + (ln.running ? " · " + ln.running + " running" : "") + (ln.settled ? " · " + ln.settled + " settled" : "");
                     if (lAt.x + lAt.w + 8 + ctx.measureText(meta).width < p0.x + sw) label(st, meta, "10px " + th.mono, alpha(th.faint, 0.95), [{ x: lAt.x + lAt.w + 8, y: lAt.y + 1 }], { h: 12, drop: true, kinds: ["body", "label"] });
@@ -457,38 +462,13 @@
             }
         }
 
-        // Edges: dependency → dependent, horizontal-tangent curves, arrow at the dependent.
-        ctx.lineWidth = level === 2 ? 1.4 : 1.1;
-        for (i = 0; i < fr.edges.length; i++) {
-            var e = fr.edges[i], a = byId[e.from], b = byId[e.to];
-            if (!a || !b) continue;
-            var pa = toScreen(st, a.x, a.y), pb = toScreen(st, b.x, b.y);
-            // An edge with a visible end says where that node's relation goes;
-            // one with neither end in view is passing traffic and recedes —
-            // continuously with distance off-screen, so panning never pops.
-            var seen = Math.max(visibility(st, pa), visibility(st, pb));
-            if (seen <= 0.02 && (Math.max(pa.x, pb.x) < -40 || Math.min(pa.x, pb.x) > st.w + 40 || Math.max(pa.y, pb.y) < -40 || Math.min(pa.y, pb.y) > st.h + 40) && !(Math.min(pa.x, pb.x) < st.w && Math.max(pa.x, pb.x) > 0 && Math.min(pa.y, pb.y) < st.h && Math.max(pa.y, pb.y) > 0)) continue;
-            var ax = level === 2 ? pa.x + halfW : pa.x + r, bx = level === 2 ? pb.x - halfW : pb.x - r;
-            var blocked = b.activity === "BlockedByDependency";
-            var settledEdge = a.settled && b.settled;
-            var strength = 0.1 + 0.9 * seen;
-            ctx.strokeStyle = alpha(blocked ? th.orange : th.faint, (settledEdge ? 0.25 : blocked ? 0.55 : 0.45) * strength);
-            ctx.beginPath();
-            ctx.moveTo(ax, pa.y);
-            var mx = (ax + bx) / 2;
-            if (e.bend) {
-                // Something stood in the straight run: arc over it (the model
-                // chose the apex), so the crossing is deliberate, not a graze.
-                var apex = Math.min(pa.y, pb.y) + e.bend * z, dx3 = (bx - ax) / 3;
-                ctx.bezierCurveTo(ax + dx3, apex, bx - dx3, apex, bx, pb.y);
-            } else {
-                ctx.bezierCurveTo(mx, pa.y, mx, pb.y, bx, pb.y);
-            }
-            ctx.stroke();
-            ctx.fillStyle = ctx.strokeStyle;
-            ctx.beginPath();
-            ctx.moveTo(bx, pb.y); ctx.lineTo(bx - 6, pb.y - 3.2); ctx.lineTo(bx - 6, pb.y + 3.2); ctx.closePath(); ctx.fill();
-        }
+        // Edges: dependency → dependent. Fans from one source (or into one
+        // target) run as a bundle of parallel lines — subway-track style — to
+        // a split point and fan out from there; every line stays its own
+        // line. A source off-screen is named at the point its wire enters,
+        // and the wire starts at that name. Edges with neither end in view
+        // recede; an edge with a named source does not.
+        drawEdges(st, byId, level, halfW, halfH, r);
 
         // The "+ dependent" preview for the hovered node: an empty box drawn
         // where the new node would land, joined by the edge that would exist.
@@ -512,7 +492,7 @@
             if (level === 2) {
                 drawCard(st, n, p, color, halfW, halfH, hovered, open, fr.details && fr.details[n.id]);
                 st.hit.push({ id: n.id, x: p.x - halfW, y: p.y - halfH, w: halfW * 2, h: halfH * 2 });
-                if (canTakeDependent(n) && open < 0.5) drawPlus(st, n, p, level, halfW, r);
+                if (canTakeDependent(n)) drawPlus(st, n, p, level, halfW, r);
                 if (isRunning) st.running.push({ id: n.id, x: p.x - halfW + 9 * z, y: p.y - halfH + 8 * z, r: Math.max(4, 3 * z), color: color, ring: false });
             } else {
                 drawShape(ctx, n.shape, p.x, p.y, r);
@@ -545,7 +525,7 @@
                 if (isRunning) st.running.push({ id: n.id, x: p.x, y: p.y, r: r + 4, color: color, ring: true });
                 if (n.waiting >= 3) {
                     label(st, "⇢ " + n.waiting + " waiting", "600 " + Math.max(o.minTextPx, 10) + "px " + th.mono, alpha(th.orange, 0.95),
-                        [{ x: p.x, y: p.y + r + 4 }, { x: p.x, y: p.y - r - 15 }, { x: p.x + r + 6, y: p.y + r + 2 }], { h: 12, align: "center" });
+                        [{ x: p.x, y: p.y + r + 4 }, { x: p.x, y: p.y - r - 15 }, { x: p.x + r + 6, y: p.y + r + 2 }, { x: p.x, y: p.y + r + 18 }, { x: p.x + r + 6, y: p.y - r - 15 }], { h: 12, align: "center", kinds: ["body", "label", "stub", "hud"] });
                 }
             }
             ctx.globalAlpha = 1;
@@ -636,15 +616,43 @@
             ctx.strokeStyle = alpha(th.accent, 0.9); ctx.beginPath(); ctx.moveTo(nowSx, h - 6); ctx.lineTo(nowSx, h); ctx.stroke();
             ctx.fillStyle = th.accentStrong; ctx.textAlign = "center"; ctx.fillText("now", nowSx, h / 2 - 1);
         }
-        // Breaks: a quiet mark each; the skipped duration only when hovered
-        // (the pointer readout covers the rest). "now" and earlier labels are
-        // never covered — a label that cannot fit shrinks to the bare mark.
+        // The past, grouped for legibility: runs are walked newest first and
+        // merged until a group is wide enough on screen to carry a date, so
+        // every surviving group is dated and the marks between groups are
+        // bounded by what fits — zooming in splits groups and dates more.
+        // Positions never change; only what the ruler says about them does.
         var taken = nowHalf ? [[nowSx - nowHalf, nowSx + nowHalf]] : [], i, w, q;
         var breaks = fr.axis.breaks || [];
         function free(x0, x1) { for (var k = 0; k < taken.length; k++) if (x1 > taken[k][0] && x0 < taken[k][1]) return false; return true; }
+        var LABEL_PX = 74, z0 = st.cam.zoom;
+        var runs = (fr.axis.stretches || []).slice().sort(function (r1, r2) { return r2.x1 - r1.x1; });
+        var groups = [], cur = null;
+        for (i = 0; i < runs.length; i++) {
+            var rn = runs[i];
+            if (!cur) cur = { x0: rn.x0, x1: rn.x1, t0: rn.t0, t1: rn.t1, runs: 1 };
+            else { cur.x0 = rn.x0; cur.t0 = rn.t0; cur.runs++; }
+            if ((cur.x1 - cur.x0) * z0 >= LABEL_PX) { groups.push(cur); cur = null; }
+        }
+        if (cur) groups.push(cur);
+        var insideGroup = function (bk) { for (var g = 0; g < groups.length; g++) if (bk.x > groups[g].x0 && bk.x + bk.w < groups[g].x1) return true; return false; };
+        for (i = 0; i < groups.length; i++) {
+            var g1 = groups[i], gx0 = toScreen(st, g1.x0, 0).x, gx1 = toScreen(st, g1.x1, 0).x;
+            if (gx1 < 0 || gx0 > st.w) continue;
+            var d0 = new Date(g1.t0), d1 = new Date(g1.t1), spanH = (d1 - d0) / 3600000;
+            ctx.font = "10px " + th.mono;
+            var text = spanH < 6 && g1.runs === 1 ? fmtClock(g1.t1) : fmtDay(d1);
+            if (spanH >= 24 && fmtDay(d0) !== fmtDay(d1)) { var range = fmtDay(d0) + " – " + fmtDay(d1); if (ctx.measureText(range).width + 8 <= gx1 - gx0) text = range; }
+            w = ctx.measureText(text).width;
+            var lx = clamp((gx0 + gx1) / 2 - w / 2, Math.max(2, gx0), Math.min(st.w - w - 2, gx1 - w));
+            if (lx < 2 || lx + w > st.w - 2 || !free(lx - 4, lx + w + 4)) continue;
+            ctx.strokeStyle = alpha(th.faint, 0.6); ctx.beginPath(); ctx.moveTo(gx1, h - 6); ctx.lineTo(gx1, h); ctx.stroke();
+            ctx.fillStyle = alpha(th.dim, 0.9); ctx.textAlign = "left"; ctx.fillText(text, lx, h / 2 - 1);
+            taken.push([lx - 4, lx + w + 4]);
+        }
         for (i = 0; i < breaks.length; i++) {
             var bk = breaks[i], bx0 = toScreen(st, bk.x, 0).x, bw0 = Math.max(6, bk.w * st.cam.zoom), bcx = bx0 + bw0 / 2;
             if (bx0 > st.w || bx0 + bw0 < 0) continue;
+            if (insideGroup(bk) && st.hover !== "break:" + i) continue; // merged into its group's dead air
             ctx.fillStyle = alpha(th.faint, 0.1); ctx.fillRect(bx0, 0, bw0, h);
             ctx.font = "700 10px " + th.mono;
             var bl = st.hover === "break:" + i ? "⋯" + bk.label + "⋯" : "⋯";
@@ -668,8 +676,9 @@
             var t = fr.axis.ticks[i], sx = toScreen(st, t.x, 0).x;
             if (t.zone === "now" || sx < 0 || sx > st.w) continue;
             var future = t.zone === "future";
-            ctx.font = "10px " + (future ? th.sans : th.mono);
-            var label = future ? (t.label === "next" ? "next" : "batch " + t.label) : (t.at ? fmtClock(t.at) : t.label);
+            if (!future) continue; // the past is dated by its groups above
+            ctx.font = "10px " + th.sans;
+            var label = t.label === "next" ? "next" : "batch " + t.label;
             w = ctx.measureText(label).width;
             if (sx - w / 2 < lastRight + 6) continue; // crowded: skip, never overlap
             if (Math.abs(sx - nowSx) < nowHalf + w / 2) continue; // never over "now"
@@ -770,7 +779,7 @@
             for (var k = 0; k < order.length; k++) {
                 var gy = order[k];
                 if (gy < 28 || gy > st.h - 4) continue;
-                if (!st.occ.free(Math.min(chX, p.x) - 2, gy - 4, Math.abs(chX - p.x) + 4, 8, ["label", "body"])) continue;
+                if (!st.occ.free(Math.min(chX, p.x) - 2, gy - 4, Math.abs(chX - p.x) + 4, 8, ["body"])) continue;
                 pts.push([chX, gy]); pts.push([p.x, gy]); pts.push([p.x, gy < p.y ? top : bottom]);
                 return { pts: pts, tip: gy < p.y ? "down" : "up" };
             }
@@ -803,9 +812,10 @@
             ctx.beginPath();
             for (var k = 0; k < route.pts.length; k++) { if (k === 0) ctx.moveTo(route.pts[k][0], route.pts[k][1]); else ctx.lineTo(route.pts[k][0], route.pts[k][1]); }
             halo(st, hot ? 5 : 4);
-            ctx.strokeStyle = alpha(col, hot ? 0.95 : lead.top ? 0.75 : 0.5);
-            ctx.lineWidth = hot ? 2 : 1.2;
-            ctx.setLineDash(hot ? [] : [4, 3]);
+            // A fine dotted thread across the gutter; solid and bright only when the card or node is hovered.
+            ctx.strokeStyle = alpha(col, hot ? 0.95 : lead.top ? 0.6 : 0.4);
+            ctx.lineWidth = hot ? 2 : 1;
+            ctx.setLineDash(hot ? [] : [2, 4]);
             ctx.stroke();
             ctx.setLineDash([]);
             ctx.fillStyle = ctx.strokeStyle;
@@ -978,9 +988,9 @@
             var pad = 8 * z, tx = x + pad, maxW = w - pad * 2;
             var fs = Math.min(13, 12 * Math.max(1, z * 0.7));
             ctx.textBaseline = "top"; ctx.textAlign = "left";
-            // The name leads, wrapped to three lines.
+            // The name leads, wrapped to as many lines as the top half of the card holds (never fewer than three).
             ctx.font = "600 " + fs + "px " + th.sans; ctx.fillStyle = n.settled ? th.dim : th.text;
-            var lines = wrapWords(ctx, n.title || "", maxW, 3), ly = y + 7 * z;
+            var lines = wrapWords(ctx, n.title || "", maxW, Math.max(3, Math.floor((h * 0.5) / (fs + 3)))), ly = y + 7 * z;
             for (var li = 0; li < lines.length; li++) { ctx.fillText(lines[li], tx, ly); ly += fs + 3; }
             // State · agent · age.
             ly += 3;
@@ -1072,9 +1082,11 @@
         // The name, in full, wrapped.
         ctx.font = "700 4.8px " + th.sans; ctx.fillStyle = th.text; ctx.textBaseline = "top";
         var isDecision = n.needsYou && detail && detail.decision;
-        var lines = wrapWords(ctx, n.title || "", W - 12, isDecision ? 2 : B.titleLines), ty = 14;
+        var lines = wrapWords(ctx, n.title || "", W - 12, isDecision ? 5 : 6), ty = 14;
         for (var li = 0; li < lines.length; li++) { ctx.fillText(lines[li], 7, ty); ty += B.lineH; }
         ctx.textBaseline = "middle";
+        // A long name pushes the circuit down rather than being cut short.
+        var titleExtra = Math.max(0, ty - (14 + B.titleLines * B.lineH));
 
         if (isDecision) { drawDecision(st, n, x, y, color, detail.decision, ty + 4); ctx.restore(); return; }
 
@@ -1103,7 +1115,7 @@
         if (!loading) for (var i = 0; i < detail.stages.length; i++) stages[detail.stages[i].key] = detail.stages[i];
 
         // The spine: plan → work → audit ⇒ merge → landed. Solid, continuing right.
-        var cy = B.rowY, r = B.stageR, pos = [];
+        var cy = B.rowY + titleExtra, r = B.stageR, pos = [];
         for (i = 0; i < STAGES.length; i++) pos.push(B.stageX0 + i * B.stagePitch);
         ctx.lineWidth = 0.6;
         for (i = 0; i < STAGES.length - 1; i++) {
@@ -1264,6 +1276,187 @@
         ctx.fillText(fitText(ctx, d.waitingOn || n.activityText || "", W - 12), 7, H - 7);
     }
 
+    // ── edges ────────────────────────────────────────────────────────────
+    function segDist(px, py, x1, y1, x2, y2) {
+        var dx = x2 - x1, dy = y2 - y1, l2 = dx * dx + dy * dy, t = l2 ? clamp(((px - x1) * dx + (py - y1) * dy) / l2, 0, 1) : 0;
+        var qx = x1 + t * dx, qy = y1 + t * dy;
+        return Math.sqrt((px - qx) * (px - qx) + (py - qy) * (py - qy));
+    }
+    // Where the straight run a→b enters the canvas (Liang–Barsky), or null.
+    function entryPoint(st, a, b) {
+        var t0 = 0, t1 = 1, dx = b.x - a.x, dy = b.y - a.y;
+        var p = [-dx, dx, -dy, dy], q = [a.x - 0, st.w - a.x, a.y - 24, st.h - a.y];
+        for (var i = 0; i < 4; i++) {
+            if (p[i] === 0) { if (q[i] < 0) return null; continue; }
+            var t = q[i] / p[i];
+            if (p[i] < 0) { if (t > t1) return null; if (t > t0) t0 = t; }
+            else { if (t < t0) return null; if (t < t1) t1 = t; }
+        }
+        return { x: a.x + t0 * dx, y: a.y + t0 * dy };
+    }
+    function drawEdges(st, byId, level, halfW, halfH, r) {
+        var fr = st.frame, ctx = st.ctx, th = st.theme, z = st.cam.zoom, o = fr.opts, i, k;
+        var legendTop = st.legendRect ? st.legendRect.y - 4 : st.h;
+        st.edgeSegs = [];
+        st.stubs = {};
+        // 1. Classify: endpoints, visibility, whether the source needs a stub.
+        var live = [], bySource = {}, byTarget = {};
+        for (i = 0; i < fr.edges.length; i++) {
+            var e = fr.edges[i], a = byId[e.from], b = byId[e.to];
+            if (!a || !b) continue;
+            var pa = toScreen(st, a.x, a.y), pb = toScreen(st, b.x, b.y);
+            var va = visibility(st, pa), vb = visibility(st, pb);
+            var onScreenRun = Math.min(pa.x, pb.x) < st.w && Math.max(pa.x, pb.x) > 0 && Math.min(pa.y, pb.y) < st.h && Math.max(pa.y, pb.y) > 24;
+            if (va <= 0.02 && vb <= 0.02 && !onScreenRun) continue;
+            var ed = { e: e, a: a, b: b, pa: pa, pb: pb, va: va, vb: vb, stub: va <= 0.02 && vb > 0.02 && (pa.x < 0 || pa.y < 24 || pa.y > st.h) };
+            live.push(ed);
+            (bySource[e.from] = bySource[e.from] || []).push(ed);
+            (byTarget[e.to] = byTarget[e.to] || []).push(ed);
+        }
+        // 2. Stubs: one per off-screen source, packed through the registry;
+        //    the overflow collapses into one summary stub.
+        var stubOrder = [], overflow = 0, sid;
+        for (sid in bySource) { for (k = 0; k < bySource[sid].length; k++) if (bySource[sid][k].stub) { stubOrder.push(sid); break; } }
+        stubOrder.sort(function (p1, p2) { return bySource[p1][0].pa.y - bySource[p2][0].pa.y; });
+        ctx.font = "600 10px " + th.sans;
+        for (i = 0; i < stubOrder.length; i++) {
+            sid = stubOrder[i];
+            var eds = bySource[sid], src = eds[0].a, entry = null;
+            for (k = 0; k < eds.length && !entry; k++) if (eds[k].stub) entry = entryPoint(st, eds[k].pa, eds[k].pb);
+            if (!entry) continue;
+            var text = fitText(ctx, src.title || "", 150), tw = ctx.measureText(text).width + 16, th2 = 14;
+            var sx = entry.x <= 0 ? 2 : entry.x >= st.w ? st.w - tw - 2 : clamp(entry.x - tw / 2, 2, st.w - tw - 2);
+            var sy = clamp(entry.y - th2 / 2, 26, Math.max(26, legendTop - th2 - 2));
+            var cands = [{ x: sx, y: sy }, { x: sx, y: sy + 16 }, { x: sx, y: sy - 16 }, { x: sx, y: sy + 32 }, { x: sx, y: sy - 32 }];
+            var spot = st.occ.place(cands, tw, th2, ["body", "label", "stub"]);
+            if (spot.plated) { overflow++; continue; }
+            var stub = { id: sid, x: spot.x, y: spot.y, w: tw, h: th2, text: text, out: entry.x <= 0 ? "right" : entry.x >= st.w ? "left" : entry.y <= 24 ? "down" : "up" };
+            st.stubs[sid] = stub;
+            st.occ.claim(spot.x, spot.y, tw, th2, "stub");
+        }
+        if (overflow > 0) {
+            var otext = "+" + overflow + " more source" + (overflow === 1 ? "" : "s") + " off-screen", ow = ctx.measureText(otext).width + 16;
+            var ospot = st.occ.place([{ x: 2, y: Math.max(26, legendTop - 18) }, { x: 2, y: Math.max(26, legendTop - 36) }], ow, 14, ["body", "label", "stub"]);
+            st.stubs["~overflow"] = { id: "~overflow", x: ospot.x, y: ospot.y, w: ow, h: 14, text: otext, out: "right", summary: true };
+        }
+        // 3. Bundles: fans of three or more edges from one source (or into one
+        //    target) share a trunk and a vertical bus — subway style: each
+        //    line keeps its own offset, runs the bus to its target's row and
+        //    then straight in, passing under nearer boxes (their halos break
+        //    it) rather than curving round them. The rest draw as curves.
+        var drawn = {}, bundles = [];
+        function collect(map, dir) {
+            for (var key in map) {
+                var ms = [];
+                for (var m = 0; m < map[key].length; m++) { var ed2 = map[key][m]; if (!drawn[ed2.e.from + ">" + ed2.e.to]) ms.push(ed2); }
+                if (ms.length < 3) continue;
+                for (m = 0; m < ms.length; m++) drawn[ms[m].e.from + ">" + ms[m].e.to] = true;
+                bundles.push({ dir: dir, members: ms });
+            }
+        }
+        collect(bySource, "out"); collect(byTarget, "in");
+        function edgeStyle(ed) {
+            var blocked = ed.b.activity === "BlockedByDependency", settledEdge = ed.a.settled && ed.b.settled;
+            var seen = ed.stub || st.stubs[ed.e.from] ? 1 : Math.max(ed.va, ed.vb);
+            var hot = st.hoverEdge === ed.e.from + ">" + ed.e.to;
+            var base = settledEdge ? 0.25 : blocked ? 0.55 : 0.45;
+            return { color: hot ? th.accentStrong : blocked ? th.orange : th.faint, alpha: hot ? 1 : base * (0.1 + 0.9 * seen), width: hot ? 2 : level === 2 ? 1.4 : 1.1 };
+        }
+        function startOf(ed) {
+            var stub = st.stubs[ed.e.from];
+            if (stub) return stub.out === "right" ? { x: stub.x + stub.w, y: stub.y + stub.h / 2 } : stub.out === "left" ? { x: stub.x, y: stub.y + stub.h / 2 } : stub.out === "down" ? { x: stub.x + stub.w / 2, y: stub.y + stub.h } : { x: stub.x + stub.w / 2, y: stub.y };
+            return { x: level === 2 ? ed.pa.x + halfW : ed.pa.x + r, y: ed.pa.y };
+        }
+        function endOf(ed) { return { x: level === 2 ? ed.pb.x - halfW : ed.pb.x - r, y: ed.pb.y }; }
+        function arrow(ex, ey, col) { ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(ex - 6, ey - 3.2); ctx.lineTo(ex - 6, ey + 3.2); ctx.closePath(); ctx.fill(); }
+        // Bundles first (under the singles, which are fewer and more specific).
+        for (i = 0; i < bundles.length; i++) {
+            var bd = bundles[i], ms = bd.members, n = ms.length;
+            var hub = bd.dir === "out" ? startOf(ms[0]) : endOf(ms[0]);
+            var stubbed = bd.dir === "out" && !!st.stubs[ms[0].e.from];
+            // Trunk: from the hub straight along x to the split, which sits
+            // short of the nearest member's far end.
+            var far = Infinity;
+            for (k = 0; k < n; k++) { var fe = bd.dir === "out" ? endOf(ms[k]) : startOf(ms[k]); far = Math.min(far, Math.abs(fe.x - hub.x)); }
+            var trunk = clamp(far * 0.45, 14, Math.max(14, 90 * Math.min(1, z)));
+            var splitX = bd.dir === "out" ? hub.x + trunk : hub.x - trunk;
+            ms.sort(function (m1, m2) { return (bd.dir === "out" ? m1.pb.y - m2.pb.y : m1.pa.y - m2.pa.y); });
+            var pitch = Math.min(1.6, Math.max(0.15, ((level === 2 ? halfH * 2 : r * 2) - 4) / n));
+            for (k = 0; k < n; k++) {
+                var ed = ms[k], st1 = edgeStyle(ed), off = (k - (n - 1) / 2) * pitch;
+                var from = bd.dir === "out" ? hub : startOf(ed), to = bd.dir === "out" ? endOf(ed) : hub;
+                ctx.strokeStyle = alpha(st1.color, st1.alpha); ctx.lineWidth = st1.width; ctx.setLineDash([]);
+                ctx.beginPath();
+                var pts;
+                if (bd.dir === "out") {
+                    pts = [[from.x, from.y + off], [splitX + off, from.y + off], [splitX + off, to.y + off], [to.x, to.y + off]];
+                } else {
+                    pts = [[from.x, from.y + off], [splitX - off, from.y + off], [splitX - off, to.y + off], [to.x, to.y + off]];
+                }
+                ctx.moveTo(pts[0][0], pts[0][1]); for (var q = 1; q < pts.length; q++) ctx.lineTo(pts[q][0], pts[q][1]);
+                ctx.stroke();
+                arrow(pts[3][0], pts[3][1], ctx.strokeStyle);
+                st.edgeSegs.push({ key: ed.e.from + ">" + ed.e.to, ed: ed, pts: pts });
+            }
+            if (stubbed) { /* the trunk starts at the stub: nothing more to draw */ }
+        }
+        // Singles: horizontal-tangent curves (or the model's arc over an obstacle).
+        for (i = 0; i < live.length; i++) {
+            var ed3 = live[i];
+            if (drawn[ed3.e.from + ">" + ed3.e.to]) continue;
+            var s3 = edgeStyle(ed3), a3 = startOf(ed3), b3 = endOf(ed3);
+            ctx.strokeStyle = alpha(s3.color, s3.alpha); ctx.lineWidth = s3.width; ctx.setLineDash([]);
+            ctx.beginPath(); ctx.moveTo(a3.x, a3.y);
+            var mx = (a3.x + b3.x) / 2, segs;
+            if (ed3.e.bend) {
+                var apex = Math.min(ed3.pa.y, ed3.pb.y) + ed3.e.bend * z, dx3 = (b3.x - a3.x) / 3;
+                ctx.bezierCurveTo(a3.x + dx3, apex, b3.x - dx3, apex, b3.x, b3.y);
+                segs = [[a3.x, a3.y], [a3.x + dx3, apex], [b3.x - dx3, apex], [b3.x, b3.y]];
+            } else {
+                ctx.bezierCurveTo(mx, a3.y, mx, b3.y, b3.x, b3.y);
+                segs = [[a3.x, a3.y], [mx, a3.y], [mx, b3.y], [b3.x, b3.y]];
+            }
+            ctx.stroke();
+            arrow(b3.x, b3.y, ctx.strokeStyle);
+            st.edgeSegs.push({ key: ed3.e.from + ">" + ed3.e.to, ed: ed3, pts: segs });
+        }
+        // 4. The stubs themselves, on top of the wires they emit.
+        for (sid in st.stubs) {
+            var sb = st.stubs[sid], shot = st.hoverStub === sid;
+            roundRect(ctx, sb.x, sb.y, sb.w, sb.h, 4);
+            ctx.fillStyle = alpha(th.overlay, 0.97); ctx.fill();
+            ctx.lineWidth = 1; ctx.strokeStyle = shot ? th.accent : alpha(th.borderStrong, 0.9); ctx.stroke();
+            ctx.font = "600 10px " + th.sans; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+            ctx.fillStyle = sb.summary ? th.dim : shot ? th.accentStrong : th.text;
+            ctx.fillText((sb.summary ? "" : "◂ ") + sb.text, sb.x + 6, sb.y + sb.h / 2 + 0.5);
+            if (!sb.summary) st.hit.push({ id: sid, action: "goto", stubHit: true, x: sb.x, y: sb.y, w: sb.w, h: sb.h });
+        }
+        // 5. The hovered edge, named.
+        if (st.hoverEdge && st.pointer) {
+            for (i = 0; i < st.edgeSegs.length; i++) {
+                if (st.edgeSegs[i].key !== st.hoverEdge) continue;
+                var hed = st.edgeSegs[i].ed;
+                drawTooltip(st, { id: hed.e.to, x: (st.pointer.x - st.w / 2) / z + st.cam.x, y: (st.pointer.y - st.h / 2) / z + st.cam.y,
+                    title: (hed.b.title || "") + " waits on " + (hed.a.title || ""), stateText: hed.b.activity === "BlockedByDependency" ? "blocked by it right now" : "dependency", sub: "" });
+                break;
+            }
+        }
+    }
+    function edgeAt(st, sx, sy) {
+        var best = null, bestD = 5;
+        for (var i = 0; i < (st.edgeSegs || []).length; i++) {
+            var sg = st.edgeSegs[i];
+            for (var k = 0; k + 1 < sg.pts.length; k++) {
+                var d = segDist(sx, sy, sg.pts[k][0], sg.pts[k][1], sg.pts[k + 1][0], sg.pts[k + 1][1]);
+                if (d < bestD) { bestD = d; best = sg.key; }
+            }
+        }
+        return best;
+    }
+    function fmtDay(d) {
+        if (isNaN(d.getTime())) return "";
+        return d.getDate() + " " + ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()];
+    }
     function fmtClock(iso) {
         var d = new Date(iso);
         if (isNaN(d.getTime())) return "";
@@ -1295,17 +1488,27 @@
             return { zone: "future", batch: best };
         }
         for (i = 0; i < (ax.breaks || []).length; i++) { var bk = ax.breaks[i]; if (wx >= bk.x && wx <= bk.x + bk.w) return { zone: "past", brk: bk }; }
-        var newest = -Infinity;
-        for (i = 0; i < (ax.stretches || []).length; i++) {
-            var run = ax.stretches[i]; if (run.x1 > newest) newest = run.x1;
-            if (wx >= run.x0 - o.nodeW / 2 && wx <= run.x1 + o.nodeW / 2) {
-                var cl = clamp(wx, run.x0, run.x1), at = new Date(new Date(run.t1).getTime() - (run.x1 - cl) / rate * 60000);
-                return { zone: "past", at: at.toISOString(), ago: fmtAgo(now - at) };
-            }
-        }
+        // Mirror of TimeAxisScale.Decompress: axis minutes back to real minutes.
+        var tau = Math.max(1, o.compressAfter || 30), kappa = Math.max(0.01, o.compression || 0.4);
+        function decompress(m) { return m <= tau ? Math.max(0, m) : tau * Math.exp((m - tau) / (kappa * tau)); }
+        var runs = ax.stretches || [], newest = -Infinity;
+        for (i = 0; i < runs.length; i++) if (runs[i].x1 > newest) newest = runs[i].x1;
         var cutBetween = false;
-        for (i = 0; i < (ax.breaks || []).length; i++) if (ax.breaks[i].x >= newest && ax.breaks[i].x + ax.breaks[i].w <= 0) cutBetween = true;
-        if (!cutBetween && wx > newest) { var at2 = new Date(now.getTime() - (-wx / rate) * 60000); return { zone: "past", at: at2.toISOString(), ago: fmtAgo(now - at2) }; }
+        for (i = 0; i < (ax.breaks || []).length; i++) if (ax.breaks[i].x + ax.breaks[i].w > newest && ax.breaks[i].x <= 0) cutBetween = true;
+        if (!cutBetween && wx > newest) { var at2 = new Date(now.getTime() - decompress(-wx / rate) * 60000); return { zone: "past", at: at2.toISOString(), ago: fmtAgo(now - at2) }; }
+        for (i = 0; i < runs.length; i++) {
+            var run = runs[i];
+            if (wx < run.x0 - o.nodeW / 2 || wx > run.x1 + o.nodeW / 2) continue;
+            var pts = run.pts || [];
+            for (var q = 0; q + 1 < pts.length; q++) {
+                if (wx <= pts[q][0] && wx >= pts[q + 1][0]) {
+                    var at = new Date(new Date(pts[q][1]).getTime() - decompress((pts[q][0] - wx) / rate) * 60000);
+                    return { zone: "past", at: at.toISOString(), ago: fmtAgo(now - at) };
+                }
+            }
+            var edge = new Date(wx >= run.x1 ? run.t1 : run.t0);
+            return { zone: "past", at: edge.toISOString(), ago: fmtAgo(now - edge) };
+        }
         return { zone: "past" };
     }
     function clusterAsNode(cl) {
@@ -1586,13 +1789,17 @@
                     var h = hitTest(st, ev.clientX - rect.left, ev.clientY - rect.top);
                     var id = h ? h.id : null, btn = h && h.action && !h.ghost ? h.id + ":" + h.action : null, ghost = h && h.ghost ? h.id : null;
                     if (h && h.plus) id = h.id; // the (+) keeps its node hovered, so the preview stays
+                    var stubId = h && h.stubHit ? h.id : null;
+                    if (h && h.stubHit) { id = null; btn = null; }
+                    var edgeKey = h ? null : edgeAt(st, ev.clientX - rect.left, ev.clientY - rect.top);
+                    if (stubId !== st.hoverStub || edgeKey !== st.hoverEdge) { st.hoverStub = stubId; st.hoverEdge = edgeKey; }
                     if (h && h.sug && !h.action) btn = null;
                     // Hovering a blocker name keeps the parent card hovered.
                     if (h && h.action === "goto") { id = h.owner || st.hover; btn = (h.owner || st.hover) + ":" + h.id; }
                     if (id !== st.hover || btn !== st.hoverBtn || ghost !== st.hoverGhost) {
                         st.hover = id; st.hoverBtn = btn; st.hoverGhost = ghost;
-                        canvas.style.cursor = h && !h.brk ? "pointer" : "grab";
                     }
+                    canvas.style.cursor = (h && !h.brk) || st.hoverEdge ? "pointer" : "grab";
                     draw(st); // the ruler readout follows the pointer
                 });
                 var endDrag = function (ev) {
@@ -1627,7 +1834,7 @@
                 canvas.addEventListener("pointercancel", function () { dragging = false; });
                 canvas.addEventListener("pointerleave", function () {
                     st.pointer = null;
-                    st.hover = null; st.hoverBtn = null; st.hoverGhost = null; canvas.style.cursor = "grab"; draw(st);
+                    st.hover = null; st.hoverBtn = null; st.hoverGhost = null; st.hoverEdge = null; st.hoverStub = null; canvas.style.cursor = "grab"; draw(st);
                 });
                 canvas.addEventListener("wheel", function (ev) {
                     ev.preventDefault();
@@ -1709,7 +1916,9 @@
             if (!st) return null;
             var fr = st.frame || {};
             return { x: st.cam.x, y: st.cam.y, zoom: st.cam.zoom, travelling: !!st.travel, tweening: !!st.tween, hover: st.hover, w: st.w, h: st.h, reduced: st.reduced, running: st.running.length,
-                groups: Object.keys(st.byCluster || {}).length, breaks: fr.axis && fr.axis.breaks ? fr.axis.breaks.length : 0, frame: fr };
+                groups: Object.keys(st.byCluster || {}).length, breaks: fr.axis && fr.axis.breaks ? fr.axis.breaks.length : 0, frame: fr,
+                occ: st.occ ? st.occ.rects : [], stubs: Object.keys(st.stubs || {}), edges: (st.edgeSegs || []).length, hoverEdge: st.hoverEdge,
+                plus: (st.hit || []).filter(function (h) { return h.plus; }).map(function (h) { return { id: h.id, x: h.x, y: h.y }; }) };
         },
 
         // A rail card is hovered (or not): brighten its leader.

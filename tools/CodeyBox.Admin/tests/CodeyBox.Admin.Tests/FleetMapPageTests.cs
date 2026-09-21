@@ -335,8 +335,7 @@ public sealed class FleetMapPageTests : BunitContext
         Assert.Contains("\"breaks\":[{", payload, StringComparison.Ordinal);
         Assert.Contains("\"label\":\"2d\",\"exact\":\"1d 13h\"", payload, StringComparison.Ordinal); // 37.8 hours of quiet, said out loud
         Assert.Contains("\"at\":\"2026-09-22T05:00:00", payload, StringComparison.Ordinal); // past ticks carry the instant
-        Assert.True(layout.Nodes["a"].Spaced); // 12 minutes behind b in the same lane: a card's width apart
-        Assert.Contains("\"spaced\":true", payload, StringComparison.Ordinal);
+        Assert.Contains("\"pts\":[[", payload, StringComparison.Ordinal); // runs carry their landing points for the readout
         Assert.DoesNotContain("\"clusters\"", payload, StringComparison.Ordinal); // clusters are a rendering, not a layout object
         Assert.Equal(payload, FleetMapFrameBuilder.BuildPayload(snapshot, projection, layout, badges, camera, [], options));
     }

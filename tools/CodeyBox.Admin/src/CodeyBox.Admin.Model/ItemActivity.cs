@@ -99,7 +99,7 @@ public static class ActivityAnalyzer
         if (!ItemStates.IsQueued(state))
         {
             return ItemStates.KnownInFlight.Contains(state)
-                ? Activity(item.Id, ActivityKind.Running, $"Running ({state}).")
+                ? Activity(item.Id, ActivityKind.Running, ItemStates.IsExecuting(state) ? $"Running ({state})." : $"Between turns ({state}).")
                 : Activity(item.Id, ActivityKind.Unknown, $"Unrecognised state '{state}'.");
         }
 

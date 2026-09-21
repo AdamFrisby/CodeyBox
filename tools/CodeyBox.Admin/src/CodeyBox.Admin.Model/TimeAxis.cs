@@ -94,7 +94,16 @@ public static class AgeText
     }
 }
 
-/// <summary>A faithful run of the past axis: between <see cref="OldestX"/> and <see cref="NewestX"/>, x is time at the fixed rate.</summary>
+/// <summary>A landing time and where it sits on the axis.</summary>
+public sealed record AxisPoint(double X, DateTimeOffset At);
+
+/// <summary>
+/// A run of the past axis between two cuts. Inside it, x follows time: at
+/// the fixed rate for short gaps, compressed (invertibly) for longer idle
+/// stretches that were not worth a cut. <see cref="Points"/> are the
+/// landing times of the run, newest first, so any x in it reads back to an
+/// instant.
+/// </summary>
 public sealed record AxisStretch
 {
     public required double OldestX { get; init; }
@@ -104,6 +113,8 @@ public sealed record AxisStretch
     public required DateTimeOffset Oldest { get; init; }
 
     public required DateTimeOffset Newest { get; init; }
+
+    public IReadOnlyList<AxisPoint> Points { get; init; } = [];
 }
 
 /// <summary>What an x position on the axis means: an instant, a cut, now, or a predicted batch.</summary>
@@ -130,9 +141,6 @@ public sealed record PastAxis
     /// <summary>X of every settled item.</summary>
     public IReadOnlyDictionary<string, double> XByItem { get; init; } = new Dictionary<string, double>(StringComparer.Ordinal);
 
-    /// <summary>Items whose spacing was inflated to a card's width because they landed within minutes of a lane-mate.</summary>
-    public IReadOnlySet<string> Spaced { get; init; } = new HashSet<string>(StringComparer.Ordinal);
-
     public IReadOnlyList<AxisBreak> Breaks { get; init; } = [];
 
     public IReadOnlyList<AxisTick> Ticks { get; init; } = [];
@@ -143,20 +151,22 @@ public sealed record SettledLanding(string Id, string LaneId, DateTimeOffset Fin
 
 /// <summary>
 /// The horizontal axis: past on the left, now at zero, future on the right.
-/// The past is warped by what it contains rather than by a curve, and it is
-/// warped <em>once</em>: nothing here depends on the camera, so a landed
-/// item keeps its world position for the life of the snapshot whatever the
-/// zoom. Inside a burst, spacing is elapsed time at a fixed rate; a stretch
-/// with no landing longer than <see cref="FleetMapOptions.QuietGapMinutes"/>
-/// is cut out and replaced by a marked break of fixed width carrying the
-/// skipped duration, so spacing never lies about time without saying so;
-/// and two landings in one lane closer than a card's width are spaced out
-/// to a card's width (older pushed left), so boxes in a lane never overlap
-/// in the world. What is drawn <em>as</em> several boxes or as one counted
-/// cluster is the renderer's call at draw time, from screen distance — the
-/// same rule as a dot becoming a card. "Now" is quantised to a bucket; the
-/// stretch between the latest landing and now follows the quiet rule, so
-/// once the fleet has been quiet that long the past stops moving. The
+/// The past is warped by what it contains, and warped <em>once</em>: nothing
+/// here depends on the camera, so a landed item keeps its world position for
+/// the life of the snapshot whatever the zoom. The pipeline works in short
+/// bursts separated by idle hours, so a fixed idle threshold would shatter
+/// months into hundreds of cuts; instead the cuts are <em>bounded</em>: only
+/// the <see cref="FleetMapOptions.MaxCuts"/> longest idle stretches (each at
+/// least <see cref="FleetMapOptions.QuietGapMinutes"/>) are cut out and
+/// replaced by a marked break of fixed width, and the quiet since the latest
+/// landing is always one of them once it qualifies, so a quiet fleet's past
+/// stops moving. Every other idle gap stays inside its run, compressed by an
+/// invertible curve — faithful up to
+/// <see cref="FleetMapOptions.PastCompressAfterMinutes"/>, logarithmic
+/// beyond — so a run reads as continuous time on the ruler and any x in it
+/// reads back to an instant. Within a run, spacing is never inflated: boxes
+/// that would overlap take rows, and what is drawn as several boxes or as
+/// one counted cluster is the renderer's call from screen distance. The
 /// future is positioned by predicted <em>rank</em>, never by a fabricated
 /// timestamp. Pure.
 /// </summary>
@@ -174,99 +184,117 @@ public static class TimeAxisScale
     public static double UnitsPerMinute(FleetMapOptions options) =>
         options.ColumnGap / Math.Max(1, options.PastMinutesPerColumn);
 
+    /// <summary>Minutes of axis an idle gap of <paramref name="minutes"/> occupies inside a run: faithful up to τ, then τ + κ·τ·ln(g/τ).</summary>
+    public static double Compress(double minutes, FleetMapOptions options)
+    {
+        var tau = Math.Max(1, options.PastCompressAfterMinutes);
+        var kappa = Math.Max(0.01, options.PastCompression);
+        return minutes <= tau ? Math.Max(0, minutes) : tau + kappa * tau * Math.Log(minutes / tau);
+    }
+
+    /// <summary>The inverse of <see cref="Compress"/>: real minutes for <paramref name="axisMinutes"/> of axis.</summary>
+    public static double Decompress(double axisMinutes, FleetMapOptions options)
+    {
+        var tau = Math.Max(1, options.PastCompressAfterMinutes);
+        var kappa = Math.Max(0.01, options.PastCompression);
+        return axisMinutes <= tau ? Math.Max(0, axisMinutes) : tau * Math.Exp((axisMinutes - tau) / (kappa * tau));
+    }
+
     /// <summary>Warps the settled work onto the past half of the axis.</summary>
     public static PastAxis WarpPast(IReadOnlyList<SettledLanding> settled, DateTimeOffset nowBucket, FleetMapOptions options)
     {
         var quiet = TimeSpan.FromMinutes(Math.Max(1, options.QuietGapMinutes));
         var breakWidth = Math.Max(options.NodeWidth * 0.5, options.BreakWidth);
         var rate = UnitsPerMinute(options);
-        var minSpacing = Math.Max(options.NodeWidth, options.PastMinSpacing);
+        var maxCuts = Math.Max(0, options.MaxCuts);
 
         var landings = (settled ?? []).Where(s => s is not null && !string.IsNullOrEmpty(s.Id))
             .GroupBy(s => s.Id, StringComparer.Ordinal).Select(g => g.First())
             .Select(s => s with { FinishedAt = s.FinishedAt > nowBucket ? nowBucket : s.FinishedAt })
             .ToList();
+        var times = landings.Select(l => l.FinishedAt).Distinct().OrderByDescending(t => t).ToList();
 
-        // 1. The axis, walked back from now over the distinct landing times:
-        //    faithful inside a burst, cut when quiet.
+        // 1. Which idle stretches are cut: the quiet since the latest landing
+        //    whenever it qualifies, then the longest of the rest, up to the cap.
+        var cutAt = new HashSet<int>();
+        if (times.Count > 0 && nowBucket - times[0] > quiet)
+        {
+            cutAt.Add(0);
+        }
+        var candidates = new List<(int Index, TimeSpan Gap)>();
+        for (var i = 1; i < times.Count; i++)
+        {
+            var gap = times[i - 1] - times[i];
+            if (gap > quiet)
+            {
+                candidates.Add((i, gap));
+            }
+        }
+        foreach (var (index, _) in candidates.OrderByDescending(c => c.Gap).ThenBy(c => c.Index).Take(maxCuts))
+        {
+            cutAt.Add(index);
+        }
+
+        // 2. The axis, walked back from now: compressed time inside a run, a
+        //    fixed break at a cut.
         var xOfTime = new Dictionary<DateTimeOffset, double>();
         var breaks = new List<AxisBreak>();
         var ticks = new List<AxisTick>();
         var stretches = new List<AxisStretch>();
         var cursor = 0.0;
         var prev = nowBucket;
-        DateTimeOffset? stretchNewest = null;
-        double stretchNewestX = 0;
-        foreach (var t in landings.Select(l => l.FinishedAt).Distinct().OrderByDescending(t => t))
+        var runPoints = new List<AxisPoint>();
+        for (var i = 0; i < times.Count; i++)
         {
+            var t = times[i];
             var gap = prev - t;
-            if (gap > quiet)
+            if (cutAt.Contains(i))
             {
-                CloseStretch();
+                CloseRun();
                 var next = cursor - (options.NodeWidth + breakWidth);
                 breaks.Add(new AxisBreak { X = next + options.NodeWidth / 2, Width = breakWidth, Skipped = gap });
                 cursor = next;
-                stretchNewest = t;
-                stretchNewestX = cursor;
             }
             else
             {
-                cursor -= gap.TotalMinutes * rate;
-                if (stretchNewest is null)
-                {
-                    stretchNewest = t;
-                    stretchNewestX = cursor;
-                }
+                cursor -= Compress(gap.TotalMinutes, options) * rate;
             }
             xOfTime[t] = cursor;
+            runPoints.Add(new AxisPoint(cursor, t));
             prev = t;
         }
-        CloseStretch();
+        CloseRun();
 
-        void CloseStretch()
+        void CloseRun()
         {
-            if (stretchNewest is null)
+            if (runPoints.Count == 0)
             {
                 return;
             }
-            stretches.Add(new AxisStretch { OldestX = cursor, NewestX = stretchNewestX, Oldest = prev, Newest = stretchNewest.Value });
-            ticks.Add(new AxisTick { X = stretchNewestX, Label = AgeText.Short(nowBucket - stretchNewest.Value) + " ago", Zone = AxisZone.Past, At = stretchNewest });
-            if (prev != stretchNewest.Value && stretchNewestX - cursor >= options.ColumnGap * 0.5)
+            var newest = runPoints[0];
+            var oldest = runPoints[^1];
+            stretches.Add(new AxisStretch { OldestX = oldest.X, NewestX = newest.X, Oldest = oldest.At, Newest = newest.At, Points = runPoints.ToList() });
+            ticks.Add(new AxisTick { X = newest.X, Label = AgeText.Short(nowBucket - newest.At) + " ago", Zone = AxisZone.Past, At = newest.At });
+            if (oldest.At != newest.At && newest.X - oldest.X >= options.ColumnGap * 0.5)
             {
-                ticks.Add(new AxisTick { X = cursor, Label = AgeText.Short(nowBucket - prev) + " ago", Zone = AxisZone.Past, At = prev });
+                ticks.Add(new AxisTick { X = oldest.X, Label = AgeText.Short(nowBucket - oldest.At) + " ago", Zone = AxisZone.Past, At = oldest.At });
             }
-            stretchNewest = null;
+            runPoints = [];
         }
 
-        // 2. Per lane, newest first: a landing closer than a card's width to
-        //    the one after it is pushed left to a card's width. Deterministic,
-        //    cascading, and independent of anything but the landings.
         var xByItem = new Dictionary<string, double>(StringComparer.Ordinal);
-        var spaced = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var lane in landings.GroupBy(l => l.LaneId ?? string.Empty, StringComparer.Ordinal).OrderBy(g => g.Key, StringComparer.Ordinal))
+        foreach (var l in landings)
         {
-            double? right = null;
-            foreach (var l in lane.OrderByDescending(l => l.FinishedAt).ThenBy(l => l.Id, StringComparer.Ordinal))
-            {
-                var x = xOfTime[l.FinishedAt];
-                if (right is not null && x > right.Value - minSpacing)
-                {
-                    x = right.Value - minSpacing;
-                    spaced.Add(l.Id);
-                }
-                xByItem[l.Id] = x;
-                right = x;
-            }
+            xByItem[l.Id] = xOfTime[l.FinishedAt];
         }
-        return new PastAxis { XByItem = xByItem, Spaced = spaced, Breaks = breaks, Ticks = ticks, Stretches = stretches };
+        return new PastAxis { XByItem = xByItem, Breaks = breaks, Ticks = ticks, Stretches = stretches };
     }
 
     /// <summary>
-    /// What a position on the axis means. Inside a faithful stretch it is an
-    /// instant; between the latest landing and now, when that run was not
-    /// cut, also an instant; inside a cut it is the cut — no timestamp is
-    /// invented; at now it is now; right of now it is the predicted batch
-    /// whose column is nearest. Pure.
+    /// What a position on the axis means. Inside a run it is an instant
+    /// (the compression inverted exactly); inside a cut it is the cut — no
+    /// timestamp is invented; at now it is now; right of now it is the
+    /// predicted batch whose column is nearest. Pure.
     /// </summary>
     public static AxisReading Read(double x, FleetMapLayout layout, FleetMapOptions options)
     {
@@ -302,20 +330,31 @@ public static class TimeAxisScale
                 return new AxisReading { Zone = AxisZone.Past, Break = cut };
             }
         }
-        foreach (var run in layout.Stretches ?? [])
+        // Between two landings of a run (or between the newest landing and
+        // now when nothing was cut there): invert the compression from the
+        // newer point of the pair.
+        var runs = layout.Stretches ?? [];
+        var newestX = runs.Count == 0 ? double.NegativeInfinity : runs.Max(r => r.NewestX);
+        var cutBetween = (layout.Breaks ?? []).Any(c => c.X + c.Width > newestX && c.X <= 0);
+        if (!cutBetween && x > newestX)
         {
-            if (x >= run.OldestX - options.NodeWidth / 2 && x <= run.NewestX + options.NodeWidth / 2)
-            {
-                var clamped = Math.Clamp(x, run.OldestX, run.NewestX);
-                return new AxisReading { Zone = AxisZone.Past, At = run.Newest - TimeSpan.FromMinutes((run.NewestX - clamped) / rate) };
-            }
+            return new AxisReading { Zone = AxisZone.Past, At = layout.NowBucket - TimeSpan.FromMinutes(Decompress(-x / rate, options)) };
         }
-        // Between the newest stretch and now with no cut in between: faithful time back from now.
-        var newest = (layout.Stretches ?? []).Select(r => r.NewestX).DefaultIfEmpty(double.NegativeInfinity).Max();
-        var cutBetween = (layout.Breaks ?? []).Any(c => c.X >= newest && c.X + c.Width <= 0);
-        if (!cutBetween && x > newest)
+        foreach (var run in runs)
         {
-            return new AxisReading { Zone = AxisZone.Past, At = layout.NowBucket - TimeSpan.FromMinutes(-x / rate) };
+            if (x < run.OldestX - options.NodeWidth / 2 || x > run.NewestX + options.NodeWidth / 2)
+            {
+                continue;
+            }
+            var pts = run.Points;
+            for (var i = 0; i + 1 < pts.Count; i++)
+            {
+                if (x <= pts[i].X && x >= pts[i + 1].X)
+                {
+                    return new AxisReading { Zone = AxisZone.Past, At = pts[i].At - TimeSpan.FromMinutes(Decompress((pts[i].X - x) / rate, options)) };
+                }
+            }
+            return new AxisReading { Zone = AxisZone.Past, At = x >= run.NewestX ? run.Newest : run.Oldest };
         }
         return new AxisReading { Zone = AxisZone.Past };
     }

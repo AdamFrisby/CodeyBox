@@ -349,7 +349,8 @@
     private int SettledCount => _snapshot?.Items.Count(i => TerminalVisibility.IsSettled(i.State)) ?? 0;
     private int ChainCount => _projection?.Chains.Count ?? 0;
     private int BlockedCount => _activities?.Values.Count(a => a.Kind == ActivityKind.BlockedByDependency) ?? 0;
-    private int RunningCount => _activities?.Values.Count(a => a.Kind == ActivityKind.Running) ?? 0;
+    // "Running" means an agent turn is executing now — not merely in flight between turns (WorkComplete, AuditPassed…).
+    private int RunningCount => _snapshot?.Items.Count(i => ItemStates.IsExecuting(i.State)) ?? 0;
     private string FocusLabel => _focusLabel;
     private bool CanSubmitAdd => !string.IsNullOrWhiteSpace(_addTitle) && !string.IsNullOrWhiteSpace(_addPrompt);
 

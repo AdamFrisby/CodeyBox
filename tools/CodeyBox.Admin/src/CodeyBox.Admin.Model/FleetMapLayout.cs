@@ -34,9 +34,6 @@ public sealed record MapNodeLayout
 
     /// <summary>True when the time position had to yield to a dependency (pushed right of a blocker).</summary>
     public bool PushedByDependency { get; init; }
-
-    /// <summary>True when this landing was spaced out from a lane-mate that landed within a card's width of it.</summary>
-    public bool Spaced { get; init; }
 }
 
 /// <summary>One lane: a horizontal band holding one or more chains.</summary>
@@ -306,7 +303,11 @@ public static class FleetMapBuilder
                 {
                     break;
                 }
-                min = Math.Max(min, bx + options.ColumnGap);
+                // History keeps its true spacing wherever it already reads left to
+                // right; only an out-of-order pair is pushed, and by a node's width,
+                // not a full column — a landing is a fact, not a forecast.
+                var minGap = zone[dep] == AxisZone.Past ? options.NodeWidth : options.ColumnGap;
+                min = Math.Max(min, bx + minGap);
             }
             if (min > x[item.Id])
             {
@@ -382,7 +383,6 @@ public static class FleetMapBuilder
                     Zone = zone[id],
                     Batch = forecast.TryGetValue(id, out var fs) ? fs.Batch : null,
                     PushedByDependency = pushed.Contains(id),
-                    Spaced = past.Spaced.Contains(id),
                 };
             }
             var height = Math.Max(options.NodeHeight, rows * options.RowGap);

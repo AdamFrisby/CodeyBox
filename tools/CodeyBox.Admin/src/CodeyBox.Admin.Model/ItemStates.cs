@@ -41,6 +41,15 @@ public static class ItemStates
         "PlanApproved", "Delegating", "ReworkingForConflict",
     };
 
+    /// <summary>States in which an agent turn is actually running (work, audit, rework, merge, planning); the rest of the in-flight set is between turns.</summary>
+    public static readonly IReadOnlySet<string> Executing = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "Working", "Auditing", "Reworking", "Merging", "UpstreamPushing", "Planning", "Delegating", "ReworkingForConflict",
+    };
+
+    public static bool IsExecuting(string? state) =>
+        state is not null && Executing.Contains(state);
+
     public static bool IsQueued(string? state) =>
         string.Equals(state, "Queued", StringComparison.Ordinal);
 

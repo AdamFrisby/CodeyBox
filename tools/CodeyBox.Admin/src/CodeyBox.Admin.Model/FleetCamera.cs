@@ -94,7 +94,9 @@ public static class CameraDirector
             LastChangeAt = now,
             CycleIndex = -1,
             TravelMs = 0,
-            DwellSeconds = 0,
+            // The fleet is established first: auto-follow may not move until
+            // the landing view has been seen.
+            DwellSeconds = Math.Max(0, options.LandingDwellSeconds),
         };
     }
 
@@ -121,6 +123,12 @@ public static class CameraDirector
         }
 
         var sinceChange = (now - state.LastChangeAt).TotalSeconds;
+        // The landing view: the whole fleet, held long enough to see it is a
+        // fleet, before anything — urgent items included — takes the camera.
+        if (state.FocusKind == CameraFocusKind.All && state.CycleIndex == -1 && sinceChange < state.DwellSeconds)
+        {
+            return state;
+        }
         // Anti-flap: an urgency hold lasts at least the minimum even once it
         // clears. A *new* urgent item always preempts — it is more urgent.
         var holding = state.FocusKind == CameraFocusKind.Item

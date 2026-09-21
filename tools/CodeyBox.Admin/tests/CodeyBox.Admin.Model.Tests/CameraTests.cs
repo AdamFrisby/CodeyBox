@@ -9,7 +9,7 @@ namespace CodeyBox.Admin.Model.Tests;
 /// </summary>
 public sealed class CameraTests
 {
-    private static readonly FleetMapOptions Options = new() { DwellSeconds = 12 };
+    private static readonly FleetMapOptions Options = new() { DwellSeconds = 12, LandingDwellSeconds = 0 };
     private static readonly CameraViewSize View = new(1600, 900);
 
     private sealed record Scripted(

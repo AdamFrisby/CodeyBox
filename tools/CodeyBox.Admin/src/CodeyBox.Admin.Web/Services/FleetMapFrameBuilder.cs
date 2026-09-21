@@ -104,7 +104,6 @@ public static class FleetMapFrameBuilder
                 zone = position.Zone.ToString().ToLowerInvariant(),
                 batch = position.Batch,
                 pushed = position.PushedByDependency,
-                spaced = position.Spaced,
                 shape = badge.Shape.ToString().ToLowerInvariant(),
                 tone = badge.Tone,
                 glyph = vocab.Glyph,
@@ -118,7 +117,8 @@ public static class FleetMapFrameBuilder
                 needsYou = TerminalVisibility.NeedsYou(item.State),
                 titleTextPx = badge.TitleTextPx,
                 subTextPx = badge.SubTextPx,
-                activity = activity?.Kind.ToString() ?? "Unknown",
+                // "Running" only while an agent turn executes; in flight between turns is "Between" (no pulse, not counted).
+                activity = activity?.Kind == ActivityKind.Running && !ItemStates.IsExecuting(item.State) ? "Between" : activity?.Kind.ToString() ?? "Unknown",
                 activityText = activity?.Summary ?? string.Empty,
                 waiting = dependents.GetValueOrDefault(id),
                 blockers = (activity?.Blockers ?? []).Select(b => new
@@ -155,6 +155,8 @@ public static class FleetMapFrameBuilder
                 futureNear = options.FutureNearBatches,
                 futureCompression = options.FutureCompression,
                 pastMinutesPerColumn = options.PastMinutesPerColumn,
+                compressAfter = options.PastCompressAfterMinutes,
+                compression = options.PastCompression,
                 fullDetailZoom = options.FullDetailZoom,
                 compactDetailZoom = options.CompactDetailZoom,
                 openZoomStart = options.OpenZoomStart,
@@ -180,6 +182,7 @@ public static class FleetMapFrameBuilder
                     x1 = Round(r.NewestX),
                     t0 = r.Oldest.ToUniversalTime().ToString("o"),
                     t1 = r.Newest.ToUniversalTime().ToString("o"),
+                    pts = r.Points.Select(pt => new object[] { Round(pt.X), pt.At.ToUniversalTime().ToString("o") }).ToList(),
                 }).ToList(),
                 // Quiet stretches cut from the past: each says what it skipped.
                 breaks = (layout.Breaks ?? []).Select(b => new
@@ -190,7 +193,7 @@ public static class FleetMapFrameBuilder
                     exact = b.Exact,
                     minutes = Math.Round(b.Skipped.TotalMinutes),
                 }).ToList(),
-                basis = "past: when it landed — quiet is cut and labelled, landings within minutes of a lane-mate are spaced a card apart · future: predicted order from dependencies and capacity, not a schedule",
+                basis = "past: when it landed — the longest idle stretches are cut and labelled, shorter idle is compressed (the ruler readout gives the exact time) · future: predicted order from dependencies and capacity, not a schedule",
             },
             lanes,
             nodes,
@@ -296,7 +299,8 @@ public static class FleetMapFrameBuilder
             var settled = 0;
             foreach (var member in members)
             {
-                if (items.TryGetValue(member.ItemId, out var memberItem) && TerminalVisibility.IsSettled(memberItem.State))
+                items.TryGetValue(member.ItemId, out var memberItem);
+                if (memberItem is not null && TerminalVisibility.IsSettled(memberItem.State))
                 {
                     settled++;
                 }
@@ -307,7 +311,7 @@ public static class FleetMapFrameBuilder
                 switch (activity.Kind)
                 {
                     case ActivityKind.BlockedByDependency: blocked++; break;
-                    case ActivityKind.Running: running++; break;
+                    case ActivityKind.Running when ItemStates.IsExecuting(memberItem?.State): running++; break;
                     case ActivityKind.Parked or ActivityKind.Failed: parkedOrFailed++; break;
                 }
             }

@@ -9,7 +9,7 @@ namespace CodeyBox.Admin.Model.Tests;
 /// </summary>
 public sealed class AttentionRailTests
 {
-    private static readonly FleetMapOptions Options = new();
+    private static readonly FleetMapOptions Options = new() { LandingDwellSeconds = 0 };
 
     private static (FleetSnapshot Snapshot, FleetProjection Projection, FleetMapLayout Layout) Build(IReadOnlyList<AdminWorkItem> items)
     {

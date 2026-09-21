@@ -10,7 +10,27 @@ namespace CodeyBox.Admin.Model.Tests;
 /// </summary>
 public sealed class CameraTravelTests
 {
-    private static readonly FleetMapOptions Options = new();
+    [Fact]
+    public void Landing_EstablishesTheFleetFirst_ThenUrgencyMayTakeTheCamera()
+    {
+        var t0 = Fixtures.Now;
+        var items = new List<AdminWorkItem> { Fixtures.Item("calm", state: "Working"), Fixtures.Item("parked", state: "NeedsOperatorInput", updatedAt: t0.AddMinutes(-10)) };
+        var snapshot = Fixtures.Snapshot(items);
+        var projection = FleetProjectionBuilder.Project(snapshot);
+        var layout = FleetMapBuilder.DeriveInitial(items, projection.Chains.ToList(), new FleetMapOptions(), t0);
+        var options = new FleetMapOptions { LandingDwellSeconds = 8 };
+        var initial = CameraDirector.Initial(layout, t0, CameraViewSize.Default, options);
+        Assert.Equal(CameraFocusKind.All, initial.FocusKind);
+
+        var early = CameraDirector.Next(initial, projection, layout, t0.AddSeconds(5), CameraViewSize.Default, options, false, snapshot);
+        Assert.Same(initial, early); // the fleet is still being shown
+
+        var later = CameraDirector.Next(initial, projection, layout, t0.AddSeconds(9), CameraViewSize.Default, options, false, snapshot);
+        Assert.Equal(CameraFocusKind.Item, later.FocusKind);
+        Assert.Equal("parked", later.FocusId);
+    }
+
+    private static readonly FleetMapOptions Options = new() { LandingDwellSeconds = 0 };
     private static readonly CameraViewSize View = new(1600, 900);
 
     private static (FleetProjection Projection, FleetMapLayout Layout) Build(IReadOnlyList<AdminWorkItem> items, DateTimeOffset now)

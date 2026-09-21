@@ -35,22 +35,27 @@ public sealed record FleetMapOptions
     /// <summary>"Now" advances in steps of this many minutes so a settled view does not creep every second.</summary>
     public int NowBucketMinutes { get; init; } = 5;
 
-    /// <summary>
-    /// A stretch with no landing longer than this is cut from the axis and
-    /// replaced by a labelled break. Fixed: the warp is computed once per
-    /// snapshot and never depends on the camera.
-    /// </summary>
+    /// <summary>Shortest idle stretch that can be cut from the axis. Shorter idle is compressed inside its run.</summary>
     public double QuietGapMinutes { get; init; } = 120.0;
+
+    /// <summary>
+    /// Upper bound on cuts in the past: only the longest idle stretches are
+    /// cut, so months of bursty history read as a dozen breaks, not hundreds.
+    /// The quiet since the latest landing is always cut once it qualifies.
+    /// </summary>
+    public int MaxCuts { get; init; } = 12;
 
     /// <summary>Width of a break marker, in map units (never less than half a node).</summary>
     public double BreakWidth { get; init; } = 200.0;
 
-    /// <summary>
-    /// Two landings in one lane closer than this are spaced out to it (older
-    /// pushed left), so boxes never overlap in the world; never less than a
-    /// node's width.
-    /// </summary>
-    public double PastMinSpacing { get; init; } = 200.0;
+    /// <summary>Inside a run, an idle gap is faithful up to this many minutes (τ) and compressed logarithmically beyond.</summary>
+    public double PastCompressAfterMinutes { get; init; } = 30.0;
+
+    /// <summary>Slope of the compression beyond τ: axis minutes = τ + κ·τ·ln(gap/τ).</summary>
+    public double PastCompression { get; init; } = 0.4;
+
+    /// <summary>Seconds the camera rests on the whole fleet after load before auto-follow may move it.</summary>
+    public double LandingDwellSeconds { get; init; } = 8.0;
 
     /// <summary>Concurrency assumed for the forecast when the fleet surface does not say.</summary>
     public int DefaultCapacity { get; init; } = 3;

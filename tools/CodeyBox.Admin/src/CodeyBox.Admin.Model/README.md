@@ -55,12 +55,14 @@ Pure pieces behind the `/map` screen, all in this project:
   by the concurrency cap, ties by queue position, agent-benched items last,
   compressed beyond `FutureNearBatches`. The past is warped by what it
   contains rather than by a curve, and warped **once per snapshot with no
-  camera input**: inside a burst, spacing is elapsed time at
-  `PastMinutesPerColumn`; a stretch with no landing longer than
-  `QuietGapMinutes` is cut out and replaced by an `AxisBreak` of fixed
-  `BreakWidth` that says what it skipped; two landings in one lane closer
-  than `PastMinSpacing` are spaced to it (older pushed left, flagged
-  `Spaced`) so boxes in a lane never overlap in the world. Zoom is a view
+  camera input**: the cuts are *bounded* — only the `MaxCuts` longest idle
+  stretches (each over `QuietGapMinutes`, plus the quiet since the latest
+  landing once it qualifies) become an `AxisBreak` of fixed `BreakWidth`
+  that says what it skipped; every other idle gap stays inside its run,
+  faithful up to `PastCompressAfterMinutes` and compressed logarithmically
+  beyond (`PastCompression`), invertibly, so `TimeAxisScale.Read` gives
+  the exact instant for any x. Landings are never spaced apart: boxes that
+  would overlap take rows. Zoom is a view
   transform and nothing else — a landed item keeps its world position for
   the life of the snapshot. What is drawn as several dots or as one counted
   cluster is the renderer's call at draw time from screen distance, the

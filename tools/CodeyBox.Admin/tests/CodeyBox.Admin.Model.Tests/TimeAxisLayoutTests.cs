@@ -91,7 +91,7 @@ public sealed class TimeAxisLayoutTests
     {
         // A landed item whose blocker landed long *after* it (a data oddity) is pushed right of the blocker and flagged.
         var odd = Layout([At("blocker", "Done", 1), At("dependent", "Done", 30, ["blocker"])]);
-        Assert.True(odd.Nodes["dependent"].X >= odd.Nodes["blocker"].X + Options.ColumnGap);
+        Assert.True(odd.Nodes["dependent"].X >= odd.Nodes["blocker"].X + Options.NodeWidth);
         Assert.True(odd.Nodes["dependent"].PushedByDependency);
         Assert.False(odd.Nodes["blocker"].PushedByDependency);
 
