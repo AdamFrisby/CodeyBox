@@ -29,6 +29,7 @@ public sealed class PluginLayoutConventionTests
         "quota",
         "telemetry",
         "test-runners",
+        "upstream",
         "work-sync",
     };
 
