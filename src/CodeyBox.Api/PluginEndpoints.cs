@@ -8,6 +8,7 @@ internal static class PluginEndpoints
     public static void Map(WebApplication app)
     {
         app.MapGet("/plugins", GetAuditorPluginsAsync);
+        app.MapGet("/plugins/status", GetPluginStatusAsync);
     }
 
     /// <summary>
@@ -39,4 +40,99 @@ internal static class PluginEndpoints
     }
 
     private sealed record AuditorPluginDto(string PluginId, string DisplayName);
+
+    /// <summary>
+    /// Returns the full loaded-plugin inventory: every loaded plugin (any
+    /// contract, not just auditors), the per-plugin discovery outcomes, and
+    /// the per-path assembly reports — exactly what discovery reported, so an
+    /// operator can answer "is my plugin actually running" without reading
+    /// logs or restarting. <c>GET /plugins</c> stays auditor-only for the
+    /// dashboard and project-config reference.
+    /// </summary>
+    private static async Task<IResult> GetPluginStatusAsync(
+        IPluginLoader pluginLoader,
+        CancellationToken ct)
+    {
+        var loaded = await pluginLoader.DiscoverAndLoadAsync(ct);
+        var statuses = pluginLoader.GetDiscoveryStatuses();
+        var assemblies = pluginLoader.GetAssemblyReports();
+
+        var contractsById = statuses
+            .Where(static s => s.Loaded)
+            .GroupBy(static s => s.PluginId, StringComparer.Ordinal)
+            .ToDictionary(
+                static g => g.Key,
+                static g => (IReadOnlyList<string>)(g.SelectMany(static s => s.Contracts ?? [])
+                    .Distinct(StringComparer.Ordinal)
+                    .Order(StringComparer.Ordinal)
+                    .ToList()),
+                StringComparer.Ordinal);
+
+        return Results.Ok(new PluginStatusDto(
+            Loaded: loaded
+                .OrderBy(static p => p.PluginId, StringComparer.Ordinal)
+                .Select(p => new LoadedPluginDto(
+                    p.PluginId,
+                    p.DisplayName,
+                    p.AssemblyPath,
+                    contractsById.TryGetValue(p.PluginId, out var contracts)
+                        ? contracts
+                        : []))
+                .ToList(),
+            Discovery: statuses
+                .OrderBy(static s => s.PluginId, StringComparer.Ordinal)
+                .Select(static s => new PluginDiscoveryDto(
+                    s.PluginId,
+                    s.DisplayName,
+                    s.AssemblyPath,
+                    s.Enabled,
+                    s.Allowlisted,
+                    s.Loaded,
+                    s.SkipReason.ToString(),
+                    s.Contracts ?? [],
+                    s.Detail))
+                .ToList(),
+            Assemblies: assemblies
+                .OrderBy(static a => a.AssemblyPath, StringComparer.Ordinal)
+                .Select(static a => new PluginAssemblyDto(
+                    a.AssemblyPath,
+                    a.Found,
+                    a.Loaded,
+                    a.PluginIds,
+                    a.Contracts,
+                    a.SkipReason.ToString(),
+                    a.Detail))
+                .ToList()));
+    }
+
+    private sealed record PluginStatusDto(
+        IReadOnlyList<LoadedPluginDto> Loaded,
+        IReadOnlyList<PluginDiscoveryDto> Discovery,
+        IReadOnlyList<PluginAssemblyDto> Assemblies);
+
+    private sealed record LoadedPluginDto(
+        string PluginId,
+        string DisplayName,
+        string AssemblyPath,
+        IReadOnlyList<string> Contracts);
+
+    private sealed record PluginDiscoveryDto(
+        string PluginId,
+        string DisplayName,
+        string AssemblyPath,
+        bool Enabled,
+        bool Allowlisted,
+        bool Loaded,
+        string SkipReason,
+        IReadOnlyList<string> Contracts,
+        string? Detail);
+
+    private sealed record PluginAssemblyDto(
+        string AssemblyPath,
+        bool Found,
+        bool Loaded,
+        IReadOnlyList<string> PluginIds,
+        IReadOnlyList<string> Contracts,
+        string SkipReason,
+        string? Detail);
 }

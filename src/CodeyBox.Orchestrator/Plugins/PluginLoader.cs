@@ -35,6 +35,7 @@ public sealed class PluginLoader : IPluginLoader
     private readonly IPluginAssemblyLoader _assemblyLoader;
     private IReadOnlyList<LoadedPlugin>? _preloaded;
     private List<PluginDiscoveryStatus>? _statuses;
+    private List<PluginAssemblyReport>? _assemblyReports;
 
     public PluginLoader(
         PluginOptions options,
@@ -42,7 +43,8 @@ public sealed class PluginLoader : IPluginLoader
         ILogger<PluginLoader> logger,
         IReadOnlyList<LoadedPlugin>? preloaded = null,
         IPluginAssemblyLoader? assemblyLoader = null,
-        IReadOnlyList<PluginDiscoveryStatus>? preloadedStatuses = null)
+        IReadOnlyList<PluginDiscoveryStatus>? preloadedStatuses = null,
+        IReadOnlyList<PluginAssemblyReport>? preloadedAssemblyReports = null)
     {
         _options = options;
         _configuration = configuration;
@@ -50,6 +52,7 @@ public sealed class PluginLoader : IPluginLoader
         _preloaded = preloaded;
         _assemblyLoader = assemblyLoader ?? new PluginAssemblyLoadContextLoader();
         _statuses = preloadedStatuses is null ? null : new List<PluginDiscoveryStatus>(preloadedStatuses);
+        _assemblyReports = preloadedAssemblyReports is null ? null : new List<PluginAssemblyReport>(preloadedAssemblyReports);
     }
 
     /// <inheritdoc/>
@@ -73,10 +76,34 @@ public sealed class PluginLoader : IPluginLoader
                 .Select(static p => new PluginDiscoveryStatus(
                     p.PluginId, p.DisplayName, p.AssemblyPath,
                     Enabled: true, Allowlisted: true, Loaded: true,
-                    SkipReason: PluginSkipReason.None, p.RequiredTools ?? []))
+                    SkipReason: PluginSkipReason.None, p.RequiredTools ?? [],
+                    Contracts: RegisteredContractNames(p.RegisteredTypes)))
                 .ToList();
         }
         return _statuses ?? [];
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<PluginAssemblyReport> GetAssemblyReports()
+    {
+        _ = DiscoverPlugins();
+        if (_preloaded is not null && _assemblyReports is null)
+        {
+            // Pre-seeded list: synthesize one report per assembly path so the
+            // administrative surface still answers "is my plugin running".
+            _assemblyReports = _preloaded
+                .GroupBy(static p => p.AssemblyPath, StringComparer.OrdinalIgnoreCase)
+                .Select(static g => new PluginAssemblyReport(
+                    g.Key,
+                    Found: true,
+                    Loaded: true,
+                    PluginIds: g.Select(static p => p.PluginId).Distinct(StringComparer.Ordinal).ToList(),
+                    Contracts: g.SelectMany(static p => RegisteredContractNames(p.RegisteredTypes))
+                        .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList(),
+                    SkipReason: PluginSkipReason.None))
+                .ToList();
+        }
+        return _assemblyReports ?? [];
     }
 
     /// <inheritdoc/>
@@ -109,16 +136,26 @@ public sealed class PluginLoader : IPluginLoader
 
         var result = new List<LoadedPlugin>();
         _statuses = [];
+        _assemblyReports = [];
 
         foreach (var path in CollectAssemblyPaths())
         {
             if (!File.Exists(path))
             {
                 _logger.LogWarning("Plugin assembly not found, skipping: {Path}", path);
+                AuditLog.PluginAssemblyFailed(path, "configured file does not exist");
+                _assemblyReports.Add(new PluginAssemblyReport(
+                    path,
+                    Found: false,
+                    Loaded: false,
+                    PluginIds: [],
+                    Contracts: [],
+                    SkipReason: PluginSkipReason.FileMissing,
+                    Detail: "configured plugin file does not exist"));
                 continue;
             }
 
-            ScanAssembly(path, result, _statuses);
+            ScanAssembly(path, result, _statuses, _assemblyReports);
         }
 
         _preloaded = result;
@@ -168,9 +205,7 @@ public sealed class PluginLoader : IPluginLoader
                         plugin.PluginId, type.Name, blocked.Name);
                 }
 
-                var coreInterfaces = allCoreInterfaces
-                    .Where(i => !_blockedInterfaces.Contains(i))
-                    .ToList();
+                var coreInterfaces = RegisterableCoreInterfaces(type);
 
                 if (coreInterfaces.Count == 0)
                 {
@@ -198,11 +233,56 @@ public sealed class PluginLoader : IPluginLoader
         }
     }
 
-    private void ScanAssembly(string absolutePath, List<LoadedPlugin> result, List<PluginDiscoveryStatus> statuses)
+    private void ScanAssembly(
+        string absolutePath,
+        List<LoadedPlugin> result,
+        List<PluginDiscoveryStatus> statuses,
+        List<PluginAssemblyReport> assemblyReports)
     {
         // Phase 1 — metadata only. No plugin code runs here, so the enablement
         // and allowlist gates are enforced before the assembly is loadable.
-        var candidates = PluginAssemblyInspector.Inspect(absolutePath, _logger);
+        var statusBase = statuses.Count;
+        var outcome = PluginAssemblyInspector.InspectWithOutcome(absolutePath, _logger);
+        var candidates = outcome.Candidates;
+
+        if (outcome.Error is not null)
+        {
+            var reason = outcome.IsStaleContracts
+                ? PluginSkipReason.StaleHostContracts
+                : PluginSkipReason.InspectionFailed;
+            if (outcome.IsStaleContracts)
+            {
+                AuditLog.PluginStaleContracts(absolutePath, outcome.Error);
+                _logger.LogError(
+                    "Plugin assembly {Path} {Detail}; skipping",
+                    absolutePath, outcome.Error);
+            }
+            else
+            {
+                AuditLog.PluginAssemblyFailed(absolutePath, outcome.Error);
+            }
+
+            assemblyReports.Add(new PluginAssemblyReport(
+                absolutePath, Found: true, Loaded: false, [], [], reason, outcome.Error));
+            return;
+        }
+
+        if (candidates.Count == 0)
+        {
+            _logger.LogWarning(
+                "Plugin assembly {Path} contains no [CodeyBoxPlugin] types; skipping",
+                absolutePath);
+            AuditLog.PluginAssemblyFailed(absolutePath, "no [CodeyBoxPlugin] types found");
+            assemblyReports.Add(new PluginAssemblyReport(
+                absolutePath,
+                Found: true,
+                Loaded: false,
+                PluginIds: [],
+                Contracts: [],
+                SkipReason: PluginSkipReason.NoPluginEntry,
+                Detail: "assembly contains no [CodeyBoxPlugin] types"));
+            return;
+        }
 
         var loadable = new List<PluginMetadataCandidate>();
         foreach (var candidate in candidates)
@@ -238,7 +318,17 @@ public sealed class PluginLoader : IPluginLoader
         }
 
         if (loadable.Count == 0)
+        {
+            assemblyReports.Add(new PluginAssemblyReport(
+                absolutePath,
+                Found: true,
+                Loaded: false,
+                PluginIds: candidates.Select(static c => c.PluginId).Distinct(StringComparer.Ordinal).ToList(),
+                Contracts: [],
+                SkipReason: FirstSkipReason(statuses, statusBase),
+                Detail: "no candidate passed the enablement/allowlist/version gates"));
             return;
+        }
 
         // Phase 2 — load once, then resolve the approved candidates by metadata
         // type name and re-validate from live attributes (the metadata read is
@@ -250,27 +340,61 @@ public sealed class PluginLoader : IPluginLoader
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to load plugin assembly: {Path}", absolutePath);
+            var stale = PluginContractStaleness.IsStaleContractFailure(ex);
+            var reason = stale ? PluginSkipReason.StaleHostContracts : PluginSkipReason.LoadFailed;
+            var detail = stale
+                ? $"assembly {PluginContractStaleness.OperatorMessage}"
+                : ex.GetType().Name + ": " + FirstLine(ex.Message);
+            if (stale)
+            {
+                AuditLog.PluginStaleContracts(absolutePath, detail);
+                _logger.LogError(
+                    "Plugin assembly {Path} {Detail}; skipping",
+                    absolutePath, detail);
+            }
+            else
+            {
+                AuditLog.PluginAssemblyFailed(absolutePath, detail);
+                _logger.LogError(ex, "Failed to load plugin assembly: {Path}", absolutePath);
+            }
+
+            MarkStatuses(statuses, statusBase, reason, detail);
+            assemblyReports.Add(new PluginAssemblyReport(
+                absolutePath,
+                Found: true,
+                Loaded: false,
+                PluginIds: loadable.Select(static c => c.PluginId).Distinct(StringComparer.Ordinal).ToList(),
+                Contracts: [],
+                SkipReason: reason,
+                Detail: detail));
             return;
         }
 
+        var loadedIds = new List<string>();
+        var loadedContracts = new SortedSet<string>(StringComparer.Ordinal);
         foreach (var candidate in loadable)
         {
             var type = assembly.GetType(candidate.TypeFullName);
             if (type is null)
             {
+                const string detail = "metadata type not found after loading";
                 _logger.LogError(
                     "Plugin {PluginId}: metadata type {TypeName} not found after loading {Path}; skipping",
                     candidate.PluginId, candidate.TypeFullName, absolutePath);
+                AuditLog.PluginAssemblyFailed(absolutePath, detail);
+                UpdateStatus(statuses, statusBase, candidate.PluginId, PluginSkipReason.LoadFailed, detail, null);
                 continue;
             }
 
             var attr = type.GetCustomAttribute<CodeyBoxPluginAttribute>();
             if (attr is null || !string.Equals(attr.Id, candidate.PluginId, StringComparison.Ordinal))
             {
+                const string detail = "metadata/live attribute mismatch";
                 _logger.LogError(
                     "Plugin metadata/live attribute mismatch for {TypeName} in {Path}; skipping",
                     candidate.TypeFullName, absolutePath);
+                AuditLog.PluginAssemblyFailed(absolutePath, detail);
+                UpdateStatus(statuses, statusBase, candidate.PluginId, PluginSkipReason.LoadFailed, detail, null);
                 continue;
             }
 
@@ -279,14 +403,19 @@ public sealed class PluginLoader : IPluginLoader
             if (!_options.IsEnabled(attr.Id) || !IsAllowed(attr.Id) ||
                 !CodeyBoxApiVersion.Satisfies(attr.MinHostApiVersion))
             {
+                const string detail = "no longer passes enablement/allowlist/version gates after load";
                 _logger.LogWarning(
                     "Plugin {PluginId} no longer passes enablement/allowlist/version gates after load; skipping",
                     attr.Id);
+                UpdateStatus(statuses, statusBase, candidate.PluginId, PluginSkipReason.LoadFailed, detail, null);
                 continue;
             }
 
             if (!TryReadToolRequirements(attr.Id, type, out var tools))
+            {
+                UpdateStatus(statuses, statusBase, candidate.PluginId, PluginSkipReason.InvalidToolDeclaration, "invalid external-tool declaration (failed closed)", null);
                 continue;
+            }
 
             if (tools.Count > PluginToolRequirement.MaxToolsPerPlugin)
             {
@@ -296,11 +425,105 @@ public sealed class PluginLoader : IPluginLoader
                 tools = tools.Take(PluginToolRequirement.MaxToolsPerPlugin).ToList();
             }
 
+            var contracts = RegisteredContractNames([type]);
             result.Add(new LoadedPlugin(attr.Id, attr.DisplayName, absolutePath, [type], tools));
+            loadedIds.Add(attr.Id);
+            foreach (var contract in contracts)
+                loadedContracts.Add(contract);
+            UpdateStatus(statuses, statusBase, candidate.PluginId, PluginSkipReason.None, null, contracts);
             _logger.LogInformation(
-                "Plugin discovered: {PluginId} ({DisplayName}) from {Path}",
-                attr.Id, attr.DisplayName, absolutePath);
+                "Plugin discovered: {PluginId} ({DisplayName}) from {Path}; contracts: {Contracts}",
+                attr.Id, attr.DisplayName, absolutePath,
+                contracts.Count == 0 ? "(none)" : string.Join(", ", contracts));
         }
+
+        assemblyReports.Add(new PluginAssemblyReport(
+            absolutePath,
+            Found: true,
+            Loaded: loadedIds.Count > 0,
+            PluginIds: loadedIds.Distinct(StringComparer.Ordinal).ToList(),
+            Contracts: [.. loadedContracts],
+            SkipReason: loadedIds.Count > 0 ? PluginSkipReason.None : PluginSkipReason.LoadFailed,
+            Detail: loadedIds.Count > 0 ? null : "no candidate survived loading"));
+    }
+
+    /// <summary>
+    /// Registerable <c>CodeyBox.Core</c> interfaces of a plugin type
+    /// (restricted interfaces excluded). Single source of truth for both DI
+    /// registration and discovery reporting.
+    /// </summary>
+    private static IReadOnlyList<Type> RegisterableCoreInterfaces(Type type)
+    {
+        var coreAssembly = typeof(IAuditor).Assembly;
+        return type.GetInterfaces()
+            .Where(i => i.Assembly == coreAssembly && !_blockedInterfaces.Contains(i))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Names of the registerable <c>CodeyBox.Core</c> contracts plugin types
+    /// contribute (restricted interfaces excluded), ordered for stable reports.
+    /// </summary>
+    internal static IReadOnlyList<string> RegisteredContractNames(IEnumerable<Type> types)
+    {
+        return types
+            .SelectMany(RegisterableCoreInterfaces)
+            .Select(static i => i.Name)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private static void MarkStatuses(
+        List<PluginDiscoveryStatus> statuses,
+        int statusBase,
+        PluginSkipReason reason,
+        string? detail)
+    {
+        for (var i = statusBase; i < statuses.Count; i++)
+        {
+            if (statuses[i].SkipReason == PluginSkipReason.None)
+                statuses[i] = statuses[i] with { Loaded = false, SkipReason = reason, Detail = detail };
+        }
+    }
+
+    private static void UpdateStatus(
+        List<PluginDiscoveryStatus> statuses,
+        int statusBase,
+        string pluginId,
+        PluginSkipReason reason,
+        string? detail,
+        IReadOnlyList<string>? contracts)
+    {
+        for (var i = statusBase; i < statuses.Count; i++)
+        {
+            if (string.Equals(statuses[i].PluginId, pluginId, StringComparison.Ordinal))
+            {
+                statuses[i] = reason == PluginSkipReason.None
+                    ? statuses[i] with { Loaded = true, SkipReason = reason, Detail = detail, Contracts = contracts ?? statuses[i].Contracts }
+                    : statuses[i] with { Loaded = false, SkipReason = reason, Detail = detail };
+                return;
+            }
+        }
+    }
+
+    private static PluginSkipReason FirstSkipReason(List<PluginDiscoveryStatus> statuses, int statusBase)
+    {
+        for (var i = statusBase; i < statuses.Count; i++)
+        {
+            if (statuses[i].SkipReason != PluginSkipReason.None)
+                return statuses[i].SkipReason;
+        }
+        return PluginSkipReason.LoadFailed;
+    }
+
+    private static string FirstLine(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "(no detail)";
+        var line = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        const int maxLength = 256;
+        return line.Length > maxLength ? line[..maxLength] + "…" : line;
     }
 
     private PluginDiscoveryStatus ClassifyCandidate(PluginMetadataCandidate candidate, string absolutePath)

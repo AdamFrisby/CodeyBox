@@ -233,6 +233,15 @@ GET /plugins
 → [{ "pluginId": "myorg.no-var-keyword", "displayName": "MyOrg: Ban var keyword" }]
 ```
 
+To confirm a plugin of any kind is actually running — including non-auditor
+contracts such as samplers or quota probes, which never appear above — query
+the full discovery inventory (loaded set, per-plugin outcomes with skip
+reasons, per-path assembly reports):
+
+```
+GET /plugins/status
+```
+
 ## Test-runner auditors
 
 Test execution is a specialised plugin shape: `ITestRunnerAuditor`

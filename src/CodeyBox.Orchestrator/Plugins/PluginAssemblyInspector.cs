@@ -25,6 +25,16 @@ internal sealed record PluginMetadataCandidate(
     IReadOnlyList<PluginToolDeclaration> ToolDeclarations);
 
 /// <summary>
+/// Outcome of <see cref="PluginAssemblyInspector.InspectWithOutcome"/>.
+/// <see cref="Error"/> is null on success — including the "valid assembly
+/// with no plugin types" case, which is not an inspection failure.
+/// </summary>
+internal sealed record PluginInspectionOutcome(
+    IReadOnlyList<PluginMetadataCandidate> Candidates,
+    string? Error,
+    bool IsStaleContracts);
+
+/// <summary>
 /// Inspects a plugin assembly's metadata <em>without loading it for
 /// execution</em>. Uses <see cref="MetadataLoadContext"/> so no static
 /// constructors, module initializers, or attribute constructors from the
@@ -44,7 +54,18 @@ internal static class PluginAssemblyInspector
     /// (with a log entry) when the file is not a readable managed assembly.
     /// Never throws.
     /// </summary>
-    public static IReadOnlyList<PluginMetadataCandidate> Inspect(string assemblyPath, ILogger logger)
+    public static IReadOnlyList<PluginMetadataCandidate> Inspect(string assemblyPath, ILogger logger) =>
+        InspectWithOutcome(assemblyPath, logger).Candidates;
+
+    /// <summary>
+    /// Metadata-only inspection that also reports <em>why</em> nothing was
+    /// found. Returns the candidates (possibly empty), a short operator-facing
+    /// error when inspection itself failed (null on success, including the
+    /// "valid assembly with no plugin types" case), and whether the failure
+    /// looks like a stale host-contracts build. Never throws and never loads
+    /// the assembly for execution.
+    /// </summary>
+    public static PluginInspectionOutcome InspectWithOutcome(string assemblyPath, ILogger logger)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(assemblyPath);
         ArgumentNullException.ThrowIfNull(logger);
@@ -52,7 +73,7 @@ internal static class PluginAssemblyInspector
         if (!File.Exists(assemblyPath))
         {
             logger.LogWarning("Plugin assembly not found, skipping: {Path}", assemblyPath);
-            return [];
+            return new PluginInspectionOutcome([], "file not found", IsStaleContracts: false);
         }
 
         try
@@ -66,12 +87,16 @@ internal static class PluginAssemblyInspector
                 if (candidate is not null)
                     candidates.Add(candidate);
             }
-            return candidates;
+            return new PluginInspectionOutcome(candidates, Error: null, IsStaleContracts: false);
         }
         catch (Exception ex)
         {
+            var stale = PluginContractStaleness.IsStaleContractFailure(ex);
             logger.LogError(ex, "Failed to inspect plugin assembly metadata: {Path}", assemblyPath);
-            return [];
+            var error = stale
+                ? $"assembly {PluginContractStaleness.OperatorMessage}"
+                : (ex.GetType().Name + ": " + FirstLine(ex.Message));
+            return new PluginInspectionOutcome([], error, stale);
         }
     }
 
@@ -116,6 +141,15 @@ internal static class PluginAssemblyInspector
             return ex.Types.Where(static t => t is not null)!;
         }
         return types;
+    }
+
+    private static string FirstLine(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "(no detail)";
+        var line = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        const int maxLength = 256;
+        return line.Length > maxLength ? line[..maxLength] + "…" : line;
     }
 
     private static PluginMetadataCandidate? ReadCandidate(Type type)

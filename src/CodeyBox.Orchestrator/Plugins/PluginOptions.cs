@@ -75,4 +75,24 @@ public sealed class PluginOptions
             return true;
         return Enabled.Contains(pluginId, StringComparer.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// Failure policy for plugin initialisation. When true (the default), a
+    /// plugin whose <c>IPluginInitializer.InitializeAsync</c> throws aborts
+    /// host startup — a half-initialised auditor that silently never runs is
+    /// worse than a host that refuses to start. When false, the failure is
+    /// logged (error + audit event) and recorded on the startup report while
+    /// the host continues without that plugin. Load failures (missing file,
+    /// unloadable assembly, stale contracts) are never fatal either way: they
+    /// are loud warnings and the host starts without the plugin. See
+    /// <c>docs/extending/plugins.md</c> ("Failure policy") for the rationale.
+    /// </summary>
+    public bool FailOnInitializationError { get; set; } = true;
+
+    /// <summary>
+    /// Maximum plugin entries listed individually in the startup summary log.
+    /// Beyond this the summary collapses to counts so dozens of configured
+    /// plugins stay a readable summary, not a wall of text.
+    /// </summary>
+    public int StartupReportMaxEntries { get; set; } = 20;
 }
