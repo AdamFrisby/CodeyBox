@@ -1044,7 +1044,7 @@ public sealed class InfisicalPluginTests : IDisposable
     public async Task Live_Fetch_Against_Real_Instance()
     {
         Skip.If(string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("INFISICAL_LIVE_SITE")),
-            "INFISICAL_LIVE_SITE is not set; the live Infisical integration test is opt-in (see plugins/CodeyBox.InfisicalPlugin/README.md).");
+            "INFISICAL_LIVE_SITE is not set; the live Infisical integration test is opt-in (see plugins/credentials/CodeyBox.InfisicalPlugin/README.md).");
         var site = Environment.GetEnvironmentVariable("INFISICAL_LIVE_SITE")!;
         var clientId = Environment.GetEnvironmentVariable("INFISICAL_LIVE_CLIENT_ID");
         var clientSecret = Environment.GetEnvironmentVariable("INFISICAL_LIVE_CLIENT_SECRET");

@@ -5,7 +5,7 @@
     <PackageReference Include="JsonSchema.Net" Version="9.2.0" />
     <ProjectReference Include="..\CodeyBox.Audit\CodeyBox.Audit.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.DotnetTestRunnerPlugin\CodeyBox.DotnetTestRunnerPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\test-runners\CodeyBox.DotnetTestRunnerPlugin\CodeyBox.DotnetTestRunnerPlugin.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
     <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />

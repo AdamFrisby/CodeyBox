@@ -2,7 +2,7 @@
 
 The merge gate's test step is an `ITestRunnerAuditor` (`CodeyBox.Core`), not a
 bespoke host service. The bundled `dotnet test` runner ships as a plugin
-package — `plugins/CodeyBox.DotnetTestRunnerPlugin/` — so `pytest`, `go test`,
+package — `plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/` — so `pytest`, `go test`,
 and `cargo test` can be peer `ITestRunnerAuditor` plugins without touching
 `CodeyBox.Core`. `TestFramework` already declares all four members.
 

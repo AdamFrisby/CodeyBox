@@ -98,7 +98,7 @@ then create the identity/project/secrets above in the local UI.
 {
   "CodeyBox": {
     "Plugins": {
-      "AssemblyPaths": ["plugins/CodeyBox.InfisicalPlugin/bin/Release/net10.0/CodeyBox.InfisicalPlugin.dll"],
+      "AssemblyPaths": ["plugins/credentials/CodeyBox.InfisicalPlugin/bin/Release/net10.0/CodeyBox.InfisicalPlugin.dll"],
       "Allowlist": ["codeybox.infisical"],
       "codeybox.infisical": {
         "Enabled": true,

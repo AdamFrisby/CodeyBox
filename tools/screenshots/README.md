@@ -56,6 +56,6 @@ The seeded instance must load the statistics plugin, or **Capacity** renders
 "Capacity analysis unavailable. Is the statistics plugin loaded?":
 
 ```
-CodeyBox__Plugins__AssemblyPaths__0=<repo>/plugins/CodeyBox.StatisticsPlugin/bin/Release/net10.0/CodeyBox.StatisticsPlugin.dll
+CodeyBox__Plugins__AssemblyPaths__0=<repo>/plugins/quota/CodeyBox.StatisticsPlugin/bin/Release/net10.0/CodeyBox.StatisticsPlugin.dll
 CodeyBox__Plugins__Allowlist__0=codeybox.statistics
 ```
