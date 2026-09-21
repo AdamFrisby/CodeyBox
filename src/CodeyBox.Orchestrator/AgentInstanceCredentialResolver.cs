@@ -114,6 +114,15 @@ public static class AgentInstanceCredentialResolver
             return true;
         }
 
+        if (agent == AgentKind.Devin)
+        {
+            credential = new AgentCredential(
+                AgentKind.Devin,
+                new Dictionary<string, string> { ["CODEYBOX_DEVIN_AUTH_TOML"] = raw },
+                new Dictionary<string, string>());
+            return true;
+        }
+
         if (agent == AgentKind.Antigravity)
         {
             // The agy CLI authenticates from a token bundle written to
@@ -223,6 +232,17 @@ public static class AgentInstanceCredentialResolver
             var token = CredentialFileTokenExtractor.ExtractCursorAccessToken(raw);
             if (string.IsNullOrWhiteSpace(token)) return false;
             credentials = new AgentQuotaCredentials(token);
+            return true;
+        }
+
+        if (agent == AgentKind.Devin)
+        {
+            // The credentials.toml carries BOTH the api_key and the
+            // login-assigned api_server_url the quota RPC lives on; a member
+            // file without an api_key yields no usable credential.
+            var (apiKey, apiServerUrl) = CredentialFileTokenExtractor.ExtractDevinCredentials(raw);
+            if (string.IsNullOrWhiteSpace(apiKey)) return false;
+            credentials = new AgentQuotaCredentials(apiKey, EndpointBaseUrl: apiServerUrl);
             return true;
         }
 
