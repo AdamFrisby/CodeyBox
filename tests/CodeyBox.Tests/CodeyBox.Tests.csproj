@@ -54,6 +54,7 @@
     <ProjectReference Include="..\..\plugins\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.DotnetTestRunnerPlugin\CodeyBox.DotnetTestRunnerPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.LinearWorkSyncPlugin\CodeyBox.LinearWorkSyncPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\CodeyBox.PlaneWorkSyncPlugin\CodeyBox.PlaneWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--
       Build dependency only: ensures CodeyBox.PluginSdk.SampleTests is compiled

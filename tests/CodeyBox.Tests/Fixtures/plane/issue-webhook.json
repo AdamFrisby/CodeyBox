@@ -1,0 +1,25 @@
+{
+  "version": "v2",
+  "delivery_id": "d1e2f3a4-b5c6-4d7e-8f90-a1b2c3d4e5f6",
+  "event_id": "e1e2f3a4-b5c6-4d7e-8f90-a1b2c3d4e5f6",
+  "entity_id": "9d8f2c1a-3b4e-4f5a-8c6d-1e2f3a4b5c6d",
+  "entity_type": "issue",
+  "event": "workitem.updated",
+  "webhook_id": "wh-1",
+  "workspace_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+  "data": {
+    "id": "9d8f2c1a-3b4e-4f5a-8c6d-1e2f3a4b5c6d",
+    "name": "Login redirect is broken",
+    "description": "Fix the login redirect.",
+    "sequence_id": 123,
+    "project": "11111111-2222-4333-8444-555555555555",
+    "project_detail": { "id": "11111111-2222-4333-8444-555555555555", "identifier": "WEB", "name": "Website" },
+    "state": "state-todo-uuid",
+    "state_detail": { "id": "state-todo-uuid", "name": "Todo", "group": "unstarted" },
+    "labels": ["label-codeybox-uuid"],
+    "label_details": [{ "id": "label-codeybox-uuid", "name": "codeybox" }],
+    "assignees": [],
+    "assignee_details": []
+  },
+  "previous_attributes": {}
+}
