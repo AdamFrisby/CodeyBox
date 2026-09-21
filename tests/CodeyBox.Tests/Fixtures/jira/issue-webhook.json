@@ -1,0 +1,25 @@
+{
+  "webhookEvent": "jira:issue_updated",
+  "user": { "accountId": "712020:op-account-id", "emailAddress": "op@example.com", "displayName": "Op Operator" },
+  "issue": {
+    "key": "PROJ-1",
+    "fields": {
+      "summary": "Login redirect is broken",
+      "description": {
+        "type": "doc",
+        "version": 1,
+        "content": [
+          { "type": "paragraph", "content": [{ "type": "text", "text": "Fix the login redirect." }] }
+        ]
+      },
+      "project": { "key": "PROJ" },
+      "labels": [],
+      "assignee": {
+        "accountId": "712020:bot-account-id",
+        "emailAddress": "bot@example.com",
+        "displayName": "codeybox"
+      },
+      "status": { "name": "To Do" }
+    }
+  }
+}

@@ -55,6 +55,7 @@
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
     <ProjectReference Include="..\..\plugins\test-runners\CodeyBox.DotnetTestRunnerPlugin\CodeyBox.DotnetTestRunnerPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.LinearWorkSyncPlugin\CodeyBox.LinearWorkSyncPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.JiraWorkSyncPlugin\CodeyBox.JiraWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.PlaneWorkSyncPlugin\CodeyBox.PlaneWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.InfisicalPlugin\CodeyBox.InfisicalPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />

@@ -1,0 +1,27 @@
+{
+  "webhookEvent": "comment_created",
+  "user": { "accountId": "712020:bot-account-id", "emailAddress": "bot@example.com", "displayName": "codeybox" },
+  "issue": {
+    "key": "PROJ-1",
+    "fields": {
+      "summary": "Login redirect is broken",
+      "project": { "key": "PROJ" }
+    }
+  },
+  "comment": {
+    "id": "10001",
+    "author": { "accountId": "712020:bot-account-id", "emailAddress": "bot@example.com", "displayName": "codeybox" },
+    "body": {
+      "type": "doc",
+      "version": 1,
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            { "type": "text", "text": "CodeyBox update: progress.\n\n<!-- codeybox-work-item:wi-000000000000000000000000 -->" }
+          ]
+        }
+      ]
+    }
+  }
+}
