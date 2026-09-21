@@ -1,0 +1,5 @@
+{
+  "webhookEvent": "jira:issue_deleted",
+  "user": { "accountId": "712020:op-account-id", "emailAddress": "op@example.com", "displayName": "Op Operator" },
+  "issue": { "key": "PROJ-1" }
+}

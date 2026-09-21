@@ -1,0 +1,22 @@
+{
+  "webhookEvent": "comment_created",
+  "user": { "accountId": "712020:op-account-id", "emailAddress": "op@example.com", "displayName": "Op Operator" },
+  "issue": {
+    "key": "PROJ-1",
+    "fields": {
+      "summary": "Login redirect is broken",
+      "project": { "key": "PROJ" }
+    }
+  },
+  "comment": {
+    "id": "10000",
+    "author": { "accountId": "712020:op-account-id", "emailAddress": "op@example.com", "displayName": "Op Operator" },
+    "body": {
+      "type": "doc",
+      "version": 1,
+      "content": [
+        { "type": "paragraph", "content": [{ "type": "text", "text": "q-001: use forward-only migrations" }] }
+      ]
+    }
+  }
+}

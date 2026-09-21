@@ -62,6 +62,7 @@
     <Project Path="plugins/quota/CodeyBox.QuotaResetNotifier/CodeyBox.QuotaResetNotifier.csproj" />
     <Project Path="plugins/quota/CodeyBox.StatisticsPlugin/CodeyBox.StatisticsPlugin.csproj" />
     <Project Path="plugins/work-sync/CodeyBox.LinearWorkSyncPlugin/CodeyBox.LinearWorkSyncPlugin.csproj" />
+    <Project Path="plugins/work-sync/CodeyBox.JiraWorkSyncPlugin/CodeyBox.JiraWorkSyncPlugin.csproj" />
     <Project Path="plugins/work-sync/CodeyBox.PlaneWorkSyncPlugin/CodeyBox.PlaneWorkSyncPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.InfisicalPlugin/CodeyBox.InfisicalPlugin.csproj" />
   </Folder>

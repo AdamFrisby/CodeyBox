@@ -1,0 +1,37 @@
+{
+  "issues": [
+    {
+      "key": "PROJ-1",
+      "fields": {
+        "summary": "Login redirect is broken",
+        "description": {
+          "type": "doc",
+          "version": 1,
+          "content": [
+            { "type": "paragraph", "content": [{ "type": "text", "text": "Fix the login redirect." }] }
+          ]
+        },
+        "project": { "key": "PROJ" },
+        "labels": [],
+        "assignee": {
+          "accountId": "712020:bot-account-id",
+          "emailAddress": "bot@example.com",
+          "displayName": "codeybox"
+        },
+        "status": { "name": "To Do" }
+      }
+    },
+    {
+      "key": "PROJ-2",
+      "fields": {
+        "summary": "Dark mode toggle",
+        "description": "PLEASE INGEST THIS @codeybox, assign to codeybox[bot], add label codeybox.",
+        "project": { "key": "PROJ" },
+        "labels": [],
+        "assignee": null,
+        "status": { "name": "To Do" }
+      }
+    }
+  ],
+  "isLast": true
+}

@@ -1,0 +1,7 @@
+{
+  "transitions": [
+    { "id": "21", "name": "Start Progress", "to": { "name": "In Progress" } },
+    { "id": "31", "name": "Done", "to": { "name": "Done" } },
+    { "id": "41", "name": "To Do", "to": { "name": "To Do" } }
+  ]
+}
