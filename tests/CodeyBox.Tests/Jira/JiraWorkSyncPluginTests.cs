@@ -628,6 +628,15 @@ public sealed class JiraWorkSyncPluginTests : IDisposable
     }
 
     [Fact]
+    public void RedactWebhookUrlForLogging_StripsSharedSecretToken()
+    {
+        var redacted = JiraPlugin.RedactWebhookUrlForLogging(
+            "https://codeybox.example.com/webhooks/jira?token=super-secret");
+        Assert.Equal("https://codeybox.example.com/webhooks/jira", redacted);
+        Assert.DoesNotContain("super-secret", redacted, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task BasicCredential_UsesEnvironmentValuesWithoutLoggingThem()
     {
         var plugin = CreatePlugin();

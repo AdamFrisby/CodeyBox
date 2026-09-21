@@ -367,13 +367,13 @@ public sealed class JiraWorkSyncPlugin
                 var renewed = await api.RefreshWebhooksAsync(options, [match.Id], ct).ConfigureAwait(false);
                 if (renewed.Count > 0)
                 {
-                    _logger.LogInformation("Jira webhook at {Url} renewed (id {Id})", options.WebhookUrl, match.Id);
+                    _logger.LogInformation("Jira webhook at {Url} renewed (id {Id})", RedactWebhookUrlForLogging(options.WebhookUrl), match.Id);
                     return;
                 }
                 await api.DeleteWebhooksAsync(options, [match.Id], ct).ConfigureAwait(false);
             }
             var id = await api.CreateWebhookAsync(options, options.WebhookUrl, ct).ConfigureAwait(false);
-            _logger.LogInformation("Jira webhook registered at {Url} (id {Id})", options.WebhookUrl, id);
+            _logger.LogInformation("Jira webhook registered at {Url} (id {Id})", RedactWebhookUrlForLogging(options.WebhookUrl), id);
         }
         catch (Exception ex) when (ex is JiraApiException or HttpRequestException or TaskCanceledException)
         {
@@ -585,6 +585,21 @@ public sealed class JiraWorkSyncPlugin
     }
 
     private static string NormalizeUrl(string url) => url.Trim().TrimEnd('/');
+
+    /// <summary>
+    /// Strips the query and fragment from a webhook URL before logging, so the
+    /// shared-secret delivery token in the query string never reaches the log sink.
+    /// </summary>
+    internal static string RedactWebhookUrlForLogging(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return "(empty)";
+        var trimmed = url.Trim();
+        if (Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+            return uri.GetLeftPart(UriPartial.Path);
+        var cut = trimmed.IndexOfAny(['?', '#']);
+        return cut < 0 ? trimmed : trimmed[..cut];
+    }
 
     /// <summary>
     /// Validates the operator's public webhook URL. Delegates SSRF policy to

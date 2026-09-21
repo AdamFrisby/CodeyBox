@@ -107,9 +107,10 @@ public sealed record JiraWorkSyncOptions
 
     /// <summary>
     /// When true the plugin registers its webhook with Jira at startup
-    /// (creating it when absent, refreshing the 30-day expiry when present)
-    /// and removes it on disposal. When false only polling is used — required
-    /// for deployments without inbound traffic.
+    /// (creating it when absent, refreshing the 30-day expiry when present).
+    /// Registrations are left to expire when the plugin is disposed; call
+    /// <c>RemoveWebhookAsync</c> for explicit removal. When false only
+    /// polling is used — required for deployments without inbound traffic.
     /// </summary>
     public bool ManageWebhooks { get; init; }
 
