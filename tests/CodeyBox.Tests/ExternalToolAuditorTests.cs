@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.ExampleSarifAuditorPlugin;
+using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk.Tools;
 using Microsoft.Extensions.Configuration;
 
@@ -272,6 +273,23 @@ public sealed class ExternalToolAuditorTests
         Assert.Throws<ArgumentException>(() => ExternalToolNames.Validate("/bin/sh"));
         Assert.Throws<ArgumentException>(() => ExternalToolNames.Validate(""));
         Assert.Equal("gitleaks", ExternalToolNames.Validate("gitleaks"));
+    }
+
+    [Fact]
+    public void ToolNameLengthBound_AgreesWithHostInstallPath()
+    {
+        // The SDK execution path and the host install/verify path share one
+        // canonical policy: a name accepted at one boundary must be accepted
+        // at the other. Probes both sides at the cap and one past it.
+        var atCap = new string('a', ExternalToolNamePolicy.MaxLength);
+        Assert.Equal(atCap, ExternalToolNames.Validate(atCap));
+        Assert.True(PluginToolRequirement.TryCreate(
+            "sample.plugin", atCap, null, null, out _, out _));
+
+        var overCap = new string('a', ExternalToolNamePolicy.MaxLength + 1);
+        Assert.Throws<ArgumentException>(() => ExternalToolNames.Validate(overCap));
+        Assert.False(PluginToolRequirement.TryCreate(
+            "sample.plugin", overCap, null, null, out _, out _));
     }
 
     private static FakeSandbox ToolReturning(int exitCode, string stdout, string stderr)
