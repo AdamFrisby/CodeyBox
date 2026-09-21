@@ -1,33 +1,73 @@
 @using CodeyBox.Admin.Model
 
-<div class="form-group dependency-picker">
-    <label for="@SearchInputId">Depends on</label>
-    <input id="@SearchInputId" value="@Search" @oninput="e => SearchChanged.InvokeAsync(e.Value?.ToString() ?? string.Empty)"
-           class="form-control" placeholder="Search queued items…" autocomplete="off" />
-    @if (Candidates.Count == 0)
+@* Existing items the new work waits for. Selected items sit as chips at
+   the top so the choice is visible without scrolling; the list beneath is
+   ordered by proximity (chain, same project, everything else — newest
+   first) and shows only its head until searched or expanded, because the
+   live queue is a hundred items and a hundred checkboxes is a wall. *@
+<div class="dependency-picker">
+    @if (Selected.Count > 0)
     {
-        <p class="form-hint">No matching items.</p>
+        <ul class="dep-chips" aria-label="Selected dependencies">
+            @foreach (var id in Selected)
+            {
+                var c = AllCandidates.FirstOrDefault(x => x.Id == id);
+                <li class="dep-chip" id="@(IdPrefix + "chip-" + id)" title="@(c?.Title ?? id)">
+                    <span class="dep-shortid">@ShortId(id)</span>
+                    <span class="dep-chip-title">@DependencyProximity.DisplayTitle(c?.Title ?? id, 48)</span>
+                    <button type="button" class="dep-chip-remove" id="@(IdPrefix + "remove-" + id)"
+                            aria-label="Stop waiting for @(c?.Title ?? id)" @onclick="() => Toggle(id, false)">✕</button>
+                </li>
+            }
+        </ul>
     }
-    @foreach (var c in Candidates)
+    <input id="@SearchInputId" value="@Search" @oninput="e => SearchChanged.InvokeAsync(e.Value?.ToString() ?? string.Empty)"
+           class="form-control dep-search" placeholder="Search in-flight items by title, id or external id…" autocomplete="off" />
+    @{
+        var unselected = Candidates.Where(c => !Selected.Contains(c.Id)).ToList();
+        var searching = !string.IsNullOrWhiteSpace(Search);
+        var shown = searching || _showAll ? unselected : unselected.Take(Limit).ToList();
+        var hidden = unselected.Count - shown.Count;
+    }
+    @if (unselected.Count == 0)
     {
-        <div class="form-check">
-            <input type="checkbox"
-                   id="@(IdPrefix + c.Id)"
-                   checked="@Selected.Contains(c.Id)"
-                   @onchange="e => Toggle(c.Id, (bool)(e.Value ?? false))" />
-            <label for="@(IdPrefix + c.Id)" title="@c.Title">
-                <span class="dep-shortid">@ShortId(c.Id)</span>
-                <span class="dep-title">@DependencyProximity.DisplayTitle(c.Title)</span>
-                <span class="dep-state">@c.State</span>
-                <span class="dep-project">@ProjectName(c.ProjectId)</span>
-            </label>
-        </div>
+        <p class="form-hint">@(searching ? "No matching items." : "No other in-flight items.")</p>
+    }
+    <ul class="dep-list">
+        @foreach (var c in shown)
+        {
+            <li class="dep-row">
+                <input type="checkbox" id="@(IdPrefix + c.Id)" checked="@Selected.Contains(c.Id)"
+                       @onchange="e => Toggle(c.Id, (bool)(e.Value ?? false))" />
+                <label for="@(IdPrefix + c.Id)" title="@c.Title">
+                    <span class="dep-shortid">@ShortId(c.Id)</span>
+                    <span class="dep-title">@DependencyProximity.DisplayTitle(c.Title)</span>
+                    <span class="dep-state">@c.State</span>
+                    <span class="dep-project">@ProjectName(c.ProjectId)</span>
+                </label>
+            </li>
+        }
+    </ul>
+    @if (hidden > 0)
+    {
+        <button type="button" class="btn btn-xs dep-more" id="@(IdPrefix + "more")" @onclick="() => _showAll = true">
+            @hidden more — show all
+        </button>
+    }
+    else if (_showAll && !searching && unselected.Count > Limit)
+    {
+        <button type="button" class="btn btn-xs dep-more" @onclick="() => _showAll = false">Show fewer</button>
     }
 </div>
 
 @code {
+    /// <summary>Filtered and proximity-ordered candidates to list.</summary>
     [Parameter]
     public IReadOnlyList<DependencyCandidate> Candidates { get; set; } = [];
+
+    /// <summary>Every candidate, so a selected item filtered out by search still has a chip.</summary>
+    [Parameter]
+    public IReadOnlyList<DependencyCandidate> AllCandidates { get; set; } = [];
 
     [Parameter]
     public IReadOnlySet<string> Selected { get; set; } = new HashSet<string>(StringComparer.Ordinal);
@@ -49,6 +89,12 @@
 
     [Parameter]
     public Func<string, string> ProjectName { get; set; } = id => id;
+
+    /// <summary>Rows shown before "show all"; the search box bypasses it.</summary>
+    [Parameter]
+    public int Limit { get; set; } = 8;
+
+    private bool _showAll;
 
     private static string ShortId(string id) => id.Length >= 8 ? id[..8] : id;
 }

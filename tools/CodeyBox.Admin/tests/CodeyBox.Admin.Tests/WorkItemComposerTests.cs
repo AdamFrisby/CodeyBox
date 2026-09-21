@@ -8,10 +8,10 @@ using CodeyBox.Admin.Web.Services;
 namespace CodeyBox.Admin.Tests;
 
 /// <summary>
-/// Composer behaviour: one submission files a whole reviewed chain with
-/// the previewed edges, inference is overridable without silent re-infer,
-/// the preview is exactly what gets created, and a two-item chain is
-/// authorable keyboard-only from start to finish.
+/// Composer behaviour: a pasted plan becomes a chain filed in one act with
+/// the outlined edges; structure is a default the operator can flip;
+/// inference is shown and overridable without silent re-infer; the review
+/// is exactly what gets created; failure is reported honestly.
 /// </summary>
 public sealed class WorkItemComposerTests : BunitContext
 {
@@ -25,7 +25,7 @@ public sealed class WorkItemComposerTests : BunitContext
         AuditMaxIterations = 8,
     };
 
-    private static WorkItemDto QueuedItem(string id, string title, string project = "proj-1") => new()
+    private static WorkItemDto QueuedItem(string id, string title, string project = "proj-1", DateTimeOffset? created = null) => new()
     {
         Id = id,
         ProjectId = project,
@@ -33,7 +33,7 @@ public sealed class WorkItemComposerTests : BunitContext
         Prompt = "p",
         Agent = "claude",
         State = "Queued",
-        CreatedAt = DateTimeOffset.UtcNow,
+        CreatedAt = created ?? DateTimeOffset.UtcNow,
         UpdatedAt = DateTimeOffset.UtcNow,
         QueuePosition = 1,
     };
@@ -44,17 +44,21 @@ public sealed class WorkItemComposerTests : BunitContext
         return Render<NewWorkItem>();
     }
 
-    private FakeApiClient Client(
-        List<WorkItemDto>? items = null, List<ProjectDto>? projects = null) =>
+    private static FakeApiClient Client(List<WorkItemDto>? items = null, List<ProjectDto>? projects = null) =>
         new(items ?? [], projects ?? [SampleProject()]);
 
-    [Fact]
-    public void Composer_ParsedChain_FiledInSingleSubmissionWithPreviewedEdges()
+    private static FakeApiClient Recording(List<CreateWorkItemRequest> seen, Func<int, Exception?>? failAt = null)
     {
-        var seen = new List<CreateWorkItemRequest>();
         var fake = Client();
+        var calls = 0;
         fake.CreateHandler = req =>
         {
+            calls++;
+            if (failAt?.Invoke(calls) is { } ex)
+            {
+                throw ex;
+            }
+
             seen.Add(req);
             return new WorkItemDto
             {
@@ -69,96 +73,79 @@ public sealed class WorkItemComposerTests : BunitContext
                 ExternalId = req.ExternalId,
             };
         };
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        return fake;
+    }
 
-        var cut = RenderComposer("?projectId=proj-1&mode=plan");
+    private const string ThreeStepPlan =
+        "1. Lay the foundation\nPour concrete.\n\n2. Raise the walls\nDepends on: 1\nBricks.\n\n3. Paint\nDepends on: 1, 2\nColour.";
 
-        cut.Find("textarea#plan-input").Input(
-            "1. Lay the foundation\nPour concrete.\n\n2. Raise the walls\nDepends on: 1\nBricks.\n\n3. Paint\nDepends on: 1, 2\nColour.");
-        cut.Find("button#parse-plan").Click();
+    [Fact]
+    public void PastedPlan_BecomesChainOutline_FiledInOneActWithOutlinedEdges()
+    {
+        var seen = new List<CreateWorkItemRequest>();
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording(seen));
 
-        cut.WaitForAssertion(() => Assert.Contains("Parsed 3 items", cut.Find("#preview-info").TextContent));
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input(ThreeStepPlan);
+
+        Assert.Contains("Reads as a plan of 3 items", cut.Find("#structure-strip").TextContent);
+        Assert.Equal(3, cut.FindAll("#chain-preview .chain-item").Count);
         Assert.Equal("Lay the foundation", cut.Find("#chain-title-1").GetAttribute("value"));
-        Assert.Contains("chain: 1", cut.FindAll(".chain-edges-summary")[1].TextContent);
+        Assert.Equal("1, 2", cut.Find("#chain-waits-3").GetAttribute("value"));
+        Assert.Contains("Files 3 items into My Project as a chain", cut.Find("#review-sentence").TextContent);
+        Assert.Equal("File 3 items", cut.Find("button#file").TextContent.Trim());
 
-        cut.Find("button#file-chain").Click();
+        cut.Find("button#file").Click();
 
         cut.WaitForAssertion(() => Assert.Equal(3, seen.Count));
         Assert.Equal(["Lay the foundation", "Raise the walls", "Paint"], seen.Select(r => r.Title));
-    }
-
-    [Fact]
-    public void Composer_ChainEdges_ReferenceSiblingsByGeneratedExternalIds()
-    {
-        var seen = new List<CreateWorkItemRequest>();
-        var fake = Client();
-        fake.CreateHandler = req =>
-        {
-            seen.Add(req);
-            return new WorkItemDto
-            {
-                Id = Guid.NewGuid().ToString(),
-                ProjectId = req.ProjectId,
-                Title = req.Title,
-                Prompt = req.Prompt,
-                Agent = req.Agent ?? "claude",
-                State = "Queued",
-                CreatedAt = DateTimeOffset.UtcNow,
-                UpdatedAt = DateTimeOffset.UtcNow,
-                ExternalId = req.ExternalId,
-            };
-        };
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
-
-        var cut = RenderComposer("?projectId=proj-1&mode=plan");
-
-        cut.Find("textarea#plan-input").Input("1. First\nA.\n\n2. Second\nB.");
-        cut.Find("button#parse-plan").Click();
-        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("#chain-preview .chain-item").Count));
-        cut.Find("button#file-chain").Click();
-
-        cut.WaitForAssertion(() => Assert.Equal(2, seen.Count));
-        Assert.NotNull(seen[0].ExternalId);
-        Assert.NotNull(seen[1].ExternalId);
-        Assert.NotEqual(seen[0].ExternalId, seen[1].ExternalId);
+        Assert.All(seen, r => Assert.NotNull(r.ExternalId));
         Assert.Empty(seen[0].DependsOn);
         Assert.Equal([seen[0].ExternalId!], seen[1].DependsOn);
+        Assert.Equal([seen[0].ExternalId!, seen[1].ExternalId!], seen[2].DependsOn);
     }
 
     [Fact]
-    public void Composer_PreviewEdits_AreWhatGetsCreated()
+    public void LongPromptWithSections_DefaultsToOneItem_SplitIsOneClick()
     {
         var seen = new List<CreateWorkItemRequest>();
-        var fake = Client();
-        fake.CreateHandler = req =>
-        {
-            seen.Add(req);
-            return new WorkItemDto
-            {
-                Id = Guid.NewGuid().ToString(),
-                ProjectId = req.ProjectId,
-                Title = req.Title,
-                Prompt = req.Prompt,
-                Agent = req.Agent ?? "claude",
-                State = "Queued",
-                CreatedAt = DateTimeOffset.UtcNow,
-                UpdatedAt = DateTimeOffset.UtcNow,
-                ExternalId = req.ExternalId,
-            };
-        };
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording(seen));
 
-        var cut = RenderComposer("?projectId=proj-1&mode=plan");
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("# Fix the redirect\n## Context\nUsers loop.\n## Acceptance criteria\n- No loop");
 
-        cut.Find("textarea#plan-input").Input("1. Original title\nBody one.\n\n2. Second\nBody two.");
-        cut.Find("button#parse-plan").Click();
-        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("#chain-preview .chain-item").Count));
+        Assert.Contains("probably one item", cut.Find("#structure-strip").TextContent);
+        Assert.Empty(cut.FindAll("#chain-preview"));
+        Assert.Equal("Fix the redirect", cut.Find("input#title").GetAttribute("value"));
+        Assert.Contains("Files 1 item", cut.Find("#review-sentence").TextContent);
+
+        cut.Find("button#file-as-chain").Click();
+        Assert.Equal(2, cut.FindAll("#chain-preview .chain-item").Count);
+
+        cut.Find("button#file-as-one").Click();
+        Assert.Empty(cut.FindAll("#chain-preview"));
+
+        cut.Find("button#file").Click();
+        cut.WaitForAssertion(() => Assert.Single(seen));
+        Assert.Contains("## Acceptance criteria", seen[0].Prompt);
+        Assert.Equal("Fix the redirect", seen[0].Title);
+    }
+
+    [Fact]
+    public void OutlineEdits_TitleBodyAndEdges_AreWhatGetsCreated()
+    {
+        var seen = new List<CreateWorkItemRequest>();
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording(seen));
+
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("1. Original title\nBody one.\n\n2. Second\nBody two.");
 
         cut.Find("input#chain-title-1").Change("Edited title");
+        cut.Find("button#chain-expand-2").Click();
         cut.Find("textarea#chain-body-2").Change("Edited body");
-        cut.Find("input#chain-dep-2-1").Change(false);
+        cut.Find("input#chain-waits-2").Change("");
 
-        cut.Find("button#file-chain").Click();
+        cut.Find("button#file").Click();
         cut.WaitForAssertion(() => Assert.Equal(2, seen.Count));
 
         Assert.Equal("Edited title", seen[0].Title);
@@ -167,40 +154,131 @@ public sealed class WorkItemComposerTests : BunitContext
     }
 
     [Fact]
-    public void Composer_InferredAgent_IsOverridableAndSurvivesProjectSwitch()
+    public void OutlineEdits_SurviveRetypingWhileCountUnchanged()
+    {
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording([]));
+
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("1. First\nA.\n\n2. Second\nB.");
+        cut.Find("input#chain-title-2").Change("Renamed");
+
+        cut.Find("textarea#prompt").Input("1. First\nA. More.\n\n2. Second\nB.");
+
+        Assert.Equal("Renamed", cut.Find("input#chain-title-2").GetAttribute("value"));
+    }
+
+    [Fact]
+    public void ShapeButtons_FanOutAfterFoundation_AndTypedEdgesAreValidated()
+    {
+        var seen = new List<CreateWorkItemRequest>();
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording(seen));
+
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input(string.Join("\n\n", Enumerable.Range(1, 5).Select(n => $"{n}. Item {n}\nBody {n}.")));
+
+        cut.Find("input#fanout-root").Change("2");
+        cut.Find("button#shape-fanout").Click();
+
+        Assert.Equal("2", cut.Find("#chain-waits-5").GetAttribute("value"));
+        Assert.Contains("1 → 2, then 3–5 in parallel after 2", cut.Find("#review-sentence").TextContent);
+
+        cut.Find("input#chain-waits-4").Change("9");
+        Assert.Contains("no item 9", cut.Find("#review-problems").TextContent);
+        Assert.True(cut.Find("button#file").HasAttribute("disabled"));
+
+        cut.Find("input#chain-waits-4").Change("1, 2");
+        Assert.Empty(cut.FindAll("#review-problems"));
+
+        cut.Find("button#file").Click();
+        cut.WaitForAssertion(() => Assert.Equal(5, seen.Count));
+        Assert.Equal([seen[1].ExternalId!], seen[4].DependsOn);
+        Assert.Equal([seen[0].ExternalId!, seen[1].ExternalId!], seen[3].DependsOn);
+    }
+
+    [Fact]
+    public void Cycle_IsNamedAndBlocksFiling()
+    {
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording([]));
+
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("1. A\nx\n\n2. B\nx");
+        cut.Find("input#chain-waits-1").Change("2");
+
+        Assert.Contains("Items 1, 2 wait for each other", cut.Find("#review-problems").TextContent);
+        Assert.True(cut.Find("button#file").HasAttribute("disabled"));
+    }
+
+    [Fact]
+    public void RemovingAnOutlineItem_RenumbersEdges()
+    {
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording([]));
+
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("1. A\nx\n\n2. B\nx\n\n3. C\nx");
+
+        cut.Find("button#chain-remove-2").Click();
+
+        Assert.Equal(2, cut.FindAll("#chain-preview .chain-item").Count);
+        Assert.Equal("C", cut.Find("input#chain-title-2").GetAttribute("value"));
+        Assert.Equal("1", cut.Find("input#chain-waits-2").GetAttribute("value"));
+    }
+
+    [Fact]
+    public void ExistingDependencies_AttachToChainRoots()
+    {
+        var seen = new List<CreateWorkItemRequest>();
+        var existing = QueuedItem("eeeeeeee-0000-0000-0000-000000000001", "Existing");
+        var fake = Client([existing]);
+        fake.CreateHandler = Recording(seen).CreateHandler;
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComposer("?followUp=" + existing.Id);
+        cut.Find("textarea#prompt").Input("1. Root one\nx\n\n2. Root two\nx\n\n3. Child\nDepends on: 1, 2\nx");
+        cut.Find("input#chain-waits-2").Change("");
+
+        Assert.Contains("the chain's roots wait for eeeeeeee", cut.Find("#review-sentence").TextContent);
+        cut.Find("button#file").Click();
+        cut.WaitForAssertion(() => Assert.Equal(3, seen.Count));
+
+        Assert.Equal([existing.Id], seen[0].DependsOn);
+        Assert.Equal([existing.Id], seen[1].DependsOn);
+        Assert.DoesNotContain(existing.Id, seen[2].DependsOn);
+    }
+
+    [Fact]
+    public void InferredAgent_IsOverridableAndSurvivesProjectSwitch()
     {
         var other = SampleProject();
         other.Id = "proj-2";
         other.DisplayName = "Second";
         other.DefaultAgent = "copilot";
-        var fake = Client(projects: [SampleProject(), other]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(Client(projects: [SampleProject(), other]));
 
         var cut = RenderComposer("?projectId=proj-1");
 
         Assert.Contains("project default", cut.Find("label[for=agent]").TextContent);
 
         cut.Find("select#agent").Change("codex");
-        Assert.Contains("set by you", cut.Find("label[for=agent]").TextContent);
+        Assert.Contains("you", cut.Find("label[for=agent]").TextContent);
 
         cut.Find("select#project").Change("proj-2");
 
-        Assert.Contains("set by you", cut.Find("label[for=agent]").TextContent);
+        Assert.Contains("you", cut.Find("label[for=agent]").TextContent);
         Assert.Equal("codex", cut.Find("select#agent").GetAttribute("value"));
+        Assert.Contains("project default", cut.Find("label[for=baseBranch]").TextContent);
     }
 
     [Fact]
-    public void Composer_ResetHandsFieldBackToInference()
+    public void Reset_HandsFieldBackToInference()
     {
-        var fake = Client();
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(Client());
 
         var cut = RenderComposer("?projectId=proj-1&agent=codex");
 
         Assert.Contains("from link", cut.Find("label[for=agent]").TextContent);
 
         cut.Find("select#agent").Change("copilot");
-        Assert.Contains("set by you", cut.Find("label[for=agent]").TextContent);
+        Assert.Contains("you", cut.Find("label[for=agent]").TextContent);
 
         cut.Find("button#reset-agent").Click();
         Assert.Contains("from link", cut.Find("label[for=agent]").TextContent);
@@ -208,128 +286,101 @@ public sealed class WorkItemComposerTests : BunitContext
     }
 
     [Fact]
-    public void Composer_AuditBudgetChip_InferredFromProjectAndOverridable()
+    public void AuditBudget_InferredFromProject_OverridableInline()
     {
-        var fake = Client();
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(Client());
 
         var cut = RenderComposer("?projectId=proj-1");
 
-        var chip = cut.Find("button#chip-budget");
-        Assert.Contains("8", chip.TextContent);
-        Assert.Contains("project default", chip.TextContent);
+        Assert.Equal("8", cut.Find("input#auditMaxIterations").GetAttribute("value"));
+        Assert.Contains("project default", cut.Find("label[for=auditMaxIterations]").TextContent);
 
-        chip.Click();
-        cut.Find("input#chip-budget-input").Change("3");
-        cut.Find("button#chip-save").Click();
+        cut.Find("input#auditMaxIterations").Change("3");
+        Assert.Contains("you", cut.Find("label[for=auditMaxIterations]").TextContent);
+        cut.Find("textarea#prompt").Input("Something");
+        Assert.Contains("audit ×3", cut.Find("#review-sentence").TextContent);
 
-        Assert.Contains("3", cut.Find("button#chip-budget").TextContent);
-        Assert.Contains("you", cut.Find("button#chip-budget").TextContent);
+        cut.Find("button#reset-auditMaxIterations").Click();
+        Assert.Equal("8", cut.Find("input#auditMaxIterations").GetAttribute("value"));
     }
 
     [Fact]
-    public void Composer_AdvancedFields_FlowIntoSingleCreate()
+    public void RailSettings_FlowIntoTheCreate_AndReadBackInTheSentence()
     {
         var seen = new List<CreateWorkItemRequest>();
-        var fake = Client();
-        fake.CreateHandler = req =>
-        {
-            seen.Add(req);
-            return new WorkItemDto
-            {
-                Id = Guid.NewGuid().ToString(),
-                ProjectId = req.ProjectId,
-                Title = req.Title,
-                Prompt = req.Prompt,
-                Agent = req.Agent ?? "claude",
-                State = "Queued",
-                CreatedAt = DateTimeOffset.UtcNow,
-                UpdatedAt = DateTimeOffset.UtcNow,
-            };
-        };
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording(seen));
 
-        var cut = Render<NewWorkItem>();
-        cut.Find("select#project").Change("proj-1");
-        cut.Find("input#title").Change("Advanced item");
-        cut.Find("textarea#prompt").Change("Do it well.");
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("Do it well.");
         cut.Find("input#priority").Change("7");
         cut.Find("input#minModelScore").Change("80");
         cut.Find("input#requiredCapabilities").Change("gpu, large-mem");
-        cut.Find("textarea#knobs").Change("retries=3\ntimeout=fast");
-        cut.Find("form").Submit();
+        cut.Find("select#knob-changeScope").Change("surgical");
+        cut.Find("textarea#knobs").Change("retries=3");
+        cut.Find("input#auditComplexity").Change("high");
+        cut.Find("input#pushUpstream").Change(false);
+
+        var sentence = cut.Find("#review-sentence").TextContent;
+        Assert.Contains("priority 7", sentence);
+        Assert.Contains("model score ≥ 80", sentence);
+        Assert.Contains("needs gpu, large-mem", sentence);
+        Assert.Contains("changeScope=surgical", sentence);
+        Assert.Contains("no upstream push", sentence);
+
+        cut.Find("button#file").Click();
 
         cut.WaitForAssertion(() => Assert.Single(seen));
         var sent = seen[0];
         Assert.Equal(7, sent.Priority);
         Assert.Equal(80, sent.MinModelScore);
         Assert.Equal(["gpu", "large-mem"], sent.RequiredCapabilities);
-        Assert.Equal("3", sent.Knobs!["retries"]);
-        Assert.Equal("fast", sent.Knobs["timeout"]);
+        Assert.Equal("surgical", sent.Knobs!["changeScope"]);
+        Assert.Equal("3", sent.Knobs["retries"]);
+        Assert.Equal("high", sent.AuditComplexity);
+        Assert.False(sent.PushUpstream);
+        Assert.Null(sent.IsRefactor);
     }
 
     [Fact]
-    public void Composer_PartialChainFailure_ReportedHonestlyWithPreviewIntact()
+    public void BadKnobValue_IsAProblemBeforeThePost()
     {
-        var calls = 0;
-        var fake = Client();
-        fake.CreateHandler = req =>
-        {
-            calls++;
-            if (calls == 2)
-            {
-                throw new HttpRequestException("orchestrator exploded");
-            }
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording([]));
 
-            return new WorkItemDto
-            {
-                Id = Guid.NewGuid().ToString(),
-                ProjectId = req.ProjectId,
-                Title = req.Title,
-                Prompt = req.Prompt,
-                Agent = req.Agent ?? "claude",
-                State = "Queued",
-                CreatedAt = DateTimeOffset.UtcNow,
-                UpdatedAt = DateTimeOffset.UtcNow,
-                ExternalId = req.ExternalId,
-            };
-        };
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("x");
+        cut.Find("textarea#knobs").Change("plan=maybe");
 
-        var cut = RenderComposer("?projectId=proj-1&mode=plan");
+        Assert.Contains("Plan first must be one of off, on", cut.Find("#review-problems").TextContent);
+        Assert.True(cut.Find("button#file").HasAttribute("disabled"));
+    }
 
-        cut.Find("textarea#plan-input").Input("1. First\nA.\n\n2. Second\nB.");
-        cut.Find("button#parse-plan").Click();
-        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("#chain-preview .chain-item").Count));
-        cut.Find("button#file-chain").Click();
+    [Fact]
+    public void PartialChainFailure_ReportedHonestlyWithOutlineIntact()
+    {
+        var seen = new List<CreateWorkItemRequest>();
+        Services.AddSingleton<ICodeyBoxApiClient>(Recording(seen, call => call == 2 ? new HttpRequestException("orchestrator exploded") : null));
 
-        cut.WaitForAssertion(() => Assert.Contains("Filed 1 of 2", cut.Find(".error-banner").TextContent));
-        Assert.Contains("orchestrator exploded", cut.Find(".error-banner").TextContent);
+        var cut = RenderComposer("?projectId=proj-1");
+        cut.Find("textarea#prompt").Input("1. First\nA.\n\n2. Second\nB.");
+        cut.Find("button#file").Click();
+
+        cut.WaitForAssertion(() => Assert.Contains("Filed 1 of 2", cut.Find("#composer-error").TextContent));
+        Assert.Contains("orchestrator exploded", cut.Find("#composer-error").TextContent);
         Assert.Equal(2, cut.FindAll("#chain-preview .chain-item").Count);
     }
 
     [Fact]
-    public void Composer_Templates_ListedAndQueuedForSelectedProject()
+    public void Templates_QueuedForSelectedProjectFromTheStrip()
     {
         var fake = Client();
-        fake.TemplatesOverride =
-        [
-            new TaskTemplateDto { Name = "nightly-checks", Path = "nightly-checks.json", CheckCount = 4 },
-        ];
-        fake.QueueTemplateResponse = new QueuedTaskTemplateResponse
-        {
-            Template = "nightly-checks",
-            Enqueued = 4,
-        };
+        fake.TemplatesOverride = [new TaskTemplateDto { Name = "nightly-checks", Path = "nightly-checks.json", CheckCount = 4 }];
+        fake.QueueTemplateResponse = new QueuedTaskTemplateResponse { Template = "nightly-checks", Enqueued = 4 };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = Render<NewWorkItem>();
+        var cut = RenderComposer("?projectId=proj-1");
 
         Assert.Contains("nightly-checks", cut.Find("#templates").TextContent);
-        Assert.True(cut.Find("button#queue-template-0").HasAttribute("disabled"));
-
-        cut.Find("select#project").Change("proj-1");
-        cut.Find("button#queue-template-0").Click();
+        cut.Find("button#queue-template").Click();
 
         cut.WaitForAssertion(() => Assert.Contains("Queued 4 items", cut.Find("#template-message").TextContent));
         Assert.Equal("nightly-checks", fake.LastQueueTemplateRequest?.Template);
@@ -337,13 +388,14 @@ public sealed class WorkItemComposerTests : BunitContext
     }
 
     [Fact]
-    public void Composer_DependencyPicker_OrdersSameProjectFirstAndSearches()
+    public void DependencyPicker_OrdersSameProjectFirst_Searches_AndFoldsTheLongTail()
     {
         var items = new List<WorkItemDto>
         {
             QueuedItem("11111111-0000-0000-0000-000000000001", "Foreign task", "proj-9"),
             QueuedItem("22222222-0000-0000-0000-000000000002", "Local database migration"),
         };
+        items.AddRange(Enumerable.Range(0, 12).Select(i => QueuedItem($"33333333-0000-0000-0000-{i:000000000000}", $"Filler {i}")));
         var projects = new List<ProjectDto>
         {
             SampleProject(),
@@ -353,77 +405,79 @@ public sealed class WorkItemComposerTests : BunitContext
 
         var cut = RenderComposer("?projectId=proj-1");
 
-        var labels = cut.FindAll(".dependency-picker .form-check label").Select(l => l.TextContent).ToList();
-        Assert.Contains("Local database migration", labels[0]);
-        Assert.Contains("Foreign task", labels[1]);
+        var labels = cut.FindAll(".dep-row label").Select(l => l.TextContent).ToList();
+        Assert.Equal(8, labels.Count);
+        Assert.DoesNotContain(labels, l => l.Contains("Foreign task"));
+        Assert.Contains("more — show all", cut.Find("button#dep-more").TextContent);
+
+        cut.Find("button#dep-more").Click();
+        labels = cut.FindAll(".dep-row label").Select(l => l.TextContent).ToList();
+        Assert.Equal(14, labels.Count);
+        Assert.Contains("Foreign task", labels[^1]);
 
         cut.Find("input#dep-search").Input("migrat");
-        labels = cut.FindAll(".dependency-picker .form-check label").Select(l => l.TextContent).ToList();
+        labels = cut.FindAll(".dep-row label").Select(l => l.TextContent).ToList();
         Assert.Single(labels);
         Assert.Contains("Local database migration", labels[0]);
+
+        cut.Find("input#dep-22222222-0000-0000-0000-000000000002").Change(true);
+        Assert.NotNull(cut.Find("#dep-chip-22222222-0000-0000-0000-000000000002"));
+        cut.Find("button#dep-remove-22222222-0000-0000-0000-000000000002").Click();
+        Assert.Empty(cut.FindAll("#dep-chip-22222222-0000-0000-0000-000000000002"));
     }
 
     [Fact]
-    public void Composer_FollowUp_InfersRelationshipNotWords()
+    public void FollowUp_InfersRelationshipNotWords()
     {
         var target = QueuedItem("aaaaaaaa-0000-0000-0000-000000000001", "Original quest");
-        var fake = Client([target]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(Client([target]));
 
         var cut = RenderComposer("?followUp=" + target.Id);
 
-        Assert.Contains("Original quest", cut.Markup);
+        Assert.Contains("Original quest", cut.Find(".composer-context").TextContent);
         Assert.Contains("follow-up", cut.Find("label[for=project]").TextContent);
-        Assert.True(cut.Find("input#dep-aaaaaaaa-0000-0000-0000-000000000001").HasAttribute("checked"));
+        Assert.NotNull(cut.Find("#dep-chip-aaaaaaaa-0000-0000-0000-000000000001"));
         Assert.Equal(string.Empty, cut.Find("input#title").GetAttribute("value"));
+        Assert.Equal(string.Empty, cut.Find("textarea#prompt").TextContent);
     }
 
-    /// <summary>
-    /// Keyboard-only authoring of a two-item chain, start to finish: focus
-    /// and change events plus Enter keydowns — no mouse clicks anywhere.
-    /// </summary>
     [Fact]
-    public void Composer_KeyboardOnly_TwoItemChainStartToFinish()
+    public void Project_InferredFromMostRecentItemWhenNothingElseSaysSo()
     {
-        var seen = new List<CreateWorkItemRequest>();
-        var fake = Client();
-        fake.CreateHandler = req =>
+        var other = SampleProject();
+        other.Id = "proj-2";
+        other.DisplayName = "Second";
+        var items = new List<WorkItemDto>
         {
-            seen.Add(req);
-            return new WorkItemDto
-            {
-                Id = Guid.NewGuid().ToString(),
-                ProjectId = req.ProjectId,
-                Title = req.Title,
-                Prompt = req.Prompt,
-                Agent = req.Agent ?? "claude",
-                State = "Queued",
-                CreatedAt = DateTimeOffset.UtcNow,
-                UpdatedAt = DateTimeOffset.UtcNow,
-                ExternalId = req.ExternalId,
-            };
+            QueuedItem("11111111-0000-0000-0000-000000000001", "Older", "proj-1", DateTimeOffset.UtcNow.AddHours(-2)),
+            QueuedItem("22222222-0000-0000-0000-000000000002", "Newest", "proj-2", DateTimeOffset.UtcNow),
         };
+        Services.AddSingleton<ICodeyBoxApiClient>(Client(items, [SampleProject(), other]));
+
+        var cut = RenderComposer();
+
+        Assert.Equal("proj-2", cut.Find("select#project").GetAttribute("value"));
+        Assert.Contains("most recent item", cut.Find("label[for=project]").TextContent);
+    }
+
+    [Fact]
+    public void Promote_ShowsOnlyWhatPromotionAccepts()
+    {
+        var fake = Client();
+        fake.SuggestionsOverride =
+        [
+            new SuggestionDto { Id = "s-1", ProjectId = "proj-1", Title = "Tighten the cache", Category = "perf", Severity = "low", Rationale = "r" },
+        ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = Render<NewWorkItem>();
+        var cut = RenderComposer("?fromSuggestion=s-1");
 
-        // Keyboard-only: native controls are Tab-focusable by construction;
-        // selections and typing raise change/input, Enter raises keydown. No Click.
-        cut.Find("select#project").Change("proj-1");
-
-        cut.Find("input#mode-plan").Change("plan");
-
-        cut.Find("textarea#plan-input").Input("1. First keyboard item\nDo alpha.\n\n2. Second keyboard item\nDo beta.");
-
-        cut.Find("button#parse-plan").KeyDown("Enter");
-        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("#chain-preview .chain-item").Count));
-
-        cut.Find("input#chain-title-2").Change("Second keyboard item (edited)");
-
-        cut.Find("button#file-chain").KeyDown("Enter");
-
-        cut.WaitForAssertion(() => Assert.Equal(2, seen.Count));
-        Assert.Equal("First keyboard item", seen[0].Title);
-        Assert.Equal("Second keyboard item (edited)", seen[1].Title);
+        Assert.Contains("Tighten the cache", cut.Find(".composer-context").TextContent);
+        Assert.Contains("suggestion", cut.Find("label[for=project]").TextContent);
+        Assert.Empty(cut.FindAll("input#title"));
+        Assert.Empty(cut.FindAll("input#priority"));
+        Assert.NotNull(cut.Find("select#agent"));
+        Assert.NotNull(cut.Find("input#externalId"));
+        Assert.Equal("Promote to work item", cut.Find("button#file").TextContent.Trim());
     }
 }

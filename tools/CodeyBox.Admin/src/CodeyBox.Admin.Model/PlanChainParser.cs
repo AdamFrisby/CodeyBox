@@ -6,25 +6,34 @@ namespace CodeyBox.Admin.Model;
 /// Splits a pasted plan into chain items. Work is authored as a numbered
 /// plan somewhere else and then transcribed, so the parser looks for the
 /// seams a human already put in the text — ATX headings, numbered markers
-/// ("1.", "2)", "Step 3:"), and explicit "depends on: 1, 3" lines — and
-/// defaults to a straight line when there is none. Prose with no structure
-/// yields exactly one item, never a bad chain.
+/// ("1.", "2)", "Step 3:", "3/7"), horizontal rules, and explicit
+/// "depends on: 1, 3" lines — and defaults to a straight line when there
+/// is none. Prose with no structure yields exactly one item, never a bad
+/// chain, and text before the first marker is never dropped: it becomes
+/// the first item's preamble.
+///
+/// The parser also reports how confident it is that the text is a plan
+/// at all (<see cref="PlanConfidence"/>): a long single prompt with
+/// "## Context" and "## Acceptance criteria" sections has headings too,
+/// and filing that as a two-item chain would be worse than filing a plan
+/// as one item. The composer defaults from the confidence; the operator
+/// decides.
 ///
 /// Pure over its input; all bounds are enforced before buffering.
 /// </summary>
 public static partial class PlanChainParser
 {
     /// <summary>Maximum pasted characters examined; the rest is ignored.</summary>
-    public const int MaxInputLength = 200_000;
+    public const int MaxInputLength = 400_000;
 
     /// <summary>Maximum items produced; further markers stay body text.</summary>
-    public const int MaxItems = 50;
+    public const int MaxItems = 200;
 
     /// <summary>Maximum title characters kept per item.</summary>
     public const int MaxTitleLength = 200;
 
     /// <summary>Maximum body characters kept per item.</summary>
-    public const int MaxBodyLength = 20_000;
+    public const int MaxBodyLength = 40_000;
 
     /// <summary>Parses <paramref name="text"/> into a chain preview.</summary>
     public static ParsedPlan Parse(string? text)
@@ -43,26 +52,41 @@ public static partial class PlanChainParser
             return SingleItem(bounded.Trim());
         }
 
-        // A lone "# Plan title" heading ahead of real structure names the
-        // plan, not an item: fold it into the first item's body instead of
-        // filing it as work.
+        // Anything before the first seam is a preamble: a lone "# Plan
+        // title" names the plan, and a paragraph of prose ahead of the
+        // numbering is context. Either way it belongs to the first item's
+        // body, not on the floor.
         var preamble = new List<string>();
-        var first = starts[0];
-        if (first.IsH1Title && starts.Count > 1)
+        var firstStartLine = starts[0].LineIndex;
+        for (var i = 0; i < firstStartLine; i++)
         {
-            preamble.Add(lines[first.LineIndex].Trim());
+            if (!string.IsNullOrWhiteSpace(lines[i]))
+            {
+                preamble.Add(lines[i].TrimEnd());
+            }
+        }
+
+        var leadingProse = preamble.Count > 0;
+        if (starts[0].IsH1Title && starts.Count > 1)
+        {
+            preamble.Add(lines[firstStartLine].Trim());
             starts.RemoveAt(0);
         }
 
+        var anyNumbered = false;
+        var anyRule = false;
         var items = new List<ParsedPlanItem>(starts.Count);
         for (var i = 0; i < starts.Count && items.Count < MaxItems; i++)
         {
+            var start = starts[i];
             var end = i + 1 < starts.Count ? starts[i + 1].LineIndex : lines.Length;
-            var chunk = lines[starts[i].LineIndex..end];
+            var chunk = lines[start.LineIndex..end];
             var item = BuildItem(items.Count + 1, chunk, i == 0 ? preamble : null);
             if (item is not null)
             {
                 items.Add(item);
+                anyNumbered |= start.IsNumbered;
+                anyRule |= start.AfterRule;
             }
         }
 
@@ -71,7 +95,13 @@ public static partial class PlanChainParser
             return SingleItem(bounded.Trim());
         }
 
-        return ApplyEdges(items);
+        var plan = ApplyEdges(items);
+        var confidence = plan.Items.Count <= 1
+            ? PlanConfidence.None
+            : !leadingProse && (anyNumbered || anyRule || plan.HadExplicitEdges)
+                ? PlanConfidence.Structured
+                : PlanConfidence.Suggested;
+        return plan with { Confidence = confidence };
     }
 
     private static ParsedPlan SingleItem(string text)
@@ -146,11 +176,14 @@ public static partial class PlanChainParser
         return new ParsedPlan(resolved, true);
     }
 
-    private sealed record ItemStart(int LineIndex, bool IsH1Title);
+    private sealed record ItemStart(int LineIndex, bool IsH1Title, bool IsNumbered, bool AfterRule);
 
     private static List<ItemStart> FindItemStarts(string[] lines)
     {
         var starts = new List<ItemStart>();
+        // A plan that uses rules as seams opens with its first section, not
+        // a preamble: the rule after the opening lines says they were one.
+        var pendingRule = lines.Any(l => RuleRegex().IsMatch(l.Trim()));
         for (var i = 0; i < lines.Length; i++)
         {
             var line = lines[i];
@@ -160,16 +193,38 @@ public static partial class PlanChainParser
             }
 
             var trimmed = line.Trim();
+            if (RuleRegex().IsMatch(trimmed))
+            {
+                // A rule is a seam, not content: the next non-blank line
+                // opens an item even when it carries no marker of its own.
+                pendingRule = true;
+                continue;
+            }
+
             var heading = HeadingRegex().Match(trimmed);
             if (heading.Success)
             {
-                starts.Add(new ItemStart(i, heading.Groups[1].Value.Length == 1));
+                var headingText = trimmed[heading.Groups[1].Length..].TrimStart();
+                starts.Add(new ItemStart(
+                    i,
+                    heading.Groups[1].Value.Length == 1,
+                    NumberedRegex().IsMatch(headingText),
+                    pendingRule));
+                pendingRule = false;
                 continue;
             }
 
             if (NumberedRegex().IsMatch(line))
             {
-                starts.Add(new ItemStart(i, false));
+                starts.Add(new ItemStart(i, false, true, pendingRule));
+                pendingRule = false;
+                continue;
+            }
+
+            if (pendingRule)
+            {
+                starts.Add(new ItemStart(i, false, false, true));
+                pendingRule = false;
             }
         }
 
@@ -185,12 +240,18 @@ public static partial class PlanChainParser
         if (preamble is { Count: > 0 })
         {
             bodyLines.AddRange(preamble);
+            bodyLines.Add(string.Empty);
         }
 
         var deps = new List<int>();
         for (var i = 1; i < chunk.Length; i++)
         {
             var line = chunk[i];
+            if (RuleRegex().IsMatch(line.Trim()))
+            {
+                continue;
+            }
+
             var depMatch = DependsOnRegex().Match(line);
             if (depMatch.Success)
             {
@@ -240,7 +301,7 @@ public static partial class PlanChainParser
             line = line[numbered.Length..].Trim();
         }
 
-        return line;
+        return line.TrimEnd(':').Trim();
     }
 
     private static string CollapseWhitespace(string value) =>
@@ -270,11 +331,14 @@ public static partial class PlanChainParser
     [GeneratedRegex(@"^(#{1,6})\s+\S", RegexOptions.CultureInvariant)]
     private static partial Regex HeadingRegex();
 
-    [GeneratedRegex(@"^\s*(?:\(?\d{1,3}\)?[.)\]:]\s+|Step\s+\d{1,3}\s*:?\s+)", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"^\s*(?:\(?\d{1,3}\)?[.)\]:]\s+|Step\s+\d{1,3}\s*[:.\-–—]?\s+|\d{1,3}\s*/\s*\d{1,3}\s*[:.\-–—]?\s+)", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
     private static partial Regex NumberedRegex();
 
-    [GeneratedRegex(@"^(?:\(?\d{1,3}\)?[.)\]:]|Step\s+\d{1,3}\s*:?)\s*", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"^(?:\(?\d{1,3}\)?[.)\]:]|Step\s+\d{1,3}\s*[:.\-–—]?|\d{1,3}\s*/\s*\d{1,3}\s*[:.\-–—]?)\s*", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
     private static partial Regex TitleNumberPrefixRegex();
+
+    [GeneratedRegex(@"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", RegexOptions.CultureInvariant)]
+    private static partial Regex RuleRegex();
 
     [GeneratedRegex(@"^\s*(?:depends?\s+on|requires?|blocked\s+by|after)\s*:\s*(.+?)\s*$", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
     private static partial Regex DependsOnRegex();

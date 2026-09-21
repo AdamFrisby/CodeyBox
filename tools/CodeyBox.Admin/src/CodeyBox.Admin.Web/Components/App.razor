@@ -1,7 +1,13 @@
 @inject IHttpContextAccessor HttpContextAccessor
+@inject IConfiguration Configuration
 
 @{
     var isAuthenticated = HttpContextAccessor.HttpContext?.User.Identity?.IsAuthenticated == true;
+    // With RequireAuth off there is no login and no principal, so the
+    // interactive circuit must not be gated on one — otherwise every page
+    // renders as static HTML and no script (map canvas, live stdout) ever runs.
+    var requireAuth = Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", false);
+    var interactive = isAuthenticated || !requireAuth;
 }
 
 <!DOCTYPE html>
@@ -12,13 +18,14 @@
     <title>CodeyBox Admin</title>
     <base href="/" />
     <link rel="stylesheet" href="css/admin.css" />
+    <link rel="stylesheet" href="css/composer.css" />
     <script>try{if(localStorage.getItem('cb-theme')==='light'){document.documentElement.setAttribute('data-theme','light');}}catch(e){}</script>
     <HeadOutlet />
 </head>
 <body>
     @* The login page must not start a protected Blazor circuit: the negotiate
        request would be redirected to HTML and the client expects JSON. *@
-    @if (isAuthenticated)
+    @if (interactive)
     {
         <Routes @rendermode="@InteractiveServer" />
         <script src="_framework/blazor.web.js"></script>

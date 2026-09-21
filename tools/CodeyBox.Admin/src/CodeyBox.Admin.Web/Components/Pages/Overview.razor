@@ -1,0 +1,194 @@
+@page "/overview"
+@using CodeyBox.Admin.Model
+@using CodeyBox.Admin.Web.Models
+@using CodeyBox.Admin.Web.Services
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<Overview> Logger
+@implements IDisposable
+
+<PageTitle>Overview — CodeyBox Admin</PageTitle>
+
+@* Answers question one — "is it healthy?" — before anything else. The three
+   buckets below are the point: items that need a LOOK are listed, items that
+   need a SLOT are folded into one line per boundary, and items that are simply
+   converging are a count. Showing all of them identically is what makes a
+   queue table useless at a hundred items. *@
+
+<h1>Overview</h1>
+
+@if (_error is not null)
+{
+    <div class="error-banner">@_error</div>
+}
+else if (_projection is null)
+{
+    <div class="empty-state"><span class="empty-state-title">Reading the fleet…</span></div>
+}
+else
+{
+    <p class="verdict verdict--@_verdictTone">@_sentence</p>
+
+    <div class="stat-grid">
+        @foreach (var v in _projection.Vitals)
+        {
+            <div class="stat-card vital vital--@v.Band.ToString().ToLowerInvariant()" title="@v.Reason">
+                <span class="vital-name">@v.Name</span>
+                <span class="vital-value">@FormatValue(v)</span>
+                <span class="vital-reason">@v.Reason</span>
+            </div>
+        }
+    </div>
+
+    <section class="ov-section">
+        <h2>Needs a look</h2>
+        @if (_attention.Count == 0)
+        {
+            <div class="empty-state"><span class="empty-state-title">Nothing is waiting on you.</span>
+                Failed, parked and conflict-blocked items appear here with their evidence.</div>
+        }
+        else
+        {
+            <ul class="ov-list">
+                @foreach (var a in _attention)
+                {
+                    <li class="ov-row">
+                        @* The title is the handle. Ids are machine identifiers — available
+                           for pasting into a CLI, but not the first thing a reader is shown. *@
+                        <a class="ov-title-link" href="@($"/work-items/{a.Id}")" title="@a.Title">@a.Title</a>
+                        <span class="ov-why">@(a.FailureKind ?? a.State)</span>
+                        <CopyableId Value="@a.Id" />
+                    </li>
+                }
+            </ul>
+        }
+    </section>
+
+    @if (_folded.Count > 0)
+    {
+        <section class="ov-section">
+            <h2>Needs a slot</h2>
+            <p class="ov-note">Stopped at a boundary nothing here can release — capacity, not a decision.</p>
+            <ul class="ov-list">
+                @foreach (var g in _folded)
+                {
+                    <li class="ov-row ov-row--folded">
+                        <span class="ov-count">@g.Value</span>
+                        <span class="ov-title">@g.Key</span>
+                    </li>
+                }
+            </ul>
+        </section>
+    }
+
+    @if (_healthyCount > 0)
+    {
+        <p class="ov-healthy">@_healthyCount @(_healthyCount == 1 ? "item is" : "items are") converging normally.</p>
+    }
+}
+
+@code {
+    private FleetProjection? _projection;
+    private string _sentence = "";
+    private string _verdictTone = "neutral";
+    private List<WorkItemDto> _attention = [];
+    private List<KeyValuePair<string,int>> _folded = [];
+    private int _healthyCount;
+    private string? _error;
+    private CancellationTokenSource? _cts;
+    private Timer? _timer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await LoadAsync();
+        _timer = new Timer(async _ => { await InvokeAsync(async () => { await LoadAsync(); StateHasChanged(); }); },
+                           null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
+    }
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            var ct = _cts?.Token ?? default;
+            var items = await ApiClient.GetWorkItemsAsync(ct);
+            var paused = await ApiClient.GetPausedAgentsAsync(ct);
+            var quota = await ApiClient.GetQuotaAsync(ct);
+            var conc = await ApiClient.GetConcurrencyAsync(ct);
+            var snap = FleetMapSnapshotMapper.ToSnapshot(items, paused, quota, conc, null, DateTimeOffset.UtcNow);
+            _projection = FleetProjectionBuilder.Project(snap);
+
+            var live = items.Where(i => !IsTerminal(i.State)).ToList();
+            _attention = live.Where(i => NeedsALook(i.State)).OrderBy(i => i.State).ToList();
+
+            // Needs a slot: blocked on capacity or a dependency — grouped, because
+            // each is the same fact repeated, and a list of forty adds nothing.
+            _folded = live.Where(i => !NeedsALook(i.State))
+                          .Select(i => BoundaryOf(i, _projection))
+                          .Where(b => b is not null)
+                          .GroupBy(b => b!)
+                          .Select(g => new KeyValuePair<string,int>(g.Key, g.Count()))
+                          .OrderByDescending(kv => kv.Value)
+                          .ToList();
+
+            _healthyCount = live.Count - _attention.Count - _folded.Sum(f => f.Value);
+            (_sentence, _verdictTone) = BuildSentence(live, _attention.Count, _folded.Sum(f => f.Value), conc, _projection);
+            _error = null;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Overview: failed to read fleet");
+            _error = "Could not read the fleet. Check server logs.";
+        }
+    }
+
+    // Constraint first, then what is actually happening — so the line never ends
+    // on a complaint. Order matters: each constraint makes the ones below it moot.
+    private static (string, string) BuildSentence(
+        List<WorkItemDto> live, int attention, int folded, ConcurrencyDto? conc, FleetProjection proj)
+    {
+        var running = conc?.CurrentlyRunningTotal ?? 0;
+        var max = conc?.GlobalMaxConcurrent ?? 0;
+        var bad = proj.Vitals.Count(v => v.Band == VitalBand.Bad);
+
+        if (attention > 0)
+            return ($"{attention} {(attention == 1 ? "item needs" : "items need")} you. {running} of {max} slots busy, {live.Count} in flight.", "bad");
+        if (bad > 0)
+            return ($"{bad} {(bad == 1 ? "vital is" : "vitals are")} off. {running} of {max} slots busy, {live.Count} in flight.", "bad");
+        if (max > 0 && running >= max)
+            return ($"Capacity-bound. All {max} slots busy, {folded} waiting for one.", "neutral");
+        if (folded > 0 && running == 0)
+            return ($"Nothing running. {folded} waiting on capacity or a dependency.", "bad");
+        if (live.Count == 0)
+            return ("Queue is empty. Nothing to do.", "good");
+        return ($"Moving. {running} of {max} slots busy, {live.Count} in flight.", "good");
+    }
+
+    private static bool IsTerminal(string s) =>
+        s is "Done" or "Cancelled" or "Merged" or "NoActionRequired";
+
+    private static bool NeedsALook(string s) =>
+        s is "Failed" or "AuditFailed" or "MergeConflictResolutionFailed"
+          or "NeedsOperatorInput" or "AbandonedAfterRecoveryAttempts";
+
+    private static string? BoundaryOf(WorkItemDto i, FleetProjection proj)
+    {
+        if (proj.Activities.TryGetValue(i.Id, out var act))
+        {
+            return act.Kind switch
+            {
+                ActivityKind.Running => null,
+                ActivityKind.BlockedByDependency => "blocked by a dependency",
+                ActivityKind.BlockedByAgentAvailability => "no eligible agent",
+                ActivityKind.WaitingForSlot => "waiting for a slot",
+                ActivityKind.Ready => "ready, waiting for a slot",
+                _ => null,
+            };
+        }
+        return i.State is "Queued" ? "waiting for a slot" : null;
+    }
+
+    private static string FormatValue(FleetVital v) =>
+        v.Unit is "%" ? $"{v.Value:0.#}%" : $"{v.Value:0.#} {v.Unit}".TrimEnd();
+
+    public void Dispose() { _timer?.Dispose(); _cts?.Cancel(); _cts?.Dispose(); }
+}

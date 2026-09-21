@@ -94,10 +94,10 @@
                             {
                                 <span style="display:inline-flex;align-items:center;gap:0.4rem;flex-wrap:wrap;">
                                     <span class="budget-bar-wrap" style="width:5rem;">
-                                        <span class="budget-bar @QuotaCss(pct)" style="width:@pct%"></span>
+                                        <span class="budget-bar @QuotaCss((int)Math.Round(pct))" style="width:@pct%"></span>
                                     </span>
-                                    <StatusChip Info="@StatusVocabulary.ForQuotaBand(pct)" />
-                                    <span>@pct%</span>
+                                    <StatusChip Info="@StatusVocabulary.ForQuotaBand((int)Math.Round(pct))" />
+                                    <span>@pct.ToString("0.#")%</span>
                                 </span>
                             }
                         </td>

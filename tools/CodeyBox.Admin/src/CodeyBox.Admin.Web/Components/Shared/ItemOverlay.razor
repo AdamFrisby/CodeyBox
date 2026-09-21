@@ -1,0 +1,624 @@
+@using CodeyBox.Admin.Model
+@using CodeyBox.Admin.Web.Models
+@using CodeyBox.Admin.Web.Services
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<ItemOverlay> Logger
+
+@* The third level of the map's progression. The bubble on the canvas shows
+   where an item is and what it did; this overlay carries what the bubble
+   cannot — evidence, findings, the diff, cost, the prompt — and every action
+   that changes the item. Sections load when opened, so a glance costs one
+   item fetch, not ten. Never a page navigation: the map stays underneath. *@
+<div class="fm-overlay" role="dialog" aria-modal="true" aria-labelledby="fm-ov-title" @onkeydown="OnKeyDown" tabindex="-1">
+    <div class="fm-overlay-scrim" @onclick="CloseAsync"></div>
+    <div class="fm-overlay-sheet">
+        @if (_error is not null)
+        {
+            <p class="error-banner">@_error</p>
+        }
+        @if (_item is null)
+        {
+            <div class="fm-ov-head">
+                <span class="fm-ov-id"><CopyableId Value="@Id" /></span>
+                <button type="button" class="fm-btn" @onclick="CloseAsync">Close</button>
+            </div>
+            <p class="fm-ov-muted">@(_notFound ? "Work item not found." : "Loading…")</p>
+        }
+        else
+        {
+            var item = _item;
+            var vocab = StatusVocabulary.ForWorkItem(item.State);
+            <div class="fm-ov-head">
+                <h2 id="fm-ov-title" class="fm-ov-title">@item.Title</h2>
+                <span class="fm-ov-spacer"></span>
+                <button type="button" class="fm-btn" @onclick="CloseAsync" title="Close (Esc)">Close</button>
+            </div>
+            <div class="fm-ov-meta">
+                <StatusChip Info="@vocab" />
+                <span class="fm-ov-id" title="Work item id — copy it for the CLI or the API"><CopyableId Value="@item.Id" /></span>
+                <span title="Agent">@(string.IsNullOrWhiteSpace(item.Agent) ? "unassigned" : item.Agent)@(string.IsNullOrWhiteSpace(item.WorkAgent) || item.WorkAgent == item.Agent ? "" : $" (work: {item.WorkAgent})")</span>
+                <span title="Project">@item.ProjectId</span>
+                <span title="@AdminFormat.FormatDateTimeFull(item.CreatedAt)">created @AdminFormat.FormatRelative(item.CreatedAt, DateTimeOffset.UtcNow)</span>
+                <span title="@AdminFormat.FormatDateTimeFull(item.UpdatedAt)">updated @AdminFormat.FormatRelative(item.UpdatedAt, DateTimeOffset.UtcNow)</span>
+                @if (item.Priority != 0)
+                {
+                    <span title="Priority">priority @item.Priority</span>
+                }
+                @if (item.Initiator is not null)
+                {
+                    <span title="Initiator">by @item.Initiator.DisplayName</span>
+                }
+            </div>
+
+            @* ── Actions: everything that changes the item, in one row ── *@
+            <div class="fm-ov-actions" role="toolbar" aria-label="Item actions">
+                @foreach (var action in MapItemActions.For(item.State))
+                {
+                    <button type="button" class="fm-btn @(action.Danger ? "fm-btn--danger" : "") @(action.Key == "addDependent" ? "fm-btn--primary" : "")"
+                            @onclick="() => RequestActionAsync(action)">@(action.Key == "addDependent" ? "+ " : "")@action.Label</button>
+                }
+                @if (item.IsQueued)
+                {
+                    <a class="fm-btn" href="/work-items/@item.Id/edit">Edit</a>
+                }
+                @if (item.IsTerminal)
+                {
+                    <a class="fm-btn" href="/work-items/@item.Id" title="Replay lives on the full page for now">Replay…</a>
+                }
+            </div>
+            @if (_pendingConfirm is not null)
+            {
+                <div class="fm-ov-confirm" role="alertdialog">
+                    <span>@ConfirmText(_pendingConfirm)</span>
+                    <button type="button" class="fm-btn @(_pendingConfirm.Danger ? "fm-btn--danger" : "fm-btn--primary")" @onclick="ConfirmActionAsync">@_pendingConfirm.Label</button>
+                    <button type="button" class="fm-btn" @onclick="() => _pendingConfirm = null">Keep</button>
+                </div>
+            }
+            @if (_actionNote is not null)
+            {
+                <p class="fm-ov-note">@_actionNote</p>
+            }
+
+            @* ── Now: what it is doing, what it waits on, what waits on it ── *@
+            <section class="fm-ov-section">
+                <h3>Now</h3>
+                <p class="fm-ov-now">@(_activity?.Summary ?? vocab.Title)</p>
+                @if (item.LastError is not null)
+                {
+                    <p class="fm-ov-error"><b>Last error:</b> @item.LastError</p>
+                }
+                @if (item.NextQuotaRetryAt is not null || item.NextTransientRetryAt is not null)
+                {
+                    <p class="fm-ov-muted">Retry scheduled @AdminFormat.FormatCountdown(item.NextQuotaRetryAt ?? item.NextTransientRetryAt, DateTimeOffset.UtcNow).</p>
+                }
+                @if (item.DependsOn.Count > 0)
+                {
+                    <p class="fm-ov-deps">
+                        <b>Waits on</b>
+                        @foreach (var dep in item.DependsOn)
+                        {
+                            <button type="button" class="fm-link-btn fm-link-btn--title" title="@dep" @onclick="() => Navigate.InvokeAsync(dep)">@(ResolveTitle?.Invoke(dep) is { Length: > 0 } depTitle ? depTitle : Short(dep))</button>
+                        }
+                        <span class="fm-ov-muted">@(item.DependsOnSatisfied ? "(all landed)" : "(waiting)")</span>
+                    </p>
+                }
+                @if (_dependents.Count > 0)
+                {
+                    <p class="fm-ov-deps">
+                        <b>@_dependents.Count waiting on this</b>
+                        @foreach (var dep in _dependents.Take(12))
+                        {
+                            <button type="button" class="fm-link-btn fm-link-btn--title" title="@dep.Id" @onclick="() => Navigate.InvokeAsync(dep.Id)">@(string.IsNullOrWhiteSpace(dep.Title) ? Short(dep.Id) : dep.Title)</button>
+                        }
+                        @if (_dependents.Count > 12)
+                        {
+                            <span class="fm-ov-muted">+@(_dependents.Count - 12) more</span>
+                        }
+                    </p>
+                }
+            </section>
+
+            @* ── Stages: the same pipeline the bubble draws, as text ── *@
+            <section class="fm-ov-section">
+                <h3>Stages</h3>
+                <p class="fm-ov-muted">plan → work → audit ⇒ merge → landed. Audit is a gate: its pass path continues to merge; its fail path returns the item to work.</p>
+                @if (_pipeline is null)
+                {
+                    <p class="fm-ov-muted">Loading history…</p>
+                }
+                else
+                {
+                    <ol class="fm-stages">
+                        @foreach (var stage in _pipeline.Stages)
+                        {
+                            <li class="fm-stage-row fm-stage-row--@stage.Status.ToString().ToLowerInvariant()">
+                                <span class="fm-stage-glyph" aria-hidden="true">@StageGlyph(stage.Status)</span>
+                                <span class="fm-stage-label">@stage.Label</span>
+                                <span class="fm-stage-meta">@StageStatusText(stage)@(string.IsNullOrEmpty(stage.Detail) ? "" : " · " + stage.Detail)</span>
+                            </li>
+                        }
+                    </ol>
+                    @if (_pipeline.Loops.Count > 0)
+                    {
+                        <div class="fm-loops">
+                            @foreach (var loop in _pipeline.Loops)
+                            {
+                                <span class="fm-loop fm-loop--@loop.Kind.ToString().ToLowerInvariant()">@LoopText(loop)</span>
+                            }
+                        </div>
+                    }
+                    <p class="fm-ov-muted">@_pipeline.Summary</p>
+                    @if (_pipeline.History == StageHistory.StateOnly)
+                    {
+                        <p class="fm-inspector-note">@_pipeline.HistoryNote</p>
+                    }
+                }
+            </section>
+
+            @* ── Findings: park text is not evidence; show the findings, or say there are none ── *@
+            <details class="fm-ov-section fm-ov-lazy" @ontoggle="() => LoadFindingsAsync()">
+                <summary>Findings @(_reports is null ? "" : $"({_reports.Iterations.Sum(i => i.BlockingCount)} blocking · {_reports.Iterations.Sum(i => i.NonBlockingCount)} non-blocking)")</summary>
+                @if (!_findingsLoaded)
+                {
+                    <p class="fm-ov-muted">Loading…</p>
+                }
+                else if (_reports is null || _reports.Iterations.Count == 0)
+                {
+                    <p class="fm-ov-muted">No audit iteration has recorded findings for this item.</p>
+                }
+                else
+                {
+                    @foreach (var iter in _reports.Iterations.OrderByDescending(i => i.Iteration).Take(3))
+                    {
+                        <div class="fm-ov-iter">
+                            <div class="fm-ov-iter-head">Iteration @iter.Iteration · @iter.BlockingCount blocking · @iter.NonBlockingCount non-blocking</div>
+                            @foreach (var auditor in iter.Auditors)
+                            {
+                                <div class="fm-ov-auditor">
+                                    <StatusChip Info="@StatusVocabulary.ForSeverity(auditor.WorstSeverity)" />
+                                    <span class="fm-ov-auditor-name">@auditor.Name</span>
+                                    <span class="fm-ov-muted">@AdminFormat.FormatDurationMs(auditor.DurationMs)</span>
+                                </div>
+                                @foreach (var finding in auditor.Findings.Take(8))
+                                {
+                                    <div class="fm-ov-finding">
+                                        <StatusChip Info="@StatusVocabulary.ForSeverity(finding.Severity)" />
+                                        <span class="fm-ov-finding-title">@finding.Title</span>
+                                        @if (finding.Files.Count > 0)
+                                        {
+                                            <code class="fm-ov-files">@string.Join(", ", finding.Files.Take(3))</code>
+                                        }
+                                    </div>
+                                }
+                                @if (auditor.Findings.Count > 8)
+                                {
+                                    <p class="fm-ov-muted">+@(auditor.Findings.Count - 8) more on the audit reports page.</p>
+                                }
+                            }
+                        </div>
+                    }
+                }
+            </details>
+
+            @* ── Evidence: what the change is and what proves it ── *@
+            <details class="fm-ov-section fm-ov-lazy" @ontoggle="() => LoadEvidenceAsync()">
+                <summary>Evidence</summary>
+                @if (!_evidenceLoaded)
+                {
+                    <p class="fm-ov-muted">Loading…</p>
+                }
+                else
+                {
+                    @if (_diff is null)
+                    {
+                        <p class="fm-ov-muted">No diff yet — nothing has been committed on the work branch.</p>
+                    }
+                    else
+                    {
+                        <p><b>@_diff.FilesChanged files</b> · <span class="fm-ov-add">+@_diff.LinesAdded</span> <span class="fm-ov-del">−@_diff.LinesRemoved</span>
+                            <span class="fm-ov-muted">@_diff.WorkBranch → @_diff.BaseBranch</span>
+                            <a href="/work-items/@item.Id/diff">open diff</a></p>
+                        @if (_diff.ChangedFiles.Count > 0)
+                        {
+                            <ul class="fm-ov-filelist">
+                                @foreach (var file in _diff.ChangedFiles.Take(12))
+                                {
+                                    <li><code>@file</code></li>
+                                }
+                                @if (_diff.ChangedFiles.Count > 12)
+                                {
+                                    <li class="fm-ov-muted">+@(_diff.ChangedFiles.Count - 12) more</li>
+                                }
+                            </ul>
+                        }
+                    }
+                    @if (item.MergedPrUrl is not null)
+                    {
+                        <p><a href="@item.MergedPrUrl" target="_blank" rel="noopener">PR #@item.MergedPrNumber</a></p>
+                    }
+                    @if (_streams.Count > 0)
+                    {
+                        <p class="fm-ov-muted">Retained agent output:
+                            @foreach (var stream in _streams.Take(8))
+                            {
+                                <a href="/work-items/@item.Id/streams/@Uri.EscapeDataString(stream.FileName)">@stream.Phase@(stream.Iteration is null ? "" : $" #{stream.Iteration}")</a>
+                            }
+                        </p>
+                    }
+                    else
+                    {
+                        <p class="fm-ov-muted">No retained agent output.</p>
+                    }
+                }
+            </details>
+
+            @* ── Cost and time ── *@
+            <details class="fm-ov-section fm-ov-lazy" @ontoggle="() => LoadCostAsync()">
+                <summary>Cost &amp; time</summary>
+                @if (!_costLoaded)
+                {
+                    <p class="fm-ov-muted">Loading…</p>
+                }
+                else
+                {
+                    @if (_costs is null)
+                    {
+                        <p class="fm-ov-muted">No cost recorded.</p>
+                    }
+                    else
+                    {
+                        <p><b>@AdminFormat.FormatUsd(_costs.Totals.EstimatedUsd)</b> · @AdminFormat.FormatCount(_costs.Totals.InputTokens) in / @AdminFormat.FormatCount(_costs.Totals.OutputTokens) out · @_costs.Totals.InvocationCount invocations</p>
+                        @if (_costs.ByAgent.Count > 0)
+                        {
+                            <ul class="fm-ov-filelist">
+                                @foreach (var agent in _costs.ByAgent.Take(6))
+                                {
+                                    <li>@agent.Agent@(agent.ModelId is null ? "" : $" ({agent.ModelId})") · @AdminFormat.FormatUsd(agent.EstimatedUsd) · @AdminFormat.FormatDurationMs(agent.ElapsedMs)</li>
+                                }
+                            </ul>
+                        }
+                    }
+                    @if (_timings is not null)
+                    {
+                        <p><b>@AdminFormat.FormatDurationMs(_timings.TotalDurationMs)</b> wall-clock
+                            @if (_timings.TopSteps.Count > 0)
+                            {
+                                <span class="fm-ov-muted">· slowest: @string.Join(", ", _timings.TopSteps.Take(3).Select(s => $"{s.Step} {AdminFormat.FormatDurationMs(s.TotalMs)}"))</span>
+                            }
+                        </p>
+                    }
+                }
+            </details>
+
+            @if (_questions.Count > 0)
+            {
+                <section class="fm-ov-section">
+                    <h3>Questions (@_questions.Count)</h3>
+                    @foreach (var q in _questions)
+                    {
+                        <div class="fm-ov-question">
+                            <p><b>[@q.QuestionId]</b> @q.QuestionText</p>
+                            @if (q.IsOpen)
+                            {
+                                <textarea @bind="_answers[q.QuestionId]" rows="2" placeholder="Your answer…"></textarea>
+                                <div class="fm-ov-actions">
+                                    <button type="button" class="fm-btn fm-btn--primary" @onclick="() => AnswerAsync(q.QuestionId)">Answer</button>
+                                    <button type="button" class="fm-btn" @onclick="() => DismissAsync(q.QuestionId)">Dismiss</button>
+                                </div>
+                            }
+                            else if (q.IsAnswered)
+                            {
+                                <p class="fm-ov-muted">Answered: @q.AnswerText</p>
+                            }
+                            else if (q.IsDismissed)
+                            {
+                                <p class="fm-ov-muted">Dismissed: @q.DismissReason</p>
+                            }
+                        </div>
+                    }
+                </section>
+            }
+
+            <details class="fm-ov-section">
+                <summary>Prompt</summary>
+                <pre class="fm-ov-pre">@item.Prompt</pre>
+            </details>
+            @if (!string.IsNullOrWhiteSpace(item.PlanArtifact))
+            {
+                <details class="fm-ov-section">
+                    <summary>Plan@(item.PlanReviewedAt is null ? "" : " (reviewed)")</summary>
+                    @if (!string.IsNullOrWhiteSpace(item.PlanReviewSummary))
+                    {
+                        <p class="fm-ov-muted">@item.PlanReviewSummary</p>
+                    }
+                    <pre class="fm-ov-pre">@item.PlanArtifact</pre>
+                </details>
+            }
+
+            <div class="fm-ov-links">
+                <span class="fm-ov-muted">Full pages:</span>
+                <a href="/work-items/@item.Id">Detail</a>
+                <a href="/work-items/@item.Id/timeline">Timeline</a>
+                <a href="/work-items/@item.Id/journey">Journey</a>
+                <a href="/work-items/@item.Id/audit-reports">Audit reports</a>
+                <a href="/work-items/@item.Id/diff">Diff</a>
+                <a href="/work-items/@item.Id/dossier">Dossier</a>
+                <a href="/work-items/@item.Id/costs">Costs</a>
+                <a href="/work-items/@item.Id/timings">Timings</a>
+                @if (item.IsTerminal)
+                {
+                    <a href="/work-items/@item.Id/comparison">Comparison</a>
+                }
+            </div>
+        }
+    </div>
+</div>
+
+@code {
+    /// <summary>Item to show.</summary>
+    [Parameter, EditorRequired] public string Id { get; set; } = string.Empty;
+
+    /// <summary>Activity verdict from the map's projection, when it has one.</summary>
+    [Parameter] public ItemActivity? Activity { get; set; }
+
+    /// <summary>Resolves an item id to its title (the name is the handle); null when unknown.</summary>
+    [Parameter] public Func<string, string?>? ResolveTitle { get; set; }
+
+    /// <summary>Raised when the overlay wants to close.</summary>
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    /// <summary>Raised to move the map (and this overlay) to another item.</summary>
+    [Parameter] public EventCallback<string> Navigate { get; set; }
+
+    /// <summary>Raised when the operator asks to add a dependent of this item.</summary>
+    [Parameter] public EventCallback<string> AddDependent { get; set; }
+
+    /// <summary>Raised after a mutation so the map can refresh.</summary>
+    [Parameter] public EventCallback Changed { get; set; }
+
+    private WorkItemDto? _item;
+    private ItemActivity? _activity;
+    private ItemStagePipeline? _pipeline;
+    private List<WorkItemDto> _dependents = [];
+    private List<QuestionDto> _questions = [];
+    private Dictionary<string, string> _answers = [];
+    private AuditReportsDto? _reports;
+    private bool _findingsLoaded;
+    private WorkItemDiffDto? _diff;
+    private List<AgentStreamFileDto> _streams = [];
+    private bool _evidenceLoaded;
+    private WorkItemCostsDto? _costs;
+    private WorkItemTimingsDto? _timings;
+    private bool _costLoaded;
+    private MapItemAction? _pendingConfirm;
+    private string? _actionNote;
+    private string? _error;
+    private bool _notFound;
+    private string? _loadedId;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _activity = Activity;
+        if (string.Equals(_loadedId, Id, StringComparison.Ordinal))
+        {
+            return;
+        }
+        _loadedId = Id;
+        _item = null;
+        _pipeline = null;
+        _reports = null; _findingsLoaded = false;
+        _diff = null; _streams = []; _evidenceLoaded = false;
+        _costs = null; _timings = null; _costLoaded = false;
+        _pendingConfirm = null;
+        _actionNote = null;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _notFound = false;
+        try
+        {
+            var itemTask = ApiClient.GetWorkItemAsync(Id);
+            var questionsTask = Guard(ApiClient.GetQuestionsAsync(Id), "questions", true);
+            var dependentsTask = Guard(ApiClient.GetDependentsAsync(Id), "dependents", true);
+            var timelineTask = Guard(ApiClient.GetWorkItemTimelineAsync(Id, "state_transition"), "timeline");
+            var progressTask = Guard(ApiClient.GetAuditProgressAsync(Id), "audit-progress");
+            await Task.WhenAll(itemTask, questionsTask, dependentsTask, timelineTask, progressTask);
+            _item = itemTask.Result;
+            if (_item is null)
+            {
+                _notFound = true;
+                return;
+            }
+            _questions = questionsTask.Result ?? [];
+            _answers = _questions.Where(q => q.IsOpen).ToDictionary(q => q.QuestionId, _ => string.Empty);
+            _dependents = dependentsTask.Result ?? [];
+            _pipeline = ItemStagePipelineBuilder.Build(
+                StageSnapshotMapper.ToStageSnapshot(_item, timelineTask.Result, progressTask.Result));
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Item overlay: failed to load item");
+            _error = "Failed to load the item. Check server logs for details.";
+        }
+    }
+
+    private async Task<T?> Guard<T>(Task<T?> task, string surface) where T : class
+    {
+        try { return await task; }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Item overlay: {Surface} unavailable", surface);
+            return null;
+        }
+    }
+
+    private async Task<T?> Guard<T>(Task<T> task, string surface, bool _ = false) where T : class
+    {
+        try { return await task; }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Item overlay: {Surface} unavailable", surface);
+            return null;
+        }
+    }
+
+    private async Task LoadFindingsAsync()
+    {
+        if (_findingsLoaded || _item is null)
+        {
+            return;
+        }
+        _reports = await Guard(ApiClient.GetAuditReportsAsync(_item.Id), "audit-reports");
+        _findingsLoaded = true;
+    }
+
+    private async Task LoadEvidenceAsync()
+    {
+        if (_evidenceLoaded || _item is null)
+        {
+            return;
+        }
+        var diffTask = Guard(ApiClient.GetWorkItemDiffAsync(_item.Id), "diff");
+        var streamsTask = Guard(ApiClient.GetAgentStreamFilesAsync(_item.Id), "agent-streams", true);
+        await Task.WhenAll(diffTask, streamsTask);
+        _diff = diffTask.Result;
+        _streams = streamsTask.Result ?? [];
+        _evidenceLoaded = true;
+    }
+
+    private async Task LoadCostAsync()
+    {
+        if (_costLoaded || _item is null)
+        {
+            return;
+        }
+        var costsTask = Guard(ApiClient.GetWorkItemCostsAsync(_item.Id), "costs");
+        var timingsTask = Guard(ApiClient.GetWorkItemTimingsAsync(_item.Id), "timings");
+        await Task.WhenAll(costsTask, timingsTask);
+        _costs = costsTask.Result;
+        _timings = timingsTask.Result;
+        _costLoaded = true;
+    }
+
+    // ── Actions ─────────────────────────────────────────────────────────
+
+    private async Task RequestActionAsync(MapItemAction action)
+    {
+        _actionNote = null;
+        if (action.Key == "addDependent")
+        {
+            await AddDependent.InvokeAsync(Id);
+            return;
+        }
+        _pendingConfirm = action;
+    }
+
+    private async Task ConfirmActionAsync()
+    {
+        var action = _pendingConfirm;
+        _pendingConfirm = null;
+        if (action is null || _item is null)
+        {
+            return;
+        }
+        try
+        {
+            var ok = action.Key switch
+            {
+                "retryWork" => await ApiClient.RetryWorkItemAsync(_item.Id, "work"),
+                "retryAudit" => await ApiClient.RetryWorkItemAsync(_item.Id, "audit"),
+                "cancel" => await ApiClient.DeleteWorkItemAsync(_item.Id),
+                "delegate" => await ApiClient.DelegateWorkItemAsync(_item.Id),
+                _ => false,
+            };
+            _actionNote = ok ? $"{action.Label}: done." : $"{action.Label}: the orchestrator refused.";
+            if (ok)
+            {
+                _loadedId = null;
+                await OnParametersSetAsync();
+                await Changed.InvokeAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Item overlay: action failed");
+            _actionNote = $"{action.Label}: failed. Check server logs.";
+        }
+    }
+
+    private async Task AnswerAsync(string questionId)
+    {
+        if (_item is null || !_answers.TryGetValue(questionId, out var answer) || string.IsNullOrWhiteSpace(answer))
+        {
+            return;
+        }
+        await ApiClient.AnswerQuestionAsync(_item.Id, questionId, answer);
+        _loadedId = null;
+        await OnParametersSetAsync();
+        await Changed.InvokeAsync();
+    }
+
+    private async Task DismissAsync(string questionId)
+    {
+        if (_item is null)
+        {
+            return;
+        }
+        await ApiClient.DismissQuestionAsync(_item.Id, questionId, "Dismissed by operator.");
+        _loadedId = null;
+        await OnParametersSetAsync();
+        await Changed.InvokeAsync();
+    }
+
+    private Task CloseAsync() => OnClose.InvokeAsync();
+
+    private async Task OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            await CloseAsync();
+        }
+    }
+
+    private static string ConfirmText(MapItemAction action) => action.Key switch
+    {
+        "cancel" => "Cancel this item? Dependents stay queued and will never start.",
+        "retryWork" => "Retry from work? The current branch is abandoned and the item re-queues.",
+        "retryAudit" => "Retry from audit? The existing work branch is audited again.",
+        "delegate" => "Delegate one repair turn to a delegate agent?",
+        _ => $"{action.Label}?",
+    };
+
+    private static string Short(string id) => id.Length >= 8 ? id[..8] : id;
+
+    private static string LoopText(StageLoop loop) => loop.Kind switch
+    {
+        StageLoopKind.Rework => $"audit sent it back to work ×{loop.Count}",
+        StageLoopKind.Conflict => $"merge conflict round ×{loop.Count}",
+        StageLoopKind.Retry => $"operator retry into {loop.To.ToString().ToLowerInvariant()} ×{loop.Count}",
+        _ => loop.From == loop.To ? $"interrupted at {loop.To.ToString().ToLowerInvariant()} ×{loop.Count}" : $"interrupted {loop.From.ToString().ToLowerInvariant()} → {loop.To.ToString().ToLowerInvariant()} ×{loop.Count}",
+    };
+
+    private static string StageGlyph(StageStatus status) => status switch
+    {
+        StageStatus.Visited => "✓",
+        StageStatus.Current => "●",
+        StageStatus.Parked => "⏸",
+        StageStatus.Failed => "✗",
+        StageStatus.Unknown => "?",
+        _ => "○",
+    };
+
+    private static string StageStatusText(StageNode stage) => stage.Status switch
+    {
+        StageStatus.Visited => stage.Visits > 1 ? $"visited ×{stage.Visits}" : "visited",
+        StageStatus.Current => stage.Visits > 1 ? $"here now (visit {stage.Visits})" : "here now",
+        StageStatus.Parked => "parked here",
+        StageStatus.Failed => "failed here",
+        StageStatus.Unknown => "history unavailable",
+        _ => "not reached",
+    };
+}

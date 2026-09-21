@@ -1,0 +1,145 @@
+@using CodeyBox.Admin.Model
+@using CodeyBox.Admin.Web.Models
+
+@* The chain as it will be filed: one row per item, the edges typed as
+   numbers ("1, 3") because that is how a plan already names them, and
+   the whole shape settable in one act. Bodies stay folded — the editor
+   above is the substance; this is the structure. *@
+<section class="chain-outline" id="chain-preview" aria-label="Chain outline">
+    <div class="ol-shape" role="group" aria-label="Chain shape">
+        <span class="ol-shape-label">Shape</span>
+        <button type="button" class="btn btn-xs" id="shape-series" @onclick="() => ApplyShape(ChainEdges.Series(Items.Count))">Series</button>
+        <button type="button" class="btn btn-xs" id="shape-parallel" @onclick="() => ApplyShape(ChainEdges.Parallel(Items.Count))">Parallel</button>
+        <span class="ol-fanout">
+            <button type="button" class="btn btn-xs" id="shape-fanout" @onclick="ApplyFanOut">Fan out after</button>
+            <input id="fanout-root" class="form-control ol-fanout-root" inputmode="numeric" aria-label="Fan-out root item number"
+                   value="@_fanOutRoot" @onchange="e => _fanOutRoot = e.Value?.ToString() ?? string.Empty" />
+        </span>
+        <span class="ol-shape-reading">@ChainEdges.Describe(Items.Select(i => (IReadOnlyList<int>)i.Edges).ToList())</span>
+    </div>
+    @if (_shapeProblem is not null)
+    {
+        <p class="validation-message">@_shapeProblem</p>
+    }
+    <ol class="ol-list">
+        @for (var i = 0; i < Items.Count; i++)
+        {
+            var index = i;
+            var number = i + 1;
+            var item = Items[index];
+            <li class="ol-row chain-item @(item.Expanded ? "ol-row--open" : string.Empty)" id="chain-item-@number">
+                <div class="ol-line">
+                    <span class="ol-num" aria-hidden="true">@number</span>
+                    <input id="chain-title-@number" class="form-control ol-title" aria-label="Item @number title"
+                           value="@item.Title" @onchange="e => OnTitle(index, e.Value?.ToString() ?? string.Empty)" />
+                    <label class="ol-waits" for="chain-waits-@number">
+                        <span>after</span>
+                        <input id="chain-waits-@number" class="form-control ol-waits-input" inputmode="numeric"
+                               placeholder="—" title="Item numbers this one waits for, e.g. 1, 3. Blank = starts immediately."
+                               value="@item.EdgesText" @onchange="e => OnEdges(index, e.Value?.ToString() ?? string.Empty)" />
+                    </label>
+                    <button type="button" class="btn btn-xs ol-expand" id="chain-expand-@number"
+                            aria-expanded="@(item.Expanded ? "true" : "false")" aria-controls="chain-body-@number"
+                            @onclick="() => Toggle(index)">@(item.Expanded ? "Hide prompt" : "Prompt")</button>
+                    <button type="button" class="btn btn-xs btn-danger ol-remove" id="chain-remove-@number"
+                            aria-label="Remove item @number" @onclick="() => OnRemove(index)">✕</button>
+                </div>
+                @if (item.EdgeProblem is not null)
+                {
+                    <p class="validation-message ol-problem">@item.EdgeProblem</p>
+                }
+                @if (item.Expanded)
+                {
+                    <textarea id="chain-body-@number" class="form-control prompt-input ol-body" rows="8"
+                              aria-label="Item @number prompt"
+                              value="@item.Body" @onchange="e => OnBody(index, e.Value?.ToString() ?? string.Empty)"></textarea>
+                }
+            </li>
+        }
+    </ol>
+</section>
+
+@code {
+    [Parameter]
+    public List<ComposerOutlineItem> Items { get; set; } = [];
+
+    /// <summary>Raised after any edit so the owner can re-read the review.</summary>
+    [Parameter]
+    public EventCallback Changed { get; set; }
+
+    private string _fanOutRoot = "1";
+    private string? _shapeProblem;
+
+    private Task OnTitle(int index, string value)
+    {
+        Items[index].Title = value;
+        Items[index].TitleEdited = true;
+        return Changed.InvokeAsync();
+    }
+
+    private Task OnBody(int index, string value)
+    {
+        Items[index].Body = value;
+        Items[index].BodyEdited = true;
+        return Changed.InvokeAsync();
+    }
+
+    private Task OnEdges(int index, string value)
+    {
+        var item = Items[index];
+        var (edges, problem) = ChainEdges.ParseWaitsFor(value, Items.Count, index + 1);
+        item.EdgesText = value;
+        item.EdgeProblem = problem;
+        if (problem is null)
+        {
+            item.Edges = edges.ToList();
+            item.EdgesText = ChainEdges.Format(edges);
+        }
+
+        return Changed.InvokeAsync();
+    }
+
+    private Task OnRemove(int index)
+    {
+        var edges = ChainEdges.Remove(Items.Select(i => (IReadOnlyList<int>)i.Edges).ToList(), index + 1);
+        Items.RemoveAt(index);
+        for (var i = 0; i < Items.Count; i++)
+        {
+            Items[i].Edges = edges[i].ToList();
+            Items[i].EdgesText = ChainEdges.Format(edges[i]);
+            Items[i].EdgeProblem = null;
+        }
+
+        return Changed.InvokeAsync();
+    }
+
+    private Task Toggle(int index)
+    {
+        Items[index].Expanded = !Items[index].Expanded;
+        return Task.CompletedTask;
+    }
+
+    private Task ApplyFanOut()
+    {
+        if (!int.TryParse(_fanOutRoot, out var root) || root < 1 || root > Items.Count)
+        {
+            _shapeProblem = $"Fan-out root must be an item number between 1 and {Items.Count}.";
+            return Task.CompletedTask;
+        }
+
+        return ApplyShape(ChainEdges.FanOutAfter(Items.Count, root));
+    }
+
+    private Task ApplyShape(IReadOnlyList<IReadOnlyList<int>> edges)
+    {
+        _shapeProblem = null;
+        for (var i = 0; i < Items.Count; i++)
+        {
+            Items[i].Edges = edges[i].ToList();
+            Items[i].EdgesText = ChainEdges.Format(edges[i]);
+            Items[i].EdgeProblem = null;
+        }
+
+        return Changed.InvokeAsync();
+    }
+}

@@ -1,51 +1,144 @@
+@page "/"
 @page "/map"
 @implements IDisposable
 @inject ICodeyBoxApiClient ApiClient
 @inject IJSRuntime JS
 @inject IOptionsMonitor<FleetMapOptions> MapOptions
 @inject ILogger<FleetMap> Logger
+@using System.Text.Json
 @using CodeyBox.Admin.Model
+@using CodeyBox.Admin.Web.Models
 @using Microsoft.Extensions.Options
 
 <PageTitle>Fleet map — CodeyBox Admin</PageTitle>
+<HeadContent>
+    <link rel="stylesheet" href="css/map.css" />
+</HeadContent>
 
-<div class="map-page">
-    <div class="map-toolbar" role="toolbar" aria-label="Fleet map controls">
-        <span class="map-mode-pill @(CameraManual ? "map-mode-manual" : "map-mode-auto")">
-            @(CameraManual ? "✋ Manual view" : "◎ Auto-follow")
+@* One canvas, one continuous progression. Zoomed out, every item is a node
+   in a horizontal dependency tree — dependents to the right of what they wait
+   on, settled work de-emphasised so the live work reads as built on it. Zoom
+   in and every node's card grows until it renders its stage circuit inside
+   itself; an item that needs a person renders its evidence and its actions
+   instead. The rail on the right is the inbox, each card pointing at its
+   node. Names are the handle; ids are secondary and copyable. *@
+<div class="fm">
+    <div class="fm-bar" role="toolbar" aria-label="Fleet map controls">
+        <span class="fm-pill @(ReducedMotion ? "fm-pill--still" : CameraManual ? "fm-pill--manual" : "fm-pill--auto")"
+              title="@(ReducedMotion ? "Automatic camera movement is off because your system prefers reduced motion." : CameraManual ? "You have the camera. Auto-follow is suspended until you resume it." : "The camera cycles through active chains and holds on anything that needs you.")">
+            @(ReducedMotion ? "⏸ Reduced motion" : CameraManual ? "✋ Manual" : "◎ Auto-follow")
         </span>
-        @if (ReducedMotion)
+        <span class="fm-focus" aria-live="polite">@FocusLabel</span>
+        @if (HoldReason is not null)
         {
-            <span class="map-mode-pill map-mode-still" title="Automatic camera movement is off because your system prefers reduced motion.">
-                Reduced motion
-            </span>
+            <span class="fm-hold" title="The camera holds here until this clears.">⚠ @HoldReason</span>
         }
-        @if (CameraManual)
-        {
-            <button class="btn btn-map-resume" @onclick="ResumeAutoAsync">Resume auto-follow</button>
-        }
-        <span class="map-focus-label">@FocusLabel</span>
-        <span class="map-counts">@ItemCount items · @ChainCount chains</span>
+        <span class="fm-actions">
+            <button type="button" class="fm-btn" @onclick="OverviewAsync" title="Frame the whole fleet">Overview</button>
+            @if (CameraManual)
+            {
+                <button type="button" class="fm-btn fm-btn--primary" @onclick="ResumeAutoAsync">Resume auto-follow</button>
+            }
+        </span>
+        <span class="fm-prefs" title="Settled work (landed or cancelled) stays while something in flight builds on it; otherwise it folds away past this horizon.">
+            <label class="fm-check"><input type="checkbox" checked="@_showSettled" @onchange="OnShowSettledChanged" /> settled</label>
+            <select class="fm-select" value="@_horizonKey" @onchange="OnHorizonChanged" disabled="@(!_showSettled)" aria-label="Hide settled items older than">
+                <option value="24h">older than 24h</option>
+                <option value="3d">older than 3 days</option>
+                <option value="7d">older than 7 days</option>
+                <option value="30d">older than 30 days</option>
+                <option value="180d">older than 180 days</option>
+                <option value="never">never hide</option>
+            </select>
+        </span>
+        <span class="fm-prefs" title="Open suggestions appear as ghost nodes beside the item that produced them — only where that item is on the map, most severe first, three per item.">
+            <label class="fm-check"><input type="checkbox" checked="@_showSuggestions" @onchange="OnShowSuggestionsChanged" /> suggestions</label>
+            <select class="fm-select" value="@_suggestionSeverity" @onchange="OnSuggestionSeverityChanged" disabled="@(!_showSuggestions)" aria-label="Lowest suggestion severity to show">
+                <option value="minor">all severities</option>
+                <option value="notable">notable and up</option>
+                <option value="important">important only</option>
+            </select>
+        </span>
+        <span class="fm-counts" title="Items on the map">
+            <b>@LiveCount</b> in flight · <b>@ChainCount</b> chains · <b>@BlockedCount</b> blocked · <b>@RunningCount</b> running@(SettledCount > 0 ? " · " : "")@if (SettledCount > 0) { <b>@SettledCount</b><text> settled</text> }@if (GhostCount > 0 || _suggestions.Count > 0) { <text> · </text><b>@GhostCount</b><text> suggested here</text>@if (_suggestions.Count > GhostCount) { <span class="fm-ov-muted"> (of @_suggestions.Count open)</span> } }@if (_releaseFrames.Count > 0) { <text> · </text><b>@_releaseFrames.Count</b><text> release@(_releaseFrames.Count == 1 ? "" : "s")</text> }
+        </span>
     </div>
 
     @if (_error is not null)
     {
         <p class="error-banner">Error loading fleet map: @_error</p>
     }
+    @if (_notice is not null)
+    {
+        <p class="fm-notice" role="status">@_notice <button type="button" class="fm-link-btn" @onclick="() => _notice = null">dismiss</button></p>
+    }
 
-    <div class="map-canvas-wrap">
-        <canvas id="fleet-map-canvas" class="map-canvas" aria-label="Fleet map canvas. Use the chain list below for a text equivalent."></canvas>
-        <div class="map-legend" aria-label="Map legend">
-            <span><i class="map-glyph map-tone-active">●</i> Running</span>
-            <span><i class="map-glyph map-tone-review">■</i> Ready</span>
-            <span><i class="map-glyph map-tone-queued">■</i> Waiting for slot</span>
-            <span><i class="map-glyph map-tone-rework">◆</i> Blocked</span>
-            <span><i class="map-glyph map-tone-wait">⬢</i> Parked</span>
-            <span><i class="map-glyph map-tone-fail">▲</i> Failed</span>
+    <div class="fm-stage">
+        <div class="fm-canvas-wrap" id="fleet-map-wrap">
+            <canvas id="fleet-map-canvas" class="fm-canvas" tabindex="0"
+                    aria-label="Fleet map canvas: dependency tree of work items. Drag to pan, wheel to zoom, click a node to zoom to it; at close zoom each node shows its stage circuit, or its evidence and actions when it needs you. The chain list below is the text equivalent."></canvas>
+            <canvas id="fleet-map-fx" class="fm-fx" aria-hidden="true"></canvas>
+
+            <div class="fm-legend" aria-label="Map legend">
+                <span><i class="fm-glyph fm-tone-active">◠</i>Running (animated)</span>
+                <span><i class="fm-glyph fm-tone-review">■</i>Ready</span>
+                <span><i class="fm-glyph fm-tone-queued">■</i>Waiting for slot</span>
+                <span><i class="fm-glyph fm-tone-rework">◆</i>Blocked by dependency</span>
+                <span><i class="fm-glyph fm-tone-wait">⬢</i>Parked</span>
+                <span><i class="fm-glyph fm-tone-fail">▲</i>Needs you</span>
+                <span><i class="fm-glyph fm-tone-muted">▢</i>Settled</span>
+                <span><i class="fm-glyph fm-tone-muted">▣</i>×n landed too close to draw apart (click to zoom in)</span>
+                <span><i class="fm-glyph fm-tone-muted">⋯</i>Quiet cut (labelled)</span>
+                <span class="fm-legend-sep" aria-hidden="true"></span>
+                <span><i class="fm-glyph fm-tone-rework">↺</i>Audit sent it back</span>
+                <span><i class="fm-glyph fm-tone-muted">⇢</i>Interruption</span>
+            </div>
         </div>
+
+        @* The inbox, docked. Cards stack in the order their nodes appear so the
+           leaders never cross; urgency is on the card, and the camera already
+           goes to the most urgent. Empty is a real state. *@
+        <aside class="fm-rail" id="fleet-map-rail" aria-label="Needs you">
+            <div class="fm-rail-head">
+                <span class="fm-rail-title">Needs you</span>
+                <span class="fm-rail-count">@_rail.Count</span>
+            </div>
+            @if (_rail.Count == 0)
+            {
+                <div class="fm-rail-empty">
+                    <span class="fm-rail-empty-glyph" aria-hidden="true">✓</span>
+                    <span>Nothing needs you.</span>
+                    <span class="fm-ov-muted">Failures, parks waiting on an answer, and abandoned items appear here with a line to where they live.</span>
+                </div>
+            }
+            else
+            {
+                @foreach (var card in _rail)
+                {
+                    <div class="fm-rail-card @(card.IsTop ? "fm-rail-card--top" : "")" data-rail-id="@card.ItemId"
+                         onmouseenter="codeyboxFleetMap.highlight('fleet-map-canvas', this.dataset.railId)"
+                         onmouseleave="codeyboxFleetMap.highlight('fleet-map-canvas', null)">
+                        <button type="button" class="fm-rail-card-title" @onclick="() => OpenFromListAsync(card.ItemId)" title="Go to this item on the map">@card.Title</button>
+                        <div class="fm-rail-card-meta">
+                            <StatusChip Info="@StatusVocabulary.ForWorkItem(card.State)" />
+                            <span class="fm-ov-muted" title="@AdminFormat.FormatDateTimeFull(card.UpdatedAt)">@AdminFormat.FormatRelative(card.UpdatedAt, DateTimeOffset.UtcNow)</span>
+                            <CopyableId Value="@card.ItemId" CopyButtonOnly="true" />
+                        </div>
+                        <div class="fm-rail-card-reason">@card.Reason</div>
+                        <div class="fm-rail-card-actions">
+                            <button type="button" class="fm-link-btn" @onclick="() => ShowDetailAsync(card.ItemId)">detail</button>
+                            @foreach (var action in MapItemActions.For(card.State).Where(a => a.Key != "addDependent").Take(3))
+                            {
+                                <button type="button" class="fm-link-btn @(action.Danger ? "fm-link-btn--danger" : "")" @onclick="() => OnNodeAction(card.ItemId, action.Key)">@action.Label.ToLowerInvariant()</button>
+                            }
+                        </div>
+                    </div>
+                }
+            }
+        </aside>
     </div>
 
-    <details class="map-fallback">
+    <details class="fm-fallback">
         <summary>Chain list (text equivalent of the map)</summary>
         @if (_projection is null)
         {
@@ -55,13 +148,20 @@
         {
             @foreach (var chain in _projection.Chains)
             {
-                <div class="map-chain-row">
-                    <strong>@(chain.SeriesPrefix ?? chain.Id)</strong>
+                <div class="fm-chain-row">
+                    <strong>@ChainName(chain)</strong>
+                    <span class="fm-chain-count">@chain.ItemIds.Count</span>
                     @foreach (var id in chain.ItemIds)
                     {
-                        <span class="map-chain-item">
-                            <a href="/work-items/@id"><CopyableId Value="@id" /></a>
+                        <span class="fm-chain-item @(string.Equals(id, FocusedItemId, StringComparison.Ordinal) ? "fm-chain-item--open" : "") @(TerminalVisibility.IsSettled(ItemState(id)) ? "fm-chain-item--settled" : "")">
+                            <button type="button" class="fm-link-btn fm-link-btn--title" title="Show on the map" @onclick="() => OpenFromListAsync(id)">@TitleOf(id)</button>
                             <StatusChip Info="@StatusVocabulary.ForWorkItem(ItemState(id))" />
+                            @if (ActivityOf(id) is { } activity && activity.Kind == ActivityKind.BlockedByDependency)
+                            {
+                                <span class="fm-chain-blocked" title="@activity.Summary">⇠ waits on @string.Join(", ", activity.Blockers.Select(b => TitleOf(b.Id)))</span>
+                            }
+                            <CopyableId Value="@id" CopyButtonOnly="true" />
+                            <button type="button" class="fm-link-btn" @onclick="() => ShowDetailAsync(id)" title="Open the detail overlay">detail</button>
                         </span>
                     }
                 </div>
@@ -70,34 +170,211 @@
     </details>
 </div>
 
+@if (_overlayId is not null)
+{
+    <ItemOverlay Id="@_overlayId"
+                 Activity="@ActivityOf(_overlayId)"
+                 ResolveTitle="@(id => _snapshot?.Items.FirstOrDefault(i => i.Id == id)?.Title)"
+                 OnClose="CloseOverlayAsync"
+                 Navigate="NavigateOverlayAsync"
+                 AddDependent="BeginAddDependentAsync"
+                 Changed="PollAndRenderAsync" />
+}
+
+@if (_addFor is not null)
+{
+    <div class="fm-overlay fm-overlay--modal" role="dialog" aria-modal="true" aria-labelledby="fm-add-title">
+        <div class="fm-overlay-scrim" @onclick="CancelAddDependent"></div>
+        <div class="fm-overlay-sheet fm-overlay-sheet--narrow">
+            <h2 id="fm-add-title" class="fm-ov-title">New item, depending on “@_addForTitle”</h2>
+            <p class="fm-ov-muted">It queues behind that item and starts only when it lands. Same project; the agent defaults to the parent's. <CopyableId Value="@_addFor" CopyButtonOnly="true" /></p>
+            <label class="fm-field">
+                <span>Title</span>
+                <input type="text" @bind="_addTitle" @bind:event="oninput" maxlength="300" placeholder="What the dependent should do" />
+            </label>
+            <label class="fm-field">
+                <span>Prompt</span>
+                <textarea rows="6" @bind="_addPrompt" @bind:event="oninput" placeholder="The full instruction the agent will receive"></textarea>
+            </label>
+            <label class="fm-field">
+                <span>Agent</span>
+                <select @bind="_addAgent">
+                    @foreach (var agent in KnownAgents())
+                    {
+                        <option value="@agent">@agent</option>
+                    }
+                </select>
+            </label>
+            @if (_addError is not null)
+            {
+                <p class="error-banner">@_addError</p>
+            }
+            <div class="fm-ov-actions">
+                <button type="button" class="fm-btn fm-btn--primary" disabled="@(!CanSubmitAdd || _addBusy)" @onclick="SubmitAddDependentAsync">@(_addBusy ? "Creating…" : "Create dependent")</button>
+                <button type="button" class="fm-btn" @onclick="CancelAddDependent">Cancel</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_menuFor is not null)
+{
+    <div class="fm-overlay fm-overlay--modal" role="dialog" aria-modal="true" aria-label="Item actions">
+        <div class="fm-overlay-scrim" @onclick="() => _menuFor = null"></div>
+        <div class="fm-overlay-sheet fm-overlay-sheet--narrow">
+            <h2 class="fm-ov-title">@TitleOf(_menuFor)</h2>
+            <p class="fm-ov-muted"><CopyableId Value="@_menuFor" /></p>
+            <div class="fm-ov-actions fm-ov-actions--column">
+                <button type="button" class="fm-btn" @onclick="async () => { var id = _menuFor; _menuFor = null; await ShowDetailAsync(id!); }">Detail</button>
+                @foreach (var action in MapItemActions.For(ItemState(_menuFor)))
+                {
+                    <button type="button" class="fm-btn @(action.Danger ? "fm-btn--danger" : "") @(action.Key == "addDependent" ? "fm-btn--primary" : "")"
+                            @onclick="async () => { var id = _menuFor; _menuFor = null; await OnNodeAction(id!, action.Key); }">@(action.Key == "addDependent" ? "+ " : "")@action.Label</button>
+                }
+                <button type="button" class="fm-btn" @onclick="() => _menuFor = null">Close</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_ghostConfirm is not null)
+{
+    <div class="fm-overlay fm-overlay--modal" role="alertdialog" aria-modal="true">
+        <div class="fm-overlay-scrim" @onclick="() => _ghostConfirm = null"></div>
+        <div class="fm-overlay-sheet fm-overlay-sheet--narrow">
+            <h2 class="fm-ov-title">@(_ghostConfirm.Action == "promote" ? "Promote" : "Dismiss") “@_ghostConfirm.Title”</h2>
+            <p class="fm-ov-meta"><span>@_ghostConfirm.Severity</span><span>@_ghostConfirm.Category</span><span>@_ghostConfirm.Effort effort</span><span title="Suggestion id"><CopyableId Value="@_ghostConfirm.Id" CopyButtonOnly="true" /></span></p>
+            <p class="fm-ov-pre fm-ov-rationale">@_ghostConfirm.Rationale</p>
+            @if (_ghostConfirm.Action == "promote")
+            {
+                <p class="fm-ov-muted">A real work item is created, depending on “@_ghostConfirm.ParentTitle”. It appears where the ghost stood.</p>
+                <label class="fm-field"><span>Extra instructions (optional)</span><textarea rows="3" @bind="_ghostExtra" @bind:event="oninput" placeholder="Anything the agent should know beyond the rationale"></textarea></label>
+            }
+            else
+            {
+                <p class="fm-ov-muted">Dismissed suggestions do not come back.</p>
+                <label class="fm-field"><span>Reason (optional)</span><input type="text" @bind="_ghostExtra" @bind:event="oninput" maxlength="300" /></label>
+            }
+            <div class="fm-ov-actions">
+                <button type="button" class="fm-btn @(_ghostConfirm.Action == "promote" ? "fm-btn--primary" : "fm-btn--danger")" disabled="@_ghostBusy" @onclick="RunGhostActionAsync">@(_ghostBusy ? "Working…" : _ghostConfirm.Action == "promote" ? "Promote to work item" : "Dismiss")</button>
+                <button type="button" class="fm-btn" @onclick="() => _ghostConfirm = null">Keep</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_confirm is not null)
+{
+    <div class="fm-overlay fm-overlay--modal" role="alertdialog" aria-modal="true">
+        <div class="fm-overlay-scrim" @onclick="() => _confirm = null"></div>
+        <div class="fm-overlay-sheet fm-overlay-sheet--narrow">
+            <h2 class="fm-ov-title">@_confirm.Action.Label · @TitleOf(_confirm.Id)</h2>
+            <p>@ConfirmText(_confirm.Action)</p>
+            <div class="fm-ov-actions">
+                <button type="button" class="fm-btn @(_confirm.Action.Danger ? "fm-btn--danger" : "fm-btn--primary")" @onclick="RunConfirmedAsync">@_confirm.Action.Label</button>
+                <button type="button" class="fm-btn" @onclick="() => _confirm = null">Keep</button>
+            </div>
+        </div>
+    </div>
+}
+
 @code {
+    private sealed record PendingConfirm(string Id, MapItemAction Action);
+
     private FleetProjection? _projection;
     private FleetMapLayout? _layout;
     private CameraState? _camera;
+    private FleetSnapshot? _snapshot;
     private FleetSnapshot? _prevSnapshot;
+    private Dictionary<string, WorkItemDto> _dtos = new(StringComparer.Ordinal);
+    private IReadOnlyDictionary<string, ItemActivity>? _activities;
     private IReadOnlyDictionary<string, ItemActivity>? _prevActivities;
+    private IReadOnlyList<MapTransition> _pendingTransitions = [];
+    private IReadOnlyList<RailCard> _rail = [];
     private string? _lastPayload;
     private CameraViewSize _viewSize = CameraViewSize.Default;
     private bool _reducedMotion;
     private string _focusLabel = "Loading…";
     private string? _error;
+    private string? _notice;
     private bool _jsReady;
     private DotNetObjectReference<FleetMap>? _dotNetRef;
     private CancellationTokenSource? _cts;
 
+    // Operator preferences (persisted per browser via JS).
+    private bool _showSettled = TerminalVisibilityOptions.Default.ShowSettled;
+    private string _horizonKey = "180d";
+
+    // Per-item history for nodes visible at pipeline zoom, keyed by id; a
+    // changed UpdatedAt invalidates the entry. Bounded concurrency so a big
+    // display never fans out into dozens of simultaneous fetches.
+    private readonly Dictionary<string, (DateTimeOffset UpdatedAt, OpenItemPayload Payload)> _detailCache = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _detailInFlight = new(StringComparer.Ordinal);
+    private const int MaxDetailConcurrency = 4;
+
+    // Overlay and mutation state.
+    private string? _overlayId;
+    private string? _addFor;
+    private string _addForTitle = string.Empty;
+    private string _addTitle = string.Empty;
+    private string _addPrompt = string.Empty;
+    private string _addAgent = string.Empty;
+    private string? _addError;
+    private bool _addBusy;
+    private PendingConfirm? _confirm;
+    private string? _menuFor;
+
+    // Round four: suggestions as ghosts, releases as containers.
+    private sealed record GhostConfirm(string Id, string Action, string Title, string ParentTitle, string Severity, string Category, string Effort, string Rationale);
+    private List<GhostSuggestion> _suggestions = [];
+    private DateTimeOffset _suggestionsAt = DateTimeOffset.MinValue;
+    private List<ReleaseInfo> _releases = [];
+    private DateTimeOffset _releasesAt = DateTimeOffset.MinValue;
+    private IReadOnlyList<GhostGroup> _ghostGroups = [];
+    private IReadOnlyList<ReleaseFrame> _releaseFrames = [];
+    private bool _showSuggestions = SuggestionGhostOptions.Default.Show;
+    private string _suggestionSeverity = SuggestionGhostOptions.Default.MinSeverity;
+    private GhostConfirm? _ghostConfirm;
+    private string _ghostExtra = string.Empty;
+    private bool _ghostBusy;
+    private int GhostCount => _ghostGroups.Sum(g => g.Shown.Count);
+    private static readonly TimeSpan SuggestionsEvery = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ReleasesEvery = TimeSpan.FromSeconds(60);
+
     private bool CameraManual => _camera?.Manual == true;
     private bool ReducedMotion => _reducedMotion;
-    private int ItemCount => _projection is null ? 0 : _prevSnapshot?.Items.Count ?? 0;
+    private string? FocusedItemId => _camera?.OpenItemId;
+    private string? HoldReason => _camera is { Manual: false, HoldReason: { Length: > 0 } reason } ? reason : null;
+    private int LiveCount => _snapshot?.Items.Count(i => !ItemStates.IsTerminal(i.State)) ?? 0;
+    private int SettledCount => _snapshot?.Items.Count(i => TerminalVisibility.IsSettled(i.State)) ?? 0;
     private int ChainCount => _projection?.Chains.Count ?? 0;
+    private int BlockedCount => _activities?.Values.Count(a => a.Kind == ActivityKind.BlockedByDependency) ?? 0;
+    private int RunningCount => _activities?.Values.Count(a => a.Kind == ActivityKind.Running) ?? 0;
     private string FocusLabel => _focusLabel;
+    private bool CanSubmitAdd => !string.IsNullOrWhiteSpace(_addTitle) && !string.IsNullOrWhiteSpace(_addPrompt);
+
+    private TerminalVisibilityOptions TerminalOptions => new()
+    {
+        ShowSettled = _showSettled,
+        Horizon = _horizonKey switch
+        {
+            "24h" => TimeSpan.FromHours(24),
+            "3d" => TimeSpan.FromDays(3),
+            "7d" => TimeSpan.FromDays(7),
+            "30d" => TimeSpan.FromDays(30),
+            "never" => null,
+            _ => TimeSpan.FromDays(180),
+        },
+    };
 
     protected override async Task OnInitializedAsync()
     {
         _cts = new CancellationTokenSource();
         _dotNetRef = DotNetObjectReference.Create(this);
-        await TickAsync();
+        await PollAsync();
         _ = RefreshLoopAsync(_cts.Token);
     }
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (!firstRender || _dotNetRef is null)
@@ -106,18 +383,180 @@
         }
         try
         {
+            await LoadPrefsAsync();
             _jsReady = await JS.InvokeAsync<bool>(
-                "codeyboxFleetMap.init", "fleet-map-canvas", _dotNetRef);
-            if (_jsReady && _lastPayload is not null)
+                "codeyboxFleetMap.init", "fleet-map-canvas", "fleet-map-wrap", "fleet-map-fx", "fleet-map-rail", _dotNetRef);
+            if (_jsReady)
             {
-                await JS.InvokeAsync<bool>(
-                    "codeyboxFleetMap.render", "fleet-map-canvas", _lastPayload);
+                if (await PollAsync())
+                {
+                    StateHasChanged();
+                }
+                else if (_lastPayload is not null)
+                {
+                    await JS.InvokeAsync<bool>("codeyboxFleetMap.render", "fleet-map-canvas", _lastPayload);
+                }
             }
         }
         catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException)
         {
             Logger.LogDebug(ex, "Fleet map: canvas init unavailable; showing text equivalent");
             _jsReady = false;
+        }
+    }
+
+    private async Task LoadPrefsAsync()
+    {
+        try
+        {
+            var prefs = await JS.InvokeAsync<JsonElement?>("codeyboxFleetMap.prefs.get");
+            if (prefs is { ValueKind: JsonValueKind.Object } p)
+            {
+                if (p.TryGetProperty("showSettled", out var show) && show.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                {
+                    _showSettled = show.GetBoolean();
+                }
+                if (p.TryGetProperty("horizon", out var horizon) && horizon.ValueKind == JsonValueKind.String
+                    && horizon.GetString() is "24h" or "3d" or "7d" or "30d" or "180d" or "never")
+                {
+                    _horizonKey = horizon.GetString()!;
+                }
+                if (p.TryGetProperty("showSuggestions", out var showSug) && showSug.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                {
+                    _showSuggestions = showSug.GetBoolean();
+                }
+                if (p.TryGetProperty("suggestionSeverity", out var sev) && sev.ValueKind == JsonValueKind.String
+                    && sev.GetString() is "minor" or "notable" or "important")
+                {
+                    _suggestionSeverity = sev.GetString()!;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException or JsonException)
+        {
+            Logger.LogDebug(ex, "Fleet map: preferences unavailable");
+        }
+    }
+
+    private async Task SavePrefsAsync()
+    {
+        if (!_jsReady)
+        {
+            return;
+        }
+        try
+        {
+            await JS.InvokeVoidAsync("codeyboxFleetMap.prefs.set", new { showSettled = _showSettled, horizon = _horizonKey, showSuggestions = _showSuggestions, suggestionSeverity = _suggestionSeverity });
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException)
+        {
+            Logger.LogDebug(ex, "Fleet map: could not persist preferences");
+        }
+    }
+
+    private async Task OnShowSettledChanged(ChangeEventArgs e)
+    {
+        _showSettled = e.Value is bool b && b;
+        await SavePrefsAsync();
+        await PollAsync();
+    }
+
+    private async Task OnHorizonChanged(ChangeEventArgs e)
+    {
+        _horizonKey = e.Value?.ToString() ?? "180d";
+        await SavePrefsAsync();
+        await PollAsync();
+    }
+
+    private async Task OnShowSuggestionsChanged(ChangeEventArgs e)
+    {
+        _showSuggestions = e.Value is bool b && b;
+        await SavePrefsAsync();
+        await PollAsync();
+    }
+
+    private async Task OnSuggestionSeverityChanged(ChangeEventArgs e)
+    {
+        _suggestionSeverity = e.Value?.ToString() ?? "minor";
+        await SavePrefsAsync();
+        await PollAsync();
+    }
+
+    private SuggestionGhostOptions GhostOptions => new() { Show = _showSuggestions, MinSeverity = _suggestionSeverity };
+
+    /// <summary>Open suggestions, refreshed every <see cref="SuggestionsEvery"/>; failures keep the last set.</summary>
+    private async Task RefreshSuggestionsAsync(DateTimeOffset now, CancellationToken ct)
+    {
+        if (!_showSuggestions || now - _suggestionsAt < SuggestionsEvery)
+        {
+            return;
+        }
+        _suggestionsAt = now;
+        try
+        {
+            var open = await ApiClient.GetOpenSuggestionsAsync(500, ct);
+            _suggestions = open
+                .Where(sg => sg is not null && !string.IsNullOrEmpty(sg.Id) && string.Equals(sg.State, "open", StringComparison.OrdinalIgnoreCase))
+                .Select(sg => new GhostSuggestion
+                {
+                    Id = sg.Id,
+                    ParentId = sg.SourceWorkItemId ?? string.Empty,
+                    Title = string.IsNullOrWhiteSpace(sg.Title) ? "(untitled suggestion)" : sg.Title.Trim(),
+                    Rationale = sg.Rationale ?? string.Empty,
+                    Category = sg.Category ?? string.Empty,
+                    Severity = sg.Severity ?? string.Empty,
+                    Effort = sg.EstimatedEffort ?? string.Empty,
+                    Files = sg.FilesReferenced ?? [],
+                    CreatedAt = sg.CreatedAt,
+                })
+                .ToList();
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Fleet map: suggestions unavailable");
+        }
+    }
+
+    /// <summary>Releases and their latest audit verdicts, refreshed every <see cref="ReleasesEvery"/>.</summary>
+    private async Task RefreshReleasesAsync(DateTimeOffset now, CancellationToken ct)
+    {
+        if (now - _releasesAt < ReleasesEvery)
+        {
+            return;
+        }
+        _releasesAt = now;
+        try
+        {
+            var releases = await ApiClient.GetReleasesAsync(ct: ct);
+            var infos = new List<ReleaseInfo>();
+            foreach (var r in releases.Where(r => r is not null && !string.IsNullOrEmpty(r.Id)))
+            {
+                var blocking = 0;
+                var remediation = new List<string>();
+                if (!ReleaseContainers.SettledReleaseStates.Contains(r.State ?? string.Empty))
+                {
+                    try
+                    {
+                        var iterations = await ApiClient.GetReleaseAuditIterationsAsync(r.Id, ct);
+                        var latest = iterations.OrderByDescending(i => i.Iteration).FirstOrDefault();
+                        blocking = latest?.BlockingFindings ?? 0;
+                        remediation = iterations.Where(i => !string.IsNullOrEmpty(i.RemediationWorkItemId)).Select(i => i.RemediationWorkItemId!).Distinct(StringComparer.Ordinal).ToList();
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        Logger.LogDebug(ex, "Fleet map: release audit iterations unavailable");
+                    }
+                }
+                infos.Add(new ReleaseInfo { Id = r.Id, Name = r.Name ?? r.Id, State = r.State ?? string.Empty, BlockingFindings = blocking, RemediationItemIds = remediation });
+            }
+            _releases = infos;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Fleet map: releases unavailable");
         }
     }
 
@@ -128,19 +567,22 @@
         {
             while (await timer.WaitForNextTickAsync(ct))
             {
-                // A quiet fleet produces an identical frame: skip the render
-                // entirely instead of diffing an unchanged tree every poll.
-                if (await TickAsync())
+                // All state lives on the renderer's sync context: the poll, the
+                // JS callbacks and the buttons never race each other.
+                await InvokeAsync(async () =>
                 {
-                    await InvokeAsync(StateHasChanged);
-                }
+                    if (await PollAsync())
+                    {
+                        StateHasChanged();
+                    }
+                });
             }
         }
         catch (OperationCanceledException) { }
     }
 
-    /// <summary>Polls and rebuilds the frame. Returns true when the UI changed.</summary>
-    private async Task<bool> TickAsync()
+    /// <summary>Polls the fleet, advances the camera, pushes a frame. Returns true when the UI changed.</summary>
+    private async Task<bool> PollAsync()
     {
         var options = MapOptions.CurrentValue;
         try
@@ -163,53 +605,59 @@
             }
 
             var now = DateTimeOffset.UtcNow;
+            await RefreshSuggestionsAsync(now, ct);
+            await RefreshReleasesAsync(now, ct);
             var snapshot = FleetMapSnapshotMapper.ToSnapshot(
                 itemsTask.Result, pausedTask.Result, quotaTask.Result,
-                concurrencyTask.Result, workersFallback, now);
+                concurrencyTask.Result, workersFallback, now, TerminalOptions);
             var projection = FleetProjectionBuilder.Project(snapshot);
+            // The axis: settled work by finish time, now at zero, queued work by
+            // predicted batch — the forecast needs the fleet's capacity and what runs.
+            var capacity = snapshot.Workers?.GlobalMaxConcurrent ?? 0;
+            var runningNow = snapshot.Workers is { GlobalMaxConcurrent: > 0 } w ? w.GlobalRunning : -1;
+            // The layout is a function of the data alone: the camera is never an
+            // input, so zooming moves nothing.
             var layout = _layout is null
-                ? FleetMapBuilder.DeriveInitial(snapshot.Items.ToList(), projection.Chains.ToList(), options)
-                : FleetMapBuilder.Update(_layout, snapshot.Items.ToList(), projection.Chains.ToList(), options);
+                ? FleetMapBuilder.DeriveInitial(snapshot.Items.ToList(), projection.Chains.ToList(), options, now, projection.Activities, capacity, runningNow)
+                : FleetMapBuilder.Update(_layout, snapshot.Items.ToList(), projection.Chains.ToList(), options, now, projection.Activities, capacity, runningNow);
             var camera = _camera is null
                 ? CameraDirector.Initial(layout, now, _viewSize, options)
-                : CameraDirector.Next(_camera, projection, layout, now, _viewSize, options, _reducedMotion);
-            var activities = ActivityAnalyzer.AnalyzeAll(snapshot);
+                : CameraDirector.Next(_camera, projection, layout, now, _viewSize, options, _reducedMotion, snapshot);
+            var activities = projection.Activities;
             var transitions = MapTransitionDetector.Detect(
                 _prevSnapshot, _prevActivities, snapshot, activities,
                 projection.Chains.ToList(), options);
-            var badges = MapNodeStyler.StyleAll(snapshot, activities, camera.Viewport.Zoom, options);
-            var payload = FleetMapFrameBuilder.BuildPayload(
-                snapshot, projection, layout, badges, camera, transitions);
+            // Settled work folding past the horizon is not an event.
+            var previouslyTerminal = new HashSet<string>(
+                (_prevSnapshot?.Items ?? []).Where(i => ItemStates.IsTerminal(i.State)).Select(i => i.Id), StringComparer.Ordinal);
+            transitions = transitions
+                .Where(t => !(t.Kind == MapTransitionKind.ItemRemoved && previouslyTerminal.Contains(t.ItemId)))
+                .ToList();
 
+            _prevSnapshot = _snapshot;
+            _prevActivities = _activities;
+            _snapshot = snapshot;
             _projection = projection;
             _layout = layout;
             _camera = camera;
-            _prevSnapshot = snapshot;
-            _prevActivities = activities;
-            _focusLabel = DescribeFocus(camera, projection);
+            _activities = activities;
+            _pendingTransitions = transitions;
+            _rail = AttentionRail.Build(snapshot, projection.Attention, layout, options.RailMaxCards);
+            _dtos = (itemsTask.Result ?? [])
+                .Where(i => i is not null && !string.IsNullOrEmpty(i.Id))
+                .GroupBy(i => i.Id, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+            _ghostGroups = SuggestionGhosts.Place(_suggestions, layout, snapshot.Items.ToList(), GhostOptions, options);
+            _releaseFrames = ReleaseContainers.Build(
+                _releases,
+                _dtos.ToDictionary(kv => kv.Key, kv => string.IsNullOrWhiteSpace(kv.Value.ReleaseId) ? null : kv.Value.ReleaseId, StringComparer.Ordinal),
+                _dtos.ToDictionary(kv => kv.Key, kv => kv.Value.State ?? string.Empty, StringComparer.Ordinal),
+                layout, options);
             var errorChanged = _error is not null;
             _error = null;
 
-            // Idle gate: identical payloads skip the JS bridge entirely.
-            if (!string.Equals(payload, _lastPayload, StringComparison.Ordinal))
-            {
-                _lastPayload = payload;
-                if (_jsReady)
-                {
-                    try
-                    {
-                        await JS.InvokeAsync<bool>(
-                            "codeyboxFleetMap.render", "fleet-map-canvas", payload);
-                    }
-                    catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException)
-                    {
-                        Logger.LogDebug(ex, "Fleet map: render skipped, circuit unavailable");
-                        _jsReady = false;
-                    }
-                }
-                return true;
-            }
-            return errorChanged;
+            var changed = await PushFrameAsync();
+            return changed || errorChanged || transitions.Count > 0;
         }
         catch (Exception ex)
         {
@@ -221,30 +669,386 @@
         }
     }
 
+    private async Task PollAndRenderAsync()
+    {
+        await PollAsync();
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Rebuilds the frame from current state and sends it when it differs —
+    /// the idle gate. Transitions ride exactly one frame. Also schedules the
+    /// per-item history fetch for every node visible at pipeline zoom.
+    /// </summary>
+    private async Task<bool> PushFrameAsync()
+    {
+        if (_snapshot is null || _projection is null || _layout is null || _camera is null || _activities is null)
+        {
+            return false;
+        }
+        var options = MapOptions.CurrentValue;
+        var details = ResolveVisibleDetails(options);
+        var badges = MapNodeStyler.StyleAll(_snapshot, _activities, options.FullDetailZoom, options);
+        var payload = FleetMapFrameBuilder.BuildPayload(
+            _snapshot, _projection, _layout, badges, _camera, _pendingTransitions, options, details, _rail, _ghostGroups, _releaseFrames);
+        _pendingTransitions = [];
+        _focusLabel = DescribeFocus(_camera, _projection, _snapshot);
+
+        ScheduleDetailFetches(details);
+
+        if (string.Equals(payload, _lastPayload, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        _lastPayload = payload;
+        if (_jsReady)
+        {
+            try
+            {
+                await JS.InvokeAsync<bool>("codeyboxFleetMap.render", "fleet-map-canvas", payload);
+            }
+            catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException)
+            {
+                Logger.LogDebug(ex, "Fleet map: render skipped, circuit unavailable");
+                _jsReady = false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>History entries (cached or "loading") for the nodes visible at pipeline zoom.</summary>
+    private Dictionary<string, OpenItemPayload> ResolveVisibleDetails(FleetMapOptions options)
+    {
+        var result = new Dictionary<string, OpenItemPayload>(StringComparer.Ordinal);
+        if (_layout is null || _camera is null || _snapshot is null)
+        {
+            return result;
+        }
+        var byId = _snapshot.Items.ToDictionary(i => i.Id, StringComparer.Ordinal);
+        foreach (var id in SemanticZoom.VisibleItems(_layout, _camera.Viewport, _viewSize, options))
+        {
+            if (!byId.TryGetValue(id, out var item))
+            {
+                continue;
+            }
+            result[id] = _detailCache.TryGetValue(id, out var cached) && cached.UpdatedAt == item.UpdatedAt
+                ? cached.Payload
+                : new OpenItemPayload { Id = id, Status = "loading" };
+        }
+        return result;
+    }
+
+    private void ScheduleDetailFetches(Dictionary<string, OpenItemPayload> details)
+    {
+        foreach (var (id, payload) in details.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            if (payload.Status != "loading" || _detailInFlight.Contains(id))
+            {
+                continue;
+            }
+            if (_detailInFlight.Count >= MaxDetailConcurrency)
+            {
+                break; // the next frame push picks up the rest
+            }
+            _detailInFlight.Add(id);
+            _ = LoadDetailAsync(id);
+        }
+    }
+
+    private async Task LoadDetailAsync(string id)
+    {
+        try
+        {
+            var ct = _cts?.Token ?? default;
+            var needsYou = TerminalVisibility.NeedsYou(ItemState(id));
+            var itemTask = ApiClient.GetWorkItemAsync(id, ct);
+            var timelineTask = Guarded(ApiClient.GetWorkItemTimelineAsync(id, "state_transition", null, null, ct), "timeline");
+            var progressTask = Guarded(ApiClient.GetAuditProgressAsync(id, ct), "audit-progress");
+            // The decision needs the evidence: findings and any open question.
+            var reportsTask = needsYou ? Guarded(ApiClient.GetAuditReportsAsync(id, ct), "audit-reports") : Task.FromResult<AuditReportsDto?>(null);
+            var questionsTask = needsYou ? GuardedList(ApiClient.GetQuestionsAsync(id, ct), "questions") : Task.FromResult<List<QuestionDto>?>(null);
+            await Task.WhenAll(itemTask, timelineTask, progressTask, reportsTask, questionsTask);
+            var item = itemTask.Result;
+            OpenItemPayload payload;
+            DateTimeOffset updatedAt;
+            if (item is null)
+            {
+                payload = new OpenItemPayload { Id = id, Status = "unavailable" };
+                updatedAt = DateTimeOffset.MinValue;
+            }
+            else
+            {
+                var pipeline = ItemStagePipelineBuilder.Build(
+                    StageSnapshotMapper.ToStageSnapshot(item, timelineTask.Result, progressTask.Result));
+                DecisionBrief? decision = null;
+                if (needsYou)
+                {
+                    decision = DecisionBriefBuilder.Build(
+                        item.State, ActivityOf(id), item.LastError, item.AuditIterations, item.AuditMaxIterations,
+                        BlockingFindings(reportsTask.Result),
+                        questionsTask.Result?.FirstOrDefault(q => q.IsOpen)?.QuestionText);
+                }
+                payload = new OpenItemPayload { Id = id, Status = "ready", Pipeline = pipeline, Decision = decision };
+                updatedAt = item.UpdatedAt;
+            }
+            await InvokeAsync(async () =>
+            {
+                _detailCache[id] = (updatedAt, payload);
+                _detailInFlight.Remove(id);
+                if (await PushFrameAsync())
+                {
+                    StateHasChanged();
+                }
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            _detailInFlight.Remove(id);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Fleet map: could not load history for a visible item");
+            await InvokeAsync(async () =>
+            {
+                var updatedAt = _snapshot?.Items.FirstOrDefault(i => i.Id == id)?.UpdatedAt ?? DateTimeOffset.MinValue;
+                _detailCache[id] = (updatedAt, new OpenItemPayload { Id = id, Status = "unavailable" });
+                _detailInFlight.Remove(id);
+                if (await PushFrameAsync())
+                {
+                    StateHasChanged();
+                }
+            });
+        }
+    }
+
+    /// <summary>Blocking findings of the latest audit iteration; null when the surface did not answer.</summary>
+    private static IReadOnlyList<DecisionFinding>? BlockingFindings(AuditReportsDto? reports)
+    {
+        if (reports is null)
+        {
+            return null;
+        }
+        var latest = reports.Iterations.OrderByDescending(i => i.Iteration).FirstOrDefault();
+        if (latest is null)
+        {
+            return [];
+        }
+        return latest.Auditors
+            .SelectMany(a => a.Findings.Select(f => (Auditor: a.Name, Finding: f)))
+            .Where(x => StatusVocabulary.ForSeverity(x.Finding.Severity).Tone == "fail")
+            .Select(x => new DecisionFinding(x.Auditor, x.Finding.Severity, x.Finding.Title))
+            .ToList();
+    }
+
+    private async Task<T?> Guarded<T>(Task<T?> task, string surface) where T : class
+    {
+        try { return await task; }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Fleet map: {Surface} unavailable for a visible item", surface);
+            return null;
+        }
+    }
+
+    private async Task<List<T>?> GuardedList<T>(Task<List<T>> task, string surface)
+    {
+        try { return await task; }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Fleet map: {Surface} unavailable for a visible item", surface);
+            return null;
+        }
+    }
+
+    // ── Camera control ──────────────────────────────────────────────────
+
     private async Task ResumeAutoAsync()
     {
         if (_camera is not null)
         {
             _camera = CameraDirector.ResumeAuto(_camera, DateTimeOffset.UtcNow);
+            if (_projection is not null && _layout is not null)
+            {
+                _camera = CameraDirector.Next(_camera, _projection, _layout, DateTimeOffset.UtcNow, _viewSize, MapOptions.CurrentValue, _reducedMotion, _snapshot);
+            }
         }
-        await TickAsync();
-        await InvokeAsync(StateHasChanged);
+        await PushFrameAsync();
+    }
+
+    private async Task OverviewAsync()
+    {
+        if (_camera is not null && _layout is not null)
+        {
+            _camera = CameraDirector.Overview(_camera, _layout, DateTimeOffset.UtcNow, _viewSize, MapOptions.CurrentValue);
+        }
+        await PushFrameAsync();
+    }
+
+    private async Task OpenFromListAsync(string id)
+    {
+        if (_camera is not null && _layout is not null)
+        {
+            _camera = CameraDirector.OpenItem(_camera, id, _layout, DateTimeOffset.UtcNow, MapOptions.CurrentValue);
+        }
+        await PushFrameAsync();
     }
 
     [JSInvokable]
-    public void OnManualViewport(double x, double y, double zoom)
+    public async Task OnManualViewport(double x, double y, double zoom)
     {
         var viewport = new CameraViewport
         {
             CenterX = double.IsFinite(x) ? x : 0,
             CenterY = double.IsFinite(y) ? y : 0,
-            Zoom = double.IsFinite(zoom) && zoom > 0 ? Math.Min(4, zoom) : 1,
+            Zoom = double.IsFinite(zoom) && zoom > 0 ? Math.Min(8, zoom) : 1,
         };
         _camera = _camera is null
             ? new CameraState { Manual = true, Viewport = viewport, LastChangeAt = DateTimeOffset.UtcNow }
-            : CameraDirector.ApplyManual(_camera, viewport, DateTimeOffset.UtcNow);
-        _focusLabel = DescribeFocus(_camera, _projection);
-        InvokeAsync(StateHasChanged);
+            : CameraDirector.ApplyManual(_camera, viewport, DateTimeOffset.UtcNow, _layout, MapOptions.CurrentValue, _viewSize);
+        await PushFrameAsync();
+        StateHasChanged();
+    }
+
+    /// <summary>A node (or a blocker's name) was clicked: travel to it and grow it.</summary>
+    [JSInvokable]
+    public async Task OnNodeActivated(string id)
+    {
+        if (_camera is null || _layout is null || !IsKnownId(id))
+        {
+            return;
+        }
+        _camera = CameraDirector.OpenItem(_camera, id, _layout, DateTimeOffset.UtcNow, MapOptions.CurrentValue);
+        await PushFrameAsync();
+        StateHasChanged();
+    }
+
+    /// <summary>A bubble's control was pressed: detail overlay, add dependent, answer, or a confirmed mutation.</summary>
+    [JSInvokable]
+    public async Task OnNodeAction(string id, string action)
+    {
+        if (!IsKnownId(id) || string.IsNullOrEmpty(action) || action.Length > 32)
+        {
+            return;
+        }
+        switch (action)
+        {
+            case "detail":
+            case "answer":
+                await ShowDetailAsync(id);
+                break;
+            case "addDependent":
+                await BeginAddDependentAsync(id);
+                break;
+            case "menu":
+                _menuFor = id;
+                break;
+            default:
+                var known = MapItemActions.For(ItemState(id)).FirstOrDefault(a => string.Equals(a.Key, action, StringComparison.Ordinal));
+                if (known is not null)
+                {
+                    _confirm = new PendingConfirm(id, known);
+                }
+                break;
+        }
+        StateHasChanged();
+    }
+
+    /// <summary>A suggestion ghost's control was pressed: promote, dismiss, or go to its parent.</summary>
+    [JSInvokable]
+    public async Task OnGhostAction(string suggestionId, string action)
+    {
+        if (string.IsNullOrEmpty(suggestionId) || suggestionId.Length > 128)
+        {
+            return;
+        }
+        var suggestion = _suggestions.FirstOrDefault(sg => string.Equals(sg.Id, suggestionId, StringComparison.Ordinal));
+        if (suggestion is null)
+        {
+            return;
+        }
+        switch (action)
+        {
+            case "parent":
+                await OnNodeActivated(suggestion.ParentId);
+                return;
+            case "promote":
+            case "dismiss":
+                _ghostExtra = string.Empty;
+                _ghostConfirm = new GhostConfirm(suggestion.Id, action, suggestion.Title, TitleOf(suggestion.ParentId), suggestion.Severity, suggestion.Category, suggestion.Effort, suggestion.Rationale);
+                break;
+        }
+        StateHasChanged();
+    }
+
+    private async Task RunGhostActionAsync()
+    {
+        var pending = _ghostConfirm;
+        if (pending is null || _ghostBusy)
+        {
+            return;
+        }
+        _ghostBusy = true;
+        try
+        {
+            if (pending.Action == "promote")
+            {
+                var createdId = await ApiClient.PromoteSuggestionAsync(pending.Id, string.IsNullOrWhiteSpace(_ghostExtra) ? null : _ghostExtra.Trim());
+                if (createdId is null)
+                {
+                    _notice = $"Promote “{pending.Title}”: the orchestrator refused.";
+                }
+                else
+                {
+                    _notice = $"Promoted “{pending.Title}” — it is now real work, depending on “{pending.ParentTitle}”.";
+                    _suggestionsAt = DateTimeOffset.MinValue;
+                    await PollAsync();
+                    if (_camera is not null && _layout is not null && _layout.Nodes.ContainsKey(createdId))
+                    {
+                        _camera = CameraDirector.OpenItem(_camera, createdId, _layout, DateTimeOffset.UtcNow, MapOptions.CurrentValue);
+                        await PushFrameAsync();
+                    }
+                }
+            }
+            else
+            {
+                await ApiClient.DismissSuggestionAsync(pending.Id, string.IsNullOrWhiteSpace(_ghostExtra) ? "Dismissed from the map" : _ghostExtra.Trim());
+                _notice = $"Dismissed “{pending.Title}”.";
+                _suggestionsAt = DateTimeOffset.MinValue;
+                await PollAsync();
+            }
+            _ghostConfirm = null;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Fleet map: suggestion action failed");
+            _notice = $"{(pending.Action == "promote" ? "Promote" : "Dismiss")} “{pending.Title}”: failed. Check server logs.";
+            _ghostConfirm = null;
+        }
+        finally
+        {
+            _ghostBusy = false;
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnCloseItem()
+    {
+        if (_overlayId is not null || _addFor is not null || _confirm is not null || _menuFor is not null || _ghostConfirm is not null)
+        {
+            _overlayId = null;
+            _addFor = null;
+            _confirm = null;
+            _menuFor = null;
+            _ghostConfirm = null;
+        }
+        else if (_camera is not null)
+        {
+            _camera = CameraDirector.CloseItem(_camera, DateTimeOffset.UtcNow, MapOptions.CurrentValue);
+            await PushFrameAsync();
+        }
+        StateHasChanged();
     }
 
     [JSInvokable]
@@ -263,6 +1067,163 @@
         InvokeAsync(StateHasChanged);
     }
 
+    // ── Overlay ─────────────────────────────────────────────────────────
+
+    private Task ShowDetailAsync(string id)
+    {
+        if (IsKnownId(id))
+        {
+            _overlayId = id;
+        }
+        return Task.CompletedTask;
+    }
+
+    private Task CloseOverlayAsync()
+    {
+        _overlayId = null;
+        return Task.CompletedTask;
+    }
+
+    private async Task NavigateOverlayAsync(string id)
+    {
+        if (!IsKnownId(id))
+        {
+            _notice = $"“{TitleOf(id)}” is not on the map (it has landed and folded away, or is not in flight).";
+            return;
+        }
+        _overlayId = id;
+        await OpenFromListAsync(id);
+    }
+
+    // ── Mutation: add a dependent ───────────────────────────────────────
+
+    private Task BeginAddDependentAsync(string parentId)
+    {
+        if (!IsKnownId(parentId))
+        {
+            return Task.CompletedTask;
+        }
+        _addFor = parentId;
+        _addForTitle = TitleOf(parentId);
+        _addTitle = string.Empty;
+        _addPrompt = string.Empty;
+        _addAgent = _dtos.TryGetValue(parentId, out var dto) && !string.IsNullOrWhiteSpace(dto.Agent) ? dto.Agent : KnownAgents().FirstOrDefault() ?? string.Empty;
+        _addError = null;
+        _addBusy = false;
+        _overlayId = null;
+        return Task.CompletedTask;
+    }
+
+    private void CancelAddDependent()
+    {
+        _addFor = null;
+        _addError = null;
+    }
+
+    private async Task SubmitAddDependentAsync()
+    {
+        if (_addFor is null || !CanSubmitAdd || !_dtos.TryGetValue(_addFor, out var parent))
+        {
+            _addError = _addFor is null ? null : "The parent item is no longer on the map.";
+            return;
+        }
+        _addBusy = true;
+        _addError = null;
+        try
+        {
+            var created = await ApiClient.CreateWorkItemAsync(new CreateWorkItemRequest
+            {
+                ProjectId = parent.ProjectId,
+                Title = _addTitle.Trim(),
+                Prompt = _addPrompt.Trim(),
+                Agent = string.IsNullOrWhiteSpace(_addAgent) ? null : _addAgent,
+                DependsOn = [parent.Id],
+            });
+            if (created is null)
+            {
+                _addError = "The orchestrator did not create the item. Check that the project accepts new work.";
+                return;
+            }
+            _notice = $"Created “{created.Title}” — it waits on “{parent.Title}”.";
+            _addFor = null;
+            await PollAsync();
+            if (_camera is not null && _layout is not null && _layout.Nodes.ContainsKey(created.Id))
+            {
+                _camera = CameraDirector.OpenItem(_camera, created.Id, _layout, DateTimeOffset.UtcNow, MapOptions.CurrentValue);
+                await PushFrameAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Fleet map: create dependent failed");
+            _addError = "Creating the item failed. Check server logs for details.";
+        }
+        finally
+        {
+            _addBusy = false;
+        }
+    }
+
+    private IEnumerable<string> KnownAgents()
+    {
+        var agents = _dtos.Values
+            .Select(i => i.Agent)
+            .Where(a => !string.IsNullOrWhiteSpace(a))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (!string.IsNullOrWhiteSpace(_addAgent) && !agents.Contains(_addAgent, StringComparer.OrdinalIgnoreCase))
+        {
+            agents.Insert(0, _addAgent);
+        }
+        return agents;
+    }
+
+    // ── Mutation: confirmed actions ─────────────────────────────────────
+
+    private async Task RunConfirmedAsync()
+    {
+        var pending = _confirm;
+        _confirm = null;
+        if (pending is null)
+        {
+            return;
+        }
+        try
+        {
+            var ok = pending.Action.Key switch
+            {
+                "retryWork" => await ApiClient.RetryWorkItemAsync(pending.Id, "work"),
+                "retryAudit" => await ApiClient.RetryWorkItemAsync(pending.Id, "audit"),
+                "cancel" => await ApiClient.DeleteWorkItemAsync(pending.Id),
+                "delegate" => await ApiClient.DelegateWorkItemAsync(pending.Id),
+                _ => false,
+            };
+            _notice = ok
+                ? $"{pending.Action.Label} · “{TitleOf(pending.Id)}”: done."
+                : $"{pending.Action.Label} · “{TitleOf(pending.Id)}”: the orchestrator refused.";
+            if (ok)
+            {
+                _detailCache.Remove(pending.Id);
+                await PollAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Fleet map: action failed");
+            _notice = $"{pending.Action.Label} · “{TitleOf(pending.Id)}”: failed. Check server logs.";
+        }
+    }
+
+    private static string ConfirmText(MapItemAction action) => action.Key switch
+    {
+        "cancel" => "Cancel this item? Dependents stay queued and will never start.",
+        "retryWork" => "Retry from work? The current branch is abandoned and the item re-queues.",
+        "retryAudit" => "Retry from audit? The existing work branch is audited again.",
+        "delegate" => "Delegate one repair turn to a delegate agent?",
+        _ => $"{action.Label}?",
+    };
+
     public void Dispose()
     {
         _cts?.Cancel();
@@ -270,23 +1231,42 @@
         _dotNetRef?.Dispose();
     }
 
-    private string ItemState(string id)
+    // ── Text helpers ────────────────────────────────────────────────────
+
+    private bool IsKnownId(string? id) =>
+        !string.IsNullOrEmpty(id) && id.Length <= 128
+        && _snapshot?.Items.Any(i => string.Equals(i.Id, id, StringComparison.Ordinal)) == true;
+
+    private string ItemState(string id) =>
+        _snapshot?.Items.FirstOrDefault(i => string.Equals(i.Id, id, StringComparison.Ordinal))?.State ?? string.Empty;
+
+    private ItemActivity? ActivityOf(string id) =>
+        _activities is not null && _activities.TryGetValue(id, out var activity) ? activity : null;
+
+    /// <summary>The name is the handle: an item's title, falling back to its short id only when it has none.</summary>
+    private string TitleOf(string id)
     {
-        foreach (var item in _prevSnapshot?.Items ?? [])
-        {
-            if (string.Equals(item.Id, id, StringComparison.Ordinal))
-            {
-                return item.State;
-            }
-        }
-        return string.Empty;
+        var title = _snapshot?.Items.FirstOrDefault(i => string.Equals(i.Id, id, StringComparison.Ordinal))?.Title;
+        return string.IsNullOrWhiteSpace(title) ? ShortId(id) : title.Trim();
     }
 
-    private static string DescribeFocus(CameraState? camera, FleetProjection? projection)
+    private static string ShortId(string id) => id.Length >= 8 ? id[..8] : id;
+
+    private string ChainName(WorkChain chain) =>
+        chain.SeriesPrefix is { Length: > 0 } prefix ? prefix : ChainLabel(_projection, _snapshot, chain.Id, bare: true);
+
+    private static string DescribeFocus(CameraState? camera, FleetProjection? projection, FleetSnapshot? snapshot)
     {
         if (camera is null)
         {
             return "Loading…";
+        }
+        if (camera.OpenItemId is { } openId)
+        {
+            var title = snapshot?.Items.FirstOrDefault(i => i.Id == openId)?.Title;
+            var name = string.IsNullOrWhiteSpace(title) ? ShortId(openId) : title.Trim();
+            var verb = camera.Manual ? "At" : camera.HoldReason is not null ? "Holding on" : "Visiting";
+            return $"{verb} “{name}”";
         }
         if (camera.Manual)
         {
@@ -294,20 +1274,35 @@
         }
         return camera.FocusKind switch
         {
-            CameraFocusKind.Item => $"Focused on {camera.FocusId} — needs attention.",
-            CameraFocusKind.Chain => $"Touring chain {ChainLabel(projection, camera.FocusId)}.",
-            _ => "Overview — fleet is quiet.",
+            CameraFocusKind.Chain => $"Touring {ChainLabel(projection, snapshot, camera.FocusId)}.",
+            _ => "Overview — the whole backlog.",
         };
     }
 
-    private static string ChainLabel(FleetProjection? projection, string chainId)
+    /// <summary>Names a chain by its series prefix, else by the title of the member most others wait on.</summary>
+    private static string ChainLabel(FleetProjection? projection, FleetSnapshot? snapshot, string chainId, bool bare = false)
     {
         foreach (var chain in projection?.Chains ?? [])
         {
-            if (string.Equals(chain.Id, chainId, StringComparison.Ordinal))
+            if (!string.Equals(chain.Id, chainId, StringComparison.Ordinal))
             {
-                return chain.SeriesPrefix ?? chain.Id;
+                continue;
             }
+            if (chain.SeriesPrefix is { Length: > 0 } prefix)
+            {
+                return bare ? prefix : $"chain “{prefix}” ({chain.ItemIds.Count} items)";
+            }
+            var members = chain.ItemIds.ToHashSet(StringComparer.Ordinal);
+            var items = (snapshot?.Items ?? []).Where(i => members.Contains(i.Id)).ToList();
+            var root = items
+                .OrderByDescending(i => items.Count(o => o.DependsOn.Contains(i.Id, StringComparer.Ordinal)))
+                .ThenBy(i => i.DependsOn.Count)
+                .ThenBy(i => i.Id, StringComparer.Ordinal)
+                .FirstOrDefault();
+            var name = root is null || string.IsNullOrWhiteSpace(root.Title)
+                ? ShortId(chain.Id.Replace("chain-", string.Empty, StringComparison.Ordinal))
+                : root.Title.Length > 48 ? root.Title[..47] + "…" : root.Title;
+            return bare ? name : $"chain “{name}” ({chain.ItemIds.Count} items)";
         }
         return chainId;
     }

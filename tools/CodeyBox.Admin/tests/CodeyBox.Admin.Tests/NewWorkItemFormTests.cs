@@ -1,4 +1,5 @@
 using Bunit;
+using Microsoft.AspNetCore.Components.Web;
 using Microsoft.Extensions.DependencyInjection;
 using CodeyBox.Admin.Web.Components.Pages;
 using CodeyBox.Admin.Web.Models;
@@ -7,9 +8,8 @@ using CodeyBox.Admin.Web.Services;
 namespace CodeyBox.Admin.Tests;
 
 /// <summary>
-/// Tests for the NewWorkItem form: validation messages and submit payload.
-/// Uses bunit for Blazor component rendering; relies on bunit's built-in
-/// NavigationManager and JSRuntime fakes.
+/// The composer's basics: what renders, what blocks filing, and that
+/// what is on the page is exactly what is sent.
 /// </summary>
 public sealed class NewWorkItemFormTests : BunitContext
 {
@@ -37,138 +37,167 @@ public sealed class NewWorkItemFormTests : BunitContext
     [Fact]
     public void NewWorkItem_RendersProjectDropdown()
     {
-        var fake = new FakeApiClient([], [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject()]));
 
         var cut = Render<NewWorkItem>();
 
-        Assert.Contains("My Project", cut.Markup);
+        Assert.Contains("My Project", cut.Find("select#project").TextContent);
     }
 
     [Fact]
-    public void NewWorkItem_RendersPromptTextarea()
+    public void NewWorkItem_RendersEditorAsMonospacePrompt()
     {
-        var fake = new FakeApiClient([], [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject()]));
 
         var cut = Render<NewWorkItem>();
 
-        // Prompt textarea must be present with monospace class
-        Assert.Contains("prompt-input", cut.Markup);
-        Assert.Contains("textarea", cut.Markup.ToLowerInvariant());
+        Assert.Contains("prompt-input", cut.Find("textarea#prompt").ClassName);
     }
 
     [Fact]
-    public void NewWorkItem_ShowsQueuedItemsForDependsOn()
+    public void NewWorkItem_ShowsQueuedItemsAsDependencyCandidates()
     {
-        var fake = new FakeApiClient(
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient(
             [QueuedItem("aabbccdd-0000-0000-0000-000000000001", "Dep Task")],
-            [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+            [SampleProject()]));
 
         var cut = Render<NewWorkItem>();
 
-        // Queued items should appear in the depends-on multi-select area
-        Assert.Contains("Dep Task", cut.Markup);
+        Assert.Contains("Dep Task", cut.Find(".dependency-picker").TextContent);
     }
 
     [Fact]
-    public void NewWorkItem_ValidationError_WhenProjectNotSelected()
+    public void NewWorkItem_SingleKnownProject_IsInferredAndFilingNeedsAPrompt()
     {
-        var fake = new FakeApiClient([], [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject()]));
 
         var cut = Render<NewWorkItem>();
 
-        // Submit the form without setting required fields
-        cut.Find("form").Submit();
-
-        Assert.Contains("Project is required", cut.Markup);
+        Assert.Equal("proj-1", cut.Find("select#project").GetAttribute("value"));
+        Assert.True(cut.Find("button#file").HasAttribute("disabled"));
+        Assert.Contains("Write a prompt", cut.Find("#review-problems").TextContent);
     }
 
     [Fact]
-    public void NewWorkItem_ValidationError_WhenTitleMissing()
+    public void NewWorkItem_SeveralProjectsAndNoSignal_AsksForAProject()
     {
-        var fake = new FakeApiClient([], [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        var other = SampleProject();
+        other.Id = "proj-2";
+        other.DisplayName = "Other";
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject(), other]));
 
         var cut = Render<NewWorkItem>();
+        cut.Find("textarea#prompt").Input("Do the thing.");
 
-        cut.Find("form").Submit();
-
-        Assert.Contains("Title is required", cut.Markup);
+        Assert.Equal(string.Empty, cut.Find("select#project").GetAttribute("value"));
+        Assert.Contains("Pick a project", cut.Find("#review-problems").TextContent);
+        Assert.True(cut.Find("button#file").HasAttribute("disabled"));
     }
 
     [Fact]
-    public void NewWorkItem_ValidationError_WhenPromptMissing()
+    public void NewWorkItem_TitleFollowsFirstLineUntilTypedOver()
     {
-        var fake = new FakeApiClient([], [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject()]));
 
         var cut = Render<NewWorkItem>();
+        cut.Find("textarea#prompt").Input("## Fix the flaky redirect\n\nReproduce it first.");
 
-        cut.Find("form").Submit();
+        Assert.Equal("Fix the flaky redirect", cut.Find("input#title").GetAttribute("value"));
+        Assert.Contains("from the first line", cut.Find("label[for=title]").TextContent);
 
-        Assert.Contains("Prompt is required", cut.Markup);
+        cut.Find("input#title").Change("Redirect race");
+        cut.Find("textarea#prompt").Input("## Something else\n\nBody.");
+
+        Assert.Equal("Redirect race", cut.Find("input#title").GetAttribute("value"));
+        Assert.Contains("you", cut.Find("label[for=title]").TextContent);
     }
 
     [Fact]
-    public async Task NewWorkItem_ValidSubmit_CallsCreateWithDependsOnIds()
+    public void NewWorkItem_File_SendsWhatIsOnThePage()
     {
-        var capturingClient = new CapturingApiClient(
+        var client = new CapturingApiClient(
             [QueuedItem("aabbccdd-0000-0000-0000-000000000001", "Dep")],
             [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(capturingClient);
+        Services.AddSingleton<ICodeyBoxApiClient>(client);
 
         var cut = Render<NewWorkItem>();
-
-        // Fill required fields
-        cut.Find("select#project").Change("proj-1");
+        cut.Find("textarea#prompt").Input("My Prompt");
         cut.Find("input#title").Change("My Title");
-        cut.Find("textarea#prompt").Change("My Prompt");
-
-        // Select a dependency
         cut.Find("input#dep-aabbccdd-0000-0000-0000-000000000001").Change(true);
+        cut.Find("input#workTimeout").Change("90");
+        cut.Find("input#mergeTimeout").Change("20");
+        cut.Find("input#isRefactor").Change(true);
+        cut.Find("input#externalId").Change("JIRA-7");
+        cut.Find("button#file").Click();
 
-        cut.Find("form").Submit();
-
-        // Wait for async submit
-        await cut.InvokeAsync(() => Task.CompletedTask);
-
-        Assert.Single(capturingClient.CreateRequests);
-        var req = capturingClient.CreateRequests[0];
+        cut.WaitForAssertion(() => Assert.Single(client.CreateRequests));
+        var req = client.CreateRequests[0];
         Assert.Equal("proj-1", req.ProjectId);
         Assert.Equal("My Title", req.Title);
         Assert.Equal("My Prompt", req.Prompt);
         Assert.Contains("aabbccdd-0000-0000-0000-000000000001", req.DependsOn);
+        Assert.Equal(90, req.WorkTimeoutMinutes);
+        Assert.Equal(20, req.MergeTimeoutMinutes);
+        Assert.True(req.IsRefactor);
+        Assert.Equal("JIRA-7", req.ExternalId);
+    }
+
+    [Fact]
+    public void NewWorkItem_CtrlEnterInEditor_Files()
+    {
+        var client = new CapturingApiClient([], [SampleProject()]);
+        Services.AddSingleton<ICodeyBoxApiClient>(client);
+
+        var cut = Render<NewWorkItem>();
+        cut.Find("textarea#prompt").Input("Keyboard-only item");
+        cut.Find("textarea#prompt").KeyDown(new KeyboardEventArgs { Key = "Enter", CtrlKey = true });
+
+        cut.WaitForAssertion(() => Assert.Single(client.CreateRequests));
+        Assert.Equal("Keyboard-only item", client.CreateRequests[0].Title);
     }
 
     [Fact]
     public void NewWorkItem_AgentDropdown_ContainsKnownAgents()
     {
-        var fake = new FakeApiClient([], [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject()]));
 
         var cut = Render<NewWorkItem>();
+        var agents = cut.Find("select#agent").TextContent;
 
-        Assert.Contains("claude", cut.Markup);
-        Assert.Contains("copilot", cut.Markup);
-        Assert.Contains("codex", cut.Markup);
+        Assert.Contains("claude", agents);
+        Assert.Contains("copilot", agents);
+        Assert.Contains("codex", agents);
     }
 
     [Fact]
     public void NewWorkItem_PushUpstreamCheckbox_DefaultsToChecked()
     {
-        var fake = new FakeApiClient([], [SampleProject()]);
-        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject()]));
 
         var cut = Render<NewWorkItem>();
 
-        // pushUpstream checkbox should be present and checked by default
-        var checkbox = cut.Find("input#pushUpstream");
-        Assert.NotNull(checkbox);
-        Assert.True(checkbox.HasAttribute("checked") || checkbox.GetAttribute("value") == "true"
-            || cut.Markup.Contains("checked"));
+        Assert.True(cut.Find("input#pushUpstream").HasAttribute("checked"));
+    }
+
+    [Fact]
+    public void NewWorkItem_EveryCreateOptionHasAControl()
+    {
+        Services.AddSingleton<ICodeyBoxApiClient>(new FakeApiClient([], [SampleProject()]));
+
+        var cut = Render<NewWorkItem>();
+
+        foreach (var id in new[]
+        {
+            "select#project", "input#baseBranch", "input#workBranch", "input#pushUpstream", "select#release",
+            "select#agent", "input#agentClass", "input#requiredCapabilities", "input#minModelScore",
+            "input#auditMaxIterations", "input#auditorProfile", "input#auditComplexity",
+            "input#priority", "input#isRefactor", "input#workTimeout", "input#mergeTimeout",
+            "select#knob-changeScope", "select#knob-plan", "textarea#knobs", "input#externalId",
+            "input#dep-search", "textarea#prompt", "input#title",
+        })
+        {
+            Assert.NotNull(cut.Find(id));
+        }
     }
 }
 

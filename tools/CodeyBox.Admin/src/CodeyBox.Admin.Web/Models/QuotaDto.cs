@@ -24,7 +24,10 @@ public sealed class QuotaProbeDto
 
 public sealed class QuotaSnapshotDto
 {
-    public int AvailablePct { get; set; }
+    /// <summary>Percentage of quota remaining. The orchestrator returns a decimal
+    /// (an agent can sit at 0.416%), so this must not be an int — deserialising it
+    /// as one threw and took the whole fleet map down with it.</summary>
+    public double AvailablePct { get; set; }
     public bool? IsKnown { get; set; }
     public DateTimeOffset? ResetAt { get; set; }
     public string? Notes { get; set; }

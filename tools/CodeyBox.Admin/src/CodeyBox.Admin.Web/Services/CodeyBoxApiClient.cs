@@ -344,6 +344,13 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return page?.Items ?? [];
     }
 
+    public async Task<List<SuggestionDto>> GetOpenSuggestionsAsync(int limit = 500, CancellationToken ct = default)
+    {
+        var capped = Math.Clamp(limit, 1, 500);
+        var page = await _http.GetFromJsonAsync<SuggestionsPage>($"/suggestions?state=open&limit={capped}", JsonOptions, ct);
+        return page?.Items ?? [];
+    }
+
     public async Task<int> GetSuggestionsCountAsync(CancellationToken ct = default)
     {
         var result = await _http.GetFromJsonAsync<SuggestionsCountResult>("/suggestions/count", JsonOptions, ct);

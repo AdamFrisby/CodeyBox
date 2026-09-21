@@ -18,10 +18,13 @@ public sealed record ComposerDefaults(
     string? AuditComplexity = null,
     string? AuditorProfile = null,
     IReadOnlyDictionary<string, string>? Knobs = null,
-    string? ReleaseId = null);
+    string? ReleaseId = null,
+    int? WorkTimeoutMinutes = null,
+    int? MergeTimeoutMinutes = null,
+    bool IsRefactor = false);
 
 /// <summary>
-/// One chain item as reviewed in the preview: title and body as shown,
+/// One chain item as reviewed in the outline: title and body as shown,
 /// plus 1-based local numbers of the siblings it waits for.
 /// </summary>
 public sealed record ChainItemDraft(
@@ -33,7 +36,7 @@ public sealed record ChainItemDraft(
 /// <summary>
 /// A single create fully resolved and ready to send: every field the
 /// create surface accepts, with sibling edges expressed as external-id
-/// references the orchestrator resolves at create time. What the preview
+/// references the orchestrator resolves at create time. What the review
 /// shows is exactly what this carries — the composer must submit these
 /// unchanged.
 /// </summary>
@@ -55,18 +58,25 @@ public sealed record PlannedCreate(
     string? AuditorProfile,
     IReadOnlyDictionary<string, string>? Knobs,
     string? ReleaseId,
-    IReadOnlyList<string> DependsOn);
+    IReadOnlyList<string> DependsOn,
+    int? WorkTimeoutMinutes = null,
+    int? MergeTimeoutMinutes = null,
+    bool IsRefactor = false);
 
 /// <summary>
-/// Turns a reviewed chain preview into the ordered creates that file it:
-/// one entry per item, in author order, where later items name earlier
+/// Turns a reviewed chain into the ordered creates that file it: one
+/// entry per item, in author order, where later items name earlier
 /// siblings by locally generated external ids. The orchestrator resolves
 /// those edges at create time, so filing needs no read round-trips — just
 /// these creates, in order. Single items keep the operator's own external
 /// id; chains stamp every member so siblings can find each other.
 ///
+/// Dependencies on items that already exist attach to the chain's roots —
+/// the members with no in-chain edge — because those are the only members
+/// that could otherwise start before the existing work is done.
+///
 /// Pure over its inputs; <paramref name="chainKey"/> is caller-supplied
-/// (8 lowercase hex chars) so results are deterministic and testable.
+/// (4–32 lowercase alphanumerics) so results are deterministic and testable.
 /// </summary>
 public static class WorkItemChainBuilder
 {
@@ -77,13 +87,15 @@ public static class WorkItemChainBuilder
     /// Builds the ordered creates for <paramref name="drafts"/> under
     /// <paramref name="defaults"/>. Local dependency numbers are 1-based
     /// positions in <paramref name="drafts"/>; out-of-range and self
-    /// references are dropped. Throws <see cref="ArgumentException"/> on
-    /// empty drafts or a malformed chain key.
+    /// references are dropped. <paramref name="existingDependsOn"/> ids are
+    /// added to every root. Throws <see cref="ArgumentException"/> on empty
+    /// drafts or a malformed chain key.
     /// </summary>
     public static IReadOnlyList<PlannedCreate> Build(
         ComposerDefaults defaults,
         IReadOnlyList<ChainItemDraft> drafts,
-        string chainKey)
+        string chainKey,
+        IReadOnlyCollection<string>? existingDependsOn = null)
     {
         ArgumentNullException.ThrowIfNull(defaults);
         ArgumentNullException.ThrowIfNull(drafts);
@@ -94,6 +106,11 @@ public static class WorkItemChainBuilder
 
         var key = NormaliseChainKey(chainKey);
         var isChain = drafts.Count > 1;
+        var existing = (existingDependsOn ?? [])
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
         var result = new List<PlannedCreate>(drafts.Count);
 
         for (var i = 0; i < drafts.Count; i++)
@@ -103,12 +120,19 @@ public static class WorkItemChainBuilder
                 ? ChainExternalId(key, i + 1)
                 : BlankToNull(draft.ExternalId);
 
-            var dependsOn = draft.DependsOnLocal
+            var localEdges = draft.DependsOnLocal
                 .Where(d => d >= 1 && d <= drafts.Count && d != i + 1)
                 .Distinct()
                 .OrderBy(d => d)
-                .Select(d => ResolveDependencyRef(key, isChain, drafts[d - 1], d))
                 .ToList();
+
+            var dependsOn = new List<string>();
+            if (localEdges.Count == 0)
+            {
+                dependsOn.AddRange(existing);
+            }
+
+            dependsOn.AddRange(localEdges.Select(d => ResolveDependencyRef(key, isChain, drafts[d - 1], d)));
 
             result.Add(new PlannedCreate(
                 defaults.ProjectId,
@@ -128,7 +152,10 @@ public static class WorkItemChainBuilder
                 defaults.AuditorProfile,
                 defaults.Knobs,
                 defaults.ReleaseId,
-                dependsOn));
+                dependsOn,
+                defaults.WorkTimeoutMinutes,
+                defaults.MergeTimeoutMinutes,
+                defaults.IsRefactor));
         }
 
         return result;

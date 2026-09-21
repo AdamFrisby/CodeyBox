@@ -25,4 +25,11 @@ public sealed class CreateWorkItemRequest
     public string? AuditComplexity { get; set; }
     public Dictionary<string, string>? Knobs { get; set; }
     public string? ReleaseId { get; set; }
+    public int? WorkTimeoutMinutes { get; set; }
+    public int? MergeTimeoutMinutes { get; set; }
+    /// <summary>
+    /// True files a project-exclusive refactor: it starts only when the
+    /// project has nothing else in flight and blocks other starts while it runs.
+    /// </summary>
+    public bool? IsRefactor { get; set; }
 }

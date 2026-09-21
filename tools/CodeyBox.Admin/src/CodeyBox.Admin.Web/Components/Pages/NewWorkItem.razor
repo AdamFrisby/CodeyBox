@@ -1,356 +1,352 @@
 @page "/work-items/new"
 @using CodeyBox.Admin.Model
+@using CodeyBox.Admin.Web.Models
 @inject ICodeyBoxApiClient ApiClient
 @inject NavigationManager Nav
 
-<PageTitle>New Work Item — CodeyBox Admin</PageTitle>
+<PageTitle>@Heading — CodeyBox Admin</PageTitle>
 
-<h1>@(_fromSuggestionId is not null ? "Promote Suggestion to Work Item" : "New Work Item")</h1>
+@* The composer is an editor with an inspector, not a form. The substance —
+   what the agent will read, and how the pieces depend on each other — is
+   the wide column. Every option the create surface accepts is in the rail
+   beside it, grouped, each showing its value and where the value came
+   from. Nothing is hidden behind a disclosure; nothing shouts. Structure
+   is read from the text as it is typed: a numbered plan becomes a chain
+   outline, a long prompt with sections stays one item, and either default
+   is one click from the other. Nothing is created until File. *@
 
-@if (_fromSuggestionData is not null)
-{
-    <div class="suggestion-context">
-        <p>
-            Promoting suggestion:
-            <strong>@_fromSuggestionData.Title</strong>
-            (<span class="category-badge">@_fromSuggestionData.Category</span>
-            / <StatusChip Info="@StatusVocabulary.ForSeverity(_fromSuggestionData.Severity)" />).
-            The suggestion title and rationale are automatically prepended to the prompt.
-        </p>
-    </div>
-}
-
-@if (_followUpItem is not null)
-{
-    <div class="followup-context">
-        <p>
-            Filing a follow-up to
-            <a href="/work-items/@_followUpItem.Id"><strong>@_followUpItem.Title</strong></a>
-            (@_followUpItem.ShortId).
-            The relationship is inferred — it will wait for that item — but the words are yours.
-        </p>
-    </div>
-}
-
-@if (_error is not null)
-{
-    <p class="error-banner">@_error</p>
-}
-
-@if (!_loaded)
-{
-    <p>Loading…</p>
-}
-else
-{
-    @* ── Inferred context: everything the interface already knows, shown ── *@
-    <section aria-label="Inferred context" class="composer-context">
-        <div class="form-group">
-            <label for="project">
-                Project
-                @InferenceBadge(_projectId.Source, _projectId.Overridden)
-            </label>
-            <select id="project" value="@(_projectId.Value ?? string.Empty)"
-                    @onchange="e => OnProjectSelected(e.Value?.ToString())" class="form-control">
-                <option value="">— select —</option>
-                @foreach (var p in _projects)
-                {
-                    <option value="@p.Id">@p.DisplayName</option>
-                }
-            </select>
-            @if (_projectError is not null)
-            {
-                <div class="validation-message">@_projectError</div>
-            }
-            <div class="form-hint">
-                <a href="/projects/setup">New project? Open the setup wizard</a> — it writes the config snippet for you.
-            </div>
-        </div>
-
-        <div class="composer-chips" role="group" aria-label="Inferred fields">
-            <div class="form-group composer-control">
-                <label for="agent">
-                    Agent
-                    @InferenceBadge(_agent.Source, _agent.Overridden)
-                </label>
-                <select id="agent" value="@(_agent.Value ?? string.Empty)"
-                        @onchange="e => OnAgentSelected(e.Value?.ToString())" class="form-control">
-                    <option value="">(project default)</option>
-                    @foreach (var a in AgentOptions)
-                    {
-                        <option value="@a.Value">@a.Label</option>
-                    }
-                </select>
-                @if (_agent.Overridden)
-                {
-                    <button type="button" id="reset-agent" class="btn btn-xs" @onclick="ResetAgent">↺ inferred</button>
-                }
-            </div>
-
-            <div class="form-group composer-control">
-                <label for="baseBranch">
-                    Base branch
-                    @InferenceBadge(_baseBranch.Source, _baseBranch.Overridden)
-                </label>
-                <input id="baseBranch" value="@(_baseBranch.Value ?? string.Empty)"
-                       @onchange="e => OnBaseBranchChanged(e.Value?.ToString() ?? string.Empty)"
-                       class="form-control" placeholder="(project default)" />
-                @if (_baseBranch.Overridden)
-                {
-                    <button type="button" id="reset-baseBranch" class="btn btn-xs" @onclick="ResetBaseBranch">↺ inferred</button>
-                }
-            </div>
-
-            @foreach (var chip in new[] { ("agentclass", "Class", _agentClassId), ("budget", "Audit ×", _auditBudgetText), ("profile", "Auditors", _auditorProfile) })
-            {
-                var key = chip.Item1;
-                <div class="form-group composer-control">
-                    <button type="button" id="chip-@key" class="composer-chip" aria-expanded="@(_editingChip == key ? "true" : "false")"
-                            @onclick="() => ToggleChipEditor(key)">
-                        <span class="chip-label">@chip.Item2</span>:
-                        <strong>@(string.IsNullOrWhiteSpace(chip.Item3.Value) ? "—" : chip.Item3.Value)</strong>
-                        <span class="chip-source">@SourceLabel(chip.Item3.Source)</span>
-                    </button>
-                </div>
-            }
-        </div>
-
-        @if (_editingChip is not null)
+<div class="composer">
+    <header class="composer-head">
+        <h1>@Heading</h1>
+        @if (_fromSuggestionData is not null)
         {
-            <div class="chip-editor" id="chip-editor">
-                @if (_editingChip == "agentclass")
-                {
-                    <label for="chip-agentclass-input">Agent class (optional)</label>
-                    <input id="chip-agentclass-input" @bind="_chipStaging" class="form-control"
-                           placeholder="e.g. default-class" />
-                }
-                else if (_editingChip == "budget")
-                {
-                    <label for="chip-budget-input">Audit iterations (optional)</label>
-                    <input id="chip-budget-input" @bind="_chipStaging" class="form-control"
-                           inputmode="numeric" placeholder="e.g. 5" />
-                }
-                else
-                {
-                    <label for="chip-profile-input">Auditor profile (optional)</label>
-                    <input id="chip-profile-input" @bind="_chipStaging" class="form-control"
-                           placeholder="e.g. strict" />
-                }
-                @if (_chipError is not null)
-                {
-                    <div class="validation-message">@_chipError</div>
-                }
-                <div class="form-actions">
-                    <button type="button" id="chip-save" class="btn btn-primary btn-sm" @onclick="SaveChipEditor">Save</button>
-                    <button type="button" id="chip-clear" class="btn btn-sm" @onclick="ClearChipEditor">Clear</button>
-                    <button type="button" id="chip-cancel" class="btn btn-sm" @onclick="CancelChipEditor">Cancel</button>
-                </div>
-            </div>
+            <p class="composer-context">
+                Promoting <strong>@_fromSuggestionData.Title</strong>
+                (<span class="category-badge">@_fromSuggestionData.Category</span>
+                / <StatusChip Info="@StatusVocabulary.ForSeverity(_fromSuggestionData.Severity)" />).
+                Its title and rationale lead the prompt; anything you write here follows them.
+            </p>
         }
-    </section>
+        @if (_followUpItem is not null)
+        {
+            <p class="composer-context">
+                Follows <a href="/work-items/@_followUpItem.Id"><strong>@_followUpItem.Title</strong></a>
+                (@_followUpItem.ShortId). The relationship is inferred — it will wait for that item — but the words are yours.
+            </p>
+        }
+    </header>
 
-    @if (_fromSuggestionId is null)
+    @if (_error is not null)
     {
-        <div class="composer-modes" role="radiogroup" aria-label="Composer mode">
-            <label>
-                <input type="radio" id="mode-single" name="composer-mode" value="single"
-                       checked="@(_mode == "single")" @onchange='() => _mode = "single"' />
-                Single item
-            </label>
-            <label>
-                <input type="radio" id="mode-plan" name="composer-mode" value="plan"
-                       checked="@(_mode == "plan")" @onchange='() => _mode = "plan"' />
-                Paste a plan
-            </label>
-        </div>
+        <p class="error-banner" id="composer-error">@_error</p>
     }
 
-    @if (_mode == "single" || _fromSuggestionId is not null)
+    @if (!_loaded)
     {
-        <EditForm Model="_form" OnValidSubmit="SubmitAsync" OnInvalidSubmit="HandleInvalidSubmit">
-            <DataAnnotationsValidator />
-
-            <div class="form-group">
-                <label for="externalId">External ID <span class="form-hint">(optional — e.g. JIRA-1234, GH-#456)</span></label>
-                <InputText id="externalId" @bind-Value="_form.ExternalId" class="form-control"
-                           placeholder="e.g. JIRA-1234" />
-            </div>
-
-            <div class="form-group">
-                <label for="title">Title</label>
-                <InputText id="title" @bind-Value="_form.Title" class="form-control" />
-                <ValidationMessage For="() => _form.Title" />
-            </div>
-
-            <div class="form-group">
-                <label for="prompt">@(_fromSuggestionId is not null ? "Additional instructions (optional)" : "Prompt")</label>
-                <InputTextArea id="prompt" @bind-Value="_form.Prompt" class="form-control prompt-input" rows="20" />
-                @if (_fromSuggestionId is null)
-                {
-                    <ValidationMessage For="() => _form.Prompt" />
-                }
-            </div>
-
-            <details class="composer-advanced" id="advanced">
-                <summary>More options — priority, model floor, audit, knobs, release</summary>
-                @AdvancedFields()
-            </details>
-
-            @if (_fromSuggestionId is null)
-            {
-                <DependencyPicker
-                    Candidates="OrderedCandidates(_selectedDeps)"
-                    Selected="_selectedDeps"
-                    Search="_depSearch"
-                    SearchChanged="v => _depSearch = v"
-                    Toggle="ToggleDep"
-                    IdPrefix="dep-"
-                    SearchInputId="dep-search"
-                    ProjectName="ProjectDisplayName" />
-            }
-
-            <div class="form-actions">
-                @if (_fromSuggestionId is not null)
-                {
-                    <button type="button" class="btn btn-primary" disabled="@_submitting" @onclick="PromoteSuggestionAsync">
-                        @(_submitting ? "Promoting…" : "Promote to work item")
-                    </button>
-                    <a href="/suggestions/@_fromSuggestionId" class="btn">Cancel</a>
-                }
-                else
-                {
-                    <button type="submit" class="btn btn-primary" disabled="@_submitting">
-                        @(_submitting ? "Submitting…" : "Create")
-                    </button>
-                    <a href="/" class="btn">Cancel</a>
-                }
-            </div>
-        </EditForm>
+        <p>Loading…</p>
     }
     else
     {
-        <section aria-label="Plan composer">
-            <div class="form-group">
-                <label for="plan-input">Pasted plan</label>
-                <textarea id="plan-input" class="form-control prompt-input" rows="12"
-                          placeholder="Paste a numbered plan — headings, 1. 2. 3., explicit “depends on: 1, 3” — and review the chain before anything is created."
-                          @bind="_planText" @bind:event="oninput"></textarea>
-                <div class="form-hint">Headings and numbering become items; “depends on: 1, 3” becomes edges; otherwise a straight line. Plain prose files one item.</div>
-            </div>
-            <div class="form-actions">
-                <button type="button" id="parse-plan" class="btn" disabled="@_submitting"
-                        @onclick="ParsePlan" @onkeydown="ParsePlanKeyDown">Parse plan</button>
-            </div>
-
-            @if (_previewInfo is not null)
-            {
-                <p class="preview-info" id="preview-info">@_previewInfo</p>
-            }
-
-            @if (_preview.Count > 0)
-            {
-                <ol class="chain-preview" id="chain-preview">
-                    @for (var i = 0; i < _preview.Count; i++)
-                    {
-                        var index = i;
-                        var item = _preview[index];
-                        <li class="chain-item">
-                            <div class="chain-item-head">
-                                <span class="chain-number">@(index + 1)</span>
-                                <input id="chain-title-@(index + 1)" class="form-control" aria-label="Item @(index + 1) title"
-                                       value="@item.Title" @onchange="e => item.Title = e.Value?.ToString() ?? string.Empty" />
-                                <button type="button" id="chain-remove-@(index + 1)" class="btn btn-xs btn-danger"
-                                        aria-label="Remove item @(index + 1)" @onclick="() => RemovePreviewItem(index)">✕</button>
-                            </div>
-                            <textarea id="chain-body-@(index + 1)" class="form-control prompt-input" rows="4"
-                                      aria-label="Item @(index + 1) prompt"
-                                      value="@item.Body" @onchange="e => item.Body = e.Value?.ToString() ?? string.Empty"></textarea>
-                            <div class="chain-edges">
-                                <span class="chain-edges-label">Waits for:</span>
-                                @for (var m = 0; m < _preview.Count; m++)
-                                {
-                                    var depNum = m + 1;
-                                    var self = depNum == index + 1;
-                                    <label class="@(self ? "chain-dep-self" : "chain-dep")" title="@(self ? "An item cannot wait for itself" : $"Item {depNum}")">
-                                        <input type="checkbox" id="chain-dep-@(index + 1)-@depNum"
-                                               disabled="@self" checked="@item.Deps.Contains(depNum)"
-                                               @onchange="e => TogglePreviewDep(index, depNum, (bool)(e.Value ?? false))" />
-                                        @depNum
-                                    </label>
-                                }
-                                <span class="chain-edges-summary">@EdgeSummary(index)</span>
-                            </div>
-                        </li>
-                    }
-                </ol>
-
-                <details class="composer-advanced" id="advanced-chain">
-                    <summary>More options — priority, model floor, audit, knobs, release</summary>
-                    @AdvancedFields()
-                </details>
-
-                <h3>Also wait for existing items <span class="form-hint">(added to the first item)</span></h3>
-                <DependencyPicker
-                    Candidates="OrderedCandidates(_chainExternalDeps)"
-                    Selected="_chainExternalDeps"
-                    Search="_depSearch"
-                    SearchChanged="v => _depSearch = v"
-                    Toggle="ToggleChainExtDep"
-                    IdPrefix="chain-ext-dep-"
-                    SearchInputId="chain-dep-search"
-                    ProjectName="ProjectDisplayName" />
-
-                <div class="form-actions">
-                    <button type="button" id="file-chain" class="btn btn-primary" disabled="@(_submitting || _preview.Count == 0)"
-                            @onclick="SubmitChainAsync" @onkeydown="SubmitChainKeyDown">
-                        @(_submitting ? "Filing…" : $"File {_preview.Count} {(_preview.Count == 1 ? "item" : "items")}")
-                    </button>
-                    <a href="/" class="btn">Cancel</a>
-                </div>
-            }
-        </section>
-    }
-
-    <details class="composer-templates" id="templates">
-        <summary>Task templates (@_templates.Count)</summary>
-        @if (_templates.Count == 0)
-        {
-            <p class="form-hint">No templates on the orchestrator, or they failed to load.</p>
-        }
-        else
-        {
-            <ul class="template-list">
-                @for (var t = 0; t < _templates.Count; t++)
+        <div class="composer-body">
+            <main class="composer-main">
+                @if (_fromSuggestionId is null && !IsChain)
                 {
-                    var template = _templates[t];
-                    var templateIndex = t;
-                    <li>
-                        <strong>@template.Name</strong>
-                        @if (template.CheckCount is not null)
+                    <div class="field-row">
+                        <label for="title">
+                            Title
+                            <span class="set-src">@(_titleDerived ? "from the first line" : "you")</span>
+                        </label>
+                        <input id="title" class="form-control composer-title" value="@_title"
+                               placeholder="Derived from the first line of the prompt"
+                               @onchange="e => OnTitleTyped(e.Value?.ToString() ?? string.Empty)" />
+                    </div>
+                }
+
+                <div class="field-row composer-editor-row">
+                    <label for="prompt">
+                        @(_fromSuggestionId is not null ? "Additional instructions" : "Prompt")
+                        <span class="set-src">@(_fromSuggestionId is not null ? "optional" : "or paste a plan — numbered steps become a chain")</span>
+                    </label>
+                    <textarea id="prompt" class="form-control prompt-input composer-editor" rows="18"
+                              placeholder="@EditorPlaceholder"
+                              @bind="_text" @bind:event="oninput" @bind:after="OnTextChanged"
+                              @onkeydown="OnEditorKeyDown"></textarea>
+                </div>
+
+                @if (_fromSuggestionId is null && _parsed.Items.Count > 1)
+                {
+                    <div class="structure-strip" id="structure-strip" role="group" aria-label="How to file this text">
+                        <span class="structure-reading">
+                            @(_parsed.Confidence == PlanConfidence.Structured
+                                ? $"Reads as a plan of {_parsed.Items.Count} items."
+                                : $"Has {_parsed.Items.Count} sections — probably one item.")
+                        </span>
+                        <span class="seg" role="radiogroup" aria-label="File as">
+                            <button type="button" id="file-as-one" class="seg-btn @(IsChain ? string.Empty : "seg-btn--on")"
+                                    role="radio" aria-checked="@(IsChain ? "false" : "true")" @onclick="() => SetChain(false)">One item</button>
+                            <button type="button" id="file-as-chain" class="seg-btn @(IsChain ? "seg-btn--on" : string.Empty)"
+                                    role="radio" aria-checked="@(IsChain ? "true" : "false")" @onclick="() => SetChain(true)">Chain of @_parsed.Items.Count</button>
+                        </span>
+                    </div>
+                }
+
+                @if (IsChain)
+                {
+                    <ChainOutline Items="_outline" Changed="OnOutlineChanged" />
+                }
+
+                @if (_fromSuggestionId is null)
+                {
+                    <section class="field-row" aria-label="Existing dependencies">
+                        <label for="dep-search">
+                            Waits for existing items
+                            <span class="set-src">@(IsChain ? "applied to the chain's roots" : "optional")</span>
+                        </label>
+                        <DependencyPicker Candidates="OrderedCandidates()" AllCandidates="AllCandidates()"
+                                          Selected="_existingDeps" Search="@_depSearch"
+                                          SearchChanged="v => _depSearch = v" Toggle="ToggleExistingDep"
+                                          IdPrefix="dep-" SearchInputId="dep-search" ProjectName="ProjectDisplayName" />
+                    </section>
+                }
+
+                <section class="review" aria-label="Review">
+                    @if (_fromSuggestionId is null)
+                    {
+                        <p class="review-sentence" id="review-sentence">@ReviewSentence</p>
+                        @if (Problems.Count > 0)
                         {
-                            <span class="form-hint">@template.CheckCount checks</span>
+                            <ul class="review-problems" id="review-problems">
+                                @foreach (var p in Problems)
+                                {
+                                    <li>@p</li>
+                                }
+                            </ul>
                         }
-                        @if (template.Error is not null)
+                    }
+                    <div class="form-actions review-actions">
+                        @if (_fromSuggestionId is not null)
                         {
-                            <span class="validation-message">@template.Error</span>
+                            <button type="button" id="file" class="btn btn-primary" disabled="@_submitting" @onclick="PromoteSuggestionAsync">
+                                @(_submitting ? "Promoting…" : "Promote to work item")
+                            </button>
+                            <a href="/suggestions/@_fromSuggestionId" class="btn">Cancel</a>
                         }
                         else
                         {
-                            <button type="button" id="queue-template-@templateIndex" class="btn btn-sm"
-                                    disabled="@(_submitting || string.IsNullOrWhiteSpace(_projectId.Value))"
-                                    title="@(string.IsNullOrWhiteSpace(_projectId.Value) ? "Select a project first" : $"Queue {template.Name} for the selected project")"
-                                    @onclick="() => QueueTemplateAsync(template)">Queue for this project</button>
+                            <button type="button" id="file" class="btn btn-primary" disabled="@(_submitting || Problems.Count > 0)" @onclick="FileAsync">
+                                @FileLabel
+                            </button>
+                            <a href="/" class="btn">Cancel</a>
+                            <span class="review-hint">Ctrl+Enter files from the editor.</span>
                         }
-                    </li>
+                    </div>
+                </section>
+            </main>
+
+            <aside class="composer-rail" aria-label="Settings">
+                <div class="set-group">
+                    <h3>Where</h3>
+                    <div class="set-row">
+                        <label for="project">Project <span class="set-src">@SourceLabel(_projectId)</span></label>
+                        <select id="project" class="form-control" value="@(_projectId.Value ?? string.Empty)"
+                                @onchange="e => OnProjectSelected(e.Value?.ToString())">
+                            <option value="">— select —</option>
+                            @foreach (var p in _projects)
+                            {
+                                <option value="@p.Id">@p.DisplayName</option>
+                            }
+                        </select>
+                    </div>
+                    <div class="set-row">
+                        <label for="baseBranch">Base branch <span class="set-src">@SourceLabel(_baseBranch)</span></label>
+                        <div class="set-ctl">
+                            <input id="baseBranch" class="form-control" value="@(_baseBranch.Value ?? string.Empty)" placeholder="project default"
+                                   @onchange="e => _baseBranch = _baseBranch.SetOperator(BlankToNull(e.Value?.ToString()))" />
+                            @if (_baseBranch.Overridden)
+                            {
+                                <button type="button" id="reset-baseBranch" class="set-reset" title="Back to the inferred value" @onclick="ResetBaseBranch">↺</button>
+                            }
+                        </div>
+                    </div>
+                    <div class="set-row">
+                        <label for="workBranch">Work branch</label>
+                        <input id="workBranch" class="form-control" @bind="_workBranch" placeholder="auto-generated" />
+                    </div>
+                    <div class="set-row set-row--check">
+                        <input type="checkbox" id="pushUpstream" @bind="_pushUpstream" />
+                        <label for="pushUpstream">Push upstream after merge</label>
+                    </div>
+                    @if (_fromSuggestionId is null)
+                    {
+                        <div class="set-row">
+                            <label for="release">Release</label>
+                            <select id="release" class="form-control" @bind="_releaseId">
+                                <option value="">none</option>
+                                @foreach (var r in _openReleases.Where(r => r.ProjectId == _projectId.Value))
+                                {
+                                    <option value="@r.Id">@r.Name</option>
+                                }
+                            </select>
+                        </div>
+                    }
+                </div>
+
+                <div class="set-group">
+                    <h3>Who</h3>
+                    <div class="set-row">
+                        <label for="agent">Agent <span class="set-src">@SourceLabel(_agent)</span></label>
+                        <div class="set-ctl">
+                            <select id="agent" class="form-control" value="@(_agent.Value ?? string.Empty)"
+                                    @onchange="e => _agent = _agent.SetOperator(BlankToNull(e.Value?.ToString()))">
+                                <option value="">project default</option>
+                                @foreach (var a in AgentOptions)
+                                {
+                                    <option value="@a.Value">@a.Label</option>
+                                }
+                            </select>
+                            @if (_agent.Overridden)
+                            {
+                                <button type="button" id="reset-agent" class="set-reset" title="Back to the inferred value" @onclick="ResetAgent">↺</button>
+                            }
+                        </div>
+                    </div>
+                    <div class="set-row">
+                        <label for="agentClass">Agent class <span class="set-src">@SourceLabel(_agentClassId)</span></label>
+                        <div class="set-ctl">
+                            <input id="agentClass" class="form-control" value="@(_agentClassId.Value ?? string.Empty)" placeholder="route by agent"
+                                   title="When set, the class routes by score and quota and the agent above is not consulted."
+                                   @onchange="e => OnAgentClassChanged(e.Value?.ToString())" />
+                            @if (_agentClassId.Overridden)
+                            {
+                                <button type="button" id="reset-agentClass" class="set-reset" title="Back to the inferred value" @onclick="ResetAgentClass">↺</button>
+                            }
+                        </div>
+                    </div>
+                    @if (_fromSuggestionId is null)
+                    {
+                        <div class="set-row">
+                            <label for="requiredCapabilities">Required capabilities</label>
+                            <input id="requiredCapabilities" class="form-control" @bind="_capabilitiesText" placeholder="gpu, large-mem" />
+                        </div>
+                        <div class="set-row">
+                            <label for="minModelScore">Min model score</label>
+                            <input id="minModelScore" class="form-control set-num" inputmode="numeric" @bind="_minModelScoreText" placeholder="any" />
+                        </div>
+                    }
+                </div>
+
+                @if (_fromSuggestionId is null)
+                {
+                    <div class="set-group">
+                        <h3>Audit</h3>
+                        <div class="set-row">
+                            <label for="auditMaxIterations">Iterations <span class="set-src">@SourceLabel(_auditBudgetText)</span></label>
+                            <div class="set-ctl">
+                                <input id="auditMaxIterations" class="form-control set-num" inputmode="numeric"
+                                       value="@(_auditBudgetText.Value ?? string.Empty)" placeholder="project default"
+                                       @onchange="e => OnBudgetChanged(e.Value?.ToString())" />
+                                @if (_auditBudgetText.Overridden)
+                                {
+                                    <button type="button" id="reset-auditMaxIterations" class="set-reset" title="Back to the inferred value" @onclick="ResetBudget">↺</button>
+                                }
+                            </div>
+                        </div>
+                        <div class="set-row">
+                            <label for="auditorProfile">Auditor profile <span class="set-src">@SourceLabel(_auditorProfile)</span></label>
+                            <input id="auditorProfile" class="form-control" value="@(_auditorProfile.Value ?? string.Empty)" placeholder="default"
+                                   @onchange="e => _auditorProfile = _auditorProfile.SetOperator(BlankToNull(e.Value?.ToString()))" />
+                        </div>
+                        <div class="set-row">
+                            <label for="auditComplexity">Complexity</label>
+                            <input id="auditComplexity" class="form-control" @bind="_auditComplexity" placeholder="server default" />
+                        </div>
+                    </div>
+
+                    <div class="set-group">
+                        <h3>Queue</h3>
+                        <div class="set-row">
+                            <label for="priority">Priority</label>
+                            <input id="priority" class="form-control set-num" inputmode="numeric" @bind="_priorityText" placeholder="0"
+                                   title="Higher is picked up sooner; -1000 to 1000." />
+                        </div>
+                        <div class="set-row set-row--check">
+                            <input type="checkbox" id="isRefactor" @bind="_isRefactor" />
+                            <label for="isRefactor" title="Runs alone: starts only when the project has nothing else in flight, and blocks other starts while it runs.">Refactor (project-exclusive)</label>
+                        </div>
+                        <div class="set-row set-row--pair">
+                            <label for="workTimeout">Timeouts <span class="set-src">minutes</span></label>
+                            <span class="set-pair">
+                                <input id="workTimeout" class="form-control set-num" inputmode="numeric" @bind="_workTimeoutText" placeholder="work" aria-label="Work timeout in minutes" />
+                                <input id="mergeTimeout" class="form-control set-num" inputmode="numeric" @bind="_mergeTimeoutText" placeholder="merge" aria-label="Merge timeout in minutes" />
+                            </span>
+                        </div>
+                    </div>
+
+                    <div class="set-group">
+                        <h3>Knobs</h3>
+                        @foreach (var knob in KnobCatalog.BuiltIn)
+                        {
+                            var key = knob.Key;
+                            <div class="set-row">
+                                <label for="knob-@key" title="@knob.Description">@knob.Label</label>
+                                <select id="knob-@key" class="form-control" value="@(_knobSelections.GetValueOrDefault(key) ?? string.Empty)"
+                                        @onchange="e => _knobSelections[key] = e.Value?.ToString()">
+                                    <option value="">@knob.DefaultValue (default)</option>
+                                    @foreach (var v in knob.AllowedValues.Where(v => v != knob.DefaultValue))
+                                    {
+                                        <option value="@v">@v</option>
+                                    }
+                                </select>
+                            </div>
+                        }
+                        <div class="set-row set-row--stack">
+                            <label for="knobs">More knobs <span class="set-src">key=value per line</span></label>
+                            <textarea id="knobs" class="form-control prompt-input set-knobs" rows="2" @bind="_extraKnobsText"></textarea>
+                        </div>
+                    </div>
                 }
-            </ul>
-        }
-        @if (_templateMessage is not null)
+
+                @if (!IsChain)
+                {
+                    <div class="set-group">
+                        <h3>Identity</h3>
+                        <div class="set-row">
+                            <label for="externalId">External id</label>
+                            <input id="externalId" class="form-control" @bind="_externalId" placeholder="JIRA-1234" />
+                        </div>
+                    </div>
+                }
+                else
+                {
+                    <p class="set-note">Chain members get generated external ids so they can name each other.</p>
+                }
+            </aside>
+        </div>
+
+        @if (_fromSuggestionId is null && _templates.Count > 0)
         {
-            <p class="template-message" id="template-message">@_templateMessage</p>
+            <footer class="composer-templates" id="templates">
+                <label for="template-pick">Or queue a task template for this project</label>
+                <select id="template-pick" class="form-control" @bind="_templatePick">
+                    @foreach (var t in _templates)
+                    {
+                        <option value="@t.Name" disabled="@(t.Error is not null)">
+                            @t.Name@(t.CheckCount is { } n ? $" ({n} checks)" : string.Empty)@(t.Error is not null ? " — unavailable" : string.Empty)
+                        </option>
+                    }
+                </select>
+                <button type="button" id="queue-template" class="btn btn-sm"
+                        disabled="@(_submitting || string.IsNullOrWhiteSpace(_projectId.Value) || string.IsNullOrWhiteSpace(_templatePick))"
+                        title="@(string.IsNullOrWhiteSpace(_projectId.Value) ? "Pick a project first" : "Queue the template's items for the selected project")"
+                        @onclick="QueueTemplateAsync">Queue</button>
+                @if (_templateMessage is not null)
+                {
+                    <span class="template-message" id="template-message">@_templateMessage</span>
+                }
+            </footer>
         }
-    </details>
-}
+    }
+</div>
 
 @code {
     [SupplyParameterFromQuery]
@@ -377,9 +373,6 @@ else
     [SupplyParameterFromQuery(Name = "auditBudget")]
     public int? QueryAuditBudget { get; set; }
 
-    [SupplyParameterFromQuery(Name = "mode")]
-    public string? QueryMode { get; set; }
-
     private static readonly IReadOnlyList<(string Value, string Label)> CuratedAgents =
     [
         ("claude", "claude"),
@@ -390,14 +383,18 @@ else
         ("opencode", "opencode"),
     ];
 
+    // ── loaded context ──────────────────────────────────────────────────
     private bool _loaded;
-    private string _mode = "single";
     private List<ProjectDto> _projects = [];
     private List<WorkItemDto> _candidates = [];
     private List<TaskTemplateDto> _templates = [];
     private List<ReleaseDto> _openReleases = [];
     private List<AgentAvailabilityDto> _availableAgents = [];
+    private string? _fromSuggestionId;
+    private SuggestionDto? _fromSuggestionData;
+    private WorkItemDto? _followUpItem;
 
+    // ── inferred settings (value + provenance) ──────────────────────────
     private InferredField<string> _projectId = InferredField<string>.Empty;
     private InferredField<string> _agent = InferredField<string>.Empty;
     private InferredField<string> _baseBranch = InferredField<string>.Empty;
@@ -405,46 +402,85 @@ else
     private InferredField<string> _auditorProfile = InferredField<string>.Empty;
     private InferredField<string> _auditBudgetText = InferredField<string>.Empty;
 
-    private string? _editingChip;
-    private string _chipStaging = "";
-    private string? _chipError;
+    // ── plain settings ──────────────────────────────────────────────────
+    private string _workBranch = "";
+    private bool _pushUpstream = true;
+    private string _releaseId = "";
+    private string _capabilitiesText = "";
+    private string _minModelScoreText = "";
+    private string _auditComplexity = "";
+    private string _priorityText = "";
+    private bool _isRefactor;
+    private string _workTimeoutText = "";
+    private string _mergeTimeoutText = "";
+    private readonly Dictionary<string, string?> _knobSelections = new(StringComparer.Ordinal);
+    private string _extraKnobsText = "";
+    private string _externalId = "";
 
-    private readonly NewItemForm _form = new();
-    private readonly HashSet<string> _selectedDeps = [];
-    private readonly HashSet<string> _chainExternalDeps = [];
+    // ── substance ───────────────────────────────────────────────────────
+    private string _title = "";
+    private bool _titleDerived = true;
+    private string _text = "";
+    private ParsedPlan _parsed = new([], false);
+    private bool? _chainChoice;
+    private readonly List<ComposerOutlineItem> _outline = [];
+    private readonly HashSet<string> _existingDeps = new(StringComparer.Ordinal);
     private string _depSearch = "";
-    private string? _projectError;
+
+    // ── review + filing ─────────────────────────────────────────────────
     private string? _error;
     private bool _submitting;
-    private string? _fromSuggestionId;
-    private SuggestionDto? _fromSuggestionData;
-    private WorkItemDto? _followUpItem;
-
-    private string _planText = "";
-    private string _lastParsedText = "";
-    private string? _previewInfo;
-    private readonly List<PreviewDraft> _preview = [];
-
-    private string _priorityText = "";
-    private string _minModelScoreText = "";
-    private string _requiredCapabilitiesText = "";
-    private string _auditComplexity = "";
-    private string _knobsText = "";
-    private string _releaseId = "";
+    private string _templatePick = "";
     private string? _templateMessage;
 
-    private IReadOnlyList<(string Value, string Label)> AgentOptions =>
-        _availableAgents.Count == 0
-            ? CuratedAgents
-            : _availableAgents
-                .OrderBy(a => a.Excluded)
-                .ThenBy(a => a.Agent, StringComparer.Ordinal)
-                .Select(a => (a.Agent, a.Excluded ? $"{a.Agent} (unavailable)" : a.Agent))
-                .ToList();
+    private string Heading =>
+        _fromSuggestionId is not null ? "Promote suggestion"
+        : _followUpItem is not null ? "Follow-up work"
+        : "New work";
+
+    private bool IsChain => _fromSuggestionId is null && _parsed.Items.Count > 1
+        && (_chainChoice ?? _parsed.Confidence == PlanConfidence.Structured);
+
+    private string EditorPlaceholder => _fromSuggestionId is not null
+        ? "Anything the agent should know beyond the suggestion itself."
+        : "Describe the work. Paste a numbered plan — “1. …”, “## 2. …”, “depends on: 1, 3” — to file a chain in one go.";
+
+    private string FileLabel =>
+        _submitting ? "Filing…"
+        : IsChain ? $"File {_outline.Count} items"
+        : _isRefactor ? "File refactor"
+        : "File";
+
+    /// <summary>
+    /// The agents on offer: the live availability list when there is one,
+    /// else the curated kinds. The inferred or chosen value is always an
+    /// option even when the fleet does not list it right now, so the select
+    /// can show what the request will actually carry.
+    /// </summary>
+    private IReadOnlyList<(string Value, string Label)> AgentOptions
+    {
+        get
+        {
+            var options = _availableAgents.Count == 0
+                ? CuratedAgents.ToList()
+                : _availableAgents
+                    .OrderBy(a => a.Excluded)
+                    .ThenBy(a => a.Agent, StringComparer.Ordinal)
+                    .Select(a => (Value: a.Agent, Label: a.Excluded ? $"{a.Agent} (unavailable)" : a.Agent))
+                    .ToList();
+            if (_agent.Value is { Length: > 0 } current && options.All(o => o.Value != current))
+            {
+                options.Insert(0, (current, $"{current} (not in the fleet list)"));
+            }
+
+            return options;
+        }
+    }
 
     private string ProjectDisplayName(string projectId) =>
         _projects.FirstOrDefault(p => p.Id == projectId)?.DisplayName ?? projectId;
 
+    // ── load + infer ────────────────────────────────────────────────────
     protected override async Task OnInitializedAsync()
     {
         try
@@ -453,23 +489,21 @@ else
             var all = await ApiClient.GetWorkItemsAsync();
             _candidates = all.Where(i => !i.IsTerminal).ToList();
             _templates = await ApiClient.GetTaskTemplatesAsync();
+            _templatePick = _templates.FirstOrDefault(t => t.Error is null)?.Name ?? "";
             _openReleases = await ApiClient.GetReleasesAsync(state: "Open", limit: 100);
             _availableAgents = await ApiClient.GetAgentAvailabilityAsync();
 
             if (!string.IsNullOrEmpty(FromSuggestion))
             {
-                _fromSuggestionId = FromSuggestion;
                 var suggestion = await ApiClient.GetSuggestionAsync(FromSuggestion);
                 if (suggestion is not null)
                 {
+                    _fromSuggestionId = FromSuggestion;
                     _fromSuggestionData = suggestion;
-                    _form.Title = suggestion.Title;
-                    _projectId = _projectId.ApplyInferred(suggestion.ProjectId, ComposerFieldSource.Suggestion);
                 }
                 else
                 {
                     _error = $"Suggestion '{FromSuggestion}' not found.";
-                    _fromSuggestionId = null;
                 }
             }
 
@@ -479,55 +513,18 @@ else
                     ?? await ApiClient.GetWorkItemAsync(QueryFollowUp);
                 if (_followUpItem is not null)
                 {
-                    if (string.IsNullOrWhiteSpace(_projectId.Value))
-                    {
-                        _projectId = _projectId.ApplyInferred(_followUpItem.ProjectId, ComposerFieldSource.FollowUp);
-                    }
-
-                    _selectedDeps.Add(_followUpItem.Id);
-                    _chainExternalDeps.Add(_followUpItem.Id);
+                    _existingDeps.Add(_followUpItem.Id);
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(QueryProjectId)
-                && _projects.Any(p => p.Id == QueryProjectId))
-            {
-                _projectId = _projectId.ApplyInferred(QueryProjectId, ComposerFieldSource.Query);
-            }
+            var recent = all.OrderByDescending(i => i.CreatedAt).FirstOrDefault()?.ProjectId;
+            var project = ComposerInference.ResolveProject(
+                QueryProjectId, _fromSuggestionData?.ProjectId, _followUpItem?.ProjectId, recent,
+                _projects.Select(p => p.Id).ToList());
+            _projectId = _projectId.ApplyInferred(project.Value, project.Source);
 
             ApplyProjectDefaults();
-            if (!string.IsNullOrWhiteSpace(QueryAgent))
-            {
-                _agent = _agent.ApplyInferred(QueryAgent.Trim(), ComposerFieldSource.Query);
-            }
-
-            if (!string.IsNullOrWhiteSpace(QueryBaseBranch))
-            {
-                _baseBranch = _baseBranch.ApplyInferred(QueryBaseBranch.Trim(), ComposerFieldSource.Query);
-            }
-
-            if (!string.IsNullOrWhiteSpace(QueryAgentClassId))
-            {
-                _agentClassId = _agentClassId.ApplyInferred(QueryAgentClassId.Trim(), ComposerFieldSource.Query);
-            }
-
-            if (!string.IsNullOrWhiteSpace(QueryAuditorProfile))
-            {
-                _auditorProfile = _auditorProfile.ApplyInferred(
-                    QueryAuditorProfile.Trim(), ComposerFieldSource.Query);
-            }
-
-            if (QueryAuditBudget is { } budget && budget > 0)
-            {
-                _auditBudgetText = _auditBudgetText.ApplyInferred(
-                    budget.ToString(), ComposerFieldSource.Query);
-            }
-
-            if (string.Equals(QueryMode, "plan", StringComparison.OrdinalIgnoreCase)
-                && _fromSuggestionId is null)
-            {
-                _mode = "plan";
-            }
+            ApplyQueryOverrides();
         }
         catch (Exception ex)
         {
@@ -548,49 +545,78 @@ else
         }
 
         _agent = _agent.ApplyInferred(BlankToNull(project.DefaultAgent), ComposerFieldSource.ProjectDefault);
-        _baseBranch = _baseBranch.ApplyInferred(
-            BlankToNull(project.DefaultBaseBranch), ComposerFieldSource.ProjectDefault);
-        _agentClassId = _agentClassId.ApplyInferred(
-            BlankToNull(project.DefaultAgentClass), ComposerFieldSource.ProjectDefault);
-        if (project.AuditMaxIterations > 0)
+        _baseBranch = _baseBranch.ApplyInferred(BlankToNull(project.DefaultBaseBranch), ComposerFieldSource.ProjectDefault);
+        _agentClassId = _agentClassId.ApplyInferred(BlankToNull(project.DefaultAgentClass), ComposerFieldSource.ProjectDefault);
+        var budget = ComposerInference.ResolveAuditBudget(null, project.AuditMaxIterations);
+        _auditBudgetText = _auditBudgetText.ApplyInferred(budget.Value?.ToString(), budget.Source);
+    }
+
+    private void ApplyQueryOverrides()
+    {
+        if (!string.IsNullOrWhiteSpace(QueryAgent))
         {
-            _auditBudgetText = _auditBudgetText.ApplyInferred(
-                project.AuditMaxIterations.ToString(), ComposerFieldSource.ProjectDefault);
+            _agent = _agent.ApplyInferred(QueryAgent.Trim(), ComposerFieldSource.Query);
+        }
+
+        if (!string.IsNullOrWhiteSpace(QueryBaseBranch))
+        {
+            _baseBranch = _baseBranch.ApplyInferred(QueryBaseBranch.Trim(), ComposerFieldSource.Query);
+        }
+
+        if (!string.IsNullOrWhiteSpace(QueryAgentClassId))
+        {
+            _agentClassId = _agentClassId.ApplyInferred(QueryAgentClassId.Trim(), ComposerFieldSource.Query);
+        }
+
+        if (!string.IsNullOrWhiteSpace(QueryAuditorProfile))
+        {
+            _auditorProfile = _auditorProfile.ApplyInferred(QueryAuditorProfile.Trim(), ComposerFieldSource.Query);
+        }
+
+        if (QueryAuditBudget is { } b && b > 0)
+        {
+            _auditBudgetText = _auditBudgetText.ApplyInferred(b.ToString(), ComposerFieldSource.Query);
         }
     }
 
     private void OnProjectSelected(string? value)
     {
         _projectId = _projectId.SetOperator(BlankToNull(value));
-        _projectError = null;
+        _releaseId = "";
         ApplyProjectDefaults();
+        ApplyQueryOverrides();
     }
 
-    private void OnAgentSelected(string? value) =>
-        _agent = _agent.SetOperator(BlankToNull(value));
-
-    private void OnBaseBranchChanged(string value) =>
-        _baseBranch = _baseBranch.SetOperator(BlankToNull(value));
+    private (string? Value, ComposerFieldSource Source) Inference(string? queryValue, Func<ProjectDto, string?> pick)
+    {
+        var project = _projects.FirstOrDefault(p => p.Id == _projectId.Value);
+        return ComposerInference.ResolveText(queryValue, project is null ? null : pick(project));
+    }
 
     private void ResetAgent()
     {
-        var inference = TextInference(QueryAgent, p => p.DefaultAgent);
-        _agent = _agent.ResetToInferred(inference.Value, inference.Source);
+        var (v, s) = Inference(QueryAgent, p => p.DefaultAgent);
+        _agent = _agent.ResetToInferred(v, s);
     }
 
     private void ResetBaseBranch()
     {
-        var inference = TextInference(QueryBaseBranch, p => p.DefaultBaseBranch);
-        _baseBranch = _baseBranch.ResetToInferred(inference.Value, inference.Source);
+        var (v, s) = Inference(QueryBaseBranch, p => p.DefaultBaseBranch);
+        _baseBranch = _baseBranch.ResetToInferred(v, s);
     }
 
-    private void OnAdvancedAgentClassChanged(string? value)
+    private void ResetAgentClass()
+    {
+        var (v, s) = Inference(QueryAgentClassId, p => p.DefaultAgentClass);
+        _agentClassId = _agentClassId.ResetToInferred(v, s);
+    }
+
+    private void OnAgentClassChanged(string? value)
     {
         var v = BlankToNull(value);
         if (v is null)
         {
-            var inference = TextInference(QueryAgentClassId, p => p.DefaultAgentClass);
-            _agentClassId = _agentClassId.ResetToInferred(inference.Value, inference.Source);
+            ResetAgentClass();
         }
         else
         {
@@ -598,14 +624,19 @@ else
         }
     }
 
-    private void OnAdvancedBudgetChanged(string? value)
+    private void ResetBudget()
+    {
+        var project = _projects.FirstOrDefault(p => p.Id == _projectId.Value);
+        var (v, s) = ComposerInference.ResolveAuditBudget(QueryAuditBudget, project?.AuditMaxIterations ?? 0);
+        _auditBudgetText = _auditBudgetText.ResetToInferred(v?.ToString(), s);
+    }
+
+    private void OnBudgetChanged(string? value)
     {
         var v = BlankToNull(value);
         if (v is null)
         {
-            _auditBudgetText = _auditBudgetText.ResetToInferred(
-                CurrentProjectBudget() ?? (QueryAuditBudget is { } b && b > 0 ? b.ToString() : null),
-                QueryAuditBudget is { } qb && qb > 0 ? ComposerFieldSource.Query : ComposerFieldSource.ProjectDefault);
+            ResetBudget();
         }
         else
         {
@@ -613,531 +644,239 @@ else
         }
     }
 
-    private (string? Value, ComposerFieldSource Source) TextInference(
-        string? queryValue, Func<ProjectDto, string?> pick)
-    {
-        var q = BlankToNull(queryValue);
-        if (q is not null)
-        {
-            return (q, ComposerFieldSource.Query);
-        }
-
-        return (CurrentProjectDefault(pick), ComposerFieldSource.ProjectDefault);
-    }
-
-    private string? CurrentProjectDefault(Func<ProjectDto, string?> pick) =>
-        BlankToNull(_projects.FirstOrDefault(p => p.Id == _projectId.Value) is { } project
-            ? pick(project)
-            : null);
-
-    private void ToggleChipEditor(string key)
-    {
-        _chipError = null;
-        if (_editingChip == key)
-        {
-            _editingChip = null;
-            return;
-        }
-
-        _editingChip = key;
-        _chipStaging = ChipValue(key) ?? string.Empty;
-    }
-
-    private InferredField<string> ChipField(string key) => key switch
-    {
-        "agentclass" => _agentClassId,
-        "budget" => _auditBudgetText,
-        _ => _auditorProfile,
-    };
-
-    private string? ChipValue(string key) => ChipField(key).Value;
-
-    private void SaveChipEditor()
-    {
-        if (_editingChip is null)
-        {
-            return;
-        }
-
-        var staged = BlankToNull(_chipStaging);
-        if (_editingChip == "budget" && staged is not null
-            && (!int.TryParse(staged, out var n) || n <= 0))
-        {
-            _chipError = "Audit budget must be a positive number of iterations.";
-            return;
-        }
-
-        if (_editingChip == "agentclass")
-        {
-            _agentClassId = _agentClassId.SetOperator(staged);
-        }
-        else if (_editingChip == "budget")
-        {
-            _auditBudgetText = _auditBudgetText.SetOperator(staged);
-        }
-        else
-        {
-            _auditorProfile = _auditorProfile.SetOperator(staged);
-        }
-
-        _editingChip = null;
-        _chipError = null;
-    }
-
-    private void ClearChipEditor()
-    {
-        if (_editingChip is null)
-        {
-            return;
-        }
-
-        if (_editingChip == "agentclass")
-        {
-            var inference = TextInference(QueryAgentClassId, p => p.DefaultAgentClass);
-            _agentClassId = _agentClassId.ResetToInferred(inference.Value, inference.Source);
-        }
-        else if (_editingChip == "budget")
-        {
-            _auditBudgetText = _auditBudgetText.ResetToInferred(
-                (QueryAuditBudget is { } b && b > 0 ? b.ToString() : null) ?? CurrentProjectBudget(),
-                QueryAuditBudget is { } qb && qb > 0 ? ComposerFieldSource.Query : ComposerFieldSource.ProjectDefault);
-        }
-        else
-        {
-            _auditorProfile = _auditorProfile.ResetToInferred(
-                BlankToNull(QueryAuditorProfile), ComposerFieldSource.Query);
-        }
-
-        _editingChip = null;
-        _chipError = null;
-    }
-
-    private string? CurrentProjectBudget()
-    {
-        var project = _projects.FirstOrDefault(p => p.Id == _projectId.Value);
-        return project is not null && project.AuditMaxIterations > 0
-            ? project.AuditMaxIterations.ToString()
-            : null;
-    }
-
-    private void CancelChipEditor()
-    {
-        _editingChip = null;
-        _chipError = null;
-    }
-
-    private static string SourceLabel(ComposerFieldSource source) => source switch
+    private static string SourceLabel(InferredField<string> field) => field.Overridden ? "you" : field.Source switch
     {
         ComposerFieldSource.Query => "from link",
         ComposerFieldSource.ProjectDefault => "project default",
         ComposerFieldSource.FollowUp => "follow-up",
         ComposerFieldSource.Suggestion => "suggestion",
+        ComposerFieldSource.Recent => "most recent item",
         ComposerFieldSource.Operator => "you",
-        _ => "not set",
+        _ => string.IsNullOrWhiteSpace(field.Value) ? "not set" : string.Empty,
     };
 
-    private RenderFragment InferenceBadge(ComposerFieldSource source, bool overridden) =>
-        builder =>
-        {
-            builder.OpenElement(0, "span");
-            builder.AddAttribute(1, "class", "infer-badge");
-            builder.AddContent(2, overridden ? "set by you" : SourceLabel(source));
-            builder.CloseElement();
-        };
-
-    private List<DependencyCandidate> OrderedCandidates(IReadOnlySet<string> selected)
+    // ── substance: text → title, structure, outline ─────────────────────
+    private void OnTitleTyped(string value)
     {
-        var query = _depSearch;
-        return DependencyProximity.Order(
-                _candidates
-                    .Where(c => DependencyProximity.Matches(ToCandidate(c), query))
-                    .Select(ToCandidate),
-                _projectId.Value,
-                selected)
-            .ToList();
+        _title = value;
+        _titleDerived = string.IsNullOrWhiteSpace(value);
+        if (_titleDerived)
+        {
+            _title = ComposerInference.DeriveTitle(_text);
+        }
     }
+
+    private void OnTextChanged()
+    {
+        if (_titleDerived)
+        {
+            _title = ComposerInference.DeriveTitle(_text);
+        }
+
+        var before = _parsed.Items.Count;
+        _parsed = PlanChainParser.Parse(_text);
+        if (_parsed.Items.Count != before)
+        {
+            _chainChoice = null;
+        }
+
+        RebuildOutline();
+    }
+
+    /// <summary>
+    /// Re-derives the outline from the parse. Titles and bodies the
+    /// operator edited in the outline survive while the item count is
+    /// unchanged; so do edges, unless the parse now carries explicit ones.
+    /// </summary>
+    private void RebuildOutline()
+    {
+        var items = _parsed.Items;
+        var sameCount = _outline.Count == items.Count;
+        var fresh = new List<ComposerOutlineItem>(items.Count);
+        for (var i = 0; i < items.Count; i++)
+        {
+            var parsed = items[i];
+            var old = sameCount ? _outline[i] : null;
+            var edges = old is not null && !_parsed.HadExplicitEdges ? old.Edges : parsed.DependsOn.ToList();
+            fresh.Add(new ComposerOutlineItem
+            {
+                Title = old is { TitleEdited: true } ? old.Title : parsed.Title,
+                Body = old is { BodyEdited: true } ? old.Body : parsed.Body,
+                TitleEdited = old?.TitleEdited ?? false,
+                BodyEdited = old?.BodyEdited ?? false,
+                Expanded = old?.Expanded ?? false,
+                Edges = edges.ToList(),
+                EdgesText = ChainEdges.Format(edges),
+            });
+        }
+
+        _outline.Clear();
+        _outline.AddRange(fresh);
+    }
+
+    private void SetChain(bool chain) => _chainChoice = chain;
+
+    private Task OnOutlineChanged() => InvokeAsync(StateHasChanged);
+
+    private async Task OnEditorKeyDown(KeyboardEventArgs e)
+    {
+        if ((e.CtrlKey || e.MetaKey) && e.Key == "Enter" && !_submitting)
+        {
+            if (_fromSuggestionId is not null)
+            {
+                await PromoteSuggestionAsync();
+            }
+            else if (Problems.Count == 0)
+            {
+                await FileAsync();
+            }
+        }
+    }
+
+    // ── dependencies ────────────────────────────────────────────────────
+    private List<DependencyCandidate> AllCandidates() => _candidates.Select(ToCandidate).ToList();
+
+    private List<DependencyCandidate> OrderedCandidates() =>
+        DependencyProximity.Order(
+                _candidates.Select(ToCandidate).Where(c => DependencyProximity.Matches(c, _depSearch)),
+                _projectId.Value,
+                _existingDeps)
+            .ToList();
 
     private static DependencyCandidate ToCandidate(WorkItemDto item) =>
         new(item.Id, item.ProjectId, item.Title, item.State, item.CreatedAt, item.ExternalId);
 
-    private void ToggleDep(string id, bool selected)
+    private void ToggleExistingDep(string id, bool selected)
     {
         if (selected)
         {
-            _selectedDeps.Add(id);
+            _existingDeps.Add(id);
         }
         else
         {
-            _selectedDeps.Remove(id);
+            _existingDeps.Remove(id);
         }
     }
 
-    private void ToggleChainExtDep(string id, bool selected)
+    // ── review ──────────────────────────────────────────────────────────
+    private IReadOnlyList<string> Problems => BuildComposition().Problems;
+
+    private string ReviewSentence
     {
-        if (selected)
+        get
         {
-            _chainExternalDeps.Add(id);
-        }
-        else
-        {
-            _chainExternalDeps.Remove(id);
+            var (composition, _) = BuildComposition();
+            return CompositionReview.Describe(
+                composition,
+                _projectId.Value is { } id ? ProjectDisplayName(id) : null,
+                id => _candidates.FirstOrDefault(c => c.Id == id)?.ShortId ?? (id.Length >= 8 ? id[..8] : id));
         }
     }
 
-    private void ParsePlan()
+    /// <summary>
+    /// Everything on the page as one value plus the reasons it cannot be
+    /// filed yet. Field parse errors are problems, not exceptions, so the
+    /// review can list them beside the structural ones.
+    /// </summary>
+    private (Composition Composition, IReadOnlyList<string> Problems) BuildComposition()
     {
-        // Idempotent: re-firing (keyboard + native button activation both
-        // land here) must not wipe preview edits, so a repeated parse of
-        // unchanged text is a no-op.
-        if (_planText == _lastParsedText && _preview.Count > 0)
+        var problems = new List<string>();
+        var (extras, extrasProblem) = KnobCatalog.ParseLines(_extraKnobsText);
+        if (extrasProblem is not null)
         {
-            return;
+            problems.Add(extrasProblem);
         }
 
-        _error = null;
-        try
+        var (knobs, knobProblem) = KnobCatalog.Compose(_knobSelections, extras);
+        if (knobProblem is not null)
         {
-            var parsed = PlanChainParser.Parse(_planText);
-            _preview.Clear();
-            foreach (var item in parsed.Items)
-            {
-                _preview.Add(new PreviewDraft
-                {
-                    Title = item.Title,
-                    Body = item.Body,
-                    Deps = item.DependsOn.ToHashSet(),
-                });
-            }
+            problems.Add(knobProblem);
+        }
 
-            _lastParsedText = _planText;
-            _previewInfo = _preview.Count == 0
-                ? "Nothing to file — paste a plan first."
-                : _preview.Count == 1
-                    ? "Parsed 1 item. Review it below — nothing is created until you file it."
-                    : parsed.HadExplicitEdges
-                        ? $"Parsed {_preview.Count} items with explicit dependencies. Review the edges — nothing is created until you file."
-                        : $"Parsed {_preview.Count} items as a straight-line chain. Adjust the edges if needed — nothing is created until you file.";
-        }
-        catch (Exception ex)
+        var defaults = new ComposerDefaults(
+            ProjectId: _projectId.Value ?? string.Empty,
+            Agent: BlankToNull(_agent.Value),
+            AgentClassId: BlankToNull(_agentClassId.Value),
+            BaseBranch: BlankToNull(_baseBranch.Value),
+            WorkBranch: BlankToNull(_workBranch),
+            PushUpstream: _pushUpstream,
+            Priority: ParseInt(_priorityText, "Priority", problems),
+            MinModelScore: ParseInt(_minModelScoreText, "Min model score", problems),
+            RequiredCapabilities: CapabilityTags.Parse(_capabilitiesText),
+            AuditMaxIterations: ParseInt(_auditBudgetText.Value, "Audit iterations", problems),
+            AuditComplexity: BlankToNull(_auditComplexity),
+            AuditorProfile: BlankToNull(_auditorProfile.Value),
+            Knobs: knobs,
+            ReleaseId: BlankToNull(_releaseId),
+            WorkTimeoutMinutes: ParseInt(_workTimeoutText, "Work timeout", problems),
+            MergeTimeoutMinutes: ParseInt(_mergeTimeoutText, "Merge timeout", problems),
+            IsRefactor: _isRefactor);
+
+        var items = IsChain
+            ? _outline.Select(o => new ChainItemDraft(o.Title.Trim(), o.Body, o.Edges)).ToList()
+            : string.IsNullOrWhiteSpace(_text) && string.IsNullOrWhiteSpace(_title)
+                ? []
+                : [new ChainItemDraft(_title.Trim(), _text, [], BlankToNull(_externalId))];
+
+        var composition = new Composition(defaults, items, _existingDeps.ToList());
+        problems.AddRange(CompositionReview.Validate(composition));
+        if (IsChain)
         {
-            _error = ex.Message;
+            problems.AddRange(_outline
+                .Select((o, i) => o.EdgeProblem is null ? null : $"Item {i + 1}: {o.EdgeProblem}")
+                .Where(p => p is not null)!);
         }
+
+        return (composition, problems);
     }
 
-    private Task ParsePlanKeyDown(KeyboardEventArgs e)
-    {
-        if (e.Key is "Enter" or " ")
-        {
-            ParsePlan();
-        }
-
-        return Task.CompletedTask;
-    }
-
-    private void TogglePreviewDep(int itemIndex, int depNumber, bool selected)
-    {
-        var item = _preview[itemIndex];
-        if (selected)
-        {
-            item.Deps.Add(depNumber);
-        }
-        else
-        {
-            item.Deps.Remove(depNumber);
-        }
-    }
-
-    private void RemovePreviewItem(int index)
-    {
-        var removedNumber = index + 1;
-        _preview.RemoveAt(index);
-        foreach (var item in _preview)
-        {
-            item.Deps.Remove(removedNumber);
-            item.Deps = item.Deps
-                .Select(d => d > removedNumber ? d - 1 : d)
-                .ToHashSet();
-        }
-    }
-
-    private string EdgeSummary(int index)
-    {
-        var item = _preview[index];
-        var parts = new List<string>();
-        if (item.Deps.Count > 0)
-        {
-            parts.Add("chain: " + string.Join(", ", item.Deps.OrderBy(d => d)));
-        }
-
-        if (index == 0 && _chainExternalDeps.Count > 0)
-        {
-            var titles = _chainExternalDeps
-                .Select(id => _candidates.FirstOrDefault(c => c.Id == id))
-                .Where(c => c is not null)
-                .Select(c => c!.ShortId)
-                .ToList();
-            parts.Add("existing: " + (titles.Count > 0 ? string.Join(", ", titles) : $"{_chainExternalDeps.Count} items"));
-        }
-
-        return parts.Count == 0 ? "first in chain" : "waits for " + string.Join("; ", parts);
-    }
-
-    private ComposerDefaults ComposerDefaults() => new(
-        ProjectId: _projectId.Value ?? string.Empty,
-        Agent: BlankToNull(_agent.Value),
-        AgentClassId: BlankToNull(_agentClassId.Value),
-        BaseBranch: BlankToNull(_baseBranch.Value),
-        WorkBranch: BlankToNull(_form.WorkBranch),
-        PushUpstream: _form.PushUpstream,
-        Priority: ParseOptionalInt(_priorityText, "Priority"),
-        MinModelScore: ParseOptionalInt(_minModelScoreText, "Min model score"),
-        RequiredCapabilities: ParseCapabilities(_requiredCapabilitiesText),
-        AuditMaxIterations: ParseBudget(),
-        AuditComplexity: BlankToNull(_auditComplexity),
-        AuditorProfile: BlankToNull(_auditorProfile.Value),
-        Knobs: ParseKnobs(_knobsText),
-        ReleaseId: BlankToNull(_releaseId));
-
-    private int? ParseBudget()
-    {
-        var text = BlankToNull(_auditBudgetText.Value);
-        if (text is null)
-        {
-            return null;
-        }
-
-        if (!int.TryParse(text, out var n) || n <= 0)
-        {
-            throw new FormatException("Audit iterations must be a positive whole number.");
-        }
-
-        return n;
-    }
-
-    private static int? ParseOptionalInt(string text, string fieldName)
+    private static int? ParseInt(string? text, string field, List<string> problems)
     {
         if (string.IsNullOrWhiteSpace(text))
         {
             return null;
         }
 
-        if (!int.TryParse(text.Trim(), out var n))
+        if (int.TryParse(text.Trim(), out var n))
         {
-            throw new FormatException($"{fieldName} must be a whole number.");
+            return n;
         }
 
-        return n;
+        problems.Add($"{field} must be a whole number.");
+        return null;
     }
 
-    private static List<string>? ParseCapabilities(string text)
+    // ── filing ──────────────────────────────────────────────────────────
+    private async Task FileAsync()
     {
-        var tags = text.Split([',', ';', '\n'], StringSplitOptions.RemoveEmptyEntries)
-            .Select(t => t.Trim())
-            .Where(t => t.Length > 0)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        return tags.Count == 0 ? null : tags;
-    }
-
-    private static Dictionary<string, string>? ParseKnobs(string text)
-    {
-        Dictionary<string, string>? knobs = null;
-        foreach (var rawLine in text.Split('\n'))
+        var (composition, problems) = BuildComposition();
+        if (problems.Count > 0)
         {
-            var line = rawLine.Trim();
-            if (line.Length == 0)
-            {
-                continue;
-            }
-
-            var eq = line.IndexOf('=');
-            if (eq <= 0 || eq == line.Length - 1)
-            {
-                throw new FormatException($"Knob line '{line}' must look like key=value.");
-            }
-
-            knobs ??= new Dictionary<string, string>(StringComparer.Ordinal);
-            knobs[line[..eq].Trim()] = line[(eq + 1)..].Trim();
+            _error = problems[0];
+            return;
         }
 
-        return knobs;
-    }
-
-    private RenderFragment AdvancedFields() =>
-        @<div class="advanced-grid">
-            <div class="form-group">
-                <label for="workBranch">Work branch</label>
-                <input id="workBranch" @bind="_form.WorkBranch" class="form-control"
-                       placeholder="(auto-generated)" />
-            </div>
-            <div class="form-group form-check">
-                <input type="checkbox" id="pushUpstream" @bind="_form.PushUpstream" />
-                <label for="pushUpstream">Push upstream after merge</label>
-            </div>
-            <div class="form-group">
-                <label for="priority">Priority</label>
-                <input id="priority" @bind="_priorityText" class="form-control" inputmode="numeric" placeholder="(server default)" />
-            </div>
-            <div class="form-group">
-                <label for="minModelScore">Min model score</label>
-                <input id="minModelScore" @bind="_minModelScoreText" class="form-control" inputmode="numeric" placeholder="(server default)" />
-            </div>
-            <div class="form-group">
-                <label for="agentClass">Agent class</label>
-                <input id="agentClass" value="@(_agentClassId.Value ?? string.Empty)"
-                       @onchange="e => OnAdvancedAgentClassChanged(e.Value?.ToString())"
-                       class="form-control" placeholder="(project default)" />
-            </div>
-            <div class="form-group">
-                <label for="requiredCapabilities">Required capabilities <span class="form-hint">(comma-separated)</span></label>
-                <input id="requiredCapabilities" @bind="_requiredCapabilitiesText" class="form-control" placeholder="e.g. gpu, large-mem" />
-            </div>
-            <div class="form-group">
-                <label for="auditMaxIterations">Audit iterations</label>
-                <input id="auditMaxIterations" value="@(_auditBudgetText.Value ?? string.Empty)"
-                       @onchange="e => OnAdvancedBudgetChanged(e.Value?.ToString())"
-                       class="form-control" inputmode="numeric" placeholder="(project default)" />
-            </div>
-            <div class="form-group">
-                <label for="auditComplexity">Audit complexity</label>
-                <input id="auditComplexity" @bind="_auditComplexity" class="form-control" placeholder="(server default)" />
-            </div>
-            <div class="form-group">
-                <label for="knobs">Knobs <span class="form-hint">(one key=value per line)</span></label>
-                <textarea id="knobs" @bind="_knobsText" class="form-control prompt-input" rows="3"></textarea>
-            </div>
-            <div class="form-group">
-                <label for="release">Release</label>
-                <select id="release" @bind="_releaseId" class="form-control">
-                    <option value="">(none)</option>
-                    @foreach (var r in _openReleases.Where(r => r.ProjectId == _projectId.Value))
-                    {
-                        <option value="@r.Id">@r.Name</option>
-                    }
-                </select>
-            </div>
-        </div>;
-
-    private CreateWorkItemRequest ToRequest(PlannedCreate planned, IEnumerable<string>? extraDependsOn = null) =>
-        new()
-        {
-            ProjectId = planned.ProjectId,
-            ExternalId = planned.ExternalId,
-            Title = planned.Title,
-            Prompt = planned.Prompt,
-            Agent = planned.Agent,
-            AuditorProfile = planned.AuditorProfile,
-            AgentClassId = planned.AgentClassId,
-            BaseBranch = planned.BaseBranch,
-            WorkBranch = planned.WorkBranch,
-            PushUpstream = planned.PushUpstream,
-            Priority = planned.Priority,
-            MinModelScore = planned.MinModelScore,
-            RequiredCapabilities = planned.RequiredCapabilities?.ToList(),
-            AuditMaxIterations = planned.AuditMaxIterations,
-            AuditComplexity = planned.AuditComplexity,
-            Knobs = planned.Knobs is null ? null : new Dictionary<string, string>(planned.Knobs, StringComparer.Ordinal),
-            ReleaseId = planned.ReleaseId,
-            DependsOn = [.. (extraDependsOn ?? []), .. planned.DependsOn],
-        };
-
-    private void HandleInvalidSubmit()
-    {
-        if (string.IsNullOrWhiteSpace(_projectId.Value))
-        {
-            _projectError = "Project is required.";
-        }
-    }
-
-    private async Task SubmitAsync()
-    {
         _submitting = true;
         _error = null;
-        _projectError = null;
         try
         {
-            if (string.IsNullOrWhiteSpace(_projectId.Value))
-            {
-                _projectError = "Project is required.";
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(_form.Title))
-            {
-                _error = "Title is required.";
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(_form.Prompt))
-            {
-                _error = "Prompt is required.";
-                return;
-            }
-
-            var defaults = ComposerDefaults();
             var planned = WorkItemChainBuilder.Build(
-                defaults,
-                [new ChainItemDraft(_form.Title.Trim(), _form.Prompt, [], BlankToNull(_form.ExternalId))],
-                NewChainKey());
-            var created = await ApiClient.CreateWorkItemAsync(ToRequest(planned[0], _selectedDeps));
-            if (created is not null)
+                composition.Defaults, composition.Items, NewChainKey(), composition.ExistingDependsOn);
+            var requests = planned.Select(ToRequest).ToList();
+
+            if (requests.Count == 1)
             {
+                var created = await ApiClient.CreateWorkItemAsync(requests[0]);
+                if (created is null)
+                {
+                    _error = "The orchestrator returned nothing — the item was not created.";
+                    return;
+                }
+
                 Nav.NavigateTo($"/work-items/{created.Id}");
-            }
-            else
-            {
-                _error = "Failed to create work item.";
-            }
-        }
-        catch (FormatException ex)
-        {
-            _error = ex.Message;
-        }
-        catch (Exception ex)
-        {
-            _error = ex.Message;
-        }
-        finally
-        {
-            _submitting = false;
-        }
-    }
-
-    private async Task SubmitChainAsync()
-    {
-        _submitting = true;
-        _error = null;
-        _projectError = null;
-        try
-        {
-            if (string.IsNullOrWhiteSpace(_projectId.Value))
-            {
-                _projectError = "Project is required.";
                 return;
             }
 
-            if (_preview.Count == 0)
-            {
-                _error = "Parse a plan first — there is nothing to file.";
-                return;
-            }
-
-            var empty = _preview.FindIndex(d => string.IsNullOrWhiteSpace(d.Title));
-            if (empty >= 0)
-            {
-                _error = $"Item {empty + 1} needs a title before filing.";
-                return;
-            }
-
-            var defaults = ComposerDefaults();
-            var drafts = _preview
-                .Select(d => new ChainItemDraft(
-                    d.Title.Trim(), d.Body, d.Deps.OrderBy(n => n).ToList()))
-                .ToList();
-            var planned = WorkItemChainBuilder.Build(defaults, drafts, NewChainKey());
-            var requests = planned
-                .Select((p, i) => ToRequest(p, i == 0 ? _chainExternalDeps : null))
-                .ToList();
             var result = await ApiClient.CreateWorkItemChainAsync(requests);
             if (result.Succeeded)
             {
@@ -1149,11 +888,9 @@ else
             _error = result.FailedIndex is null
                 ? $"Chain failed: {result.Error}"
                 : $"Filed {result.Created.Count} of {requests.Count} before item {result.FailedIndex + 1} failed: {result.Error}"
-                  + (result.Created.Count > 0 ? $" Created: {createdIds}. The preview is untouched — fix and re-file the remainder." : string.Empty);
-        }
-        catch (FormatException ex)
-        {
-            _error = ex.Message;
+                  + (result.Created.Count > 0
+                      ? $" Created: {createdIds}. The outline is untouched — remove the filed items and file the remainder."
+                      : string.Empty);
         }
         catch (Exception ex)
         {
@@ -1165,27 +902,83 @@ else
         }
     }
 
-    private async Task SubmitChainKeyDown(KeyboardEventArgs e)
+    private static CreateWorkItemRequest ToRequest(PlannedCreate planned) => new()
     {
-        if ((e.Key is "Enter" or " ") && !_submitting && _preview.Count > 0)
-        {
-            await SubmitChainAsync();
-        }
-    }
+        ProjectId = planned.ProjectId,
+        ExternalId = planned.ExternalId,
+        Title = planned.Title,
+        Prompt = planned.Prompt,
+        Agent = planned.Agent,
+        AuditorProfile = planned.AuditorProfile,
+        AgentClassId = planned.AgentClassId,
+        BaseBranch = planned.BaseBranch,
+        WorkBranch = planned.WorkBranch,
+        PushUpstream = planned.PushUpstream,
+        Priority = planned.Priority,
+        MinModelScore = planned.MinModelScore,
+        RequiredCapabilities = planned.RequiredCapabilities?.ToList(),
+        AuditMaxIterations = planned.AuditMaxIterations,
+        AuditComplexity = planned.AuditComplexity,
+        Knobs = planned.Knobs is null ? null : new Dictionary<string, string>(planned.Knobs, StringComparer.Ordinal),
+        ReleaseId = planned.ReleaseId,
+        DependsOn = planned.DependsOn.ToList(),
+        WorkTimeoutMinutes = planned.WorkTimeoutMinutes,
+        MergeTimeoutMinutes = planned.MergeTimeoutMinutes,
+        IsRefactor = planned.IsRefactor ? true : null,
+    };
 
-    private async Task QueueTemplateAsync(TaskTemplateDto template)
+    private async Task PromoteSuggestionAsync()
     {
         _submitting = true;
-        _templateMessage = null;
         _error = null;
         try
         {
-            if (string.IsNullOrWhiteSpace(_projectId.Value))
+            if (CompositionReview.ExternalIdProblem(_externalId) is { } idProblem)
             {
-                _projectError = "Project is required.";
+                _error = $"External id {idProblem}.";
                 return;
             }
 
+            var workItemId = await ApiClient.PromoteSuggestionAsync(
+                _fromSuggestionId!,
+                extraInstructions: BlankToNull(_text),
+                agent: BlankToNull(_agent.Value),
+                workBranch: BlankToNull(_workBranch),
+                baseBranch: BlankToNull(_baseBranch.Value),
+                pushUpstream: _pushUpstream,
+                agentClassId: BlankToNull(_agentClassId.Value),
+                externalId: BlankToNull(_externalId));
+            if (workItemId is not null)
+            {
+                Nav.NavigateTo($"/work-items/{workItemId}");
+            }
+            else
+            {
+                _error = "Failed to promote suggestion.";
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    private async Task QueueTemplateAsync()
+    {
+        var template = _templates.FirstOrDefault(t => t.Name == _templatePick);
+        if (template is null || string.IsNullOrWhiteSpace(_projectId.Value))
+        {
+            return;
+        }
+
+        _submitting = true;
+        _templateMessage = null;
+        try
+        {
             var response = await ApiClient.QueueTaskTemplateAsync(new QueueTaskTemplateRequest
             {
                 Template = template.Name,
@@ -1207,62 +1000,8 @@ else
         }
     }
 
-    private async Task PromoteSuggestionAsync()
-    {
-        _submitting = true;
-        _error = null;
-        try
-        {
-            var workItemId = await ApiClient.PromoteSuggestionAsync(
-                _fromSuggestionId!,
-                extraInstructions: string.IsNullOrWhiteSpace(_form.Prompt) ? null : _form.Prompt,
-                agent: BlankToNull(_agent.Value),
-                workBranch: string.IsNullOrWhiteSpace(_form.WorkBranch) ? null : _form.WorkBranch,
-                pushUpstream: _form.PushUpstream,
-                externalId: string.IsNullOrWhiteSpace(_form.ExternalId) ? null : _form.ExternalId.Trim());
-            if (workItemId is not null)
-            {
-                Nav.NavigateTo($"/work-items/{workItemId}");
-            }
-            else
-            {
-                _error = "Failed to promote suggestion.";
-            }
-        }
-        catch (Exception ex)
-        {
-            _error = ex.Message;
-        }
-        finally
-        {
-            _submitting = false;
-        }
-    }
-
-    private static string NewChainKey() =>
-        Guid.NewGuid().ToString("N")[..8];
+    private static string NewChainKey() => Guid.NewGuid().ToString("N")[..8];
 
     private static string? BlankToNull(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
-
-    private sealed class PreviewDraft
-    {
-        public string Title { get; set; } = "";
-        public string Body { get; set; } = "";
-        public HashSet<int> Deps { get; set; } = [];
-    }
-
-    private sealed class NewItemForm
-    {
-        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Title is required.")]
-        [System.ComponentModel.DataAnnotations.MaxLength(200, ErrorMessage = "Title must be ≤ 200 chars.")]
-        public string Title { get; set; } = "";
-
-        [System.ComponentModel.DataAnnotations.Required(ErrorMessage = "Prompt is required.")]
-        public string Prompt { get; set; } = "";
-
-        public string? ExternalId { get; set; }
-        public string? WorkBranch { get; set; }
-        public bool PushUpstream { get; set; } = true;
-    }
 }

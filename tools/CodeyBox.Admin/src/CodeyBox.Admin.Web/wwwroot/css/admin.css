@@ -2333,3 +2333,199 @@ summary:focus-visible,
     padding: 0;
     margin-bottom: 1rem;
 }
+
+/* ── Needs-you queue, empty states, notices ──────────────────────────────────
+   Package 5/7 shipped its markup without styles, so these rendered as bare
+   paragraphs. Built on the existing tokens and matched to .card / .error-banner
+   rather than introducing another card idiom. */
+
+.needs-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn);
+    border-radius: var(--radius-m);
+    box-shadow: var(--elev-1);
+    padding: 0.75rem 1rem;
+    margin-bottom: 0.75rem;
+    min-width: 0;
+}
+
+/* An infrastructure failure is not a verdict on the change: colour it as a
+   fault, distinct from an item genuinely awaiting a human decision. */
+.needs-card.needs-infra { border-left-color: var(--danger); }
+.needs-card.needs-rejected { border-left-color: var(--accent); }
+
+.needs-card-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.35rem;
+}
+
+.needs-headline {
+    font-weight: 600;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+.needs-sub {
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    margin-top: 0.15rem;
+    overflow-wrap: anywhere;
+}
+
+/* Ordering key, not a judgement — keep it quiet. */
+.needs-score {
+    margin-left: auto;
+    color: var(--text-faint);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.needs-trend {
+    font-size: 0.75rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: var(--radius-pill, 999px);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    white-space: nowrap;
+}
+
+/* Findings recurring across iterations is the signal that rework is not
+   converging; improving is the opposite. One meaning per hue. */
+.needs-trend--worsening { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+.needs-trend--improving { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.needs-trend--steady { color: var(--text-dim); }
+
+.notice-banner {
+    background: var(--ok-bg);
+    border: 1px solid var(--ok);
+    border-radius: var(--radius-m);
+    padding: 0.6rem 0.9rem;
+    color: var(--ok);
+    margin-bottom: 1rem;
+    max-width: 60rem;
+    overflow-wrap: anywhere;
+}
+
+.empty-state {
+    background: var(--bg-inset);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-m);
+    padding: 1.25rem 1rem;
+    color: var(--text-dim);
+    text-align: center;
+}
+
+.empty-state-title {
+    display: block;
+    color: var(--text);
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+}
+
+.dossier-link {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+}
+
+.dossier-link:hover,
+.dossier-link:focus-visible { border-bottom-color: var(--accent); }
+
+/* Journey convergence banners: the markup emits these three variants and only
+   --stuck / --atbudget / --converged were styled. */
+.journey-banner--converging { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+.journey-banner--cycling { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+.journey-banner--notyetauditing { background: var(--bg-inset); border-color: var(--border); color: var(--text-dim); }
+
+/* Map nodes for terminal/!active items. */
+.map-tone-muted { color: var(--text-faint); }
+
+
+/* ═══ Shell: two tabs over one fleet ════════════════════════════════════════
+   The sidebar is gone. The map is the primary surface and the composer, the
+   needs-you inbox, suggestions and releases all live on it; Queue View is the
+   same fleet as a list. Everything occasional is behind the menu. */
+
+.shell { display: flex; flex-direction: column; min-height: 100vh; background: var(--bg); }
+
+.shell-topbar {
+    display: flex; align-items: center; gap: 1.1rem;
+    padding: 0 1rem; height: 3rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-inset);
+    position: sticky; top: 0; z-index: 20;
+}
+
+.brand { display: inline-flex; align-items: center; gap: 0.5rem; color: var(--text); font-weight: 600; font-size: 0.9rem; flex: none; }
+.brand-mark {
+    display: grid; place-items: center; width: 1.5rem; height: 1.5rem;
+    border-radius: var(--radius-m); background: var(--accent); color: var(--bg);
+    font-size: 0.66rem; font-weight: 700;
+}
+
+/* Tabs are views of one thing, so they sit together and read as a pair. */
+.tabs { display: flex; gap: 0.15rem; }
+.shell-topbar .tab {
+    display: inline-block; padding: 0.3rem 0.75rem;
+    border-radius: var(--radius-m);
+    color: var(--text-dim); text-decoration: none; font-size: 0.86rem;
+    border: 1px solid transparent;
+}
+.shell-topbar .tab:hover { background: var(--bg-hover); color: var(--text); }
+.shell-topbar .tab.active {
+    background: var(--bg-active); color: var(--text);
+    border-color: var(--border-strong); font-weight: 600;
+}
+
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; }
+
+.menu { position: relative; }
+.menu > summary {
+    list-style: none; cursor: pointer; user-select: none;
+    padding: 0.2rem 0.5rem; border-radius: var(--radius-m);
+    color: var(--text-dim); font-size: 1rem; line-height: 1.3;
+}
+.menu > summary::-webkit-details-marker { display: none; }
+.menu > summary:hover { background: var(--bg-hover); color: var(--text); }
+.menu[open] > summary { background: var(--bg-active); color: var(--text); }
+
+.menu-pop {
+    position: absolute; right: 0; top: calc(100% + 0.35rem);
+    min-width: 13rem; padding: 0.35rem;
+    background: var(--bg-card); border: 1px solid var(--border-strong);
+    border-radius: var(--radius-m); box-shadow: var(--elev-2, 0 8px 24px rgba(0,0,0,0.35));
+    display: flex; flex-direction: column; z-index: 30;
+}
+.menu-pop a {
+    display: flex; align-items: center; gap: 0.4rem;
+    padding: 0.32rem 0.5rem; border-radius: var(--radius-m);
+    color: var(--text-dim); text-decoration: none; font-size: 0.84rem;
+}
+.menu-pop a:hover { background: var(--bg-hover); color: var(--text); }
+.menu-pop a .nav-badge { margin-left: auto; }
+.menu-section {
+    color: var(--text-faint); font-size: 0.62rem; letter-spacing: 0.09em;
+    text-transform: uppercase; padding: 0.5rem 0.5rem 0.2rem;
+}
+.menu-section:first-child { padding-top: 0.2rem; }
+
+.who {
+    display: grid; place-items: center; width: 1.6rem; height: 1.6rem;
+    border-radius: 999px; background: var(--bg-active); border: 1px solid var(--border-strong);
+    color: var(--text-dim); font-size: 0.62rem; font-weight: 700;
+}
+
+.shell-main { flex: 1 1 auto; padding: 1.1rem 1.25rem 2rem; min-width: 0; }
+/* The map takes the whole viewport; list pages keep their padding. */
+.shell-main--bleed { padding: 0; display: flex; min-height: 0; }
+.shell-main--bleed > * { flex: 1 1 auto; min-width: 0; }
+
+@media (max-width: 40rem) {
+    .shell-topbar { gap: 0.6rem; padding: 0 0.6rem; }
+    .brand span:not(.brand-mark) { display: none; }
+}

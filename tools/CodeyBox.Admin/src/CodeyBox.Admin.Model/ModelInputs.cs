@@ -32,6 +32,12 @@ public sealed record AdminWorkItem
     /// </summary>
     public int AttemptCount { get; init; }
 
+    /// <summary>Position in the orchestrator's queue (lower starts first); ties in the forecast break on it.</summary>
+    public long QueuePosition { get; init; }
+
+    /// <summary>Release this item belongs to, when it was filed into one; null otherwise.</summary>
+    public string? ReleaseId { get; init; }
+
     /// <summary>
     /// Orchestrator-computed gate bit. Only consulted for dependency ids that
     /// are absent from the snapshot (e.g. a filtered view); ids present in
@@ -61,7 +67,7 @@ public sealed record AdminAgentStatus
     public string? UnavailableReason { get; init; }
 
     /// <summary>Remaining quota 0–100, when the quota surface reported it.</summary>
-    public int? QuotaAvailablePct { get; init; }
+    public double? QuotaAvailablePct { get; init; }
 
     public DateTimeOffset? QuotaResetAt { get; init; }
 }

@@ -22,7 +22,24 @@ public static class FleetMapSnapshotMapper
         QuotaReportDto? quota,
         ConcurrencyDto? concurrency,
         WorkersStatusDto? workersFallback,
-        DateTimeOffset now)
+        DateTimeOffset now) =>
+        ToSnapshot(items, pausedAgents, quota, concurrency, workersFallback, now, terminal: null);
+
+    /// <summary>
+    /// As above, but terminal items are admitted by <paramref name="terminal"/>
+    /// (<see cref="TerminalVisibility"/>): settled work stays while something
+    /// in flight builds on it or while inside the operator's horizon, and
+    /// failures that need a decision always stay. Null keeps the legacy
+    /// behaviour of dropping every terminal item.
+    /// </summary>
+    public static FleetSnapshot ToSnapshot(
+        IReadOnlyList<WorkItemDto>? items,
+        IReadOnlyList<AgentPauseStateDto>? pausedAgents,
+        QuotaReportDto? quota,
+        ConcurrencyDto? concurrency,
+        WorkersStatusDto? workersFallback,
+        DateTimeOffset now,
+        TerminalVisibilityOptions? terminal)
     {
         var mapped = new List<AdminWorkItem>();
         if (items is not null)
@@ -33,7 +50,7 @@ public static class FleetMapSnapshotMapper
                 {
                     continue;
                 }
-                if (ItemStates.IsTerminal(item.State))
+                if (terminal is null && ItemStates.IsTerminal(item.State))
                 {
                     continue;
                 }
@@ -51,6 +68,8 @@ public static class FleetMapSnapshotMapper
                         .Take(64)
                         .ToList(),
                     DependsOnSatisfied = item.DependsOnSatisfied,
+                    ReleaseId = string.IsNullOrWhiteSpace(item.ReleaseId) ? null : item.ReleaseId,
+                    QueuePosition = item.QueuePosition,
                     AttemptCount = Math.Max(item.AuditIterations ?? 0, item.UpstreamPushAttempts),
                 });
                 if (mapped.Count >= FleetSnapshot.MaxItems)
@@ -63,7 +82,7 @@ public static class FleetMapSnapshotMapper
         return new FleetSnapshot
         {
             Now = now,
-            Items = mapped,
+            Items = terminal is null ? mapped : TerminalVisibility.Filter(mapped, now, terminal),
             Agents = ToAgentStatuses(pausedAgents, quota),
             Workers = ToWorkerCapacity(concurrency, workersFallback),
         };

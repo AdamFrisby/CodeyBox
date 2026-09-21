@@ -30,6 +30,8 @@ public sealed class WorkItemDto
     public long QueuePosition { get; set; }
     public int Priority { get; set; }
     public string? ReplayOfWorkItemId { get; set; }
+    /// <summary>Release the item was filed into (the list response surfaces <c>releaseId</c>); null when none.</summary>
+    public string? ReleaseId { get; set; }
     public string? AgentClassId { get; set; }
     public int? AuditIterations { get; set; }
     public int? FinalAuditBlockingFindings { get; set; }

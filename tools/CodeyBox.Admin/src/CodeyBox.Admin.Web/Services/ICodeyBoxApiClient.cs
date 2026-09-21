@@ -150,6 +150,13 @@ public interface ICodeyBoxApiClient
         string? projectId = null, string? category = null, string? severity = null,
         CancellationToken ct = default);
     Task<int> GetSuggestionsCountAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Every open suggestion, up to <paramref name="limit"/> (the API pages at
+    /// 200 by default and caps a page at 500). The map draws these as ghosts.
+    /// </summary>
+    Task<List<SuggestionDto>> GetOpenSuggestionsAsync(int limit = 500, CancellationToken ct = default)
+        => GetSuggestionsAsync(ct: ct);
     Task<SuggestionDto?> GetSuggestionAsync(string id, CancellationToken ct = default);
     Task<SuggestionDto?> DismissSuggestionAsync(string id, string? reason = null, CancellationToken ct = default);
     Task<string?> PromoteSuggestionAsync(

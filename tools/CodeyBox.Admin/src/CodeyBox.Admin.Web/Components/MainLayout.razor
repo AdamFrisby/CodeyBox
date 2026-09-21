@@ -1,50 +1,98 @@
 @inherits LayoutComponentBase
 @inject ICodeyBoxApiClient ApiClient
 @inject ILogger<MainLayout> Logger
+@inject NavigationManager Nav
 
-<div class="admin-layout">
-    <nav class="admin-nav">
-        <span class="admin-nav-brand">CodeyBox Admin</span>
-        <NavLink href="/" Match="NavLinkMatch.All">Queue</NavLink>
-        <NavLink href="/needs-attention">Needs you</NavLink>
-        <NavLink href="/work-items/new">+ New Item</NavLink>
-        <NavLink href="/projects/setup">Setup</NavLink>
-        <NavLink href="/fleet">Fleet</NavLink>
-        <NavLink href="/map">Map</NavLink>
-        <NavLink href="/supervision">Supervision</NavLink>
-        <NavLink href="/suggestions">
-            <span>Suggestions</span>
-            @if (_openCount > 0)
-            {
-                <span class="nav-badge">@_openCount</span>
-            }
-        </NavLink>
-        <NavLink href="/plugins">Plugins</NavLink>
-        <NavLink href="/statistics">Statistics</NavLink>
-        <NavLink href="/capacity">Capacity</NavLink>
-        <NavLink href="/releases">
-            <span>Releases</span>
-            @if (_openReleasesCount > 0)
-            {
-                <span class="nav-badge">@_openReleasesCount</span>
-            }
-        </NavLink>
-        <AuthorizeView>
-            <Authorized Context="authenticationState">
-                <span class="admin-nav-user" title="@UserLabel(authenticationState.User)">
-                    Signed in as @UserLabel(authenticationState.User)
-                </span>
-            </Authorized>
-        </AuthorizeView>
-        <button type="button" class="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle light / dark theme"
-                onclick="var d=document.documentElement;var n=d.getAttribute('data-theme')==='light'?'dark':'light';if(n==='dark'){d.removeAttribute('data-theme');}else{d.setAttribute('data-theme','light');}try{localStorage.setItem('cb-theme',n);}catch(e){}">◐</button>
-    </nav>
-    <main class="admin-main">
+@* Two tabs over one fleet. The map is the primary surface: the composer lives on
+   it as (+), the needs-you inbox is its attention rail, suggestions are ghost
+   nodes and releases are containers. Queue View is the same fleet as a list.
+   Everything genuinely occasional is behind the menu — present, not shouting. *@
+<div class="shell">
+    <header class="shell-topbar">
+        <span class="brand"><span class="brand-mark">CB</span>CodeyBox</span>
+
+        <nav class="tabs" aria-label="Views">
+            <NavLink class="tab" href="/map" Match="NavLinkMatch.All">Map view</NavLink>
+            <NavLink class="tab" href="/queue">Queue view</NavLink>
+        </nav>
+
+        <div class="topbar-right">
+            <details class="menu">
+                <summary aria-label="More">☰</summary>
+                <div class="menu-pop">
+                    <span class="menu-section">Fleet</span>
+                    <a href="/overview">Overview</a>
+                    <a href="/fleet">Agents</a>
+                    <a href="/capacity">Capacity</a>
+                    <a href="/statistics">Statistics</a>
+                    <a href="/supervision">Supervision</a>
+
+                    <span class="menu-section">Work</span>
+                    <a href="/needs-attention">Needs you</a>
+                    <a href="/work-items/new">New item</a>
+                    <a href="/suggestions">Suggestions @if (_openCount > 0) { <span class="nav-badge">@_openCount</span> }</a>
+                    <a href="/releases">Releases @if (_openReleasesCount > 0) { <span class="nav-badge">@_openReleasesCount</span> }</a>
+
+                    <span class="menu-section">Setup</span>
+                    <a href="/projects/setup">Project setup</a>
+                    <a href="/plugins">Plugins</a>
+                    <a href="/timings/aggregate">Aggregate timings</a>
+                </div>
+            </details>
+
+            <AuthorizeView>
+                <Authorized Context="auth">
+                    <span class="who" title="@UserLabel(auth.User)">@Initials(UserLabel(auth.User))</span>
+                </Authorized>
+            </AuthorizeView>
+
+            <button type="button" class="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle light / dark theme"
+                    onclick="var d=document.documentElement;var n=d.getAttribute('data-theme')==='light'?'dark':'light';if(n==='dark'){d.removeAttribute('data-theme');}else{d.setAttribute('data-theme','light');}try{localStorage.setItem('cb-theme',n);}catch(e){}">◐</button>
+        </div>
+    </header>
+
+    <main class="shell-main @(IsMap() ? "shell-main--bleed" : "")">
         @Body
     </main>
 </div>
 
 @code {
+    // The map wants the whole viewport; list pages want padding.
+    private bool IsMap() =>
+        new Uri(Nav.Uri).AbsolutePath.TrimEnd('/').Equals("/map", StringComparison.OrdinalIgnoreCase);
+
+    private string CurrentCrumb()
+    {
+        var path = new Uri(Nav.Uri).AbsolutePath.Trim('/');
+        if (string.IsNullOrEmpty(path)) return "Queue";
+        var first = path.Split('/')[0];
+        return first switch
+        {
+            "needs-attention" => "Needs you",
+            "map" => "Fleet map",
+            "work-items" => "Work item",
+            "projects" => "Setup",
+            "fleet" => "Agents",
+            _ => char.ToUpperInvariant(first[0]) + first[1..].Replace('-', ' '),
+        };
+    }
+
+    private string ApiHost()
+    {
+        try { return new Uri(Nav.BaseUri).Authority; }
+        catch { return "localhost"; }
+    }
+
+    private static string Initials(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return "?";
+        var cleaned = label.Split('@')[0];
+        var parts = cleaned.Split('.', '-', '_', ' ');
+        var a = parts.Length > 0 && parts[0].Length > 0 ? parts[0][0] : '?';
+        var b = parts.Length > 1 && parts[1].Length > 0 ? parts[1][0] : ' ';
+        return (char.ToUpperInvariant(a).ToString() + (b == ' ' ? "" : char.ToUpperInvariant(b).ToString()));
+    }
+
     private int _openCount;
     private int _openReleasesCount;
 
