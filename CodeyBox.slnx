@@ -55,14 +55,14 @@
     <Project Path="src/CodeyBox.Notifications/CodeyBox.Notifications.csproj" />
   </Folder>
   <Folder Name="/plugins/">
-    <Project Path="plugins/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
-    <Project Path="plugins/CodeyBox.DotnetTestRunnerPlugin/CodeyBox.DotnetTestRunnerPlugin.csproj" />
-    <Project Path="plugins/CodeyBox.OpencodeGoQuotaPlugin/CodeyBox.OpencodeGoQuotaPlugin.csproj" />
-    <Project Path="plugins/CodeyBox.QuotaResetNotifier/CodeyBox.QuotaResetNotifier.csproj" />
-    <Project Path="plugins/CodeyBox.StatisticsPlugin/CodeyBox.StatisticsPlugin.csproj" />
-    <Project Path="plugins/CodeyBox.LinearWorkSyncPlugin/CodeyBox.LinearWorkSyncPlugin.csproj" />
-    <Project Path="plugins/CodeyBox.PlaneWorkSyncPlugin/CodeyBox.PlaneWorkSyncPlugin.csproj" />
-    <Project Path="plugins/CodeyBox.InfisicalPlugin/CodeyBox.InfisicalPlugin.csproj" />
+    <Project Path="plugins/auditors-architecture/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <Project Path="plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/CodeyBox.DotnetTestRunnerPlugin.csproj" />
+    <Project Path="plugins/quota/CodeyBox.OpencodeGoQuotaPlugin/CodeyBox.OpencodeGoQuotaPlugin.csproj" />
+    <Project Path="plugins/quota/CodeyBox.QuotaResetNotifier/CodeyBox.QuotaResetNotifier.csproj" />
+    <Project Path="plugins/quota/CodeyBox.StatisticsPlugin/CodeyBox.StatisticsPlugin.csproj" />
+    <Project Path="plugins/work-sync/CodeyBox.LinearWorkSyncPlugin/CodeyBox.LinearWorkSyncPlugin.csproj" />
+    <Project Path="plugins/work-sync/CodeyBox.PlaneWorkSyncPlugin/CodeyBox.PlaneWorkSyncPlugin.csproj" />
+    <Project Path="plugins/credentials/CodeyBox.InfisicalPlugin/CodeyBox.InfisicalPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />

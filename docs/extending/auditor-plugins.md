@@ -247,7 +247,7 @@ GET /plugins/status
 Test execution is a specialised plugin shape: `ITestRunnerAuditor`
 (`CodeyBox.Core`) owns invocation building, test-universe enumeration, and
 result classification for one framework. The bundled `dotnet test` runner and
-a pytest reference stub ship in `plugins/CodeyBox.DotnetTestRunnerPlugin/`.
+a pytest reference stub ship in `plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/`.
 See [`docs/extending/test-runner-plugins.md`](test-runner-plugins.md) for the
 packaging, the peer-runner recipe, and the bundling caveat.
 

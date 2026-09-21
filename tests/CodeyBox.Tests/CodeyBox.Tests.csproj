@@ -48,14 +48,14 @@
     <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.DotnetTestRunnerPlugin\CodeyBox.DotnetTestRunnerPlugin.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.LinearWorkSyncPlugin\CodeyBox.LinearWorkSyncPlugin.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.PlaneWorkSyncPlugin\CodeyBox.PlaneWorkSyncPlugin.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.InfisicalPlugin\CodeyBox.InfisicalPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-architecture\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\quota\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\quota\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\quota\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
+    <ProjectReference Include="..\..\plugins\test-runners\CodeyBox.DotnetTestRunnerPlugin\CodeyBox.DotnetTestRunnerPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.LinearWorkSyncPlugin\CodeyBox.LinearWorkSyncPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.PlaneWorkSyncPlugin\CodeyBox.PlaneWorkSyncPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\credentials\CodeyBox.InfisicalPlugin\CodeyBox.InfisicalPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--
       Build dependency only: ensures CodeyBox.PluginSdk.SampleTests is compiled

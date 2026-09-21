@@ -11,8 +11,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
-    <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
   </ItemGroup>
 
   <ItemGroup>

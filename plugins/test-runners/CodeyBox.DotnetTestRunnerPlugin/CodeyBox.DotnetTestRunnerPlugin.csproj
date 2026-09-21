@@ -7,8 +7,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
-    <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
     <!--
       Execution reuse: the runner delegates each run to ShellCommandAuditor so
       the tool-presence probe, missing-tool handling and result classification
@@ -16,7 +16,7 @@
       the plugin load-context boundary; the shell copy is an implementation
       detail of this first-party package (see DotnetTestRunnerPlugin remarks).
     -->
-    <ProjectReference Include="..\..\src\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
   </ItemGroup>
 
 </Project>
