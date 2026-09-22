@@ -267,10 +267,18 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
             throw new TaskTemplateLoadException($"{prefix}.onYes.prompt is required");
         if (onYes.Prompt.Length > 64 * 1024)
             throw new TaskTemplateLoadException($"{prefix}.onYes.prompt must be <= 64KB");
-        if (onYes.AgentClassId is { Length: > 200 })
-            throw new TaskTemplateLoadException($"{prefix}.onYes.agentClassId must be <= 200 chars");
-        if (onYes.DependsOn is { Length: > 100 })
-            throw new TaskTemplateLoadException($"{prefix}.onYes.dependsOn must contain at most 100 entries");
+        string? onYesAgentClassId = null;
+        if (!string.IsNullOrWhiteSpace(onYes.AgentClassId))
+        {
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(
+                onYes.AgentClassId, $"{prefix}.onYes.agentClassId");
+            if (classIdError is not null)
+                throw new TaskTemplateLoadException(classIdError);
+            onYesAgentClassId = normalizedClassId;
+        }
+        if (WorkItemFieldRules.CheckDependsOnCount(
+                onYes.DependsOn?.Length ?? 0, $"{prefix}.onYes.dependsOn") is { } dependsOnCountError)
+            throw new TaskTemplateLoadException(dependsOnCountError);
         if (onYes.DependsOn is not null && onYes.DependsOn.Any(string.IsNullOrWhiteSpace))
             throw new TaskTemplateLoadException($"{prefix}.onYes.dependsOn must not contain empty entries");
 
@@ -296,7 +304,7 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
                 Title = onYes.Title.Trim(),
                 Prompt = onYes.Prompt,
                 Agent = string.IsNullOrWhiteSpace(onYes.Agent) ? null : onYes.Agent.Trim(),
-                AgentClassId = string.IsNullOrWhiteSpace(onYes.AgentClassId) ? null : onYes.AgentClassId.Trim(),
+                AgentClassId = onYesAgentClassId,
                 DependsOn = onYes.DependsOn is null
                     ? null
                     : onYes.DependsOn.Select(d => d.Trim()).ToArray(),

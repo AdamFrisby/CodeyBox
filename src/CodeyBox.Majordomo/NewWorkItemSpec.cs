@@ -59,11 +59,8 @@ public sealed record NewWorkItemSpec
     {
         var checkedBase = WorkItemFieldValidation.Branch(baseBranch, nameof(baseBranch));
         var checkedWork = WorkItemFieldValidation.Branch(workBranch, nameof(workBranch));
-        if (checkedBase is not null && checkedWork is not null
-            && string.Equals(checkedBase, checkedWork, StringComparison.Ordinal))
-        {
-            throw new ArgumentException("workBranch must differ from baseBranch", nameof(workBranch));
-        }
+        if (WorkItemFieldRules.CheckDistinctBranches(checkedBase, checkedWork) is { } branchError)
+            throw new ArgumentException(branchError, nameof(workBranch));
 
         ProjectId = projectId;
         Title = WorkItemFieldValidation.Title(title);
@@ -134,7 +131,10 @@ public sealed record NewWorkItemSpec
 
     /// <summary>
     /// Existing work items that must reach a terminal state before this item
-    /// is dispatched. Immutable after creation; empty when unset.
+    /// is dispatched. The spec's list is a get-only copy taken at
+    /// construction; empty when unset. The stored item's dependency set can
+    /// later be replaced via <c>update_work_item</c> while the item is
+    /// non-terminal.
     /// </summary>
     public IReadOnlyList<WorkItemId> DependsOn { get; }
 

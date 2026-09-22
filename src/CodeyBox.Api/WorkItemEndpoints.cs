@@ -776,9 +776,10 @@ internal static class WorkItemEndpoints
 
         if (!string.IsNullOrWhiteSpace(body?.AgentClassId))
         {
-            if (body.AgentClassId.Length > WorkItemLimits.MaxAgentClassIdLength)
-                return Results.BadRequest(new { error = $"agentClassId must be <= {WorkItemLimits.MaxAgentClassIdLength} chars" });
-            agentClassOverride = body.AgentClassId.Trim();
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(body.AgentClassId);
+            if (classIdError is not null)
+                return Results.BadRequest(new { error = classIdError });
+            agentClassOverride = normalizedClassId;
             agentOverride = null; // class routing takes precedence
         }
 
@@ -796,9 +797,8 @@ internal static class WorkItemEndpoints
             try { Validation.ValidateBranchName(body.WorkBranch, nameof(body.WorkBranch)); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
 
-            if (source.BaseBranch is not null &&
-                string.Equals(body.WorkBranch, source.BaseBranch, StringComparison.Ordinal))
-                return Results.BadRequest(new { error = "workBranch must differ from baseBranch" });
+            if (WorkItemFieldRules.CheckDistinctBranches(source.BaseBranch, body.WorkBranch) is { } branchError)
+                return Results.BadRequest(new { error = branchError });
 
             workBranch = body.WorkBranch;
         }
@@ -946,13 +946,8 @@ internal static class WorkItemEndpoints
         // Validate optional close-out metadata. Same shape as /resume's reason
         // guard (no control chars, ≤500 chars); resolutionSha is a Git-shaped
         // hex SHA so triage tooling can link the manual-resolution commit.
-        if (reason is not null)
-        {
-            if (reason.Any(char.IsControl))
-                return Results.BadRequest(new { error = "reason must not contain control characters" });
-            if (reason.Length > AgentPauseValidation.MaxReasonLength)
-                return Results.BadRequest(new { error = $"reason must be <= {AgentPauseValidation.MaxReasonLength} chars" });
-        }
+        if (AgentPauseValidation.ValidateOptionalReason(reason, "reason") is { } reasonError)
+            return Results.BadRequest(new { error = reasonError });
         if (resolutionSha is not null)
         {
             if (resolutionSha.Length is < 7 or > 40
@@ -1231,13 +1226,8 @@ internal static class WorkItemEndpoints
         if (err is not null) return err;
 
         var reason = body?.Reason;
-        if (reason is not null)
-        {
-            if (reason.Any(char.IsControl))
-                return Results.BadRequest(new { error = "reason must not contain control characters" });
-            if (reason.Length > AgentPauseValidation.MaxReasonLength)
-                return Results.BadRequest(new { error = $"reason must be <= {AgentPauseValidation.MaxReasonLength} chars" });
-        }
+        if (AgentPauseValidation.ValidateOptionalReason(reason, "reason") is { } reasonError)
+            return Results.BadRequest(new { error = reasonError });
 
         var outcome = await retrier.ResumeAsync(item!, body?.From ?? "work", reason, ct);
 
@@ -1945,14 +1935,17 @@ internal static class WorkItemEndpoints
 
         foreach (var (ns, value) in body.ExternalIds)
         {
-            try { Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{ns}'"); }
+            // ns is untrusted input echoed into the error field label — strip
+            // control characters and bound it before interpolating.
+            var nsLabel = Validation.DescribeUntrustedValue(ns);
+            try { Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{nsLabel}'"); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
             if (value is null)
             {
                 resulting.Remove(ns);
                 continue;
             }
-            try { Validation.ValidateExternalId(value, $"externalIds['{ns}']"); }
+            try { Validation.ValidateExternalId(value, $"externalIds['{nsLabel}']"); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
             resulting[ns] = value;
         }
@@ -2216,13 +2209,8 @@ internal static class WorkItemEndpoints
     /// </summary>
     private static IResult? ValidateQueueReason(string? reason)
     {
-        if (string.IsNullOrWhiteSpace(reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (reason.Any(char.IsControl))
-            return Results.BadRequest(new { error = "reason must not contain control characters" });
-        if (reason.Length > MaxQueueReasonLength)
-            return Results.BadRequest(new { error = $"reason must be <= {MaxQueueReasonLength} chars" });
-        return null;
+        var error = AgentPauseValidation.ValidateRequiredReason(reason, "reason");
+        return error is null ? null : Results.BadRequest(new { error });
     }
 
     private static async Task<IResult> PauseQueueAsync(

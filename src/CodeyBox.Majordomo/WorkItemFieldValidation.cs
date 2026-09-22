@@ -12,16 +12,16 @@ namespace CodeyBox.Majordomo;
 internal static class WorkItemFieldValidation
 {
     internal static string Title(string? value)
-        => OrThrow(WorkItemFieldRules.NormalizeTitle(value), nameof(value))!;
+        => OrThrow(WorkItemFieldRules.NormalizeTitle(value), "title")!;
 
     internal static string Prompt(string? value)
-        => OrThrow(WorkItemFieldRules.NormalizePrompt(value), nameof(value))!;
+        => OrThrow(WorkItemFieldRules.NormalizePrompt(value), "prompt")!;
 
     internal static string? AgentClassId(string? value)
-        => OrThrow(WorkItemFieldRules.NormalizeAgentClassId(value), nameof(value));
+        => OrThrow(WorkItemFieldRules.NormalizeAgentClassId(value), "agentClassId");
 
     internal static string? AuditorProfile(string? value)
-        => OrThrow(WorkItemFieldRules.NormalizeAuditorProfile(value), nameof(value));
+        => OrThrow(WorkItemFieldRules.NormalizeAuditorProfile(value), "auditorProfile");
 
     internal static string? Branch(string? value, string fieldName)
     {
@@ -31,41 +31,41 @@ internal static class WorkItemFieldValidation
     }
 
     internal static int Priority(int value)
-        => OrThrowRange(WorkItemFieldRules.CheckPriorityBounds(value), value, nameof(value));
+        => OrThrowRange(WorkItemFieldRules.CheckPriorityBounds(value), value, "priority");
 
     internal static int MinModelScore(int value)
-        => OrThrowRange(WorkItemFieldRules.CheckMinModelScore(value), value, nameof(value));
+        => OrThrowRange(WorkItemFieldRules.CheckMinModelScore(value), value, "minModelScore");
 
     internal static TimeSpan WorkTimeout(TimeSpan value)
-        => OrThrowRange(WorkItemFieldRules.CheckWorkTimeout(value), value, nameof(value));
+        => OrThrowRange(WorkItemFieldRules.CheckWorkTimeout(value), value, "workTimeout");
 
     internal static TimeSpan MergeTimeout(TimeSpan value)
-        => OrThrowRange(WorkItemFieldRules.CheckMergeTimeout(value), value, nameof(value));
+        => OrThrowRange(WorkItemFieldRules.CheckMergeTimeout(value), value, "mergeTimeout");
 
     internal static int AuditMaxIterations(int value)
-        => OrThrowRange(WorkItemFieldRules.CheckAuditMaxIterations(value), value, nameof(value));
+        => OrThrowRange(WorkItemFieldRules.CheckAuditMaxIterations(value), value, "auditMaxIterations");
 
     internal static string? AuditComplexity(string? value)
-        => OrThrow(WorkItemFieldRules.NormalizeAuditComplexity(value), nameof(value));
+        => OrThrow(WorkItemFieldRules.NormalizeAuditComplexity(value), "auditComplexity");
 
     internal static IReadOnlyList<string> RequiredCapabilities(IReadOnlyList<string>? value)
-        => OrThrow(WorkItemFieldRules.NormalizeRequiredCapabilities(value), nameof(value))!;
+        => OrThrow(WorkItemFieldRules.NormalizeRequiredCapabilities(value), "requiredCapabilities")!;
 
     internal static IReadOnlyList<WorkItemId> DependsOn(IReadOnlyList<WorkItemId>? value)
     {
         if (value is null) return [];
         if (WorkItemFieldRules.CheckDependsOnCount(value.Count) is { } error)
-            throw new ArgumentException(error, nameof(value));
+            throw new ArgumentException(error, "dependsOn");
         return [.. value];
     }
 
     internal static IReadOnlyDictionary<string, string> ExternalIds(
         IReadOnlyDictionary<string, string>? value)
-        => OrThrow(WorkItemFieldRules.NormalizeExternalIds(value), nameof(value))!;
+        => OrThrow(WorkItemFieldRules.NormalizeExternalIds(value), "externalIds")!;
 
     internal static IReadOnlyDictionary<string, string> Knobs(
         IReadOnlyDictionary<string, string>? value)
-        => OrThrow(WorkItemFieldRules.NormalizeKnobOverrides(value), nameof(value))!;
+        => OrThrow(WorkItemFieldRules.NormalizeKnobOverrides(value), "knobs")!;
 
     private static T? OrThrow<T>((T? Value, string? Error) result, string paramName)
         => result.Error is null

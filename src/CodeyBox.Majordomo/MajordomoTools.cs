@@ -1,5 +1,6 @@
 using System.Collections.Frozen;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 
 namespace CodeyBox.Majordomo;
 
@@ -120,14 +121,14 @@ public static class MajordomoTools
     /// case-folding, or whitespace tolerance — anything that is not a
     /// canonical name returns false.
     /// </summary>
-    public static bool TryGet(string? name, out MajordomoTool tool)
+    public static bool TryGet(string? name, [MaybeNullWhen(false)] out MajordomoTool tool)
     {
         if (name is not null && ByName.TryGetValue(name, out var found))
         {
             tool = found;
             return true;
         }
-        tool = null!;
+        tool = null;
         return false;
     }
 }

@@ -10,7 +10,7 @@ namespace CodeyBox.Majordomo;
 /// stored list/map.
 ///
 /// A patch with no changes is unrepresentable: the constructor throws when
-/// every field is null, so the model cannot emit a no-op edit.
+/// every field normalises to null, so the model cannot emit a no-op edit.
 /// </summary>
 public sealed record WorkItemPatch
 {
@@ -30,15 +30,6 @@ public sealed record WorkItemPatch
         IReadOnlyDictionary<string, string>? externalIds = null,
         IReadOnlyDictionary<string, string>? knobs = null)
     {
-        if (title is null && prompt is null && agent is null && agentClassId is null
-            && priority is null && workTimeout is null && mergeTimeout is null
-            && minModelScore is null && auditMaxIterations is null && auditComplexity is null
-            && requiredCapabilities is null && dependsOn is null && externalIds is null
-            && knobs is null)
-        {
-            throw new ArgumentException("patch must change at least one field");
-        }
-
         Title = title is null ? null : WorkItemFieldValidation.Title(title);
         Prompt = prompt is null ? null : WorkItemFieldValidation.Prompt(prompt);
         Agent = agent;
@@ -55,6 +46,19 @@ public sealed record WorkItemPatch
         DependsOn = dependsOn is null ? null : WorkItemFieldValidation.DependsOn(dependsOn);
         ExternalIds = externalIds is null ? null : WorkItemFieldValidation.ExternalIds(externalIds);
         Knobs = knobs is null ? null : WorkItemFieldValidation.Knobs(knobs);
+
+        // The no-change guard runs on the NORMALISED properties: an input
+        // that normalises away (a whitespace auditComplexity) is not a
+        // change, so a patch carrying only that is still unrepresentable.
+        // Keep this list in sync with the properties above.
+        if (Title is null && Prompt is null && Agent is null && AgentClassId is null
+            && Priority is null && WorkTimeout is null && MergeTimeout is null
+            && MinModelScore is null && AuditMaxIterations is null && AuditComplexity is null
+            && RequiredCapabilities is null && DependsOn is null && ExternalIds is null
+            && Knobs is null)
+        {
+            throw new ArgumentException("patch must change at least one field");
+        }
     }
 
     /// <summary>New title; null = unchanged.</summary>
@@ -84,7 +88,11 @@ public sealed record WorkItemPatch
     /// <summary>New audit iteration cap; null = unchanged.</summary>
     public int? AuditMaxIterations { get; }
 
-    /// <summary>New audit complexity label; null = unchanged.</summary>
+    /// <summary>
+    /// New audit complexity label; null = unchanged. A whitespace input
+    /// normalises to null — unchanged, not cleared — matching the REST PATCH
+    /// where the same input is a no-op write.
+    /// </summary>
     public string? AuditComplexity { get; }
 
     /// <summary>Replace-set required capabilities; null = unchanged, empty = clear.</summary>

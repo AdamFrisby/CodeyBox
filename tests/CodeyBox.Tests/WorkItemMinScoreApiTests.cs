@@ -253,7 +253,7 @@ public sealed class WorkItemMinScoreApiTests : IDisposable
     [Fact]
     public async Task Create_RequiredCapabilities_TooManyEntries_Returns400()
     {
-        // NormaliseRequiredCapabilities caps at 16 entries.
+        // WorkItemFieldRules.NormalizeRequiredCapabilities caps at 16 entries.
         var tags = Enumerable.Range(0, 17).Select(i => $"tag-{i}").ToArray();
         var resp = await _client.PostAsJsonAsync("/workitems", new
         {

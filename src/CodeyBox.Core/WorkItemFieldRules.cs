@@ -94,7 +94,7 @@ public static class WorkItemFieldRules
             var tag = entry?.Trim();
             if (string.IsNullOrEmpty(tag)) continue;
             if (tag.Length > WorkItemLimits.MaxCapabilityLength)
-                return (null, $"{field} entry '{tag}' exceeds {WorkItemLimits.MaxCapabilityLength} chars");
+                return (null, $"{field} entry '{Validation.DescribeUntrustedValue(tag)}' exceeds {WorkItemLimits.MaxCapabilityLength} chars");
             if (tag.Any(char.IsControl))
                 return (null, $"{field} entries must not contain control characters");
             if (seen.Add(tag)) result.Add(tag);
@@ -127,11 +127,14 @@ public static class WorkItemFieldRules
             return (null, $"{field} may contain at most {WorkItemLimits.MaxExternalIds} entries per work item");
         foreach (var (ns, id) in value)
         {
-            if (CheckExternalIdNamespace(ns, $"{field} key '{ns}'") is { } nsError)
+            // The namespace is untrusted input echoed into the error label —
+            // strip control characters and bound it before interpolating.
+            var nsLabel = Validation.DescribeUntrustedValue(ns);
+            if (CheckExternalIdNamespace(ns, $"{field} key '{nsLabel}'") is { } nsError)
                 return (null, nsError);
             if (id is null)
-                return (null, $"{field}['{ns}'] must not be null");
-            if (CheckExternalId(id, $"{field}['{ns}']") is { } idError)
+                return (null, $"{field}['{nsLabel}'] must not be null");
+            if (CheckExternalId(id, $"{field}['{nsLabel}']") is { } idError)
                 return (null, idError);
             copy[ns] = id;
         }
@@ -173,10 +176,10 @@ public static class WorkItemFieldRules
     /// Shape rules for one knob-override entry: non-empty bounded key without
     /// control characters, non-null bounded value without control characters.
     /// </summary>
-    public static string? CheckKnobOverrideEntry(string? key, string? knobValue, string field = "knobs")
+    private static string? CheckKnobOverrideEntry(string? key, string? knobValue, string field = "knobs")
     {
         if (string.IsNullOrWhiteSpace(key))
-            return "knob key must not be empty";
+            return $"{field} key must not be empty";
         if (key.Length > WorkItemLimits.MaxKnobKeyLength || key.Any(char.IsControl))
             return $"{field} keys must be <= {WorkItemLimits.MaxKnobKeyLength} chars with no control characters";
         if (knobValue is null)
@@ -265,36 +268,19 @@ public static class WorkItemFieldRules
     }
 
     private static string? CheckNoOptionLikeOrControl(string value, string field)
-    {
-        try
-        {
-            Validation.ValidateNoOptionLikeOrControl(value, field);
-            return null;
-        }
-        catch (ArgumentException ex)
-        {
-            return ex.Message;
-        }
-    }
+        => CaptureValidationError(() => Validation.ValidateNoOptionLikeOrControl(value, field));
 
     private static string? CheckExternalIdNamespace(string value, string field)
-    {
-        try
-        {
-            Validation.ValidateExternalIdNamespace(value, field);
-            return null;
-        }
-        catch (ArgumentException ex)
-        {
-            return ex.Message;
-        }
-    }
+        => CaptureValidationError(() => Validation.ValidateExternalIdNamespace(value, field));
 
     private static string? CheckExternalId(string value, string field)
+        => CaptureValidationError(() => Validation.ValidateExternalId(value, field));
+
+    private static string? CaptureValidationError(Action check)
     {
         try
         {
-            Validation.ValidateExternalId(value, field);
+            check();
             return null;
         }
         catch (ArgumentException ex)

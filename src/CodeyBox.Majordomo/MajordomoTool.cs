@@ -18,6 +18,26 @@ public sealed record MajordomoTool
         Type resultType,
         string description)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        if (!typeof(MajordomoToolArgs).IsAssignableFrom(argumentsType))
+            throw new ArgumentException(
+                $"argumentsType {argumentsType?.Name ?? "<null>"} must derive from MajordomoToolArgs",
+                nameof(argumentsType));
+        if (!typeof(MajordomoToolResult).IsAssignableFrom(resultType))
+            throw new ArgumentException(
+                $"resultType {resultType?.Name ?? "<null>"} must derive from MajordomoToolResult",
+                nameof(resultType));
+        // The gate-relevant fact "is this tool a mutation" has one source of
+        // truth: the argument contract. A Read label on mutate args (or vice
+        // versa) would bypass or break the authorization layer, so a
+        // disagreeing pair cannot be constructed.
+        var carriesMutateContract = typeof(MajordomoMutateArgs).IsAssignableFrom(argumentsType);
+        if (carriesMutateContract != (classification == MajordomoToolClass.Mutate))
+            throw new ArgumentException(
+                $"classification {classification} disagrees with arguments type {argumentsType.Name}: " +
+                "a tool is a mutation iff its arguments derive from MajordomoMutateArgs",
+                nameof(classification));
+
         Name = name;
         Class = classification;
         ArgumentsType = argumentsType;

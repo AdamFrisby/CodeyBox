@@ -337,6 +337,20 @@ public sealed class SuggestionsApiTests : IDisposable
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
 
+    [Fact]
+    public async Task PromoteSuggestion_AgentClassIdWithControlCharacters_Returns400()
+    {
+        // Same field rule as create/PATCH/replay: control characters are
+        // rejected rather than stored onto the promoted work item.
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/suggestions/{s.Id}/promote",
+            new { agentClassId = "worker-class\u001b" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     // ── Local response shapes ─────────────────────────────────────────────────
 
     private sealed record CountResponse(int Count);

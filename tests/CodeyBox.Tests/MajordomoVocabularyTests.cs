@@ -194,6 +194,55 @@ public sealed class MajordomoVocabularyTests
     }
 
     [Fact]
+    public void Patch_WhoseOnlyFieldNormalisesAway_IsUnrepresentable()
+    {
+        // A whitespace auditComplexity normalises to null — "unchanged", not
+        // "clear" — so a patch carrying only that input is still a no-op and
+        // must fail at the contract.
+        Assert.Throws<ArgumentException>(() => new WorkItemPatch(auditComplexity: "   "));
+    }
+
+    [Fact]
+    public void ToolDescriptor_ClassMustMatchTheArgumentContract()
+    {
+        // A READ label on mutate args would bypass the authorization gate; a
+        // MUTATE label on read args would crash it. Neither pair constructs.
+        Assert.Throws<ArgumentException>(() => new MajordomoTool(
+            "bad_read", MajordomoToolClass.Read,
+            typeof(CancelWorkItemArgs), typeof(MajordomoChangeSet), "d"));
+        Assert.Throws<ArgumentException>(() => new MajordomoTool(
+            "bad_mutate", MajordomoToolClass.Mutate,
+            typeof(GetWorkItemArgs), typeof(WorkItemDetailResult), "d"));
+        Assert.Throws<ArgumentException>(() => new MajordomoTool(
+            "bad_args", MajordomoToolClass.Read,
+            typeof(string), typeof(QueueStatusResult), "d"));
+        Assert.Throws<ArgumentException>(() => new MajordomoTool(
+            "bad_result", MajordomoToolClass.Read,
+            typeof(GetQueueStatusArgs), typeof(string), "d"));
+    }
+
+    [Fact]
+    public void Spec_TitleRejectsEveryControlCharacter()
+    {
+        // Not just CR/LF/NUL: ESC and friends are rejected so a model-authored
+        // title cannot carry terminal escapes into the UI or logs.
+        Assert.Throws<ArgumentException>(() =>
+            new NewWorkItemSpec(new ProjectId("demo"), "title\u001b[31m", "prompt"));
+        Assert.Throws<ArgumentException>(() =>
+            new NewWorkItemSpec(new ProjectId("demo"), "ti\ttle", "prompt"));
+    }
+
+    [Fact]
+    public void Spec_ErrorsNeverEchoRawControlCharactersOrUnboundedInput()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            new NewWorkItemSpec(new ProjectId("demo"), "t", "p",
+                workBranch: "ok\u001b[31m" + new string('a', 500)));
+        Assert.DoesNotContain(ex.Message, c => char.IsControl(c));
+        Assert.True(ex.Message.Length < 300, $"error echo was not bounded: {ex.Message.Length} chars");
+    }
+
+    [Fact]
     public void Patch_ExternalIds_FollowReplaceSetSemantics()
     {
         var patch = new WorkItemPatch(externalIds: new Dictionary<string, string>

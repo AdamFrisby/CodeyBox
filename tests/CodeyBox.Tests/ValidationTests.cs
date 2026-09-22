@@ -88,4 +88,46 @@ public sealed class ValidationTests
     [InlineData("https://bar.local/hook")]
     public void RejectedWebhookUrls(string url)
         => Assert.Throws<ArgumentException>(() => Validation.ValidateWebhookUrl(url, "url"));
+
+    // ValidateNoOptionLikeOrControl — every control character is rejected,
+    // not only the CR/LF/NUL subset.
+    [Theory]
+    [InlineData("title\u001b")]   // ESC — terminal escape lead-in
+    [InlineData("ti\ttle")]       // tab
+    [InlineData("ti\u0007le")]    // BEL
+    [InlineData("ti\u000ble")]    // VT
+    public void NoOptionLikeOrControl_RejectsAllControlCharacters(string value)
+        => Assert.Throws<ArgumentException>(() => Validation.ValidateNoOptionLikeOrControl(value, "field"));
+
+    // DescribeUntrustedValue — the echo rendered into caller-presentable
+    // messages can never carry terminal escapes or unbounded input.
+    [Fact]
+    public void DescribeUntrustedValue_StripsControlCharactersAndTruncates()
+    {
+        Assert.Equal("abc[31mdef", Validation.DescribeUntrustedValue("abc\u001b[31mdef\0"));
+        Assert.Equal("<null>", Validation.DescribeUntrustedValue(null));
+
+        var rendered = Validation.DescribeUntrustedValue(
+            new string('x', Validation.MaxEchoedValueLength + 100));
+        Assert.Equal(Validation.MaxEchoedValueLength + 1, rendered.Length);
+        Assert.EndsWith("…", rendered);
+    }
+
+    [Fact]
+    public void RejectedBranchName_ErrorEchoIsBoundedAndControlFree()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            Validation.ValidateBranchName("ok" + new string('a', 500) + "\u001b[31m", "branch"));
+        Assert.DoesNotContain(ex.Message, c => char.IsControl(c));
+        Assert.True(ex.Message.Length < 300, $"error echo was not bounded: {ex.Message.Length} chars");
+    }
+
+    [Fact]
+    public void InvalidExternalIdNamespace_ErrorEchoIsBoundedAndControlFree()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            Validation.ValidateExternalIdNamespace(new string('n', 300) + "\u001b", "field"));
+        Assert.DoesNotContain(ex.Message, c => char.IsControl(c));
+        Assert.True(ex.Message.Length < 400, $"error echo was not bounded: {ex.Message.Length} chars");
+    }
 }

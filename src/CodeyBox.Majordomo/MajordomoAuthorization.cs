@@ -1,3 +1,5 @@
+using CodeyBox.Core;
+
 namespace CodeyBox.Majordomo;
 
 /// <summary>
@@ -62,7 +64,16 @@ public static class MajordomoAuthorization
         if (tool.Class == MajordomoToolClass.Read)
             return new MajordomoDecision.Execute(tool);
 
-        var mutate = (MajordomoMutateArgs)arguments;
+        // Fail closed on a mis-declared tool: a Mutate descriptor whose
+        // arguments type does not carry the mutate contract (DryRun /
+        // AffectedItemCount) is refused rather than crashing on a cast.
+        if (arguments is not MajordomoMutateArgs mutate)
+        {
+            return new MajordomoDecision.Refuse(
+                MajordomoRefusalReason.ArgumentContractMismatch,
+                $"tool '{tool.Name}' is a mutation but its arguments type " +
+                $"{tool.ArgumentsType.Name} does not derive from MajordomoMutateArgs");
+        }
 
         // A dry-run emits the would-be change set without mutating: it is
         // never a mutation and never consumes turn budget, in either mode.
@@ -94,25 +105,11 @@ public static class MajordomoAuthorization
             : new MajordomoDecision.Propose(new MajordomoProposal(tool, mutate));
     }
 
-    /// <summary>Largest slice of an untrusted tool name echoed into a refusal detail.</summary>
-    private const int MaxEchoedToolNameLength = 128;
-
     /// <summary>
     /// Renders an untrusted tool name for an operator/model-facing detail
     /// string: control characters are stripped and the value is truncated, so
     /// terminal escapes and unbounded echoes cannot ride the refusal.
     /// </summary>
     private static string DescribeToolName(string? toolName)
-    {
-        if (toolName is null)
-            return "<null>";
-        var truncated = toolName.Length > MaxEchoedToolNameLength;
-        var builder = new System.Text.StringBuilder(MaxEchoedToolNameLength);
-        foreach (var c in toolName.AsSpan(0, Math.Min(toolName.Length, MaxEchoedToolNameLength)))
-        {
-            if (!char.IsControl(c)) builder.Append(c);
-        }
-        if (truncated) builder.Append('…');
-        return builder.ToString();
-    }
+        => Validation.DescribeUntrustedValue(toolName);
 }

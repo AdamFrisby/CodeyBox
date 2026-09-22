@@ -130,6 +130,17 @@ internal static class SuggestionEndpoints
             agentOverride = kind;
         }
 
+        // Same field rule as every other queue-facing entry point: trim,
+        // bound, reject control characters.
+        string? agentClassId = null;
+        if (!string.IsNullOrWhiteSpace(body?.AgentClassId))
+        {
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(body.AgentClassId);
+            if (classIdError is not null)
+                return Results.BadRequest(new { error = classIdError });
+            agentClassId = normalizedClassId;
+        }
+
         var workBranch = body?.WorkBranch;
         if (workBranch is not null)
         {
@@ -201,7 +212,7 @@ internal static class SuggestionEndpoints
             BaseBranch = baseBranch,
             WorkBranch = workBranch,
             PushUpstream = body?.PushUpstream ?? true,
-            AgentClassId = body?.AgentClassId,
+            AgentClassId = agentClassId,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
             ExternalIds = externalId is null
                 ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)

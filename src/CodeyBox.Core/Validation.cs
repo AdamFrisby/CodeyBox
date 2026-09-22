@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace CodeyBox.Core;
@@ -47,7 +48,7 @@ public static partial class Validation
         if (name.AsSpan().IndexOfAny(['\n', '\r', '\0', '~', '^', ':', '?', '*', '[', '\\']) >= 0)
             throw new ArgumentException($"{fieldName} contains characters invalid in a git refname", fieldName);
         if (!TagNameRegex().IsMatch(name))
-            throw new ArgumentException($"{fieldName} '{name}' is not a valid tag name", fieldName);
+            throw new ArgumentException($"{fieldName} '{DescribeUntrustedValue(name)}' is not a valid tag name", fieldName);
     }
 
     /// <summary>
@@ -69,7 +70,7 @@ public static partial class Validation
         if (name.EndsWith(".lock", StringComparison.Ordinal))
             throw new ArgumentException($"{fieldName} must not end with '.lock'", fieldName);
         if (!BranchNameRegex().IsMatch(name))
-            throw new ArgumentException($"{fieldName} '{name}' is not a valid branch name", fieldName);
+            throw new ArgumentException($"{fieldName} '{DescribeUntrustedValue(name)}' is not a valid branch name", fieldName);
     }
 
     public static void ValidateCommitSha(string sha, string fieldName)
@@ -77,7 +78,7 @@ public static partial class Validation
         if (string.IsNullOrWhiteSpace(sha))
             throw new ArgumentException($"{fieldName} must not be empty", fieldName);
         if (!CommitShaRegex().IsMatch(sha))
-            throw new ArgumentException($"{fieldName} '{sha}' is not a valid commit sha", fieldName);
+            throw new ArgumentException($"{fieldName} '{DescribeUntrustedValue(sha)}' is not a valid commit sha", fieldName);
     }
 
     public static void ValidateRepositoryUrl(string url, string fieldName)
@@ -142,7 +143,7 @@ public static partial class Validation
                 {
                     if (IsRestrictedAddress(addr))
                         throw new ArgumentException(
-                            $"{fieldName} hostname '{host}' resolves to a private or reserved address", fieldName);
+                            $"{fieldName} hostname '{DescribeUntrustedValue(host)}' resolves to a private or reserved address", fieldName);
                 }
             }
             catch (ArgumentException)
@@ -232,7 +233,7 @@ public static partial class Validation
             throw new ArgumentException($"{fieldName} must not be empty", fieldName);
         if (!ExternalIdNamespaceRegex().IsMatch(value))
             throw new ArgumentException(
-                $"{fieldName} '{value}' must be 1–32 lowercase alphanumeric characters or dashes, starting with a letter or digit",
+                $"{fieldName} '{DescribeUntrustedValue(value)}' must be 1–32 lowercase alphanumeric characters or dashes, starting with a letter or digit",
                 fieldName);
     }
 
@@ -268,7 +269,34 @@ public static partial class Validation
         if (value is null) throw new ArgumentNullException(fieldName);
         if (value.StartsWith('-'))
             throw new ArgumentException($"{fieldName} must not start with '-'", fieldName);
-        if (value.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+        if (value.Any(char.IsControl))
             throw new ArgumentException($"{fieldName} must not contain control characters", fieldName);
+    }
+
+    /// <summary>
+    /// Largest slice of an untrusted value echoed into a caller-presentable
+    /// validation message.
+    /// </summary>
+    public const int MaxEchoedValueLength = 128;
+
+    /// <summary>
+    /// Renders an untrusted value for a caller-presentable error or detail
+    /// string: control characters are stripped and the value is truncated, so
+    /// terminal escapes and unbounded echoes cannot ride the message.
+    /// </summary>
+    public static string DescribeUntrustedValue(string? value)
+    {
+        if (value is null)
+            return "<null>";
+        var truncated = value.Length > MaxEchoedValueLength;
+        var builder = new StringBuilder(Math.Min(value.Length, MaxEchoedValueLength) + 1);
+        foreach (var c in value.AsSpan(0, Math.Min(value.Length, MaxEchoedValueLength)))
+        {
+            if (!char.IsControl(c))
+                builder.Append(c);
+        }
+        if (truncated)
+            builder.Append('…');
+        return builder.ToString();
     }
 }
