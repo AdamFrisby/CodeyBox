@@ -11,10 +11,10 @@ throwaway VM, reviews the result, resolves merge conflicts, and lands the change
 on your branch (and on GitHub, if you point it there). You stay in the loop for
 product decisions; it handles the delivery grind.
 
-It drives a *fleet* of agent CLIs — Claude Code, OpenAI Codex, GitHub Copilot,
-Cursor, Gemini, opencode, Antigravity, CrockCode — and routes each task to
-whichever one is best and available, falling back automatically when a provider
-hits a rate limit. No coding agent ever runs on your host: every model call that
+It drives a *fleet* of two dozen agent CLIs — Claude Code, OpenAI Codex, GitHub
+Copilot, Cursor, Devin, Gemini, opencode, Aider, Goose and more — and routes
+each task to whichever one is best and available, falling back automatically
+when a provider hits a rate limit. No coding agent ever runs on your host: every model call that
 touches a repository happens through an agent CLI inside a sandbox.
 
 Every agent is boxed in a real VM behind a host-enforced firewall, because the
@@ -384,22 +384,23 @@ items); `--json` / `--quiet` make every command pipe-friendly.
 
 ## The agent fleet
 
-| Agent          | Add a new one by implementing `IAgentRunner` in… |
-|----------------|--------------------------------------------------|
-| Claude Code    | `CodeyBox.Agents.Claude`                         |
-| OpenAI Codex   | `CodeyBox.Agents.Codex`                          |
-| GitHub Copilot | `CodeyBox.Agents.Copilot`                        |
-| Cursor         | `CodeyBox.Agents.Cursor`                         |
-| Gemini         | `CodeyBox.Agents.Gemini`                         |
-| opencode       | `CodeyBox.Agents.Opencode`                       |
-| Antigravity    | `CodeyBox.Agents.Antigravity`                    |
-| CrockCode      | `CodeyBox.Agents.Crock`                          |
+Twenty-four agent CLIs are supported today:
+
+`claude` · `codex` · `copilot` · `cursor` · `devin` · `gemini` · `opencode` ·
+`antigravity` · `crock` · `aider` · `goose` · `pi` · `prime` · `autohand` ·
+`vibe` · `cline` · `kilo` · `omp` · `continue` · `qwen` · `cmd` · `crush` ·
+`caveman` · `dotnet-opencode`
+
+Each lives in `src/CodeyBox.Agents.<Name>` and implements `IAgentRunner` — a
+subclass of `CliAgentRunnerBase` that builds one non-interactive invocation.
+Adding another is that class, a credential mapping, an install line in the
+sandbox baseline, and two smoke probes.
 
 Agents are interchangeable. A class lists members with quality scores; the router
 prefers the highest-scoring one that's within quota and under its concurrency
-cap. Every fallback is recorded in the commit trailer. Aider, Goose, or anything
-else is just a new `IAgentRunner` — see
-[`docs/concepts/agents.md`](docs/concepts/agents.md).
+cap. Every fallback is recorded in the commit trailer. See
+[`docs/concepts/agents.md`](docs/concepts/agents.md) for each agent's auth, its
+sandbox install command, and its known quirks.
 
 ## Host platform support
 
