@@ -215,7 +215,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// sandbox-provisioning deferrals propagate unwrapped. The scan path uses
     /// this; <see cref="VerifyToolAsync"/> overrides use it for precondition
     /// probes. <paramref name="operation"/> names the invocation in failure
-    /// messages (e.g. "scan", "version check").
+    /// messages (e.g. "scan", "version check"). <paramref name="timeout"/>
+    /// must be a positive finite duration — <see cref="TimeSpan.Zero"/> would
+    /// fire immediately and <see cref="Timeout.InfiniteTimeSpan"/> would
+    /// silently disable the bound.
     /// </summary>
     protected static async Task<SandboxExecResult> ExecToolBoundedAsync(
         ISandbox sandbox,
@@ -443,9 +446,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private static string Tail(string text, int maxChars)
         => text.Length <= maxChars ? text : text[^maxChars..];
 
-    /// <summary>Flattens tool output to a single line for failure messages.</summary>
+    /// <summary>
+    /// Flattens tool output to a single line for failure messages. Every
+    /// control character — newlines, tabs, ESC and other terminal escape
+    /// bytes — becomes a space so untrusted tool output cannot inject
+    /// sequences into logged messages or persisted failure reasons.
+    /// </summary>
     protected static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+    {
+        var builder = new StringBuilder(message.Length);
+        foreach (var c in message)
+            builder.Append(char.IsControl(c) ? ' ' : c);
+        return builder.ToString().Trim();
+    }
 
     private static string FormatTimeout(TimeSpan timeout)
         => timeout.TotalMinutes >= 1

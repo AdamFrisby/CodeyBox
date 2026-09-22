@@ -149,8 +149,10 @@ public sealed class GitleaksAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
-            if (IsSuppressionProbe(exec))
-                return Task.FromResult(new SandboxExecResult(1, "", "")); // file present
+            if (IsWorktreeSuppressionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(1, ".gitleaksignore\n", "")); // file present
+            if (IsHistorySuppressionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
         });
@@ -160,6 +162,62 @@ public sealed class GitleaksAuditorTests
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains(".gitleaksignore", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            GitleaksAuditor.TrustRepositorySuppressionKey, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task RepoGitleaksToml_FailsClosed_ScanNeverRuns()
+    {
+        // gitleaks exempts its own config path from the scan, so a
+        // repo-root .gitleaks.toml is gated exactly like .gitleaksignore.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsWorktreeSuppressionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(1, ".gitleaks.toml\n", "")); // file present
+            if (IsHistorySuppressionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new GitleaksAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains(".gitleaks.toml", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            GitleaksAuditor.TrustRepositorySuppressionKey, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task RepoGitleaksTomlInHistory_FailsClosed_ScanNeverRuns()
+    {
+        // The config-path exemption covers every commit: a .gitleaks.toml
+        // committed and then deleted still hides any secret it contained, so
+        // the gate checks git history, not just the worktree.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsWorktreeSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsHistorySuppressionProbe(exec))
+                return Task.FromResult(
+                    new SandboxExecResult(0, "0123456789abcdef0123456789abcdef01234567\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new GitleaksAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains(".gitleaks.toml", ex.Message, StringComparison.Ordinal);
         Assert.Contains(
             GitleaksAuditor.TrustRepositorySuppressionKey, ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
@@ -457,6 +515,76 @@ public sealed class GitleaksAuditorTests
         }
     }
 
+    /// <summary>
+    /// Real-binary check for the config-path exemption: a secret committed
+    /// inside <c>.gitleaks.toml</c> and then deleted survives in git history
+    /// while gitleaks exempts that path from scanning in every commit. With
+    /// the operator opt-in the scan runs and reports nothing — proving the
+    /// exemption is real — and by default the gate fails closed instead.
+    /// </summary>
+    [Fact]
+    [Trait("requires_gitleaks", "true")]
+    public async Task RealGitleaks_GitleaksTomlDeletedFromHistory_EvadesScan_GateFailsClosed()
+    {
+        var installed = _installedGitleaksVersion;
+        if (installed is null)
+            return;
+
+        var repo = await SeedFixtureRepoAsync(null);
+        try
+        {
+            var tomlPath = Path.Combine(repo, ".gitleaks.toml");
+            await File.WriteAllTextAsync(
+                tomlPath, "[extend]\nuseDefault = true\n\n# " + _fixtureSecretLine + "\n");
+            await TestSupport.RunGit(repo, "add", "-A");
+            await TestSupport.RunGit(repo, "commit", "-m", "add gitleaks config");
+            File.Delete(tomlPath);
+            await TestSupport.RunGit(repo, "add", "-A");
+            await TestSupport.RunGit(repo, "commit", "-m", "drop gitleaks config");
+
+            var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+            await using var sandbox = await provider.CreateAsync(
+                new SandboxSpec
+                {
+                    ImageReference = "ignored",
+                    WorkingDirectory = "/work",
+                    Mounts = [new SandboxMount { SandboxPath = "/work", HostPath = repo }],
+                },
+                CancellationToken.None);
+
+            var auditor = new GitleaksAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                }),
+                CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+                () => ((IAuditor)auditor).RunAsync(
+                    sandbox, "/work", FakeContext(), CancellationToken.None));
+            Assert.Contains(".gitleaks.toml", ex.Message, StringComparison.Ordinal);
+
+            var trusting = new GitleaksAuditor();
+            await trusting.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                    ["Scoped:" + GitleaksAuditor.TrustRepositorySuppressionKey] = "true",
+                }),
+                CancellationToken.None);
+            var trusted = await ((IAuditor)trusting).RunAsync(
+                sandbox, "/work", FakeContext(), CancellationToken.None);
+
+            Assert.True(trusted.Passed);
+            Assert.Empty(trusted.Findings);
+        }
+        finally
+        {
+            TryDeleteDirectory(repo);
+        }
+    }
+
     [Fact]
     public void DisabledPlugin_IsNotLoaded_AndToolAbsentFromBaselineProvisioning()
     {
@@ -553,10 +681,19 @@ public sealed class GitleaksAuditorTests
             && exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private static bool IsSuppressionProbe(SandboxExec exec)
-        => exec.Argv.Count == 3
+        => IsWorktreeSuppressionProbe(exec) || IsHistorySuppressionProbe(exec);
+
+    private static bool IsWorktreeSuppressionProbe(SandboxExec exec)
+        => exec.Argv.Count >= 3
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"
-            && exec.Argv[2].Contains(".gitleaksignore", StringComparison.Ordinal);
+            && exec.Argv.Contains(".gitleaksignore", StringComparer.Ordinal)
+            && exec.Argv.Contains(".gitleaks.toml", StringComparer.Ordinal);
+
+    private static bool IsHistorySuppressionProbe(SandboxExec exec)
+        => exec.Argv.Count >= 2
+            && exec.Argv[0] == "git"
+            && exec.Argv.Contains(".gitleaks.toml", StringComparer.Ordinal);
 
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "gitleaks" && exec.Argv[1] == "version";

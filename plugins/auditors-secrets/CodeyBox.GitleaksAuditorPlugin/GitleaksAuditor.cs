@@ -3,7 +3,6 @@ using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using CodeyBox.PluginSdk.Tools;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.GitleaksAuditorPlugin;
@@ -46,16 +45,20 @@ namespace CodeyBox.GitleaksAuditorPlugin;
 /// <c>.gitleaks.toml</c> (rule/allowlist edits), a <c>.gitleaksignore</c>
 /// (fingerprint suppression, loaded unconditionally; no flag disables it),
 /// and inline <c>gitleaks:allow</c> comments — and the audit subject is the
-/// repository's author. An auditor its subject can silence is not a gate, so
-/// by default the scan pins gitleaks's built-in ruleset via
-/// <c>GITLEAKS_CONFIG_TOML</c> (outranking the repo config), passes
+/// repository's author. <c>.gitleaks.toml</c> is worse than a config
+/// override: gitleaks unconditionally exempts its own config path from the
+/// scan in every commit, so a secret committed inside that file — even one
+/// deleted before the audit — is never reported. An auditor its subject can
+/// silence is not a gate, so by default the scan pins gitleaks's built-in
+/// ruleset via <c>GITLEAKS_CONFIG_TOML</c>, passes
 /// <c>--ignore-gitleaks-allow</c>, points <c>--gitleaks-ignore-path</c> at an
 /// inert path, and fails closed when a repo-root <c>.gitleaksignore</c>
-/// exists. An operator that deliberately trusts repo-authored suppression —
-/// or relies on a repo <c>.gitleaks.toml</c> for custom detectors — sets
-/// <c>TrustRepositorySuppression</c> in scoped config; an operator-supplied
-/// <c>--config</c> via <c>ExtraArguments</c> still outranks the pinned env
-/// config.</para>
+/// exists in the worktree or a <c>.gitleaks.toml</c> exists anywhere in the
+/// worktree or git history. An operator that deliberately trusts
+/// repo-authored suppression — or relies on a repo <c>.gitleaks.toml</c> for
+/// custom detectors — sets <c>TrustRepositorySuppression</c> in scoped
+/// config; an operator-supplied <c>--config</c> via <c>ExtraArguments</c>
+/// still outranks the pinned env config.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: "codeybox.gitleaks",
@@ -66,7 +69,7 @@ namespace CodeyBox.GitleaksAuditorPlugin;
     InstallHint = "provision the pinned gitleaks release (see ExpectedVersion, default "
         + DefaultExpectedVersion + ") into the sandbox baseline; the distro apt package is "
         + "unpinned and too old on Ubuntu LTS — install the pinned upstream binary via "
-        + "CodeyBox:MultipassExtraRuncmd / Incus:ExtraRuncmd or ExecutableProvisions")]
+        + "CodeyBox:MultipassExtraRuncmd / CodeyBox:Incus:ExtraRuncmd or ExecutableProvisions")]
 public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitializer
 {
     /// <summary>Plugin id used in <c>Plugins:Enabled</c> and the scoped-config section.</summary>
@@ -102,6 +105,14 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
     private const string InertGitleaksIgnorePath = "/dev/null";
     private const string RepositoryIgnoreFile = ".gitleaksignore";
 
+    // gitleaks sets Config.Path to <source>/.gitleaks.toml whenever --config
+    // is unset — regardless of where the config actually came from — and skips
+    // every fragment at that path. The file is therefore never scanned: a
+    // secret committed inside it (including one later deleted) evades the
+    // audit, so its presence in the worktree or history is gated, not just
+    // outranked by the pinned ruleset.
+    private const string RepositoryConfigFile = ".gitleaks.toml";
+
     // Precedence 3 of 4 (above the repo's .gitleaks.toml, below --config and
     // GITLEAKS_CONFIG): pins the built-in ruleset so the audited repo cannot
     // extend rules or add allowlists. GITLEAKS_CONFIG stays available to the
@@ -109,7 +120,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
     private const string ConfigEnvVar = "GITLEAKS_CONFIG_TOML";
     private const string PinnedDefaultConfigToml = "[extend]\nuseDefault = true\n";
 
-    private const int VersionProbeMaxOutputBytes = 16 * 1024;
+    private const int ProbeMaxOutputBytes = 16 * 1024;
     private const int MessageValueMaxChars = 64;
     // The precondition probes are liveness checks, not the scan: they never
     // need more than this and share the operator-configured timeout below it.
@@ -213,9 +224,10 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
 
     /// <summary>
     /// gitleaks-specific preconditions on the live path: the pinned scanner
-    /// version, and — unless the operator opted in — absence of the repo-root
-    /// <c>.gitleaksignore</c> gitleaks would honor unconditionally. Both fail
-    /// closed as infrastructure before the scan runs.
+    /// version, and — unless the operator opted in — absence of the
+    /// repository-controlled files gitleaks would honor or exempt from the
+    /// scan (<c>.gitleaksignore</c>, <c>.gitleaks.toml</c>). Both fail closed
+    /// as infrastructure before the scan runs.
     /// </summary>
     protected override async Task VerifyToolAsync(
         ISandbox sandbox,
@@ -255,8 +267,8 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
             {
                 Argv = [tool, "version"],
                 WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = VersionProbeMaxOutputBytes,
-                MaxStderrBytes = VersionProbeMaxOutputBytes,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
                 KillOnOutputLimit = true,
             },
             ProbeTimeout(options),
@@ -292,35 +304,95 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
         // --gitleaks-ignore-path flag only adds files — so presence must be
         // gated rather than redirected. Its fingerprints are deterministic and
         // the audit subject can compute them, so honoring the file by default
-        // would let the subject hide a leak.
-        var result = await ExecToolBoundedAsync(
+        // would let the subject hide a leak. A repo-root .gitleaks.toml is
+        // gated alongside it: gitleaks exempts its own config path from the
+        // scan, so the file's contents are never checked for secrets at all.
+        var presence = await ExecToolBoundedAsync(
             sandbox,
             tool,
             "suppression check",
             new SandboxExec
             {
-                Argv = ["sh", "-c", "test ! -e ./" + RepositoryIgnoreFile],
+                Argv =
+                [
+                    "sh", "-c",
+                    "rc=0; for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then echo \"$f\"; rc=1; fi; done; exit $rc",
+                    "sh", RepositoryIgnoreFile, RepositoryConfigFile,
+                ],
                 WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = VersionProbeMaxOutputBytes,
-                MaxStderrBytes = VersionProbeMaxOutputBytes,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
                 KillOnOutputLimit = true,
             },
             ProbeTimeout(options),
             ct).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
+        if (presence.ExecutionUnavailable)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
                 + "transport was unavailable.");
-        if (result.ExitCode != 0)
+        if (presence.ExitCode != 0)
+        {
+            var found = SingleLine(presence.Stdout);
+            var detail = found.Length > 0
+                ? $"found repository-controlled file(s) '{found}'"
+                : "could not confirm file absence";
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' could not confirm the audited repository is free "
-                + $"of '{RepositoryIgnoreFile}' (exit {result.ExitCode}) — gitleaks honors that file "
-                + "unconditionally and its fingerprints would silently suppress findings. Remove the "
-                + $"file, or set CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to "
-                + "trust repository-controlled suppression surfaces.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr)
+                $"could-not-verify: audit tool '{tool}' suppression check {detail} in the audited "
+                + $"repository (exit {presence.ExitCode}) — gitleaks honors '{RepositoryIgnoreFile}' "
+                + $"unconditionally and never scans its own '{RepositoryConfigFile}' config path, so "
+                + "either file lets the audit subject hide a leak. Remove the file(s), or set "
+                + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to trust "
+                + "repository-controlled suppression surfaces.",
+                presence.ExitCode,
+                presence.Stdout + "\n" + presence.Stderr)
+            { IsDeterministic = true };
+        }
+
+        // The config-path exemption covers every commit, not just the
+        // worktree: a subject could commit a secret inside .gitleaks.toml and
+        // delete the file — the leak stays in history while the presence
+        // check above sees a clean tree. Any commit touching the path fails
+        // closed too. A non-git working directory makes this probe fail,
+        // which is still infrastructure — the gitleaks git scan would fail
+        // the same way.
+        var history = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "suppression check",
+            new SandboxExec
+            {
+                Argv = ["git", "log", "--all", "-1", "--format=%H", "--", RepositoryConfigFile],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (history.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
+                + "transport was unavailable.");
+        if (history.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' could not confirm the audited repository's git "
+                + $"history is free of '{RepositoryConfigFile}' (exit {history.ExitCode}) — gitleaks "
+                + "exempts that path from scanning in every commit.",
+                history.ExitCode,
+                history.Stdout + "\n" + history.Stderr);
+        var historyCommit = SingleLine(history.Stdout);
+        if (historyCommit.Length > 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' found '{RepositoryConfigFile}' in the audited "
+                + $"repository's git history (commit {historyCommit}) — gitleaks exempts its own config "
+                + "path from the scan in every commit, so a secret committed inside that file would "
+                + "never be reported. Purge it from history, or set "
+                + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to trust "
+                + "repository-controlled suppression surfaces.",
+                history.ExitCode,
+                history.Stdout + "\n" + history.Stderr)
             { IsDeterministic = true };
     }
 
@@ -332,7 +404,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
 
     private static string? ExtractVersion(string stdout)
     {
-        var match = VersionPattern.Match(stdout ?? string.Empty);
+        var match = VersionPattern.Match(stdout);
         return match.Success ? match.Value : null;
     }
 

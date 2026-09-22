@@ -31,6 +31,14 @@ finding with the gitleaks rule id and `file:line` location.
   pinned gitleaks build detects; custom detectors need an operator-supplied
   `--config` via `ExtraArguments` (or `TrustRepositorySuppression` to honor a
   `.gitleaks.toml` in the repository — see below).
+- **Binary and archived payloads.** In `git` mode, binary files produce no
+  text fragments to scan and archives are never unpacked
+  (`--max-archive-depth` stays at gitleaks's default `0`). A secret
+  committed inside a `.zip` or any other binary blob is never reported.
+- **A repo-root `.gitleaks.toml`'s own contents.** gitleaks exempts its
+  config path from the scan in every commit, so a secret committed inside
+  that file is invisible to it. The plugin therefore fails closed when the
+  file exists — see *Repository-controlled suppression* below.
 - **Secrets committed under an `ExcludePaths` prefix.** `vendor/`,
   `third_party/`, and `node_modules/` are finding filters: gitleaks still
   scans them, but findings there are dropped — so a leak committed under an
@@ -113,11 +121,11 @@ Scoped under `CodeyBox:Plugins:codeybox.gitleaks`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `8.30.1` | Pinned gitleaks release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `TrustRepositorySuppression` | `false` | When `true`, the audited repository's own suppression surfaces are honored: `.gitleaks.toml` config, `.gitleaksignore` fingerprints, and `gitleaks:allow` comments. See below — off by default because the audit subject authors those files. |
+| `TrustRepositorySuppression` | `false` | When `true`, the audited repository's own suppression surfaces are honored: `.gitleaks.toml` config, `.gitleaksignore` fingerprints, and `gitleaks:allow` comments. When `false`, a repo-root `.gitleaksignore` or `.gitleaks.toml` (worktree or git history) fails the run closed as infrastructure. See below — off by default because the audit subject authors those files. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact gitleaks rule ids to keep/drop (e.g. `generic-api-key`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config <sandbox path>` to pin an operator-controlled ruleset. A repeated flag wins over the built-in default. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config <sandbox path>` to pin an operator-controlled ruleset. A repeated flag wins over the built-in default — so take care: `--log-opts` replaces gitleaks's `git log` flags, silently dropping `--all`/`--full-history` history coverage, and `--baseline-path`, `--config`, or `--enable-rule` narrow or suppress findings by design. |
 | `TimeoutSeconds` | `300` | Per-run bound; also forwarded to gitleaks's own `--timeout`. Exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 
@@ -125,18 +133,27 @@ Scoped under `CodeyBox:Plugins:codeybox.gitleaks`, resolved per run
 three suppression surfaces authored inside the audited repository — a
 `.gitleaks.toml` (custom rules *and* allowlists), a `.gitleaksignore`
 (fingerprint suppression; gitleaks loads it unconditionally — no flag
-disables it), and inline `gitleaks:allow` comments. Because the audited agent
-can write all three, the plugin neutralizes them unless the operator opts in:
+disables it), and inline `gitleaks:allow` comments. `.gitleaks.toml` is also
+special to the scanner itself: gitleaks exempts its own config path from the
+scan in every commit, so a secret committed inside that file — even one
+deleted before the audit — is never reported. Because the audited agent can
+write all three, the plugin neutralizes them unless the operator opts in:
 
 - the scan exports `GITLEAKS_CONFIG_TOML` pinning gitleaks's built-in
-  ruleset, which outranks `<repo>/.gitleaks.toml` (gitleaks config
-  precedence: `--config` → `GITLEAKS_CONFIG` → `GITLEAKS_CONFIG_TOML` →
-  repo `.gitleaks.toml` → built-in default — so an operator `--config` in
-  `ExtraArguments` or a baseline `GITLEAKS_CONFIG` still wins);
+  ruleset, which outranks `<repo>/.gitleaks.toml` as *config* (gitleaks
+  config precedence: `--config` → `GITLEAKS_CONFIG` →
+  `GITLEAKS_CONFIG_TOML` → repo `.gitleaks.toml` → built-in default — so an
+  operator `--config` in `ExtraArguments` or a baseline `GITLEAKS_CONFIG`
+  still wins);
 - `--ignore-gitleaks-allow` disables `gitleaks:allow` comments;
-- `--gitleaks-ignore-path` points at an inert path, and a pre-scan check
-  **fails closed as infrastructure** when `<repo>/.gitleaksignore` exists —
-  remove it, or set `TrustRepositorySuppression=true` to trust it.
+- `--gitleaks-ignore-path` points at an inert path, and pre-scan checks
+  **fail closed as infrastructure** when `<repo>/.gitleaksignore` or
+  `<repo>/.gitleaks.toml` exists in the worktree, or when `.gitleaks.toml`
+  appears anywhere in git history (a committed-then-deleted copy would
+  still exempt that path from the scan). The gate applies regardless of an
+  operator `--config` — remove the file(s), or set
+  `TrustRepositorySuppression=true` to trust repository-controlled
+  suppression.
 
 Set `TrustRepositorySuppression: true` under
 `CodeyBox:Plugins:codeybox.gitleaks` when the audited repositories

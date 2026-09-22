@@ -26,7 +26,7 @@ public sealed class SecurityAuditToolProvisioningConfigTests
             cmd.Contains("ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet", StringComparison.Ordinal) &&
             cmd.Contains("dotnet --version | grep -Fx \"$DOTNET_SDK_VERSION\"", StringComparison.Ordinal));
         Assert.Contains(runcmd, cmd =>
-            cmd.Contains("GITLEAKS_VERSION=8.29.0", StringComparison.Ordinal) &&
+            cmd.Contains("GITLEAKS_VERSION=8.30.1", StringComparison.Ordinal) &&
             cmd.Contains("sha256sum -c -", StringComparison.Ordinal) &&
             cmd.Contains("gitleaks_${GITLEAKS_VERSION}_linux_${GITLEAKS_ARCH}.tar.gz", StringComparison.Ordinal));
         Assert.Contains(runcmd, cmd =>
@@ -34,7 +34,7 @@ public sealed class SecurityAuditToolProvisioningConfigTests
             cmd.Contains("semgrep==1.168.0", StringComparison.Ordinal) &&
             !cmd.Contains("--only-binary", StringComparison.Ordinal));
         Assert.Contains(runcmd, cmd => cmd.Contains("npm install -g @openai/codex", StringComparison.Ordinal));
-        Assert.Contains(runcmd, cmd => cmd.Contains("gitleaks version | grep -Fx 8.29.0", StringComparison.Ordinal));
+        Assert.Contains(runcmd, cmd => cmd.Contains("gitleaks version | grep -Fx 8.30.1", StringComparison.Ordinal));
         Assert.Contains(runcmd, cmd => cmd.Contains("semgrep --version | grep -Fx 1.168.0", StringComparison.Ordinal));
         Assert.Contains(runcmd, cmd => cmd.Contains("codex --version", StringComparison.Ordinal));
 
