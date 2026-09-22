@@ -19,11 +19,14 @@ namespace CodeyBox.BitwardenPlugin;
 /// manager already approved, and a group without a matching grant is never
 /// fetched (the manager never calls here for it).</para>
 /// <para>Provider credentials come from the host credential chain
-/// (environment variables holding machine-account client secrets);
-/// configuration holds only the variable <em>names</em>, never values —
-/// plus the client ids, which are not secrets. Nothing emitted — logs,
-/// lease records, exceptions — ever carries a secret value, an access
-/// token, or a client secret.</para>
+/// (environment variables holding the single machine-account access tokens
+/// as issued, <c>0.{id}.{secret}:{key}</c> — grant material and decryption
+/// key in one string); configuration holds only the variable
+/// <em>names</em>, never values — plus the client ids, which are not
+/// secrets. Secret values are opened from their end-to-end-encrypted
+/// CipherStrings with that key (see <see cref="BitwardenCrypto"/>); nothing
+/// emitted — logs, lease records, exceptions — ever carries a secret value,
+/// an access token, a client secret, or key material.</para>
 /// <para>Honest lease surface: Secrets Manager secrets are static values
 /// with no server-side lease to delete — the lease is a client-side
 /// validity window over a genuinely short-lived access token: renewal
@@ -159,7 +162,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         EnsureClients();
 
         var token = await GetAccessTokenAsync(options, mapping, ct).ConfigureAwait(false);
-        var value = await FetchValueAsync(options, mapping, token.Token, ct).ConfigureAwait(false);
+        var value = await FetchValueAsync(options, mapping, token, ct).ConfigureAwait(false);
         if (string.IsNullOrEmpty(value))
             throw new BitwardenException(
                 BitwardenFailureKind.InvalidResponse,
@@ -198,7 +201,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         // propagates within one window; the fresh value reaches the guest
         // on next provisioning.
         var token = await GetAccessTokenAsync(options, context.Mapping, ct).ConfigureAwait(false);
-        await FetchValueAsync(options, context.Mapping, token.Token, ct).ConfigureAwait(false);
+        await FetchValueAsync(options, context.Mapping, token, ct).ConfigureAwait(false);
         var expiresAt = LeaseExpiry(options, token, TimeSpan.Zero);
         _issued[leaseId] = context with { ExpiresAt = expiresAt };
         _logger.LogDebug("Bitwarden renewed lease '{LeaseId}'.", leaseId);
@@ -219,7 +222,10 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         // orchestrator's teardown scrub of the per-exec environment.
         // Always succeeds and is idempotent by construction.
         if (_issued.TryRemove(leaseId, out var context))
-            _tokens.TryRemove(context.CredentialKey, out _);
+        {
+            if (_tokens.TryRemove(context.CredentialKey, out var evicted))
+                evicted.ClearSecrets();
+        }
         _revokedLeases[leaseId] = true;
         _logger.LogInformation("Bitwarden invalidated lease '{LeaseId}'.", leaseId);
     }
@@ -230,6 +236,8 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
             return;
         _disposed = true;
         _issued.Clear();
+        foreach (var token in _tokens.Values)
+            token.ClearSecrets();
         _tokens.Clear();
         _tokenLock.Dispose();
         if (_ownsHttp)
@@ -249,22 +257,33 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
     private async Task<BitwardenAccessToken> GetAccessTokenAsync(
         BitwardenOptions options, BitwardenSecretMapping mapping, CancellationToken ct)
     {
-        var clientId = string.IsNullOrWhiteSpace(mapping.ClientId)
-            ? options.ClientId.Trim()
-            : mapping.ClientId.Trim();
+        var secretEnvName = string.IsNullOrWhiteSpace(mapping.ClientSecretEnvVar)
+            ? options.ClientSecretEnvVar
+            : mapping.ClientSecretEnvVar;
+        var rawCredential = string.IsNullOrWhiteSpace(secretEnvName) ? null : _env(secretEnvName);
+        if (string.IsNullOrWhiteSpace(rawCredential))
+            throw new BitwardenException(
+                BitwardenFailureKind.Misconfigured,
+                $"Bitwarden client-secret env '{secretEnvName}' is empty. Provision a machine-account access token " +
+                $"with access to the mapped projects from the host credential chain.");
+        // The credential chain holds the single machine-account access
+        // token as issued (0.{id}.{secret}:{key}): the id/secret drive the
+        // client-credentials grant and the :key opens CipherString values.
+        // A bare client secret (legacy shape) still authenticates but
+        // carries no decryption key. An explicit mapping ClientId always
+        // wins; otherwise the token's own id is the client id.
+        var hasTokenFormat = BitwardenCrypto.TryParseMachineCredential(
+            rawCredential, out var tokenClientId, out var tokenClientSecret, out var tokenKey);
+        var clientId = !string.IsNullOrWhiteSpace(mapping.ClientId)
+            ? mapping.ClientId.Trim()
+            : hasTokenFormat
+                ? tokenClientId
+                : options.ClientId.Trim();
         if (string.IsNullOrWhiteSpace(clientId))
             throw new BitwardenException(
                 BitwardenFailureKind.Misconfigured,
                 $"Bitwarden mapping for '{mapping.SandboxEnvVar}' names no machine-account client id; set mapping ClientId or provider ClientId.");
-        var secretEnvName = string.IsNullOrWhiteSpace(mapping.ClientSecretEnvVar)
-            ? options.ClientSecretEnvVar
-            : mapping.ClientSecretEnvVar;
-        var clientSecret = string.IsNullOrWhiteSpace(secretEnvName) ? null : _env(secretEnvName);
-        if (string.IsNullOrWhiteSpace(clientSecret))
-            throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
-                $"Bitwarden client-secret env '{secretEnvName}' is empty. Provision a machine-account client secret " +
-                $"with access to the mapped projects from the host credential chain.");
+        var clientSecret = hasTokenFormat ? tokenClientSecret : rawCredential.Trim();
         var key = CredentialKey(options, mapping);
 
         if (_tokens.TryGetValue(key, out var cached) && TokenUsable(cached, options))
@@ -277,7 +296,9 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
                 return cached;
             EnsureClients();
             var fresh = await _api!.AuthenticateAsync(
-                options.IdentityUrl, clientId, clientSecret, options.MaxResponseBytes, ct).ConfigureAwait(false);
+                options.IdentityUrl, clientId, clientSecret, options.MaxResponseBytes, tokenKey, ct).ConfigureAwait(false);
+            if (_tokens.TryGetValue(key, out var replaced))
+                replaced.ClearSecrets();
             _tokens[key] = fresh;
             return fresh;
         }
@@ -291,7 +312,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         => _clock.GetUtcNow() + TimeSpan.FromSeconds(Math.Max(options.TokenRefreshSkewSeconds, 0)) < token.ExpiresAt;
 
     private async Task<string> FetchValueAsync(
-        BitwardenOptions options, BitwardenSecretMapping mapping, string accessToken, CancellationToken ct)
+        BitwardenOptions options, BitwardenSecretMapping mapping, BitwardenAccessToken accessToken, CancellationToken ct)
     {
         EnsureClients();
         var projectId = string.IsNullOrWhiteSpace(mapping.ProjectId) ? null : mapping.ProjectId.Trim();
@@ -305,7 +326,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
             ? options.OrganizationId.Trim()
             : mapping.OrganizationId.Trim();
         var secretId = await _api!.ResolveSecretIdAsync(
-            options.ApiUrl, accessToken, organizationId, mapping.SecretKey.Trim(), projectId,
+            options.ApiUrl, accessToken.Token, organizationId, mapping.SecretKey.Trim(), projectId,
             options.MaxResponseBytes, ct).ConfigureAwait(false);
         return await _api.GetSecretAsync(
             options.ApiUrl, accessToken, secretId, projectId,

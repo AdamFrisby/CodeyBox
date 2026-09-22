@@ -8,11 +8,57 @@ namespace CodeyBox.BitwardenPlugin;
 
 /// <summary>
 /// Minted machine-account access token: the bearer value plus the server's
-/// own expiry. The value never leaves host memory (never logged, never
-/// persisted, never embedded in lease handles); only <see cref="ExpiresAt"/>
-/// informs lease windows.
+/// own expiry, with the symmetric decryption material held alongside in
+/// host memory only. <see cref="AccessTokenKey"/> is the 64-byte key parsed
+/// from the single access-token string's <c>:key</c> suffix (null for legacy
+/// bare-secret credentials); <see cref="OrganizationKey"/> is recovered by
+/// opening the token response's <c>encrypted_payload</c> with that key
+/// (null when the server sent none or it did not open — values are then
+/// tried directly against <see cref="AccessTokenKey"/>). Nothing here is
+/// ever logged, persisted, or embedded in lease handles; only
+/// <see cref="ExpiresAt"/> informs lease windows.
 /// </summary>
-internal sealed record BitwardenAccessToken(string Token, DateTimeOffset ExpiresAt);
+internal sealed class BitwardenAccessToken
+{
+    public string Token { get; }
+
+    public DateTimeOffset ExpiresAt { get; }
+
+    public byte[]? AccessTokenKey { get; }
+
+    public byte[]? OrganizationKey { get; }
+
+    /// <summary>
+    /// Key tried first for secret values: the payload-derived organisation
+    /// key when present, else the access-token key. Null when the operator
+    /// configured a legacy bare client secret carrying no key material.
+    /// </summary>
+    public byte[]? EffectiveDecryptionKey => OrganizationKey ?? AccessTokenKey;
+
+    public BitwardenAccessToken(
+        string token, DateTimeOffset expiresAt, byte[]? accessTokenKey = null, byte[]? organizationKey = null)
+    {
+        Token = token;
+        ExpiresAt = expiresAt;
+        AccessTokenKey = accessTokenKey;
+        OrganizationKey = organizationKey;
+    }
+
+    /// <summary>
+    /// Never renders the bearer value or key material: the synthesized
+    /// record-style dump would leak the credential into any log or
+    /// exception-data capture.
+    /// </summary>
+    public override string ToString() => "BitwardenAccessToken (redacted)";
+
+    internal void ClearSecrets()
+    {
+        if (AccessTokenKey is not null)
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(AccessTokenKey);
+        if (OrganizationKey is not null)
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(OrganizationKey);
+    }
+}
 
 /// <summary>
 /// Minimal Bitwarden Secrets Manager REST client: machine-account
@@ -33,9 +79,10 @@ internal sealed record BitwardenAccessToken(string Token, DateTimeOffset Expires
 /// identifiers — never values, tokens, client secrets, or free-text server
 /// prose (a server echoing request content in an error body must not land a
 /// credential in logs or the lease store). A <c>value</c> arriving as a
-/// Bitwarden CipherString (end-to-end-encrypted) is refused loudly instead
-/// of being served as ciphertext: this client holds no project decryption
-/// keys (see the plugin README's contract gaps).</para>
+/// Bitwarden CipherString (end-to-end-encrypted) is opened with the
+/// machine-account decryption key (see <see cref="BitwardenCrypto"/>); only
+/// when no key material is configured, or the envelope does not open, is it
+/// refused loudly instead of being served as ciphertext.</para>
 /// </summary>
 internal sealed class BitwardenRestClient
 {
@@ -84,12 +131,20 @@ internal sealed class BitwardenRestClient
     /// grant. The client secret travels only in this form body, over https
     /// (or loopback http), to the configured identity origin — never to any
     /// other host, because the client never follows redirects.
+    /// <para>When <paramref name="accessTokenKey"/> carries the 64-byte key
+    /// parsed from the single access-token string's <c>:key</c> suffix, the
+    /// token response's <c>encrypted_payload</c> (when present) is opened
+    /// with it to recover the organisation decryption key; secret values
+    /// are then tried against that key first. Null (legacy bare-secret
+    /// credentials) mints a bearer-only token that can still serve
+    /// plaintext values but refuses CipherString values loudly.</para>
     /// </summary>
     public async Task<BitwardenAccessToken> AuthenticateAsync(
         string identityUrl,
         string clientId,
         string clientSecret,
         int maxResponseBytes,
+        byte[]? accessTokenKey = null,
         CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(identityUrl);
@@ -121,8 +176,17 @@ internal sealed class BitwardenRestClient
                     BitwardenFailureKind.InvalidResponse,
                     "Bitwarden identity server returned no usable token lifetime.");
             var expiresAt = _clock.GetUtcNow() + TimeSpan.FromSeconds(Math.Min(expiresIn, MaxAcceptedTokenLifetimeSeconds));
+            byte[]? organizationKey = null;
+            if (accessTokenKey is { Length: BitwardenCrypto.KeySize }
+                && TryGetString(root, "encrypted_payload", out var payload)
+                && !string.IsNullOrWhiteSpace(payload))
+            {
+                // A payload that does not open is not fatal: values are
+                // still tried directly against the access-token key.
+                organizationKey = BitwardenCrypto.DeriveOrganizationKey(payload, accessTokenKey);
+            }
             _log.LogDebug("Bitwarden minted a machine-account access token.");
-            return new BitwardenAccessToken(token, expiresAt);
+            return new BitwardenAccessToken(token, expiresAt, accessTokenKey, organizationKey);
         }
     }
 
@@ -134,25 +198,36 @@ internal sealed class BitwardenRestClient
     /// a secret living in any other project, or a response carrying no
     /// usable project linkage at all, fails loudly instead of serving a
     /// wrong-project value. An end-to-end-encrypted <c>value</c>
-    /// (Bitwarden CipherString) is refused loudly: serving ciphertext as a
-    /// credential would be a silent integrity failure, and this client
-    /// holds no project decryption keys.
+    /// (Bitwarden CipherString) is opened with the token's decryption key;
+    /// when no key is configured, or the envelope does not open, it is
+    /// refused loudly: serving ciphertext as a credential would be a silent
+    /// integrity failure.
+    /// <para>The requested id must be a UUID (the documented
+    /// <c>SecretResponseModel.id</c> shape, matching the validated
+    /// configured <c>SecretId</c> and the allowlisted listing ids): anything
+    /// else is rejected before any network or message use, so
+    /// server-controlled text can never reach exception messages or logs
+    /// via the <c>read secret '{id}'</c> operation string.</para>
     /// </summary>
     public async Task<string> GetSecretAsync(
         string apiUrl,
-        string accessToken,
+        BitwardenAccessToken accessToken,
         string secretId,
         string? expectedProjectId,
         int maxResponseBytes,
         CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(apiUrl);
-        ArgumentException.ThrowIfNullOrWhiteSpace(accessToken);
+        ArgumentNullException.ThrowIfNull(accessToken);
         ArgumentException.ThrowIfNullOrWhiteSpace(secretId);
         var trimmedId = secretId.Trim();
+        if (!Guid.TryParse(trimmedId, out _))
+            throw new BitwardenException(
+                BitwardenFailureKind.Misconfigured,
+                "Bitwarden secret id is not a UUID; check the mapping's SecretId.");
         var url = $"{apiUrl.TrimEnd('/')}/secrets/{Uri.EscapeDataString(trimmedId)}";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken.Token);
         using var response = await SendAsync(request, $"read secret '{trimmedId}'", ct).ConfigureAwait(false);
         var doc = await ReadJsonAsync(response, $"read secret '{trimmedId}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
@@ -166,12 +241,22 @@ internal sealed class BitwardenRestClient
                 throw new BitwardenException(
                     BitwardenFailureKind.Misconfigured,
                     $"Bitwarden secret '{trimmedId}' is not in the mapped project; refusing a wrong-project read.");
-            if (LooksEncrypted(value))
-                throw new BitwardenException(
-                    BitwardenFailureKind.InvalidResponse,
-                    $"Bitwarden secret '{trimmedId}' returned an end-to-end-encrypted value this provider cannot decrypt; refusing to serve ciphertext.");
-            _log.LogDebug("Bitwarden read secret '{SecretId}'.", trimmedId);
-            return value;
+            if (!BitwardenCrypto.IsCipherString(value))
+            {
+                _log.LogDebug("Bitwarden read secret '{SecretId}'.", trimmedId);
+                return value;
+            }
+            var key = accessToken.EffectiveDecryptionKey;
+            if (key is not null
+                && BitwardenCrypto.TryDecryptCipherString(value, key, out var plaintext)
+                && !string.IsNullOrEmpty(plaintext))
+            {
+                _log.LogDebug("Bitwarden read secret '{SecretId}'.", trimmedId);
+                return plaintext;
+            }
+            throw new BitwardenException(
+                BitwardenFailureKind.InvalidResponse,
+                $"Bitwarden secret '{trimmedId}' returned an end-to-end-encrypted value this provider could not open; refusing to serve ciphertext.");
         }
     }
 
@@ -211,17 +296,6 @@ internal sealed class BitwardenRestClient
     }
 
     /// <summary>
-    /// True when a secret <c>value</c> wears a Bitwarden CipherString
-    /// envelope (<c>&lt;type&gt;.&lt;payload&gt;</c> with a <c>|</c>
-    /// separator) rather than a usable plaintext value.
-    /// </summary>
-    private static bool LooksEncrypted(string value)
-        => value.Length > 2
-            && char.IsAsciiDigit(value[0])
-            && value[1] == '.'
-            && value.Contains('|');
-
-    /// <summary>
     /// Resolves a secret key to its UUID with an exact (ordinal) match over
     /// the organisation's secret listing
     /// (<c>GET /organizations/{organizationId}/secrets</c>, whose entries
@@ -232,6 +306,11 @@ internal sealed class BitwardenRestClient
     /// that project (via their <c>projects</c> array) are eligible — an
     /// entry with no usable project linkage cannot satisfy a project
     /// filter, so it is skipped rather than served.
+    /// <para>Listing entries are dependency runtime output (less-trusted):
+    /// a candidate <c>id</c> that is not a UUID — the documented shape —
+    /// is skipped, never accepted, so server-controlled text can never flow
+    /// into the follow-up <c>GET /secrets/{id}</c> operation string and from
+    /// there into exception messages and host logs.</para>
     /// </summary>
     public async Task<string> ResolveSecretIdAsync(
         string apiUrl,
@@ -274,8 +353,11 @@ internal sealed class BitwardenRestClient
                     continue;
                 if (!TryGetString(candidate, "id", out var id) || string.IsNullOrWhiteSpace(id))
                     continue;
+                var trimmedId = id.Trim();
+                if (!Guid.TryParse(trimmedId, out _))
+                    continue;
                 matches++;
-                match ??= id;
+                match ??= trimmedId;
             }
             if (matches == 0)
                 throw new BitwardenException(

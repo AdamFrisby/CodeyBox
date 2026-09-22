@@ -75,18 +75,34 @@ documented choice — not a silent fallback.
    project set) per secret group. Note each secret's UUID (preferred —
    UUIDs survive renames) or its exact key.
 3. **Create the secrets** in each project (for example `PAID_API_KEY`).
-   The provider reads the `value` field of `GET /secrets/{id}` only, and
-   only when it is a usable plaintext value: a `value` arriving as a
-   Bitwarden CipherString (end-to-end-encrypted) is refused loudly rather
-   than injected as ciphertext — see Contract gaps.
+   The provider reads the `value` field of `GET /secrets/{id}` and opens
+   end-to-end-encrypted values (Bitwarden CipherStrings) with the
+   machine-account decryption key (see step 5): type-2
+   (`Aes256Cbc_HmacSha256_B64`) envelopes are decrypted with AES-256-CBC
+   after a constant-time HMAC check; a value that does not open — wrong
+   key, tampered envelope, or unsupported envelope type — is refused
+   loudly (`InvalidResponse`, i.e. infrastructure, never a diff verdict)
+   instead of being injected as ciphertext.
 4. **Create a machine account per secret group**: Organisation →
    Settings → Machine accounts, granting exactly the projects that
    account may read (read-only where possible). A machine account's
    project grants are least-privilege by construction — an account for
    `paid-api` never sees `Development` projects.
-5. Note each machine account's **client id** (configuration, not a
-   secret) and **client secret** (credential — goes in the host
-   credential chain, never in configuration).
+5. Copy each machine account's **access token** (the single
+   `0.{clientId}.{clientSecret}:{encryptionKey}` string shown once at
+   creation) into the host credential chain (for example
+   `BITWARDEN_CLIENT_SECRET_AUTOMATION`), and put that variable's *name*
+   in `ClientSecretEnvVar`. The provider splits the string itself: the
+   `clientId` is the default client id (an explicit mapping `ClientId`
+   still wins), the `clientSecret` drives the `POST {identity}/connect/token`
+   grant, and the `:key` (the 64-byte `encKey || macKey` material) opens
+   CipherString values — including the token response's
+   `encrypted_payload`, which is opened first to recover the organisation
+   key when the server sends one. A bare client secret (legacy shape)
+   still authenticates but carries no decryption key, so encrypted values
+   are refused until the full token is provisioned. Never put the value
+   in configuration — only the variable name (plus the non-secret client
+   id when it is configured separately).
 
 For EU tenants use `https://identity.bitwarden.eu` /
 `https://api.bitwarden.eu`; for self-hosted servers point both URLs at
@@ -104,9 +120,11 @@ the deployment's origins.
   ambiguity fails loudly), but a rename breaks key-based mappings while
   UUIDs survive it.
 - **Provider credentials from the host credential chain only**: the
-  `BITWARDEN_CLIENT_SECRET_*` values live in host environment (vault
+  `BITWARDEN_CLIENT_SECRET_*` values (the full machine-account access
+  tokens, `0.{id}.{secret}:{key}`) live in host environment (vault
   agent, systemd credentials, container secrets). Configuration holds
-  only the variable *names* (plus the non-secret client ids). Never put
+  only the variable *names* (plus the non-secret client ids when they are
+  configured separately rather than taken from the token). Never put
   values in `appsettings.json`.
 - **Network**: the orchestrator needs egress to the identity and API
   origins only. Prefer `https` (plain `http` is rejected for
@@ -173,17 +191,15 @@ a client-side validity window over a genuinely short-lived access token:
 
 ## Contract gaps
 
-- **No project-key decryption (limitation).** Secrets Manager is
-  end-to-end-encrypted: a `value` may arrive as a Bitwarden CipherString
-  that only a holder of the project decryption keys can open. This
-  provider speaks the REST API with a service-account bearer token and
-  holds no project keys, so it serves plaintext values and refuses
-  CipherString values loudly (`InvalidResponse`, i.e. infrastructure —
-  never a diff verdict) instead of injecting ciphertext into the guest
-  environment. If Bitwarden documents a service-account decryption flow
-  (or re-licenses the SDK under MIT-compatible terms), wiring project-key
-  decryption in is the natural next step; until then the refusal is the
-  honest behaviour.
+- **Envelope types beyond type-2 are refused (limitation).** Secrets
+  Manager values are end-to-end-encrypted CipherStrings; this provider
+  opens the current type-2 (`Aes256Cbc_HmacSha256_B64`) envelopes with the
+  machine-account key as described above. Legacy type-0 (unauthenticated)
+  and type-7 (COSE) envelopes are refused loudly (`InvalidResponse`,
+  i.e. infrastructure — never a diff verdict) instead of being injected
+  as ciphertext. Type-2 is the current Secrets Manager default; if the
+  backend starts issuing another envelope type, supporting it is the
+  natural next step.
 - Otherwise none known: the lease-shaped contract (`Issue` / `Renew` /
   `Revoke` plus the reconciliation sweep over persisted lease handles)
   expresses everything else this backend offers. Brokered/dynamic secrets
@@ -198,7 +214,11 @@ wiring; payload shapes live in
 `tests/CodeyBox.Tests/Fixtures/bitwarden/`, hand-built to match the
 authoritative server response models (`SecretResponseModel` /
 `SecretWithProjectsListResponseModel` in `bitwarden/server`) — they were
-not captured from live traffic. The one live test runs only when
+not captured from live traffic. CipherString decryption is verified with
+fixed type-2 test vectors (AES-256-CBC Encrypt-then-MAC, the SDK's
+construction) covering direct-key opens, `encrypted_payload`-derived
+organisation keys, wrong-key/tampered/missing-key refusals, and
+non-UUID listing ids. The one live test runs only when
 `BW_SM_LIVE_*` env is set (`BW_SM_LIVE_IDENTITY_URL`,
 `BW_SM_LIVE_API_URL`, `BW_SM_LIVE_CLIENT_ID`,
 `BW_SM_LIVE_CLIENT_SECRET`, `BW_SM_LIVE_SECRET_ID`,

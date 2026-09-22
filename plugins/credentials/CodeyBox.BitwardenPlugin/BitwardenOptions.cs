@@ -61,16 +61,20 @@ public sealed record BitwardenSecretMapping
 
     /// <summary>
     /// Machine-account client id used for this mapping. Empty inherits the
-    /// provider-level <c>ClientId</c>. An id is configuration, not a secret.
+    /// provider-level <c>ClientId</c>, falling back to the id parsed from
+    /// the mapping's access-token credential. An id is configuration, not
+    /// a secret; an explicit value here always wins over the token's own.
     /// </summary>
     public string ClientId { get; init; } = string.Empty;
 
     /// <summary>
-    /// Name of the env var holding the machine-account client secret scoped
-    /// to this mapping. Empty inherits the provider-level
-    /// <c>ClientSecretEnvVar</c>. A machine account's project grants are the
-    /// natural mapping onto secret groups: one machine account (or account
-    /// set) per group, each naming its own least-privilege credential here.
+    /// Name of the env var holding the machine-account credential scoped
+    /// to this mapping: the single access-token string as issued
+    /// (<c>0.{clientId}.{clientSecret}:{encryptionKey}</c>). Empty inherits
+    /// the provider-level <c>ClientSecretEnvVar</c>. A machine account's
+    /// project grants are the natural mapping onto secret groups: one
+    /// machine account (or account set) per group, each naming its own
+    /// least-privilege credential here.
     /// </summary>
     public string ClientSecretEnvVar { get; init; } = string.Empty;
 }
@@ -116,13 +120,18 @@ public sealed record BitwardenOptions
 
     /// <summary>
     /// Default machine-account client id, inherited by mappings that set no
-    /// <c>ClientId</c>. An id is configuration, not a secret.
+    /// <c>ClientId</c> and whose credential carries no parsable token id.
+    /// An id is configuration, not a secret.
     /// </summary>
     public string ClientId { get; init; } = string.Empty;
 
     /// <summary>
-    /// Name of the env var holding the machine-account client secret used
-    /// when a mapping names no <c>ClientSecretEnvVar</c> override.
+    /// Name of the env var holding the machine-account credential used
+    /// when a mapping names no <c>ClientSecretEnvVar</c> override: the
+    /// single access-token string as issued
+    /// (<c>0.{clientId}.{clientSecret}:{encryptionKey}</c>), split by the
+    /// provider into grant material and decryption key. A bare client
+    /// secret (legacy shape) still authenticates but carries no key.
     /// </summary>
     public string ClientSecretEnvVar { get; init; } = "BITWARDEN_CLIENT_SECRET";
 

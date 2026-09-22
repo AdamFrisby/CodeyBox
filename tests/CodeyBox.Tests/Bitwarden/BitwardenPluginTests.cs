@@ -950,9 +950,10 @@ public sealed class BitwardenPluginTests : IDisposable
             })))
         { Timeout = TimeSpan.FromSeconds(10) };
         var api = new BitwardenRestClient(http);
+        var bearer = new BitwardenAccessToken(AccessToken, DateTimeOffset.UtcNow.AddHours(1));
         var ex = await Assert.ThrowsAsync<BitwardenException>(() =>
             api.GetSecretAsync(
-                "https://bitwarden.example.com", AccessToken, SecretId, null, 256 * 1024));
+                "https://bitwarden.example.com", bearer, SecretId, null, 256 * 1024));
         // A backend 3xx is never followed: it fails closed as a backend
         // fault (infrastructure, never a diff verdict) — the bearer token
         // goes nowhere else.
@@ -1036,21 +1037,174 @@ public sealed class BitwardenPluginTests : IDisposable
         Assert.DoesNotContain("projectless-value", ex.Message);
     }
 
-    [Fact]
-    public async Task Encrypted_Value_Is_Refused_Not_Served()
+    // Type-2 test vectors (AES-256-CBC-HMAC-SHA256, Encrypt-then-MAC over
+    // iv || ciphertext; construction mirrors the public SDK). Access key is
+    // bytes 0..63, organisation key is bytes 255..192, base64-encoded.
+    private const string TokenClientId = "aaaaaaaa-1111-4111-8111-111111111111";
+    private const string TokenClientSecret = "test-machine-account-secret-abc123";
+    private const string AccessKeyB64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==";
+    private const string OrgKeyB64 = "//79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eDf3t3c29rZ2NfW1dTT0tHQz87NzMvKycjHxsXEw8LBwA==";
+    private const string DirectCipher = "2.EBESExQVFhcYGRobHB0eHw==|qQ11w+1GPWg4Kr0T5Z5j+xZMjKhF35/TH/FHHc7mIvI=|jo8u63GLQboj5hJpp0Q8Noo3XtayiYDz0KqR/BU8yyU=";
+    private const string OrgCipher = "2.ICEiIyQlJicoKSorLC0uLw==|sLOImeA2NV/rBqczHAd73lelKAkuClYosQvuP1oEHR0=|oRkfe7804KYTrRfIHqBlRWvtwTJYo6YTT45N2VCpEks=";
+    private const string PayloadCipher = "2.MDEyMzQ1Njc4OTo7PD0+Pw==|qJxbSm/TF3kJo+gB49xyZ3uT9QYyPuQQj7N97lvVAV1pbVj+riKGAEXGdb7znRJQ6EpQGEkFzrAqdmeAaq/NTZCgRLdADqSvGQmNDeB9m/i1nbSXRCEG6wAYiaOxlBlQ5VURdjr8Mf6wbuq7CPVYxA==|RZskzy4lf4AJrD+2GDrScLzLkmLLKuijV9CvxOanCIo=";
+    private const string TamperedCipher = "2.EBESExQVFhcYGRobHB0eHw==|qQ11w+1GPWg4Kr0T5Z5j+xZMjKhF35/TH/FHHc7mIvAA|jo8u63GLQboj5hJpp0Q8Noo3XtayiYDz0KqR/BU8yyU=";
+
+    private static string FullToken(string keyB64 = AccessKeyB64)
+        => $"0.{TokenClientId}.{TokenClientSecret}:{keyB64}";
+
+    private Dictionary<string, string?> FullTokenEnv(string keyB64 = AccessKeyB64) => new(StringComparer.Ordinal)
     {
-        UseRecordedShapes();
-        const string ciphertext = "2.AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
-        _handler.SecretJson = $$"""{ "object": "secret", "id": "{{SecretId}}", "organizationId": "{{OrganizationId}}", "key": "PAID_API_TOKEN", "value": "{{ciphertext}}", "projects": [{ "id": "{{AutomationProjectId}}", "name": "Automation" }] }""";
+        ["BITWARDEN_CLIENT_SECRET"] = FullToken(keyB64),
+        ["BITWARDEN_CLIENT_SECRET_DEV"] = FullToken(keyB64),
+    };
+
+    private void UseEncryptedShapes(string cipher, string? payload = null)
+    {
+        _handler.TokenJson = payload is null
+            ? """{"access_token":"bitwarden-test-access-token","expires_in":3600,"token_type":"Bearer"}"""
+            : $$"""{"access_token":"bitwarden-test-access-token","expires_in":3600,"token_type":"Bearer","encrypted_payload":"{{payload}}"}""";
+        _handler.SecretJson = $$"""{ "object": "secret", "id": "{{SecretId}}", "organizationId": "{{OrganizationId}}", "key": "PAID_API_TOKEN", "value": "{{cipher}}", "projects": [{ "id": "{{AutomationProjectId}}", "name": "Automation" }] }""";
+        _handler.ListJson = Fixture("secrets-list.json");
+    }
+
+    [Fact]
+    public async Task Encrypted_Value_Is_Decrypted_With_Access_Token_Key()
+    {
+        UseEncryptedShapes(DirectCipher);
+        var log = new CapturingLogger();
+        var provider = CreateProvider(IdMapping("PAID_API_TOKEN"), log: log, env: FullTokenEnv());
+
+        var material = await provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20));
+
+        // The real-server shape — every value end-to-end-encrypted — now
+        // resolves to the same plaintext the plaintext fixture carries.
+        Assert.Equal(StaticValue, material.Value);
+        Assert.Equal([TokenClientId], _handler.TokenClientIds);
+        Assert.DoesNotContain(DirectCipher, string.Join('\n', log.Messages));
+        Assert.DoesNotContain(StaticValue, string.Join('\n', log.Messages));
+    }
+
+    [Fact]
+    public async Task Encrypted_Value_Opens_Via_Encrypted_Payload()
+    {
+        UseEncryptedShapes(OrgCipher, PayloadCipher);
+        var provider = CreateProvider(IdMapping("PAID_API_TOKEN"), env: FullTokenEnv());
+
+        var material = await provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20));
+
+        // Organisation key recovered from encrypted_payload opens values
+        // the access-token key alone cannot.
+        Assert.Equal(StaticValue, material.Value);
+    }
+
+    [Fact]
+    public async Task Encrypted_Value_Without_Key_Is_Refused_Not_Served()
+    {
+        UseEncryptedShapes(DirectCipher);
         var provider = CreateProvider(IdMapping("PAID_API_TOKEN"));
 
-        // Serving ciphertext as a credential would be a silent integrity
-        // failure: refuse loudly (infrastructure — never a diff verdict).
+        // A legacy bare-secret credential carries no decryption key:
+        // serving ciphertext as a credential would be a silent integrity
+        // failure, so refuse loudly (infrastructure — never a diff verdict).
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
         Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
-        Assert.DoesNotContain(ciphertext, ex.Message);
+        Assert.DoesNotContain(DirectCipher, ex.Message);
+        Assert.DoesNotContain(StaticValue, ex.Message);
+    }
+
+    [Fact]
+    public async Task Encrypted_Value_With_Wrong_Key_Fails_Loud()
+    {
+        UseEncryptedShapes(DirectCipher);
+        var provider = CreateProvider(IdMapping("PAID_API_TOKEN"), env: FullTokenEnv(OrgKeyB64));
+
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
+        Assert.True(ex.IsInfrastructure);
+        Assert.DoesNotContain(DirectCipher, ex.Message);
+    }
+
+    [Fact]
+    public async Task Tampered_Ciphertext_Is_Refused()
+    {
+        UseEncryptedShapes(TamperedCipher);
+        var provider = CreateProvider(IdMapping("PAID_API_TOKEN"), env: FullTokenEnv());
+
+        // A single flipped ciphertext byte breaks the MAC: fail closed,
+        // never serve, never echo the envelope.
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
+        Assert.DoesNotContain(TamperedCipher, ex.Message);
+    }
+
+    [Fact]
+    public void Machine_Credential_Parsing_Accepts_Token_Rejects_Legacy()
+    {
+        Assert.True(BitwardenCrypto.TryParseMachineCredential(
+            FullToken(), out var clientId, out var clientSecret, out var key));
+        Assert.Equal(TokenClientId, clientId);
+        Assert.Equal(TokenClientSecret, clientSecret);
+        Assert.NotNull(key);
+        Assert.Equal(64, key!.Length);
+
+        Assert.False(BitwardenCrypto.TryParseMachineCredential(
+            "bw_test-machine-account-client-secret", out _, out _, out var legacyKey));
+        Assert.Null(legacyKey);
+        Assert.False(BitwardenCrypto.TryParseMachineCredential(
+            "0.not-a-uuid.secret:AAAA", out _, out _, out _));
+    }
+
+    [Fact]
+    public async Task Non_Uuid_Listing_Id_Is_Ignored()
+    {
+        UseRecordedShapes();
+        const string malicious = "x\"><script>alert(1)</script>\u001b[31mred\nnewline";
+        _handler.ListJson = $$"""{ "object": "SecretsWithProjectsList", "secrets": [{ "id": "{{EscapeJson(malicious)}}", "organizationId": "{{OrganizationId}}", "key": "PAID_API_TOKEN", "projects": [] }, { "id": "{{SecretId}}", "organizationId": "{{OrganizationId}}", "key": "PAID_API_TOKEN", "projects": [] }] }""";
+        var provider = CreateProvider(KeyMapping("PAID_API_TOKEN", "PAID_API_TOKEN"));
+
+        var material = await provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20));
+
+        // The server-controlled id is skipped, never fetched: only the
+        // documented UUID shape resolves, and no server text reaches logs.
+        Assert.Equal(StaticValue, material.Value);
+        Assert.True(_handler.SawReadOf(SecretId));
+        foreach (var read in _handler.ReadSecretIds)
+            Assert.True(Guid.TryParse(read, out _), $"non-UUID id was fetched: {read}");
+    }
+
+    [Fact]
+    public async Task Listing_With_Only_Non_Uuid_Id_Is_Not_Found()
+    {
+        UseRecordedShapes();
+        _handler.ListJson = """{ "object": "SecretsWithProjectsList", "secrets": [{ "id": "not-a-uuid", "organizationId": "33333333-3333-3333-3333-333333333333", "key": "PAID_API_TOKEN", "projects": [] }] }""";
+        var provider = CreateProvider(KeyMapping("PAID_API_TOKEN", "PAID_API_TOKEN"));
+
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.Equal(BitwardenFailureKind.NotFound, ex.Kind);
+        Assert.Empty(_handler.ReadSecretIds);
+    }
+
+    [Fact]
+    public async Task GetSecret_Rejects_Non_Uuid_Id_Without_Echo()
+    {
+        using var http = new HttpClient(_handler) { Timeout = TimeSpan.FromSeconds(30) };
+        var api = new BitwardenRestClient(http);
+        const string evil = "x\u001b[31mred\nnewline";
+        var bearer = new BitwardenAccessToken(AccessToken, DateTimeOffset.UtcNow.AddHours(1));
+
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() =>
+            api.GetSecretAsync("https://bitwarden.example.com", bearer, evil, null, 256 * 1024));
+        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.DoesNotContain("red", ex.Message);
+        Assert.Empty(_handler.ReadSecretIds);
     }
 
     [Fact]
@@ -1287,5 +1441,34 @@ public sealed class BitwardenPluginTests : IDisposable
         var port = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port;
         probe.Stop();
         return port;
+    }
+
+    /// <summary>
+    /// Minimal JSON string escaper for hostile test inputs: a
+    /// server-controlled listing id must arrive as valid JSON (escapes
+    /// decoded by the parser) so the test exercises the post-parse guard,
+    /// not the JSON parser.
+    /// </summary>
+    private static string EscapeJson(string value)
+    {
+        var builder = new StringBuilder(value.Length + 16);
+        foreach (var c in value)
+        {
+            switch (c)
+            {
+                case '"': builder.Append("\\\""); break;
+                case '\\': builder.Append("\\\\"); break;
+                case '\n': builder.Append("\\n"); break;
+                case '\r': builder.Append("\\r"); break;
+                case '\t': builder.Append("\\t"); break;
+                default:
+                    if (c < 0x20)
+                        builder.Append($"\\u{(int)c:x4}");
+                    else
+                        builder.Append(c);
+                    break;
+            }
+        }
+        return builder.ToString();
     }
 }
