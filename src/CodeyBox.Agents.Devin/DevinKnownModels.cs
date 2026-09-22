@@ -29,6 +29,18 @@ public static class DevinKnownModels
         "opus",
         "swe",
         "fable",
+
+        // The swe-2 variants, re-verified 2026-09-22 against the same command.
+        // These are the ONLY entries the catalog reports as cost_tier "Free";
+        // every other family — including the other swe-* families (swe-1.6,
+        // swe-1.7, swe-1.7-lightning) and every fusion-*-sidekick-swe-2-*
+        // combination — is billed. Prefer one of these exact uids over the
+        // "swe" alias when a deployment must not spend: an alias resolves
+        // through the account's registry and can be repointed at a later,
+        // paid generation without the configuration changing.
+        "swe-2-high",
+        "swe-2-medium",
+        "swe-2-max",
     };
 
     public static bool IsKnown(string? modelId)
