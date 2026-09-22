@@ -49,7 +49,7 @@ public static class MajordomoAuthorization
         {
             return new MajordomoDecision.Refuse(
                 MajordomoRefusalReason.UnknownTool,
-                $"unknown tool '{toolName ?? "<null>"}'");
+                $"unknown tool '{DescribeToolName(toolName)}'");
         }
 
         if (arguments is null || arguments.GetType() != tool.ArgumentsType)
@@ -92,5 +92,27 @@ public static class MajordomoAuthorization
         return options.Mode == MajordomoAutonomyMode.Autonomous
             ? new MajordomoDecision.Execute(tool)
             : new MajordomoDecision.Propose(new MajordomoProposal(tool, mutate));
+    }
+
+    /// <summary>Largest slice of an untrusted tool name echoed into a refusal detail.</summary>
+    private const int MaxEchoedToolNameLength = 128;
+
+    /// <summary>
+    /// Renders an untrusted tool name for an operator/model-facing detail
+    /// string: control characters are stripped and the value is truncated, so
+    /// terminal escapes and unbounded echoes cannot ride the refusal.
+    /// </summary>
+    private static string DescribeToolName(string? toolName)
+    {
+        if (toolName is null)
+            return "<null>";
+        var truncated = toolName.Length > MaxEchoedToolNameLength;
+        var builder = new System.Text.StringBuilder(MaxEchoedToolNameLength);
+        foreach (var c in toolName.AsSpan(0, Math.Min(toolName.Length, MaxEchoedToolNameLength)))
+        {
+            if (!char.IsControl(c)) builder.Append(c);
+        }
+        if (truncated) builder.Append('…');
+        return builder.ToString();
     }
 }

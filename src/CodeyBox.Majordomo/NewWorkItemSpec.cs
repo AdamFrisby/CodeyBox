@@ -20,6 +20,17 @@ namespace CodeyBox.Majordomo;
 /// one in. <c>Initiator</c> is likewise absent: the caller's principal is a
 /// transport concern, never model-chosen.
 /// </para>
+///
+/// <para>
+/// Field SHAPE is enforced here; field EXISTENCE is not knowable at contract
+/// time. The executor must repeat the live-registry checks the REST surface
+/// performs — project existence for <see cref="ProjectId"/>, agent-registry
+/// membership for <see cref="Agent"/>, class-catalog membership for
+/// <see cref="AgentClassId"/>, profile existence for
+/// <see cref="AuditorProfile"/>, release lookup for <see cref="ReleaseId"/>,
+/// and <c>IKnobRegistry.Normalize</c> for <see cref="Knobs"/> — before
+/// persisting anything.
+/// </para>
 /// </summary>
 public sealed record NewWorkItemSpec
 {
@@ -139,7 +150,10 @@ public sealed record NewWorkItemSpec
     /// <summary>Per-item audit iteration cap; null inherits the project budget.</summary>
     public int? AuditMaxIterations { get; }
 
-    /// <summary>Audit complexity label; null inherits the project default.</summary>
+    /// <summary>
+    /// Audit complexity label; null (or whitespace, normalised away at
+    /// construction) inherits the project default.
+    /// </summary>
     public string? AuditComplexity { get; }
 
     /// <summary>Release to attach the item to; null = unattached.</summary>

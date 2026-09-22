@@ -27,12 +27,14 @@ public sealed record WorkItemPatch
         string? auditComplexity = null,
         IReadOnlyList<string>? requiredCapabilities = null,
         IReadOnlyList<WorkItemId>? dependsOn = null,
+        IReadOnlyDictionary<string, string>? externalIds = null,
         IReadOnlyDictionary<string, string>? knobs = null)
     {
         if (title is null && prompt is null && agent is null && agentClassId is null
             && priority is null && workTimeout is null && mergeTimeout is null
             && minModelScore is null && auditMaxIterations is null && auditComplexity is null
-            && requiredCapabilities is null && dependsOn is null && knobs is null)
+            && requiredCapabilities is null && dependsOn is null && externalIds is null
+            && knobs is null)
         {
             throw new ArgumentException("patch must change at least one field");
         }
@@ -51,6 +53,7 @@ public sealed record WorkItemPatch
             ? null
             : WorkItemFieldValidation.RequiredCapabilities(requiredCapabilities);
         DependsOn = dependsOn is null ? null : WorkItemFieldValidation.DependsOn(dependsOn);
+        ExternalIds = externalIds is null ? null : WorkItemFieldValidation.ExternalIds(externalIds);
         Knobs = knobs is null ? null : WorkItemFieldValidation.Knobs(knobs);
     }
 
@@ -89,6 +92,13 @@ public sealed record WorkItemPatch
 
     /// <summary>Replace-set dependency list; null = unchanged, empty = clear.</summary>
     public IReadOnlyList<WorkItemId>? DependsOn { get; }
+
+    /// <summary>
+    /// Replace-set namespaced external identifiers; null = unchanged, empty =
+    /// clear. Namespace deletion is expressed by omitting the namespace from
+    /// the replacement map.
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? ExternalIds { get; }
 
     /// <summary>Replace-set knob overrides; null = unchanged, empty = clear.</summary>
     public IReadOnlyDictionary<string, string>? Knobs { get; }

@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using CodeyBox.Core;
 
 namespace CodeyBox.Majordomo;
@@ -62,12 +63,23 @@ public sealed record ListWorkItemsArgs : MajordomoToolArgs
     {
         if (states is { Count: 0 })
             throw new ArgumentException("states must be non-empty when provided", nameof(states));
+        if (states is not null)
+        {
+            foreach (var state in states)
+            {
+                if (!Enum.IsDefined(state))
+                    throw new ArgumentOutOfRangeException(nameof(states), state,
+                        $"states entry '{state}' is not a defined {nameof(WorkItemState)}");
+            }
+        }
         if (limit is < MinLimit or > MaxLimit)
             throw new ArgumentOutOfRangeException(nameof(limit), limit,
                 $"limit must be within [{MinLimit}, {MaxLimit}]");
 
         ProjectId = projectId;
-        States = states;
+        // Copy to a frozen set: the caller's collection must not be able to
+        // mutate the filter after it was validated.
+        States = states?.ToFrozenSet();
         Limit = limit;
     }
 

@@ -120,6 +120,9 @@ public sealed record RetryWorkItemArgs : MajordomoMutateArgs
         WorkItemRetryFrom from = WorkItemRetryFrom.Work,
         TimeSpan? workTimeout = null)
     {
+        if (!Enum.IsDefined(from))
+            throw new ArgumentOutOfRangeException(nameof(from), from,
+                $"from must be a defined {nameof(WorkItemRetryFrom)} phase");
         Id = id;
         From = from;
         WorkTimeout = workTimeout is { } wt ? WorkItemFieldValidation.WorkTimeout(wt) : null;

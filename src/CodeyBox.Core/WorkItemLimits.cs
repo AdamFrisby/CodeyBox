@@ -39,6 +39,18 @@ public static class WorkItemLimits
     /// <summary>Maximum length of an <see cref="WorkItem.AgentClassId"/> reference.</summary>
     public const int MaxAgentClassIdLength = 200;
 
+    /// <summary>Maximum length of an <see cref="WorkItem.AuditorProfile"/> name.</summary>
+    public const int MaxAuditorProfileLength = 200;
+
+    /// <summary>Maximum knob overrides carried by one work item.</summary>
+    public const int MaxKnobOverrides = 64;
+
+    /// <summary>Maximum length of a knob-override key.</summary>
+    public const int MaxKnobKeyLength = 64;
+
+    /// <summary>Maximum length of a knob-override value.</summary>
+    public const int MaxKnobValueLength = 1024;
+
     /// <summary>Lowest selectable <see cref="WorkItem.MinModelScore"/>.</summary>
     public const int MinModelScoreFloor = 0;
 

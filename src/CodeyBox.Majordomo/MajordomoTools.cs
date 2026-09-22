@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using System.Collections.Immutable;
 
 namespace CodeyBox.Majordomo;
 
@@ -76,7 +77,7 @@ public static class MajordomoTools
         MajordomoToolClass.Mutate,
         typeof(UpdateWorkItemArgs),
         typeof(MajordomoChangeSet),
-        "Replace-set edit of one work item's fields (title, prompt, routing, priority, timeouts, dependencies).");
+        "Replace-set edit of one work item's fields (title, prompt, routing, priority, timeouts, dependencies, external ids).");
 
     public static readonly MajordomoTool CancelWorkItem = new(
         "cancel_work_item",
@@ -92,21 +93,24 @@ public static class MajordomoTools
         typeof(MajordomoChangeSet),
         "Re-queue one work item resuming from a chosen pipeline phase.");
 
-    /// <summary>Every tool in the vocabulary, in declaration order.</summary>
+    /// <summary>
+    /// Every tool in the vocabulary, in declaration order. Backed by an
+    /// <see cref="ImmutableArray{T}"/> so the vocabulary itself cannot be
+    /// rewritten through a mutable-cast of the exposed list.
+    /// </summary>
     public static readonly IReadOnlyList<MajordomoTool> All =
-    [
-        GetQueueStatus,
-        GetDispatchStatus,
-        GetAgentCapacity,
-        ListWorkItems,
-        GetWorkItem,
-        GetWorkItemAudit,
-        CreateWorkItem,
-        CreateWorkItemChain,
-        UpdateWorkItem,
-        CancelWorkItem,
-        RetryWorkItem,
-    ];
+        ImmutableArray.Create(
+            GetQueueStatus,
+            GetDispatchStatus,
+            GetAgentCapacity,
+            ListWorkItems,
+            GetWorkItem,
+            GetWorkItemAudit,
+            CreateWorkItem,
+            CreateWorkItemChain,
+            UpdateWorkItem,
+            CancelWorkItem,
+            RetryWorkItem);
 
     private static readonly FrozenDictionary<string, MajordomoTool> ByName =
         All.ToFrozenDictionary(t => t.Name, StringComparer.Ordinal);

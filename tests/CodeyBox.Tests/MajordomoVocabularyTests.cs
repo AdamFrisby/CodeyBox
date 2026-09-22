@@ -60,13 +60,18 @@ public sealed class MajordomoVocabularyTests
             Assert.True(typeof(MajordomoToolResult).IsAssignableFrom(tool.ResultType));
         }
 
-        // No argument type may exist outside the declared catalog: the union
-        // is closed by the internal constructor, and every reachable member
-        // must appear in it.
+        // No argument or result type may exist outside the declared catalog:
+        // the unions are closed by the internal constructors, and every
+        // reachable member must appear in it.
         var reachable = typeof(MajordomoTools).Assembly.GetTypes()
             .Where(t => typeof(MajordomoToolArgs).IsAssignableFrom(t) && !t.IsAbstract);
         Assert.True(declaredArgs.SetEquals(reachable),
             "every concrete argument type must be declared in the catalog");
+
+        var reachableResults = typeof(MajordomoTools).Assembly.GetTypes()
+            .Where(t => typeof(MajordomoToolResult).IsAssignableFrom(t) && !t.IsAbstract);
+        Assert.True(declaredResults.SetEquals(reachableResults),
+            "every concrete result type must be declared in the catalog");
     }
 
     // ── No dangerous capability in the contract ──────────────────────────────
@@ -81,7 +86,7 @@ public sealed class MajordomoVocabularyTests
         string[] forbidden =
         [
             "command", "shell", "path", "file", "directory", "process",
-            "url", "uri", "endpoint", "connectionstring", "config",
+            "url", "uri", "endpoint", "connection", "config",
             "service", "environment",
         ];
 
@@ -189,6 +194,51 @@ public sealed class MajordomoVocabularyTests
     }
 
     [Fact]
+    public void Patch_ExternalIds_FollowReplaceSetSemantics()
+    {
+        var patch = new WorkItemPatch(externalIds: new Dictionary<string, string>
+        {
+            ["github"] = "gh-42",
+        });
+        Assert.NotNull(patch.ExternalIds);
+        Assert.Equal("gh-42", patch.ExternalIds!["github"]);
+
+        // An empty map is a real value: it clears the stored map.
+        var clearing = new WorkItemPatch(externalIds: new Dictionary<string, string>());
+        Assert.NotNull(clearing.ExternalIds);
+        Assert.Empty(clearing.ExternalIds!);
+
+        // Invalid namespaces and null values fail at the contract.
+        Assert.Throws<ArgumentException>(() => new WorkItemPatch(
+            externalIds: new Dictionary<string, string> { ["BAD NS"] = "x" }));
+        Assert.Throws<ArgumentException>(() => new WorkItemPatch(
+            externalIds: new Dictionary<string, string?> { ["github"] = null! }
+                .ToDictionary(kv => kv.Key, kv => kv.Value!)));
+    }
+
+    [Fact]
+    public void Spec_KnobKeys_CollapseCaseInsensitively_LikeTheRestSurface()
+    {
+        var spec = new NewWorkItemSpec(new ProjectId("demo"), "t", "p",
+            knobs: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["ChangeScope"] = "surgical",
+                ["CHANGESCOPE"] = "refactor",
+            });
+        // Same last-wins case-insensitive resolution as the REST surface —
+        // a case-variant duplicate cannot survive contract validation.
+        Assert.Single(spec.Knobs);
+        Assert.Equal("refactor", spec.Knobs["changescope"]);
+    }
+
+    [Fact]
+    public void Spec_WhitespaceAuditComplexity_NormalisesToUnset()
+    {
+        var spec = new NewWorkItemSpec(new ProjectId("demo"), "t", "p", auditComplexity: "   ");
+        Assert.Null(spec.AuditComplexity);
+    }
+
+    [Fact]
     public void Spec_RejectsOutOfContractValues()
     {
         Assert.Throws<ArgumentException>(() =>
@@ -239,6 +289,33 @@ public sealed class MajordomoVocabularyTests
     }
 
     [Fact]
+    public void ListArgs_RejectOutOfVocabularyStates()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new ListWorkItemsArgs(states: new HashSet<WorkItemState> { (WorkItemState)999 }));
+    }
+
+    [Fact]
+    public void ListArgs_CopyTheCallerSuppliedStateSet()
+    {
+        var callerSet = new HashSet<WorkItemState> { WorkItemState.Failed };
+        var args = new ListWorkItemsArgs(states: callerSet);
+
+        callerSet.Add(WorkItemState.Queued);
+        callerSet.Clear();
+
+        Assert.NotNull(args.States);
+        Assert.True(args.States!.SetEquals([WorkItemState.Failed]));
+    }
+
+    [Fact]
+    public void Vocabulary_CannotBeMutatedThroughTheExposedList()
+    {
+        Assert.Throws<NotSupportedException>(() =>
+            ((IList<MajordomoTool>)MajordomoTools.All).RemoveAt(0));
+    }
+
+    [Fact]
     public void EveryMutateArgs_ReportsItsBlastRadius()
     {
         Assert.Equal(1, new CreateWorkItemArgs(Spec()).AffectedItemCount);
@@ -257,5 +334,14 @@ public sealed class MajordomoVocabularyTests
         var ok = new RetryWorkItemArgs(WorkItemId.New(), WorkItemRetryFrom.Merge, TimeSpan.FromMinutes(30));
         Assert.Equal(WorkItemRetryFrom.Merge, ok.From);
         Assert.Equal("merge", ok.From.ToPolicyValue());
+    }
+
+    [Fact]
+    public void Retry_RejectsOutOfVocabularyPhase()
+    {
+        // A deserialized or cast enum must fail at the contract, not later in
+        // ToPolicyValue — out-of-vocabulary values are unrepresentable.
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new RetryWorkItemArgs(WorkItemId.New(), (WorkItemRetryFrom)999));
     }
 }

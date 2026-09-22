@@ -1511,11 +1511,10 @@ internal static class WorkItemEndpoints
         string? oldAgentClassId = item!.AgentClassId;
         if (agentClassPatch)
         {
-            var trimmed = body.AgentClassId!.Trim();
-            if (trimmed.Length == 0)
-                return Results.BadRequest(new { error = "agentClassId must not be empty" });
-            if (trimmed.Length > WorkItemLimits.MaxAgentClassIdLength)
-                return Results.BadRequest(new { error = $"agentClassId must be <= {WorkItemLimits.MaxAgentClassIdLength} chars" });
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(body.AgentClassId);
+            if (classIdError is not null)
+                return Results.BadRequest(new { error = classIdError });
+            var trimmed = normalizedClassId!;
             var knownClasses = router.ClassIds;
             if (!knownClasses.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
                 return Results.BadRequest(new
@@ -1560,20 +1559,20 @@ internal static class WorkItemEndpoints
 
         if (body.Title is not null)
         {
-            try { Validation.ValidateNoOptionLikeOrControl(body.Title, nameof(body.Title)); }
-            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
-            if (body.Title.Length > WorkItemLimits.MaxTitleLength) return Results.BadRequest(new { error = $"title must be <= {WorkItemLimits.MaxTitleLength} chars" });
-            updated = updated with { Title = body.Title, UpdatedAt = now };
+            var (newTitle, titleError) = WorkItemFieldRules.NormalizeTitle(body.Title);
+            if (titleError is not null) return Results.BadRequest(new { error = titleError });
+            updated = updated with { Title = newTitle!, UpdatedAt = now };
         }
 
         if (body.Prompt is not null)
         {
-            if (body.Prompt.Length > WorkItemLimits.MaxPromptLength) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
+            var (newPrompt, promptError) = WorkItemFieldRules.NormalizePrompt(body.Prompt);
+            if (promptError is not null) return Results.BadRequest(new { error = promptError });
             if (deferPromptReplace)
             {
                 updated = updated with
                 {
-                    Prompt = body.Prompt,
+                    Prompt = newPrompt!,
                     PromptRevision = updated.PromptRevision + 1,
                     UpdatedAt = now,
                 };
@@ -1587,14 +1586,14 @@ internal static class WorkItemEndpoints
                 // guard inside TryReplacePromptAsync mirrors the Queued check
                 // above; success refreshes our in-memory snapshot for the rest
                 // of the PATCH so the response DTO reflects the new revision.
-                var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
+                var promptResult = await store.TryReplacePromptAsync(updated.Id, newPrompt!, now, ct);
                 if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
                     return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
                 if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
                     return Results.Conflict(new { error = $"cannot edit item in terminal state" });
                 updated = updated with
                 {
-                    Prompt = body.Prompt,
+                    Prompt = newPrompt!,
                     PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
                     UpdatedAt = now,
                 };
@@ -1611,18 +1610,18 @@ internal static class WorkItemEndpoints
         }
 
         if (body.WorkTimeoutMinutes is { } w)
-            updated = updated with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, WorkTimeoutPolicy.MinMinutes, WorkTimeoutPolicy.MaxMinutes)), UpdatedAt = now };
+            updated = updated with { WorkTimeout = WorkItemFieldRules.ClampWorkTimeoutMinutes(w), UpdatedAt = now };
 
         if (body.MergeTimeoutMinutes is { } m)
-            updated = updated with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, WorkItemLimits.MinMergeTimeoutMinutes, WorkItemLimits.MaxMergeTimeoutMinutes)), UpdatedAt = now };
+            updated = updated with { MergeTimeout = WorkItemFieldRules.ClampMergeTimeoutMinutes(m), UpdatedAt = now };
 
         if (body.MinModelScore is { } minScore)
-            updated = updated with { MinModelScore = Math.Clamp(minScore, WorkItemLimits.MinModelScoreFloor, WorkItemLimits.MinModelScoreCeiling), UpdatedAt = now };
+            updated = updated with { MinModelScore = WorkItemFieldRules.ClampMinModelScore(minScore), UpdatedAt = now };
 
         if (body.RequiredCapabilities is { } patchCaps)
         {
-            var (normalised, capErr) = NormaliseRequiredCapabilities(patchCaps);
-            if (capErr is not null) return capErr;
+            var (normalised, capErr) = WorkItemFieldRules.NormalizeRequiredCapabilities(patchCaps);
+            if (capErr is not null) return Results.BadRequest(new { error = capErr });
             updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
         }
 
@@ -1636,7 +1635,7 @@ internal static class WorkItemEndpoints
 
         if (body.AuditMaxIterations is { } auditMaxIterations)
         {
-            var auditMaxIterationsError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditMaxIterations);
+            var auditMaxIterationsError = WorkItemFieldRules.CheckAuditMaxIterations(auditMaxIterations);
             if (auditMaxIterationsError is not null)
                 return Results.BadRequest(new { error = auditMaxIterationsError });
             updated = updated with { AuditMaxIterations = auditMaxIterations, UpdatedAt = now };
@@ -1644,7 +1643,7 @@ internal static class WorkItemEndpoints
 
         if (body.AuditComplexity is not null)
         {
-            var (normalised, complexityErr) = AuditBudgetRequestValidation.NormaliseAuditComplexity(body.AuditComplexity);
+            var (normalised, complexityErr) = WorkItemFieldRules.NormalizeAuditComplexity(body.AuditComplexity);
             if (complexityErr is not null) return Results.BadRequest(new { error = complexityErr });
             updated = updated with { AuditComplexity = normalised, UpdatedAt = now };
         }
@@ -1837,8 +1836,8 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         CancellationToken ct)
     {
-        if (rawDeps.Length > WorkItemLimits.MaxDependsOn)
-            return (Results.BadRequest(new { error = $"dependsOn must contain at most {WorkItemLimits.MaxDependsOn} entries" }), null);
+        if (WorkItemFieldRules.CheckDependsOnCount(rawDeps.Length) is { } depsCountError)
+            return (Results.BadRequest(new { error = depsCountError }), null);
 
         var allItems = new List<WorkItem>();
         await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
@@ -2027,15 +2026,16 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         CancellationToken ct)
     {
-        if (body is null || string.IsNullOrEmpty(body.Prompt))
+        if (body is null)
             return Results.BadRequest(new { error = "prompt is required" });
-        if (body.Prompt.Length > WorkItemLimits.MaxPromptLength)
-            return Results.BadRequest(new { error = "prompt must be <= 64KB" });
+        var (newPrompt, promptError) = WorkItemFieldRules.NormalizePrompt(body.Prompt);
+        if (promptError is not null)
+            return Results.BadRequest(new { error = promptError });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var result = await store.TryReplacePromptAsync(item!.Id, body.Prompt, DateTimeOffset.UtcNow, ct);
+        var result = await store.TryReplacePromptAsync(item!.Id, newPrompt!, DateTimeOffset.UtcNow, ct);
         return result.Outcome switch
         {
             PromptReplaceOutcome.NotFound => Results.NotFound(new { error = $"work item '{id}' no longer exists" }),
@@ -2841,42 +2841,6 @@ internal static class WorkItemEndpoints
                 grant.IsImplicit)).ToList());
     }
 
-
-    /// <summary>
-    /// Normalises and validates a caller-supplied list of required-capability
-    /// tags. Returns the normalised list, or null + error result on failure.
-    /// Trims whitespace, drops empties, de-duplicates case-insensitively.
-    /// </summary>
-    private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(
-        IReadOnlyList<string> raw)
-    {
-        if (raw.Count > WorkItemLimits.MaxRequiredCapabilities)
-            return (null, Results.BadRequest(new
-            {
-                error = $"requiredCapabilities may contain at most {WorkItemLimits.MaxRequiredCapabilities} entries",
-            }));
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var result = new List<string>();
-        foreach (var entry in raw)
-        {
-            if (entry is null) continue;
-            var tag = entry.Trim();
-            if (tag.Length == 0) continue;
-            if (tag.Length > WorkItemLimits.MaxCapabilityLength)
-                return (null, Results.BadRequest(new
-                {
-                    error = $"requiredCapabilities entry '{tag}' exceeds {WorkItemLimits.MaxCapabilityLength} chars",
-                }));
-            if (tag.Any(char.IsControl))
-                return (null, Results.BadRequest(new
-                {
-                    error = "requiredCapabilities entries must not contain control characters",
-                }));
-            if (seen.Add(tag)) result.Add(tag);
-        }
-        return (result, null);
-    }
-
     private static AgentControlDto? ToAgentControlDto(AgentControlSpec? spec) =>
         spec is null
             ? null
@@ -2898,17 +2862,9 @@ internal static class WorkItemEndpoints
     /// </summary>
     private static IResult? ValidatePriority(int priority, Project project)
     {
-        if (priority < WorkItemLimits.MinPriority || priority > WorkItemLimits.MaxPriority)
-            return Results.BadRequest(new
-            {
-                error = $"priority must be within [{WorkItemLimits.MinPriority}, {WorkItemLimits.MaxPriority}]",
-            });
-        if (project.MaxPriority is { } maxPriority && priority > maxPriority)
-            return Results.BadRequest(new
-            {
-                error = $"priority {priority} exceeds project '{project.Id}' max priority {maxPriority}",
-            });
-        return null;
+        var error = WorkItemFieldRules.CheckPriorityBounds(priority)
+            ?? WorkItemFieldRules.CheckProjectPriorityCeiling(priority, project);
+        return error is null ? null : Results.BadRequest(new { error });
     }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)
