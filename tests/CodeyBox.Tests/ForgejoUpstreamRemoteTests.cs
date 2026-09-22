@@ -540,6 +540,16 @@ public sealed class ForgejoUpstreamRemoteTests : IDisposable
             remote.CompleteAsync(SampleRequest with { WorkBranch = "bad branch" }));
         await Assert.ThrowsAsync<ArgumentException>(() =>
             remote.TryMergeUpstreamBranchAsync("main", "x\ny"));
+        // Leading-dash branch names would be parsed as git options
+        // (--upload-pack RCE); they must be rejected before any side effect.
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            remote.CompleteAsync(SampleRequest with { WorkBranch = "--upload-pack=evil" }));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            remote.TryMergeUpstreamBranchAsync("--upload-pack=evil", "main"));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            remote.TryMergeUpstreamBranchAsync("main", "--upload-pack=evil"));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            remote.FetchBaseBranchAsync("repo-id", "--upload-pack=evil"));
         Assert.Empty(git.Pushes);
         Assert.Empty(handler.Requests);
     }

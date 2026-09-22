@@ -89,8 +89,8 @@ public sealed partial class ForgejoUpstreamRemote : IUpstreamRemote, IPluginInit
     public async Task<UpstreamCompletionOutcome> CompleteAsync(
         UpstreamCompletionRequest request, CancellationToken ct = default)
     {
-        ValidateBranch(request.WorkBranch, nameof(request.WorkBranch));
-        ValidateBranch(request.BaseBranch, nameof(request.BaseBranch));
+        Validation.ValidateBranchName(request.WorkBranch, nameof(request.WorkBranch));
+        Validation.ValidateBranchName(request.BaseBranch, nameof(request.BaseBranch));
 
         var config = ResolveProjectConfig(request.ProjectId);
         var token = ResolveToken(request.TokenEnvVar);
@@ -180,8 +180,8 @@ public sealed partial class ForgejoUpstreamRemote : IUpstreamRemote, IPluginInit
     public async Task<bool> TryMergeUpstreamBranchAsync(
         string targetBranch, string sourceBranch, CancellationToken ct = default)
     {
-        ValidateBranch(targetBranch, nameof(targetBranch));
-        ValidateBranch(sourceBranch, nameof(sourceBranch));
+        Validation.ValidateBranchName(targetBranch, nameof(targetBranch));
+        Validation.ValidateBranchName(sourceBranch, nameof(sourceBranch));
         var config = ResolveScopedConfig()
             ?? throw new InvalidOperationException(
                 "Forgejo upstream merge requires plugin-scoped BaseUrl/Owner/Repository " +
@@ -197,13 +197,13 @@ public sealed partial class ForgejoUpstreamRemote : IUpstreamRemote, IPluginInit
 
             var clone = await ForgejoGitRunner.RunAsync(
                 stagingRoot, auth.Environment, ct,
-                "clone", "--branch", targetBranch, "--single-branch", "--", config.GitUrl, cloneDir);
+                "clone", $"--branch={targetBranch}", "--single-branch", "--", config.GitUrl, cloneDir);
             if (clone.ExitCode != 0)
                 throw new ForgejoUpstreamException(
                     $"Forgejo git clone of '{SanitizeForLog(targetBranch)}' failed: {Scrub(clone.Stderr, token)}");
 
             var fetch = await ForgejoGitRunner.RunAsync(
-                cloneDir, auth.Environment, ct, "fetch", "origin", sourceBranch);
+                cloneDir, auth.Environment, ct, "fetch", "origin", "--", sourceBranch);
             if (fetch.ExitCode != 0)
                 throw new ForgejoUpstreamException(
                     $"Forgejo git fetch of '{SanitizeForLog(sourceBranch)}' failed: {Scrub(fetch.Stderr, token)}");
@@ -217,7 +217,7 @@ public sealed partial class ForgejoUpstreamRemote : IUpstreamRemote, IPluginInit
             }
 
             var push = await ForgejoGitRunner.RunAsync(
-                cloneDir, auth.Environment, ct, "push", "origin", targetBranch);
+                cloneDir, auth.Environment, ct, "push", "origin", "--", targetBranch);
             if (push.ExitCode != 0)
                 throw new ForgejoUpstreamException(
                     $"Forgejo git push of '{SanitizeForLog(targetBranch)}' failed: {Scrub(push.Stderr, token)}");
@@ -247,6 +247,7 @@ public sealed partial class ForgejoUpstreamRemote : IUpstreamRemote, IPluginInit
     public async Task<string?> FetchBaseBranchAsync(
         string repositoryId, string baseBranch, CancellationToken ct = default)
     {
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
         var config = ResolveScopedConfig();
         if (config is null)
             return null;
@@ -645,16 +646,6 @@ public sealed partial class ForgejoUpstreamRemote : IUpstreamRemote, IPluginInit
     // ------------------------------------------------------------------
     // Small pure helpers
     // ------------------------------------------------------------------
-
-    private static void ValidateBranch(string branch, string paramName)
-    {
-        static bool HasInvalidChars(string s) =>
-            s.Any(c => char.IsWhiteSpace(c) || (char.IsControl(c) && c != '\t'));
-        if (string.IsNullOrEmpty(branch) || HasInvalidChars(branch))
-            throw new ArgumentException(
-                $"Branch contains invalid characters (whitespace/control chars not allowed): '{SanitizeForLog(branch)}'",
-                paramName);
-    }
 
     private static string ToForgejoMergeAction(string mergeMethod) =>
         mergeMethod.ToLowerInvariant() switch
