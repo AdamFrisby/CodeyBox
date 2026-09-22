@@ -8,8 +8,8 @@ namespace CodeyBox.BitwardenPlugin;
 /// Bitwarden Secrets Manager end-to-end decryption: type-2
 /// (<c>Aes256Cbc_HmacSha256_B64</c>) CipherString decryption plus parsing of
 /// the single machine-account access token (<c>0.{id}.{secret}:{key}</c>)
-/// that carries both the client-credentials grant material and the 64-byte
-/// symmetric key. The construction mirrors the public SDK
+/// that carries both the client-credentials grant material and the symmetric
+/// key seed. The construction mirrors the public SDK
 /// (<c>Aes256CbcHmacSha256</c>: AES-256-CBC PKCS7 Encrypt-then-MAC with
 /// <c>HMAC-SHA256(macKey, iv || ciphertext)</c> over raw bytes, standard
 /// base64) using only <see cref="System.Security.Cryptography"/> primitives.
@@ -27,6 +27,9 @@ internal static class BitwardenCrypto
     internal const int IvSize = 16;
     internal const int MacSize = 32;
 
+    /// <summary>Wire size of the access-token <c>:key</c> seed, in bytes.</summary>
+    internal const int AccessTokenSeedSize = 16;
+
     /// <summary>Maximum decrypted plaintext accepted, in bytes (values are small).</summary>
     internal const int MaxPlaintextBytes = 1024 * 1024;
 
@@ -34,10 +37,14 @@ internal static class BitwardenCrypto
     /// Parses a machine-account credential from the host credential chain.
     /// Accepts the single access-token string Bitwarden issues
     /// (<c>0.{clientId}.{clientSecret}:{base64Key}</c>, where the key is the
-    /// 64-byte <c>encKey || macKey</c> material) or a legacy bare client
-    /// secret. Returns false for the legacy shape, with <paramref name="key"/>
-    /// null — the caller then authenticates without decryption material and
-    /// any CipherString value fails loudly instead of being served.
+    /// 16-byte seed that the SDK expands via
+    /// <c>derive_shareable_key(seed, "accesstoken", "sm-access-token")</c>
+    /// into the 64-byte <c>encKey || macKey</c> material) or a legacy bare
+    /// client secret. A 64-byte key is also accepted as already-expanded
+    /// material. Returns false for the legacy shape, with
+    /// <paramref name="key"/> null — the caller then authenticates without
+    /// decryption material and any CipherString value fails loudly instead
+    /// of being served.
     /// </summary>
     internal static bool TryParseMachineCredential(
         string? raw, out string clientId, out string clientSecret, out byte[]? key)
@@ -56,21 +63,84 @@ internal static class BitwardenCrypto
             return false;
         var left = remainder[..colon];
         var keyText = remainder[(colon + 1)..].Trim();
-        var keyBytes = DecodeKeyMaterial(keyText);
+        var keyBytes = DecodeB64(keyText);
         if (keyBytes is null)
             return false;
+        byte[] expanded;
+        if (keyBytes.Length == AccessTokenSeedSize)
+        {
+            expanded = DeriveAccessKey(keyBytes);
+            CryptographicOperations.ZeroMemory(keyBytes);
+        }
+        else if (keyBytes.Length == KeySize)
+        {
+            expanded = keyBytes;
+        }
+        else
+        {
+            CryptographicOperations.ZeroMemory(keyBytes);
+            return false;
+        }
         var segments = left.Split('.', StringSplitOptions.None);
         if (segments.Length < 2
             || string.IsNullOrWhiteSpace(segments[0])
             || !Guid.TryParse(segments[0].Trim(), out _))
+        {
+            CryptographicOperations.ZeroMemory(expanded);
             return false;
+        }
         var secret = string.Join(".", segments.Skip(1)).Trim();
         if (string.IsNullOrEmpty(secret))
+        {
+            CryptographicOperations.ZeroMemory(expanded);
             return false;
+        }
         clientId = segments[0].Trim();
         clientSecret = secret;
-        key = keyBytes;
+        key = expanded;
         return true;
+    }
+
+    /// <summary>
+    /// Expands a 16-byte access-token seed into the 64-byte
+    /// <c>encKey || macKey</c> material, mirroring the SDK's
+    /// <c>derive_shareable_key(seed, "accesstoken", "sm-access-token")</c>:
+    /// HMAC-SHA256 with key <c>"bitwarden-accesstoken"</c> over the seed to
+    /// a 32-byte PRK, then HKDF-Expand (SHA-256) with info
+    /// <c>"sm-access-token"</c> to 64 bytes.
+    /// </summary>
+    internal static byte[] DeriveAccessKey(byte[] seed)
+    {
+        ArgumentNullException.ThrowIfNull(seed);
+        if (seed.Length != AccessTokenSeedSize)
+            throw new ArgumentException("Access-token seed must be 16 bytes.", nameof(seed));
+        using var prkHmac = new HMACSHA256(Encoding.UTF8.GetBytes("bitwarden-accesstoken"));
+        var prk = prkHmac.ComputeHash(seed);
+        try
+        {
+            var info = Encoding.UTF8.GetBytes("sm-access-token");
+            var output = new byte[KeySize];
+            var previous = Array.Empty<byte>();
+            var offset = 0;
+            for (var counter = (byte)1; offset < output.Length; counter++)
+            {
+                using var expandHmac = new HMACSHA256(prk);
+                var input = new byte[previous.Length + info.Length + 1];
+                Buffer.BlockCopy(previous, 0, input, 0, previous.Length);
+                Buffer.BlockCopy(info, 0, input, previous.Length, info.Length);
+                input[input.Length - 1] = counter;
+                previous = expandHmac.ComputeHash(input);
+                CryptographicOperations.ZeroMemory(input);
+                var take = Math.Min(previous.Length, output.Length - offset);
+                Buffer.BlockCopy(previous, 0, output, offset, take);
+                offset += take;
+            }
+            return output;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(prk);
+        }
     }
 
     /// <summary>
@@ -146,9 +216,9 @@ internal static class BitwardenCrypto
             string text;
             try
             {
-                text = Encoding.UTF8.GetString(decrypted);
+                text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(decrypted);
             }
-            catch (ArgumentException)
+            catch (DecoderFallbackException)
             {
                 return false;
             }

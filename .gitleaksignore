@@ -68,3 +68,8 @@ ee80b4ddd9b086f55aa67d06a9e949f0e7f988b8:tests/CodeyBox.Tests/PullRequestDescrip
 992c17caafb6ff9cb00b54827258796253f835fc:plugins/credentials/CodeyBox.BitwardenPlugin/README.md:generic-api-key:157
 992c17caafb6ff9cb00b54827258796253f835fc:tests/CodeyBox.Tests/Bitwarden/BitwardenPluginTests.cs:generic-api-key:33
 992c17caafb6ff9cb00b54827258796253f835fc:tests/CodeyBox.Tests/Bitwarden/BitwardenPluginTests.cs:generic-api-key:34
+# Synthetic Bitwarden test-vector key (tests/CodeyBox.Tests/Bitwarden/BitwardenPluginTests.cs):
+# base64 of bytes 0..63, used only as a fixed AES/HMAC test key. Never a live
+# credential. The source now builds the vector at runtime (no literal), so this
+# entry covers the pre-fix commit only.
+32ec20ecbc1b87f9ec4901e8b9a7ff09607eb05c:tests/CodeyBox.Tests/Bitwarden/BitwardenPluginTests.cs:generic-api-key:1045

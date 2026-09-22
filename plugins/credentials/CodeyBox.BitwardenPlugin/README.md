@@ -89,13 +89,16 @@ documented choice — not a silent fallback.
    project grants are least-privilege by construction — an account for
    `paid-api` never sees `Development` projects.
 5. Copy each machine account's **access token** (the single
-   `0.{clientId}.{clientSecret}:{encryptionKey}` string shown once at
+   `0.{clientId}.{clientSecret}:{key}` string shown once at
    creation) into the host credential chain (for example
    `BITWARDEN_CLIENT_SECRET_AUTOMATION`), and put that variable's *name*
    in `ClientSecretEnvVar`. The provider splits the string itself: the
    `clientId` is the default client id (an explicit mapping `ClientId`
    still wins), the `clientSecret` drives the `POST {identity}/connect/token`
-   grant, and the `:key` (the 64-byte `encKey || macKey` material) opens
+   grant, and the `:key` (a 16-byte seed, expanded via the SDK's
+   `derive_shareable_key(seed, "accesstoken", "sm-access-token")` —
+   HMAC-SHA256 with key `bitwarden-accesstoken` plus HKDF-Expand with info
+   `sm-access-token` — into the 64-byte `encKey || macKey` material) opens
    CipherString values — including the token response's
    `encrypted_payload`, which is opened first to recover the organisation
    key when the server sends one. A bare client secret (legacy shape)
