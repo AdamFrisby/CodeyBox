@@ -178,6 +178,7 @@ public sealed class PluginEnablementTests
     [InlineData("codeybox.statistics", true)]
     [InlineData("codeybox.quota-reset-notifier", true)]
     [InlineData("codeybox.opencode-go-quota", true)]
+    [InlineData("codeybox.gitleaks", false)]
     [InlineData("codeybox.dotnet-test-runner", false)]
     [InlineData("codeybox.pytest-test-runner", false)]
     [InlineData("some.future-auditor", false)]
