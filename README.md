@@ -19,45 +19,60 @@ point is to be able to leave it running — see
 > Built in C#/.NET 10. Managed repos can be any stack — Python, Node, Go, Rust,
 > C#, or your own — through config-driven auditors.
 
-![Agnes watching a CodeyBox fleet — vitals, quota to reset, cumulative flow, and what needs a look](screenshots/agnes-01-overview.png)
+![The CodeyBox fleet map — every chain on one canvas, zoomed to the item that needs a decision](screenshots/map-01-fleet.png)
 
-## Want a front end? Use Agnes
+## The admin
 
-CodeyBox is an **orchestrator**, not an application. It exposes a REST API, a
-SignalR stream and a typed CLI, and it is designed to be left running without
-anyone watching it.
+CodeyBox ships its own web admin on the host. It is two views of one fleet.
 
-When you do want to watch — or steer from another machine, or from your
-phone — use **[Agnes](https://github.com/AdamFrisby/Agnes)** — a separate product, a
-remote interface to coding CLIs, which ships a first-class CodeyBox client.
-Point it at your orchestrator and you get the screens below. Neither product
-requires the other.
+**Map view** is the default. Every chain is on one canvas against a time axis:
+landed work to the left, what is running now in the middle, and the queue
+forecast to the right. Zoom is semantic — chains at a distance, cards close up,
+and an item's full stage pipeline (work, audit as a decision gate, the rework
+loop) when you zoom into it. Dead time is compressed rather than scrolled
+through, so months of history stay on one screen.
 
 <table>
 <tr>
-<td width="50%"><img src="screenshots/agnes-03-now-working.png" alt="Now working"><br><sub><b>Now working</b> — every busy slot, what it is doing this second, and how long it has been doing it. Landed today, in flight, time to drain.</sub></td>
-<td width="50%"><img src="screenshots/agnes-02-work-queue.png" alt="Work queue"><br><sub><b>Work queue</b> — now, next in dispatch order, waiting on you, and landed. A failed item explains itself and offers the three things you can actually do about it.</sub></td>
+<td width="50%"><img src="screenshots/map-02-whole-board.png" alt="The whole board"><br><sub><b>The whole board</b> — four hundred chains and five hundred landed items against a warped time axis, so idle gaps cost pixels instead of scrolling. Zoom out to orient, zoom in on what you found.</sub></td>
+<td width="50%"><img src="screenshots/admin-01-queue.png" alt="Queue view"><br><sub><b>Queue view</b> — the same fleet as a list when you want one: filter by state, reorder dispatch, and act on a row without leaving it.</sub></td>
 </tr>
 </table>
 
-The overview above is the one to leave on a spare monitor: a plain-language
-verdict at the top, quota-to-reset per agent, thirty days of cumulative flow,
-and a "needs a look" list that ranks by how stuck something is rather than by
-age.
-
-## The built-in admin
-
-CodeyBox also ships its own web admin on the host — pause the queue or a single
-project, inspect any item's timeline, audit reports, timings, costs and diff,
-and watch agent output live. It is deliberately plain today and is being
-rebuilt; screenshots of the current state are in
-[`screenshots/`](screenshots), generated against a deterministic seeded
-instance by [`tools/screenshots/`](tools/screenshots).
+What needs a decision comes to you rather than waiting to be found: an
+attention rail pins parked and failed items to the side of the canvas, each
+with the actions that actually apply to it — answer the agent's question,
+retry from work, retry from audit, delegate a repair turn. Suggestions raised
+by agents appear as ghost cards beside the item that produced them, and
+promote to real work items in one click.
 
 <table>
 <tr>
 <td width="50%"><img src="screenshots/10-work-item-detail.png" alt="A single work item"><br><sub><b>One item, end to end</b> — state, branches, and tabs for its timeline, audit reports, timings, costs and diff.</sub></td>
 <td width="50%"><img src="screenshots/05-capacity.png" alt="Subscription capacity"><br><sub><b>Capacity</b> — quota snapshots joined against real token consumption, to estimate what each 1% of a window buys.</sub></td>
+</tr>
+</table>
+
+Screenshots of the remaining screens are in [`screenshots/`](screenshots); the
+page captures are generated against a deterministic seeded instance by
+[`tools/screenshots/`](tools/screenshots).
+
+## Want it on your phone? Use Agnes
+
+CodeyBox is an **orchestrator** as well as an application. It exposes a REST
+API, a SignalR stream and a typed CLI, and it is designed to be left running
+without anyone watching it.
+
+When you want to steer it from another machine or from your phone, use
+**[Agnes](https://github.com/AdamFrisby/Agnes)** — a separate product, a remote
+interface to coding CLIs, which ships a first-class CodeyBox client. Point it
+at your orchestrator and you get the screens below. Neither product requires
+the other.
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/agnes-01-overview.png" alt="Fleet overview"><br><sub><b>Overview</b> — a plain-language verdict, quota-to-reset per agent, thirty days of cumulative flow, and a "needs a look" list ranked by how stuck something is rather than by age.</sub></td>
+<td width="50%"><img src="screenshots/agnes-02-work-queue.png" alt="Work queue"><br><sub><b>Work queue</b> — now, next in dispatch order, waiting on you, and landed. A failed item explains itself and offers the three things you can actually do about it.</sub></td>
 </tr>
 </table>
 

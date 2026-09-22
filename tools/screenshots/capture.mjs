@@ -8,8 +8,11 @@ const BASE = process.env.ADMIN_URL ?? 'http://localhost:5070';
 const OUT = process.env.OUT_DIR ?? './out';
 const EXECUTABLE = process.env.CHROMIUM_PATH;
 
+// "/" is the fleet map since the shell became two tabs; the queue moved to
+// "/queue". The map is a canvas, so it is captured separately below rather
+// than here — this table asserts on rendered text, which a canvas has none of.
 const PAGES = [
-  ['01-queue',       '/',                 'Work Queue'],
+  ['01-queue',       '/queue',            'Work Queue'],
   ['02-fleet',       '/fleet',            'Fleet'],
   ['03-supervision', '/supervision',      'Supervision'],
   ['04-statistics',  '/statistics',       'Statistics'],
