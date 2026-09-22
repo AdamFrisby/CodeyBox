@@ -63,11 +63,14 @@ public sealed class DevinInVmSmokeProbeTests
         // `auth status` would pass even logged out, so it is not the check.
         Assert.Equal(["devin", "models", "list", "--format", "json"], steps[2].Argv.ToArray());
 
-        // The turn exercises the same permission/trust contract as dispatch.
+        // The turn exercises the same permission/trust contract as dispatch AND
+        // the same prompt delivery: the probe runs the runner's own wrapper
+        // script, so a prompt the CLI cannot open fails the probe too.
         Assert.Equal(
-            ["devin", "-p", "--permission-mode", "dangerous",
-             "--respect-workspace-trust", "false", "--prompt-file", "/dev/stdin"],
+            ["bash", "-c", DevinAgentRunner.BuildPromptFileScript(
+                DevinAgentRunner.FullAutonomyInvocationPrefix(DevinAgentRunner.DefaultBinary))],
             steps[3].Argv.ToArray());
+        Assert.DoesNotContain("/dev/stdin", steps[3].Argv[2], StringComparison.Ordinal);
         Assert.NotNull(steps[3].Stdin);
     }
 }

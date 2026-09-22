@@ -1842,7 +1842,14 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         }
     }
 
-    private static string ShellQuote(string value) =>
+    /// <summary>
+    /// Single-quotes <paramref name="value"/> for safe interpolation into a
+    /// <c>bash -c</c> script, escaping embedded single quotes. Protected so a
+    /// concrete runner that has to wrap its CLI in a shell (see
+    /// <see cref="BuildInvocation"/>, whose contract allows passing the prompt
+    /// by file) quotes argv the same way rather than re-implementing it.
+    /// </summary>
+    protected static string ShellQuote(string value) =>
         "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
 
     private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>

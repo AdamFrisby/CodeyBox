@@ -26,8 +26,20 @@ public sealed class DevinAgentRunnerTests
             new Dictionary<string, string> { [DevinAgentRunner.AuthTomlEnvironmentVariable] = toml },
             new Dictionary<string, string>());
 
+    /// <summary>
+    /// The devin dispatch exec. The CLI is wrapped in a bash script that
+    /// materialises the piped prompt into a temp file (see
+    /// <c>DevinAgentRunner.BuildPromptFileScript</c>), so the exec to find is
+    /// the one whose script declares that file — not the sibling bash exec
+    /// that materialises credentials.
+    /// </summary>
     private static SandboxExec DevinExec(RecordingSandbox sandbox) =>
-        Assert.Single(sandbox.Execs, e => e.Argv.Count > 0 && e.Argv[0] == "devin");
+        Assert.Single(sandbox.Execs, e => e.Argv.Count == 3 && e.Argv[0] == "bash"
+            && e.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal));
+
+    /// <summary>The devin command line the wrapper script ends with.</summary>
+    private static string DevinCommandLine(RecordingSandbox sandbox) =>
+        DevinExec(sandbox).Argv[2].Split('\n')[^1];
 
     [Fact]
     public void Kind_IsDevin()
@@ -49,18 +61,18 @@ public sealed class DevinAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "do the thing", Cred());
 
-        var argv = DevinExec(sandbox).Argv.ToList();
-        Assert.Equal(["devin", "-p", "--permission-mode", "dangerous",
-            "--respect-workspace-trust", "false",
-            "--model", ConfiguredModel, "--prompt-file", "/dev/stdin"], argv);
+        Assert.Equal(
+            $"'devin' '-p' '--permission-mode' 'dangerous' '--respect-workspace-trust' 'false' "
+            + $"'--model' '{ConfiguredModel}' --prompt-file \"$cb_prompt\"",
+            DevinCommandLine(sandbox));
     }
 
     [Fact]
     public async Task RunAsync_Prompt_TravelsViaStdin_NotArgv()
     {
-        // Linux MAX_ARG_STRLEN is 128 KiB per argv element; rework prompts can
-        // exceed it. Verified: bare `-p` ignores a piped prompt —
-        // --prompt-file /dev/stdin is required.
+        // Linux MAX_ARG_STRLEN is 128 KiB per element and applies to argv AND
+        // the environment, so neither can carry a rework prompt. The prompt is
+        // piped and `cat` writes it to the file the CLI opens.
         var sandbox = new RecordingSandbox();
         var runner = RunnerWithDefault();
         const string prompt = "implement the widget with extra care";
@@ -70,6 +82,27 @@ public sealed class DevinAgentRunnerTests
         var devin = DevinExec(sandbox);
         Assert.Equal(prompt, devin.Stdin);
         Assert.DoesNotContain(devin.Argv, a => a.Contains("widget", StringComparison.Ordinal));
+        Assert.All(devin.ExtraEnvironment ?? new Dictionary<string, string>(),
+            kv => Assert.DoesNotContain("widget", kv.Value, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task RunAsync_NeverPassesDevStdin_AsThePromptFile()
+    {
+        // /dev/stdin must be RE-OPENED by the CLI, and the in-VM exec wrapper
+        // pipes stdin in before dropping to the sandbox user, so opening it
+        // fails EACCES and every dispatch died in under a second. Regression
+        // guard: the prompt file must be a real file the sandbox user owns.
+        var sandbox = new RecordingSandbox();
+        var runner = RunnerWithDefault();
+
+        await runner.RunAsync(sandbox, "/work", "do the thing", Cred());
+
+        var script = DevinExec(sandbox).Argv[2];
+        Assert.DoesNotContain("/dev/stdin", script, StringComparison.Ordinal);
+        Assert.Contains("cat > \"$cb_prompt\"", script, StringComparison.Ordinal);
+        Assert.Contains("umask 077", script, StringComparison.Ordinal);
+        Assert.Contains("trap 'rm -f \"$cb_prompt\"' EXIT INT TERM", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -80,9 +113,9 @@ public sealed class DevinAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "x", Cred(), modelId: "claude-opus-4.6");
 
-        var argv = DevinExec(sandbox).Argv.ToList();
-        Assert.Contains("claude-opus-4.6", argv);
-        Assert.DoesNotContain(ConfiguredModel, argv);
+        var command = DevinCommandLine(sandbox);
+        Assert.Contains("'claude-opus-4.6'", command, StringComparison.Ordinal);
+        Assert.DoesNotContain(ConfiguredModel, command, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -235,11 +268,13 @@ public sealed class DevinAgentRunnerTests
         var result = await runner.RunTextOnlyAsync("summarise", Cred(), sandbox: sandbox, workingDirectory: "/work");
 
         Assert.True(result.Success);
-        var argv = DevinExec(sandbox).Argv.ToList();
-        Assert.Equal(["devin", "-p", "--respect-workspace-trust", "false",
-            "--model", ConfiguredModel, "--prompt-file", "/dev/stdin"], argv);
-        Assert.DoesNotContain("--permission-mode", argv);
-        Assert.DoesNotContain("dangerous", argv);
+        var command = DevinCommandLine(sandbox);
+        Assert.Equal(
+            $"'devin' '-p' '--respect-workspace-trust' 'false' "
+            + $"'--model' '{ConfiguredModel}' --prompt-file \"$cb_prompt\"",
+            command);
+        Assert.DoesNotContain("--permission-mode", command, StringComparison.Ordinal);
+        Assert.DoesNotContain("dangerous", command, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -300,8 +335,13 @@ public sealed class DevinAgentRunnerTests
             {
                 return Task.FromResult(new SandboxExecResult(MaterialiseExitCode, "", "auth stderr"));
             }
-            if (exec.Argv.Count > 0 && exec.Argv[0] == "devin")
+            // The dispatch exec is the prompt-file wrapper (bash -c <script>),
+            // not a bare `devin` argv — the script declares cb_prompt.
+            if (exec.Argv.Count == 3 && exec.Argv[0] == "bash"
+                && exec.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal))
+            {
                 return Task.FromResult(new SandboxExecResult(DevinExitCode, DevinStdout, DevinStderr));
+            }
             return Task.FromResult(new SandboxExecResult(0, "ok", ""));
         }
 

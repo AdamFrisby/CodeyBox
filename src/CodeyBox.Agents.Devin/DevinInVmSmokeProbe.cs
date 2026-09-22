@@ -47,11 +47,13 @@ public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
             steps.Add(new(
                 [DevinAgentRunner.DefaultBinary, "models", "list", "--format", "json"],
                 FailureHint: "devin models list failed (credentials path drift or invalid token)"));
+            // Runs through the runner's own prompt-file wrapper, so the probe
+            // fails whenever a real dispatch would fail to deliver its prompt.
             steps.Add(new(
-                [.. DevinAgentRunner.FullAutonomyInvocationPrefix(DevinAgentRunner.DefaultBinary),
-                    "--prompt-file", "/dev/stdin"],
+                ["bash", "-c", DevinAgentRunner.BuildPromptFileScript(
+                    DevinAgentRunner.FullAutonomyInvocationPrefix(DevinAgentRunner.DefaultBinary))],
                 Stdin: "Reply with the single word: OK",
-                FailureHint: "devin print-mode turn failed (workspace-trust or permission-mode contract drift)"));
+                FailureHint: "devin print-mode turn failed (prompt delivery, workspace-trust or permission-mode contract drift)"));
         }
 
         return steps;

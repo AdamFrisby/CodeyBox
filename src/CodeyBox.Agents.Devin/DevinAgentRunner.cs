@@ -152,13 +152,64 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         _ = credential;
         _ = captureStructuredStream;
 
-        // The prompt travels on stdin through --prompt-file /dev/stdin rather
-        // than `-- <prompt>` argv: bare `-p` ignores a piped prompt entirely,
-        // and MAX_ARG_STRLEN (128 KiB per argv element) caps positional
-        // prompts below what rework dispatches can reach.
-        argv.Add("--prompt-file");
-        argv.Add("/dev/stdin");
-        return new AgentInvocation(argv, Stdin: prompt);
+        return PromptFileInvocation(argv, prompt);
+    }
+
+    /// <summary>
+    /// Sandbox path template for the prompt file. A per-run <c>mktemp</c> name
+    /// under <c>$TMPDIR</c>, so two phases in one sandbox never collide.
+    /// </summary>
+    private const string PromptFileTemplate = "${TMPDIR:-/tmp}/codeybox-devin-prompt.XXXXXX";
+
+    /// <summary>
+    /// Wraps a devin argv so the prompt reaches the CLI as a file it can open,
+    /// and returns the invocation to execute.
+    ///
+    /// <para><b>Why not <c>--prompt-file /dev/stdin</c>.</b> That path must be
+    /// RE-OPENED by the CLI, and the in-VM exec wrapper pipes stdin in before
+    /// dropping to the sandbox user, so the open fails
+    /// <c>Permission denied (os error 13)</c> and every dispatch dies in under
+    /// a second. The pipe itself is delivered fine — only re-opening it is
+    /// refused.</para>
+    ///
+    /// <para><b>Why the prompt still arrives on stdin.</b> <c>MAX_ARG_STRLEN</c>
+    /// (128 KiB per element) caps argv <i>and</i> the environment alike, and
+    /// rework prompts exceed it, so neither can carry the prompt. <c>cat</c>
+    /// reads the already-open descriptor 0 rather than re-opening it, which is
+    /// the operation the sandbox user is allowed to perform, and writes the
+    /// bytes to a file that the CLI can then open normally. The prompt never
+    /// enters argv, the environment, or <c>/proc/&lt;pid&gt;/environ</c>.</para>
+    ///
+    /// <para><c>umask 077</c> and <c>mktemp</c> keep the file 0600, and the
+    /// trap removes it however the turn ends, so a later phase sharing the
+    /// sandbox cannot read a previous prompt. The CLI is NOT <c>exec</c>'d, so
+    /// that trap still runs; bash then exits with devin's own status, and
+    /// <see cref="PreemptProcessPattern"/> still matches the child process.</para>
+    /// </summary>
+    private static AgentInvocation PromptFileInvocation(IReadOnlyList<string> devinArgv, string prompt)
+        => new(["bash", "-c", BuildPromptFileScript(devinArgv)], Stdin: prompt);
+
+    /// <summary>
+    /// The <c>bash -c</c> script body that materialises the piped prompt and
+    /// runs <paramref name="devinArgv"/> against it. Public so
+    /// <c>DevinInVmSmokeProbe</c> exercises the exact prompt path a real
+    /// dispatch uses — a probe that passed while dispatch failed is what let
+    /// the <c>/dev/stdin</c> fault reach production.
+    /// </summary>
+    public static string BuildPromptFileScript(IReadOnlyList<string> devinArgv)
+    {
+        ArgumentNullException.ThrowIfNull(devinArgv);
+        if (devinArgv.Count == 0)
+            throw new ArgumentException("Devin argv must be non-empty.", nameof(devinArgv));
+
+        var command = string.Join(' ', devinArgv.Select(ShellQuote));
+        return string.Join('\n',
+            "set -eu",
+            "umask 077",
+            $"cb_prompt=$(mktemp \"{PromptFileTemplate}\")",
+            "trap 'rm -f \"$cb_prompt\"' EXIT INT TERM",
+            "cat > \"$cb_prompt\"",
+            command + " --prompt-file \"$cb_prompt\"");
     }
 
     /// <summary>
@@ -193,9 +244,7 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         }
 
         _ = reasoningMode;
-        argv.Add("--prompt-file");
-        argv.Add("/dev/stdin");
-        return new AgentInvocation(argv, Stdin: prompt);
+        return PromptFileInvocation(argv, prompt);
     }
 
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
