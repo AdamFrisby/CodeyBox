@@ -179,4 +179,28 @@ public static class AdminFormat
     /// <summary>Round-trip timestamp for detail rows. Never throws; null renders as an em dash.</summary>
     public static string FormatDateTimeFull(DateTimeOffset? at) =>
         at is null ? "—" : at.Value.ToString("O", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Strips line breaks and other control characters so an untrusted value —
+    /// a route parameter, an id typed into a URL, anything an agent produced —
+    /// cannot forge log lines when the sink renders messages as plain text.
+    ///
+    /// <para>Route parameters are the live case: pages declare them as
+    /// unconstrained <c>string</c>, and ASP.NET URL-decodes the segment, so a
+    /// <c>%0A</c> in the path arrives as a real newline. Every admin page that
+    /// logs one must pass it through here.</para>
+    /// </summary>
+    public static string ForLog(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return "";
+        Span<char> buffer = value.Length <= 256 ? stackalloc char[value.Length] : new char[value.Length];
+        var written = 0;
+        foreach (var ch in value)
+        {
+            // Replace rather than drop, so a forged value stays visibly odd in
+            // the log instead of silently closing up into a plausible line.
+            buffer[written++] = char.IsControl(ch) ? '�' : ch;
+        }
+        return new string(buffer[..written]);
+    }
 }

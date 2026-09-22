@@ -196,7 +196,7 @@ else
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Failed to load timeline for {Id}", Id.Replace("\r", "").Replace("\n", ""));
+            Logger.LogError(ex, "Failed to load timeline for {Id}", AdminFormat.ForLog(Id));
             _error = "Failed to load timeline. Check server logs for details.";
         }
 
@@ -207,7 +207,7 @@ else
         }
         catch (Exception ex)
         {
-            Logger.LogWarning(ex, "Failed to load audit reports for timeline {Id}", Id.Replace("\r", "").Replace("\n", ""));
+            Logger.LogWarning(ex, "Failed to load audit reports for timeline {Id}", AdminFormat.ForLog(Id));
         }
     }
 

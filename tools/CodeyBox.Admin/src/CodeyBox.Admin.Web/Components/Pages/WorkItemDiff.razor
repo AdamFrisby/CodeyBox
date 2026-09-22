@@ -139,7 +139,7 @@ else
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Failed to load diff for {Id}", Id.Replace("\r", "").Replace("\n", ""));
+            Logger.LogError(ex, "Failed to load diff for {Id}", AdminFormat.ForLog(Id));
             _error = "Failed to load diff. Check server logs for details.";
         }
     }
