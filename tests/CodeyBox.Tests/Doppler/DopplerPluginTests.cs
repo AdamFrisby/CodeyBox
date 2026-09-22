@@ -29,7 +29,7 @@ namespace CodeyBox.Tests.Doppler;
 public sealed class DopplerPluginTests : IDisposable
 {
     private const string StaticValue = "doppler-live-value-7a4b9c2d1e";
-    private const string IdentityToken = "dp.sa.ident.8f3a1b2c4d5e6f708192a3b4c5d6e7f8";
+    private const string IdentityToken = "dp.sa.ident.test-placeholder-token";
     private static readonly DateTimeOffset IdentityExpiry =
         new(2030, 5, 1, 1, 0, 0, TimeSpan.Zero);
 
@@ -87,7 +87,7 @@ public sealed class DopplerPluginTests : IDisposable
                     return Json(new { message = "Invalid identity.", error = "Unauthorized", statusCode = 401 }, HttpStatusCode.Unauthorized);
                 Interlocked.Increment(ref Exchanges);
                 if (OidcExpiresAt is { } fresh)
-                    return Json(new { token = "dp.sa.ident.8f3a1b2c4d5e6f708192a3b4c5d6e7f8", expires_at = fresh.ToString("O") }, HttpStatusCode.OK);
+                    return Json(new { token = "dp.sa.ident.test-placeholder-token", expires_at = fresh.ToString("O") }, HttpStatusCode.OK);
                 return Raw(OidcJson);
             }
             if (path.EndsWith("/v3/auth/revoke", StringComparison.Ordinal))
@@ -638,6 +638,52 @@ public sealed class DopplerPluginTests : IDisposable
         await provider.RevokeAsync(material.LeaseId);
         await provider.RevokeAsync(material.LeaseId);
         Assert.Equal(secretCallsBefore, _handler.CountRequests(HttpMethod.Get.Method, "/v3/configs/config/secret"));
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized, DopplerFailureKind.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden, DopplerFailureKind.Unauthorized)]
+    [InlineData((HttpStatusCode)429, DopplerFailureKind.RateLimited)]
+    [InlineData(HttpStatusCode.BadRequest, DopplerFailureKind.Misconfigured)]
+    [InlineData(HttpStatusCode.InternalServerError, DopplerFailureKind.BackendError)]
+    public async Task Revoke_Propagates_Non_NotFound_Failures_For_Retry(
+        HttpStatusCode status, DopplerFailureKind kind)
+    {
+        // Only a genuinely absent token (404) is success-by-definition.
+        // 401/403/429 — and any other non-404 failure — must propagate so
+        // the sweep retries a revocation that never happened instead of
+        // dropping the token and recording a revocation that never was.
+        using var http = new HttpClient(new DelegatingHandlerStub((request, ct) =>
+            Task.FromResult(new HttpResponseMessage(status)
+            {
+                Content = new StringContent(
+                    """{"message":"Revocation did not happen.","error":"Revocation did not happen"}""",
+                    Encoding.UTF8, "application/json"),
+            })))
+        { Timeout = TimeSpan.FromSeconds(10) };
+        var api = new DopplerRestClient(http);
+
+        var ex = await Assert.ThrowsAsync<DopplerException>(() =>
+            api.RevokeTokenAsync("https://doppler.example.com", "doomed-token"));
+        Assert.Equal(kind, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Revoke_Treats_Unknown_Token_As_Revoked()
+    {
+        using var http = new HttpClient(new DelegatingHandlerStub((request, ct) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)
+            {
+                Content = new StringContent(
+                    """{"message":"Unknown token.","error":"Not Found"}""",
+                    Encoding.UTF8, "application/json"),
+            })))
+        { Timeout = TimeSpan.FromSeconds(10) };
+        var api = new DopplerRestClient(http);
+
+        // Must not throw: an unknown or already-revoked token means the
+        // revocation goal is already met (idempotent teardown).
+        await api.RevokeTokenAsync("https://doppler.example.com", "doomed-token");
     }
 
     [Fact]

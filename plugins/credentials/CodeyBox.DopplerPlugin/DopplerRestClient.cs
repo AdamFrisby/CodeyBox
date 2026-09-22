@@ -128,9 +128,11 @@ public sealed class DopplerRestClient
 
     /// <summary>
     /// Revokes a minted identity token (<c>POST /v3/auth/revoke</c>).
-    /// Idempotent: a 4xx (unknown or already-revoked token) counts as
-    /// revoked, matching the manager's must-be-idempotent contract. Only
-    /// 5xx, unreachable, or redirect-refusal failures propagate.
+    /// Idempotent only for a genuinely absent token (HTTP 404): an
+    /// unknown or already-revoked token counts as revoked, matching the
+    /// manager's must-be-idempotent contract. Every other failure —
+    /// notably 401/403 (rejected credential) and 429 (rate-limited) —
+    /// propagates so the sweep retries a revocation that never happened.
     /// </summary>
     public async Task RevokeTokenAsync(string apiUrl, string token, CancellationToken ct = default)
     {
@@ -150,8 +152,7 @@ public sealed class DopplerRestClient
             response.Dispose();
             _log.LogInformation("Doppler revoked identity token.");
         }
-        catch (DopplerException ex) when (ex.Kind == DopplerFailureKind.NotFound
-            || (ex.StatusCode.HasValue && ex.StatusCode.Value >= 400 && ex.StatusCode.Value < 500))
+        catch (DopplerException ex) when (ex.Kind == DopplerFailureKind.NotFound)
         {
             // Unknown or already-revoked token: revocation is complete by
             // definition. The lease id (not the token) is the logged unit.
@@ -296,7 +297,15 @@ public sealed class DopplerRestClient
             }
             text = Encoding.UTF8.GetString(sink.ToArray());
         }
-        catch (Exception)
+        catch (IOException)
+        {
+            return "no readable error body";
+        }
+        catch (HttpRequestException)
+        {
+            return "no readable error body";
+        }
+        catch (ObjectDisposedException)
         {
             return "no readable error body";
         }
@@ -313,7 +322,14 @@ public sealed class DopplerRestClient
                     {
                         var detail = message.GetString() ?? string.Empty;
                         if (!string.IsNullOrWhiteSpace(detail))
-                            return detail.Length <= MaxServerDetailChars ? detail : detail[..MaxServerDetailChars];
+                        {
+                            // Flatten CR/LF like the raw branch below: this
+                            // text flows into exception messages, host logs,
+                            // and the lease store, so a newline-bearing
+                            // server message must not forge log lines.
+                            var flatDetail = detail.Replace('\n', ' ').Replace('\r', ' ');
+                            return flatDetail.Length <= MaxServerDetailChars ? flatDetail : flatDetail[..MaxServerDetailChars];
+                        }
                     }
                 }
             }
