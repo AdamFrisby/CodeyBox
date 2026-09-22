@@ -1,0 +1,28 @@
+[
+  {
+    "id": "h5a2nk7exampleitem000001",
+    "title": "Paid API",
+    "version": 3,
+    "vault": {
+      "id": "ftz4pm2xxwmwrsd7rjqn7grzfz",
+      "name": "Automation"
+    },
+    "category": "API_CREDENTIAL",
+    "lastEditedBy": "EXAMPLEUSERID",
+    "createdAt": "2026-03-01T10:00:00Z",
+    "updatedAt": "2026-08-15T10:00:00Z"
+  },
+  {
+    "id": "k9p4exampleitem00000002",
+    "title": "Search API",
+    "version": 1,
+    "vault": {
+      "id": "ftz4pm2xxwmwrsd7rjqn7grzfz",
+      "name": "Automation"
+    },
+    "category": "API_CREDENTIAL",
+    "lastEditedBy": "EXAMPLEUSERID",
+    "createdAt": "2026-04-01T10:00:00Z",
+    "updatedAt": "2026-04-01T10:00:00Z"
+  }
+]
