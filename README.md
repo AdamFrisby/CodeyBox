@@ -48,14 +48,15 @@ promote to real work items in one click.
 
 <table>
 <tr>
-<td width="50%"><img src="screenshots/10-work-item-detail.png" alt="A single work item"><br><sub><b>One item, end to end</b> — state, branches, and tabs for its timeline, audit reports, timings, costs and diff.</sub></td>
-<td width="50%"><img src="screenshots/05-capacity.png" alt="Subscription capacity"><br><sub><b>Capacity</b> — quota snapshots joined against real token consumption, to estimate what each 1% of a window buys.</sub></td>
+<td width="50%"><img src="screenshots/map-03-dependencies.png" alt="A chain and its dependencies"><br><sub><b>A chain, and what waits on what</b> — a seven-item feature forking after its second step. Every edge says which item it waits on, by title rather than by id, and a <code>(+)</code> beside a card files a new item that waits on it.</sub></td>
+<td width="50%"><img src="screenshots/map-04-stages.png" alt="One item's stage pipeline"><br><sub><b>Zoom into an item</b> and you get its stage pipeline — work, audit as a decision gate that sends failures back rather than a box to pass through, then merge and landed.</sub></td>
 </tr>
 </table>
 
-Screenshots of the remaining screens are in [`screenshots/`](screenshots); the
-page captures are generated against a deterministic seeded instance by
-[`tools/screenshots/`](tools/screenshots).
+The remaining page screenshots in [`screenshots/`](screenshots) predate this
+rework and still show the old sidebar shell; they are generated against a
+deterministic seeded instance by [`tools/screenshots/`](tools/screenshots) and
+are being regenerated.
 
 ## Want it on your phone? Use Agnes
 
