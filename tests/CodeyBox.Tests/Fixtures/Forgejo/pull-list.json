@@ -1,0 +1,28 @@
+[
+  {
+    "id": 41,
+    "number": 7,
+    "index": 7,
+    "state": "open",
+    "title": "Add feature Z",
+    "body": "Automated via CodeyBox",
+    "html_url": "https://forge.example.com/team/repo/pulls/7",
+    "merged": false,
+    "mergeable": true,
+    "head": { "label": "team:codeybox/abc123", "ref": "codeybox/abc123", "sha": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c" },
+    "base": { "label": "team:main", "ref": "main", "sha": "1111111111111111111111111111111111111111" }
+  },
+  {
+    "id": 42,
+    "number": 8,
+    "index": 8,
+    "state": "open",
+    "title": "WIP: another change",
+    "body": "",
+    "html_url": "https://forge.example.com/team/repo/pulls/8",
+    "merged": false,
+    "mergeable": null,
+    "head": { "label": "team:codeybox/def456", "ref": "codeybox/def456", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "base": { "label": "team:main", "ref": "main", "sha": "1111111111111111111111111111111111111111" }
+  }
+]

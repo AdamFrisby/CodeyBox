@@ -1,0 +1,14 @@
+[
+  {
+    "id": 501,
+    "rule_name": "main",
+    "branch_name": "main",
+    "required_approvals": 2,
+    "enable_status_check": true,
+    "status_check_contexts": ["continuous-integration/forgejo/build"],
+    "block_on_rejected_reviews": true,
+    "dismiss_stale_approvals": true,
+    "created_at": "2026-09-01T00:00:00Z",
+    "updated_at": "2026-09-01T00:00:00Z"
+  }
+]
