@@ -14,8 +14,9 @@ product decisions; it handles the delivery grind.
 It drives a *fleet* of two dozen agent CLIs — Claude Code, OpenAI Codex, GitHub
 Copilot, Cursor, Devin, Gemini, opencode, Aider, Goose and more — and routes
 each task to whichever one is best and available, falling back automatically
-when a provider hits a rate limit. No coding agent ever runs on your host: every model call that
-touches a repository happens through an agent CLI inside a sandbox.
+when a provider hits a rate limit. No coding agent ever runs on your host:
+every model call that touches a repository happens through an agent CLI inside
+a sandbox.
 
 Every agent is boxed in a real VM behind a host-enforced firewall, because the
 point is to be able to leave it running — see
