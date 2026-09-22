@@ -56,6 +56,34 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// </summary>
     protected virtual Func<ExternalToolAuditorOptions> OptionsAccessor => static () => new ExternalToolAuditorOptions();
 
+    /// <summary>
+    /// Extra environment for the tool process, merged over the sandbox
+    /// baseline environment at exec time. Override when a tool's behavior is
+    /// env-controlled — e.g. to pin configuration that must not come from the
+    /// audited repository. Values should be author-chosen constants, never
+    /// untrusted data. Default: none.
+    /// </summary>
+    protected virtual IReadOnlyDictionary<string, string>? BuildToolEnvironment(ExternalToolAuditorOptions options)
+        => null;
+
+    /// <summary>
+    /// Pre-scan precondition hook, invoked inside <see cref="RunAsync"/> after
+    /// the tool's presence is confirmed and before the scan executes. Override
+    /// for tool requirements the base cannot express — a pinned version, a
+    /// repository-state gate — and throw <see cref="AuditUnavailableException"/>
+    /// to fail closed: a failed precondition is infrastructure, never a pass.
+    /// Use <see cref="ExecToolBoundedAsync"/> for precondition probes so they
+    /// get the same timeout bounding and failure classification as the scan.
+    /// The default imposes no extra preconditions.
+    /// </summary>
+    protected virtual Task VerifyToolAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+        => Task.CompletedTask;
+
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -71,6 +99,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var argv = BuildArgv(tool, options);
 
         await ThrowIfToolMissingAsync(sandbox, workingDirectory, tool, ct).ConfigureAwait(false);
+        await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
         var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
 
         if (result.ExecutionUnavailable)
@@ -140,7 +169,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 $"could-not-verify: audit tool '{tool}' is not installed in the audit sandbox. Install it in the sandbox baseline; the check did not run, so this is infrastructure, not a verdict on the diff.");
     }
 
-    private async Task<SandboxExecResult> ExecToolAsync(
+    private Task<SandboxExecResult> ExecToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
@@ -148,28 +177,64 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        var timeout = options.Timeout <= TimeSpan.Zero
-            ? TimeSpan.FromSeconds(ExternalToolAuditorOptions.DefaultTimeoutSeconds)
-            : options.Timeout;
-        var maxBytes = Math.Clamp(options.MaxOutputBytesPerStream, 4096, 64 * 1024 * 1024);
-
-        using var timeoutCts = new CancellationTokenSource(timeout);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-        try
-        {
-            return await sandbox.ExecAsync(new SandboxExec
+        var maxBytes = Math.Clamp(
+            options.MaxOutputBytesPerStream,
+            ExternalToolAuditorOptions.MinCapturedOutputBytes,
+            ExternalToolAuditorOptions.MaxCapturedOutputBytes);
+        return ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "scan",
+            new SandboxExec
             {
                 Argv = argv,
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = maxBytes,
                 MaxStderrBytes = maxBytes,
                 KillOnOutputLimit = false,
-            }, linkedCts.Token).ConfigureAwait(false);
+                ExtraEnvironment = BuildToolEnvironment(options),
+            },
+            EffectiveTimeout(options),
+            ct);
+    }
+
+    /// <summary>
+    /// Effective per-invocation timeout: the configured value, or the default
+    /// when it is unset or non-positive.
+    /// </summary>
+    protected static TimeSpan EffectiveTimeout(ExternalToolAuditorOptions options)
+        => options.Timeout <= TimeSpan.Zero
+            ? TimeSpan.FromSeconds(ExternalToolAuditorOptions.DefaultTimeoutSeconds)
+            : options.Timeout;
+
+    /// <summary>
+    /// Executes one bounded invocation on behalf of <paramref name="tool"/>:
+    /// enforces <paramref name="timeout"/> and classifies a timeout or exec
+    /// transport failure as <see cref="AuditUnavailableException"/> naming the
+    /// tool — infrastructure, never a pass. Cooperative cancellation and
+    /// sandbox-provisioning deferrals propagate unwrapped. The scan path uses
+    /// this; <see cref="VerifyToolAsync"/> overrides use it for precondition
+    /// probes. <paramref name="operation"/> names the invocation in failure
+    /// messages (e.g. "scan", "version check").
+    /// </summary>
+    protected static async Task<SandboxExecResult> ExecToolBoundedAsync(
+        ISandbox sandbox,
+        string tool,
+        string operation,
+        SandboxExec exec,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+        try
+        {
+            return await sandbox.ExecAsync(exec, linkedCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' timed out after {FormatTimeout(timeout)} without producing a verdict.");
+                $"could-not-verify: audit tool '{tool}' {operation} timed out after {FormatTimeout(timeout)}.");
         }
         catch (OperationCanceledException)
         {
@@ -178,7 +243,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' could not execute: {SingleLine(ex.Message)}",
+                $"could-not-verify: audit tool '{tool}' {operation} could not run: {SingleLine(ex.Message)}",
                 ex);
         }
     }
@@ -312,7 +377,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
         int droppedFindings,
         bool findingsTruncated)
     {
-        var maxBytes = Math.Clamp(options.MaxOutputBytesPerStream, 4096, 64 * 1024 * 1024);
+        var maxBytes = Math.Clamp(
+            options.MaxOutputBytesPerStream,
+            ExternalToolAuditorOptions.MinCapturedOutputBytes,
+            ExternalToolAuditorOptions.MaxCapturedOutputBytes);
         var stdout = result.Stdout;
         if (result.StdoutLimitExceeded)
             stdout += $"\n[stdout truncated after {maxBytes} bytes]";
@@ -375,7 +443,8 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private static string Tail(string text, int maxChars)
         => text.Length <= maxChars ? text : text[^maxChars..];
 
-    private static string SingleLine(string message)
+    /// <summary>Flattens tool output to a single line for failure messages.</summary>
+    protected static string SingleLine(string message)
         => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 
     private static string FormatTimeout(TimeSpan timeout)

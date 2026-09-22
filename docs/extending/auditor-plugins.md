@@ -308,7 +308,21 @@ Behaviour the base guarantees identically for every tool:
   the plugin's scoped config section; resolve it per invocation so edits apply
   without a restart.
 
-A worked example lives at
+Two extension points cover tool requirements the base cannot express
+declaratively:
+
+- `VerifyToolAsync` — a pre-scan precondition hook invoked inside `RunAsync`
+  after the tool's presence is confirmed. Override it for checks like a pinned
+  tool version or repository-state gates, throwing `AuditUnavailableException`
+  to fail closed. Run probes through `ExecToolBoundedAsync` so they inherit
+  the same timeout bounding and failure classification as the scan.
+- `BuildToolEnvironment` — extra environment variables for the tool process,
+  for tools whose behavior is env-controlled (e.g. pinning configuration that
+  must not come from the audited repository).
+
+`plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/` uses both to pin a
+scanner version and keep repo-authored suppression files from silencing the
+audit. A worked example lives at
 `plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/`.
 
 ## Sample plugin

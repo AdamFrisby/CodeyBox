@@ -17,7 +17,8 @@ finding with the gitleaks rule id and `file:line` location.
   plugin's declared mapping sends every result to `Error`. A detected
   credential fails the audit — that is the intended gate. There is no
   advisory mode; narrow the scope instead (`ExcludedRules`, `ExcludePaths`,
-  or the repo's `.gitleaks.toml` allowlist).
+  or — with `TrustRepositorySuppression` — the repo's `.gitleaks.toml`
+  allowlist).
 
 ## What it cannot see
 
@@ -27,8 +28,13 @@ finding with the gitleaks rule id and `file:line` location.
 - **Non-git directories.** If the working directory is not a git repository
   the scan cannot run and is reported as infrastructure, not a pass.
 - **Anything gitleaks's rules don't cover.** Findings are exactly what the
-  pinned gitleaks build detects; custom detectors need a `.gitleaks.toml` in
-  the repository (or an operator-supplied `--config` via `ExtraArguments`).
+  pinned gitleaks build detects; custom detectors need an operator-supplied
+  `--config` via `ExtraArguments` (or `TrustRepositorySuppression` to honor a
+  `.gitleaks.toml` in the repository — see below).
+- **Secrets committed under an `ExcludePaths` prefix.** `vendor/`,
+  `third_party/`, and `node_modules/` are finding filters: gitleaks still
+  scans them, but findings there are dropped — so a leak committed under an
+  excluded prefix never surfaces. Re-include by overriding `ExcludePaths`.
 - **Runtime provenance of a finding.** `git`-mode SARIF locations point at the
   file path and line; the originating commit is in the finding description,
   not the location.
@@ -107,22 +113,40 @@ Scoped under `CodeyBox:Plugins:codeybox.gitleaks`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `8.30.1` | Pinned gitleaks release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
+| `TrustRepositorySuppression` | `false` | When `true`, the audited repository's own suppression surfaces are honored: `.gitleaks.toml` config, `.gitleaksignore` fingerprints, and `gitleaks:allow` comments. See below — off by default because the audit subject authors those files. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact gitleaks rule ids to keep/drop (e.g. `generic-api-key`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config /abs/path/in/sandbox.toml` or `--ignore-gitleaks-allow`. A repeated flag wins over the built-in default. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config <sandbox path>` to pin an operator-controlled ruleset. A repeated flag wins over the built-in default. |
 | `TimeoutSeconds` | `300` | Per-run bound; also forwarded to gitleaks's own `--timeout`. Exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 
-**Repository files gitleaks honours** (precedence: `--config` →
-`GITLEAKS_CONFIG` → `GITLEAKS_CONFIG_TOML` → `<repo>/.gitleaks.toml` →
-built-in default): a `.gitleaks.toml` in the audited repository defines or
-extends rules and allowlists, and `.gitleaksignore` suppresses known
-fingerprints. Both are committed files — an agent under audit can edit them
-to hide a leak, and `gitleaks:allow` comments do the same inline. Those edits
-are part of the audited diff, but an operator who wants audit-controlled
-rules should pin a config outside the repo via `ExtraArguments`
-(`--config,<sandbox path>`) and consider `--ignore-gitleaks-allow`.
+**Repository-controlled suppression is off by default.** gitleaks honors
+three suppression surfaces authored inside the audited repository — a
+`.gitleaks.toml` (custom rules *and* allowlists), a `.gitleaksignore`
+(fingerprint suppression; gitleaks loads it unconditionally — no flag
+disables it), and inline `gitleaks:allow` comments. Because the audited agent
+can write all three, the plugin neutralizes them unless the operator opts in:
+
+- the scan exports `GITLEAKS_CONFIG_TOML` pinning gitleaks's built-in
+  ruleset, which outranks `<repo>/.gitleaks.toml` (gitleaks config
+  precedence: `--config` → `GITLEAKS_CONFIG` → `GITLEAKS_CONFIG_TOML` →
+  repo `.gitleaks.toml` → built-in default — so an operator `--config` in
+  `ExtraArguments` or a baseline `GITLEAKS_CONFIG` still wins);
+- `--ignore-gitleaks-allow` disables `gitleaks:allow` comments;
+- `--gitleaks-ignore-path` points at an inert path, and a pre-scan check
+  **fails closed as infrastructure** when `<repo>/.gitleaksignore` exists —
+  remove it, or set `TrustRepositorySuppression=true` to trust it.
+
+Set `TrustRepositorySuppression: true` under
+`CodeyBox:Plugins:codeybox.gitleaks` when the audited repositories
+legitimately carry `.gitleaks.toml` detectors or `.gitleaksignore`
+fingerprints. Understand the trade-off below before enabling it.
+
+The alternative to trusting repo files is operator-controlled config: pin a
+ruleset outside the repo via `ExtraArguments` (`--config
+/abs/path/in/sandbox.toml`) or a baseline `GITLEAKS_CONFIG`, and manage
+suppression through `ExcludedRules`/`ExcludePaths`.
 
 ## Default scope
 
@@ -130,5 +154,5 @@ Vendored and dependency trees (`vendor/`, `third_party/`, `node_modules/`)
 are excluded by default: secrets reported there belong to upstream packages,
 not the change under audit, and the noise would teach operators to ignore the
 auditor. The exclusion is a finding filter — gitleaks still scans those paths
-(scan-time exclusion belongs to the repo's `.gitleaks.toml`). Re-include them
+(scan-time exclusion belongs to an operator-pinned `--config`). Re-include them
 by overriding `ExcludePaths`.

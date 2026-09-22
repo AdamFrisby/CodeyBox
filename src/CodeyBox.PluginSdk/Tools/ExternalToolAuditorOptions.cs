@@ -21,6 +21,13 @@ public sealed class ExternalToolAuditorOptions
     /// <summary>Maximum distinct extra arguments an operator may append. Enforced before execution.</summary>
     public const int MaxExtraArguments = 256;
 
+    /// <summary>Ceiling applied to <see cref="Timeout"/> at bind and exec time, in seconds.</summary>
+    public const int MaxTimeoutSeconds = 3600;
+
+    /// <summary>Floor and ceiling applied to <see cref="MaxOutputBytesPerStream"/> at bind and exec time.</summary>
+    public const int MinCapturedOutputBytes = 4096;
+    public const int MaxCapturedOutputBytes = 64 * 1024 * 1024;
+
     /// <summary>
     /// Per-invocation ceiling for the tool. When exceeded the run is reported
     /// as infrastructure (the check could not complete), never as a pass.
@@ -92,11 +99,11 @@ public sealed class ExternalToolAuditorOptions
 
         var timeoutSeconds = ReadInt(section["TimeoutSeconds"]);
         if (timeoutSeconds.HasValue && timeoutSeconds.Value > 0)
-            bound.Timeout = TimeSpan.FromSeconds(Math.Min(timeoutSeconds.Value, 3600));
+            bound.Timeout = TimeSpan.FromSeconds(Math.Min(timeoutSeconds.Value, MaxTimeoutSeconds));
 
         var maxOutput = ReadInt(section["MaxOutputBytesPerStream"]);
-        if (maxOutput.HasValue && maxOutput.Value >= 4096)
-            bound.MaxOutputBytesPerStream = Math.Min(maxOutput.Value, 64 * 1024 * 1024);
+        if (maxOutput.HasValue && maxOutput.Value >= MinCapturedOutputBytes)
+            bound.MaxOutputBytesPerStream = Math.Min(maxOutput.Value, MaxCapturedOutputBytes);
 
         var maxFindings = ReadInt(section["MaxFindings"]);
         if (maxFindings.HasValue && maxFindings.Value > 0)
