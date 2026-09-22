@@ -282,6 +282,18 @@ Then configure the orchestrator:
 }
 ```
 
+## Production Forgejo plugin
+
+Beyond the sample above, `plugins/upstream/CodeyBox.ForgejoUpstreamPlugin/`
+is a production-quality, first-class upstream remote for Forgejo
+(`codeybox.forgejo-upstream`, `Upstream.Kind = "forgejo"`) implementing the
+full `IUpstreamRemote` contract: push/open/auto-merge, release-sync branch
+merges, base-branch fetch, PR listing/reads, plus the extended surfaces
+Forgejo genuinely provides (reviews, commit statuses, plain comments,
+repository webhooks, repository metadata). See its `README.md` for the
+support matrix, configuration, and instance-version requirements. It is off
+unless an operator allowlists it and selects the kind.
+
 ## Registering your plugin
 
 1. Add the plugin assembly path to `CodeyBox:Plugins:AssemblyPaths`.

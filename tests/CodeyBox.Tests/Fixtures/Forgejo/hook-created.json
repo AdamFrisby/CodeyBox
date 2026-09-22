@@ -1,0 +1,13 @@
+{
+  "id": 402,
+  "type": "forgejo",
+  "events": ["push", "pull_request"],
+  "active": true,
+  "config": {
+    "url": "https://codeybox.example.com/hooks/forgejo",
+    "content_type": "json"
+  },
+  "url": "https://codeybox.example.com/hooks/forgejo",
+  "created_at": "2026-09-10T14:00:00Z",
+  "updated_at": "2026-09-10T14:00:00Z"
+}

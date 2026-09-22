@@ -61,6 +61,7 @@
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.InfisicalPlugin\CodeyBox.InfisicalPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.AzureDevOpsUpstreamPlugin\CodeyBox.AzureDevOpsUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.GiteaUpstreamPlugin\CodeyBox.GiteaUpstreamPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\upstream\CodeyBox.ForgejoUpstreamPlugin\CodeyBox.ForgejoUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.SlackPlugin\CodeyBox.SlackPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--

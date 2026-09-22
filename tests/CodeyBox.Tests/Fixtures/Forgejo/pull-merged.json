@@ -1,0 +1,31 @@
+{
+  "id": 41,
+  "number": 7,
+  "index": 7,
+  "state": "closed",
+  "title": "Add feature Z",
+  "body": "Automated via CodeyBox",
+  "html_url": "https://forge.example.com/team/repo/pulls/7",
+  "url": "https://forge.example.com/api/v1/repos/team/repo/pulls/7",
+  "merged": true,
+  "mergeable": true,
+  "merge_commit_sha": "cafef00dcafef00dcafef00dcafef00dcafef00d",
+  "head": {
+    "label": "team:codeybox/abc123",
+    "ref": "codeybox/abc123",
+    "sha": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c",
+    "repo_id": 12
+  },
+  "base": {
+    "label": "team:main",
+    "ref": "main",
+    "sha": "1111111111111111111111111111111111111111",
+    "repo_id": 12
+  },
+  "requested_reviewers": [],
+  "requested_reviewers_teams": [],
+  "created_at": "2026-09-10T08:00:00Z",
+  "updated_at": "2026-09-10T09:00:00Z",
+  "closed_at": "2026-09-10T13:00:00Z",
+  "merged_at": "2026-09-10T13:00:00Z"
+}
