@@ -1,0 +1,35 @@
+[
+  {
+    "id": 101,
+    "user": { "id": 2, "login": "approver-bob" },
+    "body": "Looks good.",
+    "state": "APPROVED",
+    "commit_id": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c",
+    "stale": false,
+    "dismissed": false,
+    "submitted_at": "2026-09-10T10:00:00Z",
+    "html_url": "https://forge.example.com/team/repo/pulls/7#pullrequestreview-101"
+  },
+  {
+    "id": 102,
+    "user": { "id": 3, "login": "reviewer-ada" },
+    "body": "Needs a test for the empty case.",
+    "state": "REQUEST_CHANGES",
+    "commit_id": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c",
+    "stale": false,
+    "dismissed": false,
+    "submitted_at": "2026-09-10T11:00:00Z",
+    "html_url": "https://forge.example.com/team/repo/pulls/7#pullrequestreview-102"
+  },
+  {
+    "id": 103,
+    "user": { "id": 4, "login": "commenter-cy" },
+    "body": "Nit: rename this variable.",
+    "state": "COMMENT",
+    "commit_id": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c",
+    "stale": false,
+    "dismissed": false,
+    "submitted_at": "2026-09-10T12:00:00Z",
+    "html_url": "https://forge.example.com/team/repo/pulls/7#pullrequestreview-103"
+  }
+]
