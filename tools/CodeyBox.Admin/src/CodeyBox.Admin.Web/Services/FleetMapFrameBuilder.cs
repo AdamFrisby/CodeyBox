@@ -151,6 +151,7 @@ public static class FleetMapFrameBuilder
                 rowGap = options.RowGap,
                 laneGap = options.ChainLaneGap,
                 minFitZoom = options.MinFitZoom,
+                wholeBoardMinZoom = options.WholeBoardMinZoom,
                 panMargin = options.PanMarginFraction,
                 futureNear = options.FutureNearBatches,
                 futureCompression = options.FutureCompression,
@@ -191,6 +192,7 @@ public static class FleetMapFrameBuilder
                     w = Round(b.Width),
                     label = b.Label,
                     exact = b.Exact,
+                    since = b.SinceLatest,
                     minutes = Math.Round(b.Skipped.TotalMinutes),
                 }).ToList(),
                 basis = "past: when it landed — the longest idle stretches are cut and labelled, shorter idle is compressed (the ruler readout gives the exact time) · future: predicted order from dependencies and capacity, not a schedule",
@@ -320,10 +322,6 @@ public static class FleetMapFrameBuilder
             if (string.Equals(lane.ChainId, FleetMapBuilder.LooseLaneId, StringComparison.Ordinal))
             {
                 label = "No dependencies";
-            }
-            else if (FleetMapBuilder.IsHistoryLane(lane.ChainId))
-            {
-                label = "Landed work";
             }
             else if (chainIds.Count == 1 && prefixByChain.TryGetValue(chainIds[0], out var prefix) && !string.IsNullOrWhiteSpace(prefix))
             {

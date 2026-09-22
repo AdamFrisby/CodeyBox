@@ -49,7 +49,7 @@ public sealed class CameraBoundsTests
 
         var tooFar = CameraBounds.Clamp(new CameraViewport { CenterX = 0, CenterY = 0, Zoom = 0.001 }, layout, View, Options);
         Assert.Equal(CameraBounds.MinZoom(layout, View, Options), tooFar.Zoom);
-        Assert.True(tooFar.Zoom >= Options.MinFitZoom * 0.5);
+        Assert.True(tooFar.Zoom >= Options.WholeBoardMinZoom && tooFar.Zoom <= Options.MinFitZoom);
     }
 
     [Fact]

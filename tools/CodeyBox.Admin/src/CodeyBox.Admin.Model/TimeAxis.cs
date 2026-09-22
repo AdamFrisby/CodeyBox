@@ -34,6 +34,9 @@ public sealed record AxisBreak
 
     public required TimeSpan Skipped { get; init; }
 
+    /// <summary>True for the gap between the latest landing and now: always a cut of fixed width, so the settled past never moves with the clock.</summary>
+    public bool SinceLatest { get; init; }
+
     /// <summary>Duration text for the ruler, one unit, e.g. "16h" or "3w".</summary>
     public string Label => AgeText.Coarse(Skipped);
 
@@ -158,9 +161,10 @@ public sealed record SettledLanding(string Id, string LaneId, DateTimeOffset Fin
 /// months into hundreds of cuts; instead the cuts are <em>bounded</em>: only
 /// the <see cref="FleetMapOptions.MaxCuts"/> longest idle stretches (each at
 /// least <see cref="FleetMapOptions.QuietGapMinutes"/>) are cut out and
-/// replaced by a marked break of fixed width, and the quiet since the latest
-/// landing is always one of them once it qualifies, so a quiet fleet's past
-/// stops moving. Every other idle gap stays inside its run, compressed by an
+/// replaced by a marked break of fixed width, and the gap from the latest
+/// landing to now is always one of them — so the settled past is anchored
+/// to its own landings and the clock moves nothing: same facts, later
+/// clock, same positions. Every other idle gap stays inside its run, compressed by an
 /// invertible curve — faithful up to
 /// <see cref="FleetMapOptions.PastCompressAfterMinutes"/>, logarithmic
 /// beyond — so a run reads as continuous time on the ruler and any x in it
@@ -214,10 +218,12 @@ public static class TimeAxisScale
             .ToList();
         var times = landings.Select(l => l.FinishedAt).Distinct().OrderByDescending(t => t).ToList();
 
-        // 1. Which idle stretches are cut: the quiet since the latest landing
-        //    whenever it qualifies, then the longest of the rest, up to the cap.
+        // 1. Which idle stretches are cut: the gap from the latest landing to
+        //    now, always (a fixed-width, labelled cut, so the settled past is
+        //    anchored to its own landings and the clock moves nothing), then
+        //    the longest of the rest, up to the cap.
         var cutAt = new HashSet<int>();
-        if (times.Count > 0 && nowBucket - times[0] > quiet)
+        if (times.Count > 0)
         {
             cutAt.Add(0);
         }
@@ -252,7 +258,7 @@ public static class TimeAxisScale
             {
                 CloseRun();
                 var next = cursor - (options.NodeWidth + breakWidth);
-                breaks.Add(new AxisBreak { X = next + options.NodeWidth / 2, Width = breakWidth, Skipped = gap });
+                breaks.Add(new AxisBreak { X = next + options.NodeWidth / 2, Width = breakWidth, Skipped = gap, SinceLatest = i == 0 });
                 cursor = next;
             }
             else
@@ -334,12 +340,6 @@ public static class TimeAxisScale
         // now when nothing was cut there): invert the compression from the
         // newer point of the pair.
         var runs = layout.Stretches ?? [];
-        var newestX = runs.Count == 0 ? double.NegativeInfinity : runs.Max(r => r.NewestX);
-        var cutBetween = (layout.Breaks ?? []).Any(c => c.X + c.Width > newestX && c.X <= 0);
-        if (!cutBetween && x > newestX)
-        {
-            return new AxisReading { Zone = AxisZone.Past, At = layout.NowBucket - TimeSpan.FromMinutes(Decompress(-x / rate, options)) };
-        }
         foreach (var run in runs)
         {
             if (x < run.OldestX - options.NodeWidth / 2 || x > run.NewestX + options.NodeWidth / 2)
@@ -415,19 +415,20 @@ public sealed record ForecastSlot
 /// <summary>
 /// The honest forecast: a topological order of the queued items over the
 /// dependency graph, cut into batches by the fleet's concurrency cap.
-/// Wave 0 is dispatchable now (running items occupy the first slots), wave k
-/// waits on wave k−1; within a wave, queue position then creation time
-/// decide, and items whose agent cannot run go last. That is an ordering
-/// with a capacity count — nothing more precise is knowable from the
-/// surfaces, so nothing more precise is claimed. Pure.
+/// Wave 0 is dispatchable next, wave k waits on wave k−1; within a wave,
+/// queue position then creation time decide, and items whose agent cannot
+/// run go last. That is an ordering with a capacity count — nothing more
+/// precise is knowable from the surfaces, so nothing more precise is
+/// claimed. It is a function of the queue's facts alone: the live running
+/// count is deliberately not an input, because it ticks every few seconds
+/// and a still queue must produce a still board. Pure.
 /// </summary>
 public static class QueueForecast
 {
     public static IReadOnlyDictionary<string, ForecastSlot> Rank(
         IReadOnlyList<AdminWorkItem> items,
         IReadOnlyDictionary<string, ItemActivity>? activities,
-        int capacity,
-        int runningNow)
+        int capacity)
     {
         var byId = new Dictionary<string, AdminWorkItem>(StringComparer.Ordinal);
         foreach (var item in items ?? [])
@@ -483,7 +484,7 @@ public static class QueueForecast
 
         var slots = new Dictionary<string, ForecastSlot>(StringComparer.Ordinal);
         var batch = 0;
-        var freeInBatch = Math.Max(0, cap - Math.Max(0, runningNow));
+        var freeInBatch = cap;
         foreach (var group in queued.GroupBy(i => wave[i.Id]).OrderBy(g => g.Key))
         {
             if (group.Key > 0)

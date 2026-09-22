@@ -23,7 +23,7 @@ public sealed class QueueForecastTests
             Q("dead", state: "Failed"), Q("after-dead", dependsOn: ["dead"]),
         };
 
-        var slots = QueueForecast.Rank(items, null, capacity: 10, runningNow: 1);
+        var slots = QueueForecast.Rank(items, null, capacity: 10);
 
         Assert.Equal(0, slots["ready"].Wave);
         Assert.Equal(0, slots["after-done"].Wave);
@@ -36,18 +36,26 @@ public sealed class QueueForecastTests
     }
 
     [Fact]
-    public void Batches_CutByCapacity_MinusWhatIsRunning_AndANewWaveNeverSharesABatch()
+    public void Batches_CutByCapacity_ANewWaveNeverSharesABatch_AndTheRunningCountIsNotAnInput()
     {
         var items = new List<AdminWorkItem> { Q("a", 1), Q("b", 2), Q("c", 3), Q("d", 4), Q("e", 5, ["a"]) };
 
-        var slots = QueueForecast.Rank(items, null, capacity: 3, runningNow: 2);
+        var slots = QueueForecast.Rank(items, null, capacity: 3);
 
-        Assert.Equal(0, slots["a"].Batch); // one free slot right now
-        Assert.Equal(1, slots["b"].Batch);
-        Assert.Equal(1, slots["c"].Batch);
+        Assert.Equal(0, slots["a"].Batch);
+        Assert.Equal(0, slots["b"].Batch);
+        Assert.Equal(0, slots["c"].Batch);
         Assert.Equal(1, slots["d"].Batch);
-        Assert.Equal(2, slots["e"].Batch); // wave 1 starts a fresh batch even though batch 1 was full anyway
+        Assert.Equal(2, slots["e"].Batch); // wave 1 starts a fresh batch
         Assert.Equal(1, slots["e"].Wave);
+
+        // A sibling starting or finishing elsewhere changes nothing about the queue's order.
+        var busier = items.Concat([Q("r1", state: "Working"), Q("r2", state: "Working"), Q("r3", state: "Auditing")]).ToList();
+        var again = QueueForecast.Rank(busier, null, capacity: 3);
+        foreach (var id in new[] { "a", "b", "c", "d", "e" })
+        {
+            Assert.Equal(slots[id].Batch, again[id].Batch);
+        }
     }
 
     [Fact]
@@ -59,7 +67,7 @@ public sealed class QueueForecastTests
             ["benched"] = new ItemActivity { ItemId = "benched", Kind = ActivityKind.BlockedByAgentAvailability, Summary = "agent paused" },
         };
 
-        var slots = QueueForecast.Rank(items, activities, capacity: 1, runningNow: 0);
+        var slots = QueueForecast.Rank(items, activities, capacity: 1);
 
         Assert.Equal(0, slots["early"].Batch);
         Assert.Equal(1, slots["late"].Batch);
@@ -72,7 +80,7 @@ public sealed class QueueForecastTests
     public void CyclesAndOddInput_DoNotHang()
     {
         var items = new List<AdminWorkItem> { Q("a", dependsOn: ["b"]), Q("b", dependsOn: ["a"]), Q("c", dependsOn: ["ghost"]) };
-        var slots = QueueForecast.Rank(items, null, capacity: 0, runningNow: -5);
+        var slots = QueueForecast.Rank(items, null, capacity: 0);
         Assert.Equal(3, slots.Count);
         Assert.All(slots.Values, s => Assert.True(s.Batch >= 0));
     }

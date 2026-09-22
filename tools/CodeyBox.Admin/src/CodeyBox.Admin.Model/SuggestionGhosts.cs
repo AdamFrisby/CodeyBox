@@ -62,8 +62,12 @@ public sealed record SuggestionGhostOptions
 
 /// <summary>
 /// Places open suggestions on the map as ghost nodes beside the item that
-/// produced them — provisional boxes, pre-filled, sitting exactly where the
-/// promoted item would land, joined by the edge that would exist.
+/// produced them — provisional boxes, pre-filled, joined by the edge that
+/// would exist. Each ghost takes the nearest free spot to its parent on a
+/// grid of column and row pitches (right of the parent first, then above
+/// and below, then further out), never on top of a node or another ghost:
+/// proximity is the goal, not a fixed offset, and a taken spot means going
+/// further, never stacking.
 /// Volume: a ghost is drawn only when its parent is on the map (the settled
 /// horizon already bounds that), most severe first, at most
 /// <see cref="SuggestionGhostOptions.MaxPerParent"/> per parent with the rest
@@ -96,6 +100,7 @@ public static class SuggestionGhosts
         var minRank = SeverityRank(options.MinSeverity);
         var cap = Math.Max(1, options.MaxPerParent);
         var groups = new List<GhostGroup>();
+        var occupancy = new WorldOccupancy(layout, mapOptions ?? new FleetMapOptions());
         foreach (var byParent in open
                      .Where(s => s is not null && !string.IsNullOrEmpty(s.Id) && !string.IsNullOrEmpty(s.ParentId))
                      .Where(s => layout.Nodes.ContainsKey(s.ParentId))
@@ -109,14 +114,81 @@ public static class SuggestionGhosts
                 .ThenBy(s => s.Id, StringComparer.Ordinal)
                 .ToList();
             var shown = ordered.Take(cap).ToList();
-            var slots = FleetMapBuilder.PreviewDependents(layout, items, byParent.Key, shown.Count, mapOptions);
+            var parent = layout.Nodes[byParent.Key];
             var placements = new List<GhostPlacement>(shown.Count);
-            for (var i = 0; i < shown.Count && i < slots.Count; i++)
+            for (var i = 0; i < shown.Count; i++)
             {
-                placements.Add(new GhostPlacement { Suggestion = shown[i], X = slots[i].X, Y = slots[i].Y, Rank = i });
+                var spot = occupancy.NearestFree(parent.X, parent.Y);
+                occupancy.Claim(spot.X, spot.Y);
+                placements.Add(new GhostPlacement { Suggestion = shown[i], X = spot.X, Y = spot.Y, Rank = i });
             }
             groups.Add(new GhostGroup { ParentId = byParent.Key, Shown = placements, Folded = ordered.Count - placements.Count });
         }
         return groups;
+    }
+
+    /// <summary>
+    /// Free space on the map, in map units: every laid-out node claims its
+    /// box, every placed ghost claims one too. Candidate spots around a
+    /// point are the column/row grid out to a few rings, nearest first with
+    /// the right-hand side preferred (a dependent sits right of its parent).
+    /// </summary>
+    public sealed class WorldOccupancy
+    {
+        private readonly List<(double X, double Y)> _taken = [];
+        private readonly FleetMapOptions _options;
+
+        public WorldOccupancy(FleetMapLayout layout, FleetMapOptions options)
+        {
+            _options = options;
+            foreach (var node in layout.Nodes?.Values ?? [])
+            {
+                _taken.Add((node.X, node.Y));
+            }
+        }
+
+        public bool IsFree(double x, double y)
+        {
+            foreach (var (tx, ty) in _taken)
+            {
+                if (Math.Abs(tx - x) < _options.NodeWidth * 1.1 && Math.Abs(ty - y) < _options.NodeHeight * 1.1)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public void Claim(double x, double y) => _taken.Add((x, y));
+
+        /// <summary>The nearest free grid spot to (<paramref name="x"/>, <paramref name="y"/>); the far right of the widest ring when nothing nearer is free.</summary>
+        public MapPoint NearestFree(double x, double y)
+        {
+            const int rings = 12;
+            MapPoint? best = null;
+            var bestScore = double.MaxValue;
+            for (var dx = -rings; dx <= rings; dx++)
+            {
+                for (var dy = -rings; dy <= rings; dy++)
+                {
+                    if (dx == 0 && dy == 0)
+                    {
+                        continue;
+                    }
+                    var cx = x + dx * _options.ColumnGap;
+                    var cy = y + dy * _options.RowGap;
+                    // Distance, with the left side, straight above/below and vertical
+                    // moves costing more: right of the parent is where a dependent belongs.
+                    var score = Math.Abs(dx) * (dx < 0 ? 2.5 : 1.0) + Math.Abs(dy) * 1.2 + (dx <= 0 ? 1.5 : 0.0);
+                    if (score >= bestScore || !IsFree(cx, cy))
+                    {
+                        continue;
+                    }
+                    best = new MapPoint(cx, cy);
+                    bestScore = score;
+                }
+            }
+            return best ?? new MapPoint(x + (rings + 1) * _options.ColumnGap, y);
+        }
     }
 }

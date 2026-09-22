@@ -138,6 +138,14 @@ public sealed record FleetMapOptions
     /// <summary>Fraction of the view kept as empty margin beyond the outermost node when panning is bounded.</summary>
     public double PanMarginFraction { get; init; } = 0.25;
 
+    /// <summary>
+    /// The smallest zoom the operator can reach, whatever the board's size:
+    /// the whole board always fits one screen (nodes become dots or smears —
+    /// at full zoom-out one looks for shape and position, not labels). A
+    /// hard floor only, so an absurd extent cannot zoom to zero.
+    /// </summary>
+    public double WholeBoardMinZoom { get; init; } = 0.002;
+
     /// <summary>Largest zoom the camera ever applies when fitting a region.</summary>
     public double MaxFitZoom { get; init; } = 3.2;
 

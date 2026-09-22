@@ -60,8 +60,8 @@ public sealed class LayoutInvarianceTests
     }
 }
 
-/// <summary>Months of history share a strip; the overview frames the live work when the whole map cannot fit.</summary>
-public sealed class HistoryStripTests
+/// <summary>Landed chains keep their shape; the overview reaches the whole board.</summary>
+public sealed class LandedChainTests
 {
     private static readonly FleetMapOptions Options = new();
     private static readonly DateTimeOffset Now = Fixtures.Now;
@@ -70,42 +70,47 @@ public sealed class HistoryStripTests
         Fixtures.Item(id, state: state, dependsOn: dependsOn, updatedAt: Now.AddHours(-hoursAgo));
 
     [Fact]
-    public void WhollyLandedChains_ShareTheHistoryStrip_LiveChainsKeepLanes()
+    public void WhollyLandedChains_KeepTheirOwnLanes_BelowLiveWork_MostRecentFirst_SingletonsPack()
     {
         var items = new List<AdminWorkItem>
         {
-            At("a1", "Done", 100), At("a2", "Done", 99, ["a1"]),
-            At("b1", "Done", 50), At("b2", "Cancelled", 49, ["b1"]),
+            At("a1", "Done", 100), At("a2", "Done", 96, ["a1"]),
+            At("b1", "Done", 50), At("b2", "Cancelled", 46, ["b1"]),
             At("c1", "Done", 5), At("c2", "Working", dependsOn: ["c1"]),
+            At("lone", "Done", 70),
         };
         var layout = FleetMapBuilder.DeriveInitial(items, ChainGrouping.BuildChains(items).ToList(), Options, Now);
-        Assert.Equal(FleetMapBuilder.HistoryLaneId, layout.Nodes["a1"].LaneId);
-        Assert.Equal(FleetMapBuilder.HistoryLaneId, layout.Nodes["b2"].LaneId);
-        Assert.NotEqual(FleetMapBuilder.HistoryLaneId, layout.Nodes["c1"].LaneId);
-        Assert.Equal(layout.Nodes["c1"].LaneId, layout.Nodes["c2"].LaneId);
-        Assert.True(layout.Lanes.Single(l => l.ChainId == FleetMapBuilder.HistoryLaneId).Y > layout.Nodes["c1"].Y, "history sits below the live work");
-        Assert.True(FleetMapBuilder.IsHistoryLane(FleetMapBuilder.HistoryLaneFor("rel-1")));
+        Assert.Equal(layout.Nodes["a1"].LaneId, layout.Nodes["a2"].LaneId);
+        Assert.NotEqual(layout.Nodes["a1"].LaneId, layout.Nodes["b1"].LaneId); // each landed chain its own lane
+        Assert.Equal(layout.Nodes["a1"].Y, layout.Nodes["a2"].Y); // one row: the chain's shape
+        Assert.True(layout.Nodes["c1"].Y < layout.Nodes["b1"].Y && layout.Nodes["b1"].Y < layout.Nodes["a1"].Y, "live first, then landed by recency");
+        Assert.True(FleetMapBuilder.IsLooseLane(layout.Nodes["lone"].LaneId));
+        Assert.True(layout.Nodes["lone"].Y > layout.Nodes["a1"].Y, "the loose lane last");
 
-        // When the last live member lands, the chain moves into the strip: a data change, not a camera one.
+        // When the last live member lands, the chain keeps the lane it had.
         var landed = items.Select(i => i.Id == "c2" ? i with { State = "Done", UpdatedAt = Now } : i).ToList();
         var after = FleetMapBuilder.Update(layout, landed, ChainGrouping.BuildChains(landed).ToList(), Options, Now);
-        Assert.Equal(FleetMapBuilder.HistoryLaneId, after.Nodes["c2"].LaneId);
+        Assert.Equal(layout.Nodes["c2"].LaneId, after.Nodes["c2"].LaneId);
+        Assert.Equal(layout.Nodes["c2"].Y, after.Nodes["c2"].Y);
     }
 
     [Fact]
-    public void Overview_FramesTheLiveWork_WhenMonthsOfHistoryCannotFit()
+    public void Overview_ReachesTheWholeBoard_HoweverLarge()
     {
         var items = new List<AdminWorkItem> { At("run", "Working"), At("q", "Queued", dependsOn: ["run"]) };
         for (var d = 1; d <= 120; d++)
         {
-            items.Add(At($"h{d}", "Done", d * 24 + 0.5));
+            items.Add(At($"h{d}a", "Done", d * 24 + 0.5));
+            items.Add(At($"h{d}b", "Done", d * 24 + 0.4, [$"h{d}a"]));
         }
         var layout = FleetMapBuilder.DeriveInitial(items, ChainGrouping.BuildChains(items).ToList(), Options, Now);
         var view = new CameraViewSize(1400, 800);
         var camera = CameraDirector.Initial(layout, Now, view, Options);
         var halfW = view.Width / 2 / camera.Viewport.Zoom;
-        Assert.True(camera.Viewport.CenterX - halfW <= 0 && camera.Viewport.CenterX + halfW >= layout.Nodes["q"].X, "now and the forecast are in the frame");
-        Assert.True(camera.Viewport.Zoom > Options.MinFitZoom, "not squashed to the floor to fit history");
-        Assert.True(layout.Nodes["h120"].X < camera.Viewport.CenterX - halfW, "deep history runs off to the left");
+        var halfH = view.Height / 2 / camera.Viewport.Zoom;
+        Assert.True(camera.Viewport.Zoom < Options.MinFitZoom, "far below the legible floor: dots, not labels");
+        Assert.True(camera.Viewport.Zoom >= Options.WholeBoardMinZoom);
+        Assert.All(layout.Nodes.Values, n => Assert.True(n.X >= camera.Viewport.CenterX - halfW && n.X <= camera.Viewport.CenterX + halfW && n.Y >= camera.Viewport.CenterY - halfH && n.Y <= camera.Viewport.CenterY + halfH, "every node is in the frame"));
+        Assert.True(CameraBounds.MinZoom(layout, view, Options) <= camera.Viewport.Zoom + 1e-9, "the pan clamp lets the operator reach it");
     }
 }

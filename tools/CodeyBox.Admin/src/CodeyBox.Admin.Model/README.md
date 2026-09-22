@@ -71,6 +71,17 @@ Pure pieces behind the `/map` screen, all in this project:
   since the latest landing follows the quiet rule, so a quiet fleet's past
   stops moving altogether. Positions in the future are an ordering, never
   a timestamp.
+- **The board is still and whole.** The forecast reads the queue's facts
+  only (never the live running count, which ticks every few seconds), and
+  the past is anchored to its own landings: the gap from the latest
+  landing to now is always a fixed-width labelled cut, so *same facts,
+  later clock, same positions* (tested). Zoom-out reaches the entire
+  board (`CameraBounds.MinZoom`, `WholeBoardMinZoom`): at the floor nodes
+  are dots and the operator is looking for shape and position. Landed
+  chains keep their own lanes below the live work, most recent first;
+  only singletons pack into the loose lane. Suggestion ghosts take the
+  nearest free grid spot to their parent (`SuggestionGhosts.WorldOccupancy`,
+  right-hand side preferred) and never stack.
 - **`EdgeRouter`** — an edge whose straight run would pass through a node
   between its endpoints arcs over it (into the gap above the row, or over
   the lane when the obstacle is on another row) and names the obstacle, so

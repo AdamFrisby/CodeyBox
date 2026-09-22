@@ -48,7 +48,7 @@ public sealed class SuggestionGhostsTests
     }
 
     [Fact]
-    public void Ghosts_SitWherePromotionWouldLand_AndDoNotCollideWithEachOther()
+    public void Ghosts_TakeTheNearestFreeSpotToTheirParent_AndNeverStack()
     {
         var (items, layout) = Fleet();
         var groups = SuggestionGhosts.Place([Sug("a", "hub", "notable"), Sug("b", "hub", "notable", 1)], layout, items, null, Options);
@@ -57,11 +57,47 @@ public sealed class SuggestionGhostsTests
         Assert.Equal(2, shown.Count);
         Assert.All(shown, p => Assert.True(p.X > layout.Nodes["hub"].X, "to the right of the parent"));
         Assert.NotEqual((shown[0].X, shown[0].Y), (shown[1].X, shown[1].Y));
+        foreach (var g in shown)
+        {
+            Assert.DoesNotContain(layout.Nodes.Values, n => Math.Abs(n.X - g.X) < Options.NodeWidth && Math.Abs(n.Y - g.Y) < Options.NodeHeight);
+        }
+        // The first ghost sits in the nearest free column to the right; a free spot that near is never skipped.
+        var free = new SuggestionGhosts.WorldOccupancy(layout, Options);
+        var nearest = free.NearestFree(layout.Nodes["hub"].X, layout.Nodes["hub"].Y);
+        Assert.Equal((nearest.X, nearest.Y), (shown[0].X, shown[0].Y));
+    }
 
-        // Promoting the first one lands it exactly on its ghost's slot.
-        var promoted = items.Append(Fixtures.Item("promoted", dependsOn: ["hub"])).ToList();
-        var refreshed = FleetMapBuilder.Update(layout, promoted, ChainGrouping.BuildChains(promoted).ToList(), Options);
-        Assert.Equal((shown[0].X, shown[0].Y), (refreshed.Nodes["promoted"].X, refreshed.Nodes["promoted"].Y));
+    [Fact]
+    public void GhostsOfNeighbouringParents_DoNotLandOnEachOther()
+    {
+        // Two parents one row apart with open suggestions each: six ghosts, six distinct spots, none on a node.
+        var items = new List<AdminWorkItem> { Fixtures.Item("p1", state: "Working"), Fixtures.Item("p2", state: "Working"), Fixtures.Item("p3", state: "Working") };
+        var layout = FleetMapBuilder.DeriveInitial(items, ChainGrouping.BuildChains(items).ToList(), Options);
+        var open = new List<GhostSuggestion>();
+        foreach (var parent in new[] { "p1", "p2", "p3" })
+        {
+            for (var i = 0; i < 3; i++)
+            {
+                open.Add(Sug(parent + "-" + i, parent, "notable", i));
+            }
+        }
+        var placed = SuggestionGhosts.Place(open, layout, items, new SuggestionGhostOptions { MaxPerParent = 3 }, Options).SelectMany(g => g.Shown).ToList();
+        Assert.Equal(9, placed.Count);
+        Assert.Equal(9, placed.Select(g => (g.X, g.Y)).Distinct().Count());
+        foreach (var g in placed)
+        {
+            Assert.DoesNotContain(layout.Nodes.Values, n => Math.Abs(n.X - g.X) < Options.NodeWidth && Math.Abs(n.Y - g.Y) < Options.NodeHeight);
+            foreach (var other in placed)
+            {
+                Assert.True(ReferenceEquals(g, other) || Math.Abs(other.X - g.X) >= Options.NodeWidth || Math.Abs(other.Y - g.Y) >= Options.NodeHeight, "ghosts never overlap");
+            }
+        }
+        // And each parent's first ghost is within two columns and one row of it.
+        foreach (var g in placed.Where(g => g.Rank == 0))
+        {
+            var parent = layout.Nodes[g.Suggestion.ParentId];
+            Assert.True(Math.Abs(g.X - parent.X) <= Options.ColumnGap * 2 + 1e-6 && Math.Abs(g.Y - parent.Y) <= Options.RowGap + 1e-6, "close to its parent");
+        }
     }
 
     [Fact]

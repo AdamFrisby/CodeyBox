@@ -176,11 +176,16 @@
         var mx = Math.max(o.nodeW, st.w * o.panMargin / z), my = Math.max(o.nodeH, st.h * o.panMargin / z);
         return { minX: minX - o.nodeW / 2 - mx, minY: minY - o.nodeH / 2 - my, maxX: maxX + o.nodeW / 2 + mx, maxY: maxY + o.nodeH / 2 + my };
     }
+    // Mirror of CameraBounds.MinZoom: the zoom at which the content plus its
+    // view-fraction margins exactly fills the view — where clampCam centres it.
     function minZoom(st) {
-        var o = st.frame && st.frame.opts, b = contentBounds(st, 1);
-        if (!o || !b) return 0.08;
-        var fit = Math.min(st.w / Math.max(1, b.maxX - b.minX), st.h / Math.max(1, b.maxY - b.minY));
-        return Math.max(o.minFitZoom * 0.5, Math.min(fit, o.minFitZoom * 8));
+        var fr = st.frame, o = fr && fr.opts;
+        if (!o || !fr.nodes.length) return 0.08;
+        var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, i, n;
+        for (i = 0; i < fr.nodes.length; i++) { n = fr.nodes[i]; var x = n.tx !== undefined ? n.tx : n.x, y = n.ty !== undefined ? n.ty : n.y; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+        var usable = Math.max(0.1, 1 - 2 * clamp(o.panMargin, 0, 0.45));
+        var fit = Math.min(st.w * usable / Math.max(1, maxX - minX + o.nodeW), st.h * usable / Math.max(1, maxY - minY + o.nodeH));
+        return Math.max(o.wholeBoardMinZoom || 0.002, Math.min(fit, o.minFitZoom));
     }
     function clampCam(cam, st) {
         var z = Math.max(cam.zoom, minZoom(st)), b = contentBounds(st, z);
@@ -432,6 +437,8 @@
         }
 
         // Lanes: a faint frame per chain with its name — the shape of the backlog.
+        // Names are drawn after the edges (a name must read over a wire, never under one).
+        var laneLabels = [];
         ctx.font = "600 11px " + th.sans;
         ctx.textBaseline = "bottom"; ctx.textAlign = "left";
         for (i = 0; i < (fr.lanes || []).length; i++) {
@@ -442,24 +449,7 @@
             ctx.fillStyle = alpha(th.card, th.light ? 0.55 : 0.35);
             ctx.fill();
             ctx.strokeStyle = alpha(th.border, 0.9); ctx.lineWidth = 1; ctx.stroke();
-            if (sw > 48) {
-                // The name sits in the gutter above the lane, stays in view when
-                // the lane runs off the left edge, and is plated when the gutter
-                // is too thin for it at this zoom: the chain's name is essential.
-                // Pinned: a visible lane's name never rides off an edge or under the legend.
-                var legendTop = st.legendRect ? st.legendRect.y - 4 : st.h, lyTop = 26, lyBot = Math.max(lyTop, legendTop - 14);
-                var lx0 = clamp(p0.x + 6, 4, Math.max(4, st.w - 64)), room = Math.min(p0.x + sw, st.w) - lx0 - 4;
-                ctx.font = "600 11px " + th.sans;
-                var lbl = fitText(ctx, ln.label, Math.max(40, room));
-                var topY = clamp(p0.y - 16, lyTop, lyBot), botY = clamp(p0.y + sh - 14, lyTop, lyBot);
-                var lAt = label(st, lbl, "600 11px " + th.sans, alpha(th.dim, 0.95),
-                    [{ x: lx0, y: topY }, { x: lx0, y: clamp(topY + 15, lyTop, lyBot) }, { x: lx0, y: clamp(topY + 30, lyTop, lyBot) }, { x: lx0, y: botY }, { x: lx0, y: clamp(botY - 15, lyTop, lyBot) }],
-                    { h: 13, kinds: ["body", "label", "stub"] });
-                if (lAt && (ln.n > 1 || ln.blocked || ln.running || ln.settled)) {
-                    var meta = ln.n + (ln.n === 1 ? " item" : " items") + (ln.blocked ? " · " + ln.blocked + " blocked" : "") + (ln.running ? " · " + ln.running + " running" : "") + (ln.settled ? " · " + ln.settled + " settled" : "");
-                    if (lAt.x + lAt.w + 8 + ctx.measureText(meta).width < p0.x + sw) label(st, meta, "10px " + th.mono, alpha(th.faint, 0.95), [{ x: lAt.x + lAt.w + 8, y: lAt.y + 1 }], { h: 12, drop: true, kinds: ["body", "label"] });
-                }
-            }
+            if (sw > 48 && sh >= 8) laneLabels.push(ln);
         }
 
         // Edges: dependency → dependent. Fans from one source (or into one
@@ -469,6 +459,7 @@
         // and the wire starts at that name. Edges with neither end in view
         // recede; an edge with a named source does not.
         drawEdges(st, byId, level, halfW, halfH, r);
+        for (i = 0; i < laneLabels.length; i++) drawLaneLabel(st, laneLabels[i]);
 
         // The "+ dependent" preview for the hovered node: an empty box drawn
         // where the new node would land, joined by the edge that would exist.
@@ -523,7 +514,7 @@
                 st.hit.push({ id: n.id, x: p.x - r - 2, y: p.y - r - 2, w: r * 2 + 4 + labelW, h: r * 2 + 4 });
                 if (level === 1 && hovered && canTakeDependent(n)) drawPlus(st, n, { x: p.x + labelW, y: p.y }, level, halfW, r);
                 if (isRunning) st.running.push({ id: n.id, x: p.x, y: p.y, r: r + 4, color: color, ring: true });
-                if (n.waiting >= 3) {
+                if (n.waiting >= 3 && z >= o.minFitZoom * 0.75) {
                     label(st, "⇢ " + n.waiting + " waiting", "600 " + Math.max(o.minTextPx, 10) + "px " + th.mono, alpha(th.orange, 0.95),
                         [{ x: p.x, y: p.y + r + 4 }, { x: p.x, y: p.y - r - 15 }, { x: p.x + r + 6, y: p.y + r + 2 }, { x: p.x, y: p.y + r + 18 }, { x: p.x + r + 6, y: p.y - r - 15 }], { h: 12, align: "center", kinds: ["body", "label", "stub", "hud"] });
                 }
@@ -591,7 +582,7 @@
         if (st.hover && byCluster[st.hover] && level < 2) drawTooltip(st, clusterAsNode(byCluster[st.hover]));
         if (st.hover && st.hover.indexOf("break:") === 0 && breaks[+st.hover.slice(6)]) {
             var hb = breaks[+st.hover.slice(6)];
-            drawTooltip(st, { id: st.hover, x: hb.x + hb.w / 2, y: (st.cam.y), title: hb.exact + " of quiet cut from the axis", stateText: "nothing landed in that stretch", sub: "" });
+            drawTooltip(st, { id: st.hover, x: hb.x + hb.w / 2, y: (st.cam.y), title: hb.since ? hb.exact + " since the last landing" : hb.exact + " of quiet cut from the axis", stateText: hb.since ? "the past is anchored to its landings, not the clock" : "nothing landed in that stretch", sub: "" });
         }
         drawRuler(st);
         fxSync(st);
@@ -696,6 +687,7 @@
             var reading = readAxis(fr, wx), text;
             if (reading.zone === "now") text = "now";
             else if (reading.zone === "future") text = "batch " + (reading.batch === 0 ? "next" : "+" + reading.batch) + " · predicted order";
+            else if (reading.brk && reading.brk.since) text = reading.brk.exact + " since the last landing";
             else if (reading.brk) text = "in a cut · " + reading.brk.exact + " skipped, nothing landed";
             else if (reading.at) text = fmtClock(reading.at) + " · " + reading.ago;
             else text = "past";
@@ -1276,6 +1268,28 @@
         ctx.fillText(fitText(ctx, d.waitingOn || n.activityText || "", W - 12), 7, H - 7);
     }
 
+    // A lane's name, drawn after the edges so it reads over a wire, pinned into the viewport and placed through the registry.
+    function drawLaneLabel(st, ln) {
+        var ctx = st.ctx, th = st.theme, z = st.cam.zoom;
+        var p0 = toScreen(st, ln.x, ln.y), sw = ln.w * z, sh = ln.h * z;
+        // The name sits in the gutter above the lane, stays in view when
+        // the lane runs off the left edge, and is plated when the gutter
+        // is too thin for it at this zoom: the chain's name is essential.
+        // Pinned: a visible lane's name never rides off an edge or under the legend.
+        var legendTop = st.legendRect ? st.legendRect.y - 4 : st.h, lyTop = 26, lyBot = Math.max(lyTop, legendTop - 14);
+        var lx0 = clamp(p0.x + 6, 4, Math.max(4, st.w - 64)), room = Math.min(p0.x + sw, st.w) - lx0 - 4;
+        ctx.font = "600 11px " + th.sans;
+        var lbl = fitText(ctx, ln.label, Math.max(40, room));
+        var topY = clamp(p0.y - 16, lyTop, lyBot), botY = clamp(p0.y + sh - 14, lyTop, lyBot);
+        var lAt = label(st, lbl, "600 11px " + th.sans, alpha(th.dim, 0.95),
+            [{ x: lx0, y: topY }, { x: lx0, y: clamp(topY + 15, lyTop, lyBot) }, { x: lx0, y: clamp(topY + 30, lyTop, lyBot) }, { x: lx0, y: botY }, { x: lx0, y: clamp(botY - 15, lyTop, lyBot) }],
+            { h: 13, kinds: ["body", "label", "stub"] });
+        if (lAt && (ln.n > 1 || ln.blocked || ln.running || ln.settled)) {
+            var meta = ln.n + (ln.n === 1 ? " item" : " items") + (ln.blocked ? " · " + ln.blocked + " blocked" : "") + (ln.running ? " · " + ln.running + " running" : "") + (ln.settled ? " · " + ln.settled + " settled" : "");
+            if (lAt.x + lAt.w + 8 + ctx.measureText(meta).width < p0.x + sw) label(st, meta, "10px " + th.mono, alpha(th.faint, 0.95), [{ x: lAt.x + lAt.w + 8, y: lAt.y + 1 }], { h: 12, drop: true, kinds: ["body", "label"] });
+        }
+    }
+
     // ── edges ────────────────────────────────────────────────────────────
     function segDist(px, py, x1, y1, x2, y2) {
         var dx = x2 - x1, dy = y2 - y1, l2 = dx * dx + dy * dy, t = l2 ? clamp(((px - x1) * dx + (py - y1) * dy) / l2, 0, 1) : 0;
@@ -1367,58 +1381,85 @@
             if (stub) return stub.out === "right" ? { x: stub.x + stub.w, y: stub.y + stub.h / 2 } : stub.out === "left" ? { x: stub.x, y: stub.y + stub.h / 2 } : stub.out === "down" ? { x: stub.x + stub.w / 2, y: stub.y + stub.h } : { x: stub.x + stub.w / 2, y: stub.y };
             return { x: level === 2 ? ed.pa.x + halfW : ed.pa.x + r, y: ed.pa.y };
         }
-        function endOf(ed) { return { x: level === 2 ? ed.pb.x - halfW : ed.pb.x - r, y: ed.pb.y }; }
-        function arrow(ex, ey, col) { ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(ex - 6, ey - 3.2); ctx.lineTo(ex - 6, ey + 3.2); ctx.closePath(); ctx.fill(); }
+        // Routing. A wire runs straight along its row only when nothing
+        // stands in that run; otherwise it goes orthogonally: out to a free
+        // bus column, up or down to the corridor between rows just above
+        // the target's row, along that corridor, and down onto the target's
+        // top edge — so a wire never passes through a box it does not join.
+        // A bundle's members share the bus column and keep their offsets, so
+        // the bundle detours as a unit and fans at its split.
+        var rowGapPx = o.rowGap * z, halfBody = level === 2 ? halfH : r;
+        function corridorY(p) { return p.y - rowGapPx / 2; }
+        function topOf(p) { return p.y - halfBody - 1; }
+        function runFree(x0, x1, y) { var lo = Math.min(x0, x1) + 3, hi = Math.max(x0, x1) - 3; return hi <= lo || st.occ.free(lo, y - 2, hi - lo, 4, ["body"]); }
+        function spanFree(x, y0, y1) { var lo = Math.min(y0, y1), hi = Math.max(y0, y1); return st.occ.free(x - 2, lo, 4, hi - lo, ["body"]); }
+        // The bus column for a set of routes from one start: the first free
+        // column past the start, before the nearest target.
+        function busFor(sx, sy, targets) {
+            var nearest = Infinity, y0 = sy, y1 = sy, t;
+            for (t = 0; t < targets.length; t++) { nearest = Math.min(nearest, targets[t].xc - halfBody); var cy = corridorY(targets[t]); y0 = Math.min(y0, cy); y1 = Math.max(y1, cy); }
+            var lo = sx + 12, hi = Math.max(lo, nearest - 8);
+            for (var x = lo; x <= hi; x += 8) if (spanFree(x, y0, y1)) return x;
+            return lo;
+        }
+        function routeOne(S, T, busX, off, direct) {
+            // S: start point at the source's right edge; T: { xc, y } target centre.
+            if (direct && Math.abs(T.y - S.y) < 2 && runFree(S.x, T.xc - halfBody, S.y)) return { pts: [[S.x, S.y + off], [T.xc - halfBody, S.y + off]], tip: "right" };
+            var cy = corridorY(T) + off, bx = busX + off;
+            if (Math.abs(T.y - S.y) < 2 && runFree(bx, T.xc - halfBody, S.y)) return { pts: [[S.x, S.y + off], [T.xc - halfBody, S.y + off]], tip: "right" };
+            return { pts: [[S.x, S.y + off], [bx, S.y + off], [bx, cy], [T.xc, cy], [T.xc, topOf(T)]], tip: "down" };
+        }
+        function strokeRoute(route, style) {
+            ctx.strokeStyle = alpha(style.color, style.alpha); ctx.lineWidth = style.width; ctx.setLineDash([]);
+            ctx.beginPath(); ctx.moveTo(route.pts[0][0], route.pts[0][1]);
+            for (var q = 1; q < route.pts.length; q++) ctx.lineTo(route.pts[q][0], route.pts[q][1]);
+            ctx.stroke();
+            var e = route.pts[route.pts.length - 1];
+            ctx.fillStyle = ctx.strokeStyle; ctx.beginPath();
+            if (route.tip === "down") { ctx.moveTo(e[0], e[1]); ctx.lineTo(e[0] - 3.2, e[1] - 6); ctx.lineTo(e[0] + 3.2, e[1] - 6); }
+            else { ctx.moveTo(e[0], e[1]); ctx.lineTo(e[0] - 6, e[1] - 3.2); ctx.lineTo(e[0] - 6, e[1] + 3.2); }
+            ctx.closePath(); ctx.fill();
+        }
+        function targetOf(ed) { return { xc: ed.pb.x, y: ed.pb.y }; }
         // Bundles first (under the singles, which are fewer and more specific).
         for (i = 0; i < bundles.length; i++) {
             var bd = bundles[i], ms = bd.members, n = ms.length;
-            var hub = bd.dir === "out" ? startOf(ms[0]) : endOf(ms[0]);
-            var stubbed = bd.dir === "out" && !!st.stubs[ms[0].e.from];
-            // Trunk: from the hub straight along x to the split, which sits
-            // short of the nearest member's far end.
-            var far = Infinity;
-            for (k = 0; k < n; k++) { var fe = bd.dir === "out" ? endOf(ms[k]) : startOf(ms[k]); far = Math.min(far, Math.abs(fe.x - hub.x)); }
-            var trunk = clamp(far * 0.45, 14, Math.max(14, 90 * Math.min(1, z)));
-            var splitX = bd.dir === "out" ? hub.x + trunk : hub.x - trunk;
-            ms.sort(function (m1, m2) { return (bd.dir === "out" ? m1.pb.y - m2.pb.y : m1.pa.y - m2.pa.y); });
-            var pitch = Math.min(1.6, Math.max(0.15, ((level === 2 ? halfH * 2 : r * 2) - 4) / n));
-            for (k = 0; k < n; k++) {
-                var ed = ms[k], st1 = edgeStyle(ed), off = (k - (n - 1) / 2) * pitch;
-                var from = bd.dir === "out" ? hub : startOf(ed), to = bd.dir === "out" ? endOf(ed) : hub;
-                ctx.strokeStyle = alpha(st1.color, st1.alpha); ctx.lineWidth = st1.width; ctx.setLineDash([]);
-                ctx.beginPath();
-                var pts;
-                if (bd.dir === "out") {
-                    pts = [[from.x, from.y + off], [splitX + off, from.y + off], [splitX + off, to.y + off], [to.x, to.y + off]];
-                } else {
-                    pts = [[from.x, from.y + off], [splitX - off, from.y + off], [splitX - off, to.y + off], [to.x, to.y + off]];
+            if (bd.dir === "out") {
+                var hubS = startOf(ms[0]);
+                ms.sort(function (m1, m2) { return m1.pb.y - m2.pb.y || m1.pb.x - m2.pb.x; });
+                var pitch = Math.min(1.6, Math.max(0.15, (halfBody * 2 - 4) / n));
+                var busX = busFor(hubS.x, hubS.y, ms.map(targetOf));
+                for (k = 0; k < n; k++) {
+                    var ed = ms[k], off = (k - (n - 1) / 2) * pitch;
+                    var route = routeOne(hubS, targetOf(ed), busX, off, false);
+                    strokeRoute(route, edgeStyle(ed));
+                    st.edgeSegs.push({ key: ed.e.from + ">" + ed.e.to, ed: ed, pts: route.pts });
                 }
-                ctx.moveTo(pts[0][0], pts[0][1]); for (var q = 1; q < pts.length; q++) ctx.lineTo(pts[q][0], pts[q][1]);
-                ctx.stroke();
-                arrow(pts[3][0], pts[3][1], ctx.strokeStyle);
-                st.edgeSegs.push({ key: ed.e.from + ">" + ed.e.to, ed: ed, pts: pts });
+            } else {
+                // Many sources into one target: each runs to a shared bus column
+                // left of the target, then the corridor above it, then drops.
+                var hubT = targetOf(ms[0]);
+                ms.sort(function (m1, m2) { return m1.pa.y - m2.pa.y || m1.pa.x - m2.pa.x; });
+                var pitchIn = Math.min(1.6, Math.max(0.15, (halfBody * 2 - 4) / n));
+                var leftmost = Infinity;
+                for (k = 0; k < n; k++) leftmost = Math.min(leftmost, startOf(ms[k]).x);
+                var busIn = busFor(leftmost, hubT.y, [hubT]);
+                for (k = 0; k < n; k++) {
+                    var ed2 = ms[k], off2 = (k - (n - 1) / 2) * pitchIn, S2 = startOf(ed2);
+                    var routeIn = routeOne(S2, hubT, Math.max(busIn, S2.x + 12), off2, false);
+                    strokeRoute(routeIn, edgeStyle(ed2));
+                    st.edgeSegs.push({ key: ed2.e.from + ">" + ed2.e.to, ed: ed2, pts: routeIn.pts });
+                }
             }
-            if (stubbed) { /* the trunk starts at the stub: nothing more to draw */ }
         }
-        // Singles: horizontal-tangent curves (or the model's arc over an obstacle).
+        // Singles: straight along the row when the run is clear, else the same orthogonal detour.
         for (i = 0; i < live.length; i++) {
             var ed3 = live[i];
             if (drawn[ed3.e.from + ">" + ed3.e.to]) continue;
-            var s3 = edgeStyle(ed3), a3 = startOf(ed3), b3 = endOf(ed3);
-            ctx.strokeStyle = alpha(s3.color, s3.alpha); ctx.lineWidth = s3.width; ctx.setLineDash([]);
-            ctx.beginPath(); ctx.moveTo(a3.x, a3.y);
-            var mx = (a3.x + b3.x) / 2, segs;
-            if (ed3.e.bend) {
-                var apex = Math.min(ed3.pa.y, ed3.pb.y) + ed3.e.bend * z, dx3 = (b3.x - a3.x) / 3;
-                ctx.bezierCurveTo(a3.x + dx3, apex, b3.x - dx3, apex, b3.x, b3.y);
-                segs = [[a3.x, a3.y], [a3.x + dx3, apex], [b3.x - dx3, apex], [b3.x, b3.y]];
-            } else {
-                ctx.bezierCurveTo(mx, a3.y, mx, b3.y, b3.x, b3.y);
-                segs = [[a3.x, a3.y], [mx, a3.y], [mx, b3.y], [b3.x, b3.y]];
-            }
-            ctx.stroke();
-            arrow(b3.x, b3.y, ctx.strokeStyle);
-            st.edgeSegs.push({ key: ed3.e.from + ">" + ed3.e.to, ed: ed3, pts: segs });
+            var S3 = startOf(ed3), T3 = targetOf(ed3);
+            var route3 = routeOne(S3, T3, busFor(S3.x, S3.y, [T3]), 0, true);
+            strokeRoute(route3, edgeStyle(ed3));
+            st.edgeSegs.push({ key: ed3.e.from + ">" + ed3.e.to, ed: ed3, pts: route3.pts });
         }
         // 4. The stubs themselves, on top of the wires they emit.
         for (sid in st.stubs) {
@@ -1569,9 +1610,10 @@
             ctx.strokeStyle = hovered && s2 === 0 ? th.accent : th.faint; ctx.stroke(); ctx.setLineDash([]);
         }
         ctx.globalAlpha = 1;
-        // The count is the point: always legible, never mistaken for one item.
+        // The count is the point: always legible, never mistaken for one item —
+        // except at whole-board zoom, where counts would only be noise.
         var badge = "×" + cl.count, bf = "700 " + Math.max(o.minTextPx, 10) + "px " + th.mono;
-        var bAt = label(st, badge, bf, alpha(th.dim, 0.95), [{ x: p.x + r + d * 2 + 4, y: p.y - 6 }, { x: p.x - r, y: p.y + r + 3 }, { x: p.x - r, y: p.y - r - d * 2 - 15 }], { h: 12, plate: true, plateAlpha: 0.6 });
+        var bAt = st.cam.zoom < o.minFitZoom * 0.75 ? null : label(st, badge, bf, alpha(th.dim, 0.95), [{ x: p.x + r + d * 2 + 4, y: p.y - 6 }, { x: p.x - r, y: p.y + r + 3 }, { x: p.x - r, y: p.y - r - d * 2 - 15 }], { h: 12, plate: true, plateAlpha: 0.6 });
         var bw = bAt ? bAt.w : 0;
         st.hit.push({ id: cl.id, grp: cl, x: p.x - r - 2, y: p.y - r - d * 2 - 2, w: r * 2 + d * 2 + bw + 10, h: r * 2 + d * 2 + 4 });
     }

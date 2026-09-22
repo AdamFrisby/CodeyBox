@@ -37,13 +37,24 @@ public static class CameraBounds
             nodes.Max(n => n.Y) + options.NodeHeight / 2 + marginY);
     }
 
-    /// <summary>The smallest zoom worth having: the content fits the view with its margin; never below <see cref="FleetMapOptions.MinFitZoom"/> × the floor fraction.</summary>
+    /// <summary>
+    /// The smallest zoom worth having: the whole board fits the view (with its
+    /// margin), however large the board — the zoom-out-to-orient loop needs
+    /// the entire extent reachable. Never above <see cref="FleetMapOptions.MinFitZoom"/>
+    /// (a small board still zooms out to dots) nor below the hard floor.
+    /// </summary>
     public static double MinZoom(FleetMapLayout layout, CameraViewSize view, FleetMapOptions? options = null)
     {
         options ??= new FleetMapOptions();
-        var b = Of(layout, view, 1, options);
-        var fit = Math.Min(view.Width / Math.Max(1, b.Width), view.Height / Math.Max(1, b.Height));
-        return Math.Max(options.MinFitZoom * 0.5, Math.Min(fit, options.MinFitZoom * 8));
+        var nodes = layout.Nodes?.Values ?? [];
+        var rawW = nodes.Any() ? nodes.Max(n => n.X) - nodes.Min(n => n.X) + options.NodeWidth : options.ColumnGap * 2;
+        var rawH = nodes.Any() ? nodes.Max(n => n.Y) - nodes.Min(n => n.Y) + options.NodeHeight : options.RowGap * 2;
+        // The margin is a fraction of the view at every zoom, so the zoom at
+        // which content plus margins exactly fills the view is
+        // view·(1 − 2f) / content — and at that zoom Clamp centres the board.
+        var usable = Math.Max(0.1, 1 - 2 * Math.Clamp(options.PanMarginFraction, 0, 0.45));
+        var fit = Math.Min(view.Width * usable / Math.Max(1, rawW), view.Height * usable / Math.Max(1, rawH));
+        return Math.Max(Math.Max(1e-4, options.WholeBoardMinZoom), Math.Min(fit, options.MinFitZoom));
     }
 
     /// <summary>

@@ -43,8 +43,10 @@ public sealed class TimeAxisLayoutTests
     {
         var layout = Layout([At("a", "Done", 0.5), At("b", "Done", 1.0, dependsOn: null), At("q", "Queued")]);
         var rate = TimeAxisScale.UnitsPerMinute(Options);
-        Assert.Equal(-30 * rate, layout.Nodes["a"].X, 6);
-        Assert.Equal(0, TimeAxisScale.WarpPast([new SettledLanding("f", "L", Now.AddMinutes(5))], TimeAxisScale.Bucket(Now, Options), Options).XByItem["f"]); // the future is never in the past
+        var sinceWidth = Options.NodeWidth + Math.Max(Options.NodeWidth * 0.5, Options.BreakWidth);
+        Assert.Equal(-sinceWidth, layout.Nodes["a"].X, 6); // the latest landing sits past the fixed "since" cut
+        Assert.Equal(-sinceWidth - 30 * rate, layout.Nodes["b"].X, 6); // half an hour earlier: faithful
+        Assert.Equal(-sinceWidth, TimeAxisScale.WarpPast([new SettledLanding("f", "L", Now.AddMinutes(5))], TimeAxisScale.Bucket(Now, Options), Options).XByItem["f"]); // the future is never in the past
 
         var ticks = layout.Ticks;
         Assert.Contains(ticks, t => t.Label == "now" && t.X == 0 && t.Zone == AxisZone.Now);
@@ -139,27 +141,32 @@ public sealed class TimeAxisLayoutTests
         var after = Layout(landed, before);
 
         Assert.True(after.Nodes["hub"].X <= 0 && after.Nodes["hub"].Zone == AxisZone.Past);
-        Assert.True(after.Nodes["d0"].X < before.Nodes["d0"].X, "one wave closer: the forecast advanced");
+        Assert.True(after.Nodes["d0"].X <= before.Nodes["d0"].X, "nothing was queued ahead of d0: it was next, and still is");
         Assert.Equal(before.Nodes["d0"].Slot, after.Nodes["d0"].Slot);
         Assert.Equal(before.Nodes["d1"].Slot, after.Nodes["d1"].Slot);
         Assert.Equal(before.Nodes["d0"].LaneId, after.Nodes["d0"].LaneId);
     }
 
     [Fact]
-    public void ObservedPositions_DoNotCreep_WithinANowBucket_AndStepWhenItAdvances()
+    public void SameFacts_LaterClock_SamePositions()
     {
-        var items = new List<AdminWorkItem> { At("old", "Done", 1), At("run", "Working"), At("q", "Queued") };
+        // The board is a function of the facts, not of the clock: minutes,
+        // hours or days later, with nothing landed or dispatched, every node
+        // sits exactly where it was — only the "ago" labels age.
+        var items = new List<AdminWorkItem> { At("old", "Done", 1), At("older", "Done", 30), At("run", "Working"), At("q", "Queued") };
         var first = Layout(items, now: Now);
-        var withinBucket = Layout(items, first, Now.AddMinutes(2));
-        foreach (var (id, node) in first.Nodes)
+        foreach (var later in new[] { Now.AddMinutes(2), Now.AddMinutes(Options.NowBucketMinutes + 1), Now.AddHours(3), Now.AddDays(2) })
         {
-            Assert.Equal(node, withinBucket.Nodes[id]);
+            var again = Layout(items, first, later);
+            foreach (var (id, node) in first.Nodes)
+            {
+                Assert.Equal(node, again.Nodes[id]);
+            }
+            Assert.Equal(first.Breaks.Select(b => (b.X, b.Width)), again.Breaks.Select(b => (b.X, b.Width)));
         }
-
-        var nextBucket = Layout(items, first, Now.AddMinutes(Options.NowBucketMinutes + 1));
-        Assert.True(nextBucket.Nodes["old"].X < first.Nodes["old"].X, "the past recedes by one step");
-        Assert.Equal(first.Nodes["run"].X, nextBucket.Nodes["run"].X);
-        Assert.Equal(first.Nodes["q"].X, nextBucket.Nodes["q"].X);
+        var since = Assert.Single(first.Breaks, b => b.SinceLatest);
+        Assert.Equal(TimeSpan.FromHours(1), since.Skipped);
+        Assert.Equal(TimeSpan.FromDays(2) + TimeSpan.FromHours(1), Assert.Single(Layout(items, first, Now.AddDays(2)).Breaks, b => b.SinceLatest).Skipped);
     }
 
     [Fact]

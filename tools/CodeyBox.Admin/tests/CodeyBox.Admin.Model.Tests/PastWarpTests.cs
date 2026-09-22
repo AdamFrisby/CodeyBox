@@ -21,13 +21,16 @@ public sealed class PastWarpTests
     public void InsideABurst_SpacingIsElapsedTime_AndLongerIdleIsCompressedNotCut()
     {
         var past = TimeAxisScale.WarpPast([L("a", 0.25), L("b", 0.5, "B"), L("c", 2.0, "C")], Bucket, Options);
-        Assert.Equal(-15 * Rate, past.XByItem["a"], 6);
+        var sinceWidth = Options.NodeWidth + Math.Max(Options.NodeWidth * 0.5, Options.BreakWidth);
+        Assert.Equal(-sinceWidth, past.XByItem["a"], 6); // the latest landing sits past the fixed "since" cut, whatever the clock says
         Assert.Equal(15 * Rate, past.XByItem["a"] - past.XByItem["b"], 6); // under τ: faithful
         var idle = 1.5 * 60;
         var compressed = TimeAxisScale.Compress(idle, Options);
         Assert.True(compressed < idle && compressed > Options.PastCompressAfterMinutes, "a 90-minute idle gap inside a run takes less axis than time, more than τ");
         Assert.Equal(compressed * Rate, past.XByItem["b"] - past.XByItem["c"], 6);
-        Assert.Empty(past.Breaks); // under the quiet threshold: never a cut
+        var only = Assert.Single(past.Breaks); // under the quiet threshold: never a cut — only the "since" cut
+        Assert.True(only.SinceLatest);
+        Assert.Equal(TimeSpan.FromMinutes(15), only.Skipped);
     }
 
     [Fact]
@@ -55,7 +58,7 @@ public sealed class PastWarpTests
         var options = Options with { MaxCuts = 3 };
         var past = TimeAxisScale.WarpPast(landings, Bucket, options);
 
-        Assert.Equal(4, past.Breaks.Count); // the quiet since the last landing + the 3 longest idle stretches
+        Assert.Equal(4, past.Breaks.Count); // the gap since the last landing + the 3 longest idle stretches
         Assert.Contains(past.Breaks, b => b.Skipped == TimeSpan.FromHours(5));
         Assert.Contains(past.Breaks, b => b.Skipped == TimeSpan.FromHours(72));
         Assert.Equal(4, past.Stretches.Count);
@@ -74,12 +77,13 @@ public sealed class PastWarpTests
     }
 
     [Fact]
-    public void QuietSinceTheLastLanding_IsCut_SoTheSettledPastStopsMoving()
+    public void TheGapSinceTheLastLanding_IsAlwaysCut_SoTheClockMovesNothing()
     {
         var landings = new List<SettledLanding> { L("a", 5), L("b", 5.5, "B") };
         var quiet = TimeAxisScale.WarpPast(landings, Bucket, Options);
         var later = TimeAxisScale.WarpPast(landings, Bucket.AddHours(3), Options);
         var cut = Assert.Single(quiet.Breaks);
+        Assert.True(cut.SinceLatest);
         Assert.Equal(TimeSpan.FromHours(5), cut.Skipped);
         Assert.Equal(Math.Max(Options.NodeWidth * 0.5, Options.BreakWidth), cut.Width);
         Assert.Equal(-(Options.NodeWidth + cut.Width), quiet.XByItem["a"], 6);
@@ -93,12 +97,12 @@ public sealed class PastWarpTests
     public void Breaks_SitBetweenBoxes_AndCarryWhatTheySkipped()
     {
         var past = TimeAxisScale.WarpPast([L("n1", 1.0, "A"), L("n2", 1.5, "B"), L("o1", 26, "A"), L("o2", 26.25, "B")], Bucket, Options);
-        var cut = Assert.Single(past.Breaks);
+        var cut = Assert.Single(past.Breaks, b => !b.SinceLatest);
         Assert.Equal(TimeSpan.FromHours(24.5), cut.Skipped);
         Assert.Equal("1d", cut.Label);
         Assert.True(cut.X + cut.Width <= past.XByItem["n2"] - Options.NodeWidth / 2 + 1e-6, "the break sits between the boxes, not under one");
         Assert.True(cut.X >= past.XByItem["o1"] + Options.NodeWidth / 2 - 1e-6);
-        Assert.Equal(-TimeAxisScale.Compress(60, Options) * Rate, past.XByItem["n1"], 6); // an hour of quiet since: under the threshold, compressed inside the run
+        Assert.Equal(-(Options.NodeWidth + Math.Max(Options.NodeWidth * 0.5, Options.BreakWidth)), past.XByItem["n1"], 6); // past the fixed "since" cut
     }
 
     [Fact]
@@ -110,6 +114,7 @@ public sealed class PastWarpTests
         var again = TimeAxisScale.WarpPast(landings.AsEnumerable().Reverse().ToList(), Bucket, Options);
         Assert.Equal(past.XByItem.OrderBy(kv => kv.Key).ToList(), again.XByItem.OrderBy(kv => kv.Key).ToList());
         Assert.True(past.Breaks.Count <= Options.MaxCuts + 1);
+        Assert.Equal(1, past.Breaks.Count(b => b.SinceLatest));
         // Two landings a minute apart sit a minute apart: rows, not spacing, keep their boxes apart.
         var close = TimeAxisScale.WarpPast([L("p", 1.0), L("q", 1.0 + 1.0 / 60)], Bucket, Options);
         Assert.Equal(1 * Rate, close.XByItem["p"] - close.XByItem["q"], 6);
@@ -122,8 +127,9 @@ public sealed class PastWarpTests
         Assert.Empty(past.XByItem);
         Assert.Empty(past.Breaks);
         var future = TimeAxisScale.WarpPast([L("f", -3), L("f", -3)], Bucket, Options); // finished "in the future", duplicated
-        Assert.Equal(0, future.XByItem["f"]);
-        Assert.All(TimeAxisScale.WarpPast([L("z", 40)], Bucket, Options with { MaxCuts = 0 }).Breaks, b => Assert.Equal(TimeSpan.FromHours(40), b.Skipped));
+        Assert.Equal(-(Options.NodeWidth + Math.Max(Options.NodeWidth * 0.5, Options.BreakWidth)), future.XByItem["f"]); // clamped to now, past the "since" cut
+        Assert.Equal(TimeSpan.Zero, Assert.Single(future.Breaks).Skipped);
+        Assert.All(TimeAxisScale.WarpPast([L("z", 40)], Bucket, Options with { MaxCuts = 0 }).Breaks, b => Assert.True(b.SinceLatest && b.Skipped == TimeSpan.FromHours(40)));
         Assert.Equal("<1m", AgeText.Short(TimeSpan.FromSeconds(10)));
         Assert.Equal("2w 3d", AgeText.Short(TimeSpan.FromDays(17)));
         Assert.Equal("16h", AgeText.Coarse(TimeSpan.FromMinutes(953)));
@@ -143,7 +149,7 @@ public sealed class PastWarpTests
         var layout = Layout([At("hub", "Done", 3), At("d1", "Done", 2.9, ["hub"]), At("d2", "Done", 1, ["hub"]), At("run", "Working", dependsOn: ["hub"]), At("old", "Done", 40)]);
         Assert.True(layout.Nodes["hub"].X < layout.Nodes["d1"].X && layout.Nodes["d1"].X < layout.Nodes["d2"].X);
         Assert.NotEqual(layout.Nodes["d1"].Slot, layout.Nodes["hub"].Slot); // six minutes apart: the boxes overlap, so rows keep them apart
-        Assert.Single(layout.Breaks);
+        Assert.Equal(2, layout.Breaks.Count); // the "since" cut and the 37h hole before "old"
         Assert.Contains(layout.Ticks, t => t.Zone == AxisZone.Now);
 
         // A dependent cancelled long before its blocker landed sits right of the blocker and is flagged.

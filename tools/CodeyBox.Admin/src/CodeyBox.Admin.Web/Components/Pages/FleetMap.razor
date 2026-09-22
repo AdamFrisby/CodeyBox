@@ -615,12 +615,11 @@
             // The axis: settled work by finish time, now at zero, queued work by
             // predicted batch — the forecast needs the fleet's capacity and what runs.
             var capacity = snapshot.Workers?.GlobalMaxConcurrent ?? 0;
-            var runningNow = snapshot.Workers is { GlobalMaxConcurrent: > 0 } w ? w.GlobalRunning : -1;
             // The layout is a function of the data alone: the camera is never an
             // input, so zooming moves nothing.
             var layout = _layout is null
-                ? FleetMapBuilder.DeriveInitial(snapshot.Items.ToList(), projection.Chains.ToList(), options, now, projection.Activities, capacity, runningNow)
-                : FleetMapBuilder.Update(_layout, snapshot.Items.ToList(), projection.Chains.ToList(), options, now, projection.Activities, capacity, runningNow);
+                ? FleetMapBuilder.DeriveInitial(snapshot.Items.ToList(), projection.Chains.ToList(), options, now, projection.Activities, capacity)
+                : FleetMapBuilder.Update(_layout, snapshot.Items.ToList(), projection.Chains.ToList(), options, now, projection.Activities, capacity);
             var camera = _camera is null
                 ? CameraDirector.Initial(layout, now, _viewSize, options)
                 : CameraDirector.Next(_camera, projection, layout, now, _viewSize, options, _reducedMotion, snapshot);

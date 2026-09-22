@@ -333,7 +333,8 @@ public sealed class FleetMapPageTests : BunitContext
         var payload = FleetMapFrameBuilder.BuildPayload(snapshot, projection, layout, badges, camera, [], options);
 
         Assert.Contains("\"breaks\":[{", payload, StringComparison.Ordinal);
-        Assert.Contains("\"label\":\"2d\",\"exact\":\"1d 13h\"", payload, StringComparison.Ordinal); // 37.8 hours of quiet, said out loud
+        Assert.Contains("\"label\":\"2d\",\"exact\":\"1d 13h\",\"since\":false", payload, StringComparison.Ordinal); // 37.8 hours of quiet, said out loud
+        Assert.Contains("\"since\":true", payload, StringComparison.Ordinal); // and the fixed cut between the latest landing and now
         Assert.Contains("\"at\":\"2026-09-22T05:00:00", payload, StringComparison.Ordinal); // past ticks carry the instant
         Assert.Contains("\"pts\":[[", payload, StringComparison.Ordinal); // runs carry their landing points for the readout
         Assert.DoesNotContain("\"clusters\"", payload, StringComparison.Ordinal); // clusters are a rendering, not a layout object

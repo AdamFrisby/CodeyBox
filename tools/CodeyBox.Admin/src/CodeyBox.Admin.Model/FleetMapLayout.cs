@@ -105,17 +105,6 @@ public static class FleetMapBuilder
     /// <summary>Lane id for the packed lane of dependency-free items.</summary>
     public const string LooseLaneId = "loose";
 
-    /// <summary>Lane id for the history strip: chains whose every member has settled share it, packed by time.</summary>
-    public const string HistoryLaneId = "history";
-
-    /// <summary>History-strip id for a release (or the unreleased tail).</summary>
-    public static string HistoryLaneFor(string? releaseId) =>
-        string.IsNullOrEmpty(releaseId) ? HistoryLaneId : HistoryLaneId + ":" + releaseId;
-
-    /// <summary>True for any history strip (unreleased or per-release).</summary>
-    public static bool IsHistoryLane(string laneId) =>
-        string.Equals(laneId, HistoryLaneId, StringComparison.Ordinal) || laneId.StartsWith(HistoryLaneId + ":", StringComparison.Ordinal);
-
     /// <summary>
     /// Deterministic first layout. <paramref name="now"/> anchors the axis;
     /// when omitted the latest timestamp in the snapshot stands in, which
@@ -127,9 +116,8 @@ public static class FleetMapBuilder
         FleetMapOptions? options = null,
         DateTimeOffset? now = null,
         IReadOnlyDictionary<string, ItemActivity>? activities = null,
-        int capacity = 0,
-        int runningNow = -1) =>
-        Build(null, items, chains, options ?? new FleetMapOptions(), now, activities, capacity, runningNow);
+        int capacity = 0) =>
+        Build(null, items, chains, options ?? new FleetMapOptions(), now, activities, capacity);
 
     /// <summary>
     /// Refreshes <paramref name="previous"/> for a new snapshot. Lanes keep
@@ -143,11 +131,10 @@ public static class FleetMapBuilder
         FleetMapOptions? options = null,
         DateTimeOffset? now = null,
         IReadOnlyDictionary<string, ItemActivity>? activities = null,
-        int capacity = 0,
-        int runningNow = -1)
+        int capacity = 0)
     {
         ArgumentNullException.ThrowIfNull(previous);
-        return Build(previous, items, chains, options ?? new FleetMapOptions(), now, activities, capacity, runningNow);
+        return Build(previous, items, chains, options ?? new FleetMapOptions(), now, activities, capacity);
     }
 
     /// <summary>Where a new item depending on <paramref name="parentId"/> would land. Null when the parent is not on the map.</summary>
@@ -201,7 +188,7 @@ public static class FleetMapBuilder
         }
         var withGhosts = (items ?? []).Where(i => i is not null).Concat(ghosts).ToList();
         var chains = ChainGrouping.BuildChains(withGhosts);
-        var preview = Build(layout, withGhosts, chains, options ?? new FleetMapOptions(), layout.NowBucket, null, 0, -1);
+        var preview = Build(layout, withGhosts, chains, options ?? new FleetMapOptions(), layout.NowBucket, null, 0);
         var result = new List<MapPoint>(ghosts.Count);
         foreach (var ghost in ghosts)
         {
@@ -230,15 +217,13 @@ public static class FleetMapBuilder
         FleetMapOptions options,
         DateTimeOffset? now,
         IReadOnlyDictionary<string, ItemActivity>? activities,
-        int capacity,
-        int runningNow)
+        int capacity)
     {
         var byId = IndexItems(items);
         var anchor = now ?? previous?.NowBucket ?? (byId.Count == 0 ? DateTimeOffset.UnixEpoch : byId.Values.Max(i => i.UpdatedAt > i.CreatedAt ? i.UpdatedAt : i.CreatedAt));
         var nowBucket = TimeAxisScale.Bucket(anchor, options);
         var depths = ComputeDepths(byId, previous?.Nodes.ToDictionary(kv => kv.Key, kv => kv.Value.Depth, StringComparer.Ordinal), options);
-        var running = runningNow >= 0 ? runningNow : byId.Values.Count(i => ItemStates.KnownInFlight.Contains(i.State ?? string.Empty));
-        var forecast = QueueForecast.Rank(byId.Values.ToList(), activities, capacity > 0 ? capacity : options.DefaultCapacity, running);
+        var forecast = QueueForecast.Rank(byId.Values.ToList(), activities, capacity > 0 ? capacity : options.DefaultCapacity);
 
         // 1. Lanes first: the past warp spaces landings per lane.
         var ordered = OrderedChains(chains, byId);
@@ -425,8 +410,7 @@ public static class FleetMapBuilder
         foreach (var chain in ordered)
         {
             string? laneId = null;
-            var wholeChainSettled = chain.ItemIds.All(id => byId.TryGetValue(id, out var m0) && TerminalVisibility.IsSettled(m0.State));
-            if (previous is not null && previous.Nodes.Count > 0 && !wholeChainSettled)
+            if (previous is not null && previous.Nodes.Count > 0)
             {
                 var votes = new Dictionary<string, int>(StringComparer.Ordinal);
                 foreach (var id in chain.ItemIds)
@@ -445,12 +429,10 @@ public static class FleetMapBuilder
                     laneId = chain.Id;
                 }
             }
-            // A chain that has wholly landed is history: it shares the history
-            // strip (packed by time) rather than holding a lane of its own for
-            // months. Live chains keep their lanes; singletons pack loosely.
-            var allSettled = chain.ItemIds.All(id => byId.TryGetValue(id, out var m) && TerminalVisibility.IsSettled(m.State));
-            laneId ??= allSettled ? HistoryLaneFor(ReleaseOf(chain, byId))
-                : chain.ItemIds.Count == 1 ? LooseLaneFor(ReleaseOf(chain, byId)) : chain.Id;
+            // A chain keeps its lane whether live or landed — a settled chain
+            // reads as the chain it was; only a singleton, which has no shape
+            // to keep, packs into the loose lane.
+            laneId ??= chain.ItemIds.Count == 1 ? LooseLaneFor(ReleaseOf(chain, byId)) : chain.Id;
             if (!groups.TryGetValue(laneId, out var group))
             {
                 group = [];
@@ -510,8 +492,17 @@ public static class FleetMapBuilder
             else
             {
                 // First layout: releases before unreleased work, each release's lanes
-                // together; the history strips sit below the live work.
-                sortY = (IsHistoryLane(laneId) ? 10_000_000 : 0) + (release is null ? 1_000_000 + index : releaseFirstSeen[release] * 1000 + index);
+                // together; wholly landed chains below the live ones, the most
+                // recently landed nearest; the loose lanes last.
+                var settledLane = group.All(c => c.ItemIds.All(id => byId.TryGetValue(id, out var m) && TerminalVisibility.IsSettled(m.State)));
+                var loose = IsLooseLane(laneId);
+                var recency = settledLane && !loose
+                    ? group.SelectMany(c => c.ItemIds).Select(id => byId.TryGetValue(id, out var m) ? m.UpdatedAt : DateTimeOffset.MinValue).DefaultIfEmpty(DateTimeOffset.MinValue).Max()
+                    : DateTimeOffset.MaxValue;
+                var tier = loose ? 20_000_000.0 : settledLane ? 10_000_000.0 + Math.Min(9_000_000, (DateTimeOffset.MaxValue - recency).TotalDays) : 0.0;
+                // A release's lanes stay contiguous; the live/landed/loose order applies within it.
+                var basis = release is null ? 5_000_000_000.0 : releaseFirstSeen[release] * 100_000_000.0;
+                sortY = basis + tier + index;
             }
             keys.Add((laneId, sortY, index));
         }

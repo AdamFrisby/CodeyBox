@@ -26,11 +26,11 @@ public sealed class AxisReadingTests
         Assert.Equal(AxisZone.Now, TimeAxisScale.Read(0, layout, Options).Zone);
         Assert.Equal(AxisZone.Now, TimeAxisScale.Read(Options.NodeWidth / 4, layout, Options).Zone);
 
-        // Between the latest landing and now, not cut: the compression inverted exactly.
-        var quarter = TimeAxisScale.Read(-TimeAxisScale.Compress(45, Options) * rate, layout, Options);
-        Assert.Equal(AxisZone.Past, quarter.Zone);
-        Assert.Equal(bucket.AddMinutes(-45), quarter.At!.Value, TimeSpan.FromSeconds(1));
-        Assert.Null(quarter.Break);
+        // Between the latest landing and now: the fixed "since" cut — no instant is invented for it.
+        var since = TimeAxisScale.Read(-(Options.NodeWidth + Options.BreakWidth / 2), layout, Options);
+        Assert.Equal(AxisZone.Past, since.Zone);
+        Assert.Null(since.At);
+        Assert.True(since.Break!.SinceLatest);
         var atA = TimeAxisScale.Read(layout.Nodes["a"].X, layout, Options);
         Assert.Equal(bucket.AddHours(-1), atA.At!.Value, TimeSpan.FromSeconds(1));
 
@@ -42,7 +42,7 @@ public sealed class AxisReadingTests
         Assert.Equal(bucket.AddHours(-1.5), atB.At!.Value, TimeSpan.FromSeconds(1));
 
         // Inside the cut before "old": the cut, no instant.
-        var cut = Assert.Single(layout.Breaks);
+        var cut = Assert.Single(layout.Breaks, b => !b.SinceLatest);
         var inCut = TimeAxisScale.Read(cut.X + cut.Width / 2, layout, Options);
         Assert.Equal(AxisZone.Past, inCut.Zone);
         Assert.Null(inCut.At);

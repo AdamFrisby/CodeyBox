@@ -319,12 +319,14 @@ public static class CameraDirector
     /// </summary>
     public static CameraViewport FitViewport(
         double minX, double minY, double maxX, double maxY,
-        CameraViewSize view, FleetMapOptions options)
+        CameraViewSize view, FleetMapOptions options, bool wholeBoard = false)
     {
         var width = Math.Max(options.NodeWidth, maxX - minX + options.NodeWidth * 1.5);
         var height = Math.Max(options.NodeHeight, maxY - minY + options.NodeHeight * 3);
         var zoom = Math.Min(view.Width / width, view.Height / height);
-        zoom = Math.Clamp(zoom, options.MinFitZoom, options.MaxFitZoom);
+        // A region fit (a chain stop) keeps its legible floor; the whole-board
+        // fit goes as far out as the board needs.
+        zoom = Math.Clamp(zoom, wholeBoard ? Math.Max(1e-4, options.WholeBoardMinZoom) : options.MinFitZoom, options.MaxFitZoom);
         return new CameraViewport
         {
             CenterX = (minX + maxX) / 2,
@@ -513,27 +515,13 @@ public static class CameraDirector
         {
             return new CameraViewport { CenterX = 0, CenterY = 0, Zoom = options.OverviewZoom };
         }
+        // The whole board, always: zoom out to orient, spot the thing, zoom
+        // back in on it. Legibility at the floor is not the point; position is.
         var fit = FitViewport(
             nodes.Min(n => n.X), nodes.Min(n => n.Y),
             nodes.Max(n => n.X), nodes.Max(n => n.Y),
-            view, options);
-        if (fit.Zoom > options.MinFitZoom + 1e-9)
-        {
-            return fit with { Zoom = Math.Min(fit.Zoom, options.OverviewZoom) };
-        }
-        // Months of history do not fit one screen at a legible zoom. The
-        // overview is then the live work — now and the forecast — with the
-        // history running off to the left, where panning finds it.
-        var live = nodes.Where(n => n.Zone != AxisZone.Past).ToList();
-        if (live.Count == 0)
-        {
-            return fit;
-        }
-        var liveFit = FitViewport(
-            live.Min(n => n.X), live.Min(n => n.Y),
-            live.Max(n => n.X), live.Max(n => n.Y),
-            view, options);
-        return liveFit with { Zoom = Math.Min(liveFit.Zoom, options.OverviewZoom) };
+            view, options, wholeBoard: true);
+        return fit with { Zoom = Math.Min(fit.Zoom, options.OverviewZoom) };
     }
 }
 
