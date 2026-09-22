@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.PluginSdk.Credentials;
 
 namespace CodeyBox.InfisicalPlugin;
 
@@ -98,11 +99,7 @@ public sealed class InfisicalException : Exception
     }
 
     private static string Truncate(string message)
-    {
-        if (string.IsNullOrEmpty(message))
-            return "Infisical request failed.";
-        return message.Length <= MaxMessageChars ? message : message[..MaxMessageChars];
-    }
+        => CredentialMessages.Truncate(message, "Infisical request failed.", MaxMessageChars);
 
     /// <summary>Builds an exception from an HTTP status with safe context only.</summary>
     public static InfisicalException FromStatus(

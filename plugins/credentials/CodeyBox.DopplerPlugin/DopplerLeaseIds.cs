@@ -1,3 +1,5 @@
+using CodeyBox.PluginSdk.Credentials;
+
 namespace CodeyBox.DopplerPlugin;
 
 /// <summary>
@@ -26,27 +28,20 @@ internal static class DopplerLeaseIds
     internal sealed record ParsedLeaseId(LeaseKind Kind, string SandboxEnvVar, string Tail);
 
     internal static string BuildStatic(string sandboxEnvVar)
-        => $"{Prefix}.s.{sandboxEnvVar}.{Guid.NewGuid():N}";
+        => LeaseHandles.Build(Prefix, "s", sandboxEnvVar);
 
     internal static string BuildIdentity(string sandboxEnvVar)
-        => $"{Prefix}.i.{sandboxEnvVar}.{Guid.NewGuid():N}";
+        => LeaseHandles.Build(Prefix, "i", sandboxEnvVar);
 
     internal static bool IsOurs(string? leaseId)
-        => leaseId is not null
-            && leaseId.StartsWith(Prefix + ".", StringComparison.Ordinal);
+        => LeaseHandles.IsOurs(leaseId, Prefix);
 
     internal static bool TryParse(string? leaseId, out ParsedLeaseId parsed)
     {
         parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty, string.Empty);
-        if (string.IsNullOrWhiteSpace(leaseId))
+        if (!LeaseHandles.TryParse(leaseId, Prefix, out var kindLetter, out var sandboxVar, out var tail))
             return false;
-        var parts = leaseId.Split('.');
-        if (parts.Length != 4
-            || !string.Equals(parts[0], Prefix, StringComparison.Ordinal)
-            || string.IsNullOrWhiteSpace(parts[2])
-            || string.IsNullOrWhiteSpace(parts[3]))
-            return false;
-        var kind = parts[1] switch
+        var kind = kindLetter switch
         {
             "s" => LeaseKind.Static,
             "i" => LeaseKind.Identity,
@@ -54,7 +49,7 @@ internal static class DopplerLeaseIds
         };
         if (kind == LeaseKind.Unknown)
             return false;
-        parsed = new ParsedLeaseId(kind, parts[2], parts[3]);
+        parsed = new ParsedLeaseId(kind, sandboxVar, tail);
         return true;
     }
 }

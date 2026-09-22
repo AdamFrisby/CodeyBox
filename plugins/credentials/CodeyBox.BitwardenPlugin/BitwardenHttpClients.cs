@@ -1,4 +1,5 @@
 using System.Net;
+using CodeyBox.PluginSdk.Credentials;
 
 namespace CodeyBox.BitwardenPlugin;
 
@@ -12,35 +13,18 @@ namespace CodeyBox.BitwardenPlugin;
 /// </summary>
 internal static class BitwardenHttpClients
 {
-    /// <summary>Connection-pool lifetime, so DNS rotation still propagates without the shared HTTP factory.</summary>
-    private const int PooledConnectionLifetimeMinutes = 5;
-
     /// <summary>A client for identity and Secrets Manager API traffic. Never follows redirects.</summary>
     internal static HttpClient Create(TimeSpan timeout)
-    {
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero);
-        var handler = new SocketsHttpHandler
-        {
-            AllowAutoRedirect = false,
-            PooledConnectionLifetime = TimeSpan.FromMinutes(PooledConnectionLifetimeMinutes),
-        };
-        return new HttpClient(handler, disposeHandler: true) { Timeout = timeout };
-    }
+        => CredentialHttp.CreateNoRedirectClient(timeout);
 
     /// <summary>True for 3xx statuses, which this plugin never follows.</summary>
-    internal static bool IsRedirect(HttpStatusCode status) =>
-        (int)status >= 300 && (int)status < 400;
+    internal static bool IsRedirect(HttpStatusCode status)
+        => CredentialHttp.IsRedirect(status);
 
     /// <summary>
     /// True when both URIs share scheme, host, and port — i.e. no hop to
     /// another origin happened between them.
     /// </summary>
     internal static bool IsSameOrigin(Uri first, Uri second)
-    {
-        ArgumentNullException.ThrowIfNull(first);
-        ArgumentNullException.ThrowIfNull(second);
-        return string.Equals(first.Scheme, second.Scheme, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(first.Host, second.Host, StringComparison.OrdinalIgnoreCase)
-            && first.Port == second.Port;
-    }
+        => CredentialHttp.IsSameOrigin(first, second);
 }

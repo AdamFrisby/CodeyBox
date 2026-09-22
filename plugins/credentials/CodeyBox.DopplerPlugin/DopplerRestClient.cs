@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -265,19 +266,14 @@ public sealed class DopplerRestClient
                 $"Doppler response declares {contentLength.Value} bytes, above the {maxBytes}-byte cap.");
         await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         // Cap BEFORE buffering: a lying or missing content-length can never
-        // fill host memory.
-        var buffer = new byte[Math.Min(maxBytes + 1, 64 * 1024)];
-        using var sink = new MemoryStream();
-        int read;
-        while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
-        {
-            sink.Write(buffer, 0, read);
-            if (sink.Length > maxBytes)
-                throw new DopplerException(
-                    DopplerFailureKind.InvalidResponse,
-                    $"Doppler response exceeds the {maxBytes}-byte cap.");
-        }
-        return sink.ToArray();
+        // fill host memory. The shared copy stops past the cap; over-cap
+        // stays a typed backend failure.
+        var (bytes, truncated) = await CredentialBodies.CopyCappedAsync(stream, maxBytes, ct).ConfigureAwait(false);
+        if (truncated)
+            throw new DopplerException(
+                DopplerFailureKind.InvalidResponse,
+                $"Doppler response exceeds the {maxBytes}-byte cap.");
+        return bytes;
     }
 
     private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
@@ -286,16 +282,8 @@ public sealed class DopplerRestClient
         try
         {
             await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var buffer = new byte[2049];
-            using var sink = new MemoryStream();
-            int read;
-            while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
-            {
-                sink.Write(buffer, 0, read);
-                if (sink.Length > 2048)
-                    break;
-            }
-            text = Encoding.UTF8.GetString(sink.ToArray());
+            var (bytes, _) = await CredentialBodies.CopyCappedAsync(stream, 2048, ct).ConfigureAwait(false);
+            text = Encoding.UTF8.GetString(bytes);
         }
         catch (IOException)
         {
@@ -342,21 +330,8 @@ public sealed class DopplerRestClient
         return flat.Length <= MaxServerDetailChars ? flat : flat[..MaxServerDetailChars];
     }
 
-    private static int? ParseRetryAfter(HttpResponseMessage response)
-    {
-        try
-        {
-            if (response.Headers.RetryAfter?.Delta is TimeSpan delta)
-                return (int)Math.Clamp(delta.TotalSeconds, 0, 3600);
-            if (response.Headers.RetryAfter?.Date is DateTimeOffset date)
-                return (int)Math.Clamp((date - DateTimeOffset.UtcNow).TotalSeconds, 0, 3600);
-        }
-        catch (FormatException)
-        {
-            // Malformed header: no backoff hint.
-        }
-        return null;
-    }
+    private int? ParseRetryAfter(HttpResponseMessage response)
+        => CredentialRetryAfter.Parse(response, _clock);
 
     private static bool TryGetString(JsonElement element, string name, out string value)
     {

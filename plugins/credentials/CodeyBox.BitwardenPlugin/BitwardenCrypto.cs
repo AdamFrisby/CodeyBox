@@ -105,42 +105,21 @@ internal static class BitwardenCrypto
     /// Expands a 16-byte access-token seed into the 64-byte
     /// <c>encKey || macKey</c> material, mirroring the SDK's
     /// <c>derive_shareable_key(seed, "accesstoken", "sm-access-token")</c>:
-    /// HMAC-SHA256 with key <c>"bitwarden-accesstoken"</c> over the seed to
-    /// a 32-byte PRK, then HKDF-Expand (SHA-256) with info
-    /// <c>"sm-access-token"</c> to 64 bytes.
+    /// HKDF-SHA256 with salt <c>"bitwarden-accesstoken"</c> over the seed
+    /// and info <c>"sm-access-token"</c> to 64 bytes, via the vetted BCL
+    /// <see cref="HKDF"/> primitive.
     /// </summary>
     internal static byte[] DeriveAccessKey(byte[] seed)
     {
         ArgumentNullException.ThrowIfNull(seed);
         if (seed.Length != AccessTokenSeedSize)
             throw new ArgumentException("Access-token seed must be 16 bytes.", nameof(seed));
-        using var prkHmac = new HMACSHA256(Encoding.UTF8.GetBytes("bitwarden-accesstoken"));
-        var prk = prkHmac.ComputeHash(seed);
-        try
-        {
-            var info = Encoding.UTF8.GetBytes("sm-access-token");
-            var output = new byte[KeySize];
-            var previous = Array.Empty<byte>();
-            var offset = 0;
-            for (var counter = (byte)1; offset < output.Length; counter++)
-            {
-                using var expandHmac = new HMACSHA256(prk);
-                var input = new byte[previous.Length + info.Length + 1];
-                Buffer.BlockCopy(previous, 0, input, 0, previous.Length);
-                Buffer.BlockCopy(info, 0, input, previous.Length, info.Length);
-                input[input.Length - 1] = counter;
-                previous = expandHmac.ComputeHash(input);
-                CryptographicOperations.ZeroMemory(input);
-                var take = Math.Min(previous.Length, output.Length - offset);
-                Buffer.BlockCopy(previous, 0, output, offset, take);
-                offset += take;
-            }
-            return output;
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(prk);
-        }
+        return HKDF.DeriveKey(
+            HashAlgorithmName.SHA256,
+            seed,
+            KeySize,
+            Encoding.UTF8.GetBytes("bitwarden-accesstoken"),
+            Encoding.UTF8.GetBytes("sm-access-token"));
     }
 
     /// <summary>

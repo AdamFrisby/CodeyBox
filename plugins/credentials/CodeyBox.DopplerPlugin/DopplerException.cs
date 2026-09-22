@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.PluginSdk.Credentials;
 
 namespace CodeyBox.DopplerPlugin;
 
@@ -99,11 +100,7 @@ public sealed class DopplerException : Exception
     }
 
     private static string Truncate(string message)
-    {
-        if (string.IsNullOrEmpty(message))
-            return "Doppler request failed.";
-        return message.Length <= MaxMessageChars ? message : message[..MaxMessageChars];
-    }
+        => CredentialMessages.Truncate(message, "Doppler request failed.", MaxMessageChars);
 
     /// <summary>Builds an exception from an HTTP status with safe context only.</summary>
     public static DopplerException FromStatus(

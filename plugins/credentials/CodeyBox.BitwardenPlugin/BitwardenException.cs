@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.PluginSdk.Credentials;
 
 namespace CodeyBox.BitwardenPlugin;
 
@@ -99,15 +100,7 @@ public sealed class BitwardenException : Exception
     }
 
     private static string Truncate(string message)
-    {
-        if (string.IsNullOrEmpty(message))
-            return "Bitwarden request failed.";
-        // Flatten control characters: messages flow into host logs and the
-        // persisted lease store, so embedded newlines must not forge log
-        // lines regardless of which caller constructed the text.
-        var flat = message.Replace('\n', ' ').Replace('\r', ' ');
-        return flat.Length <= MaxMessageChars ? flat : flat[..MaxMessageChars];
-    }
+        => CredentialMessages.Truncate(message, "Bitwarden request failed.", MaxMessageChars);
 
     /// <summary>Builds an exception from an HTTP status with safe context only.</summary>
     public static BitwardenException FromStatus(

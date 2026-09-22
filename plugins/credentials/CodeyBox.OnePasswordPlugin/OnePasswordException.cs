@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.PluginSdk.Credentials;
 
 namespace CodeyBox.OnePasswordPlugin;
 
@@ -100,11 +101,7 @@ public sealed class OnePasswordException : Exception
     }
 
     private static string Truncate(string message)
-    {
-        if (string.IsNullOrEmpty(message))
-            return "1Password request failed.";
-        return message.Length <= MaxMessageChars ? message : message[..MaxMessageChars];
-    }
+        => CredentialMessages.Truncate(message, "1Password request failed.", MaxMessageChars);
 
     /// <summary>Builds an exception from an HTTP status with safe context only.</summary>
     public static OnePasswordException FromStatus(

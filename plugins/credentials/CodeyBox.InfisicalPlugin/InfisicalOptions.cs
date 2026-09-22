@@ -1,5 +1,5 @@
-using System.Globalization;
 using Microsoft.Extensions.Configuration;
+using CodeyBox.PluginSdk.Credentials;
 
 namespace CodeyBox.InfisicalPlugin;
 
@@ -357,48 +357,18 @@ public sealed record InfisicalOptions
     }
 
     private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw) || !bool.TryParse(raw.Trim(), out var parsed) ? fallback : parsed;
-    }
+        => CredentialOptions.ReadBool(section, key, fallback);
 
     private static int ReadInt(
         IConfigurationSection section, string key, int fallback, List<string>? warnings)
-    {
-        var raw = section[key];
-        if (string.IsNullOrWhiteSpace(raw))
-            return fallback;
-        if (!int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
-        {
-            warnings?.Add($"'{key}' value '{raw.Trim()}' is not an integer; using {fallback}.");
-            return fallback;
-        }
-        return parsed;
-    }
+        => CredentialOptions.ReadInt(section, key, fallback, warnings);
 
     private static string ReadNonEmpty(IConfigurationSection section, string key, string fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw) ? fallback : raw.Trim();
-    }
+        => CredentialOptions.ReadNonEmpty(section, key, fallback);
 
     internal static bool IsLoopbackHost(string host)
-        => string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(host, "127.0.0.1", StringComparison.Ordinal)
-            || string.Equals(host, "::1", StringComparison.Ordinal)
-            || host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase);
+        => CredentialOptions.IsLoopbackHost(host);
 
     private static bool IsEnvVarName(string value)
-    {
-        if (string.IsNullOrEmpty(value))
-            return false;
-        if (!(value[0] is (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or '_'))
-            return false;
-        foreach (var c in value.AsSpan(1))
-        {
-            if (!(c is (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or (>= '0' and <= '9') or '_'))
-                return false;
-        }
-        return true;
-    }
+        => CredentialOptions.IsEnvVarName(value);
 }

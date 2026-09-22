@@ -1,3 +1,5 @@
+using CodeyBox.PluginSdk.Credentials;
+
 namespace CodeyBox.InfisicalPlugin;
 
 /// <summary>
@@ -23,27 +25,20 @@ internal static class InfisicalLeaseIds
     internal sealed record ParsedLeaseId(LeaseKind Kind, string SandboxEnvVar, string Tail, bool Brokered);
 
     internal static string BuildStatic(string sandboxEnvVar, bool brokered)
-        => $"{Prefix}.{(brokered ? 'S' : 's')}.{sandboxEnvVar}.{Guid.NewGuid():N}";
+        => LeaseHandles.Build(Prefix, brokered ? "S" : "s", sandboxEnvVar);
 
     internal static string BuildDynamic(string sandboxEnvVar, string serverLeaseId, bool brokered)
-        => $"{Prefix}.{(brokered ? 'D' : 'd')}.{sandboxEnvVar}.{serverLeaseId}";
+        => LeaseHandles.Build(Prefix, brokered ? "D" : "d", sandboxEnvVar, serverLeaseId);
 
     internal static bool IsOurs(string? leaseId)
-        => leaseId is not null
-            && leaseId.StartsWith(Prefix + ".", StringComparison.Ordinal);
+        => LeaseHandles.IsOurs(leaseId, Prefix);
 
     internal static bool TryParse(string? leaseId, out ParsedLeaseId parsed)
     {
         parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty, string.Empty, false);
-        if (string.IsNullOrWhiteSpace(leaseId))
+        if (!LeaseHandles.TryParse(leaseId, Prefix, out var kindLetter, out var sandboxVar, out var tail))
             return false;
-        var parts = leaseId.Split('.');
-        if (parts.Length != 4
-            || !string.Equals(parts[0], Prefix, StringComparison.Ordinal)
-            || string.IsNullOrWhiteSpace(parts[2])
-            || string.IsNullOrWhiteSpace(parts[3]))
-            return false;
-        var (kind, brokered) = parts[1] switch
+        var (kind, brokered) = kindLetter switch
         {
             "s" => (LeaseKind.Static, false),
             "S" => (LeaseKind.Static, true),
@@ -53,7 +48,7 @@ internal static class InfisicalLeaseIds
         };
         if (kind == LeaseKind.Unknown)
             return false;
-        parsed = new ParsedLeaseId(kind, parts[2], parts[3], brokered);
+        parsed = new ParsedLeaseId(kind, sandboxVar, tail, brokered);
         return true;
     }
 }

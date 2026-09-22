@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -519,19 +520,14 @@ internal sealed class BitwardenRestClient
                 $"Bitwarden response declares {contentLength.Value} bytes, above the {maxBytes}-byte cap.");
         await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         // Cap BEFORE buffering: a lying or missing content-length can never
-        // fill host memory.
-        var buffer = new byte[Math.Min(maxBytes + 1, 64 * 1024)];
-        using var sink = new MemoryStream();
-        int read;
-        while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
-        {
-            sink.Write(buffer, 0, read);
-            if (sink.Length > maxBytes)
-                throw new BitwardenException(
-                    BitwardenFailureKind.InvalidResponse,
-                    $"Bitwarden response exceeds the {maxBytes}-byte cap.");
-        }
-        return sink.ToArray();
+        // fill host memory. The shared copy stops past the cap; over-cap
+        // stays a typed backend failure.
+        var (bytes, truncated) = await CredentialBodies.CopyCappedAsync(stream, maxBytes, ct).ConfigureAwait(false);
+        if (truncated)
+            throw new BitwardenException(
+                BitwardenFailureKind.InvalidResponse,
+                $"Bitwarden response exceeds the {maxBytes}-byte cap.");
+        return bytes;
     }
 
     /// <summary>
@@ -550,16 +546,8 @@ internal sealed class BitwardenRestClient
         try
         {
             await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var buffer = new byte[MaxErrorBodyBytes + 1];
-            using var sink = new MemoryStream();
-            int read;
-            while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
-            {
-                sink.Write(buffer, 0, read);
-                if (sink.Length > MaxErrorBodyBytes)
-                    break;
-            }
-            text = Encoding.UTF8.GetString(sink.ToArray());
+            var (bytes, _) = await CredentialBodies.CopyCappedAsync(stream, MaxErrorBodyBytes, ct).ConfigureAwait(false);
+            text = Encoding.UTF8.GetString(bytes);
         }
         catch (IOException)
         {
@@ -593,21 +581,8 @@ internal sealed class BitwardenRestClient
         return "no readable error body";
     }
 
-    private static int? ParseRetryAfter(HttpResponseMessage response)
-    {
-        try
-        {
-            if (response.Headers.RetryAfter?.Delta is TimeSpan delta)
-                return (int)Math.Clamp(delta.TotalSeconds, 0, 3600);
-            if (response.Headers.RetryAfter?.Date is DateTimeOffset date)
-                return (int)Math.Clamp((date - DateTimeOffset.UtcNow).TotalSeconds, 0, 3600);
-        }
-        catch (FormatException)
-        {
-            // Malformed header: no backoff hint.
-        }
-        return null;
-    }
+    private int? ParseRetryAfter(HttpResponseMessage response)
+        => CredentialRetryAfter.Parse(response, _clock);
 
     private static bool TryGetString(JsonElement element, string name, out string value)
     {
