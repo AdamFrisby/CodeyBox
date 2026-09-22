@@ -1,4 +1,9 @@
-# CodeyBox
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/codeybox-logo-dark.svg">
+    <img src="brand/codeybox-logo.svg" alt="CodeyBox" width="380">
+  </picture>
+</p>
 
 **An autonomous coding orchestrator.** Hand it a task — a title and a prompt
 against one of your repos — and CodeyBox picks a coding agent, runs it inside a
