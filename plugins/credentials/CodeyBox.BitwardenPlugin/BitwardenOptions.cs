@@ -31,7 +31,7 @@ public sealed record BitwardenSecretMapping
     public string Group { get; init; } = string.Empty;
 
     /// <summary>
-    /// Secrets Manager secret UUID (<c>GET /secrets-manager/secrets/{id}</c>).
+    /// Secrets Manager secret UUID (<c>GET /secrets/{id}</c>).
     /// Exactly one of <see cref="SecretId"/> and <see cref="SecretKey"/>
     /// must be set; the UUID form is preferred because it survives renames.
     /// </summary>
@@ -41,7 +41,7 @@ public sealed record BitwardenSecretMapping
     /// Secrets Manager secret key, resolved with an exact (ordinal) match
     /// over the organisation's secret listing. Empty selects the
     /// <see cref="SecretId"/> path. Requires an effective organisation id
-    /// (mapping <c>OrganizationId</c> or provider <c>Default</c>).
+    /// (mapping <c>OrganizationId</c> or provider <c>OrganizationId</c>).
     /// </summary>
     public string SecretKey { get; init; } = string.Empty;
 

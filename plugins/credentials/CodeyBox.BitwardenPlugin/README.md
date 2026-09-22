@@ -20,7 +20,9 @@ workload sandbox ── env (value) ── orchestrator
                                codeybox.bitwarden
                                   │  1. POST {identity}/connect/token
                                   │     (client-credentials, api.secrets)
-                                  │  2. GET {api}/secrets-manager/secrets/{id}
+                                  │  2. GET {api}/secrets/{id}
+                                  │     (or GET {api}/organizations/{org}/secrets
+                                  │      for key-based resolution)
                                   ▼
 guest ── value ──► upstream      Bitwarden Cloud (or self-hosted)
 ```
@@ -73,7 +75,10 @@ documented choice — not a silent fallback.
    project set) per secret group. Note each secret's UUID (preferred —
    UUIDs survive renames) or its exact key.
 3. **Create the secrets** in each project (for example `PAID_API_KEY`).
-   The provider reads the `value` field only.
+   The provider reads the `value` field of `GET /secrets/{id}` only, and
+   only when it is a usable plaintext value: a `value` arriving as a
+   Bitwarden CipherString (end-to-end-encrypted) is refused loudly rather
+   than injected as ciphertext — see Contract gaps.
 4. **Create a machine account per secret group**: Organisation →
    Settings → Machine accounts, granting exactly the projects that
    account may read (read-only where possible). A machine account's
@@ -154,9 +159,9 @@ a client-side validity window over a genuinely short-lived access token:
         "StaticLeaseTtlMinutes": 20,
         "Mappings": [
           { "SandboxEnvVar": "PAID_API_TOKEN", "Group": "paid-api",
-            "SecretId": "2c4c8a1e-3f5b-4a6c-9d7e-8f0a1b2c3d4e" },
+            "SecretId": "11111111-1111-1111-1111-111111111111" },
           { "SandboxEnvVar": "DEV_TOKEN", "Group": "dev-api",
-            "SecretKey": "DEV_TOKEN", "ProjectId": "9d7e8f0a-1b2c-4d5e-8f0a-1b2c3d4e5f6a",
+            "SecretKey": "DEV_TOKEN", "ProjectId": "22222222-2222-2222-2222-222222222222",
             "ClientId": "dev-machine-account-client-id",
             "ClientSecretEnvVar": "BITWARDEN_CLIENT_SECRET_DEV" }
         ]
@@ -168,21 +173,34 @@ a client-side validity window over a genuinely short-lived access token:
 
 ## Contract gaps
 
-None known: the lease-shaped contract (`Issue` / `Renew` / `Revoke`
-plus the reconciliation sweep over persisted lease handles) expresses
-everything this backend offers. Brokered/dynamic secrets do not exist in
-Secrets Manager, so this provider always issues classic values
-(`Brokered=false`).
+- **No project-key decryption (limitation).** Secrets Manager is
+  end-to-end-encrypted: a `value` may arrive as a Bitwarden CipherString
+  that only a holder of the project decryption keys can open. This
+  provider speaks the REST API with a service-account bearer token and
+  holds no project keys, so it serves plaintext values and refuses
+  CipherString values loudly (`InvalidResponse`, i.e. infrastructure —
+  never a diff verdict) instead of injecting ciphertext into the guest
+  environment. If Bitwarden documents a service-account decryption flow
+  (or re-licenses the SDK under MIT-compatible terms), wiring project-key
+  decryption in is the natural next step; until then the refusal is the
+  honest behaviour.
+- Otherwise none known: the lease-shaped contract (`Issue` / `Renew` /
+  `Revoke` plus the reconciliation sweep over persisted lease handles)
+  expresses everything else this backend offers. Brokered/dynamic secrets
+  do not exist in Secrets Manager, so this provider always issues classic
+  values (`Brokered=false`).
 
 ## Tests
 
 `tests/CodeyBox.Tests/Bitwarden/BitwardenPluginTests.cs` verifies the
 contract with HTTP faked at the transport and the real manager/store/sweep
-wiring; recorded payload shapes live in
-`tests/CodeyBox.Tests/Fixtures/bitwarden/`, transcribed from the live
-Secrets Manager API shapes. The one live test runs only when
+wiring; payload shapes live in
+`tests/CodeyBox.Tests/Fixtures/bitwarden/`, hand-built to match the
+authoritative server response models (`SecretResponseModel` /
+`SecretWithProjectsListResponseModel` in `bitwarden/server`) — they were
+not captured from live traffic. The one live test runs only when
 `BW_SM_LIVE_*` env is set (`BW_SM_LIVE_IDENTITY_URL`,
 `BW_SM_LIVE_API_URL`, `BW_SM_LIVE_CLIENT_ID`,
 `BW_SM_LIVE_CLIENT_SECRET`, `BW_SM_LIVE_SECRET_ID`,
-`BW_SM_LIVE_VALUE`), so offline runs rely on the recorded shapes plus
+`BW_SM_LIVE_VALUE`), so offline runs rely on the model-derived shapes plus
 this README's statement of why no live instance is required in CI.

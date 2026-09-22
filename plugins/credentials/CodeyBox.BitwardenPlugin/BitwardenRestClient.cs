@@ -18,15 +18,24 @@ internal sealed record BitwardenAccessToken(string Token, DateTimeOffset Expires
 /// Minimal Bitwarden Secrets Manager REST client: machine-account
 /// client-credentials token minting against the identity origin
 /// (<c>POST /connect/token</c>) plus single-secret reads
-/// (<c>GET /secrets-manager/secrets/{id}</c>) and key-to-UUID resolution
-/// (<c>POST /secrets-manager/secrets/list</c>) against the API origin.
+/// (<c>GET /secrets/{id}</c>) and key-to-UUID resolution
+/// (<c>GET /organizations/{organizationId}/secrets</c>) against the API
+/// origin — the routes and response models served by
+/// <c>bitwarden/server</c> <c>SecretsController</c> (<c>SecretResponseModel</c>
+/// carries <c>value</c> plus a <c>projects</c> array; the organisation
+/// listing <c>SecretWithProjectsListResponseModel</c> carries a
+/// <c>secrets</c> array whose entries carry no <c>value</c>).
 /// <para>Every response body is bounded <em>before</em> buffering
 /// (<c>ResponseHeadersRead</c> + content-length pre-check + capped copy), so
 /// an unbounded upstream can never fill host memory. Every failure surfaces
-/// as <see cref="BitwardenException"/> with safe fields only — values and
-/// tokens never reach messages, logs, or exceptions. A <c>message</c> or
-/// <c>error_description</c> echoed by the server is truncated and names
-/// operations and identifiers, never values.</para>
+/// as <see cref="BitwardenException"/> with safe fields only — HTTP status,
+/// the allowlisted machine-readable <c>error</c> code, and operator
+/// identifiers — never values, tokens, client secrets, or free-text server
+/// prose (a server echoing request content in an error body must not land a
+/// credential in logs or the lease store). A <c>value</c> arriving as a
+/// Bitwarden CipherString (end-to-end-encrypted) is refused loudly instead
+/// of being served as ciphertext: this client holds no project decryption
+/// keys (see the plugin README's contract gaps).</para>
 /// </summary>
 internal sealed class BitwardenRestClient
 {
@@ -34,8 +43,34 @@ internal sealed class BitwardenRestClient
     private readonly TimeProvider _clock;
     private readonly ILogger _log;
 
-    /// <summary>Maximum characters kept from a server-echoed error message.</summary>
-    public const int MaxServerDetailChars = 200;
+    /// <summary>Server <c>expires_in</c> fallback when the token response carries none.</summary>
+    internal const int DefaultTokenLifetimeSeconds = 3600;
+
+    /// <summary>Sanity cap on an accepted token lifetime; larger values are clamped, not trusted.</summary>
+    internal const int MaxAcceptedTokenLifetimeSeconds = 24 * 3600;
+
+    /// <summary>Cap on an error response body kept for error-code extraction.</summary>
+    internal const int MaxErrorBodyBytes = 2048;
+
+    /// <summary>
+    /// Machine-readable OAuth/API <c>error</c> codes safe to relay into an
+    /// exception message. Anything else the server sends — free-text
+    /// <c>message</c>/<c>error_description</c>, raw bodies — is untrusted
+    /// runtime output that may echo request content (including credentials)
+    /// and therefore never reaches messages, logs, or the lease store.
+    /// </summary>
+    private static readonly HashSet<string> SafeErrorCodes = new(StringComparer.Ordinal)
+    {
+        "invalid_client",
+        "invalid_grant",
+        "invalid_request",
+        "invalid_scope",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "access_denied",
+        "server_error",
+        "temporarily_unavailable",
+    };
 
     public BitwardenRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
@@ -80,22 +115,28 @@ internal sealed class BitwardenRestClient
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
                     "Bitwarden identity server returned no access token.");
-            var expiresIn = TryGetInt32(root, "expires_in", out var seconds) ? seconds : 3600;
+            var expiresIn = TryGetInt32(root, "expires_in", out var seconds) ? seconds : DefaultTokenLifetimeSeconds;
             if (expiresIn <= 0)
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
                     "Bitwarden identity server returned no usable token lifetime.");
-            var expiresAt = _clock.GetUtcNow() + TimeSpan.FromSeconds(Math.Min(expiresIn, 24 * 3600));
+            var expiresAt = _clock.GetUtcNow() + TimeSpan.FromSeconds(Math.Min(expiresIn, MaxAcceptedTokenLifetimeSeconds));
             _log.LogDebug("Bitwarden minted a machine-account access token.");
             return new BitwardenAccessToken(token, expiresAt);
         }
     }
 
     /// <summary>
-    /// Reads one secret value by UUID. Only the <c>value</c> is returned;
-    /// every other field is dropped without logging. When
-    /// <paramref name="expectedProjectId"/> is set, a secret living in any
-    /// other project fails loudly instead of serving a wrong-project value.
+    /// Reads one secret value by UUID (<c>GET /secrets/{id}</c>). Only the
+    /// <c>value</c> is returned; every other field is dropped without
+    /// logging. When <paramref name="expectedProjectId"/> is set, the
+    /// response's <c>projects</c> array must contain it (ordinal match) —
+    /// a secret living in any other project, or a response carrying no
+    /// usable project linkage at all, fails loudly instead of serving a
+    /// wrong-project value. An end-to-end-encrypted <c>value</c>
+    /// (Bitwarden CipherString) is refused loudly: serving ciphertext as a
+    /// credential would be a silent integrity failure, and this client
+    /// holds no project decryption keys.
     /// </summary>
     public async Task<string> GetSecretAsync(
         string apiUrl,
@@ -108,40 +149,89 @@ internal sealed class BitwardenRestClient
         ArgumentException.ThrowIfNullOrWhiteSpace(apiUrl);
         ArgumentException.ThrowIfNullOrWhiteSpace(accessToken);
         ArgumentException.ThrowIfNullOrWhiteSpace(secretId);
-        var url = $"{apiUrl.TrimEnd('/')}/secrets-manager/secrets/{Uri.EscapeDataString(secretId.Trim())}";
+        var trimmedId = secretId.Trim();
+        var url = $"{apiUrl.TrimEnd('/')}/secrets/{Uri.EscapeDataString(trimmedId)}";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        using var response = await SendAsync(request, $"read secret '{secretId.Trim()}'", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, $"read secret '{secretId.Trim()}'", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await SendAsync(request, $"read secret '{trimmedId}'", ct).ConfigureAwait(false);
+        var doc = await ReadJsonAsync(response, $"read secret '{trimmedId}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
-            if (!TryGetString(root, "value", out var value) || value is null)
+            if (!TryGetString(root, "value", out var value) || string.IsNullOrEmpty(value))
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
-                    $"Bitwarden secret '{secretId.Trim()}' returned no value.");
-            if (!string.IsNullOrWhiteSpace(expectedProjectId)
-                && TryGetString(root, "projectId", out var projectId)
-                && !string.IsNullOrWhiteSpace(projectId)
-                && !string.Equals(projectId, expectedProjectId.Trim(), StringComparison.Ordinal))
+                    $"Bitwarden secret '{trimmedId}' returned no value.");
+            if (!ProjectGuardPasses(root, expectedProjectId))
                 throw new BitwardenException(
                     BitwardenFailureKind.Misconfigured,
-                    $"Bitwarden secret '{secretId.Trim()}' lives in project '{projectId}', not the mapped project; refusing a wrong-project read.");
-            if (string.IsNullOrEmpty(value))
+                    $"Bitwarden secret '{trimmedId}' is not in the mapped project; refusing a wrong-project read.");
+            if (LooksEncrypted(value))
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
-                    $"Bitwarden secret '{secretId.Trim()}' returned an empty value.");
-            _log.LogDebug("Bitwarden read secret '{SecretId}'.", secretId.Trim());
+                    $"Bitwarden secret '{trimmedId}' returned an end-to-end-encrypted value this provider cannot decrypt; refusing to serve ciphertext.");
+            _log.LogDebug("Bitwarden read secret '{SecretId}'.", trimmedId);
             return value;
         }
     }
 
     /// <summary>
+    /// True when no project expectation is configured, or the secret's
+    /// <c>projects</c> array contains the expected project id (ordinal).
+    /// Anything else — a different project, or no usable project linkage —
+    /// is a loud failure at the call site, never a served value.
+    /// </summary>
+    private static bool ProjectGuardPasses(JsonElement secret, string? expectedProjectId)
+    {
+        if (string.IsNullOrWhiteSpace(expectedProjectId))
+            return true;
+        var expected = expectedProjectId.Trim();
+        foreach (var listed in ReadProjectIds(secret))
+        {
+            if (string.Equals(listed, expected, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>Project ids linked to a secret response (<c>projects[].id</c>).</summary>
+    private static IEnumerable<string> ReadProjectIds(JsonElement secret)
+    {
+        if (secret.TryGetProperty("projects", out var projects)
+            && projects.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var project in projects.EnumerateArray())
+            {
+                if (project.ValueKind == JsonValueKind.Object
+                    && TryGetString(project, "id", out var id)
+                    && !string.IsNullOrWhiteSpace(id))
+                    yield return id.Trim();
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when a secret <c>value</c> wears a Bitwarden CipherString
+    /// envelope (<c>&lt;type&gt;.&lt;payload&gt;</c> with a <c>|</c>
+    /// separator) rather than a usable plaintext value.
+    /// </summary>
+    private static bool LooksEncrypted(string value)
+        => value.Length > 2
+            && char.IsAsciiDigit(value[0])
+            && value[1] == '.'
+            && value.Contains('|');
+
+    /// <summary>
     /// Resolves a secret key to its UUID with an exact (ordinal) match over
-    /// the organisation's secret listing. Substring or case-insensitive
-    /// matching would let similarly-named secrets shadow each other; exact
-    /// match fails loudly instead, and ambiguity resolves only via
-    /// <c>SecretId</c>.
+    /// the organisation's secret listing
+    /// (<c>GET /organizations/{organizationId}/secrets</c>, whose entries
+    /// carry no <c>value</c>). Substring or case-insensitive matching would
+    /// let similarly-named secrets shadow each other; exact match fails
+    /// loudly instead, and ambiguity resolves only via <c>SecretId</c>.
+    /// When <paramref name="projectId"/> is set, only entries linked to
+    /// that project (via their <c>projects</c> array) are eligible — an
+    /// entry with no usable project linkage cannot satisfy a project
+    /// filter, so it is skipped rather than served.
     /// </summary>
     public async Task<string> ResolveSecretIdAsync(
         string apiUrl,
@@ -156,19 +246,17 @@ internal sealed class BitwardenRestClient
         ArgumentException.ThrowIfNullOrWhiteSpace(accessToken);
         ArgumentException.ThrowIfNullOrWhiteSpace(organizationId);
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
-        var url = $"{apiUrl.TrimEnd('/')}/secrets-manager/secrets/list";
-        var payload = JsonSerializer.Serialize(
-            new Dictionary<string, string>(StringComparer.Ordinal) { ["organizationId"] = organizationId.Trim() });
-        using var request = new HttpRequestMessage(HttpMethod.Post, url)
-        {
-            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
-        };
+        var trimmedOrg = organizationId.Trim();
+        var trimmedKey = key.Trim();
+        var projectFilter = string.IsNullOrWhiteSpace(projectId) ? null : projectId.Trim();
+        var url = $"{apiUrl.TrimEnd('/')}/organizations/{Uri.EscapeDataString(trimmedOrg)}/secrets";
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
         using var response = await SendAsync(request, "list secrets", ct).ConfigureAwait(false);
         var doc = await ReadJsonAsync(response, "list secrets", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
-            if (!doc.RootElement.TryGetProperty("data", out var data)
+            if (!doc.RootElement.TryGetProperty("secrets", out var data)
                 || data.ValueKind != JsonValueKind.Array)
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
@@ -180,12 +268,9 @@ internal sealed class BitwardenRestClient
                 if (candidate.ValueKind != JsonValueKind.Object)
                     continue;
                 if (!TryGetString(candidate, "key", out var candidateKey)
-                    || !string.Equals(candidateKey, key.Trim(), StringComparison.Ordinal))
+                    || !string.Equals(candidateKey, trimmedKey, StringComparison.Ordinal))
                     continue;
-                if (!string.IsNullOrWhiteSpace(projectId)
-                    && TryGetString(candidate, "projectId", out var candidateProject)
-                    && !string.IsNullOrWhiteSpace(candidateProject)
-                    && !string.Equals(candidateProject, projectId.Trim(), StringComparison.Ordinal))
+                if (projectFilter is not null && !ListsProject(candidate, projectFilter))
                     continue;
                 if (!TryGetString(candidate, "id", out var id) || string.IsNullOrWhiteSpace(id))
                     continue;
@@ -195,13 +280,23 @@ internal sealed class BitwardenRestClient
             if (matches == 0)
                 throw new BitwardenException(
                     BitwardenFailureKind.NotFound,
-                    $"Bitwarden secret key '{key.Trim()}' was not found.");
+                    $"Bitwarden secret key '{trimmedKey}' was not found.");
             if (matches > 1)
                 throw new BitwardenException(
                     BitwardenFailureKind.Misconfigured,
-                    $"Bitwarden secret key '{key.Trim()}' is ambiguous ({matches} matches); use SecretId instead.");
+                    $"Bitwarden secret key '{trimmedKey}' is ambiguous ({matches} matches); use SecretId instead.");
             return match!;
         }
+    }
+
+    private static bool ListsProject(JsonElement candidate, string projectId)
+    {
+        foreach (var listed in ReadProjectIds(candidate))
+        {
+            if (string.Equals(listed, projectId, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
     }
 
     private async Task<HttpResponseMessage> SendTokenAsync(
@@ -222,6 +317,7 @@ internal sealed class BitwardenRestClient
             throw new BitwardenException(
                 BitwardenFailureKind.Unauthorized,
                 $"Bitwarden mint machine-account access token rejected the machine-account credential: {ex.Message}",
+                ex,
                 400);
         }
     }
@@ -292,9 +388,9 @@ internal sealed class BitwardenRestClient
     }
 
     private static bool IsIdentityCredentialRejection(string detail)
-        => detail.Contains("invalid_client", StringComparison.OrdinalIgnoreCase)
-            || detail.Contains("invalid_grant", StringComparison.OrdinalIgnoreCase)
-            || detail.Contains("unauthorized_client", StringComparison.OrdinalIgnoreCase);
+        => string.Equals(detail, "invalid_client", StringComparison.Ordinal)
+            || string.Equals(detail, "invalid_grant", StringComparison.Ordinal)
+            || string.Equals(detail, "unauthorized_client", StringComparison.Ordinal);
 
     private async Task<JsonDocument> ReadJsonAsync(
         HttpResponseMessage response, string operation, int maxBytes, CancellationToken ct)
@@ -356,19 +452,29 @@ internal sealed class BitwardenRestClient
         return sink.ToArray();
     }
 
+    /// <summary>
+    /// Extracts the safe part of an error response: the machine-readable
+    /// <c>error</c> code, and only when it is on the allowlist. Server
+    /// free text (<c>message</c>, <c>error_description</c>) and raw bodies
+    /// are untrusted dependency output that may echo request content — a
+    /// reflected client secret or bearer token must never reach exception
+    /// messages (which the host logs and persists in the lease store) — so
+    /// they are never relayed. Anything without an allowlisted code yields
+    /// a fixed placeholder; the HTTP status travels separately.
+    /// </summary>
     private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
     {
         string text;
         try
         {
             await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var buffer = new byte[2049];
+            var buffer = new byte[MaxErrorBodyBytes + 1];
             using var sink = new MemoryStream();
             int read;
             while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
             {
                 sink.Write(buffer, 0, read);
-                if (sink.Length > 2048)
+                if (sink.Length > MaxErrorBodyBytes)
                     break;
             }
             text = Encoding.UTF8.GetString(sink.ToArray());
@@ -389,33 +495,20 @@ internal sealed class BitwardenRestClient
         try
         {
             using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            if (doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("error", out var error)
+                && error.ValueKind == JsonValueKind.String)
             {
-                foreach (var key in new[] { "message", "error_description", "error" })
-                {
-                    if (doc.RootElement.TryGetProperty(key, out var message)
-                        && message.ValueKind == JsonValueKind.String)
-                    {
-                        var detail = message.GetString() ?? string.Empty;
-                        if (!string.IsNullOrWhiteSpace(detail))
-                        {
-                            // Flatten CR/LF like the raw branch below: this
-                            // text flows into exception messages, host logs,
-                            // and the lease store, so a newline-bearing
-                            // server message must not forge log lines.
-                            var flatDetail = detail.Replace('\n', ' ').Replace('\r', ' ');
-                            return flatDetail.Length <= MaxServerDetailChars ? flatDetail : flatDetail[..MaxServerDetailChars];
-                        }
-                    }
-                }
+                var code = (error.GetString() ?? string.Empty).Trim();
+                if (SafeErrorCodes.Contains(code))
+                    return code;
             }
         }
         catch (JsonException)
         {
-            // Fall through to the truncated raw text (status context only).
+            // No allowlisted code: fall through to the fixed placeholder.
         }
-        var flat = text.Replace('\n', ' ').Replace('\r', ' ');
-        return flat.Length <= MaxServerDetailChars ? flat : flat[..MaxServerDetailChars];
+        return "no readable error body";
     }
 
     private static int? ParseRetryAfter(HttpResponseMessage response)

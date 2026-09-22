@@ -209,8 +209,6 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
     public async Task RevokeAsync(string leaseId, CancellationToken ct = default)
     {
         _ = ParseOurs(leaseId);
-        var options = RequireUsableOptions();
-        EnsureClients();
         await Task.CompletedTask.ConfigureAwait(false);
 
         // Secrets Manager secrets carry no server-side lease and the
@@ -267,7 +265,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
                 BitwardenFailureKind.Misconfigured,
                 $"Bitwarden client-secret env '{secretEnvName}' is empty. Provision a machine-account client secret " +
                 $"with access to the mapped projects from the host credential chain.");
-        var key = CredentialKey(clientId, secretEnvName!);
+        var key = CredentialKey(options, mapping);
 
         if (_tokens.TryGetValue(key, out var cached) && TokenUsable(cached, options))
             return cached;
@@ -336,11 +334,19 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         var secretEnvName = string.IsNullOrWhiteSpace(mapping.ClientSecretEnvVar)
             ? options.ClientSecretEnvVar
             : mapping.ClientSecretEnvVar;
-        return CredentialKey(clientId, secretEnvName);
+        // Bound to the origins that minted the token: options are re-read
+        // on every call for hot reload, so an operator changing ApiUrl or
+        // IdentityUrl must never replay a token minted by the old origin
+        // against the new one.
+        return CredentialKey(
+            options.IdentityUrl.Trim(),
+            options.ApiUrl.Trim(),
+            clientId,
+            secretEnvName);
     }
 
-    private static string CredentialKey(string clientId, string secretEnvName)
-        => $"{clientId}\0{secretEnvName}";
+    private static string CredentialKey(string identityUrl, string apiUrl, string clientId, string secretEnvName)
+        => $"{identityUrl}\0{apiUrl}\0{clientId}\0{secretEnvName}";
 
     private BitwardenOptions RequireUsableOptions()
     {

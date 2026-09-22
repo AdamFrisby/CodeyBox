@@ -19,7 +19,7 @@ public enum BitwardenFailureKind
     Unauthorized,
     /// <summary>HTTP 429: the backend rate limit.</summary>
     RateLimited,
-    /// <summary>HTTP 503 with a retry signal, or 429 with Retry-After: slow down, retry later.</summary>
+    /// <summary>HTTP 503 with a Retry-After signal: slow down, retry later.</summary>
     Throttled,
     /// <summary>HTTP 5xx: the backend errored.</summary>
     BackendError,
@@ -102,7 +102,11 @@ public sealed class BitwardenException : Exception
     {
         if (string.IsNullOrEmpty(message))
             return "Bitwarden request failed.";
-        return message.Length <= MaxMessageChars ? message : message[..MaxMessageChars];
+        // Flatten control characters: messages flow into host logs and the
+        // persisted lease store, so embedded newlines must not forge log
+        // lines regardless of which caller constructed the text.
+        var flat = message.Replace('\n', ' ').Replace('\r', ' ');
+        return flat.Length <= MaxMessageChars ? flat : flat[..MaxMessageChars];
     }
 
     /// <summary>Builds an exception from an HTTP status with safe context only.</summary>

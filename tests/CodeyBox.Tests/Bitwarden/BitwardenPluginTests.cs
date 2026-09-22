@@ -21,18 +21,22 @@ namespace CodeyBox.Tests.Bitwarden;
 /// lease never outlives it, and key-based resolution is exact-match only.
 /// HTTP is faked at the transport; the manager, store shape, and sweep path
 /// are the real production wiring. Recorded payload shapes live in
-/// <c>Fixtures/bitwarden/</c>, transcribed from the live Secrets Manager
-/// API shapes; the one live test runs only when <c>BW_SM_LIVE_*</c> env is
-/// set, so offline runs rely on the recorded shapes plus the documented
-/// reason in the plugin README (including why the native C# SDK was not
-/// taken as a dependency).
+/// <c>Fixtures/bitwarden/</c>, hand-built to match the authoritative server
+/// response models (<c>SecretResponseModel</c> /
+/// <c>SecretWithProjectsListResponseModel</c> in <c>bitwarden/server</c>)
+/// — they were not captured from live traffic, so offline runs rely on
+/// those shapes plus the documented reason in the plugin README (including
+/// why the native C# SDK was not taken as a dependency). The one live test
+/// runs only when <c>BW_SM_LIVE_*</c> env is set.
 /// </summary>
 public sealed class BitwardenPluginTests : IDisposable
 {
     private const string StaticValue = "bitwarden-live-value-7d2e9a4b1c";
-    private const string SecretId = "2c4c8a1e-3f5b-4a6c-9d7e-8f0a1b2c3d4e";
-    private const string OtherSecretId = "9d7e8f0a-1b2c-4d5e-8f0a-1b2c3d4e5f6a";
-    private const string OrganizationId = "a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5";
+    private const string SecretId = "11111111-1111-1111-1111-111111111111";
+    private const string OtherSecretId = "22222222-2222-2222-2222-222222222222";
+    private const string OrganizationId = "33333333-3333-3333-3333-333333333333";
+    private const string AutomationProjectId = "44444444-4444-4444-4444-444444444444";
+    private const string ForeignProjectId = "ffffffff-0000-4000-8000-000000000099";
     private const string ClientId = "test-machine-account-client-id";
     private const string AccessToken = "bitwarden-test-access-token";
     private const string ClientSecret = "bw_test-machine-account-client-secret";
@@ -60,11 +64,13 @@ public sealed class BitwardenPluginTests : IDisposable
     {
         public string TokenJson = "{}";
         public string SecretJson = "{}";
-        public string ListJson = """{"object":"list","data":[]}""";
+        public string ListJson = """{"object":"SecretsWithProjectsList","secrets":[]}""";
         public bool Unreachable;
         public int FailTokenStatus;
         public int FailSecretStatus;
         public int FailListStatus;
+        public string? FailTokenBody;
+        public string? FailSecretBody;
         public readonly List<(string Method, string Path)> Requests = [];
         public readonly List<string> ReadSecretIds = [];
         public readonly List<string> TokenClientIds = [];
@@ -104,10 +110,11 @@ public sealed class BitwardenPluginTests : IDisposable
                         TokenClientIds.Add(clientId);
                 }
                 if (FailTokenStatus != 0)
-                    return Failure(FailTokenStatus, TokenFailureBody);
+                    return Failure(FailTokenStatus, FailTokenBody ?? TokenFailureBody);
                 return Raw(TokenJson);
             }
-            if (path.EndsWith("/secrets-manager/secrets/list", StringComparison.Ordinal))
+            if (path.Contains("/organizations/", StringComparison.Ordinal)
+                && path.EndsWith("/secrets", StringComparison.Ordinal))
             {
                 lock (Requests)
                     ListCalls++;
@@ -115,7 +122,7 @@ public sealed class BitwardenPluginTests : IDisposable
                     return Failure(FailListStatus);
                 return Raw(ListJson);
             }
-            if (path.Contains("/secrets-manager/secrets/", StringComparison.Ordinal))
+            if (path.Contains("/secrets/", StringComparison.Ordinal))
             {
                 var id = path[(path.LastIndexOf('/') + 1)..];
                 var bearer = string.Equals(
@@ -126,7 +133,7 @@ public sealed class BitwardenPluginTests : IDisposable
                     SecretBearerAttached.Add(bearer);
                 }
                 if (FailSecretStatus != 0)
-                    return Failure(FailSecretStatus);
+                    return Failure(FailSecretStatus, FailSecretBody);
                 return Raw(SecretJson);
             }
             return Failure(404);
@@ -783,6 +790,100 @@ public sealed class BitwardenPluginTests : IDisposable
     }
 
     [Fact]
+    public async Task Server_Error_Text_Never_Reaches_Messages()
+    {
+        UseRecordedShapes();
+        // A server echoing request content in its error body must not land
+        // that credential in the exception message — which the host logs
+        // and persists in the lease store. Only the allowlisted
+        // machine-readable error code survives.
+        _handler.FailSecretStatus = 500;
+        _handler.FailSecretBody =
+            """{"error":"server_error","error_description":"grant failed for secret '""" + ClientSecret + """'"}""";
+        var provider = CreateProvider(IdMapping("PAID_API_TOKEN"));
+
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.Equal(BitwardenFailureKind.BackendError, ex.Kind);
+        Assert.DoesNotContain(ClientSecret, ex.Message);
+        Assert.Contains("server_error", ex.Message, StringComparison.Ordinal);
+
+        // Nor does a non-JSON body reflecting request content: without an
+        // allowlisted code the detail is a fixed placeholder.
+        _handler.FailSecretBody = "upstream exploded for secret '" + ClientSecret + "': retry\nforged-line";
+        var raw = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.DoesNotContain(ClientSecret, raw.Message);
+        Assert.DoesNotContain("forged-line", raw.Message);
+        Assert.Contains("no readable error body", raw.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Identity_Error_Text_Never_Relays_Credentials()
+    {
+        _handler.TokenJson = Fixture("token.json");
+        _handler.SecretJson = Fixture("secret.json");
+        _handler.FailTokenStatus = 400;
+        _handler.FailTokenBody =
+            """{"error":"invalid_client","error_description":"unknown client secret '""" + ClientSecret + """'"}""";
+        var provider = CreateProvider(IdMapping("PAID_API_TOKEN"));
+
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.Equal(BitwardenFailureKind.Unauthorized, ex.Kind);
+        Assert.Contains("invalid_client", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ClientSecret, ex.Message);
+    }
+
+    [Fact]
+    public async Task Token_Is_Not_Replayed_Across_Changed_Origins()
+    {
+        UseRecordedShapes();
+        var values = BaseConfig();
+        values["ApiUrl"] = "https://a.bitwarden.example.com";
+        foreach (var (k, v) in IdMapping("PAID_API_TOKEN"))
+            values[k] = v;
+        var root = new ConfigurationBuilder()
+            .AddInMemoryCollection(
+                values.ToDictionary(
+                    kv => $"x:{kv.Key}", kv => kv.Value, StringComparer.OrdinalIgnoreCase)!)
+            .Build();
+        using var http = new HttpClient(_handler) { Timeout = TimeSpan.FromSeconds(30) };
+        var provider = new BitwardenSecretProvider(
+            http,
+            root.GetSection("x"),
+            env: name => _env.TryGetValue(name, out var v) ? v : null);
+
+        await provider.IssueAsync(Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20));
+        Assert.Equal(1, _handler.AuthCalls);
+
+        // The operator hot-reloads a new API origin while the client
+        // identity stays the same: the token minted by the old origin must
+        // not be replayed against the new one, so issuance re-mints.
+        root["x:ApiUrl"] = "https://b.bitwarden.example.com";
+        await provider.IssueAsync(Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20));
+        Assert.Equal(2, _handler.AuthCalls);
+        provider.Dispose();
+    }
+
+    [Fact]
+    public async Task Revoke_Succeeds_Without_Usable_Configuration()
+    {
+        var config = IdMapping("PAID_API_TOKEN");
+        config["Enabled"] = "false";
+        var provider = CreateProvider(config);
+
+        // Revocation is purely local: a disabled or invalid hot-reloaded
+        // config must not fail teardown — and it performs no network
+        // traffic. Repeating it stays harmless (idempotent).
+        var requestsBefore = _handler.RequestCount;
+        await provider.RevokeAsync(BitwardenLeaseIds.BuildStatic("PAID_API_TOKEN"));
+        await provider.RevokeAsync(BitwardenLeaseIds.BuildStatic("PAID_API_TOKEN"));
+        Assert.Equal(requestsBefore, _handler.RequestCount);
+        provider.Dispose();
+    }
+
+    [Fact]
     public async Task Unknown_Secret_Is_Configuration_Not_Infrastructure()
     {
         UseRecordedShapes();
@@ -870,7 +971,7 @@ public sealed class BitwardenPluginTests : IDisposable
         using var redirector = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
         using var client = BitwardenHttpClients.Create(TimeSpan.FromSeconds(10));
         using var response = await client.GetAsync(
-            redirector.Url + "secrets-manager/secrets/" + SecretId);
+            redirector.Url + "secrets/" + SecretId);
         Assert.Equal(HttpStatusCode.Found, response.StatusCode);
         Assert.Equal(1, redirector.Hits);
         Assert.Equal(0, sink.Hits);
@@ -888,7 +989,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         // A similarly-named key must not shadow the match: ambiguity is a
         // loud configuration fault, never a silent wrong-secret read.
-        _handler.ListJson = """{"object":"list","data":[{"id":"aaaaaaaa-0000-4000-8000-000000000001","key":"PAID_API_TOKEN"},{"id":"bbbbbbbb-0000-4000-8000-000000000002","key":"PAID_API_TOKEN"}]}""";
+        _handler.ListJson = """{"object":"SecretsWithProjectsList","secrets":[{"id":"aaaaaaaa-0000-4000-8000-000000000001","organizationId":"33333333-3333-3333-3333-333333333333","key":"PAID_API_TOKEN","projects":[]},{"id":"bbbbbbbb-0000-4000-8000-000000000002","organizationId":"33333333-3333-3333-3333-333333333333","key":"PAID_API_TOKEN","projects":[]}]}""";
         var ambiguous = CreateProvider(KeyMapping("PAID_API_TOKEN", "PAID_API_TOKEN"));
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => ambiguous.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
@@ -907,15 +1008,49 @@ public sealed class BitwardenPluginTests : IDisposable
     public async Task Secret_From_Wrong_Project_Fails_Loud()
     {
         UseRecordedShapes();
-        _handler.SecretJson = """{"object":"secret","id":"2c4c8a1e-3f5b-4a6c-9d7e-8f0a1b2c3d4e","projectId":"ffffffff-0000-4000-8000-000000000099","key":"PAID_API_TOKEN","value":"wrong-project-value"}""";
+        _handler.SecretJson = $$"""{ "object": "secret", "id": "{{SecretId}}", "organizationId": "{{OrganizationId}}", "key": "PAID_API_TOKEN", "value": "wrong-project-value", "projects": [{ "id": "{{ForeignProjectId}}", "name": "Other" }] }""";
         var config = IdMapping("PAID_API_TOKEN");
-        config["Mappings:0:ProjectId"] = "11111111-2222-4333-8444-555555555555";
+        config["Mappings:0:ProjectId"] = AutomationProjectId;
         var provider = CreateProvider(config);
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
         Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
         Assert.DoesNotContain("wrong-project-value", ex.Message);
+    }
+
+    [Fact]
+    public async Task Secret_Without_Project_Linkage_Fails_Loud_When_Project_Expected()
+    {
+        UseRecordedShapes();
+        _handler.SecretJson = $$"""{ "object": "secret", "id": "{{SecretId}}", "organizationId": "{{OrganizationId}}", "key": "PAID_API_TOKEN", "value": "projectless-value" }""";
+        var config = IdMapping("PAID_API_TOKEN");
+        config["Mappings:0:ProjectId"] = AutomationProjectId;
+        var provider = CreateProvider(config);
+
+        // A response carrying no usable project linkage must not slip past
+        // a configured project expectation: fail closed, never serve.
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.DoesNotContain("projectless-value", ex.Message);
+    }
+
+    [Fact]
+    public async Task Encrypted_Value_Is_Refused_Not_Served()
+    {
+        UseRecordedShapes();
+        const string ciphertext = "2.AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        _handler.SecretJson = $$"""{ "object": "secret", "id": "{{SecretId}}", "organizationId": "{{OrganizationId}}", "key": "PAID_API_TOKEN", "value": "{{ciphertext}}", "projects": [{ "id": "{{AutomationProjectId}}", "name": "Automation" }] }""";
+        var provider = CreateProvider(IdMapping("PAID_API_TOKEN"));
+
+        // Serving ciphertext as a credential would be a silent integrity
+        // failure: refuse loudly (infrastructure — never a diff verdict).
+        var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
+            Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+        Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
+        Assert.True(ex.IsInfrastructure);
+        Assert.DoesNotContain(ciphertext, ex.Message);
     }
 
     [Fact]
@@ -988,8 +1123,11 @@ public sealed class BitwardenPluginTests : IDisposable
             ["Mappings:7:SecretId"] = SecretId,
             ["Mappings:7:ProjectId"] = "not-a-uuid",
         });
-        // KEY_NO_ORG needs an empty provider organisation to trip the
-        // key-without-org error: clear it for this case.
+        // KEY_NO_ORG sets a mapping-level empty organisation, but it
+        // inherits the provider-level organisation above, so it produces no
+        // error here — the key-without-organisation path is covered by
+        // Key_Without_Organisation_Is_Rejected, which clears the provider
+        // organisation.
         var errors = provider.CurrentOptions().Validate();
         Assert.Contains(errors, e => e.Contains("'A'", StringComparison.Ordinal) && e.Contains("duplicate", StringComparison.Ordinal));
         Assert.Contains(errors, e => e.Contains("bad-name!", StringComparison.Ordinal) && e.Contains("POSIX", StringComparison.Ordinal));
