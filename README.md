@@ -120,22 +120,7 @@ the other.
 
 ## How it works
 
-```mermaid
-flowchart TD
-    A["POST /workitems"] --> Q["Queue"]
-    Q --> W["Worker pool — one fresh VM per phase"]
-    subgraph atomic["Atomic — lands cleanly or not at all"]
-        W -->|"'plan' knob set"| P0["0 · Plan (optional) · draft + review a plan artifact first"]
-        P0 --> P1
-        W -->|"no 'plan' knob"| P1["1 · Work · run the agent, commit, push a branch"]
-        P1 --> P2["2 · Audit · tool + LLM review"]
-        P2 -->|"findings"| RW["Rework"]
-        RW --> P2
-        P2 -->|"all gates pass"| P3["3 · Merge · host-side clean merge; agent only for real conflicts"]
-    end
-    P3 --> P4["4 · Push · retryable — replicate to GitHub / any remote"]
-    P4 --> DONE(["A reviewed, merged change"])
-```
+![How CodeyBox works: a task is POSTed to /workitems, queued, and picked up by a worker pool that runs each phase in a fresh VM. An optional Plan phase (off by default) precedes Work, where the agent runs and pushes a work branch. Audit applies tool and LLM review; findings loop back through Rework until every gate passes. Merge happens host-side as clean git plumbing, and a real content conflict goes to a break-glass phase where an agent resolves it and the host verifies the scope. Plan through Merge form an atomic zone that lands cleanly or not at all. Push is a separate retryable step replicating to GitHub or any remote.](docs/images/how-it-works.png)
 
 Phases 1–3 are atomic: the change lands cleanly or not at all. A clean merge is
 pure git plumbing on the host — `git merge-tree` then `git commit-tree`, no VM,
