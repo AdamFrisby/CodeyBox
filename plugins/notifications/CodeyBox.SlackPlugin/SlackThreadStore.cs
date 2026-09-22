@@ -19,16 +19,28 @@ internal sealed class SlackThreadStore
 {
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private readonly TimeProvider _clock;
-    private readonly TimeSpan _lifetime;
-    private readonly int _maxEntries;
+    private TimeSpan _lifetime;
+    private int _maxEntries;
 
     private sealed record Entry(string Channel, string Ts, DateTimeOffset StoredAt);
 
     public SlackThreadStore(TimeProvider? clock = null, TimeSpan? lifetime = null, int maxEntries = 10_000)
     {
         _clock = clock ?? TimeProvider.System;
-        _lifetime = lifetime ?? TimeSpan.FromHours(24);
+        _lifetime = lifetime is { Ticks: > 0 } value ? value : TimeSpan.FromHours(24);
         _maxEntries = maxEntries >= 1 ? maxEntries : 10_000;
+    }
+
+    /// <summary>Apply the operator-configured bounds (hot-reloadable).
+    /// Non-positive values fall back to the built-in defaults so a bad
+    /// config edit can never unboundedly grow the store or expire
+    /// everything immediately.</summary>
+    public void Configure(TimeSpan lifetime, int maxEntries)
+    {
+        _lifetime = lifetime.Ticks > 0 ? lifetime : TimeSpan.FromHours(24);
+        _maxEntries = maxEntries >= 1 ? maxEntries : 10_000;
+        while (_entries.Count > _maxEntries)
+            EvictOldest();
     }
 
     private static string ThreadKey(string channel, string workItemId) => $"thread:{channel}:{workItemId}";

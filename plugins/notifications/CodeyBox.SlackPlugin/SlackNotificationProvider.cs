@@ -98,6 +98,8 @@ public sealed class SlackNotificationProvider : INotificationProvider, IPluginIn
         if (!opts.Enabled)
             return;
 
+        _threads.Configure(opts.EntryLifetime, opts.MaxEntries);
+
         var token = Environment.GetEnvironmentVariable(opts.BotTokenEnvVar);
         if (string.IsNullOrEmpty(token))
         {
@@ -176,6 +178,8 @@ public sealed class SlackNotificationProvider : INotificationProvider, IPluginIn
             return;
         if (string.IsNullOrWhiteSpace(notification.CorrelationToken))
             return;
+
+        _threads.Configure(opts.EntryLifetime, opts.MaxEntries);
 
         var identity = _threads.MessageFor(notification.CorrelationToken);
         if (identity is null)

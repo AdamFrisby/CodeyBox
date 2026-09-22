@@ -77,14 +77,65 @@ public sealed class SlackNotificationProviderTests
     [Fact]
     public async Task Disabled_MakesNoHttpCall()
     {
-        var handler = new CapturingHttpHandler();
-        var provider = BuildProvider(
-            Config(new Dictionary<string, string?> { ["CodeyBox:Plugins:codeybox.slack:Enabled"] = "false" }),
-            new HttpClient(handler));
+        Environment.SetEnvironmentVariable(TokenEnvVar, Token);
+        try
+        {
+            var handler = new CapturingHttpHandler();
+            var provider = BuildProvider(
+                Config(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:Plugins:codeybox.slack:Enabled"] = "false",
+                    ["CodeyBox:Plugins:codeybox.slack:DefaultChannel"] = Channel,
+                    ["CodeyBox:Plugins:codeybox.slack:AgnesBaseUrl"] = "https://agnes.example.invalid",
+                    ["CodeyBox:Plugins:codeybox.slack:ActionsMode"] = "Buttons",
+                }),
+                new HttpClient(handler));
 
-        await provider.SendAsync(MakeNotification(), CancellationToken.None);
+            await provider.SendAsync(MakeNotification(), CancellationToken.None);
 
-        Assert.Empty(handler.Requests);
+            Assert.Empty(handler.Requests);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TokenEnvVar, null);
+        }
+    }
+
+    [Fact]
+    public async Task ThreadStoreBounds_AreWiredFromOptions()
+    {
+        Environment.SetEnvironmentVariable(TokenEnvVar, Token);
+        try
+        {
+            var counter = 0;
+            var handler = new CapturingHttpHandler(_ =>
+            {
+                counter++;
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(SlackOkJson(ts: $"1758640000.0012{counter:00}")),
+                };
+            });
+            var threads = new SlackThreadStore();
+            var config = Config(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Plugins:codeybox.slack:Enabled"] = "true",
+                ["CodeyBox:Plugins:codeybox.slack:DefaultChannel"] = Channel,
+                ["CodeyBox:Plugins:codeybox.slack:AgnesBaseUrl"] = "https://agnes.example.invalid",
+                ["CodeyBox:Plugins:codeybox.slack:MaxEntries"] = "2",
+            });
+            var provider = BuildProvider(config, new HttpClient(handler), threads: threads);
+
+            await provider.SendAsync(MakeNotification(correlationToken: "work-A:q-001"), CancellationToken.None);
+            await provider.SendAsync(MakeNotification(correlationToken: "work-B:q-001"), CancellationToken.None);
+
+            Assert.Null(threads.ThreadRootFor(Channel, "work-A"));
+            Assert.NotNull(threads.ThreadRootFor(Channel, "work-B"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TokenEnvVar, null);
+        }
     }
 
     [Fact]
