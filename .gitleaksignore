@@ -20,6 +20,16 @@
 #   not a credential.
 # - The github-refresh-token hit is an OpenAI "encrypted_content" blob inside a
 #   checked-in Codex session transcript, not a GitHub token.
+# - "dp.sa.ident.8f3a..." synthetic Doppler identity-token fixtures
+#   (tests/CodeyBox.Tests/Doppler/DopplerPluginTests.cs,
+#   tests/CodeyBox.Tests/Fixtures/doppler/oidc.json): invented
+#   high-entropy-looking placeholders, never issued by Doppler, never live.
+#   The source was replaced with the low-entropy placeholder
+#   "dp.sa.ident.test-placeholder-token"; these entries cover the
+#   pre-fix commit only.
+06f26e09ef62d0cfa5cfc6e93e6fb16820b4d11e:tests/CodeyBox.Tests/Fixtures/doppler/oidc.json:generic-api-key:2
+06f26e09ef62d0cfa5cfc6e93e6fb16820b4d11e:tests/CodeyBox.Tests/Doppler/DopplerPluginTests.cs:generic-api-key:32
+06f26e09ef62d0cfa5cfc6e93e6fb16820b4d11e:tests/CodeyBox.Tests/Doppler/DopplerPluginTests.cs:generic-api-key:90
 # Genuine secrets must never be added here; fix the source instead.
 # Verified 2026-09-16: `gitleaks detect --log-opts="HEAD~1..HEAD"` on the goose-agent
 # commit reports no leaks; these 27 findings are all in older commits.
