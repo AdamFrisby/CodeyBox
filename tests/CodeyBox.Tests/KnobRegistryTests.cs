@@ -363,6 +363,50 @@ public sealed class KnobRegistryTests
     }
 
     [Fact]
+    public void Normalize_UnknownKeyError_SanitisesAndBoundsTheEchoedKey()
+    {
+        // The key is untrusted request input echoed into an error that API
+        // callers surface verbatim: control characters must be stripped and
+        // the echo truncated so terminal escapes and megabyte keys cannot
+        // ride the failure reason.
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
+        var hostileKey = "evil\u001b[31m" + new string('k', 500);
+
+        var result = registry.Normalize(hostileKey, "x");
+
+        Assert.False(result.Ok);
+        Assert.Contains("unknown knob", result.Error);
+        Assert.DoesNotContain(result.Error!, char.IsControl);
+        Assert.True(result.Error!.Length < 300, $"error echo was not bounded: {result.Error!.Length} chars");
+    }
+
+    [Fact]
+    public void Normalize_NullValueError_SanitisesTheEchoedKey()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
+
+        var result = registry.Normalize("shape\u001b[2J", null!);
+
+        Assert.False(result.Ok);
+        Assert.Contains("must not be null", result.Error);
+        Assert.DoesNotContain(result.Error!, char.IsControl);
+    }
+
+    [Fact]
+    public void Validate_ParserError_SanitisesAndBoundsTheEchoedValue()
+    {
+        var registry = new KnobRegistry([new TestEnumKnob("shape", "round", ["round", "square"])]);
+        var hostileValue = "x\u001b[31m" + new string('v', 500);
+
+        var result = registry.Validate("shape", hostileValue);
+
+        Assert.False(result.Ok);
+        Assert.Contains("not allowed", result.Error);
+        Assert.DoesNotContain(result.Error!, char.IsControl);
+        Assert.True(result.Error!.Length < 300, $"error echo was not bounded: {result.Error!.Length} chars");
+    }
+
+    [Fact]
     public void TryGet_ReturnsRegisteredKnob_AndFalseForUnknownOrEmpty()
     {
         var registered = new TestEnumKnob("shape", "round", ["round", "square"]);

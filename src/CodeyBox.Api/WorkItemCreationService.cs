@@ -98,7 +98,7 @@ internal sealed class WorkItemCreationService
             if (!_agents.TryGet(kind, out _))
                 return new PreparedWorkItemCreationResult(
                     null,
-                    Results.BadRequest(new { error = $"unknown agent '{req.Agent}'", available = _agents.Available.Select(a => a.Value) }));
+                    Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(req.Agent)}'", available = _agents.Available.Select(a => a.Value) }));
             agentOverride = kind;
         }
 
@@ -153,15 +153,15 @@ internal sealed class WorkItemCreationService
             if (Validation.TryParseNamespacedExternalId(rawId, out var depNs, out var depValue) && depNs is not null)
             {
                 if (!byNamespacedExternalId.TryGetValue((depNs, depValue), out var depByNs))
-                    return Error($"dependency '{rawId}' could not be resolved: no work item with externalId '{depValue}' in namespace '{depNs}' in project '{pid}'");
+                    return Error($"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(depValue)}' in namespace '{depNs}' in project '{pid}'");
                 dependsOnIds.Add(depByNs.Id);
                 continue;
             }
             if (!byBareExternalId.TryGetValue(rawId, out var matches) || matches.Count == 0)
-                return Error($"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{pid}'");
+                return Error($"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(rawId)}' in project '{pid}'");
             var distinctItems = matches.Select(m => m.Item.Id).Distinct().ToList();
             if (distinctItems.Count > 1)
-                return Error($"dependency '{rawId}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} - qualify as 'namespace:value'");
+                return Error($"dependency '{Validation.DescribeUntrustedValue(rawId)}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} - qualify as 'namespace:value'");
             dependsOnIds.Add(distinctItems[0]);
         }
 
@@ -292,7 +292,7 @@ internal sealed class WorkItemCreationService
                         null,
                         Results.BadRequest(new
                         {
-                            error = $"unknown agent '{onYes.Agent}' on {onYesLocation}",
+                            error = $"unknown agent '{Validation.DescribeUntrustedValue(onYes.Agent)}' on {onYesLocation}",
                             available = _agents.Available.Select(a => a.Value),
                         }));
                 }
@@ -349,7 +349,7 @@ internal sealed class WorkItemCreationService
             if (!_agents.TryGet(controlAgent, out _))
                 return new PreparedWorkItemCreationResult(
                     null,
-                    Results.BadRequest(new { error = $"unknown agent '{control.Agent}'", available = _agents.Available.Select(a => a.Value) }));
+                    Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(control.Agent)}'", available = _agents.Available.Select(a => a.Value) }));
 
             var actionText = control.Action?.Trim();
             AgentControlAction action;
@@ -501,8 +501,11 @@ internal sealed class WorkItemCreationService
             return (null, Results.BadRequest(new { error = countError }));
 
         // The registry runs first so its errors (unknown key, rejected value)
-        // keep their wording; the shared shape rules then bound the canonical
-        // output the same way they bound the majordomo contract's input.
+        // keep their wording — it renders echoed keys/values through
+        // Validation.DescribeUntrustedValue at the source, so unbounded or
+        // escape-bearing raw input cannot ride the failure reason. The shared
+        // shape rules then bound the canonical output the same way they bound
+        // the majordomo contract's input.
         var normalised = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (rawKey, rawValue) in raw)
         {

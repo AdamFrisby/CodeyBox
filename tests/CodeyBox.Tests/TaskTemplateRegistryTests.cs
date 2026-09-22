@@ -194,7 +194,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         yield return Case(TemplateWithCheck(
             "{\"question\":" + JsonString(new string('q', 64 * 1024 + 1)) +
             ",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
-            ".question must be <= 64KB");
+            ".question must be <= 65536 chars");
         yield return Case("""{"checks":[null]}""", "checks[0] must be an object");
         yield return Case("""{"checks":[1]}""", "not a valid check entry");
         yield return Case("{", "not valid JSON");
@@ -220,7 +220,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         yield return Case(TemplateWithCheck(
             "{\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":" +
             JsonString(new string('p', 64 * 1024 + 1)) + "}}"),
-            ".onYes.prompt must be <= 64KB");
+            ".onYes.prompt must be <= 65536 chars");
         yield return Case(TemplateWithCheck(
             "{\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\",\"agentClassId\":" +
             JsonString(new string('c', 201)) + "}}"),
@@ -240,7 +240,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         yield return Case(TemplateWithCheck(
             "{\"question\":\"q\",\"prompt\":" + JsonString(new string('p', 64 * 1024 + 1)) +
             ",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
-            ".prompt must be <= 64KB");
+            ".prompt must be <= 65536 chars");
     }
 
     public static IEnumerable<object[]> InvalidTemplateRefCases()

@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using CodeyBox.Core;
 
 namespace CodeyBox.Majordomo;
@@ -48,24 +49,34 @@ internal static class WorkItemFieldValidation
     internal static string? AuditComplexity(string? value)
         => OrThrow(WorkItemFieldRules.NormalizeAuditComplexity(value), "auditComplexity");
 
+    // The collection adapters re-wrap the shared rules' output in
+    // ImmutableArray/ImmutableDictionary: the validated contract collections
+    // must not be rewritable through a mutable cast of the exposed
+    // IReadOnly* surface.
+
     internal static IReadOnlyList<string> RequiredCapabilities(IReadOnlyList<string>? value)
-        => OrThrow(WorkItemFieldRules.NormalizeRequiredCapabilities(value), "requiredCapabilities")!;
+        => ImmutableArray.CreateRange(
+            OrThrow(WorkItemFieldRules.NormalizeRequiredCapabilities(value), "requiredCapabilities")!);
 
     internal static IReadOnlyList<WorkItemId> DependsOn(IReadOnlyList<WorkItemId>? value)
     {
-        if (value is null) return [];
+        if (value is null) return ImmutableArray<WorkItemId>.Empty;
         if (WorkItemFieldRules.CheckDependsOnCount(value.Count) is { } error)
             throw new ArgumentException(error, "dependsOn");
-        return [.. value];
+        return ImmutableArray.CreateRange(value);
     }
 
     internal static IReadOnlyDictionary<string, string> ExternalIds(
         IReadOnlyDictionary<string, string>? value)
-        => OrThrow(WorkItemFieldRules.NormalizeExternalIds(value), "externalIds")!;
+        => ImmutableDictionary.CreateRange(
+            StringComparer.OrdinalIgnoreCase,
+            OrThrow(WorkItemFieldRules.NormalizeExternalIds(value), "externalIds")!);
 
     internal static IReadOnlyDictionary<string, string> Knobs(
         IReadOnlyDictionary<string, string>? value)
-        => OrThrow(WorkItemFieldRules.NormalizeKnobOverrides(value), "knobs")!;
+        => ImmutableDictionary.CreateRange(
+            StringComparer.OrdinalIgnoreCase,
+            OrThrow(WorkItemFieldRules.NormalizeKnobOverrides(value), "knobs")!);
 
     private static T? OrThrow<T>((T? Value, string? Error) result, string paramName)
         => result.Error is null

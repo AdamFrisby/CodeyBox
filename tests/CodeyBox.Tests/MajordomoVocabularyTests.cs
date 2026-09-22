@@ -324,6 +324,18 @@ public sealed class MajordomoVocabularyTests
     }
 
     [Fact]
+    public void Cancel_ReasonRejectsControlCharacters()
+    {
+        // Same reason rule as every other operator-facing surface: a
+        // model-authored reason carrying terminal escapes fails at the
+        // contract.
+        Assert.Throws<ArgumentException>(() =>
+            new CancelWorkItemArgs(WorkItemId.New(), "done\nnow"));
+        Assert.Throws<ArgumentException>(() =>
+            new CancelWorkItemArgs(WorkItemId.New(), "done\u001b[31m"));
+    }
+
+    [Fact]
     public void ListArgs_BoundThePage()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new ListWorkItemsArgs(limit: 0));
@@ -362,6 +374,43 @@ public sealed class MajordomoVocabularyTests
     {
         Assert.Throws<NotSupportedException>(() =>
             ((IList<MajordomoTool>)MajordomoTools.All).RemoveAt(0));
+    }
+
+    [Fact]
+    public void ValidatedCollections_CannotBeMutatedThroughMutableCasts()
+    {
+        // Constructor validation is meaningless if a holder can cast the
+        // exposed IReadOnly* surface back to List/Dictionary and rewrite it —
+        // e.g. inject a forward edge into a chain node after the index
+        // checks ran. The backing stores must be genuinely immutable.
+        var spec = new NewWorkItemSpec(new ProjectId("demo"), "t", "p",
+            dependsOn: [WorkItemId.New()],
+            requiredCapabilities: ["cap"],
+            externalIds: new Dictionary<string, string> { ["github"] = "gh-1" },
+            knobs: new Dictionary<string, string> { ["scope"] = "small" });
+
+        Assert.Throws<InvalidCastException>(() => _ = (List<WorkItemId>)spec.DependsOn);
+        Assert.Throws<InvalidCastException>(() => _ = (List<string>)spec.RequiredCapabilities);
+        Assert.Throws<InvalidCastException>(() => _ = (Dictionary<string, string>)spec.ExternalIds);
+        Assert.Throws<InvalidCastException>(() => _ = (Dictionary<string, string>)spec.Knobs);
+
+        var node = new WorkItemChainNode(spec, [0]);
+        Assert.Throws<InvalidCastException>(() => _ = (List<int>)node.DependsOnIndexes);
+        Assert.Throws<NotSupportedException>(() =>
+            ((IList<int>)node.DependsOnIndexes)[0] = 5);
+
+        var chain = new CreateWorkItemChainArgs([new WorkItemChainNode(spec), node]);
+        Assert.Throws<InvalidCastException>(() => _ = (List<WorkItemChainNode>)chain.Items);
+
+        var patch = new WorkItemPatch(
+            requiredCapabilities: ["cap"],
+            dependsOn: [WorkItemId.New()],
+            externalIds: new Dictionary<string, string> { ["github"] = "gh-1" },
+            knobs: new Dictionary<string, string> { ["scope"] = "small" });
+        Assert.Throws<InvalidCastException>(() => _ = (List<string>)patch.RequiredCapabilities!);
+        Assert.Throws<InvalidCastException>(() => _ = (List<WorkItemId>)patch.DependsOn!);
+        Assert.Throws<InvalidCastException>(() => _ = (Dictionary<string, string>)patch.ExternalIds!);
+        Assert.Throws<InvalidCastException>(() => _ = (Dictionary<string, string>)patch.Knobs!);
     }
 
     [Fact]

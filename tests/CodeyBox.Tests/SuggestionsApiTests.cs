@@ -294,6 +294,18 @@ public sealed class SuggestionsApiTests : IDisposable
     }
 
     [Fact]
+    public async Task PatchSuggestion_DismissReasonWithControlChars_Returns400()
+    {
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var resp = await _client.PatchAsJsonAsync(
+            $"/suggestions/{s.Id}",
+            new { state = "dismissed", dismissReason = "not\u0007relevant" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
     public async Task PatchSuggestion_ReasonTooLong_Returns400()
     {
         var s = MakeSuggestion();

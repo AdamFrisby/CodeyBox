@@ -21,7 +21,7 @@ public readonly record struct ProjectId
             var c = value[i];
             var ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
                 || (c >= '0' && c <= '9') || c == '-' || c == '_';
-            if (!ok) throw new ArgumentException($"ProjectId may only contain ASCII alnum / '-' / '_': {value}", nameof(value));
+            if (!ok) throw new ArgumentException($"ProjectId may only contain ASCII alnum / '-' / '_': {Validation.DescribeUntrustedValue(value)}", nameof(value));
         }
         Value = value;
     }

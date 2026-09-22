@@ -19,6 +19,7 @@ public sealed record MajordomoTool
         string description)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentException.ThrowIfNullOrWhiteSpace(description);
         if (!typeof(MajordomoToolArgs).IsAssignableFrom(argumentsType))
             throw new ArgumentException(
                 $"argumentsType {argumentsType?.Name ?? "<null>"} must derive from MajordomoToolArgs",

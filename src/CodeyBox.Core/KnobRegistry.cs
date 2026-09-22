@@ -69,13 +69,17 @@ public sealed class KnobRegistry : IKnobRegistry
     {
         if (string.IsNullOrWhiteSpace(key))
             return KnobNormalizationResult.Fail("knob key must not be empty");
+        // key/value are untrusted input echoed into failure reasons that API
+        // callers surface verbatim — describe rather than echo so escapes and
+        // unbounded values cannot ride the message.
+        var keyLabel = Validation.DescribeUntrustedValue(key);
         if (value is null)
-            return KnobNormalizationResult.Fail($"knob '{key}' value must not be null");
+            return KnobNormalizationResult.Fail($"knob '{keyLabel}' value must not be null");
 
         var trimmedKey = key.Trim();
         if (!_byKey.TryGetValue(trimmedKey, out var knob))
             return KnobNormalizationResult.Fail(
-                $"unknown knob '{key}'. Known knobs: {KnownKeysDescription()}");
+                $"unknown knob '{keyLabel}'. Known knobs: {KnownKeysDescription()}");
 
         var parsed = knob.ParseValue(value);
         if (!parsed.Ok)

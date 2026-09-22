@@ -39,13 +39,13 @@ internal static class TestCaseEndpoints
             return Results.BadRequest(new { error = "SourceWorkItemId is required" });
 
         if (!Guid.TryParse(req.SourceWorkItemId, out var g))
-            return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{req.SourceWorkItemId}'" });
+            return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{Validation.DescribeUntrustedValue(req.SourceWorkItemId)}'" });
 
         var normalisedSourceWorkItemId = new WorkItemId(g).ToString();
 
         var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
         if (workItem is null)
-            return Results.BadRequest(new { error = $"Linked WorkItem '{req.SourceWorkItemId}' not found" });
+            return Results.BadRequest(new { error = $"Linked WorkItem '{Validation.DescribeUntrustedValue(req.SourceWorkItemId)}' not found" });
 
         var id = string.IsNullOrWhiteSpace(req.Id) ? Guid.NewGuid().ToString("N") : req.Id;
 
@@ -91,13 +91,13 @@ internal static class TestCaseEndpoints
                 return Results.BadRequest(new { error = "SourceWorkItemId is required for all test cases" });
 
             if (!Guid.TryParse(req.SourceWorkItemId, out var g))
-                return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{req.SourceWorkItemId}'" });
+                return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{Validation.DescribeUntrustedValue(req.SourceWorkItemId)}'" });
 
             var normalisedSourceWorkItemId = new WorkItemId(g).ToString();
 
             var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
             if (workItem is null)
-                return Results.BadRequest(new { error = $"Linked WorkItem '{req.SourceWorkItemId}' not found" });
+                return Results.BadRequest(new { error = $"Linked WorkItem '{Validation.DescribeUntrustedValue(req.SourceWorkItemId)}' not found" });
 
             var id = string.IsNullOrWhiteSpace(req.Id) ? Guid.NewGuid().ToString("N") : req.Id;
 
@@ -140,13 +140,13 @@ internal static class TestCaseEndpoints
         CancellationToken ct)
     {
         if (!Guid.TryParse(workItemId, out var g))
-            return Results.BadRequest(new { error = $"Invalid WorkItemId format: '{workItemId}'" });
+            return Results.BadRequest(new { error = $"Invalid WorkItemId format: '{Validation.DescribeUntrustedValue(workItemId)}'" });
 
         var normalisedWorkItemId = new WorkItemId(g).ToString();
 
         var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
         if (workItem is null)
-            return Results.NotFound(new { error = $"WorkItem '{workItemId}' not found" });
+            return Results.NotFound(new { error = $"WorkItem '{Validation.DescribeUntrustedValue(workItemId)}' not found" });
 
         var list = new List<TestCase>();
         await foreach (var tc in store.ListByWorkItemAsync(normalisedWorkItemId, ct))
@@ -179,13 +179,13 @@ internal static class TestCaseEndpoints
             return Results.BadRequest(new { error = "SourceWorkItemId is required" });
 
         if (!Guid.TryParse(req.SourceWorkItemId, out var g))
-            return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{req.SourceWorkItemId}'" });
+            return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{Validation.DescribeUntrustedValue(req.SourceWorkItemId)}'" });
 
         var normalisedSourceWorkItemId = new WorkItemId(g).ToString();
 
         var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
         if (workItem is null)
-            return Results.BadRequest(new { error = $"Linked WorkItem '{req.SourceWorkItemId}' not found" });
+            return Results.BadRequest(new { error = $"Linked WorkItem '{Validation.DescribeUntrustedValue(req.SourceWorkItemId)}' not found" });
 
         var existing = await store.GetAsync(id, ct);
         if (existing is null) return Results.NotFound();

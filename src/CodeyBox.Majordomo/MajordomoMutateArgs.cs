@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using CodeyBox.Core;
 
 namespace CodeyBox.Majordomo;
@@ -58,7 +59,9 @@ public sealed record CreateWorkItemChainArgs : MajordomoMutateArgs
                 "a chain must contain at least one dependency edge; use create_work_item for independent items",
                 nameof(items));
 
-        Items = [.. items];
+        // ImmutableArray: the validated node list cannot be rewritten through
+        // a mutable cast of the exposed IReadOnlyList.
+        Items = ImmutableArray.CreateRange(items);
     }
 
     /// <summary>Ordered chain nodes; <c>Items[i].DependsOnIndexes</c> only references positions &lt; i.</summary>

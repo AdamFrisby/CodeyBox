@@ -4,7 +4,9 @@ namespace CodeyBox.Core;
 /// The per-field validation and normalisation rules for work-item fields —
 /// the single definition of "what a valid field is" for every queue-facing
 /// surface: REST create/PATCH (<c>WorkItemCreationService</c>,
-/// <c>WorkItemEndpoints</c>) and the majordomo tool contract. Each
+/// <c>WorkItemEndpoints</c>), suggestion promotion
+/// (<c>SuggestionEndpoints</c>), task-template checks
+/// (<c>TaskTemplateRegistry</c>), and the majordomo tool contract. Each
 /// <c>Normalize*</c> helper returns the canonical value plus a null error on
 /// success, or a null value plus a caller-presentable error string; each
 /// <c>Check*</c> helper returns the error or null. Surfaces adapt the error

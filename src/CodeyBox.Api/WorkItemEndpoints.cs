@@ -769,7 +769,7 @@ internal static class WorkItemEndpoints
         {
             var kind = new AgentKind(body.Agent);
             if (!agents.TryGet(kind, out _))
-                return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'", available = agents.Available.Select(a => a.Value) });
+                return Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(body.Agent)}'", available = agents.Available.Select(a => a.Value) });
             agentOverride = kind;
             agentClassOverride = null; // agent-specific override clears class routing
         }
@@ -1595,7 +1595,7 @@ internal static class WorkItemEndpoints
         {
             var kind = new AgentKind(body.Agent);
             if (!agents.TryGet(kind, out _))
-                return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'", available = agents.Available.Select(a => a.Value) });
+                return Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(body.Agent)}'", available = agents.Available.Select(a => a.Value) });
             updated = updated with { Agent = kind, UpdatedAt = now };
         }
 
@@ -1860,7 +1860,7 @@ internal static class WorkItemEndpoints
                 if (!byNamespacedExternalId.TryGetValue((depNs, depValue), out var depByNs))
                     return (Results.BadRequest(new
                     {
-                        error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{depValue}' in namespace '{depNs}' in project '{projectId}'",
+                        error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(depValue)}' in namespace '{depNs}' in project '{projectId}'",
                     }), null);
                 dependsOnIds.Add(depByNs.Id);
                 continue;
@@ -1868,13 +1868,13 @@ internal static class WorkItemEndpoints
             if (!byBareExternalId.TryGetValue(rawId, out var matches) || matches.Count == 0)
                 return (Results.BadRequest(new
                 {
-                    error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{projectId}'",
+                    error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(rawId)}' in project '{projectId}'",
                 }), null);
             var distinctItems = matches.Select(m => m.Item.Id).Distinct().ToList();
             if (distinctItems.Count > 1)
                 return (Results.BadRequest(new
                 {
-                    error = $"dependency '{rawId}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} — qualify as 'namespace:value'",
+                    error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} — qualify as 'namespace:value'",
                 }), null);
             dependsOnIds.Add(distinctItems[0]);
         }
@@ -2133,7 +2133,7 @@ internal static class WorkItemEndpoints
         foreach (var raw in rawIds)
         {
             if (!Guid.TryParse(raw, out var g))
-                return Results.BadRequest(new { error = $"'{raw}' is not a valid work item id" });
+                return Results.BadRequest(new { error = $"'{Validation.DescribeUntrustedValue(raw)}' is not a valid work item id" });
             parsedIds.Add(new WorkItemId(g));
         }
 
@@ -2192,9 +2192,6 @@ internal static class WorkItemEndpoints
         });
     }
 
-    /// <summary>Maximum length of a queue pause/drain reason (characters).</summary>
-    public const int MaxQueueReasonLength = AgentPauseValidation.MaxReasonLength;
-
     /// <summary>Minimum drain wait (seconds) accepted by the drain endpoint.</summary>
     public const int MinDrainTimeoutSeconds = 1;
 
@@ -2204,8 +2201,8 @@ internal static class WorkItemEndpoints
     /// <summary>
     /// Shared required-reason guard for the queue pause/drain endpoints: the
     /// reason must be present, contain no control characters, and fit within
-    /// <see cref="MaxQueueReasonLength"/> characters. Returns a BadRequest
-    /// result when invalid, null when the reason is acceptable.
+    /// <see cref="AgentPauseValidation.MaxReasonLength"/> characters. Returns a
+    /// BadRequest result when invalid, null when the reason is acceptable.
     /// </summary>
     private static IResult? ValidateQueueReason(string? reason)
     {
@@ -2448,10 +2445,8 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = "questionId is required" });
         if (!System.Text.RegularExpressions.Regex.IsMatch(req.QuestionId, @"^[a-zA-Z0-9_-]{1,64}$"))
             return Results.BadRequest(new { error = "questionId must be 1-64 alphanumeric/hyphen/underscore characters" });
-        if (string.IsNullOrWhiteSpace(req.Reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (req.Reason.Length > AgentPauseValidation.MaxReasonLength)
-            return Results.BadRequest(new { error = $"reason must be <= {AgentPauseValidation.MaxReasonLength} chars" });
+        if (AgentPauseValidation.ValidateRequiredReason(req.Reason, "reason") is { } reasonError)
+            return Results.BadRequest(new { error = reasonError });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
@@ -3113,7 +3108,7 @@ public sealed record PauseQueueRequest(string Reason = "");
 /// <summary>
 /// Pause-and-wait drain request. <c>Reason</c> follows the shared queue-reason
 /// guard (required, no control characters, at most
-/// <c>WorkItemEndpoints.MaxQueueReasonLength</c> characters).
+/// <c>AgentPauseValidation.MaxReasonLength</c> characters).
 /// <c>TimeoutSeconds</c> bounds how long the endpoint waits for in-flight work
 /// to reach a safe boundary (<c>WorkItemEndpoints.MinDrainTimeoutSeconds</c> to
 /// <c>WorkItemEndpoints.MaxDrainTimeoutSeconds</c>); on expiry the endpoint

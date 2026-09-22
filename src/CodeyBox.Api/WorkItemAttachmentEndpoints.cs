@@ -128,7 +128,7 @@ internal static class WorkItemAttachmentEndpoints
 
                     var sanitized = FileNameSanitizer.Sanitize(originalFileName);
                     if (sanitized is null)
-                        return await RejectAsync(Results.BadRequest(new { error = $"filename '{originalFileName}' is invalid (path traversal or empty)" }));
+                        return await RejectAsync(Results.BadRequest(new { error = $"filename '{Validation.DescribeUntrustedValue(originalFileName)}' is invalid (path traversal or empty)" }));
                     if (sanitized.Length > opts.MaxFileNameChars)
                         return await RejectAsync(Results.BadRequest(new { error = $"filename exceeds {opts.MaxFileNameChars} chars" }));
 
@@ -184,7 +184,7 @@ internal static class WorkItemAttachmentEndpoints
                     {
                         // Reject unrecognised form fields rather than silently
                         // draining an unbounded section body.
-                        return await RejectAsync(Results.BadRequest(new { error = $"unrecognised form-data field '{name}'" }));
+                        return await RejectAsync(Results.BadRequest(new { error = $"unrecognised form-data field '{Validation.DescribeUntrustedValue(name)}'" }));
                     }
                 }
                 else

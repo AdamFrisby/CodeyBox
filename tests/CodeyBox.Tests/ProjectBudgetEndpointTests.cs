@@ -101,6 +101,16 @@ public sealed class ProjectBudgetEndpointTests : IClassFixture<BudgetApiFactory>
     }
 
     [Fact]
+    public async Task PauseProjectQueue_ControlCharReason_Returns400()
+    {
+        var client = _factory.CreateClient();
+        var resp = await client.PostAsJsonAsync(
+            "/projects/budget-test-project/queue/pause",
+            new { reason = "hold\nplease" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
     public async Task PauseProjectQueue_ValidReason_ReturnsPausedState()
     {
         var client = _factory.CreateClient();

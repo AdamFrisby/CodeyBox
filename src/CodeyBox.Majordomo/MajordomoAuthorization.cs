@@ -64,16 +64,12 @@ public static class MajordomoAuthorization
         if (tool.Class == MajordomoToolClass.Read)
             return new MajordomoDecision.Execute(tool);
 
-        // Fail closed on a mis-declared tool: a Mutate descriptor whose
-        // arguments type does not carry the mutate contract (DryRun /
-        // AffectedItemCount) is refused rather than crashing on a cast.
-        if (arguments is not MajordomoMutateArgs mutate)
-        {
-            return new MajordomoDecision.Refuse(
-                MajordomoRefusalReason.ArgumentContractMismatch,
-                $"tool '{tool.Name}' is a mutation but its arguments type " +
-                $"{tool.ArgumentsType.Name} does not derive from MajordomoMutateArgs");
-        }
+        // A Mutate descriptor's argument type always derives from
+        // MajordomoMutateArgs: MajordomoTool's constructor refuses a
+        // classification/argument-type mismatch, and the exact-type check
+        // above pinned the payload to that declared type. The cast is the
+        // invariant, not a guess.
+        var mutate = (MajordomoMutateArgs)arguments;
 
         // A dry-run emits the would-be change set without mutating: it is
         // never a mutation and never consumes turn budget, in either mode.

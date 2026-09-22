@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using CodeyBox.Core;
 
 namespace CodeyBox.Majordomo;
@@ -21,10 +22,12 @@ public sealed record WorkItemChainNode(
     public NewWorkItemSpec Item { get; init; } =
         Item ?? throw new ArgumentNullException(nameof(Item));
 
+    // Backed by an ImmutableArray so the edge list validated by
+    // CreateWorkItemChainArgs cannot be rewritten through a mutable cast.
     public IReadOnlyList<int> DependsOnIndexes { get; init; } =
         DependsOnIndexes is null
             ? throw new ArgumentNullException(nameof(DependsOnIndexes))
-            : [.. DependsOnIndexes];
+            : ImmutableArray.CreateRange(DependsOnIndexes);
 
     /// <summary>Empty-edge convenience ctor for root nodes.</summary>
     public WorkItemChainNode(NewWorkItemSpec item) : this(item, []) { }

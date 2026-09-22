@@ -247,26 +247,21 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
         var prefix = $"template '{templateName}' checks[{index}]";
         if (check is null)
             throw new TaskTemplateLoadException($"{prefix} must be an object");
-        if (string.IsNullOrWhiteSpace(check.Question))
-            throw new TaskTemplateLoadException($"{prefix}.question is required");
-        if (check.Question.Length > 64 * 1024)
-            throw new TaskTemplateLoadException($"{prefix}.question must be <= 64KB");
+        // Same title/prompt shape rules as every other queue-facing surface —
+        // WorkItemFieldRules is the single definition, adapted here to the
+        // template loader's exception idiom.
+        if (WorkItemFieldRules.NormalizePrompt(check.Question, $"{prefix}.question") is { Error: { } questionError })
+            throw new TaskTemplateLoadException(questionError);
         if (!CheckAndActModes.TryNormalise(check.Mode, out var mode))
             throw new TaskTemplateLoadException($"{prefix}.mode must be 'agentic' or 'completion'");
         if (check.OnYes is null)
             throw new TaskTemplateLoadException($"{prefix}.onYes is required");
 
         var onYes = check.OnYes;
-        if (string.IsNullOrWhiteSpace(onYes.Title))
-            throw new TaskTemplateLoadException($"{prefix}.onYes.title is required");
-        try { Validation.ValidateNoOptionLikeOrControl(onYes.Title, $"{prefix}.onYes.title"); }
-        catch (ArgumentException ex) { throw new TaskTemplateLoadException(ex.Message); }
-        if (onYes.Title.Length > 200)
-            throw new TaskTemplateLoadException($"{prefix}.onYes.title must be <= 200 chars");
-        if (string.IsNullOrWhiteSpace(onYes.Prompt))
-            throw new TaskTemplateLoadException($"{prefix}.onYes.prompt is required");
-        if (onYes.Prompt.Length > 64 * 1024)
-            throw new TaskTemplateLoadException($"{prefix}.onYes.prompt must be <= 64KB");
+        if (WorkItemFieldRules.NormalizeTitle(onYes.Title, $"{prefix}.onYes.title") is { Error: { } onYesTitleError })
+            throw new TaskTemplateLoadException(onYesTitleError);
+        if (WorkItemFieldRules.NormalizePrompt(onYes.Prompt, $"{prefix}.onYes.prompt") is { Error: { } onYesPromptError })
+            throw new TaskTemplateLoadException(onYesPromptError);
         string? onYesAgentClassId = null;
         if (!string.IsNullOrWhiteSpace(onYes.AgentClassId))
         {
@@ -282,16 +277,16 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
         if (onYes.DependsOn is not null && onYes.DependsOn.Any(string.IsNullOrWhiteSpace))
             throw new TaskTemplateLoadException($"{prefix}.onYes.dependsOn must not contain empty entries");
 
-        if (!string.IsNullOrWhiteSpace(check.Title))
-        {
-            try { Validation.ValidateNoOptionLikeOrControl(check.Title, $"{prefix}.title"); }
-            catch (ArgumentException ex) { throw new TaskTemplateLoadException(ex.Message); }
-            if (check.Title.Length > 200)
-                throw new TaskTemplateLoadException($"{prefix}.title must be <= 200 chars");
-        }
+        // check.Title / check.Prompt are optional: whitespace normalises to
+        // unset rather than erroring, so the shared required-field rules only
+        // run on a present value.
+        if (!string.IsNullOrWhiteSpace(check.Title)
+            && WorkItemFieldRules.NormalizeTitle(check.Title, $"{prefix}.title") is { Error: { } titleError })
+            throw new TaskTemplateLoadException(titleError);
 
-        if (check.Prompt is { Length: > 64 * 1024 })
-            throw new TaskTemplateLoadException($"{prefix}.prompt must be <= 64KB");
+        if (!string.IsNullOrWhiteSpace(check.Prompt)
+            && WorkItemFieldRules.NormalizePrompt(check.Prompt, $"{prefix}.prompt") is { Error: { } promptError })
+            throw new TaskTemplateLoadException(promptError);
 
         return check with
         {

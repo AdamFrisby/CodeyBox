@@ -100,12 +100,8 @@ internal static class ProjectBudgetEndpoints
         var project = await projects.GetAsync(pid, ct);
         if (project is null) return Results.NotFound();
 
-        if (string.IsNullOrWhiteSpace(body.Reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (body.Reason.Any(char.IsControl))
-            return Results.BadRequest(new { error = "reason must not contain control characters" });
-        if (body.Reason.Length > 500)
-            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        if (AgentPauseValidation.ValidateRequiredReason(body.Reason, "reason") is { } reasonError)
+            return Results.BadRequest(new { error = reasonError });
 
         await queueController.PauseProjectAsync(pid, body.Reason, ct);
 

@@ -273,7 +273,7 @@ internal static class KnobValueParsers
             }
 
             return KnobValueParseResult.Fail(
-                $"knob '{knob.Key}' value '{value}' is not allowed. Allowed values: " +
+                $"knob '{knob.Key}' value '{Validation.DescribeUntrustedValue(value)}' is not allowed. Allowed values: " +
                 $"{string.Join(", ", knob.AllowedValues)}");
         }
 
@@ -282,14 +282,14 @@ internal static class KnobValueParsers
             KnobValueType.String => KnobValueParseResult.Success(trimmed, trimmed),
             KnobValueType.Boolean => bool.TryParse(trimmed, out var b)
                 ? KnobValueParseResult.Success(b ? "true" : "false", b)
-                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be true or false"),
+                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{Validation.DescribeUntrustedValue(value)}' must be true or false"),
             KnobValueType.Integer => long.TryParse(
                     trimmed,
                     System.Globalization.NumberStyles.Integer,
                     System.Globalization.CultureInfo.InvariantCulture,
                     out var i)
                 ? KnobValueParseResult.Success(i.ToString(System.Globalization.CultureInfo.InvariantCulture), i)
-                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be an integer"),
+                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{Validation.DescribeUntrustedValue(value)}' must be an integer"),
             KnobValueType.Decimal => decimal.TryParse(
                     trimmed,
                     System.Globalization.NumberStyles.AllowLeadingSign |
@@ -297,7 +297,7 @@ internal static class KnobValueParsers
                     System.Globalization.CultureInfo.InvariantCulture,
                     out var d)
                 ? KnobValueParseResult.Success(d.ToString(System.Globalization.CultureInfo.InvariantCulture), d)
-                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{value}' must be a decimal number"),
+                : KnobValueParseResult.Fail($"knob '{knob.Key}' value '{Validation.DescribeUntrustedValue(value)}' must be a decimal number"),
             KnobValueType.Json => ParseJson(knob, trimmed, value),
             _ => KnobValueParseResult.Success(trimmed, trimmed),
         };
@@ -312,7 +312,7 @@ internal static class KnobValueParsers
         }
         catch (System.Text.Json.JsonException)
         {
-            return KnobValueParseResult.Fail($"knob '{knob.Key}' value '{original}' must be valid JSON");
+            return KnobValueParseResult.Fail($"knob '{knob.Key}' value '{Validation.DescribeUntrustedValue(original)}' must be valid JSON");
         }
     }
 }
