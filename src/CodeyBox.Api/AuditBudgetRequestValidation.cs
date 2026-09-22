@@ -10,8 +10,8 @@ internal static class AuditBudgetRequestValidation
             return (null, null);
 
         var trimmed = value.Trim();
-        if (trimmed.Length > 64)
-            return (null, "auditComplexity must be <= 64 chars");
+        if (trimmed.Length > WorkItemLimits.MaxAuditComplexityLength)
+            return (null, $"auditComplexity must be <= {WorkItemLimits.MaxAuditComplexityLength} chars");
 
         try { Validation.ValidateNoOptionLikeOrControl(trimmed, "auditComplexity"); }
         catch (ArgumentException ex) { return (null, ex.Message); }

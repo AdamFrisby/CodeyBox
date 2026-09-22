@@ -776,8 +776,8 @@ internal static class WorkItemEndpoints
 
         if (!string.IsNullOrWhiteSpace(body?.AgentClassId))
         {
-            if (body.AgentClassId.Length > 200)
-                return Results.BadRequest(new { error = "agentClassId must be <= 200 chars" });
+            if (body.AgentClassId.Length > WorkItemLimits.MaxAgentClassIdLength)
+                return Results.BadRequest(new { error = $"agentClassId must be <= {WorkItemLimits.MaxAgentClassIdLength} chars" });
             agentClassOverride = body.AgentClassId.Trim();
             agentOverride = null; // class routing takes precedence
         }
@@ -950,8 +950,8 @@ internal static class WorkItemEndpoints
         {
             if (reason.Any(char.IsControl))
                 return Results.BadRequest(new { error = "reason must not contain control characters" });
-            if (reason.Length > 500)
-                return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+            if (reason.Length > AgentPauseValidation.MaxReasonLength)
+                return Results.BadRequest(new { error = $"reason must be <= {AgentPauseValidation.MaxReasonLength} chars" });
         }
         if (resolutionSha is not null)
         {
@@ -1235,8 +1235,8 @@ internal static class WorkItemEndpoints
         {
             if (reason.Any(char.IsControl))
                 return Results.BadRequest(new { error = "reason must not contain control characters" });
-            if (reason.Length > 500)
-                return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+            if (reason.Length > AgentPauseValidation.MaxReasonLength)
+                return Results.BadRequest(new { error = $"reason must be <= {AgentPauseValidation.MaxReasonLength} chars" });
         }
 
         var outcome = await retrier.ResumeAsync(item!, body?.From ?? "work", reason, ct);
@@ -1300,8 +1300,8 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = $"unknown project '{item.ProjectId}'" });
 
         var highestAllowedPriority = project.MaxPriority is { } cap
-            ? Math.Min(cap, GlobalMaxPriority)
-            : GlobalMaxPriority;
+            ? Math.Min(cap, WorkItemLimits.MaxPriority)
+            : WorkItemLimits.MaxPriority;
         var promotedPriority = Math.Max(item.Priority, highestAllowedPriority);
         if (item.Priority == promotedPriority)
             return Results.Ok(new { id = item.Id.ToString(), state = item.State.ToString() });
@@ -1514,8 +1514,8 @@ internal static class WorkItemEndpoints
             var trimmed = body.AgentClassId!.Trim();
             if (trimmed.Length == 0)
                 return Results.BadRequest(new { error = "agentClassId must not be empty" });
-            if (trimmed.Length > 200)
-                return Results.BadRequest(new { error = "agentClassId must be <= 200 chars" });
+            if (trimmed.Length > WorkItemLimits.MaxAgentClassIdLength)
+                return Results.BadRequest(new { error = $"agentClassId must be <= {WorkItemLimits.MaxAgentClassIdLength} chars" });
             var knownClasses = router.ClassIds;
             if (!knownClasses.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
                 return Results.BadRequest(new
@@ -1562,13 +1562,13 @@ internal static class WorkItemEndpoints
         {
             try { Validation.ValidateNoOptionLikeOrControl(body.Title, nameof(body.Title)); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
-            if (body.Title.Length > 200) return Results.BadRequest(new { error = "title must be <= 200 chars" });
+            if (body.Title.Length > WorkItemLimits.MaxTitleLength) return Results.BadRequest(new { error = $"title must be <= {WorkItemLimits.MaxTitleLength} chars" });
             updated = updated with { Title = body.Title, UpdatedAt = now };
         }
 
         if (body.Prompt is not null)
         {
-            if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
+            if (body.Prompt.Length > WorkItemLimits.MaxPromptLength) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
             if (deferPromptReplace)
             {
                 updated = updated with
@@ -1611,13 +1611,13 @@ internal static class WorkItemEndpoints
         }
 
         if (body.WorkTimeoutMinutes is { } w)
-            updated = updated with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)), UpdatedAt = now };
+            updated = updated with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, WorkTimeoutPolicy.MinMinutes, WorkTimeoutPolicy.MaxMinutes)), UpdatedAt = now };
 
         if (body.MergeTimeoutMinutes is { } m)
-            updated = updated with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)), UpdatedAt = now };
+            updated = updated with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, WorkItemLimits.MinMergeTimeoutMinutes, WorkItemLimits.MaxMergeTimeoutMinutes)), UpdatedAt = now };
 
         if (body.MinModelScore is { } minScore)
-            updated = updated with { MinModelScore = Math.Clamp(minScore, 0, 200), UpdatedAt = now };
+            updated = updated with { MinModelScore = Math.Clamp(minScore, WorkItemLimits.MinModelScoreFloor, WorkItemLimits.MinModelScoreCeiling), UpdatedAt = now };
 
         if (body.RequiredCapabilities is { } patchCaps)
         {
@@ -1837,8 +1837,8 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         CancellationToken ct)
     {
-        if (rawDeps.Length > 100)
-            return (Results.BadRequest(new { error = "dependsOn must contain at most 100 entries" }), null);
+        if (rawDeps.Length > WorkItemLimits.MaxDependsOn)
+            return (Results.BadRequest(new { error = $"dependsOn must contain at most {WorkItemLimits.MaxDependsOn} entries" }), null);
 
         var allItems = new List<WorkItem>();
         await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
@@ -1958,8 +1958,8 @@ internal static class WorkItemEndpoints
             resulting[ns] = value;
         }
 
-        if (resulting.Count > 16)
-            return Results.BadRequest(new { error = "externalIds may contain at most 16 entries per work item" });
+        if (resulting.Count > WorkItemLimits.MaxExternalIds)
+            return Results.BadRequest(new { error = $"externalIds may contain at most {WorkItemLimits.MaxExternalIds} entries per work item" });
 
         // Pre-check for conflicts on namespaced IDs newly assigned to this item
         // (additions and changed values). We don't pre-check unchanged entries —
@@ -2029,7 +2029,7 @@ internal static class WorkItemEndpoints
     {
         if (body is null || string.IsNullOrEmpty(body.Prompt))
             return Results.BadRequest(new { error = "prompt is required" });
-        if (body.Prompt.Length > 64 * 1024)
+        if (body.Prompt.Length > WorkItemLimits.MaxPromptLength)
             return Results.BadRequest(new { error = "prompt must be <= 64KB" });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -2200,7 +2200,7 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>Maximum length of a queue pause/drain reason (characters).</summary>
-    public const int MaxQueueReasonLength = 500;
+    public const int MaxQueueReasonLength = AgentPauseValidation.MaxReasonLength;
 
     /// <summary>Minimum drain wait (seconds) accepted by the drain endpoint.</summary>
     public const int MinDrainTimeoutSeconds = 1;
@@ -2462,8 +2462,8 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = "questionId must be 1-64 alphanumeric/hyphen/underscore characters" });
         if (string.IsNullOrWhiteSpace(req.Reason))
             return Results.BadRequest(new { error = "reason is required" });
-        if (req.Reason.Length > 500)
-            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        if (req.Reason.Length > AgentPauseValidation.MaxReasonLength)
+            return Results.BadRequest(new { error = $"reason must be <= {AgentPauseValidation.MaxReasonLength} chars" });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
@@ -2841,10 +2841,6 @@ internal static class WorkItemEndpoints
                 grant.IsImplicit)).ToList());
     }
 
-    private const int GlobalMinPriority = -1000;
-    private const int GlobalMaxPriority = 1000;
-    private const int MaxRequiredCapabilities = 16;
-    private const int MaxCapabilityLength = 64;
 
     /// <summary>
     /// Normalises and validates a caller-supplied list of required-capability
@@ -2854,10 +2850,10 @@ internal static class WorkItemEndpoints
     private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(
         IReadOnlyList<string> raw)
     {
-        if (raw.Count > MaxRequiredCapabilities)
+        if (raw.Count > WorkItemLimits.MaxRequiredCapabilities)
             return (null, Results.BadRequest(new
             {
-                error = $"requiredCapabilities may contain at most {MaxRequiredCapabilities} entries",
+                error = $"requiredCapabilities may contain at most {WorkItemLimits.MaxRequiredCapabilities} entries",
             }));
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<string>();
@@ -2866,10 +2862,10 @@ internal static class WorkItemEndpoints
             if (entry is null) continue;
             var tag = entry.Trim();
             if (tag.Length == 0) continue;
-            if (tag.Length > MaxCapabilityLength)
+            if (tag.Length > WorkItemLimits.MaxCapabilityLength)
                 return (null, Results.BadRequest(new
                 {
-                    error = $"requiredCapabilities entry '{tag}' exceeds {MaxCapabilityLength} chars",
+                    error = $"requiredCapabilities entry '{tag}' exceeds {WorkItemLimits.MaxCapabilityLength} chars",
                 }));
             if (tag.Any(char.IsControl))
                 return (null, Results.BadRequest(new
@@ -2902,10 +2898,10 @@ internal static class WorkItemEndpoints
     /// </summary>
     private static IResult? ValidatePriority(int priority, Project project)
     {
-        if (priority < GlobalMinPriority || priority > GlobalMaxPriority)
+        if (priority < WorkItemLimits.MinPriority || priority > WorkItemLimits.MaxPriority)
             return Results.BadRequest(new
             {
-                error = $"priority must be within [{GlobalMinPriority}, {GlobalMaxPriority}]",
+                error = $"priority must be within [{WorkItemLimits.MinPriority}, {WorkItemLimits.MaxPriority}]",
             });
         if (project.MaxPriority is { } maxPriority && priority > maxPriority)
             return Results.BadRequest(new

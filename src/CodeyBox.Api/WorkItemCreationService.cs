@@ -5,11 +5,6 @@ namespace CodeyBox.Api;
 
 internal sealed class WorkItemCreationService
 {
-    private const int GlobalMinPriority = -1000;
-    private const int GlobalMaxPriority = 1000;
-    private const int MaxRequiredCapabilities = 16;
-    private const int MaxCapabilityLength = 64;
-
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
     private readonly IProjectRepository _projects;
@@ -75,9 +70,9 @@ internal sealed class WorkItemCreationService
                 return Error("workBranch must differ from baseBranch");
             }
 
-            if (req.Title.Length > 200)
-                return Error("title must be <= 200 chars");
-            if (req.Prompt.Length > 64 * 1024)
+            if (req.Title.Length > WorkItemLimits.MaxTitleLength)
+                return Error($"title must be <= {WorkItemLimits.MaxTitleLength} chars");
+            if (req.Prompt.Length > WorkItemLimits.MaxPromptLength)
                 return Error("prompt must be <= 64KB");
         }
         catch (ArgumentException ex)
@@ -88,8 +83,8 @@ internal sealed class WorkItemCreationService
         var canonicalExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (req.ExternalIds is { Count: > 0 })
         {
-            if (req.ExternalIds.Count > 16)
-                return Error("externalIds may contain at most 16 entries per work item");
+            if (req.ExternalIds.Count > WorkItemLimits.MaxExternalIds)
+                return Error($"externalIds may contain at most {WorkItemLimits.MaxExternalIds} entries per work item");
             foreach (var (ns, value) in req.ExternalIds)
             {
                 if (value is null)
@@ -144,8 +139,8 @@ internal sealed class WorkItemCreationService
                     }));
         }
 
-        if ((req.DependsOn?.Length ?? 0) > 100)
-            return Error("dependsOn must contain at most 100 entries");
+        if ((req.DependsOn?.Length ?? 0) > WorkItemLimits.MaxDependsOn)
+            return Error($"dependsOn must contain at most {WorkItemLimits.MaxDependsOn} entries");
 
         var allItems = new List<WorkItem>();
         var byNamespacedExternalId = new Dictionary<(string Namespace, string Value), WorkItem>();
@@ -233,8 +228,8 @@ internal sealed class WorkItemCreationService
         string? agentClassId = null;
         if (!string.IsNullOrWhiteSpace(req.AgentClassId))
         {
-            if (req.AgentClassId.Length > 200)
-                return Error("agentClassId must be <= 200 chars");
+            if (req.AgentClassId.Length > WorkItemLimits.MaxAgentClassIdLength)
+                return Error($"agentClassId must be <= {WorkItemLimits.MaxAgentClassIdLength} chars");
             agentClassId = req.AgentClassId.Trim();
         }
 
@@ -297,7 +292,7 @@ internal sealed class WorkItemCreationService
             var check = req.Check;
             if (string.IsNullOrWhiteSpace(check.Question))
                 return Error("check.question is required");
-            if (check.Question.Length > 64 * 1024)
+            if (check.Question.Length > WorkItemLimits.MaxPromptLength)
                 return Error("check.question must be <= 64KB");
             if (!CheckAndActModes.TryNormalise(check.Mode, out var checkMode))
                 return Error("check.mode must be 'agentic' or 'completion'");
@@ -308,11 +303,11 @@ internal sealed class WorkItemCreationService
                 return Error("check.onYes.title is required");
             try { Validation.ValidateNoOptionLikeOrControl(onYes.Title, "check.onYes.title"); }
             catch (ArgumentException ex) { return Error(ex.Message); }
-            if (onYes.Title.Length > 200)
-                return Error("check.onYes.title must be <= 200 chars");
+            if (onYes.Title.Length > WorkItemLimits.MaxTitleLength)
+                return Error($"check.onYes.title must be <= {WorkItemLimits.MaxTitleLength} chars");
             if (string.IsNullOrWhiteSpace(onYes.Prompt))
                 return Error("check.onYes.prompt is required");
-            if (onYes.Prompt.Length > 64 * 1024)
+            if (onYes.Prompt.Length > WorkItemLimits.MaxPromptLength)
                 return Error("check.onYes.prompt must be <= 64KB");
             if (!string.IsNullOrWhiteSpace(onYes.Agent))
             {
@@ -331,10 +326,10 @@ internal sealed class WorkItemCreationService
                         }));
                 }
             }
-            if (onYes.AgentClassId is { Length: > 200 })
-                return Error("check.onYes.agentClassId must be <= 200 chars");
-            if (onYes.DependsOn is { Length: > 100 })
-                return Error("check.onYes.dependsOn must contain at most 100 entries");
+            if (onYes.AgentClassId is { Length: > WorkItemLimits.MaxAgentClassIdLength })
+                return Error($"check.onYes.agentClassId must be <= {WorkItemLimits.MaxAgentClassIdLength} chars");
+            if (onYes.DependsOn is { Length: > WorkItemLimits.MaxDependsOn })
+                return Error($"check.onYes.dependsOn must contain at most {WorkItemLimits.MaxDependsOn} entries");
             IReadOnlyDictionary<string, string> onYesKnobs = EmptyKnobs;
             if (onYes.Knobs is { Count: > 0 })
             {
@@ -446,11 +441,11 @@ internal sealed class WorkItemCreationService
             TemplateEntryIndex = provenance?.TemplateEntryIndex,
         };
         if (req.WorkTimeoutMinutes is { } w)
-            item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
+            item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, WorkTimeoutPolicy.MinMinutes, WorkTimeoutPolicy.MaxMinutes)) };
         if (req.MergeTimeoutMinutes is { } m)
-            item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
+            item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, WorkItemLimits.MinMergeTimeoutMinutes, WorkItemLimits.MaxMergeTimeoutMinutes)) };
         if (req.MinModelScore is { } minScore)
-            item = item with { MinModelScore = Math.Clamp(minScore, 0, 200) };
+            item = item with { MinModelScore = Math.Clamp(minScore, WorkItemLimits.MinModelScoreFloor, WorkItemLimits.MinModelScoreCeiling) };
 
         return new PreparedWorkItemCreationResult(
             new PreparedWorkItemCreation(item, project, boundRelease, canonicalExternalIds),
@@ -539,10 +534,10 @@ internal sealed class WorkItemCreationService
     private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(
         IReadOnlyList<string> raw)
     {
-        if (raw.Count > MaxRequiredCapabilities)
+        if (raw.Count > WorkItemLimits.MaxRequiredCapabilities)
             return (null, Results.BadRequest(new
             {
-                error = $"requiredCapabilities may contain at most {MaxRequiredCapabilities} entries",
+                error = $"requiredCapabilities may contain at most {WorkItemLimits.MaxRequiredCapabilities} entries",
             }));
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<string>();
@@ -551,10 +546,10 @@ internal sealed class WorkItemCreationService
             if (entry is null) continue;
             var tag = entry.Trim();
             if (tag.Length == 0) continue;
-            if (tag.Length > MaxCapabilityLength)
+            if (tag.Length > WorkItemLimits.MaxCapabilityLength)
                 return (null, Results.BadRequest(new
                 {
-                    error = $"requiredCapabilities entry '{tag}' exceeds {MaxCapabilityLength} chars",
+                    error = $"requiredCapabilities entry '{tag}' exceeds {WorkItemLimits.MaxCapabilityLength} chars",
                 }));
             if (tag.Any(char.IsControl))
                 return (null, Results.BadRequest(new
@@ -568,10 +563,10 @@ internal sealed class WorkItemCreationService
 
     private static IResult? ValidatePriority(int priority, Project project)
     {
-        if (priority < GlobalMinPriority || priority > GlobalMaxPriority)
+        if (priority < WorkItemLimits.MinPriority || priority > WorkItemLimits.MaxPriority)
             return Results.BadRequest(new
             {
-                error = $"priority must be within [{GlobalMinPriority}, {GlobalMaxPriority}]",
+                error = $"priority must be within [{WorkItemLimits.MinPriority}, {WorkItemLimits.MaxPriority}]",
             });
         if (project.MaxPriority is { } maxPriority && priority > maxPriority)
             return Results.BadRequest(new
