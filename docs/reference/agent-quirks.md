@@ -389,6 +389,118 @@ where any `401 Unauthorized` is classified by
 pay-per-api surface is undocumented at the time of writing; treat
 `PayPerApi` as a forward hook.
 
+### Devin CLI (`devin`)
+
+Verified against devin 3000.11.1 (installed via
+`curl -fsSL https://cli.devin.ai/install.sh | bash`, binary at
+`~/.local/bin/devin`, real payload under
+`~/.local/share/devin/cli/_versions/<ver>/bin/devin`).
+
+**Binary name:** `devin`. No runtime dependency beyond bash for the
+install script.
+
+**Install in the sandbox image:**
+```sh
+curl -fsSL https://cli.devin.ai/install.sh | bash
+```
+Add it to `CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`,
+matching the selected provider, and make sure `~/.local/bin` is on the
+non-login PATH the dispatcher uses (or symlink `devin` onto PATH).
+
+**Subscription auth setup:**
+
+1. On the host, run `devin auth login` (or `devin auth import`) once. This
+   writes `~/.local/share/devin/credentials.toml` — a flat TOML table with
+   the account token under `api_key` or `windsurf_api_key` (verified
+   2026-09-21: current logins write only `windsurf_api_key`, a
+   `devin-session-token$…` value — CodeyBox accepts either field) plus the
+   login-assigned `api_server_url`.
+   There is NO env-var alternative (`DEVIN_API_KEY` does not exist in the
+   binary), and `devin auth status` exits 0 even when logged out — do not
+   use it as an auth check.
+2. Point CodeyBox at the file with
+   `CODEYBOX_DEVIN_AUTH_FILE=/path/to/credentials.toml` (or leave unset for
+   the default path), or inject the file contents directly via the
+   `CODEYBOX_DEVIN_AUTH_TOML` host env var.
+3. The orchestrator re-reads the file on every pickup and ships the raw
+   TOML into the sandbox via `CODEYBOX_DEVIN_AUTH_TOML`;
+   `DevinAgentRunner` materialises it at
+   `~/.local/share/devin/credentials.toml` inside the VM before invoking
+   the binary. The host credentials directory is not bind-mounted.
+
+**Non-interactive invocation:**
+`devin -p --permission-mode dangerous --respect-workspace-trust false
+--prompt-file /dev/stdin` with the prompt on stdin.
+
+- A bare `devin -p` does NOT read a piped prompt from stdin — verified
+  live; `--prompt-file /dev/stdin` is required. The prompt travels on stdin
+  rather than positional argv (Linux MAX_ARG_STRLEN is 128 KiB per argv
+  element).
+- `--permission-mode` accepts `auto|accept-edits|smart|dangerous` (default
+  `auto` auto-approves read-only tools only). The runner passes `dangerous`
+  for workspace dispatches — the VM is the security perimeter — and omits
+  the flag for text-only calls so the read-only `auto` default applies.
+- `--respect-workspace-trust false` is REQUIRED: print mode cannot show the
+  workspace-trust prompt and fails outright in an untrusted directory.
+- `--model <id>` selects the model (env `DEVIN_MODEL` also works); unset
+  falls back to the account's server-side default.
+- Failure text surfaces as `Error: …` lines on stderr (verified: `Error:
+  Not logged in` exits 1); `DevinTerminalDiagnoser` lifts the first such
+  line into `TerminalDiagnostic`.
+
+**Default model:** `claude-sonnet-5-medium` (verified live catalog variant;
+the documented examples `sonnet`/`opus`/`swe`/`fable` are also accepted
+aliases). Override via `ModelId` on the
+agent-class member.
+
+**Reasoning level:** the CLI exposes no reasoning-effort flag;
+`ReasoningMode` is accepted for schema uniformity but not threaded into
+argv.
+
+**Quota probe:** `DevinQuotaProbe` POSTs a hand-encoded protobuf
+`GetUserStatusRequest` (the endpoint rejects `application/json`, verified
+live) to the Connect-RPC `SeatManagementService/GetUserStatus` endpoint
+with `Authorization: Basic <token>` (Basic, NOT Bearer — the token is the
+credentials.toml `api_key`/`windsurf_api_key` verbatim) and
+`Connect-Protocol-Version: 1`. The API host is NOT a compile-time
+constant — it is the login-assigned `api_server_url` from credentials.toml
+(`api.devin.ai` returns 404 for this RPC, verified), carried through
+`AgentQuotaCredentials.EndpointBaseUrl`; the probe fails closed when it is
+absent or not an absolute http(s) URL. `user_status.plan_status` provides
+`daily_quota_remaining_percent` / `weekly_quota_remaining_percent` (proto
+fields 14/15) with per-window Unix-second resets (17/18) — `AvailablePct`
+is the MINIMUM of the present windows so the binding constraint wins, and
+the ACU counters (`acu_consumed`/`acu_limit`, fields 19/20) derive a
+window when the percent fields are absent. `plan_info.plan_name` and the
+overage balance surface in `Notes`, not `BalanceRemaining` — the plan
+windows are the primary bucket. Results cache for `QuotaCacheTtlSeconds`
+and invalidate on credential-file `TokenUpdated`. `DevinQuotaFailureDetector` classifies
+dispatch-time signals (`Quota exhausted`, `Usage limit reached`, `Not
+logged in`, …) and accepts operator extras via
+`CodeyBox:QuotaFailurePatterns:devin`.
+
+**Smoke probes:** the host probe validates that
+`CODEYBOX_DEVIN_AUTH_TOML` parses and carries a non-empty token field
+(`api_key` or `windsurf_api_key`) — no network call. The in-VM probe runs `devin --version`, then (when auth is
+present) materialises the credentials file with the runner's exact script,
+runs `devin models list --format json` (exits 1 unauthenticated — the real
+auth check), and performs a real print-mode turn with the dispatch argv.
+
+**Model list probe:** `DevinModelListProbe` execs `devin models list
+--format json` on the host (account-scoped catalog; requires the CLI
+installed AND authenticated on the orchestrator host). The emitted shape
+is `{"families":[{slug, aliases[], variants:[{model_uid}]}]}` — family
+slugs, aliases, and variant uids are all valid `--model` values and all
+three are collected. `CODEYBOX_DEVIN_BINARY`
+overrides the binary path. When the probe fails, the `DevinKnownModels`
+seed stays the warn-only validation surface.
+
+**Sessions / scratchpad:** the CLI persists sessions in
+`~/.local/share/devin/cli/sessions.db` (sqlite + WAL/SHM); the scratchpad
+allowlist captures the database so preempted sandboxes keep session state.
+Resume is not wired: `-c` combined with `-p` is unverified, so a restored
+run re-dispatches fresh like the other file-state agents.
+
 ### Google Antigravity CLI (`agy`)
 
 #### Invocation: `--print` is unusable; use stream-json (verified agy 1.1.24 and 1.1.26)

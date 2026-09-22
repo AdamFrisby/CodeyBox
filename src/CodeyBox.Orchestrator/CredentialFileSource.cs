@@ -39,6 +39,7 @@ public class CredentialFileSource : IDisposable, ICredentialFileReader
     private readonly ILogger? _log;
     private readonly Func<string, string, FileSystemWatcher> _createWatcher;
     private readonly Action<FileSystemWatcher> _watcherDisposed;
+    private readonly Func<string, bool> _isWellFormedContents;
     private readonly object _gate = new();
     private string? _cached;
     private DateTime _cachedMtimeUtc = DateTime.MinValue;
@@ -59,13 +60,25 @@ public class CredentialFileSource : IDisposable, ICredentialFileReader
     /// </summary>
     public event Action? TokenUpdated;
 
-    public CredentialFileSource(string filePath, ILogger? log = null, bool watch = true)
+    /// <param name="contentValidator">
+    /// Well-formedness check applied to freshly read bytes before they are
+    /// cached — the torn-write guard protecting against a writer mid-dump.
+    /// Defaults to a JSON parse (all existing credential files are JSON);
+    /// sources for non-JSON formats pass their own shape check (e.g. devin's
+    /// credentials.toml validates that a token field is present).
+    /// </param>
+    public CredentialFileSource(
+        string filePath,
+        ILogger? log = null,
+        bool watch = true,
+        Func<string, bool>? contentValidator = null)
         : this(
             filePath,
             log,
             watch,
             CredentialFileSourceWatcherDiagnostics.CreateWatcher,
-            CredentialFileSourceWatcherDiagnostics.WatcherDisposed)
+            CredentialFileSourceWatcherDiagnostics.WatcherDisposed,
+            contentValidator)
     {
     }
 
@@ -74,14 +87,29 @@ public class CredentialFileSource : IDisposable, ICredentialFileReader
         ILogger? log,
         bool watch,
         Func<string, string, FileSystemWatcher> createWatcher,
-        Action<FileSystemWatcher> watcherDisposed)
+        Action<FileSystemWatcher> watcherDisposed,
+        Func<string, bool>? contentValidator = null)
     {
         FilePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
         _log = log;
         _createWatcher = createWatcher ?? throw new ArgumentNullException(nameof(createWatcher));
         _watcherDisposed = watcherDisposed ?? throw new ArgumentNullException(nameof(watcherDisposed));
+        _isWellFormedContents = contentValidator ?? IsWellFormedJson;
         TryReload(force: false, out _);
         if (watch) StartWatcher();
+    }
+
+    private static bool IsWellFormedJson(string contents)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(contents);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -199,14 +227,13 @@ public class CredentialFileSource : IDisposable, ICredentialFileReader
                     return null;
                 }
 
-                // Validate JSON — protects against TOCTOU where the writer is
-                // partway through dumping a fresh token. Retry once or twice;
-                // if still bad, leave the existing cache untouched.
-                try
-                {
-                    using var doc = JsonDocument.Parse(contents);
-                }
-                catch (JsonException)
+                // Validate the contents — protects against TOCTOU where the
+                // writer is partway through dumping a fresh credential. Retry
+                // once or twice; if still bad, leave the existing cache
+                // untouched. The default validator is a JSON parse; non-JSON
+                // sources (e.g. devin's credentials.toml) pass their own check
+                // via the constructor.
+                if (!_isWellFormedContents(contents))
                 {
                     if (attempt + 1 < MaxReadAttempts)
                     {
@@ -214,7 +241,7 @@ public class CredentialFileSource : IDisposable, ICredentialFileReader
                         continue;
                     }
                     _log?.LogWarning(
-                        "Credential file {Path} did not parse as JSON after {Attempts} attempts; keeping previous snapshot",
+                        "Credential file {Path} did not pass its well-formedness check after {Attempts} attempts; keeping previous snapshot",
                         FilePath, MaxReadAttempts);
                     return null;
                 }
@@ -429,6 +456,20 @@ public sealed class OpencodeCredentialFileSource : CredentialFileSource
 {
     public OpencodeCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
         : base(filePath, log, watch) { }
+}
+
+/// <summary>
+/// Marker for the Devin CLI credentials file source. The devin CLI hard-reads
+/// <c>~/.local/share/devin/credentials.toml</c> written by
+/// <c>devin auth login</c>; CodeyBox ships the raw bytes to the sandbox as
+/// <c>CODEYBOX_DEVIN_AUTH_TOML</c> and the runner materialises them at the
+/// same XDG path inside the VM. The file is TOML, not JSON, so the torn-write
+/// guard checks for a usable token field instead of parsing JSON.
+/// </summary>
+public sealed class DevinCredentialFileSource : CredentialFileSource
+{
+    public DevinCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch, DevinCliCredentialsFileCredentialProvider.IsUsableCredentialsToml) { }
 }
 
 /// <summary>

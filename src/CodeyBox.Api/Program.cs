@@ -17,6 +17,7 @@ using CodeyBox.Agents.Cmd;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
+using CodeyBox.Agents.Devin;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Goose;
 using CodeyBox.Agents.Kilo;
@@ -1418,6 +1419,16 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CodexAgentRunner(
 builder.Services.AddSingleton<IAgentRunner>(sp => new GeminiAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
+// Devin: Cognition's agent CLI (binary `devin`, installed via
+// cli.devin.ai/install.sh). Driven non-interactively via `-p` with the prompt
+// on stdin through --prompt-file /dev/stdin (bare -p ignores piped stdin;
+// verified against devin 3000.11.1). Auth is the credentials.toml file
+// contents shipped via CODEYBOX_DEVIN_AUTH_TOML and materialised at
+// ~/.local/share/devin/credentials.toml — the CLI has no DEVIN_API_KEY-style
+// env var. The binary must be installed in the sandbox image; see
+// docs/concepts/agents.md and docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new DevinAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner>(sp => new CavemanCodeAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
@@ -1893,6 +1904,22 @@ if (cursorAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         cursorAuthFilePath[2..]);
 
+// Devin subscription credentials. Path is operator-configurable; default
+// matches what `devin auth login` writes (XDG data dir). The orchestrator
+// never bind-mounts this path into the sandbox — only the file contents are
+// shipped via CODEYBOX_DEVIN_AUTH_TOML and DevinAgentRunner re-materialises
+// them inside the VM at the matching path.
+var devinAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_DEVIN_AUTH_FILE")
+    ?? builder.Configuration["CodeyBox:DevinAuthFile"]
+    ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".local", "share", "devin", "credentials.toml");
+if (devinAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    devinAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        devinAuthFilePath[2..]);
+
 var opencodeAuthFilePath =
     Environment.GetEnvironmentVariable("CODEYBOX_OPENCODE_AUTH_FILE")
     ?? builder.Configuration["CodeyBox:OpencodeAuthFile"]
@@ -1940,6 +1967,10 @@ builder.Services.AddSingleton(sp => new GeminiSettingsCredentialFileSource(
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new CursorCredentialFileSource(
     cursorAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
+builder.Services.AddSingleton(sp => new DevinCredentialFileSource(
+    devinAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new OpencodeCredentialFileSource(
@@ -2004,6 +2035,14 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         sp.GetRequiredService<CursorCredentialFileSource>(),
         sp.GetService<ILogger<CursorOAuthFileCredentialProvider>>()));
 
+    // Devin subscription credentials. Same pattern as Cursor: the CLI hard-
+    // reads its own credentials file (~/.local/share/devin/credentials.toml),
+    // we ship the contents into the sandbox via CODEYBOX_DEVIN_AUTH_TOML and
+    // the runner re-materialises them.
+    builtInFirst.Add(new DevinCliCredentialsFileCredentialProvider(
+        sp.GetRequiredService<DevinCredentialFileSource>(),
+        sp.GetService<ILogger<DevinCliCredentialsFileCredentialProvider>>()));
+
     // opencode (sst/opencode "Go" subscription) auth file. The opencode CLI
     // hard-reads its credential file in the target user's home; this
     // provider ships the raw bytes to the sandbox via OPENCODE_AUTH_JSON
@@ -2063,6 +2102,14 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // when an operator wants to inject the JSON directly via env var
         // without an on-host credential file.
         new AgentCredentialMapping(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON", "CODEYBOX_CURSOR_AUTH_JSON"),
+        // Devin: the CLI uses subscription auth via
+        // ~/.local/share/devin/credentials.toml (NOT an env-var key). The
+        // orchestrator ships the file's contents to the sandbox via
+        // CODEYBOX_DEVIN_AUTH_TOML and DevinAgentRunner materialises it inside
+        // the VM. This env-var mapping is the fallback when an operator wants
+        // to inject the TOML directly via env var without an on-host
+        // credentials file.
+        new AgentCredentialMapping(AgentKind.Devin, "CODEYBOX_DEVIN_AUTH_TOML", "CODEYBOX_DEVIN_AUTH_TOML"),
         // Note: Crock is NOT in this verbatim mapping. The crock provider needs to
         // attach a bind-mount (the host crock daemon Unix socket) alongside the
         // config env var, which only CrockEnvironmentCredentialProvider (registered
@@ -2530,6 +2577,26 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         loggerFactory.CreateLogger<CursorQuotaProbe>());
     return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var source = sp.GetRequiredService<DevinCredentialFileSource>();
+    var probe = new DevinQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () =>
+            {
+                var (apiKey, apiServerUrl) = CredentialFileTokenExtractor.ExtractDevinCredentials(
+                    source.GetRaw()
+                        ?? Environment.GetEnvironmentVariable("CODEYBOX_DEVIN_AUTH_TOML"));
+                return new AgentQuotaCredentials(apiKey, EndpointBaseUrl: apiServerUrl);
+            })
+            ?? new AgentQuotaCredentials(null),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        loggerFactory.CreateLogger<DevinQuotaProbe>());
+    return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
+});
 
 // opencode: metered out-of-tree by the codeybox.opencode-go-quota plugin,
 // which claims opencode-go members (and zen-backed copilot members) through
@@ -2953,6 +3020,12 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new OpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
+// Devin: credential-shape check only (CODEYBOX_DEVIN_AUTH_TOML parses and
+// carries a token field). The remote GetUserStatus reading is owned by the quota
+// probe; the real auth check happens on first CLI call in-VM.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new DevinSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<DevinSmokeProbe>()));
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new CavemanCodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CavemanCodeSmokeProbe>()));
@@ -3073,6 +3146,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CopilotInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, DevinInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CavemanCodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
@@ -3164,6 +3238,19 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         loggerFactory.CreateLogger<GeminiModelListProbe>());
 });
 builder.Services.AddSingleton<IAgentModelListProbe, CursorModelListProbe>();
+// Devin model-list probe: `devin models list --format json` is the
+// account-scoped catalog — it needs the CLI installed and authenticated on
+// the orchestrator host (the same `devin auth login` that produced the
+// credentials file). Absent either, the probe reports Failed and the
+// DevinKnownModels seed stays the warn-only validation surface.
+builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    return new DevinModelListProbe(
+        new DefaultDevinCliRunner(),
+        binary: Environment.GetEnvironmentVariable("CODEYBOX_DEVIN_BINARY"),
+        loggerFactory.CreateLogger<DevinModelListProbe>());
+});
 // Antigravity model-list probe: no reachable endpoint enumerates the agy
 // gateway models for our credential (the cloudcode-pa Code Assist surface
 // returns the wrong gemini-2.5 catalog; the daily-cloudcode-pa gateway 403s on
@@ -4341,6 +4428,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Qwen] = new QwenCostExtractor(),
         [AgentKind.Cmd] = new CmdCostExtractor(),
         [AgentKind.Crush] = new CrushCostExtractor(),
+        [AgentKind.Devin] = new DevinCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -4430,6 +4518,7 @@ builder.Services.AddSingleton<IAgentStreamParser, ClaudeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CopilotStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, DevinStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, PiStreamParser>();
@@ -4513,6 +4602,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
     return new CursorQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Devin detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:devin, mirroring the cursor hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Devin.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new DevinQuotaFailureDetector(extras);
+});
 builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
 {
     // Pi detector accepts operator-extensible patterns from

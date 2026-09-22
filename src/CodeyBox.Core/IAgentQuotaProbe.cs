@@ -112,7 +112,15 @@ public interface IAgentQuotaRecoveryStateInvalidator
 }
 
 /// <summary>OAuth/subscription credentials used by quota probes.</summary>
-public sealed record AgentQuotaCredentials(string? AccessToken, string? AccountId = null);
+/// <param name="EndpointBaseUrl">
+/// Provider-assigned API base URL when the account's endpoints are not fixed
+/// (e.g. devin's login-assigned <c>api_server_url</c>). Null for providers
+/// whose quota endpoint is a compile-time constant.
+/// </param>
+public sealed record AgentQuotaCredentials(
+    string? AccessToken,
+    string? AccountId = null,
+    string? EndpointBaseUrl = null);
 
 /// <summary>
 /// Why a quota snapshot carries no real availability reading. The

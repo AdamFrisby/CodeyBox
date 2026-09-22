@@ -104,6 +104,25 @@ public static class CredentialFileTokenExtractor
     }
 
     /// <summary>
+    /// Reads the <c>api_key</c> and <c>api_server_url</c> out of a Devin CLI
+    /// <c>credentials.toml</c> payload (flat TOML written by
+    /// <c>devin auth login</c>). The endpoint is login-assigned per account —
+    /// the public <c>api.devin.ai</c> host does not serve the quota RPC — so
+    /// the quota probe needs both fields, not just the key. Returns nulls on
+    /// missing fields.
+    /// </summary>
+    public static (string? ApiKey, string? ApiServerUrl) ExtractDevinCredentials(string? rawContents)
+    {
+        if (string.IsNullOrWhiteSpace(rawContents))
+            return (null, null);
+        return (
+            // api_key or windsurf_api_key — current `devin auth login` writes
+            // only the latter (see DevinCredentialsToml.TryGetToken).
+            CodeyBox.Agents.DevinCredentialsToml.TryGetToken(rawContents),
+            CodeyBox.Agents.DevinCredentialsToml.TryGetString(rawContents, "api_server_url"));
+    }
+
+    /// <summary>
     /// Extracts an Anthropic API key from a CrockCode <c>config.json</c>
     /// payload of shape <c>{ "anthropic_api_key": "sk-…", "tunnel_provider": "…" }</c>.
     /// Tolerant of leading/trailing whitespace and the camelCase /

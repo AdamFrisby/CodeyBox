@@ -15,6 +15,7 @@ tooling, not in the agent runner contract.
 | `codex`     | `codex`           | `OPENAI_API_KEY`        | `CODEYBOX_CODEX_API_KEY`  |
 | `gemini`    | `gemini`          | `GEMINI_API_KEY`        | `CODEYBOX_GEMINI_API_KEY` |
 | `cursor`    | `agent`           | `CODEYBOX_CURSOR_AUTH_JSON` (subscription credentials JSON) | `CODEYBOX_CURSOR_AUTH_FILE` (file path on host) |
+| `devin`     | `devin`           | `CODEYBOX_DEVIN_AUTH_TOML` (credentials.toml contents, materialised to `~/.local/share/devin/credentials.toml`) | `CODEYBOX_DEVIN_AUTH_FILE` (file path on host) |
 | `opencode`  | `opencode`        | `OPENCODE_AUTH_JSON`, written to `~/.local/share/opencode/auth.json` | `CODEYBOX_OPENCODE_AUTH_FILE` |
 | `antigravity` | `agy`           | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` (OAuth bundle, written to `~/.gemini/antigravity-cli/antigravity-oauth-token`) | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` |
 | `crock`     | `crock`           | `CROCK_CONFIG_JSON` (file-materialised to `~/.crockcode/config.json`) | `CODEYBOX_CROCK_CONFIG_JSON` |
@@ -35,7 +36,7 @@ tooling, not in the agent runner contract.
 
 The sandbox-side env name is what the agent CLI reads. The host-side name is
 what the orchestrator looks up when building the credential bundle — for most
-agents through `EnvironmentCredentialProvider`, and for Claude, Cursor,
+agents through `EnvironmentCredentialProvider`, and for Claude, Cursor, Devin,
 Antigravity, opencode, and Crock through a dedicated provider that materialises
 a credential *file* inside the sandbox. Quota probes resolve their own tokens
 separately: Antigravity's, for instance, falls back to the Gemini OAuth file and
@@ -61,6 +62,7 @@ the most common cause of fresh-class dispatch failures.
 | `codex`   | `npm install -g @openai/codex` | Reuses the Node.js stack from Claude. |
 | `gemini`  | `npm install -g @google/gemini-cli` | `ReasoningMode` is **not** wired into argv — Gemini's reasoning level is encoded in `ModelId` (pick a `gemini-3-*-preview` model for HIGH). See [Gemini quirks](../reference/agent-quirks.md#google-gemini-cli-googlegemini-cli). |
 | `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). See [Cursor quirks](../reference/agent-quirks.md#cursor-cli-agent). |
+| `devin`   | `curl -fsSL https://cli.devin.ai/install.sh \| bash` | Installs the `devin` binary at `~/.local/bin/devin`. Plaintext stdout only — no structured stream. See [Devin quirks](../reference/agent-quirks.md#devin-cli-devin). |
 | `opencode` | `curl -fsSL https://opencode.ai/install \| bash` | Plaintext stdout only — no structured stream. |
 | `caveman` | `npm install -g @juliusbrussee/caveman-code` | Invoked as `caveman-code` (the unambiguous alias — the successor `caveman wrap` package ships a colliding `caveman` binary). Needs Node.js 20+ on the image. Plaintext stdout only — no structured stream. |
 | `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it via `CodeyBox:MultipassExecutableProvisions` or `CodeyBox:Incus:ExecutableProvisions`, matching the selected provider* (see [Antigravity quirks](../reference/agent-quirks.md#google-antigravity-cli-agy)). Do not use `curl -fsSL https://antigravity.google/cli/install.sh \| bash`: that URL serves the landing page, not a script, and piping HTML into `bash` fails silently when the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
@@ -196,6 +198,7 @@ credentials before they waste expensive compute.
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent` | `x-goog-api-key: <api-key>` |
 | `copilot` | *(no probe)* — always passes | — |
 | `cursor` | *(no HTTP probe — Cursor exposes no public usage endpoint)* — verifies the credential bundle carries `CODEYBOX_CURSOR_AUTH_JSON`; real auth check happens on first CLI call | — |
+| `devin` | `POST {api_server_url}/exa.seat_management_pb.SeatManagementService/GetUserStatus` — the API host is login-assigned and read from `api_server_url` in the credentials TOML (`api.devin.ai` does NOT serve this RPC) | `Authorization: Bearer <api_key>` |
 | `opencode` | *(no network call)* — credential-presence check only | `OPENCODE_AUTH_JSON` |
 | `pi` | *(no network call — pi fronts 30+ providers, so no single endpoint validates the credential)* — verifies the bundle carries `ANTHROPIC_API_KEY`; real auth check happens on first CLI call | `ANTHROPIC_API_KEY` |
 | `aider` | *(no network call — aider fronts many providers through litellm, so no single endpoint validates the credential)* — verifies the bundle carries `OPENROUTER_API_KEY`; real auth check happens on first CLI call | `OPENROUTER_API_KEY` |
