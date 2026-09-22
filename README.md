@@ -19,37 +19,59 @@ point is to be able to leave it running — see
 > Built in C#/.NET 10. Managed repos can be any stack — Python, Node, Go, Rust,
 > C#, or your own — through config-driven auditors.
 
-![The CodeyBox fleet map — every chain on one canvas, zoomed to the item that needs a decision](screenshots/map-01-fleet.png)
+![A feature as a dependency graph — seven items, each waiting on the one before it, with the machine's execution order derived from the edges](screenshots/map-01-chain.png)
 
 ## The admin
 
 CodeyBox ships its own web admin on the host. It is two views of one fleet.
 
-**Map view** is the default. Every chain is on one canvas against a time axis:
-landed work to the left, what is running now in the middle, and the queue
-forecast to the right. Zoom is semantic — chains at a distance, cards close up,
-and an item's full stage pipeline (work, audit as a decision gate, the rework
-loop) when you zoom into it. Dead time is compressed rather than scrolled
-through, so months of history stay on one screen.
+**Map view** is the default, and the picture above is what it is for. You file
+a feature as a chain of small items with explicit dependencies; the map draws
+the graph, and the orchestrator derives the execution order from it. Every
+edge names the item it waits on by title rather than by id, and the `(+)`
+beside a card files a new item that queues behind it.
+
+Everything is placed against a time axis: landed work to the left, what is
+running now in the middle, the queue forecast to the right. Zoom is semantic —
+chains at a distance, cards close up, an item's full stage pipeline when you
+zoom into it. Idle time is compressed rather than scrolled through, so months
+of history stay on one screen, and positions are anchored to the work rather
+than to the clock, so nothing drifts under the cursor while you read it.
 
 <table>
 <tr>
-<td width="50%"><img src="screenshots/map-02-whole-board.png" alt="The whole board"><br><sub><b>The whole board</b> — four hundred chains and five hundred landed items against a warped time axis, so idle gaps cost pixels instead of scrolling. Zoom out to orient, zoom in on what you found.</sub></td>
+<td width="50%"><img src="screenshots/map-02-fleet.png" alt="The fleet and its forecast"><br><sub><b>The whole fleet</b> — chains with their counts, the fan-out of everything waiting on one item, and the predicted dispatch batches to the right of <code>now</code>. Four hundred chains and five hundred landed items on one canvas.</sub></td>
 <td width="50%"><img src="screenshots/admin-01-queue.png" alt="Queue view"><br><sub><b>Queue view</b> — the same fleet as a list when you want one: filter by state, reorder dispatch, and act on a row without leaving it.</sub></td>
 </tr>
 </table>
 
-What needs a decision comes to you rather than waiting to be found: an
-attention rail pins parked and failed items to the side of the canvas, each
-with the actions that actually apply to it — answer the agent's question,
-retry from work, retry from audit, delegate a repair turn. Suggestions raised
-by agents appear as ghost cards beside the item that produced them, and
-promote to real work items in one click.
+### The audit gate is the point
+
+Every item goes `plan → work → audit → merge → landed`, and audit is a gate,
+not a step: its fail path returns the item to work. That loop is drawn rather
+than described, and an item's record keeps the whole history — how many times
+it worked, how many times audit sent it back, every finding and which auditor
+raised it.
 
 <table>
 <tr>
-<td width="50%"><img src="screenshots/map-03-dependencies.png" alt="A chain and its dependencies"><br><sub><b>A chain, and what waits on what</b> — a seven-item feature forking after its second step. Every edge says which item it waits on, by title rather than by id, and a <code>(+)</code> beside a card files a new item that waits on it.</sub></td>
-<td width="50%"><img src="screenshots/map-04-stages.png" alt="One item's stage pipeline"><br><sub><b>Zoom into an item</b> and you get its stage pipeline — work, audit as a decision gate that sends failures back rather than a box to pass through, then merge and landed.</sub></td>
+<td width="50%"><img src="screenshots/map-03-audit.png" alt="One item's full record"><br><sub><b>What it took to land</b> — seven work attempts, five audits, one rejection that sent it back, and twenty-three findings across the auditor panel, each named, timed and quoted against the file it came from.</sub></td>
+<td width="50%"><img src="screenshots/map-04-rework.png" alt="An item going round the loop"><br><sub><b>The loop, live</b> — a running item on its third attempt with a passed audit, and the returns that got it there labelled on the arcs: operator retries and interruptions, stated in plain language underneath.</sub></td>
+</tr>
+</table>
+
+### It comes to you
+
+What needs a decision is pinned to the side of the canvas rather than waiting
+to be found, with the actions that actually apply — answer the agent's
+question, retry from work, retry from audit, delegate a repair turn.
+Suggestions raised by agents while they work appear as ghost cards beside the
+item that produced them, and promote to real work items in one click.
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/map-05-attention.png" alt="The attention rail"><br><sub><b>Landed, failed, running</b> — three states of one chain side by side, with the failure tethered to its entry in the rail and offering the three things you can do about it.</sub></td>
+<td width="50%"><img src="screenshots/map-06-suggestions.png" alt="A suggestion raised by an agent"><br><sub><b>Suggestions</b> — an agent noticed the work-item prompts point at a directory that does not exist, and proposed the fix. Promote it and it becomes a work item; dismiss it and it goes away.</sub></td>
 </tr>
 </table>
 
