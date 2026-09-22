@@ -59,6 +59,7 @@
     <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.PlaneWorkSyncPlugin\CodeyBox.PlaneWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.ShortcutWorkSyncPlugin\CodeyBox.ShortcutWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.InfisicalPlugin\CodeyBox.InfisicalPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\credentials\CodeyBox.DopplerPlugin\CodeyBox.DopplerPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.AzureDevOpsUpstreamPlugin\CodeyBox.AzureDevOpsUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.GiteaUpstreamPlugin\CodeyBox.GiteaUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.SlackPlugin\CodeyBox.SlackPlugin.csproj" />
