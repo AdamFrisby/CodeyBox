@@ -66,6 +66,7 @@
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.GiteaUpstreamPlugin\CodeyBox.GiteaUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.ForgejoUpstreamPlugin\CodeyBox.ForgejoUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.SlackPlugin\CodeyBox.SlackPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\notifications\CodeyBox.GotifyPlugin\CodeyBox.GotifyPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--
       Build dependency only: ensures CodeyBox.PluginSdk.SampleTests is compiled
