@@ -38,8 +38,8 @@ internal static class InteractionEndpoints
 
     public static void Map(WebApplication app)
     {
-        app.MapPost("/webhooks/interactions/{provider}", HandleInteractionAsync);
-        app.MapGet("/webhooks/interactions/capabilities", GetCapabilitiesAsync);
+        app.MapPost(InteractionContract.RoutePrefix + "/{provider}", HandleInteractionAsync);
+        app.MapGet(InteractionContract.RoutePrefix + "/capabilities", GetCapabilitiesAsync);
     }
 
     private static async Task<IResult> GetCapabilitiesAsync(
@@ -340,8 +340,8 @@ internal static class InteractionEndpoints
             return "questionId must be 1-64 alphanumeric/hyphen/underscore characters";
         if (string.IsNullOrWhiteSpace(payload.Answer))
             return "answer is required";
-        if (payload.Answer.Length > 4000)
-            return "answer must be <= 4000 chars";
+        if (payload.Answer.Length > InteractionContract.MaxAnswerChars)
+            return $"answer must be <= {InteractionContract.MaxAnswerChars} chars";
         if (payload.User is null || string.IsNullOrWhiteSpace(payload.User.UserId) || payload.User.UserId.Length > 256)
             return "user.userId is required (max 256 chars)";
         if (payload.User.Login is not null && payload.User.Login.Length > 256)
