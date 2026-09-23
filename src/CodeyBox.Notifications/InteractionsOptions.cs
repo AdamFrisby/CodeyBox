@@ -34,7 +34,10 @@ public sealed class InteractionProviderOptions
     /// Matched exactly (case-insensitive); unknown names are refused.</summary>
     public string Provider { get; set; } = string.Empty;
 
-    /// <summary>Verification scheme: "hmac-sha256" (generic) or "slack-v0".</summary>
+    /// <summary>Verification scheme: "hmac-sha256" (generic), "slack-v0"
+    /// (Slack platform signatures), or "ntfy-hmac" (publish-time MAC over the
+    /// exact callback body — ntfy clients invoke the URL themselves, so there
+    /// is no platform signature or sender timestamp).</summary>
     public string Scheme { get; set; } = "hmac-sha256";
 
     /// <summary>Environment variable holding the provider signing secret.

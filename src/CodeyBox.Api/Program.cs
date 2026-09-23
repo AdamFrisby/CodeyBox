@@ -3940,6 +3940,14 @@ builder.Services.AddSingleton<IInteractionVerifier>(sp =>
             string.Equals(p.Provider, name, StringComparison.OrdinalIgnoreCase));
     return new SlackInteractionVerifier("slack", () => Opts("slack"));
 });
+builder.Services.AddSingleton<IInteractionVerifier>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
+    InteractionProviderOptions? Opts(string name) =>
+        monitor.CurrentValue.Providers.FirstOrDefault(p =>
+            string.Equals(p.Provider, name, StringComparison.OrdinalIgnoreCase));
+    return new NtfyInteractionVerifier("ntfy", () => Opts("ntfy"));
+});
 
 // --- Changelog automation ----------------------------------------------------
 // Named HTTP client for direct Anthropic Messages API calls (changelog generation).
