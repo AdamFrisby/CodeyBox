@@ -260,7 +260,11 @@ public sealed class BitwardenPluginTests : IDisposable
         public bool IsEnabled(LogLevel logLevel) => true;
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
         {
-            lock (Messages) Messages.Add(formatter(state, exception));
+            // A real logger renders the exception argument too — capture it
+            // so a secret smuggled in a logged exception still trips the
+            // no-secret-in-logs assertions.
+            lock (Messages)
+                Messages.Add(formatter(state, exception) + (exception is null ? string.Empty : " " + exception));
         }
 
         private sealed class NullScope : IDisposable
@@ -553,7 +557,7 @@ public sealed class BitwardenPluginTests : IDisposable
         var readsBefore = _handler.CountReadsOf(SecretId);
         var authBefore = _handler.AuthCalls;
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.RenewAsync(lease.LeaseId));
-        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.Equal(readsBefore, _handler.CountReadsOf(SecretId));
         Assert.Equal(authBefore, _handler.AuthCalls);
 
@@ -731,11 +735,11 @@ public sealed class BitwardenPluginTests : IDisposable
     }
 
     [Theory]
-    [InlineData(401, BitwardenFailureKind.Unauthorized)]
-    [InlineData(403, BitwardenFailureKind.Unauthorized)]
-    [InlineData(429, BitwardenFailureKind.RateLimited)]
-    [InlineData(500, BitwardenFailureKind.BackendError)]
-    public async Task Backend_Faults_Classify_As_Infrastructure(int status, BitwardenFailureKind kind)
+    [InlineData(401, CredentialFailureKind.Unauthorized)]
+    [InlineData(403, CredentialFailureKind.Unauthorized)]
+    [InlineData(429, CredentialFailureKind.RateLimited)]
+    [InlineData(500, CredentialFailureKind.BackendError)]
+    public async Task Backend_Faults_Classify_As_Infrastructure(int status, CredentialFailureKind kind)
     {
         _handler.TokenJson = Fixture("token.json");
         _handler.SecretJson = Fixture("secret.json");
@@ -770,7 +774,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.BackendError, ex.Kind);
+        Assert.Equal(CredentialFailureKind.BackendError, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, ex.FailureKindForWorkItem);
     }
@@ -784,7 +788,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.Unauthorized, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unauthorized, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, ex.FailureKindForWorkItem);
         Assert.DoesNotContain(ClientSecret, ex.Message);
@@ -805,7 +809,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.BackendError, ex.Kind);
+        Assert.Equal(CredentialFailureKind.BackendError, ex.Kind);
         Assert.DoesNotContain(ClientSecret, ex.Message);
         Assert.Contains("server_error", ex.Message, StringComparison.Ordinal);
 
@@ -831,7 +835,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.Unauthorized, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unauthorized, ex.Kind);
         Assert.Contains("invalid_client", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(ClientSecret, ex.Message);
     }
@@ -893,7 +897,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.NotFound, ex.Kind);
+        Assert.Equal(CredentialFailureKind.NotFound, ex.Kind);
         Assert.False(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Configuration, ex.FailureKindForWorkItem);
 
@@ -914,7 +918,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.Unreachable, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unreachable, ex.Kind);
         Assert.True(ex.IsInfrastructure);
 
         var store = new MemorySecretLeaseStore();
@@ -935,7 +939,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.False(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Configuration, ex.FailureKindForWorkItem);
         Assert.Equal(0, _handler.AuthCalls);
@@ -958,7 +962,7 @@ public sealed class BitwardenPluginTests : IDisposable
         // A backend 3xx is never followed: it fails closed as a backend
         // fault (infrastructure, never a diff verdict) — the bearer token
         // goes nowhere else.
-        Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Contains("redirect", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -995,7 +999,7 @@ public sealed class BitwardenPluginTests : IDisposable
         var ambiguous = CreateProvider(KeyMapping("PAID_API_TOKEN", "PAID_API_TOKEN"));
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => ambiguous.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.False(ex.IsInfrastructure);
 
         // Case-insensitive near-misses never resolve either.
@@ -1003,7 +1007,7 @@ public sealed class BitwardenPluginTests : IDisposable
         var wrongCase = CreateProvider(KeyMapping("PAID_API_TOKEN", "paid_api_token"));
         var missing = await Assert.ThrowsAsync<BitwardenException>(() => wrongCase.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.NotFound, missing.Kind);
+        Assert.Equal(CredentialFailureKind.NotFound, missing.Kind);
     }
 
     [Fact]
@@ -1017,7 +1021,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.DoesNotContain("wrong-project-value", ex.Message);
     }
 
@@ -1034,7 +1038,7 @@ public sealed class BitwardenPluginTests : IDisposable
         // a configured project expectation: fail closed, never serve.
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.DoesNotContain("projectless-value", ex.Message);
     }
 
@@ -1113,7 +1117,7 @@ public sealed class BitwardenPluginTests : IDisposable
         // failure, so refuse loudly (infrastructure — never a diff verdict).
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.DoesNotContain(DirectCipher, ex.Message);
         Assert.DoesNotContain(StaticValue, ex.Message);
@@ -1127,7 +1131,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.DoesNotContain(DirectCipher, ex.Message);
     }
@@ -1142,7 +1146,7 @@ public sealed class BitwardenPluginTests : IDisposable
         // never serve, never echo the envelope.
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.InvalidResponse, ex.Kind);
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.DoesNotContain(TamperedCipher, ex.Message);
     }
 
@@ -1227,7 +1231,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(BitwardenFailureKind.NotFound, ex.Kind);
+        Assert.Equal(CredentialFailureKind.NotFound, ex.Kind);
         Assert.Empty(_handler.ReadSecretIds);
     }
 
@@ -1241,7 +1245,7 @@ public sealed class BitwardenPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<BitwardenException>(() =>
             api.GetSecretAsync("https://bitwarden.example.com", bearer, evil, null, 256 * 1024));
-        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.DoesNotContain("red", ex.Message);
         Assert.Empty(_handler.ReadSecretIds);
     }
@@ -1253,7 +1257,7 @@ public sealed class BitwardenPluginTests : IDisposable
         var provider = CreateProvider(IdMapping("PAID_API_TOKEN"));
         var ex = await Assert.ThrowsAsync<BitwardenException>(
             () => provider.RenewAsync("doppler.s.PAID_API_TOKEN.abc123"));
-        Assert.Equal(BitwardenFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         await Assert.ThrowsAsync<BitwardenException>(() => provider.RevokeAsync("not-a-lease"));
     }
 

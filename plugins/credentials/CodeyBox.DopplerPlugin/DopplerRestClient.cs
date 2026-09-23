@@ -1,4 +1,3 @@
-using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -26,8 +25,7 @@ public sealed record DopplerIdentityToken(string Token, DateTimeOffset ExpiresAt
 /// </summary>
 public sealed class DopplerRestClient
 {
-    private readonly HttpClient _http;
-    private readonly TimeProvider _clock;
+    private readonly CredentialTransport _transport;
     private readonly ILogger _log;
 
     /// <summary>JSON error-body fields relayed as detail, in preference order.</summary>
@@ -35,8 +33,13 @@ public sealed class DopplerRestClient
 
     public DopplerRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
-        _clock = clock ?? TimeProvider.System;
+        _transport = new CredentialTransport(
+            http ?? throw new ArgumentNullException(nameof(http)),
+            "Doppler",
+            DopplerException.Create,
+            ErrorDetailFields,
+            relayRawErrorText: true,
+            clock: clock);
         _log = log ?? NullLogger.Instance;
     }
 
@@ -65,18 +68,18 @@ public sealed class DopplerRestClient
         url.Append("&name=").Append(Uri.EscapeDataString(secretName));
         using var request = new HttpRequestMessage(HttpMethod.Get, url.ToString());
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var response = await SendAsync(request, $"fetch secret '{secretName}'", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, $"fetch secret '{secretName}'", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, $"fetch secret '{secretName}'", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, $"fetch secret '{secretName}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
             if (!root.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Object)
                 throw new DopplerException(
-                    DopplerFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Doppler fetch of secret '{secretName}' returned no value object.");
             if (!CredentialJson.TryGetString(value, "computed", out var computed) || computed is null)
                 throw new DopplerException(
-                    DopplerFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Doppler fetch of secret '{secretName}' returned no computed value.");
             _log.LogDebug(
                 "Doppler fetched secret '{Name}' from project '{Project}' config '{Config}'.",
@@ -109,18 +112,18 @@ public sealed class DopplerRestClient
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
-        using var response = await SendAsync(request, "OIDC identity exchange", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, "OIDC identity exchange", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, "OIDC identity exchange", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, "OIDC identity exchange", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
             if (!CredentialJson.TryGetString(root, "token", out var token) || string.IsNullOrEmpty(token))
                 throw new DopplerException(
-                    DopplerFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     "Doppler OIDC exchange returned no token.");
             if (!CredentialJson.TryGetDateTime(root, "expires_at", out var expiresAt))
                 throw new DopplerException(
-                    DopplerFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     "Doppler OIDC exchange returned no expires_at.");
             _log.LogDebug("Doppler OIDC exchange succeeded; identity token valid until {ExpiresAt}.", expiresAt);
             return new DopplerIdentityToken(token, expiresAt - skew);
@@ -149,11 +152,11 @@ public sealed class DopplerRestClient
         };
         try
         {
-            using var response = await SendAsync(request, "revoke identity token", ct).ConfigureAwait(false);
+            using var response = await _transport.SendAsync(request, "revoke identity token", ct).ConfigureAwait(false);
             response.Dispose();
             _log.LogInformation("Doppler revoked identity token.");
         }
-        catch (DopplerException ex) when (ex.Kind == DopplerFailureKind.NotFound)
+        catch (DopplerException ex) when (ex.Kind == CredentialFailureKind.NotFound)
         {
             // Unknown or already-revoked token: revocation is complete by
             // definition. The lease id (not the token) is the logged unit.
@@ -161,122 +164,4 @@ public sealed class DopplerRestClient
         }
     }
 
-    private async Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request, string operation, CancellationToken ct)
-    {
-        HttpResponseMessage response;
-        try
-        {
-            response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
-        {
-            throw new DopplerException(
-                DopplerFailureKind.Unreachable, $"Doppler {operation} timed out.", ex);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new DopplerException(
-                DopplerFailureKind.Unreachable, $"Doppler {operation} could not reach the backend.", ex);
-        }
-
-        if (CredentialHttp.IsRedirect(response.StatusCode))
-        {
-            // Never follow: the backend's 3xx (and its Location) is
-            // untrusted runtime output, and re-sending would carry the
-            // bearer token to the redirect target. Fail closed as a backend
-            // fault — never a verdict on the item.
-            var redirect = (int)response.StatusCode;
-            response.Dispose();
-            throw new DopplerException(
-                DopplerFailureKind.InvalidResponse,
-                $"Doppler {operation} returned redirect HTTP {redirect}; refusing to follow.",
-                redirect);
-        }
-
-        if (response.RequestMessage?.RequestUri is { } finalUri
-            && request.RequestUri is { } originalUri
-            && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
-        {
-            // The handler followed a redirect before this code saw the
-            // response (only possible with an externally supplied
-            // following client — the plugin builds non-following ones).
-            // The credential may already have been re-sent off-origin,
-            // so fail loudly rather than trusting this response.
-            var followedStatus = (int)response.StatusCode;
-            response.Dispose();
-            throw new DopplerException(
-                DopplerFailureKind.InvalidResponse,
-                $"Doppler {operation} was redirected to another origin; refusing the response.",
-                followedStatus);
-        }
-
-        if (response.IsSuccessStatusCode)
-            return response;
-
-        var status = (int)response.StatusCode;
-        var detail = await CredentialMessages.ReadServerDetailAsync(
-            response, ErrorDetailFields, relayRawText: true, ct).ConfigureAwait(false);
-        var retryAfter = ParseRetryAfter(response);
-        response.Dispose();
-        throw DopplerException.FromStatus(status, operation, detail, retryAfter);
-    }
-
-    private async Task<JsonDocument> ReadJsonAsync(
-        HttpResponseMessage response, string operation, int maxBytes, CancellationToken ct)
-    {
-        byte[] body;
-        try
-        {
-            body = await ReadBoundedAsync(response, maxBytes, ct).ConfigureAwait(false);
-        }
-        catch (DopplerException)
-        {
-            response.Dispose();
-            throw;
-        }
-        response.Dispose();
-        JsonDocument doc;
-        try
-        {
-            doc = JsonDocument.Parse(body);
-        }
-        catch (JsonException ex)
-        {
-            // The body may contain secret-adjacent text; never echo it.
-            throw new DopplerException(
-                DopplerFailureKind.InvalidResponse,
-                $"Doppler {operation} returned a non-JSON success body.", ex);
-        }
-        if (doc.RootElement.ValueKind != JsonValueKind.Object)
-        {
-            doc.Dispose();
-            throw new DopplerException(
-                DopplerFailureKind.InvalidResponse,
-                $"Doppler {operation} returned an unexpected JSON shape.");
-        }
-        return doc;
-    }
-
-    private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, int maxBytes, CancellationToken ct)
-    {
-        var contentLength = response.Content.Headers.ContentLength;
-        if (contentLength.HasValue && contentLength.Value > maxBytes)
-            throw new DopplerException(
-                DopplerFailureKind.InvalidResponse,
-                $"Doppler response declares {contentLength.Value} bytes, above the {maxBytes}-byte cap.");
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        // Cap BEFORE buffering: a lying or missing content-length can never
-        // fill host memory. The shared copy stops past the cap; over-cap
-        // stays a typed backend failure.
-        var (bytes, truncated) = await CredentialBodies.CopyCappedAsync(stream, maxBytes, ct).ConfigureAwait(false);
-        if (truncated)
-            throw new DopplerException(
-                DopplerFailureKind.InvalidResponse,
-                $"Doppler response exceeds the {maxBytes}-byte cap.");
-        return bytes;
-    }
-
-    private int? ParseRetryAfter(HttpResponseMessage response)
-        => CredentialRetryAfter.Parse(response, _clock);
 }

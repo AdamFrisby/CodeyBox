@@ -21,8 +21,7 @@ namespace CodeyBox.OnePasswordPlugin;
 /// </summary>
 public sealed class OnePasswordRestClient
 {
-    private readonly HttpClient _http;
-    private readonly TimeProvider _clock;
+    private readonly CredentialTransport _transport;
     private readonly ILogger _log;
 
     /// <summary>JSON error-body fields relayed as detail, in preference order.</summary>
@@ -30,8 +29,13 @@ public sealed class OnePasswordRestClient
 
     public OnePasswordRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
-        _clock = clock ?? TimeProvider.System;
+        _transport = new CredentialTransport(
+            http ?? throw new ArgumentNullException(nameof(http)),
+            "1Password",
+            OnePasswordException.Create,
+            ErrorDetailFields,
+            relayRawErrorText: true,
+            clock: clock);
         _log = log ?? NullLogger.Instance;
     }
 
@@ -63,14 +67,14 @@ public sealed class OnePasswordRestClient
         var url = $"{serverUrl.TrimEnd('/')}/v1/vaults/{Uri.EscapeDataString(vaultId)}/items/{Uri.EscapeDataString(itemId)}";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var response = await SendAsync(request, $"read item '{itemId}'", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, $"read item '{itemId}'", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, $"read item '{itemId}'", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, $"read item '{itemId}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
             if (!root.TryGetProperty("fields", out var fields) || fields.ValueKind != JsonValueKind.Array)
                 throw new OnePasswordException(
-                    OnePasswordFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"1Password item '{itemId}' returned no fields array.");
             foreach (var candidate in fields.EnumerateArray())
             {
@@ -84,7 +88,7 @@ public sealed class OnePasswordRestClient
                 var value = CredentialJson.GetString(candidate, "value");
                 if (value is null)
                     throw new OnePasswordException(
-                        OnePasswordFailureKind.InvalidResponse,
+                        CredentialFailureKind.InvalidResponse,
                         $"1Password item '{itemId}' field '{field}' has no value.");
                 _log.LogDebug(
                     "1Password read field '{Field}' from item '{Item}' in vault '{Vault}'.",
@@ -92,7 +96,7 @@ public sealed class OnePasswordRestClient
                 return value;
             }
             throw new OnePasswordException(
-                OnePasswordFailureKind.NotFound,
+                CredentialFailureKind.NotFound,
                 $"1Password item '{itemId}' has no field '{field}'.");
         }
     }
@@ -116,13 +120,13 @@ public sealed class OnePasswordRestClient
         var url = $"{serverUrl.TrimEnd('/')}/v1/vaults";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var response = await SendAsync(request, "list vaults", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, "list vaults", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, "list vaults", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, "list vaults", maxResponseBytes, ct, allowArrayRoot: true).ConfigureAwait(false);
         using (doc)
         {
             if (doc.RootElement.ValueKind != JsonValueKind.Array)
                 throw new OnePasswordException(
-                    OnePasswordFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     "1Password vault listing returned an unexpected JSON shape.");
             string? match = null;
             foreach (var vault in doc.RootElement.EnumerateArray())
@@ -136,13 +140,13 @@ public sealed class OnePasswordRestClient
                     continue;
                 if (match is not null)
                     throw new OnePasswordException(
-                        OnePasswordFailureKind.Misconfigured,
+                        CredentialFailureKind.Misconfigured,
                         $"1Password vault name '{vaultName}' is ambiguous; use VaultId instead.");
                 match = id;
             }
             if (match is null)
                 throw new OnePasswordException(
-                    OnePasswordFailureKind.NotFound,
+                    CredentialFailureKind.NotFound,
                     $"1Password vault '{vaultName}' was not found.");
             return match;
         }
@@ -168,13 +172,13 @@ public sealed class OnePasswordRestClient
         var url = $"{serverUrl.TrimEnd('/')}/v1/vaults/{Uri.EscapeDataString(vaultId)}/items";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var response = await SendAsync(request, "list items", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, "list items", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, "list items", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, "list items", maxResponseBytes, ct, allowArrayRoot: true).ConfigureAwait(false);
         using (doc)
         {
             if (doc.RootElement.ValueKind != JsonValueKind.Array)
                 throw new OnePasswordException(
-                    OnePasswordFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     "1Password item listing returned an unexpected JSON shape.");
             string? match = null;
             foreach (var item in doc.RootElement.EnumerateArray())
@@ -188,134 +192,16 @@ public sealed class OnePasswordRestClient
                     continue;
                 if (match is not null)
                     throw new OnePasswordException(
-                        OnePasswordFailureKind.Misconfigured,
+                        CredentialFailureKind.Misconfigured,
                         $"1Password item title '{itemTitle}' is ambiguous in vault '{vaultId}'; use ItemId instead.");
                 match = id;
             }
             if (match is null)
                 throw new OnePasswordException(
-                    OnePasswordFailureKind.NotFound,
+                    CredentialFailureKind.NotFound,
                     $"1Password item '{itemTitle}' was not found in vault '{vaultId}'.");
             return match;
         }
     }
 
-    private async Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request, string operation, CancellationToken ct)
-    {
-        HttpResponseMessage response;
-        try
-        {
-            response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
-        {
-            throw new OnePasswordException(
-                OnePasswordFailureKind.Unreachable, $"1Password {operation} timed out.", ex);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new OnePasswordException(
-                OnePasswordFailureKind.Unreachable, $"1Password {operation} could not reach the backend.", ex);
-        }
-
-        if (CredentialHttp.IsRedirect(response.StatusCode))
-        {
-            // Never follow: the backend's 3xx (and its Location) is
-            // untrusted runtime output, and re-sending would carry the
-            // bearer token to the redirect target. Fail closed as a backend
-            // fault — never a verdict on the item.
-            var redirect = (int)response.StatusCode;
-            response.Dispose();
-            throw new OnePasswordException(
-                OnePasswordFailureKind.InvalidResponse,
-                $"1Password {operation} returned redirect HTTP {redirect}; refusing to follow.",
-                redirect);
-        }
-
-        if (response.RequestMessage?.RequestUri is { } finalUri
-            && request.RequestUri is { } originalUri
-            && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
-        {
-            // The handler followed a redirect before this code saw the
-            // response (only possible with an externally supplied
-            // following client — the plugin builds non-following ones).
-            // The credential may already have been re-sent off-origin,
-            // so fail loudly rather than trusting this response.
-            var followedStatus = (int)response.StatusCode;
-            response.Dispose();
-            throw new OnePasswordException(
-                OnePasswordFailureKind.InvalidResponse,
-                $"1Password {operation} was redirected to another origin; refusing the response.",
-                followedStatus);
-        }
-
-        if (response.IsSuccessStatusCode)
-            return response;
-
-        var status = (int)response.StatusCode;
-        var detail = await CredentialMessages.ReadServerDetailAsync(
-            response, ErrorDetailFields, relayRawText: true, ct).ConfigureAwait(false);
-        var retryAfter = ParseRetryAfter(response);
-        response.Dispose();
-        throw OnePasswordException.FromStatus(status, operation, detail, retryAfter);
-    }
-
-    private async Task<JsonDocument> ReadJsonAsync(
-        HttpResponseMessage response, string operation, int maxBytes, CancellationToken ct)
-    {
-        byte[] body;
-        try
-        {
-            body = await ReadBoundedAsync(response, maxBytes, ct).ConfigureAwait(false);
-        }
-        catch (OnePasswordException)
-        {
-            response.Dispose();
-            throw;
-        }
-        response.Dispose();
-        JsonDocument doc;
-        try
-        {
-            doc = JsonDocument.Parse(body);
-        }
-        catch (JsonException ex)
-        {
-            // The body may contain secret-adjacent text; never echo it.
-            throw new OnePasswordException(
-                OnePasswordFailureKind.InvalidResponse,
-                $"1Password {operation} returned a non-JSON success body.", ex);
-        }
-        if (doc.RootElement.ValueKind is not (JsonValueKind.Object or JsonValueKind.Array))
-        {
-            doc.Dispose();
-            throw new OnePasswordException(
-                OnePasswordFailureKind.InvalidResponse,
-                $"1Password {operation} returned an unexpected JSON shape.");
-        }
-        return doc;
-    }
-
-    private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, int maxBytes, CancellationToken ct)
-    {
-        var contentLength = response.Content.Headers.ContentLength;
-        if (contentLength.HasValue && contentLength.Value > maxBytes)
-            throw new OnePasswordException(
-                OnePasswordFailureKind.InvalidResponse,
-                $"1Password response declares {contentLength.Value} bytes, above the {maxBytes}-byte cap.");
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        // Cap BEFORE buffering: a lying or missing content-length can never
-        // fill host memory. The shared copy stops past the cap; over-cap
-        // stays a typed backend failure.
-        var (bytes, truncated) = await CredentialBodies.CopyCappedAsync(stream, maxBytes, ct).ConfigureAwait(false);
-        if (truncated)
-            throw new OnePasswordException(
-                OnePasswordFailureKind.InvalidResponse,
-                $"1Password response exceeds the {maxBytes}-byte cap.");
-        return bytes;
-    }
-
-    private int? ParseRetryAfter(HttpResponseMessage response)
-        => CredentialRetryAfter.Parse(response, _clock);
 }

@@ -154,7 +154,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         var options = RequireUsableOptions();
         var mapping = FindMapping(options, secret)
             ?? throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical has no mapping for sandbox variable '{secret.SandboxEnvVar}'; the operator never put this secret against this backend.");
         EnsureClients();
 
@@ -168,7 +168,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
                 mapping.SecretKey, mapping.SecretPath, options.MaxResponseBytes, ct).ConfigureAwait(false);
             if (string.IsNullOrEmpty(fetched.Value))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical secret '{mapping.SecretKey}' returned an empty value.");
             var window = StaticWindow(options, requestedTtl);
             var expiresAt = _clock.GetUtcNow() + window;
@@ -196,11 +196,11 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         {
             if (!options.BrokerEnabled)
                 throw new InfisicalException(
-                    InfisicalFailureKind.Misconfigured,
+                    CredentialFailureKind.Misconfigured,
                     $"Infisical mapping for '{mapping.SandboxEnvVar}' is brokered but BrokerEnabled is false; refusing a silent downgrade to direct issue.");
             if (string.IsNullOrEmpty(material.Value))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical brokered issue for '{mapping.SandboxEnvVar}' produced no value to hold proxy-side.");
             var endpoint = EnsureBroker(options, mapping, material.LeaseId, material.Value, material.ExpiresAt);
             material = material with { Value = null, Brokered = true, Endpoint = endpoint };
@@ -338,7 +338,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
             options.MaxResponseBytes, ct).ConfigureAwait(false);
         if (!created.Data.TryGetValue(mapping.DataField, out var value) || string.IsNullOrEmpty(value))
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical dynamic lease for '{mapping.DynamicSecretName}' has no field '{mapping.DataField}'; check DataField against the dynamic-secret type.");
         var leaseId = InfisicalLeaseIds.BuildDynamic(mapping.SandboxEnvVar, created.LeaseId, mapping.Brokered);
         var material = new LeasedSecretMaterial
@@ -405,7 +405,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
                 // unbindable interface) — loud, and the secret is skipped
                 // rather than downgraded to a direct lease.
                 throw new InfisicalException(
-                    InfisicalFailureKind.Misconfigured,
+                    CredentialFailureKind.Misconfigured,
                     $"Infisical broker could not bind {options.BrokerBindHost}:{options.BrokerBindPort}.",
                     ex);
             }
@@ -479,7 +479,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         else
         {
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical provider credentials are not set: env '{options.ClientIdEnvVar}'/'{options.ClientSecretEnvVar}' (universal auth) and " +
                 (string.IsNullOrWhiteSpace(options.AccessTokenEnvVar)
                     ? "no access-token variable is configured."
@@ -500,16 +500,16 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         var options = CurrentOptions();
         if (!options.Enabled)
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 "Infisical provider is disabled (Enabled=false); enable it to issue.");
         var errors = options.Validate();
         if (errors.Count > 0)
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical configuration is invalid: {errors[0]}");
         if (string.IsNullOrWhiteSpace(options.WorkspaceId))
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 "Infisical WorkspaceId is required (the Infisical project ID).");
         return options;
     }
@@ -560,7 +560,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         }
         if (mapping is null)
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical lease '{leaseId}' names sandbox variable '{parsed.SandboxEnvVar}' with no current mapping; restore the mapping or revoke server-side.");
         return new IssuedLeaseContext(
             parsed.Kind, mapping,
@@ -572,7 +572,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
     {
         if (!InfisicalLeaseIds.TryParse(leaseId, out var parsed))
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Lease '{leaseId ?? string.Empty}' is not an Infisical lease handle.");
         return parsed;
     }
@@ -585,7 +585,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         if (!string.IsNullOrWhiteSpace(options.ProjectSlug))
             return options.ProjectSlug;
         throw new InfisicalException(
-            InfisicalFailureKind.Misconfigured,
+            CredentialFailureKind.Misconfigured,
             "Infisical ProjectSlug is required for dynamic-secret leases (dynamic-lease endpoints address the project by slug).");
     }
 

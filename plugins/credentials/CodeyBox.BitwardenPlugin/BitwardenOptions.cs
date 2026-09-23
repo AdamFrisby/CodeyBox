@@ -99,6 +99,18 @@ public sealed record BitwardenOptions
     /// <summary>Plugin ID used in <c>CodeyBox:Plugins:&lt;id&gt;</c>.</summary>
     public const string PluginId = "codeybox.bitwarden";
 
+    /// <summary>Smallest accepted <see cref="StaticLeaseTtlMinutes"/>.</summary>
+    public const int MinStaticLeaseTtlMinutes = 1;
+
+    /// <summary>Largest accepted <see cref="StaticLeaseTtlMinutes"/> (one day).</summary>
+    public const int MaxStaticLeaseTtlMinutes = 1440;
+
+    /// <summary>Smallest accepted <see cref="TimeoutSeconds"/>.</summary>
+    public const int MinTimeoutSeconds = 1;
+
+    /// <summary>Largest accepted <see cref="TimeoutSeconds"/>.</summary>
+    public const int MaxTimeoutSeconds = 300;
+
     /// <summary>Master switch. Default false: off unless an operator enables it.</summary>
     public bool Enabled { get; init; }
 
@@ -150,7 +162,8 @@ public sealed record BitwardenOptions
     /// and re-fetches, so rotation propagates within one window; the minted
     /// expiry additionally never exceeds the access token's own server
     /// lifetime. Kept in step with the host
-    /// <c>SecretLeasing:DefaultLeaseTtl</c> default (20 min). Range 1–1440
+    /// <c>SecretLeasing:DefaultLeaseTtl</c> default (20 min). Range
+    /// <see cref="MinStaticLeaseTtlMinutes"/>–<see cref="MaxStaticLeaseTtlMinutes"/>
     /// minutes.
     /// </summary>
     public int StaticLeaseTtlMinutes { get; init; } = 20;
@@ -161,7 +174,11 @@ public sealed record BitwardenOptions
     /// </summary>
     public int TokenRefreshSkewSeconds { get; init; } = 60;
 
-    /// <summary>Per-request timeout, in seconds (1–300, default 30).</summary>
+    /// <summary>
+    /// Per-request timeout, in seconds
+    /// (<see cref="MinTimeoutSeconds"/>–<see cref="MaxTimeoutSeconds"/>,
+    /// default 30).
+    /// </summary>
     public int TimeoutSeconds { get; init; } = 30;
 
     /// <summary>
@@ -198,11 +215,13 @@ public sealed record BitwardenOptions
             ClientSecretEnvVar = ReadNonEmpty(section, "ClientSecretEnvVar", defaults.ClientSecretEnvVar),
             OrganizationId = (section["OrganizationId"] ?? string.Empty).Trim(),
             StaticLeaseTtlMinutes = Math.Clamp(
-                ReadInt(section, "StaticLeaseTtlMinutes", defaults.StaticLeaseTtlMinutes, warnings), 1, 1440),
+                ReadInt(section, "StaticLeaseTtlMinutes", defaults.StaticLeaseTtlMinutes, warnings),
+                MinStaticLeaseTtlMinutes, MaxStaticLeaseTtlMinutes),
             TokenRefreshSkewSeconds = Math.Clamp(
                 ReadInt(section, "TokenRefreshSkewSeconds", defaults.TokenRefreshSkewSeconds, warnings), 0, 3600),
             TimeoutSeconds = Math.Clamp(
-                ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings), 1, 300),
+                ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings),
+                MinTimeoutSeconds, MaxTimeoutSeconds),
             MaxResponseBytes = Math.Max(
                 ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings), 1024),
             Mappings = ReadMappings(section.GetSection("Mappings")),

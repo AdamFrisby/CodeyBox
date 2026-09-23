@@ -613,7 +613,7 @@ public sealed class DopplerPluginTests : IDisposable
             clock.Advance(IdentityExpiry - start + TimeSpan.FromMinutes(1));
             _handler.FailOidcUnauthorized = true;
             var ex = await Assert.ThrowsAsync<DopplerException>(() => provider.RenewAsync(lease.LeaseId));
-            Assert.Equal(DopplerFailureKind.Unauthorized, ex.Kind);
+            Assert.Equal(CredentialFailureKind.Unauthorized, ex.Kind);
             Assert.True(ex.IsInfrastructure);
             Assert.Equal(WorkItemFailureKinds.Infrastructure, ex.FailureKindForWorkItem);
             Assert.Equal(SecretLeaseStatus.Active, (await store.GetAsync(lease.LeaseId))!.Status);
@@ -642,13 +642,13 @@ public sealed class DopplerPluginTests : IDisposable
     }
 
     [Theory]
-    [InlineData(HttpStatusCode.Unauthorized, DopplerFailureKind.Unauthorized)]
-    [InlineData(HttpStatusCode.Forbidden, DopplerFailureKind.Unauthorized)]
-    [InlineData((HttpStatusCode)429, DopplerFailureKind.RateLimited)]
-    [InlineData(HttpStatusCode.BadRequest, DopplerFailureKind.Misconfigured)]
-    [InlineData(HttpStatusCode.InternalServerError, DopplerFailureKind.BackendError)]
+    [InlineData(HttpStatusCode.Unauthorized, CredentialFailureKind.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden, CredentialFailureKind.Unauthorized)]
+    [InlineData((HttpStatusCode)429, CredentialFailureKind.RateLimited)]
+    [InlineData(HttpStatusCode.BadRequest, CredentialFailureKind.Misconfigured)]
+    [InlineData(HttpStatusCode.InternalServerError, CredentialFailureKind.BackendError)]
     public async Task Revoke_Propagates_Non_NotFound_Failures_For_Retry(
-        HttpStatusCode status, DopplerFailureKind kind)
+        HttpStatusCode status, CredentialFailureKind kind)
     {
         // Only a genuinely absent token (404) is success-by-definition.
         // 401/403/429 — and any other non-404 failure — must propagate so
@@ -832,11 +832,11 @@ public sealed class DopplerPluginTests : IDisposable
     }
 
     [Theory]
-    [InlineData(401, DopplerFailureKind.Unauthorized)]
-    [InlineData(403, DopplerFailureKind.Unauthorized)]
-    [InlineData(429, DopplerFailureKind.RateLimited)]
-    [InlineData(500, DopplerFailureKind.BackendError)]
-    public async Task Backend_Faults_Classify_As_Infrastructure(int status, DopplerFailureKind kind)
+    [InlineData(401, CredentialFailureKind.Unauthorized)]
+    [InlineData(403, CredentialFailureKind.Unauthorized)]
+    [InlineData(429, CredentialFailureKind.RateLimited)]
+    [InlineData(500, CredentialFailureKind.BackendError)]
+    public async Task Backend_Faults_Classify_As_Infrastructure(int status, CredentialFailureKind kind)
     {
         _handler.SecretJson = Fixture("secret.json");
         _handler.FailFetchStatus = status;
@@ -870,7 +870,7 @@ public sealed class DopplerPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<DopplerException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(DopplerFailureKind.NotFound, ex.Kind);
+        Assert.Equal(CredentialFailureKind.NotFound, ex.Kind);
         Assert.False(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Configuration, ex.FailureKindForWorkItem);
 
@@ -891,7 +891,7 @@ public sealed class DopplerPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<DopplerException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(DopplerFailureKind.Unreachable, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unreachable, ex.Kind);
         Assert.True(ex.IsInfrastructure);
 
         var store = new MemorySecretLeaseStore();
@@ -912,7 +912,7 @@ public sealed class DopplerPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<DopplerException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(DopplerFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.False(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Configuration, ex.FailureKindForWorkItem);
     }
@@ -936,7 +936,7 @@ public sealed class DopplerPluginTests : IDisposable
         // A backend 3xx is never followed: it fails closed as a backend
         // fault (infrastructure, never a diff verdict), with exactly one
         // request sent — the bearer token goes nowhere else.
-        Assert.Equal(DopplerFailureKind.InvalidResponse, ex.Kind);
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Contains("redirect", ex.Message);
         Assert.Equal(1, Volatile.Read(ref followed));

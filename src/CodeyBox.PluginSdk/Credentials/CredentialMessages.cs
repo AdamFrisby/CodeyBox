@@ -39,7 +39,13 @@ public static class CredentialMessages
             for (var i = 0; i < source.Length; i++)
                 span[i] = char.IsControl(source[i]) ? ' ' : source[i];
         });
-        return flat.Length <= maxChars ? flat : flat[..maxChars];
+        if (flat.Length <= maxChars)
+            return flat;
+        // Never split a UTF-16 surrogate pair: a trailing lone high
+        // surrogate would mangle under the strict UTF-8 encoders that
+        // persist or render this message.
+        var cut = char.IsHighSurrogate(flat[maxChars - 1]) ? maxChars - 1 : maxChars;
+        return flat[..cut];
     }
 
     /// <summary>
@@ -74,16 +80,10 @@ public static class CredentialMessages
             var (bytes, _) = await CredentialBodies.CopyCappedAsync(stream, MaxErrorBodyBytes, ct).ConfigureAwait(false);
             text = Encoding.UTF8.GetString(bytes);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or HttpRequestException or ObjectDisposedException)
         {
-            return NoReadableDetail;
-        }
-        catch (HttpRequestException)
-        {
-            return NoReadableDetail;
-        }
-        catch (ObjectDisposedException)
-        {
+            // Only read/connection faults mean "no readable body"; caller
+            // cancellation is never swallowed.
             return NoReadableDetail;
         }
 

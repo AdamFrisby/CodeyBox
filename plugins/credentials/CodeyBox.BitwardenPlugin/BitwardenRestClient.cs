@@ -87,7 +87,7 @@ internal sealed class BitwardenAccessToken
 /// </summary>
 internal sealed class BitwardenRestClient
 {
-    private readonly HttpClient _http;
+    private readonly CredentialTransport _transport;
     private readonly TimeProvider _clock;
     private readonly ILogger _log;
 
@@ -122,9 +122,17 @@ internal sealed class BitwardenRestClient
 
     public BitwardenRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
         _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger.Instance;
+        _transport = new CredentialTransport(
+            http ?? throw new ArgumentNullException(nameof(http)),
+            "Bitwarden",
+            BitwardenException.Create,
+            ErrorCodeFields,
+            relayRawErrorText: false,
+            errorCodeAllowlist: SafeErrorCodes,
+            statusOverride: ClassifyCredentialRejection,
+            clock: _clock);
     }
 
     /// <summary>
@@ -163,18 +171,18 @@ internal sealed class BitwardenRestClient
             }),
         };
         using var response = await SendTokenAsync(request, ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, "mint machine-account access token", maxResponseBytes, ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, "mint machine-account access token", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
             if (!CredentialJson.TryGetString(root, "access_token", out var token) || string.IsNullOrEmpty(token))
                 throw new BitwardenException(
-                    BitwardenFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     "Bitwarden identity server returned no access token.");
             var expiresIn = CredentialJson.TryGetInt32(root, "expires_in", out var seconds) ? seconds : DefaultTokenLifetimeSeconds;
             if (expiresIn <= 0)
                 throw new BitwardenException(
-                    BitwardenFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     "Bitwarden identity server returned no usable token lifetime.");
             var expiresAt = _clock.GetUtcNow() + TimeSpan.FromSeconds(Math.Min(expiresIn, MaxAcceptedTokenLifetimeSeconds));
             byte[]? organizationKey = null;
@@ -224,23 +232,23 @@ internal sealed class BitwardenRestClient
         var trimmedId = secretId.Trim();
         if (!Guid.TryParse(trimmedId, out _))
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 "Bitwarden secret id is not a UUID; check the mapping's SecretId.");
         var url = $"{apiUrl.TrimEnd('/')}/secrets/{Uri.EscapeDataString(trimmedId)}";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken.Token);
-        using var response = await SendAsync(request, $"read secret '{trimmedId}'", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, $"read secret '{trimmedId}'", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, $"read secret '{trimmedId}'", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, $"read secret '{trimmedId}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
             if (!CredentialJson.TryGetString(root, "value", out var value) || string.IsNullOrEmpty(value))
                 throw new BitwardenException(
-                    BitwardenFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Bitwarden secret '{trimmedId}' returned no value.");
             if (!ProjectGuardPasses(root, expectedProjectId))
                 throw new BitwardenException(
-                    BitwardenFailureKind.Misconfigured,
+                    CredentialFailureKind.Misconfigured,
                     $"Bitwarden secret '{trimmedId}' is not in the mapped project; refusing a wrong-project read.");
             if (!BitwardenCrypto.IsCipherString(value))
             {
@@ -256,7 +264,7 @@ internal sealed class BitwardenRestClient
                 return plaintext;
             }
             throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
+                CredentialFailureKind.InvalidResponse,
                 $"Bitwarden secret '{trimmedId}' returned an end-to-end-encrypted value this provider could not open; refusing to serve ciphertext.");
         }
     }
@@ -332,14 +340,14 @@ internal sealed class BitwardenRestClient
         var url = $"{apiUrl.TrimEnd('/')}/organizations/{Uri.EscapeDataString(trimmedOrg)}/secrets";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        using var response = await SendAsync(request, "list secrets", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, "list secrets", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, "list secrets", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, "list secrets", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             if (!doc.RootElement.TryGetProperty("secrets", out var data)
                 || data.ValueKind != JsonValueKind.Array)
                 throw new BitwardenException(
-                    BitwardenFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     "Bitwarden secret listing returned an unexpected JSON shape.");
             string? match = null;
             var matches = 0;
@@ -362,11 +370,11 @@ internal sealed class BitwardenRestClient
             }
             if (matches == 0)
                 throw new BitwardenException(
-                    BitwardenFailureKind.NotFound,
+                    CredentialFailureKind.NotFound,
                     $"Bitwarden secret key '{trimmedKey}' was not found.");
             if (matches > 1)
                 throw new BitwardenException(
-                    BitwardenFailureKind.Misconfigured,
+                    CredentialFailureKind.Misconfigured,
                     $"Bitwarden secret key '{trimmedKey}' is ambiguous ({matches} matches); use SecretId instead.");
             return match!;
         }
@@ -387,9 +395,9 @@ internal sealed class BitwardenRestClient
     {
         try
         {
-            return await SendAsync(request, "mint machine-account access token", ct).ConfigureAwait(false);
+            return await _transport.SendAsync(request, "mint machine-account access token", ct).ConfigureAwait(false);
         }
-        catch (BitwardenException ex) when (ex.Kind == BitwardenFailureKind.Misconfigured && ex.StatusCode == 400)
+        catch (BitwardenException ex) when (ex.Kind == CredentialFailureKind.Misconfigured && ex.StatusCode == 400)
         {
             // A 400 from the token endpoint is by definition a rejected
             // grant: bad client id/secret, wrong scope (which this client
@@ -398,143 +406,30 @@ internal sealed class BitwardenRestClient
             // carries the machine-readable code but the classification must
             // not depend on which field the server filled in.
             throw new BitwardenException(
-                BitwardenFailureKind.Unauthorized,
+                CredentialFailureKind.Unauthorized,
                 $"Bitwarden mint machine-account access token rejected the machine-account credential: {ex.Message}",
                 ex,
                 400);
         }
     }
 
-    private async Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request, string operation, CancellationToken ct)
-    {
-        HttpResponseMessage response;
-        try
-        {
-            response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
-        {
-            throw new BitwardenException(
-                BitwardenFailureKind.Unreachable, $"Bitwarden {operation} timed out.", ex);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new BitwardenException(
-                BitwardenFailureKind.Unreachable, $"Bitwarden {operation} could not reach the backend.", ex);
-        }
-
-        if (CredentialHttp.IsRedirect(response.StatusCode))
-        {
-            // Never follow: the backend's 3xx (and its Location) is
-            // untrusted runtime output, and re-sending would carry the
-            // bearer token to the redirect target. Fail closed as a backend
-            // fault — never a verdict on the item.
-            var redirect = (int)response.StatusCode;
-            response.Dispose();
-            throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
-                $"Bitwarden {operation} returned redirect HTTP {redirect}; refusing to follow.",
-                redirect);
-        }
-
-        if (response.RequestMessage?.RequestUri is { } finalUri
-            && request.RequestUri is { } originalUri
-            && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
-        {
-            // The handler followed a redirect before this code saw the
-            // response (only possible with an externally supplied
-            // following client — the plugin builds non-following ones).
-            // The credential may already have been re-sent off-origin,
-            // so fail loudly rather than trusting this response.
-            var followedStatus = (int)response.StatusCode;
-            response.Dispose();
-            throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
-                $"Bitwarden {operation} was redirected to another origin; refusing the response.",
-                followedStatus);
-        }
-
-        if (response.IsSuccessStatusCode)
-            return response;
-
-        var status = (int)response.StatusCode;
-        // Only the allowlisted machine-readable error code is safe to
-        // relay: server free text is untrusted runtime output that may echo
-        // request content (including credentials), so the raw body is never
-        // relayed — the shared reader applies the cap and sanitisation.
-        var detail = await CredentialMessages.ReadServerDetailAsync(
-            response, ErrorCodeFields, relayRawText: false, ct, SafeErrorCodes).ConfigureAwait(false);
-        var retryAfter = ParseRetryAfter(response);
-        response.Dispose();
-        if (status == 400 && IsIdentityCredentialRejection(detail))
-            throw new BitwardenException(
-                BitwardenFailureKind.Unauthorized,
+    /// <summary>
+    /// Bitwarden-specific status classification for the shared transport:
+    /// a 400 whose allowlisted error code is a credential rejection
+    /// (<c>invalid_client</c>/<c>invalid_grant</c>/<c>unauthorized_client</c>)
+    /// is an authorisation outcome, not operator shape.
+    /// </summary>
+    private static CredentialException? ClassifyCredentialRejection(
+        int statusCode, string operation, string detail, int? retryAfterSeconds)
+        => statusCode == 400 && IsIdentityCredentialRejection(detail)
+            ? new BitwardenException(
+                CredentialFailureKind.Unauthorized,
                 $"Bitwarden {operation} rejected the machine-account credential: {detail}",
-                status);
-        throw BitwardenException.FromStatus(status, operation, detail, retryAfter);
-    }
+                statusCode)
+            : null;
 
     private static bool IsIdentityCredentialRejection(string detail)
         => string.Equals(detail, "invalid_client", StringComparison.Ordinal)
             || string.Equals(detail, "invalid_grant", StringComparison.Ordinal)
             || string.Equals(detail, "unauthorized_client", StringComparison.Ordinal);
-
-    private async Task<JsonDocument> ReadJsonAsync(
-        HttpResponseMessage response, string operation, int maxBytes, CancellationToken ct)
-    {
-        byte[] body;
-        try
-        {
-            body = await ReadBoundedAsync(response, maxBytes, ct).ConfigureAwait(false);
-        }
-        catch (BitwardenException)
-        {
-            response.Dispose();
-            throw;
-        }
-        response.Dispose();
-        JsonDocument doc;
-        try
-        {
-            doc = JsonDocument.Parse(body);
-        }
-        catch (JsonException ex)
-        {
-            // The body may contain secret-adjacent text; never echo it.
-            throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
-                $"Bitwarden {operation} returned a non-JSON success body.", ex);
-        }
-        if (doc.RootElement.ValueKind != JsonValueKind.Object)
-        {
-            doc.Dispose();
-            throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
-                $"Bitwarden {operation} returned an unexpected JSON shape.");
-        }
-        return doc;
-    }
-
-    private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, int maxBytes, CancellationToken ct)
-    {
-        var contentLength = response.Content.Headers.ContentLength;
-        if (contentLength.HasValue && contentLength.Value > maxBytes)
-            throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
-                $"Bitwarden response declares {contentLength.Value} bytes, above the {maxBytes}-byte cap.");
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        // Cap BEFORE buffering: a lying or missing content-length can never
-        // fill host memory. The shared copy stops past the cap; over-cap
-        // stays a typed backend failure.
-        var (bytes, truncated) = await CredentialBodies.CopyCappedAsync(stream, maxBytes, ct).ConfigureAwait(false);
-        if (truncated)
-            throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
-                $"Bitwarden response exceeds the {maxBytes}-byte cap.");
-        return bytes;
-    }
-
-    private int? ParseRetryAfter(HttpResponseMessage response)
-        => CredentialRetryAfter.Parse(response, _clock);
 }

@@ -43,7 +43,10 @@ public static class LeaseHandles
 
     /// <summary>
     /// Parses a handle into its kind letter, sandbox variable, and tail.
-    /// Returns false for null, over-long, or mis-shaped handles.
+    /// Returns false for null, over-long, or mis-shaped handles, and for
+    /// segments <see cref="Build(string, string, string, string)"/> would
+    /// refuse — so a parsed handle is always a shape Build could emit and
+    /// never carries control characters into logs.
     /// </summary>
     public static bool TryParse(
         string? leaseId, string prefix,
@@ -57,15 +60,20 @@ public static class LeaseHandles
         var parts = leaseId.Split('.');
         if (parts.Length != 4
             || !string.Equals(parts[0], prefix, StringComparison.Ordinal)
-            || string.IsNullOrWhiteSpace(parts[1])
-            || string.IsNullOrWhiteSpace(parts[2])
-            || string.IsNullOrWhiteSpace(parts[3]))
+            || !IsValidSegment(parts[1])
+            || !IsValidSegment(parts[2])
+            || !IsValidSegment(parts[3]))
             return false;
         kindLetter = parts[1];
         sandboxEnvVar = parts[2];
         tail = parts[3];
         return true;
     }
+
+    private static bool IsValidSegment(string? value)
+        => !string.IsNullOrWhiteSpace(value)
+            && value.IndexOf('.') < 0
+            && !value.Any(static c => char.IsControl(c));
 
     private static void ValidateSegment(string? value, string parameterName)
     {

@@ -60,14 +60,16 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
     private readonly object _clientLock = new();
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
     private readonly ConcurrentDictionary<string, IssuedLeaseContext> _issued = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, BitwardenAccessToken> _tokens = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<TokenCacheKey, BitwardenAccessToken> _tokens = new();
 
     /// <summary>
     /// Lease handles revoked in this process. Renewal of one fails loudly
     /// instead of silently re-fetching — revocation is verified, not
     /// assumed. The set is memory-only, so a restart re-resolves the
     /// mapping (the documented trade-off of holding no server lease).
-    /// Bounded: entries are lease-id sized and one per revoked lease.
+    /// It accumulates one lease-id-sized entry per revocation for the
+    /// process lifetime — accepted deliberately, because a revoked handle
+    /// must refuse renewal forever and no eviction can safely forget that.
     /// </summary>
     private readonly ConcurrentDictionary<string, bool> _revokedLeases = new(StringComparer.Ordinal);
     private bool _disposed;
@@ -158,7 +160,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         var options = RequireUsableOptions();
         var mapping = FindMapping(options, secret)
             ?? throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Bitwarden has no mapping for sandbox variable '{secret.SandboxEnvVar}'; the operator never put this secret against this backend.");
         EnsureClients();
 
@@ -166,7 +168,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         var value = await FetchValueAsync(options, mapping, token, ct).ConfigureAwait(false);
         if (string.IsNullOrEmpty(value))
             throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
+                CredentialFailureKind.InvalidResponse,
                 $"Bitwarden secret '{secret.SandboxEnvVar}' returned an empty value.");
         var expiresAt = LeaseExpiry(options, token, requestedTtl);
         var leaseId = BitwardenLeaseIds.BuildStatic(mapping.SandboxEnvVar);
@@ -191,7 +193,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         EnsureClients();
         if (_revokedLeases.ContainsKey(leaseId))
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Bitwarden lease '{leaseId}' was revoked in this process and cannot be renewed.");
         var context = _issued.TryGetValue(leaseId, out var known)
             ? known
@@ -210,10 +212,9 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
     }
 
     /// <inheritdoc />
-    public async Task RevokeAsync(string leaseId, CancellationToken ct = default)
+    public Task RevokeAsync(string leaseId, CancellationToken ct = default)
     {
         _ = ParseOurs(leaseId);
-        await Task.CompletedTask.ConfigureAwait(false);
 
         // Secrets Manager secrets carry no server-side lease and the
         // client-credentials flow exposes no token-revocation endpoint:
@@ -229,6 +230,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         }
         _revokedLeases[leaseId] = true;
         _logger.LogInformation("Bitwarden invalidated lease '{LeaseId}'.", leaseId);
+        return Task.CompletedTask;
     }
 
     public void Dispose()
@@ -266,7 +268,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         var rawCredential = string.IsNullOrWhiteSpace(secretEnvName) ? null : _env(secretEnvName);
         if (string.IsNullOrWhiteSpace(rawCredential))
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Bitwarden client-secret env '{secretEnvName}' is empty. Provision a machine-account access token " +
                 $"with access to the mapped projects from the host credential chain.");
         // The credential chain holds the single machine-account access
@@ -284,22 +286,39 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
                 : options.ClientId.Trim();
         if (string.IsNullOrWhiteSpace(clientId))
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Bitwarden mapping for '{mapping.SandboxEnvVar}' names no machine-account client id; set mapping ClientId or provider ClientId.");
         var clientSecret = hasTokenFormat ? tokenClientSecret : rawCredential.Trim();
         var key = CredentialKey(options, mapping);
 
         if (_tokens.TryGetValue(key, out var cached) && TokenUsable(cached, options))
+        {
+            ZeroKeyMaterial(tokenKey);
             return cached;
+        }
 
         await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             if (_tokens.TryGetValue(key, out cached) && TokenUsable(cached, options))
+            {
+                ZeroKeyMaterial(tokenKey);
                 return cached;
+            }
             EnsureClients();
-            var fresh = await _api!.AuthenticateAsync(
-                options.IdentityUrl, clientId, clientSecret, options.MaxResponseBytes, tokenKey, ct).ConfigureAwait(false);
+            BitwardenAccessToken fresh;
+            try
+            {
+                fresh = await _api!.AuthenticateAsync(
+                    options.IdentityUrl, clientId, clientSecret, options.MaxResponseBytes, tokenKey, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // The mint failed, so the parsed key reached no token;
+                // do not leave it on the heap.
+                ZeroKeyMaterial(tokenKey);
+                throw;
+            }
             if (_tokens.TryGetValue(key, out var replaced))
                 replaced.ClearSecrets();
             _tokens[key] = fresh;
@@ -309,6 +328,18 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         {
             _tokenLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Zeroes a parsed access-token key that is not being handed to a
+    /// minted token (a cache hit or a failed mint). On success the minted
+    /// <see cref="BitwardenAccessToken"/> owns the array and
+    /// <see cref="BitwardenAccessToken.ClearSecrets"/> zeroes it.
+    /// </summary>
+    private static void ZeroKeyMaterial(byte[]? key)
+    {
+        if (key is not null)
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(key);
     }
 
     private bool TokenUsable(BitwardenAccessToken token, BitwardenOptions options)
@@ -340,17 +371,20 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         BitwardenOptions options, BitwardenAccessToken token, TimeSpan requestedTtl)
     {
         var now = _clock.GetUtcNow();
-        var configured = TimeSpan.FromMinutes(Math.Clamp(options.StaticLeaseTtlMinutes, 1, 1440));
+        var configured = TimeSpan.FromMinutes(Math.Clamp(
+            options.StaticLeaseTtlMinutes,
+            BitwardenOptions.MinStaticLeaseTtlMinutes,
+            BitwardenOptions.MaxStaticLeaseTtlMinutes));
         var window = requestedTtl > TimeSpan.Zero && requestedTtl < configured ? requestedTtl : configured;
         var tokenRemaining = token.ExpiresAt - now - TimeSpan.FromSeconds(Math.Max(options.TokenRefreshSkewSeconds, 0));
         if (tokenRemaining <= TimeSpan.Zero)
             throw new BitwardenException(
-                BitwardenFailureKind.InvalidResponse,
+                CredentialFailureKind.InvalidResponse,
                 "Bitwarden access token carries no usable lifetime; refusing to cache a secret beyond its lease.");
         return now + (window < tokenRemaining ? window : tokenRemaining);
     }
 
-    private string CredentialKey(BitwardenOptions options, BitwardenSecretMapping mapping)
+    private static TokenCacheKey CredentialKey(BitwardenOptions options, BitwardenSecretMapping mapping)
     {
         var clientId = string.IsNullOrWhiteSpace(mapping.ClientId)
             ? options.ClientId.Trim()
@@ -362,43 +396,49 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         // on every call for hot reload, so an operator changing ApiUrl or
         // IdentityUrl must never replay a token minted by the old origin
         // against the new one.
-        return CredentialKey(
+        return new TokenCacheKey(
             options.IdentityUrl.Trim(),
             options.ApiUrl.Trim(),
             clientId,
             secretEnvName);
     }
 
-    private static string CredentialKey(string identityUrl, string apiUrl, string clientId, string secretEnvName)
-        => $"{identityUrl}\0{apiUrl}\0{clientId}\0{secretEnvName}";
-
     private BitwardenOptions RequireUsableOptions()
     {
         var options = CurrentOptions();
         if (!options.Enabled)
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 "Bitwarden provider is disabled (Enabled=false); enable it to issue.");
         var errors = options.Validate();
         if (errors.Count > 0)
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Bitwarden configuration is invalid: {errors[0]}");
         return options;
     }
 
     private static BitwardenSecretMapping? FindMapping(BitwardenOptions options, ProjectSandboxSecret secret)
     {
-        foreach (var mapping in options.Mappings)
+        foreach (var mapping in FindMappingsByEnvVar(options, secret.SandboxEnvVar))
         {
-            if (!string.Equals(mapping.SandboxEnvVar, secret.SandboxEnvVar, StringComparison.Ordinal))
-                continue;
             if (!string.IsNullOrWhiteSpace(mapping.Group)
                 && !string.Equals(mapping.Group, secret.Group, StringComparison.Ordinal))
                 continue;
             return mapping;
         }
         return null;
+    }
+
+    /// <summary>Mappings naming this sandbox variable, in declaration order.</summary>
+    private static IEnumerable<BitwardenSecretMapping> FindMappingsByEnvVar(
+        BitwardenOptions options, string sandboxEnvVar)
+    {
+        foreach (var mapping in options.Mappings)
+        {
+            if (string.Equals(mapping.SandboxEnvVar, sandboxEnvVar, StringComparison.Ordinal))
+                yield return mapping;
+        }
     }
 
     private IssuedLeaseContext RebuildContext(
@@ -408,17 +448,10 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         // id carries the sandbox variable — enough to re-resolve today's
         // mapping. The grant itself was verified at issue time and is not
         // re-decided here; renewal extends the same lease.
-        BitwardenSecretMapping? mapping = null;
-        foreach (var candidate in options.Mappings)
-        {
-            if (!string.Equals(candidate.SandboxEnvVar, parsed.SandboxEnvVar, StringComparison.Ordinal))
-                continue;
-            mapping = candidate;
-            break;
-        }
+        var mapping = FindMappingsByEnvVar(options, parsed.SandboxEnvVar).FirstOrDefault();
         if (mapping is null)
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Bitwarden lease '{leaseId}' names sandbox variable '{parsed.SandboxEnvVar}' with no current mapping; restore the mapping.");
         return new IssuedLeaseContext(mapping, CredentialKey(options, mapping), _clock.GetUtcNow());
     }
@@ -427,13 +460,16 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
     {
         if (!BitwardenLeaseIds.TryParse(leaseId, out var parsed))
             throw new BitwardenException(
-                BitwardenFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Lease '{leaseId ?? string.Empty}' is not a Bitwarden lease handle.");
         return parsed;
     }
 
     private static TimeSpan ClientTimeout(BitwardenOptions options) =>
-        TimeSpan.FromSeconds(Math.Clamp(options.TimeoutSeconds, 1, 300));
+        TimeSpan.FromSeconds(Math.Clamp(
+            options.TimeoutSeconds,
+            BitwardenOptions.MinTimeoutSeconds,
+            BitwardenOptions.MaxTimeoutSeconds));
 
     private void EnsureClients()
     {
@@ -461,8 +497,16 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         }
     }
 
+    /// <summary>
+    /// Identity of one cached machine-account token: the origins it was
+    /// minted against plus the client id and credential env var it was
+    /// minted from. A structural-equality record so the cache key is
+    /// compile-time checked rather than positionally concatenated.
+    /// </summary>
+    private sealed record TokenCacheKey(string IdentityUrl, string ApiUrl, string ClientId, string SecretEnvVar);
+
     private sealed record IssuedLeaseContext(
         BitwardenSecretMapping Mapping,
-        string CredentialKey,
+        TokenCacheKey CredentialKey,
         DateTimeOffset ExpiresAt);
 }

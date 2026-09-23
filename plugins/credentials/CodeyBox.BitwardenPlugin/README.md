@@ -170,6 +170,13 @@ a client-side validity window over a genuinely short-lived access token:
     "Plugins": {
       "AssemblyPaths": ["plugins/credentials/CodeyBox.BitwardenPlugin/bin/Release/net10.0/CodeyBox.BitwardenPlugin.dll"],
       "Allowlist": ["codeybox.bitwarden"],
+      "Enabled": [
+        "codeybox.file-size-limits",
+        "codeybox.statistics",
+        "codeybox.quota-reset-notifier",
+        "codeybox.opencode-go-quota",
+        "codeybox.bitwarden"
+      ],
       "codeybox.bitwarden": {
         "Enabled": true,
         "ApiUrl": "https://api.bitwarden.com",
@@ -191,6 +198,11 @@ a client-side validity window over a genuinely short-lived access token:
   }
 }
 ```
+
+A plugin loads only when it is **both allowlisted and enabled**. `Enabled`
+replaces the default-enabled set when configured, so it must re-list the
+bundled plugins that should stay on; the `codeybox.bitwarden` section's
+own `Enabled: true` is the provider-level master switch, a separate gate.
 
 ## Contract gaps
 

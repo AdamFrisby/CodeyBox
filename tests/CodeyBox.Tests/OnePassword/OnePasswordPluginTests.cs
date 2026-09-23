@@ -553,7 +553,7 @@ public sealed class OnePasswordPluginTests : IDisposable
         // revoked handle now fails loudly instead of silently re-fetching.
         var readsBefore = _handler.CountReadsOf(ItemId);
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.RenewAsync(lease.LeaseId));
-        Assert.Equal(OnePasswordFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.Equal(readsBefore, _handler.CountReadsOf(ItemId));
 
         // Idempotent: a second teardown revoke still reports success.
@@ -676,7 +676,7 @@ public sealed class OnePasswordPluginTests : IDisposable
         Assert.True(report.AllRevoked);
         Assert.Equal(SecretLeaseStatus.Revoked, (await store.GetAsync(lease.LeaseId))!.Status);
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.RenewAsync(lease.LeaseId));
-        Assert.Equal(OnePasswordFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
 
         string all;
         lock (log.Messages)
@@ -696,7 +696,7 @@ public sealed class OnePasswordPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(OnePasswordFailureKind.Unauthorized, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unauthorized, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, ex.FailureKindForWorkItem);
         Assert.DoesNotContain(StaticValue, ex.Message);
@@ -725,7 +725,7 @@ public sealed class OnePasswordPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(OnePasswordFailureKind.BackendError, ex.Kind);
+        Assert.Equal(CredentialFailureKind.BackendError, ex.Kind);
         Assert.True(ex.IsInfrastructure);
     }
 
@@ -738,7 +738,7 @@ public sealed class OnePasswordPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(OnePasswordFailureKind.Unreachable, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unreachable, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, ex.FailureKindForWorkItem);
     }
@@ -789,11 +789,11 @@ public sealed class OnePasswordPluginTests : IDisposable
     }
 
     [Theory]
-    [InlineData(401, OnePasswordFailureKind.Unauthorized)]
-    [InlineData(403, OnePasswordFailureKind.Unauthorized)]
-    [InlineData(429, OnePasswordFailureKind.RateLimited)]
-    [InlineData(500, OnePasswordFailureKind.BackendError)]
-    public async Task Backend_Faults_Classify_As_Infrastructure(int status, OnePasswordFailureKind kind)
+    [InlineData(401, CredentialFailureKind.Unauthorized)]
+    [InlineData(403, CredentialFailureKind.Unauthorized)]
+    [InlineData(429, CredentialFailureKind.RateLimited)]
+    [InlineData(500, CredentialFailureKind.BackendError)]
+    public async Task Backend_Faults_Classify_As_Infrastructure(int status, CredentialFailureKind kind)
     {
         _handler.ItemJson = Fixture("item.json");
         _handler.FailItemStatus = status;
@@ -827,7 +827,7 @@ public sealed class OnePasswordPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(OnePasswordFailureKind.NotFound, ex.Kind);
+        Assert.Equal(CredentialFailureKind.NotFound, ex.Kind);
         Assert.False(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Configuration, ex.FailureKindForWorkItem);
 
@@ -848,7 +848,7 @@ public sealed class OnePasswordPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(OnePasswordFailureKind.Unreachable, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unreachable, ex.Kind);
         Assert.True(ex.IsInfrastructure);
 
         var store = new MemorySecretLeaseStore();
@@ -869,7 +869,7 @@ public sealed class OnePasswordPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(OnePasswordFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.False(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Configuration, ex.FailureKindForWorkItem);
     }
@@ -897,7 +897,7 @@ public sealed class OnePasswordPluginTests : IDisposable
         // A backend 3xx is never followed: it fails closed as a backend
         // fault (infrastructure, never a diff verdict) — the bearer token
         // goes nowhere else.
-        Assert.Equal(OnePasswordFailureKind.InvalidResponse, ex.Kind);
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Contains("redirect", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -946,7 +946,7 @@ public sealed class OnePasswordPluginTests : IDisposable
         });
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => ambiguous.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(OnePasswordFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.False(ex.IsInfrastructure);
     }
 
@@ -963,7 +963,7 @@ public sealed class OnePasswordPluginTests : IDisposable
         // credential.
         var flipped = CreateProvider(ServiceAccountMapping("PAID_API_TOKEN"));
         var ex = await Assert.ThrowsAsync<OnePasswordException>(() => flipped.RenewAsync(material.LeaseId));
-        Assert.Equal(OnePasswordFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
     }
 
     [Fact]
@@ -973,7 +973,7 @@ public sealed class OnePasswordPluginTests : IDisposable
         var provider = CreateProvider(ConnectMapping("PAID_API_TOKEN"));
         var ex = await Assert.ThrowsAsync<OnePasswordException>(
             () => provider.RenewAsync("doppler.s.PAID_API_TOKEN.abc123"));
-        Assert.Equal(OnePasswordFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         await Assert.ThrowsAsync<OnePasswordException>(() => provider.RevokeAsync("not-a-lease"));
     }
 

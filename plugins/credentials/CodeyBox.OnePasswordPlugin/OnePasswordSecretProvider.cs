@@ -152,14 +152,14 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         var options = RequireUsableOptions();
         var mapping = FindMapping(options, secret)
             ?? throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password has no mapping for sandbox variable '{secret.SandboxEnvVar}'; the operator never put this secret against this backend.");
         EnsureClients();
 
         var value = await FetchValueAsync(options, mapping, ct).ConfigureAwait(false);
         if (string.IsNullOrEmpty(value))
             throw new OnePasswordException(
-                OnePasswordFailureKind.InvalidResponse,
+                CredentialFailureKind.InvalidResponse,
                 $"1Password secret '{secret.SandboxEnvVar}' returned an empty value.");
         var window = StaticWindow(options, requestedTtl);
         var expiresAt = _clock.GetUtcNow() + window;
@@ -191,14 +191,14 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         EnsureClients();
         if (_revokedLeases.ContainsKey(leaseId))
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password lease '{leaseId}' was revoked in this process and cannot be renewed.");
         var context = _issued.TryGetValue(leaseId, out var known)
             ? known
             : RebuildContext(leaseId, options, parsed);
         if (context.Kind != parsed.Kind)
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password lease '{leaseId}' changed retrieval transport; re-provision instead of renewing.");
 
         // Static renewal re-fetches so an edit or rotation propagates
@@ -285,7 +285,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         var token = string.IsNullOrWhiteSpace(name) ? null : _env(name);
         if (string.IsNullOrWhiteSpace(token))
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password Connect token env '{name}' is empty. Provision a Connect token " +
                 $"scoped to the mapped vault from the host credential chain.");
         return token;
@@ -297,7 +297,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         var token = string.IsNullOrWhiteSpace(name) ? null : _env(name);
         if (string.IsNullOrWhiteSpace(token))
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password service-account token env '{name}' is empty. Provision a service-account token " +
                 $"with access to the mapped vaults from the host credential chain.");
         return token;
@@ -314,12 +314,12 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         var options = CurrentOptions();
         if (!options.Enabled)
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 "1Password provider is disabled (Enabled=false); enable it to issue.");
         var errors = options.Validate();
         if (errors.Count > 0)
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password configuration is invalid: {errors[0]}");
         return options;
     }
@@ -356,7 +356,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         }
         if (mapping is null)
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password lease '{leaseId}' names sandbox variable '{parsed.SandboxEnvVar}' with no current mapping; restore the mapping.");
         var expectedKind = mapping.UseServiceAccount
             ? OnePasswordLeaseIds.LeaseKind.ServiceAccount
@@ -368,7 +368,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
     {
         if (!OnePasswordLeaseIds.TryParse(leaseId, out var parsed))
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Lease '{leaseId ?? string.Empty}' is not a 1Password lease handle.");
         return parsed;
     }

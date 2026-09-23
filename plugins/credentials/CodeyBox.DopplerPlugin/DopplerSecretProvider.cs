@@ -148,7 +148,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
         var options = RequireUsableOptions();
         var mapping = FindMapping(options, secret)
             ?? throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Doppler has no mapping for sandbox variable '{secret.SandboxEnvVar}'; the operator never put this secret against this backend.");
         EnsureClients();
         var (project, config, secretName) = ResolveTriple(options, mapping);
@@ -163,7 +163,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 options.MaxResponseBytes, ct).ConfigureAwait(false);
             if (string.IsNullOrEmpty(value))
                 throw new DopplerException(
-                    DopplerFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Doppler secret '{secretName}' returned an empty value.");
             var leaseId = DopplerLeaseIds.BuildIdentity(mapping.SandboxEnvVar);
             context = new IssuedLeaseContext(
@@ -188,7 +188,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 options.MaxResponseBytes, ct).ConfigureAwait(false);
             if (string.IsNullOrEmpty(value))
                 throw new DopplerException(
-                    DopplerFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Doppler secret '{secretName}' returned an empty value.");
             var window = StaticWindow(options, requestedTtl);
             var expiresAt = _clock.GetUtcNow() + window;
@@ -310,7 +310,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
             // visibly, while the server-side expiry — short by design —
             // bounds the exposure. Never fake a revocation.
             throw new DopplerException(
-                DopplerFailureKind.Unreachable,
+                CredentialFailureKind.Unreachable,
                 $"Doppler identity lease '{leaseId}' holds no minted token in this process (orchestrator restarted); " +
                 $"the server-side token expires at {context.TokenExpiresAt:O} and cannot be revoked from here.");
         }
@@ -355,12 +355,12 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
     {
         if (string.IsNullOrWhiteSpace(options.IdentityId) || string.IsNullOrWhiteSpace(options.OidcTokenEnvVar))
             throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 "Doppler service-account identity is not configured (IdentityId and OidcTokenEnvVar must both be set).");
         var oidcToken = _env(options.OidcTokenEnvVar);
         if (string.IsNullOrWhiteSpace(oidcToken))
             throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Doppler OIDC token env '{options.OidcTokenEnvVar}' is empty. Provision a fresh OIDC token from the host credential chain.");
         EnsureClients();
         var skew = TimeSpan.FromSeconds(Math.Clamp(options.TokenRefreshSkewSeconds, 0, 3600));
@@ -369,7 +369,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
             options.MaxResponseBytes, ct).ConfigureAwait(false);
         if (minted.ExpiresAt <= _clock.GetUtcNow())
             throw new DopplerException(
-                DopplerFailureKind.InvalidResponse,
+                CredentialFailureKind.InvalidResponse,
                 "Doppler OIDC exchange returned an already-expired token.");
         return minted;
     }
@@ -382,7 +382,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
         var token = string.IsNullOrWhiteSpace(name) ? null : _env(name);
         if (string.IsNullOrWhiteSpace(token))
             throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Doppler service token env '{name}' is empty. Provision a restricted service token " +
                 $"scoped to the mapped project/config from the host credential chain.");
         return token;
@@ -393,12 +393,12 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 "Doppler provider is disabled (Enabled=false); enable it to issue.");
         var errors = options.Validate();
         if (errors.Count > 0)
             throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Doppler configuration is invalid: {errors[0]}");
         return options;
     }
@@ -455,7 +455,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
         }
         if (mapping is null)
             throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Doppler lease '{leaseId}' names sandbox variable '{parsed.SandboxEnvVar}' with no current mapping; restore the mapping or revoke server-side.");
         var (project, config, secretName) = ResolveTriple(options, mapping);
         return new IssuedLeaseContext(
@@ -467,7 +467,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
     {
         if (!DopplerLeaseIds.TryParse(leaseId, out var parsed))
             throw new DopplerException(
-                DopplerFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Lease '{leaseId ?? string.Empty}' is not a Doppler lease handle.");
         return parsed;
     }
