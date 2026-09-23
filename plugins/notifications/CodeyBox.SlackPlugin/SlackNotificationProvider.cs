@@ -101,7 +101,7 @@ public sealed class SlackNotificationProvider : INotificationProvider, IPluginIn
         _threads.Configure(opts.EntryLifetime, opts.MaxEntries);
 
         var token = Environment.GetEnvironmentVariable(opts.BotTokenEnvVar);
-        if (string.IsNullOrEmpty(token))
+        if (string.IsNullOrWhiteSpace(token))
         {
             _log.LogWarning("SlackNotificationProvider: env var '{EnvVar}' is not set; skipping notification {Condition}",
                 opts.BotTokenEnvVar, notification.ConditionId);
@@ -122,9 +122,7 @@ public sealed class SlackNotificationProvider : INotificationProvider, IPluginIn
         if (opts.ThreadByWorkItem && workItemId is not null)
             threadTs = _threads.ThreadRootFor(channel, workItemId);
 
-        var timeout = opts.PostTimeoutSeconds >= 1
-            ? TimeSpan.FromSeconds(opts.PostTimeoutSeconds)
-            : TimeSpan.FromSeconds(15);
+        var timeout = NotificationDelivery.PostTimeoutOrDefault(opts.PostTimeoutSeconds, _log);
 
         SlackApiClient.PostResult result;
         try
@@ -186,7 +184,7 @@ public sealed class SlackNotificationProvider : INotificationProvider, IPluginIn
             return;
 
         var token = Environment.GetEnvironmentVariable(opts.BotTokenEnvVar);
-        if (string.IsNullOrEmpty(token))
+        if (string.IsNullOrWhiteSpace(token))
         {
             _log.LogWarning("SlackNotificationProvider: env var '{EnvVar}' is not set; skipping decision update for {Condition}",
                 opts.BotTokenEnvVar, notification.ConditionId);
@@ -195,9 +193,7 @@ public sealed class SlackNotificationProvider : INotificationProvider, IPluginIn
 
         var blocks = SlackBlockKit.BuildDecidedBlocks(notification.Title, decisionSummary, notification.ConditionId);
         var fallback = $"Decided: {decisionSummary}";
-        var timeout = opts.PostTimeoutSeconds >= 1
-            ? TimeSpan.FromSeconds(opts.PostTimeoutSeconds)
-            : TimeSpan.FromSeconds(15);
+        var timeout = NotificationDelivery.PostTimeoutOrDefault(opts.PostTimeoutSeconds, _log);
 
         try
         {

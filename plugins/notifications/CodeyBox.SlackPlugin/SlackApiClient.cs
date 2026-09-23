@@ -13,12 +13,9 @@ namespace CodeyBox.SlackPlugin;
 /// </summary>
 internal sealed class SlackApiException : Exception
 {
-    public string ErrorCode { get; }
-
     public SlackApiException(string errorCode, string message, Exception? inner = null)
-        : base(message, inner)
+        : base($"[{errorCode}] {message}", inner)
     {
-        ErrorCode = errorCode;
     }
 }
 

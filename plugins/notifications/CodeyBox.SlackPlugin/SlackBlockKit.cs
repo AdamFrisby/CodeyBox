@@ -7,8 +7,10 @@ namespace CodeyBox.SlackPlugin;
 /// Pure Block Kit rendering for Slack notifications: severity, summary and
 /// fields rendered as native blocks rather than a dumped text blob. All
 /// decision logic lives here as input→output functions; the provider only
-/// transports the result. Bounds come from <see cref="SlackPluginOptions"/>
-/// so every cap is operator-configurable, never a literal at the sink.
+/// transports the result. Operator-configurable bounds come from
+/// <see cref="SlackPluginOptions"/>; the fixed presentation caps (header,
+/// label, field name/value lengths) are named constants — the field caps
+/// shared with every provider via <see cref="NotificationRendering"/>.
 /// </summary>
 internal static class SlackBlockKit
 {
@@ -52,19 +54,6 @@ internal static class SlackBlockKit
         if (string.IsNullOrEmpty(text))
             return string.Empty;
         return text.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
-    }
-
-    /// <summary>Truncate to a character budget, marking the cut.</summary>
-    public static string Truncate(string text, int maxChars)
-    {
-        if (maxChars < 1)
-            return string.Empty;
-        if (text.Length <= maxChars)
-            return text;
-        const string marker = "… (truncated)";
-        if (maxChars <= marker.Length)
-            return text[..maxChars];
-        return text[..(maxChars - marker.Length)] + marker;
     }
 
     /// <summary>Encode one offered action as the button <c>value</c>.
@@ -125,14 +114,15 @@ internal static class SlackBlockKit
         Notification notification,
         SlackPluginOptions options)
     {
-        var workItemId = BindWorkItemId(notification);
+        var workItemId = NotificationBinding.WorkItemIdFor(notification);
         var color = ColorFor(notification.Severity);
         var emoji = EmojiFor(notification.Severity);
-        var body = Truncate(notification.Body ?? notification.Summary ?? notification.Title, options.MaxTextChars);
+        var body = NotificationRendering.Truncate(notification.Body ?? notification.Summary ?? notification.Title, options.MaxTextChars);
 
         var fallback = $"{emoji} [{notification.Severity}] {notification.Title}";
-        if (!string.IsNullOrWhiteSpace(notification.AnswerUrl))
-            fallback += $"\nAnswer here: {notification.AnswerUrl}";
+        var answerLink = NotificationLinks.SafeLinkUri(notification.AnswerUrl)?.AbsoluteUri;
+        if (answerLink is not null)
+            fallback += $"\nAnswer here: {answerLink}";
 
         var blocks = new List<object?>();
 
@@ -142,7 +132,7 @@ internal static class SlackBlockKit
             ["text"] = new Dictionary<string, object?>
             {
                 ["type"] = "plain_text",
-                ["text"] = Truncate($"{emoji} {notification.Title}", MaxHeaderChars),
+                ["text"] = NotificationRendering.Truncate($"{emoji} {notification.Title}", MaxHeaderChars),
                 ["emoji"] = true,
             },
         });
@@ -208,7 +198,7 @@ internal static class SlackBlockKit
     /// line (e.g. <c>Decided: … — by …</c>); it is escaped, never trusted.</summary>
     public static List<object?> BuildDecidedBlocks(string title, string decisionSummary, string conditionId)
     {
-        var safeSummary = Truncate(decisionSummary, 3000);
+        var safeSummary = NotificationRendering.Truncate(decisionSummary, 3000);
         return
         [
             new Dictionary<string, object?>
@@ -217,7 +207,7 @@ internal static class SlackBlockKit
                 ["text"] = new Dictionary<string, object?>
                 {
                     ["type"] = "plain_text",
-                    ["text"] = Truncate($":white_check_mark: {title}", MaxHeaderChars),
+                    ["text"] = NotificationRendering.Truncate($":white_check_mark: {title}", MaxHeaderChars),
                     ["emoji"] = true,
                 },
             },
@@ -245,32 +235,6 @@ internal static class SlackBlockKit
         ];
     }
 
-    /// <summary>Deep link from a notification to the Agnes front end for the
-    /// owning work item. Agnes steers; this integration only links. Returns
-    /// null when no base URL is configured or no work item is bound.</summary>
-    public static string? AgnesWorkItemUrl(SlackPluginOptions options, string? workItemId)
-    {
-        if (string.IsNullOrWhiteSpace(options.AgnesBaseUrl) || string.IsNullOrWhiteSpace(workItemId))
-            return null;
-        if (!Uri.TryCreate(options.AgnesBaseUrl, UriKind.Absolute, out var baseUri))
-            return null;
-        return $"{baseUri.ToString().TrimEnd('/')}/workitems/{Uri.EscapeDataString(workItemId)}";
-    }
-
-    private static string? BindWorkItemId(Notification notification)
-    {
-        if (notification.Actions is { Count: > 0 })
-        {
-            var first = notification.Actions[0];
-            if (!string.IsNullOrWhiteSpace(first.WorkItemId))
-                return first.WorkItemId;
-        }
-        if (!string.IsNullOrWhiteSpace(notification.CorrelationToken)
-            && NotificationCorrelation.TryParse(notification.CorrelationToken, out var workItemId, out _))
-            return workItemId;
-        return null;
-    }
-
     private static List<object> RenderFields(Notification notification, int maxFields)
     {
         var fields = new List<object>();
@@ -280,8 +244,8 @@ internal static class SlackBlockKit
         {
             if (fields.Count >= maxFields)
                 break;
-            var name = Truncate(key, 100);
-            var val = Truncate(value, 500);
+            var name = NotificationRendering.Truncate(key, NotificationRendering.MaxFieldNameChars);
+            var val = NotificationRendering.Truncate(value, NotificationRendering.MaxFieldValueChars);
             if (string.IsNullOrWhiteSpace(name))
                 continue;
             fields.Add(new Dictionary<string, object?>
@@ -324,7 +288,7 @@ internal static class SlackBlockKit
                 ["text"] = new Dictionary<string, object?>
                 {
                     ["type"] = "plain_text",
-                    ["text"] = Truncate(action.Label, MaxLabelChars),
+                    ["text"] = NotificationRendering.Truncate(action.Label, MaxLabelChars),
                     ["emoji"] = true,
                 },
                 ["value"] = value,
@@ -355,8 +319,8 @@ internal static class SlackBlockKit
         bool actionsRendered)
     {
         var links = new List<object>();
-        if (!string.IsNullOrWhiteSpace(notification.AnswerUrl)
-            && Uri.TryCreate(notification.AnswerUrl, UriKind.Absolute, out _))
+        var answerUrl = NotificationLinks.SafeLinkUri(notification.AnswerUrl)?.AbsoluteUri;
+        if (answerUrl is not null)
         {
             links.Add(new Dictionary<string, object?>
             {
@@ -368,10 +332,10 @@ internal static class SlackBlockKit
                     ["text"] = actionsRendered ? "Answer here" : "Answer in CodeyBox",
                     ["emoji"] = true,
                 },
-                ["url"] = notification.AnswerUrl,
+                ["url"] = answerUrl,
             });
         }
-        var agnesUrl = AgnesWorkItemUrl(options, workItemId);
+        var agnesUrl = NotificationLinks.AgnesWorkItemUrl(options.AgnesBaseUrl, workItemId);
         if (agnesUrl is not null)
         {
             links.Add(new Dictionary<string, object?>
