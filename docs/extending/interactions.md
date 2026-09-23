@@ -69,7 +69,9 @@ endpoint receives (see
 [`ntfy-notifications.md`](ntfy-notifications.md)).
 
 Header names are overridable per provider (`SignatureHeader`,
-`TimestampHeader`). Timestamps outside `ReplayWindow` (default 5 minutes)
+`TimestampHeader`) — except `ntfy-hmac`, whose publisher mints buttons
+with the fixed `X-CodeyBox-Signature` contract header, so that verifier
+always reads it. Timestamps outside `ReplayWindow` (default 5 minutes)
 are rejected as replays. Secrets come from the credential chain
 (environment variables named in config); raw secrets never appear in
 configuration files.

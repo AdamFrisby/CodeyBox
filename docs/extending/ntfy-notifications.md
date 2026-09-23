@@ -55,9 +55,16 @@ exact topic names. `AllowedUsers` has no meaningful narrowing here — ntfy
 delivers no per-press user identity, so answers are recorded as
 `ntfy:subscriber`.
 
+The signature header is fixed: the plugin mints buttons with
+`X-CodeyBox-Signature` and the `ntfy` provider entry's `SignatureHeader`
+option does not apply — leave it unset for this provider.
+
 ## ntfy-side setup
 
 1. Pick or deploy a server: `https://ntfy.sh` or a self-hosted instance.
+   `BaseUrl` must be an HTTPS origin — publishes carry the access token
+   and the signed button bodies, so plain HTTP is accepted only for a
+   loopback server.
 2. Choose a topic. On ntfy.sh a topic name is effectively a password —
    use an unguessable one. On a self-hosted server, also enable ACLs and
    create an access token (`ntfy token add …`) if the topic is protected.
@@ -79,7 +86,7 @@ plugin (see [`plugins.md`](plugins.md)):
       "Enabled": ["codeybox.ntfy"],
       "codeybox.ntfy": {
         "Enabled": true,
-        "BaseUrl": "https://ntfy.sh",
+        "BaseUrl": "https://ntfy.sh",   // HTTPS required (HTTP only for loopback)
         "DefaultTopic": "codeybox-fleet-9f2c",
         "TokenEnvVar": "CODEYBOX_NTFY_TOKEN",
         "InteractionSecretEnvVar": "CODEYBOX_NTFY_INTERACTION_SECRET",
@@ -140,8 +147,9 @@ device holding the subscription can reach
   warning / 3 default), a severity tag (`rotating_light` / `warning` /
   `information_source`), the body as plain text (ntfy renders markdown on
   the web app only), and up to `MaxFields` `key: value` lines. Over-long
-  text truncates with a marker (`MaxMessageChars` stays under ntfy's
-  4096-byte message ceiling; `MaxTitleChars` under the 1 KB title limit).
+  text truncates with a marker: `MaxMessageBytes` bounds the UTF-8 byte
+  count, staying under ntfy's 4096-byte message ceiling even for
+  multi-byte text; `MaxTitleChars` stays under the 1 KB title limit.
 - **Actions**: ntfy accepts at most three buttons per message. `http`
   answer buttons take slots first; *Answer in CodeyBox* / *Open in Agnes*
   view actions fill what remains, and any link that does not fit is

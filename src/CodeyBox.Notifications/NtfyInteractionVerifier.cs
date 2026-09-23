@@ -1,3 +1,5 @@
+using CodeyBox.Core;
+
 namespace CodeyBox.Notifications;
 
 /// <summary>
@@ -12,6 +14,12 @@ namespace CodeyBox.Notifications;
 /// replay only the decision that button already grants; replays land on the
 /// endpoint's dedup claim and the question-state checks, which is the replay
 /// protection this scheme relies on in place of a timestamp window.
+///
+/// <para>The signature header is pinned to
+/// <see cref="InteractionContract.DefaultSignatureHeader"/>: the publisher
+/// mints buttons with that name and cannot see this host's options, so a
+/// <see cref="InteractionProviderOptions.SignatureHeader"/> override cannot
+/// apply to this scheme.</para>
 /// </summary>
 public sealed class NtfyInteractionVerifier : InteractionVerifierBase
 {
@@ -37,11 +45,7 @@ public sealed class NtfyInteractionVerifier : InteractionVerifierBase
         if (!TryResolveSecret(out var secret, out var failure))
             return Task.FromResult(InteractionVerificationResult.Fail(failure));
 
-        var signatureHeader = Options?.SignatureHeader;
-        if (string.IsNullOrWhiteSpace(signatureHeader))
-            signatureHeader = "X-CodeyBox-Signature";
-
-        var signature = Header(headers, signatureHeader);
+        var signature = Header(headers, InteractionContract.DefaultSignatureHeader);
         const string Prefix = "sha256=";
         if (string.IsNullOrEmpty(signature) || !signature.StartsWith(Prefix, StringComparison.Ordinal))
             return Task.FromResult(InteractionVerificationResult.Fail("missing or malformed signature"));

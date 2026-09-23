@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.NtfyPlugin;
@@ -281,7 +282,7 @@ public sealed class NtfyNotificationProviderTests
             a.GetProperty("action").GetString() == "view"
             && a.GetProperty("url").GetString() == "https://codeybox.example.invalid/workitems/work-1/questions");
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning
-            && e.Message.Contains("interaction secret or public base URL"));
+            && e.Message.Contains("cannot be rendered"));
     }
 
     [Fact]
@@ -334,6 +335,65 @@ public sealed class NtfyNotificationProviderTests
             Assert.Single(handler.Requests);
             Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning
                 && e.Message.Contains("unauthorized"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SecretEnvVar, null);
+        }
+    }
+
+    [Fact]
+    public async Task PublishError_ServerReason_IsFlattenedToOneLine()
+    {
+        Environment.SetEnvironmentVariable(SecretEnvVar, Secret);
+        try
+        {
+            var handler = new CapturingHttpHandler(_ =>
+                new HttpResponseMessage(HttpStatusCode.Forbidden)
+                {
+                    // The server's error text is untrusted: embedded newlines
+                    // must not smuggle forged lines into operator logs.
+                    Content = new StringContent("""{"code":40303,"http":403,"error":"denied\nforged-line"}"""),
+                });
+            var logger = new CapturingLogger<NtfyNotificationProvider>();
+            var provider = BuildProvider(EnabledConfig(), new HttpClient(handler), logger);
+
+            await provider.SendAsync(MakeNotification(), CancellationToken.None);
+
+            var entry = Assert.Single(logger.Entries,
+                e => e.Level == LogLevel.Warning && e.Message.Contains("denied"));
+            Assert.DoesNotContain('\n', entry.Message);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SecretEnvVar, null);
+        }
+    }
+
+    [Fact]
+    public async Task PlainHttpBaseUrl_IsRefusedBeforePublish()
+    {
+        Environment.SetEnvironmentVariable(SecretEnvVar, Secret);
+        try
+        {
+            var handler = new CapturingHttpHandler();
+            var logger = new CapturingLogger<NtfyNotificationProvider>();
+            // Plain HTTP beyond loopback would carry the bearer token and the
+            // signed button bodies in cleartext, so it is refused outright.
+            var provider = BuildProvider(
+                Config(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:Plugins:codeybox.ntfy:Enabled"] = "true",
+                    ["CodeyBox:Plugins:codeybox.ntfy:BaseUrl"] = "http://ntfy.example.invalid",
+                    ["CodeyBox:Plugins:codeybox.ntfy:DefaultTopic"] = Topic,
+                }),
+                new HttpClient(handler), logger);
+
+            await provider.SendAsync(MakeNotification(), CancellationToken.None);
+
+            Assert.Empty(handler.Requests);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning
+                && e.Message.Contains("BaseUrl"));
         }
         finally
         {
@@ -480,6 +540,75 @@ public sealed class NtfyNotificationProviderTests
         Assert.Null(NtfyMessageBuilder.CallbackUrl("https://user:pw@host.example"));
         Assert.Null(NtfyMessageBuilder.CallbackUrl(""));
         Assert.Null(NtfyMessageBuilder.CallbackUrl("not a url"));
+    }
+
+    [Fact]
+    public void CallbackUrl_RejectsPathQueryAndFragment()
+    {
+        // The host's PublicBaseUrl policy rejects these outright; silently
+        // stripping a configured path would mint buttons pointing at a URL
+        // that does not exist.
+        Assert.Null(NtfyMessageBuilder.CallbackUrl("https://host.example/base"));
+        Assert.Null(NtfyMessageBuilder.CallbackUrl("https://host.example/?x=1"));
+        Assert.Null(NtfyMessageBuilder.CallbackUrl("https://host.example/#frag"));
+    }
+
+    [Fact]
+    public void AgnesWorkItemUrl_RequiresWebScheme()
+    {
+        var opts = new NtfyPluginOptions { AgnesBaseUrl = "https://agnes.example.invalid" };
+        Assert.Equal("https://agnes.example.invalid/workitems/work-1",
+            NtfyMessageBuilder.AgnesWorkItemUrl(opts, "work-1"));
+
+        // Non-web schemes must not land in a rendered action URL.
+        Assert.Null(NtfyMessageBuilder.AgnesWorkItemUrl(
+            new NtfyPluginOptions { AgnesBaseUrl = "file:///etc/passwd" }, "work-1"));
+        Assert.Null(NtfyMessageBuilder.AgnesWorkItemUrl(
+            new NtfyPluginOptions { AgnesBaseUrl = "javascript:alert(1)" }, "work-1"));
+    }
+
+    [Fact]
+    public void TruncateUtf8_BoundsBytesWithoutSplittingCodePoints()
+    {
+        Assert.Equal("abc", NtfyMessageBuilder.TruncateUtf8("abc", 10));
+        Assert.Equal(string.Empty, NtfyMessageBuilder.TruncateUtf8("abc", 0));
+
+        // Budget smaller than the marker cuts to a bare prefix: four ASCII
+        // bytes fit, the 3-byte CJK char does not and is never split.
+        Assert.Equal("aaaa", NtfyMessageBuilder.TruncateUtf8("aaaa你你", 6));
+
+        // Same for an astral character (4 UTF-8 bytes / one surrogate pair).
+        Assert.Equal("a", NtfyMessageBuilder.TruncateUtf8("a🙂b", 3));
+
+        var withMarker = NtfyMessageBuilder.TruncateUtf8(new string('x', 100), 30);
+        Assert.EndsWith("… (truncated)", withMarker);
+        Assert.True(Encoding.UTF8.GetByteCount(withMarker) <= 30);
+    }
+
+    [Fact]
+    public async Task Message_TruncatesOnUtf8ByteBudget()
+    {
+        Environment.SetEnvironmentVariable(SecretEnvVar, Secret);
+        try
+        {
+            var handler = new CapturingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+            var provider = BuildProvider(EnabledConfig(), new HttpClient(handler));
+
+            // 2 000 CJK chars = 6 000 UTF-8 bytes: within a naive char budget
+            // of 3 800 but over ntfy's byte ceiling — the message must come
+            // back under the byte bound.
+            await provider.SendAsync(
+                MakeNotification(body: new string('你', 2000)), CancellationToken.None);
+
+            var message = Published(Assert.Single(handler.Requests).Body)
+                .GetProperty("message").GetString()!;
+            Assert.True(Encoding.UTF8.GetByteCount(message) <= 3800);
+            Assert.Contains("… (truncated)", message);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SecretEnvVar, null);
+        }
     }
 
     [Fact]

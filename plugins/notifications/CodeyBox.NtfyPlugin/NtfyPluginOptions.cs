@@ -28,13 +28,19 @@ namespace CodeyBox.NtfyPlugin;
 /// </summary>
 public sealed class NtfyPluginOptions
 {
+    /// <summary>Publish timeout applied when <see cref="PostTimeoutSeconds"/>
+    /// is configured below its 1-second minimum.</summary>
+    public const int DefaultPostTimeoutSeconds = 15;
+
     /// <summary>Master switch. Default false: the plugin is inert until an
     /// operator enables it (and allowlists it per the plugin gates).</summary>
     public bool Enabled { get; set; }
 
     /// <summary>Base URL of the ntfy server, e.g. <c>https://ntfy.sh</c> or a
     /// self-hosted instance. Publishing goes to this server's root URL with the
-    /// topic carried in the JSON body. Must be an absolute http(s) origin.</summary>
+    /// topic carried in the JSON body. Must be an absolute HTTPS origin —
+    /// HTTP is accepted only for loopback, since publishes carry the bearer
+    /// token and MAC-signed button bodies.</summary>
     public string BaseUrl { get; set; } = "https://ntfy.sh";
 
     /// <summary>Topic used when a notification carries no explicit recipient.
@@ -78,12 +84,14 @@ public sealed class NtfyPluginOptions
 
     /// <summary>Per-call timeout in seconds for ntfy publish calls.
     /// Must be &gt;= 1. Default 15.</summary>
-    public int PostTimeoutSeconds { get; set; } = 15;
+    public int PostTimeoutSeconds { get; set; } = DefaultPostTimeoutSeconds;
 
-    /// <summary>Maximum characters kept for the notification message body
-    /// before truncation. Must be &gt;= 1. Default 3800 — under ntfy's
-    /// 4096-byte message ceiling even with multi-byte text.</summary>
-    public int MaxMessageChars { get; set; } = 3800;
+    /// <summary>Maximum UTF-8 bytes kept for the notification message body
+    /// before truncation (ntfy measures the limit in bytes, so this bound is
+    /// applied to the encoded length, not the char count). Must be &gt;= 1.
+    /// Default 3800 — under ntfy's 4096-byte message ceiling even with
+    /// multi-byte text.</summary>
+    public int MaxMessageBytes { get; set; } = 3800;
 
     /// <summary>Maximum characters kept for the notification title.
     /// Must be &gt;= 1. Default 200 (ntfy's title limit is 1 KB).</summary>

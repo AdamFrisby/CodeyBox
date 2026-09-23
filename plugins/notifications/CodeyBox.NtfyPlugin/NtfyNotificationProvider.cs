@@ -82,9 +82,8 @@ public sealed class NtfyNotificationProvider : INotificationProvider, IPluginIni
             _pluginLog.LogInformation("ntfy notifications are disabled (codeybox.ntfy Enabled=false).");
             return Task.CompletedTask;
         }
-        if (!Uri.TryCreate(opts.BaseUrl, UriKind.Absolute, out var baseUri)
-            || (baseUri.Scheme != Uri.UriSchemeHttps && baseUri.Scheme != Uri.UriSchemeHttp))
-            _pluginLog.LogWarning("ntfy notifications are enabled but BaseUrl '{BaseUrl}' is not an absolute http(s) origin; delivery will fail.", opts.BaseUrl);
+        if (!NtfyApiClient.IsUsableBaseUrl(opts.BaseUrl))
+            _pluginLog.LogWarning("ntfy notifications are enabled but BaseUrl '{BaseUrl}' is not an absolute HTTPS origin (HTTP allowed only for loopback); delivery will fail.", opts.BaseUrl);
         if (string.IsNullOrWhiteSpace(opts.DefaultTopic))
             _pluginLog.LogWarning("ntfy notifications are enabled with no DefaultTopic; notifications without an explicit recipient topic will be skipped.");
         if (opts.ActionsMode == NtfyActionsMode.Buttons)
@@ -113,9 +112,9 @@ public sealed class NtfyNotificationProvider : INotificationProvider, IPluginIni
                 notification.ConditionId);
             return;
         }
-        if (!IsUsableBaseUrl(opts.BaseUrl))
+        if (!NtfyApiClient.IsUsableBaseUrl(opts.BaseUrl))
         {
-            _log.LogWarning("NtfyNotificationProvider: BaseUrl '{BaseUrl}' is not an absolute http(s) origin; skipping notification {Condition}",
+            _log.LogWarning("NtfyNotificationProvider: BaseUrl '{BaseUrl}' is not an absolute HTTPS origin (HTTP allowed only for loopback); skipping notification {Condition}",
                 opts.BaseUrl, notification.ConditionId);
             return;
         }
@@ -127,37 +126,16 @@ public sealed class NtfyNotificationProvider : INotificationProvider, IPluginIni
             && !NtfyMessageBuilder.CanRenderButtons(opts, NtfyMessageBuilder.CallbackUrl(publicBaseUrl), secret))
         {
             _log.LogWarning(
-                "NtfyNotificationProvider: action buttons requested for {Condition} but the interaction secret or public base URL is missing; rendering answer links instead",
+                "NtfyNotificationProvider: action buttons requested for {Condition} but cannot be rendered (MaxActions is 0, or the interaction secret or a usable public base URL is missing); rendering answer links instead",
                 notification.ConditionId);
         }
 
         var (payload, _) = NtfyMessageBuilder.BuildPublishPayload(
             notification, opts, topic, publicBaseUrl, secret);
 
-        var timeout = opts.PostTimeoutSeconds >= 1
-            ? TimeSpan.FromSeconds(opts.PostTimeoutSeconds)
-            : TimeSpan.FromSeconds(15);
-
-        NtfyApiClient.PostResult result;
-        try
-        {
-            var api = new NtfyApiClient(_httpClients.CreateClient(), opts.BaseUrl);
-            result = await api.PublishAsync(
-                Environment.GetEnvironmentVariable(opts.TokenEnvVar), payload, timeout, ct);
-        }
-        catch (OperationCanceledException)
-        {
-            // Any cancellation reaching this layer is foreign: the client's
-            // own timeout already surfaces as a result, so rethrow
-            // unconditionally and let shutdown proceed.
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "NtfyNotificationProvider: delivery failed for condition {Condition}",
-                notification.ConditionId);
+        var result = await PostAsync(opts, payload, notification.ConditionId, ct);
+        if (result is null)
             return;
-        }
 
         if (!result.Ok)
         {
@@ -196,25 +174,45 @@ public sealed class NtfyNotificationProvider : INotificationProvider, IPluginIni
                 notification.ConditionId);
             return;
         }
-        if (!IsUsableBaseUrl(opts.BaseUrl))
+        if (!NtfyApiClient.IsUsableBaseUrl(opts.BaseUrl))
+        {
+            _log.LogWarning("NtfyNotificationProvider: BaseUrl '{BaseUrl}' is not an absolute HTTPS origin (HTTP allowed only for loopback); skipping decision update on {Condition}",
+                opts.BaseUrl, notification.ConditionId);
             return;
+        }
 
         var payload = NtfyMessageBuilder.BuildDecidedPayload(
             topic, notification.Title, decisionSummary, notification.CorrelationToken, opts);
+
+        var result = await PostAsync(opts, payload, notification.ConditionId, ct);
+        if (result is { Ok: false })
+        {
+            _log.LogWarning("NtfyNotificationProvider: decision update failed ({Error}) for condition {Condition}",
+                result.Error, notification.ConditionId);
+        }
+    }
+
+    /// <summary>Publish one payload through the shared transport: resolves
+    /// the per-call timeout, mints the client (which re-validates
+    /// <see cref="NtfyPluginOptions.BaseUrl"/>), and reads the token fresh
+    /// from the credential chain. Returns null when the transport itself
+    /// failed — the error is already logged; an unsuccessful
+    /// <see cref="NtfyApiClient.PostResult"/> still reaches the caller so it
+    /// can log the ntfy-side reason.</summary>
+    private async Task<NtfyApiClient.PostResult?> PostAsync(
+        NtfyPluginOptions opts,
+        Dictionary<string, object?> payload,
+        string conditionId,
+        CancellationToken ct)
+    {
         var timeout = opts.PostTimeoutSeconds >= 1
             ? TimeSpan.FromSeconds(opts.PostTimeoutSeconds)
-            : TimeSpan.FromSeconds(15);
-
+            : TimeSpan.FromSeconds(NtfyPluginOptions.DefaultPostTimeoutSeconds);
         try
         {
             var api = new NtfyApiClient(_httpClients.CreateClient(), opts.BaseUrl);
-            var result = await api.PublishAsync(
+            return await api.PublishAsync(
                 Environment.GetEnvironmentVariable(opts.TokenEnvVar), payload, timeout, ct);
-            if (!result.Ok)
-            {
-                _log.LogWarning("NtfyNotificationProvider: decision update failed ({Error}) for condition {Condition}",
-                    result.Error, notification.ConditionId);
-            }
         }
         catch (OperationCanceledException)
         {
@@ -225,8 +223,9 @@ public sealed class NtfyNotificationProvider : INotificationProvider, IPluginIni
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "NtfyNotificationProvider: decision update failed for condition {Condition}",
-                notification.ConditionId);
+            _log.LogError(ex, "NtfyNotificationProvider: delivery failed for condition {Condition}",
+                conditionId);
+            return null;
         }
     }
 
@@ -241,10 +240,6 @@ public sealed class NtfyNotificationProvider : INotificationProvider, IPluginIni
         !string.IsNullOrWhiteSpace(opts.PublicBaseUrl)
             ? opts.PublicBaseUrl.Trim()
             : _configuration["CodeyBox:PublicBaseUrl"];
-
-    private static bool IsUsableBaseUrl(string baseUrl) =>
-        Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
-        && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp);
 
     private static string? ResolveTopic(Notification notification, NtfyPluginOptions opts)
     {

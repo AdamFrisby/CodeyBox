@@ -3923,31 +3923,11 @@ builder.Services.Configure<InteractionsOptions>(
     builder.Configuration.GetSection("CodeyBox:Notifications:Interactions"));
 builder.Services.AddSingleton<IInteractionDedupStore, InMemoryInteractionDedupStore>();
 builder.Services.AddSingleton<IInteractionVerifier>(sp =>
-{
-    var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
-    InteractionProviderOptions? Opts(string name) =>
-        monitor.CurrentValue.Providers.FirstOrDefault(p =>
-            string.Equals(p.Provider, name, StringComparison.OrdinalIgnoreCase));
-    // The verifier reads live options per call via the accessor so
-    // hot-reloaded configuration takes effect without a restart.
-    return new HmacInteractionVerifier("generic", () => Opts("generic"));
-});
+    new HmacInteractionVerifier("generic", Program.InteractionProviderOpts(sp, "generic")));
 builder.Services.AddSingleton<IInteractionVerifier>(sp =>
-{
-    var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
-    InteractionProviderOptions? Opts(string name) =>
-        monitor.CurrentValue.Providers.FirstOrDefault(p =>
-            string.Equals(p.Provider, name, StringComparison.OrdinalIgnoreCase));
-    return new SlackInteractionVerifier("slack", () => Opts("slack"));
-});
+    new SlackInteractionVerifier("slack", Program.InteractionProviderOpts(sp, "slack")));
 builder.Services.AddSingleton<IInteractionVerifier>(sp =>
-{
-    var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
-    InteractionProviderOptions? Opts(string name) =>
-        monitor.CurrentValue.Providers.FirstOrDefault(p =>
-            string.Equals(p.Provider, name, StringComparison.OrdinalIgnoreCase));
-    return new NtfyInteractionVerifier("ntfy", () => Opts("ntfy"));
-});
+    new NtfyInteractionVerifier("ntfy", Program.InteractionProviderOpts(sp, "ntfy")));
 
 // --- Changelog automation ----------------------------------------------------
 // Named HTTP client for direct Anthropic Messages API calls (changelog generation).
@@ -9325,5 +9305,19 @@ public partial class Program
             ResumeTimeout = shutdown.SandboxResumeTimeout,
             AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
         };
+    }
+
+    /// <summary>
+    /// Live per-provider options accessor for an inbound interaction
+    /// verifier: the verifier reads current options per call through the
+    /// monitor, so hot-reloaded configuration takes effect without a
+    /// restart.
+    /// </summary>
+    internal static Func<InteractionProviderOptions?> InteractionProviderOpts(
+        IServiceProvider sp, string providerName)
+    {
+        var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
+        return () => monitor.CurrentValue.Providers.FirstOrDefault(p =>
+            string.Equals(p.Provider, providerName, StringComparison.OrdinalIgnoreCase));
     }
 }

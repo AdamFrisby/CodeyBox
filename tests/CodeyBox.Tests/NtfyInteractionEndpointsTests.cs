@@ -156,7 +156,7 @@ public sealed class NtfyInteractionEndpointsTests : IDisposable
     }
 
     [Fact]
-    public async Task MissingSignature_RejectedBeforeSemanticProcessing()
+    public async Task InvalidSignature_RejectedBeforeSemanticProcessing()
     {
         var item = await CreateWorkItemAsync();
         await CreateQuestionAsync(item);
@@ -280,6 +280,29 @@ public sealed class NtfyInteractionEndpointsTests : IDisposable
         var headers = new Dictionary<string, string> { ["X-CodeyBox-Signature"] = Sign("""{"interactionId":"x"}""") };
 
         var result = await verifier.VerifyAsync(body, headers, CancellationToken.None);
+
+        Assert.True(result.Valid);
+    }
+
+    [Fact]
+    public async Task NtfyVerifier_SignatureHeaderOverrideDoesNotApply()
+    {
+        // The plugin mints buttons with the contract header and cannot see
+        // this host's options, so a SignatureHeader override must not change
+        // which header the ntfy verifier reads.
+        var opts = new InteractionProviderOptions
+        {
+            Provider = "ntfy",
+            Scheme = "ntfy-hmac",
+            SigningSecretEnvVar = SecretEnvVar,
+            SignatureHeader = "X-Custom-Signature",
+        };
+        var verifier = new NtfyInteractionVerifier("ntfy", () => opts);
+        var body = """{"interactionId":"x"}""";
+        var headers = new Dictionary<string, string> { ["X-CodeyBox-Signature"] = Sign(body) };
+
+        var result = await verifier.VerifyAsync(
+            Encoding.UTF8.GetBytes(body), headers, CancellationToken.None);
 
         Assert.True(result.Valid);
     }

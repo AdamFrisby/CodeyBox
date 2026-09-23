@@ -21,8 +21,9 @@ internal static class NtfyMessageBuilder
     public const int NtfyMaxActions = 3;
 
     /// <summary>Header each <c>http</c> action button carries the payload MAC
-    /// in. Same name the host's inbound verifiers read by default.</summary>
-    public const string SignatureHeader = "X-CodeyBox-Signature";
+    /// in. The name is fixed by <see cref="InteractionContract"/>: the host's
+    /// ntfy verifier reads this same header, so it is not operator-overridable.</summary>
+    public const string SignatureHeader = InteractionContract.DefaultSignatureHeader;
 
     /// <summary>Value prefix on <see cref="SignatureHeader"/>.</summary>
     public const string SignaturePrefix = "sha256=";
@@ -34,21 +35,32 @@ internal static class NtfyMessageBuilder
     public const string SubscriberUserId = "subscriber";
 
     /// <summary>Endpoint-relative path action buttons call back to.</summary>
-    public const string InteractionsPath = "/webhooks/interactions/ntfy";
+    public const string InteractionsPath = InteractionContract.RoutePrefix + "/ntfy";
 
     /// <summary>Upper bound the host's inbound endpoint places on the answer
-    /// field (InteractionEndpoints.ValidatePayload). A button whose answer
-    /// would exceed it can never resolve, so it is not rendered.</summary>
-    public const int MaxAnswerChars = 4000;
+    /// field (<see cref="InteractionContract.MaxAnswerChars"/>). A button whose
+    /// answer would exceed it can never resolve, so it is not rendered.</summary>
+    public const int MaxAnswerChars = InteractionContract.MaxAnswerChars;
 
     /// <summary>Sequence-id budget in characters; derived ids stay URL-safe
     /// ([A-Za-z0-9_-]) so they can ride the ntfy path/header forms too.</summary>
     public const int MaxSequenceIdChars = 96;
 
-    private static readonly JsonSerializerOptions CodecJson = new()
-    {
-        PropertyNamingPolicy = null,
-    };
+    /// <summary>Character budget for one rendered action-button label.</summary>
+    public const int MaxActionLabelChars = 64;
+
+    /// <summary>Character budgets for a structured field's key and value when
+    /// rendered into the plain-text message body.</summary>
+    public const int MaxFieldKeyChars = 100;
+    public const int MaxFieldValueChars = 500;
+
+    /// <summary>ntfy priority for the decision republish: below default, since
+    /// the resolved question is informational, not a prompt.</summary>
+    public const int DecidedPriority = 2;
+
+    // Payload keys are emitted verbatim from the dictionary literals in
+    // BuildInteractionBody — naming policies never apply to dictionary keys.
+    private static readonly JsonSerializerOptions CodecJson = new();
 
     /// <summary>ntfy priority for a severity: 5 urgent, 4 high, 3 default.</summary>
     public static int PriorityFor(NotificationSeverity severity) => severity switch
@@ -77,6 +89,39 @@ internal static class NtfyMessageBuilder
         if (maxChars <= marker.Length)
             return text[..maxChars];
         return text[..(maxChars - marker.Length)] + marker;
+    }
+
+    /// <summary>Truncate to a UTF-8 <em>byte</em> budget, marking the cut and
+    /// never splitting a code point. ntfy bounds the message body in bytes,
+    /// so the text must be measured the way the server will measure it —
+    /// multi-byte text would otherwise sail past the ceiling.</summary>
+    public static string TruncateUtf8(string text, int maxBytes)
+    {
+        if (maxBytes < 1)
+            return string.Empty;
+        if (Encoding.UTF8.GetByteCount(text) <= maxBytes)
+            return text;
+        const string marker = "… (truncated)";
+        var markerBytes = Encoding.UTF8.GetByteCount(marker);
+        return maxBytes <= markerBytes
+            ? CutUtf8(text, maxBytes)
+            : CutUtf8(text, maxBytes - markerBytes) + marker;
+    }
+
+    /// <summary>Longest prefix of <paramref name="text"/> whose UTF-8
+    /// encoding fits <paramref name="maxBytes"/>.</summary>
+    private static string CutUtf8(string text, int maxBytes)
+    {
+        var used = 0;
+        var chars = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (used + rune.Utf8SequenceLength > maxBytes)
+                break;
+            used += rune.Utf8SequenceLength;
+            chars += rune.Utf16SequenceLength;
+        }
+        return text[..chars];
     }
 
     /// <summary>Deterministic sequence id for a correlation token. Publishing
@@ -148,13 +193,18 @@ internal static class NtfyMessageBuilder
 
     /// <summary>Public callback URL for action buttons, or null when the
     /// configured base is missing/unsafe (buttons then degrade to links —
-    /// a question must never render unanswerable). HTTPS required; HTTP is
-    /// allowed only for loopback, matching the host's PublicBaseUrl policy.</summary>
+    /// a question must never render unanswerable). Matches the host's
+    /// PublicBaseUrl policy exactly: HTTPS required (HTTP only for
+    /// loopback), and credentials, a path, query, or fragment reject the
+    /// value rather than being silently stripped.</summary>
     public static string? CallbackUrl(string? publicBaseUrl)
     {
         if (string.IsNullOrWhiteSpace(publicBaseUrl)
             || !Uri.TryCreate(publicBaseUrl, UriKind.Absolute, out var uri)
-            || !string.IsNullOrEmpty(uri.UserInfo))
+            || !string.IsNullOrEmpty(uri.UserInfo)
+            || uri.AbsolutePath != "/"
+            || !string.IsNullOrEmpty(uri.Query)
+            || !string.IsNullOrEmpty(uri.Fragment))
             return null;
         var https = string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
         var loopbackHttp = string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
@@ -165,12 +215,17 @@ internal static class NtfyMessageBuilder
     }
 
     /// <summary>Deep link to the Agnes front end for the owning work item.
-    /// Agnes steers; this integration only links. Null when unconfigured.</summary>
+    /// Agnes steers; this integration only links. Null when unconfigured or
+    /// when the configured base is not an absolute http(s) URI — the value
+    /// lands in a rendered action URL, so it gets the same scheme guard as
+    /// any other link.</summary>
     public static string? AgnesWorkItemUrl(NtfyPluginOptions options, string? workItemId)
     {
         if (string.IsNullOrWhiteSpace(options.AgnesBaseUrl) || string.IsNullOrWhiteSpace(workItemId))
             return null;
-        if (!Uri.TryCreate(options.AgnesBaseUrl, UriKind.Absolute, out var baseUri))
+        if (!Uri.TryCreate(options.AgnesBaseUrl, UriKind.Absolute, out var baseUri)
+            || !string.Equals(baseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(baseUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
             return null;
         return $"{baseUri.ToString().TrimEnd('/')}/workitems/{Uri.EscapeDataString(workItemId)}";
     }
@@ -222,7 +277,7 @@ internal static class NtfyMessageBuilder
                 actions.Add(new Dictionary<string, object?>
                 {
                     ["action"] = "http",
-                    ["label"] = Truncate(action.Label, 64),
+                    ["label"] = Truncate(action.Label, MaxActionLabelChars),
                     ["url"] = callbackUrl,
                     ["method"] = "POST",
                     ["headers"] = new Dictionary<string, object?>
@@ -297,8 +352,8 @@ internal static class NtfyMessageBuilder
         {
             ["topic"] = topic,
             ["title"] = Truncate($"✅ {title}", options.MaxTitleChars),
-            ["message"] = Truncate(decisionSummary, options.MaxMessageChars),
-            ["priority"] = 2,
+            ["message"] = TruncateUtf8(decisionSummary, options.MaxMessageBytes),
+            ["priority"] = DecidedPriority,
             ["tags"] = new[] { "white_check_mark" },
             ["sequence_id"] = SequenceIdFor(correlationToken),
         };
@@ -320,14 +375,14 @@ internal static class NtfyMessageBuilder
                     break;
                 if (string.IsNullOrWhiteSpace(key))
                     continue;
-                sb.Append('\n').Append(Truncate(key.Trim(), 100)).Append(": ").Append(Truncate(value, 500));
+                sb.Append('\n').Append(Truncate(key.Trim(), MaxFieldKeyChars)).Append(": ").Append(Truncate(value, MaxFieldValueChars));
                 rendered++;
             }
         }
         foreach (var line in linkLines)
             sb.Append('\n').Append(line);
         sb.Append('\n').Append($"CodeyBox · {notification.ConditionId} · {notification.Timestamp.UtcDateTime:yyyy-MM-dd HH:mm} UTC");
-        return Truncate(sb.ToString(), options.MaxMessageChars);
+        return TruncateUtf8(sb.ToString(), options.MaxMessageBytes);
     }
 
     private static IEnumerable<(string Label, string Url)> LinkButtons(

@@ -13,12 +13,9 @@ namespace CodeyBox.NtfyPlugin;
 /// </summary>
 internal sealed class NtfyApiException : Exception
 {
-    public string ErrorCode { get; }
-
-    public NtfyApiException(string errorCode, string message, Exception? inner = null)
+    public NtfyApiException(string message, Exception? inner = null)
         : base(message, inner)
     {
-        ErrorCode = errorCode;
     }
 }
 
@@ -35,6 +32,10 @@ internal sealed class NtfyApiClient
     /// <summary>Response body bytes read when extracting an error reason.</summary>
     private const int MaxErrorBodyBytes = 8 * 1024;
 
+    /// <summary>Characters of the server's error reason surfaced in a
+    /// <see cref="PostResult"/>.</summary>
+    private const int MaxErrorReasonChars = 200;
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
@@ -43,11 +44,30 @@ internal sealed class NtfyApiClient
     private readonly HttpClient _http;
     private readonly string _publishUrl;
 
+    /// <summary>The sink carries its own guard: publishes attach a bearer
+    /// token and MAC-signed bodies, so the target must be an absolute HTTPS
+    /// origin (HTTP only for loopback), never a caller-supplied string that
+    /// slipped past the provider's check.</summary>
     public NtfyApiClient(HttpClient http, string baseUrl)
     {
+        if (!IsUsableBaseUrl(baseUrl))
+            throw new ArgumentException(
+                "ntfy BaseUrl must be an absolute HTTPS origin (HTTP allowed only for loopback), with no credentials, path, query, or fragment.",
+                nameof(baseUrl));
         _http = http;
         _publishUrl = $"{baseUrl.TrimEnd('/')}/";
     }
+
+    /// <summary>Whether a configured server URL is safe to publish to —
+    /// the same origin policy the host applies to PublicBaseUrl.</summary>
+    internal static bool IsUsableBaseUrl(string? baseUrl) =>
+        Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
+        && (uri.Scheme == Uri.UriSchemeHttps
+            || (uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback))
+        && string.IsNullOrEmpty(uri.UserInfo)
+        && uri.AbsolutePath == "/"
+        && string.IsNullOrEmpty(uri.Query)
+        && string.IsNullOrEmpty(uri.Fragment);
 
     public sealed record PostResult(bool Ok, string? Error);
 
@@ -86,7 +106,7 @@ internal sealed class NtfyApiClient
         }
         catch (Exception ex) when (ex is HttpRequestException or IOException)
         {
-            throw new NtfyApiException("transport", "ntfy publish request did not complete.", ex);
+            throw new NtfyApiException("ntfy publish request did not complete.", ex);
         }
 
         using (response)
@@ -95,7 +115,9 @@ internal sealed class NtfyApiClient
                 return new PostResult(true, null);
 
             // ntfy answers errors as {"code":…,"http":…,"error":"…"} — surface
-            // the fixed reason field, bounded, never the raw body.
+            // the fixed reason field, bounded and flattened to one line (the
+            // server is a dependency, so its text is untrusted log input),
+            // never the raw body.
             try
             {
                 var body = await ReadBoundedAsync(response, timeoutCts.Token);
@@ -104,9 +126,9 @@ internal sealed class NtfyApiClient
                     && err.ValueKind == JsonValueKind.String
                     && !string.IsNullOrWhiteSpace(err.GetString()))
                 {
-                    var reason = err.GetString()!;
+                    var reason = err.GetString()!.ReplaceLineEndings(" ");
                     return new PostResult(false,
-                        $"http-{(int)response.StatusCode}: {reason[..Math.Min(reason.Length, 200)]}");
+                        $"http-{(int)response.StatusCode}: {reason[..Math.Min(reason.Length, MaxErrorReasonChars)]}");
                 }
             }
             catch (OperationCanceledException)
