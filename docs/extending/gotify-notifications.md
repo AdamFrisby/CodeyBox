@@ -126,14 +126,20 @@ inbound.
   when present, else the Agnes work-item link — a tap opens the route to
   answer or steer.
 - **Markdown safety**: notification content is markdown-escaped before
-  interpolation, and only absolute http(s) URLs are ever emitted as links
-  or click targets.
+  interpolation, field values are flattened to a single line so they cannot
+  inject block structure, and only absolute http(s) URLs are ever emitted —
+  in canonical percent-encoded form, with destinations that could break
+  out of a markdown link refused.
 - **Loop-close**: Gotify has no message-update API and no authenticated
   callback, so a landed decision cannot be reflected back into the
   original message; the channel of record for "what was decided and by
   whom" is the CodeyBox questions page the message links to.
 - **Failures**: a delivery failure (transport, non-2xx, timeout) is logged
-  and swallowed — it never affects a work item.
+  and swallowed — it never affects a work item. The plugin owns its HTTP
+  client and never follows redirects — a 3xx would re-send the application
+  token to a server-chosen host — bounds the buffered response body at
+  64 KiB, and sanitizes server-supplied error text before it can reach
+  the logs.
 
 ## Inbound exposure
 

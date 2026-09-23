@@ -9,8 +9,10 @@ namespace CodeyBox.GotifyPlugin;
 /// Severity maps to the message priority plus an emoji marker in the title;
 /// summary and fields render as markdown (or plain text) rather than a
 /// dumped blob. All decision logic lives here as input→output functions;
-/// the provider only transports the result. Bounds come from
-/// <see cref="GotifyPluginOptions"/> so every cap is operator-configurable.
+/// the provider only transports the result. Operator-configurable bounds
+/// come from <see cref="GotifyPluginOptions"/>; the fixed presentation caps
+/// (title length, field name/value lengths) are named constants — shared
+/// with every provider via <see cref="NotificationRendering"/>.
 ///
 /// <para>Gotify cannot carry an authenticated interaction — messages offer
 /// no answer buttons and no callback scheme — so offered actions never
@@ -29,6 +31,13 @@ internal static class GotifyMessageBuilder
     /// <summary>Title cap. Gotify does not document a title limit; this is a
     /// presentation bound so a runaway title cannot swamp a push preview.</summary>
     public const int MaxTitleChars = 200;
+
+    /// <summary>Characters that would terminate a markdown link destination
+    /// (<c>[label](dest)</c>) early and let the remainder render as
+    /// arbitrary markup. Canonical <see cref="Uri.AbsoluteUri"/> output is
+    /// already percent-encoded, so only legal literal URI characters can
+    /// appear — parens and angle brackets among them.</summary>
+    private static readonly char[] MarkdownDestUnsafe = ['(', ')', '<', '>'];
 
     /// <summary>Emoji marker for a severity (unicode — Gotify clients render
     /// UTF-8 directly, unlike Slack's colon syntax).</summary>
@@ -66,48 +75,15 @@ internal static class GotifyMessageBuilder
         return sb.ToString();
     }
 
-    /// <summary>Truncate to a character budget, marking the cut.</summary>
-    public static string Truncate(string text, int maxChars)
-    {
-        if (maxChars < 1)
-            return string.Empty;
-        if (text.Length <= maxChars)
-            return text;
-        const string marker = "… (truncated)";
-        if (maxChars <= marker.Length)
-            return text[..maxChars];
-        return text[..(maxChars - marker.Length)] + marker;
-    }
-
-    /// <summary>Whether <paramref name="url"/> is safe to emit as a rendered
-    /// link / click target: an absolute http(s) URI only. The sink carries
-    /// its own guard so a malformed or non-web scheme
-    /// (<c>javascript:</c>, <c>file:</c>) can never reach a client.</summary>
-    public static bool IsSafeLink(string? url) =>
-        !string.IsNullOrWhiteSpace(url)
-        && Uri.TryCreate(url, UriKind.Absolute, out var uri)
-        && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp);
-
-    /// <summary>Deep link from a notification to the Agnes front end for the
-    /// owning work item. Agnes steers; this integration only links. Returns
-    /// null when no base URL is configured or no work item is bound.</summary>
-    public static string? AgnesWorkItemUrl(GotifyPluginOptions options, string? workItemId)
-    {
-        if (string.IsNullOrWhiteSpace(options.AgnesBaseUrl) || string.IsNullOrWhiteSpace(workItemId))
-            return null;
-        if (!IsSafeLink(options.AgnesBaseUrl))
-            return null;
-        return $"{options.AgnesBaseUrl.TrimEnd('/')}/workitems/{Uri.EscapeDataString(workItemId)}";
-    }
-
     /// <summary>Build the <c>POST /message</c> JSON body for a
     /// notification.</summary>
     public static Dictionary<string, object?> BuildMessage(
         Notification notification,
         GotifyPluginOptions options)
     {
-        var workItemId = BindWorkItemId(notification);
-        var body = Truncate(notification.Body ?? notification.Summary ?? notification.Title, options.MaxTextChars);
+        var workItemId = NotificationBinding.WorkItemIdFor(notification);
+        var body = NotificationRendering.Truncate(
+            notification.Body ?? notification.Summary ?? notification.Title, options.MaxTextChars);
 
         var message = new StringBuilder();
         if (options.Markdown)
@@ -126,9 +102,8 @@ internal static class GotifyMessageBuilder
                 ["contentType"] = options.Markdown ? "text/markdown" : "text/plain",
             },
         };
-        var clickUrl = IsSafeLink(notification.AnswerUrl)
-            ? notification.AnswerUrl
-            : AgnesWorkItemUrl(options, workItemId);
+        var clickUrl = NotificationLinks.SafeLinkUri(notification.AnswerUrl)?.AbsoluteUri
+            ?? NotificationLinks.AgnesWorkItemUrl(options.AgnesBaseUrl, workItemId);
         if (clickUrl is not null)
         {
             extras["client::notification"] = new Dictionary<string, object?>
@@ -139,26 +114,26 @@ internal static class GotifyMessageBuilder
 
         return new Dictionary<string, object?>
         {
-            ["title"] = Truncate($"{EmojiFor(notification.Severity)} {notification.Title}", MaxTitleChars),
+            ["title"] = NotificationRendering.Truncate(
+                $"{EmojiFor(notification.Severity)} {notification.Title}", MaxTitleChars),
             ["message"] = message.ToString(),
             ["priority"] = PriorityFor(notification.Severity, options),
             ["extras"] = extras,
         };
     }
 
-    private static string? BindWorkItemId(Notification notification)
-    {
-        if (notification.Actions is { Count: > 0 })
-        {
-            var first = notification.Actions[0];
-            if (!string.IsNullOrWhiteSpace(first.WorkItemId))
-                return first.WorkItemId;
-        }
-        if (!string.IsNullOrWhiteSpace(notification.CorrelationToken)
-            && NotificationCorrelation.TryParse(notification.CorrelationToken, out var workItemId, out _))
-            return workItemId;
-        return null;
-    }
+    /// <summary>Whether <paramref name="canonicalUrl"/> is safe to
+    /// interpolate as a markdown link destination: canonical
+    /// <see cref="Uri.AbsoluteUri"/> form with no character that would close
+    /// the destination early.</summary>
+    private static bool IsMarkdownLinkSafe(string? canonicalUrl) =>
+        canonicalUrl is not null && canonicalUrl.IndexOfAny(MarkdownDestUnsafe) < 0;
+
+    /// <summary>Collapse line breaks so a field cannot break out of its
+    /// bullet line and inject markdown block structure (fake headings,
+    /// rules, list items) into the rendered message.</summary>
+    private static string SingleLine(string text) =>
+        text.Replace('\r', ' ').Replace('\n', ' ');
 
     private static void AppendFields(StringBuilder message, Notification notification, GotifyPluginOptions options)
     {
@@ -171,8 +146,8 @@ internal static class GotifyMessageBuilder
                 break;
             if (string.IsNullOrWhiteSpace(key))
                 continue;
-            var name = Truncate(key, 100);
-            var val = Truncate(value, 500);
+            var name = NotificationRendering.Truncate(SingleLine(key), NotificationRendering.MaxFieldNameChars);
+            var val = NotificationRendering.Truncate(SingleLine(value), NotificationRendering.MaxFieldValueChars);
             lines.Add(options.Markdown
                 ? $"- **{EscapeMarkdown(name)}**: {EscapeMarkdown(val)}"
                 : $"{name}: {val}");
@@ -187,22 +162,26 @@ internal static class GotifyMessageBuilder
         GotifyPluginOptions options,
         string? workItemId)
     {
-        var answerUrl = IsSafeLink(notification.AnswerUrl) ? notification.AnswerUrl : null;
-        var agnesUrl = AgnesWorkItemUrl(options, workItemId);
+        // Emit the canonical AbsoluteUri, never the raw string: a URI is
+        // percent-encoded form, so whitespace and markup characters cannot
+        // smuggle into the destination verbatim.
+        var answerUrl = NotificationLinks.SafeLinkUri(notification.AnswerUrl)?.AbsoluteUri;
+        var agnesUrl = NotificationLinks.AgnesWorkItemUrl(options.AgnesBaseUrl, workItemId);
         if (answerUrl is null && agnesUrl is null)
             return;
 
-        message.Append("\n\n");
         if (options.Markdown)
         {
             var links = new List<string>(2);
-            if (answerUrl is not null)
+            if (IsMarkdownLinkSafe(answerUrl))
                 links.Add($"[Answer in CodeyBox]({answerUrl})");
-            if (agnesUrl is not null)
+            if (IsMarkdownLinkSafe(agnesUrl))
                 links.Add($"[Open in Agnes]({agnesUrl})");
-            message.Append(string.Join(" · ", links));
+            if (links.Count > 0)
+                message.Append("\n\n").Append(string.Join(" · ", links));
             return;
         }
+        message.Append("\n\n");
         if (answerUrl is not null)
             message.Append("Answer here: ").Append(answerUrl);
         if (agnesUrl is not null)

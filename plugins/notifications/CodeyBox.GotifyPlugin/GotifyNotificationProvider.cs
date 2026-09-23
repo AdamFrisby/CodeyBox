@@ -26,21 +26,26 @@ namespace CodeyBox.GotifyPlugin;
 ///
 /// <para>Credential split honoured: Gotify application tokens send, client
 /// tokens read — this provider sends, so it holds only the application
-/// token via the environment (never config files). Off unless an operator
-/// enables it: <c>Enabled</c> defaults to false. A delivery failure never
-/// affects a work item — it is logged and swallowed, per the provider
+/// token via the environment (never config files). The token rides in a
+/// request header, so the plugin owns its HTTP client
+/// (<see cref="GotifyHttpClients"/>) rather than sharing the host factory:
+/// it never follows a redirect, which would re-send the credential to a
+/// server-chosen host. Off unless an operator enables it:
+/// <c>Enabled</c> defaults to false. A delivery failure never affects a
+/// work item — it is logged and swallowed, per the provider
 /// contract.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: GotifyNotificationProvider.PluginId,
     displayName: "CodeyBox: Gotify Notifications",
     minHostApiVersion: "1.3")]
-public sealed class GotifyNotificationProvider : INotificationProvider, IPluginInitializer
+public sealed class GotifyNotificationProvider : INotificationProvider, IPluginInitializer, IDisposable
 {
     public const string PluginId = "codeybox.gotify";
 
     private readonly IConfiguration _configuration;
-    private readonly IHttpClientFactory _httpClients;
+    private readonly HttpClient _http;
+    private readonly bool _ownsHttp;
     private readonly ILogger<GotifyNotificationProvider> _log;
 
     private ILogger _pluginLog = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
@@ -54,23 +59,28 @@ public sealed class GotifyNotificationProvider : INotificationProvider, IPluginI
 
     public GotifyNotificationProvider(
         IConfiguration configuration,
-        IHttpClientFactory httpClients,
         ILogger<GotifyNotificationProvider> logger)
     {
         _configuration = configuration;
-        _httpClients = httpClients;
+        _http = GotifyHttpClients.Create();
+        _ownsHttp = true;
         _log = logger;
     }
 
     internal GotifyNotificationProvider(
         IConfiguration configuration,
         HttpClient httpClient,
-        ILogger<GotifyNotificationProvider> logger,
-        IHttpClientFactory? httpClients = null)
+        ILogger<GotifyNotificationProvider> logger)
     {
         _configuration = configuration;
-        _httpClients = httpClients ?? new SingleClientFactory(httpClient);
+        _http = httpClient;
         _log = logger;
+    }
+
+    public void Dispose()
+    {
+        if (_ownsHttp)
+            _http.Dispose();
     }
 
     public Task InitializeAsync(PluginContext context, CancellationToken ct)
@@ -105,7 +115,7 @@ public sealed class GotifyNotificationProvider : INotificationProvider, IPluginI
         }
 
         var token = Environment.GetEnvironmentVariable(opts.AppTokenEnvVar);
-        if (string.IsNullOrEmpty(token))
+        if (string.IsNullOrWhiteSpace(token))
         {
             _log.LogWarning("GotifyNotificationProvider: env var '{EnvVar}' is not set; skipping notification {Condition}",
                 opts.AppTokenEnvVar, notification.ConditionId);
@@ -113,15 +123,12 @@ public sealed class GotifyNotificationProvider : INotificationProvider, IPluginI
         }
 
         var payload = GotifyMessageBuilder.BuildMessage(notification, opts);
-        var timeout = opts.PostTimeoutSeconds >= 1
-            ? TimeSpan.FromSeconds(opts.PostTimeoutSeconds)
-            : TimeSpan.FromSeconds(15);
+        var timeout = NotificationDelivery.PostTimeoutOrDefault(opts.PostTimeoutSeconds, _log);
 
         GotifyApiClient.PostResult result;
         try
         {
-            var client = _httpClients.CreateClient();
-            var api = new GotifyApiClient(client);
+            var api = new GotifyApiClient(_http);
             result = await api.PostMessageAsync(token, endpoint, payload, timeout, ct);
         }
         catch (OperationCanceledException)
@@ -194,12 +201,5 @@ public sealed class GotifyNotificationProvider : INotificationProvider, IPluginI
         }
         endpoint = uri;
         return true;
-    }
-
-    private sealed class SingleClientFactory : IHttpClientFactory
-    {
-        private readonly HttpClient _client;
-        public SingleClientFactory(HttpClient client) => _client = client;
-        public HttpClient CreateClient(string name) => _client;
     }
 }

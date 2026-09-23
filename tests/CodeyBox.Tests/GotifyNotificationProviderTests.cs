@@ -454,6 +454,109 @@ public sealed class GotifyNotificationProviderTests
     }
 
     [Fact]
+    public async Task FieldValue_NewlinesCannotInjectMarkdownBlocks()
+    {
+        Environment.SetEnvironmentVariable(TokenEnvVar, Token);
+        try
+        {
+            var handler = new CapturingHttpHandler(_ =>
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(GotifyCreatedJson),
+                });
+            var provider = BuildProvider(EnabledConfig(), new HttpClient(handler));
+
+            await provider.SendAsync(MakeNotification(
+                fields: new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["detail"] = "line one\n## forged heading\n- [x](https://evil.invalid)",
+                }),
+                CancellationToken.None);
+
+            var req = Assert.Single(handler.Requests);
+            using var doc = JsonDocument.Parse(req.Body);
+            var message = doc.RootElement.GetProperty("message").GetString()!;
+
+            // The field renders as one bullet line: newlines flattened, so a
+            // value cannot break out and inject markdown block structure.
+            Assert.Contains("- **detail**: line one ## forged heading - ", message);
+            Assert.DoesNotContain("\n## forged heading", message);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TokenEnvVar, null);
+        }
+    }
+
+    [Fact]
+    public async Task AnswerUrl_WithLinkUnsafeChars_NotEmittedAsMarkdownLink()
+    {
+        Environment.SetEnvironmentVariable(TokenEnvVar, Token);
+        try
+        {
+            var handler = new CapturingHttpHandler(_ =>
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(GotifyCreatedJson),
+                });
+            var provider = BuildProvider(EnabledConfig(), new HttpClient(handler));
+
+            // A ')' would terminate the markdown link destination and let
+            // the tail render as arbitrary markup — the link is dropped,
+            // but the URL is still a valid click target (a JSON field, not
+            // markdown), so the question stays answerable.
+            var answerUrl = "https://codeybox.example.invalid/workitems/work-1)/questions";
+            await provider.SendAsync(MakeNotification(answerUrl: answerUrl), CancellationToken.None);
+
+            var req = Assert.Single(handler.Requests);
+            using var doc = JsonDocument.Parse(req.Body);
+            var root = doc.RootElement;
+            var message = root.GetProperty("message").GetString()!;
+
+            Assert.DoesNotContain("[Answer in CodeyBox](", message);
+            Assert.Equal(answerUrl,
+                root.GetProperty("extras").GetProperty("client::notification")
+                    .GetProperty("click").GetProperty("url").GetString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TokenEnvVar, null);
+        }
+    }
+
+    [Fact]
+    public async Task InvalidPostTimeout_FallsBackToDefault_AndWarns()
+    {
+        Environment.SetEnvironmentVariable(TokenEnvVar, Token);
+        try
+        {
+            var handler = new CapturingHttpHandler(_ =>
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(GotifyCreatedJson),
+                });
+            var logger = new CapturingLogger<GotifyNotificationProvider>();
+            var config = Config(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Plugins:codeybox.gotify:Enabled"] = "true",
+                ["CodeyBox:Plugins:codeybox.gotify:ServerUrl"] = Server,
+                ["CodeyBox:Plugins:codeybox.gotify:PostTimeoutSeconds"] = "0",
+            });
+            var provider = BuildProvider(config, new HttpClient(handler), logger);
+
+            await provider.SendAsync(MakeNotification(), CancellationToken.None);
+
+            Assert.Single(handler.Requests);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning
+                && e.Message.Contains("PostTimeoutSeconds"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TokenEnvVar, null);
+        }
+    }
+
+    [Fact]
     public async Task GotifyError_LogsWarning_DoesNotThrow()
     {
         Environment.SetEnvironmentVariable(TokenEnvVar, Token);

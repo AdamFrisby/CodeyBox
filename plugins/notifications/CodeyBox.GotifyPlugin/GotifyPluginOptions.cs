@@ -1,3 +1,5 @@
+using CodeyBox.Core;
+
 namespace CodeyBox.GotifyPlugin;
 
 /// <summary>
@@ -79,8 +81,10 @@ public sealed class GotifyPluginOptions
     public int CriticalPriority { get; set; } = 8;
 
     /// <summary>Per-call timeout in seconds for Gotify REST calls.
-    /// Must be &gt;= 1. Default 15.</summary>
-    public int PostTimeoutSeconds { get; set; } = 15;
+    /// Must be &gt;= 1 — an invalid value is overridden with the shared
+    /// <see cref="NotificationDelivery.DefaultPostTimeoutSeconds"/> default
+    /// and a warning.</summary>
+    public int PostTimeoutSeconds { get; set; } = NotificationDelivery.DefaultPostTimeoutSeconds;
 
     /// <summary>Maximum characters kept from the notification body before
     /// truncation. Must be &gt;= 1. Default 4000.</summary>

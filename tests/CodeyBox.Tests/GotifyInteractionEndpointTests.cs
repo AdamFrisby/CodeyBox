@@ -205,7 +205,6 @@ internal sealed class GotifyInteractionEndpointFactory : WebApplicationFactory<P
             services.AddSingleton<INotificationProvider>(sp =>
                 new GotifyNotificationProvider(
                     sp.GetRequiredService<IConfiguration>(),
-                    sp.GetRequiredService<IHttpClientFactory>(),
                     sp.GetRequiredService<ILogger<GotifyNotificationProvider>>()));
         });
     }

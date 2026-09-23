@@ -30,8 +30,8 @@ public sealed class SlackBlockKitTests
     [Fact]
     public void Truncate_MarksTheCut()
     {
-        Assert.Equal("abc", SlackBlockKit.Truncate("abc", 10));
-        var cut = SlackBlockKit.Truncate(new string('x', 100), 20);
+        Assert.Equal("abc", NotificationRendering.Truncate("abc", 10));
+        var cut = NotificationRendering.Truncate(new string('x', 100), 20);
         Assert.Equal(20, cut.Length);
         Assert.EndsWith("… (truncated)", cut);
     }
@@ -68,11 +68,13 @@ public sealed class SlackBlockKitTests
     [Fact]
     public void AgnesUrl_NeedsBaseAndWorkItem()
     {
-        var opts = new SlackPluginOptions { AgnesBaseUrl = "https://agnes.example.invalid/" };
         Assert.Equal("https://agnes.example.invalid/workitems/work-1",
-            SlackBlockKit.AgnesWorkItemUrl(opts, "work-1"));
-        Assert.Null(SlackBlockKit.AgnesWorkItemUrl(new SlackPluginOptions(), "work-1"));
-        Assert.Null(SlackBlockKit.AgnesWorkItemUrl(opts, null));
-        Assert.Null(SlackBlockKit.AgnesWorkItemUrl(new SlackPluginOptions { AgnesBaseUrl = "not a url" }, "work-1"));
+            NotificationLinks.AgnesWorkItemUrl("https://agnes.example.invalid/", "work-1"));
+        Assert.Null(NotificationLinks.AgnesWorkItemUrl("", "work-1"));
+        Assert.Null(NotificationLinks.AgnesWorkItemUrl("https://agnes.example.invalid/", null));
+        Assert.Null(NotificationLinks.AgnesWorkItemUrl("not a url", "work-1"));
+        // One safe-link policy for every provider: a non-http(s) base is
+        // refused rather than rendered.
+        Assert.Null(NotificationLinks.AgnesWorkItemUrl("ftp://agnes.example.invalid", "work-1"));
     }
 }

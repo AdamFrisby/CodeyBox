@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -6,19 +7,17 @@ namespace CodeyBox.GotifyPlugin;
 
 /// <summary>
 /// Typed transport failure from the Gotify REST API: the request never
-/// completed (DNS, connection, TLS). Routine API-level outcomes (HTTP
-/// status, timeouts) stay as <see cref="GotifyApiClient.PostResult"/>
-/// values; only a dead transport throws, so the provider can log it as an
-/// error while still swallowing it per the notification contract.
+/// completed (DNS, connection, TLS), or the response body stalled past the
+/// call timeout. Routine API-level outcomes (HTTP status, send-phase
+/// timeouts) stay as <see cref="GotifyApiClient.PostResult"/> values; only
+/// a dead transport or a stalled read throws, so the provider can log it as
+/// an error while still swallowing it per the notification contract.
 /// </summary>
 internal sealed class GotifyApiException : Exception
 {
-    public string ErrorCode { get; }
-
     public GotifyApiException(string errorCode, string message, Exception? inner = null)
-        : base(message, inner)
+        : base($"[{errorCode}] {message}", inner)
     {
-        ErrorCode = errorCode;
     }
 }
 
@@ -27,11 +26,19 @@ internal sealed class GotifyApiException : Exception
 /// application token travels per call in the <c>X-Gotify-Key</c> header —
 /// never in the URL, never stored, never logged. Routine failures surface
 /// as <see cref="PostResult"/> values (the provider logs and swallows, per
-/// the notification contract), a dead transport throws
-/// <see cref="GotifyApiException"/>, and cancellation propagates.
+/// the notification contract), a dead transport or stalled response read
+/// throws <see cref="GotifyApiException"/>, and cancellation propagates.
 /// </summary>
 internal sealed class GotifyApiClient
 {
+    /// <summary>Hard cap on the buffered response body. Gotify envelopes are
+    /// small JSON (<c>{id,…}</c> on success, <c>{errorCode,error,…}</c> on
+    /// failure); the cap stops a hostile or malfunctioning peer — or a LAN
+    /// MITM under <c>AllowPlainHttp</c> — from streaming an unbounded body
+    /// into host memory. The per-call timeout bounds duration; this bounds
+    /// size.</summary>
+    internal const int MaxResponseBodyBytes = 64 * 1024;
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
@@ -53,6 +60,10 @@ internal sealed class GotifyApiClient
         TimeSpan timeout,
         CancellationToken ct)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(appToken);
+        ArgumentNullException.ThrowIfNull(messageEndpoint);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero);
+
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
@@ -65,7 +76,10 @@ internal sealed class GotifyApiClient
         HttpResponseMessage response;
         try
         {
-            response = await _http.SendAsync(request, timeoutCts.Token);
+            // Headers-only completion: the body is streamed under
+            // MaxResponseBodyBytes below rather than buffered unbounded.
+            response = await _http.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -83,14 +97,19 @@ internal sealed class GotifyApiClient
 
         using (response)
         {
-            // Gotify error bodies are small JSON envelopes
-            // ({"errorCode":…,"error":"…","errorDescription":"…"}); the read
-            // stays under the same timeout so a stalled peer cannot hang
-            // the notification path.
+            // The plugin's handler never follows redirects, so a 3xx here is
+            // the peer asking for the token to be re-sent to a Location it
+            // chose — refused as a fixed-vocabulary failure, never retried.
+            if (GotifyHttpClients.IsRedirect(response.StatusCode))
+                return new PostResult(false, null, $"http-{(int)response.StatusCode}-redirect");
+
             string body;
             try
             {
-                body = await response.Content.ReadAsStringAsync(timeoutCts.Token);
+                var (content, tooLarge) = await ReadBodyBoundedAsync(response, timeoutCts.Token);
+                if (tooLarge)
+                    return new PostResult(false, null, "response_too_large");
+                body = content ?? string.Empty;
             }
             catch (OperationCanceledException)
             {
@@ -104,7 +123,7 @@ internal sealed class GotifyApiClient
             }
 
             if (!response.IsSuccessStatusCode)
-                return new PostResult(false, null, DescribeError(response, body));
+                return new PostResult(false, null, DescribeError(response, body, appToken));
 
             try
             {
@@ -123,19 +142,48 @@ internal sealed class GotifyApiClient
         }
     }
 
+    /// <summary>Read the response body under a hard byte cap — enforced
+    /// before buffering, on the declared length and again while streaming —
+    /// so an unbounded body is cut off rather than materialised.</summary>
+    private static async Task<(string? Body, bool TooLarge)> ReadBodyBoundedAsync(
+        HttpResponseMessage response, CancellationToken ct)
+    {
+        if (response.Content.Headers.ContentLength is > MaxResponseBodyBytes)
+            return (null, true);
+
+        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        var buffer = new byte[MaxResponseBodyBytes + 1];
+        var totalRead = 0;
+        while (totalRead < buffer.Length)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(totalRead, buffer.Length - totalRead), ct)
+                .ConfigureAwait(false);
+            if (read == 0)
+                break;
+            totalRead += read;
+        }
+
+        return totalRead > MaxResponseBodyBytes
+            ? (null, true)
+            : (Encoding.UTF8.GetString(buffer, 0, totalRead), false);
+    }
+
     /// <summary>Extract Gotify's error envelope fields without letting a
-    /// hostile or oversized body escape into logs — only the fixed fields
-    /// are taken, each bounded.</summary>
-    private static string DescribeError(HttpResponseMessage response, string body)
+    /// hostile or oversized body escape into logs — only the fixed field is
+    /// taken, control and format characters that could forge log lines are
+    /// stripped, the application token is redacted if the peer echoes it
+    /// back, and the result is bounded.</summary>
+    private static string DescribeError(HttpResponseMessage response, string body, string appToken)
     {
         const int maxFieldChars = 200;
         try
         {
             using var doc = JsonDocument.Parse(body);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.String)
+            if (doc.RootElement.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.String)
             {
-                var text = err.GetString() ?? string.Empty;
+                var text = SanitizeForLog(err.GetString() ?? string.Empty);
+                if (!string.IsNullOrEmpty(appToken) && text.Contains(appToken, StringComparison.Ordinal))
+                    text = text.Replace(appToken, "<redacted>", StringComparison.Ordinal);
                 if (text.Length > maxFieldChars)
                     text = text[..maxFieldChars];
                 return $"http-{(int)response.StatusCode}:{text}";
@@ -145,5 +193,21 @@ internal sealed class GotifyApiClient
         {
         }
         return $"http-{(int)response.StatusCode}";
+    }
+
+    /// <summary>Replace characters that could forge log structure — line
+    /// breaks, ANSI escapes, bidi overrides and other control/format code
+    /// points — with spaces.</summary>
+    private static string SanitizeForLog(string text)
+    {
+        var sb = new StringBuilder(text.Length);
+        foreach (var c in text)
+        {
+            sb.Append(
+                char.IsControl(c) || char.GetUnicodeCategory(c) == UnicodeCategory.Format
+                    ? ' '
+                    : c);
+        }
+        return sb.ToString();
     }
 }
