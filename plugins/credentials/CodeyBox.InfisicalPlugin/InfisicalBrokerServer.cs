@@ -161,6 +161,14 @@ public sealed class InfisicalBrokerServer : IDisposable
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentException.ThrowIfNullOrWhiteSpace(entry.LeaseId);
         ArgumentException.ThrowIfNullOrWhiteSpace(entry.Value);
+        // The credential rides upstream verbatim, so the sink carries its
+        // own guard — not only the options validator upstream: absolute
+        // http(s), and plain http only for loopback hosts.
+        if (!Uri.TryCreate(entry.UpstreamBaseUrl, UriKind.Absolute, out var upstreamBase)
+            || !CredentialOptions.IsCredentialEndpoint(upstreamBase))
+            throw new ArgumentException(
+                "Broker upstream base URL must be an absolute http(s) endpoint; plain http only for loopback hosts.",
+                nameof(entry));
         lock (_lock)
             _entries[entry.LeaseId] = entry;
         _log.LogInformation(

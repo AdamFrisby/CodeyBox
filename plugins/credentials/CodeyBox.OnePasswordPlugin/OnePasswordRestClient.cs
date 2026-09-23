@@ -31,7 +31,7 @@ public sealed class OnePasswordRestClient
     {
         _transport = new CredentialTransport(
             http ?? throw new ArgumentNullException(nameof(http)),
-            "1Password",
+            OnePasswordException.BackendName,
             OnePasswordException.Create,
             ErrorDetailFields,
             relayRawErrorText: true,

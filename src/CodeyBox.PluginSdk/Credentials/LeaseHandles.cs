@@ -3,6 +3,13 @@ using CodeyBox.Core;
 namespace CodeyBox.PluginSdk.Credentials;
 
 /// <summary>
+/// Parses a backend's typed lease handle — the signature every plugin's
+/// <c>TryParse</c> shares, so <see cref="LeaseHandles.ParseOrThrow"/> can
+/// gate renew/revoke identically across backends.
+/// </summary>
+public delegate bool CredentialLeaseParser<TParsed>(string? leaseId, out TParsed parsed);
+
+/// <summary>
 /// Shared lease-handle shape for credential-provider plugins. Handles are
 /// self-describing — <c>{prefix}.{kindLetter}.{sandboxVar}.{tail}</c> — so
 /// renew and revoke keep working after an orchestrator restart, when the
@@ -68,6 +75,32 @@ public static class LeaseHandles
         sandboxEnvVar = parts[2];
         tail = parts[3];
         return true;
+    }
+
+    /// <summary>
+    /// The lease-handle gate every credential provider applies before renew
+    /// and revoke: a foreign or malformed handle is a typed
+    /// <see cref="CredentialFailureKind.Misconfigured"/> failure carrying the
+    /// backend's own exception type, identical across backends. The handle is
+    /// already segment-sanitised by the parser, so echoing it is safe.
+    /// </summary>
+    public static TParsed ParseOrThrow<TParsed>(
+        string? leaseId,
+        string backend,
+        CredentialLeaseParser<TParsed> parser,
+        CredentialExceptionFactory exceptionFactory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(backend);
+        ArgumentNullException.ThrowIfNull(parser);
+        ArgumentNullException.ThrowIfNull(exceptionFactory);
+        if (!parser(leaseId, out var parsed))
+        {
+            throw exceptionFactory(
+                CredentialFailureKind.Misconfigured,
+                $"Lease '{leaseId ?? string.Empty}' is not a valid {backend} lease handle.",
+                null, null, null);
+        }
+        return parsed;
     }
 
     private static bool IsValidSegment(string? value)

@@ -12,15 +12,19 @@ namespace CodeyBox.BitwardenPlugin;
 /// </summary>
 public sealed class BitwardenException : CredentialException
 {
+    /// <summary>Display name stamped on every Bitwarden failure and transport message.</summary>
+    internal const string BackendName = "Bitwarden";
+
     public BitwardenException(
         CredentialFailureKind kind, string message, int? statusCode = null, int? retryAfterSeconds = null)
-        : base("Bitwarden", kind, message, statusCode, retryAfterSeconds)
+        : base(BackendName, kind, message, statusCode, retryAfterSeconds)
     {
     }
 
     public BitwardenException(
-        CredentialFailureKind kind, string message, Exception inner, int? statusCode = null)
-        : base("Bitwarden", kind, message, inner, statusCode)
+        CredentialFailureKind kind, string message, Exception inner,
+        int? statusCode = null, int? retryAfterSeconds = null)
+        : base(BackendName, kind, message, inner, statusCode, retryAfterSeconds)
     {
     }
 
@@ -29,5 +33,5 @@ public sealed class BitwardenException : CredentialException
         CredentialFailureKind kind, string message, Exception? inner, int? statusCode, int? retryAfterSeconds)
         => inner is null
             ? new BitwardenException(kind, message, statusCode, retryAfterSeconds)
-            : new BitwardenException(kind, message, inner, statusCode);
+            : new BitwardenException(kind, message, inner, statusCode, retryAfterSeconds);
 }

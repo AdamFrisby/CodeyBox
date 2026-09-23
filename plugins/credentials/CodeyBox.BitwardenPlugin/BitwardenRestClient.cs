@@ -126,7 +126,7 @@ internal sealed class BitwardenRestClient
         _log = log ?? NullLogger.Instance;
         _transport = new CredentialTransport(
             http ?? throw new ArgumentNullException(nameof(http)),
-            "Bitwarden",
+            BitwardenException.BackendName,
             BitwardenException.Create,
             ErrorCodeFields,
             relayRawErrorText: false,

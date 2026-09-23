@@ -17,31 +17,22 @@ internal static class BitwardenLeaseIds
 {
     internal const string Prefix = "bitwarden";
 
-    internal enum LeaseKind : byte
-    {
-        Unknown = 0,
-        /// <summary>Secret read from Secrets Manager with a machine-account access token.</summary>
-        Static = 1,
-    }
-
-    internal sealed record ParsedLeaseId(LeaseKind Kind, string SandboxEnvVar, string Tail);
-
     internal static string BuildStatic(string sandboxEnvVar)
         => LeaseHandles.Build(Prefix, "s", sandboxEnvVar);
 
-    internal static bool TryParse(string? leaseId, out ParsedLeaseId parsed)
+    /// <summary>
+    /// Parses a handle into the sandbox variable it was issued for — the
+    /// only datum renew/revoke need. Bitwarden mints a single kind ('s');
+    /// the tail is an opaque random handle nothing reads back.
+    /// </summary>
+    internal static bool TryParse(string? leaseId, out string sandboxEnvVar)
     {
-        parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty, string.Empty);
-        if (!LeaseHandles.TryParse(leaseId, Prefix, out var kindLetter, out var sandboxVar, out var tail))
+        sandboxEnvVar = string.Empty;
+        if (!LeaseHandles.TryParse(leaseId, Prefix, out var kindLetter, out var sandboxVar, out _))
             return false;
-        var kind = kindLetter switch
-        {
-            "s" => LeaseKind.Static,
-            _ => LeaseKind.Unknown,
-        };
-        if (kind == LeaseKind.Unknown)
+        if (kindLetter != "s")
             return false;
-        parsed = new ParsedLeaseId(kind, sandboxVar, tail);
+        sandboxEnvVar = sandboxVar;
         return true;
     }
 }

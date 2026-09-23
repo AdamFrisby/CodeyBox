@@ -74,7 +74,7 @@ public sealed record DopplerSecretMapping
 /// systemd credentials, container secrets). Only the names are
 /// configured.</para>
 /// </summary>
-public sealed record DopplerOptions
+public sealed record DopplerOptions : ICredentialOptions
 {
     /// <summary>Plugin ID used in <c>CodeyBox:Plugins:&lt;id&gt;</c>.</summary>
     public const string PluginId = "codeybox.doppler";
@@ -170,21 +170,21 @@ public sealed record DopplerOptions
 
         return new DopplerOptions
         {
-            Enabled = ReadBool(section, "Enabled", defaults.Enabled),
-            ApiUrl = ReadNonEmpty(section, "ApiUrl", defaults.ApiUrl).TrimEnd('/'),
+            Enabled = CredentialOptions.ReadBool(section, "Enabled", defaults.Enabled, warnings),
+            ApiUrl = CredentialOptions.ReadNonEmpty(section, "ApiUrl", defaults.ApiUrl).TrimEnd('/'),
             DefaultProject = (section["DefaultProject"] ?? string.Empty).Trim(),
             DefaultConfig = (section["DefaultConfig"] ?? string.Empty).Trim(),
-            ServiceTokenEnvVar = ReadNonEmpty(section, "ServiceTokenEnvVar", defaults.ServiceTokenEnvVar),
+            ServiceTokenEnvVar = CredentialOptions.ReadNonEmpty(section, "ServiceTokenEnvVar", defaults.ServiceTokenEnvVar),
             IdentityId = (section["IdentityId"] ?? string.Empty).Trim(),
             OidcTokenEnvVar = (section["OidcTokenEnvVar"] ?? string.Empty).Trim(),
-            StaticLeaseTtlMinutes = Math.Clamp(
-                ReadInt(section, "StaticLeaseTtlMinutes", defaults.StaticLeaseTtlMinutes, warnings), 1, 1440),
-            TokenRefreshSkewSeconds = Math.Clamp(
-                ReadInt(section, "TokenRefreshSkewSeconds", defaults.TokenRefreshSkewSeconds, warnings), 0, 3600),
-            TimeoutSeconds = Math.Clamp(
-                ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings), 1, 300),
-            MaxResponseBytes = Math.Max(
-                ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings), 1024),
+            StaticLeaseTtlMinutes = CredentialOptions.ReadStaticLeaseTtlMinutes(
+                section, defaults.StaticLeaseTtlMinutes, warnings),
+            TokenRefreshSkewSeconds = CredentialOptions.ReadTokenRefreshSkewSeconds(
+                section, defaults.TokenRefreshSkewSeconds, warnings),
+            TimeoutSeconds = CredentialOptions.ReadTimeoutSeconds(
+                section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings),
+            MaxResponseBytes = CredentialOptions.ReadByteCap(
+                section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings),
             Mappings = ReadMappings(section.GetSection("Mappings")),
         };
     }
@@ -197,15 +197,7 @@ public sealed record DopplerOptions
     public IReadOnlyList<string> Validate()
     {
         var errors = new List<string>();
-        if (!Uri.TryCreate(ApiUrl, UriKind.Absolute, out var api)
-            || (api.Scheme != Uri.UriSchemeHttps && api.Scheme != Uri.UriSchemeHttp))
-        {
-            errors.Add($"ApiUrl '{ApiUrl}' must be an absolute http(s) URL.");
-        }
-        else if (api.Scheme == Uri.UriSchemeHttp && !IsLoopbackHost(api.Host))
-        {
-            errors.Add($"ApiUrl '{ApiUrl}' uses plain http against a non-loopback host; use https.");
-        }
+        CredentialOptions.ValidateEndpointUrl("ApiUrl", ApiUrl, errors);
 
         var identityIdSet = !string.IsNullOrWhiteSpace(IdentityId);
         var oidcEnvSet = !string.IsNullOrWhiteSpace(OidcTokenEnvVar);
@@ -216,20 +208,8 @@ public sealed record DopplerOptions
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var mapping in Mappings)
         {
-            var where = string.IsNullOrWhiteSpace(mapping.SandboxEnvVar)
-                ? "mapping with an empty SandboxEnvVar"
-                : $"mapping for '{mapping.SandboxEnvVar}'";
-            if (string.IsNullOrWhiteSpace(mapping.SandboxEnvVar))
-            {
-                errors.Add("A mapping has an empty SandboxEnvVar; every mapping must name its sandbox variable.");
+            if (!CredentialOptions.ValidateSandboxEnvVar(mapping.SandboxEnvVar, seen, errors, out var where))
                 continue;
-            }
-            if (mapping.SandboxEnvVar.Length > MaxSandboxEnvVarChars)
-                errors.Add($"{where}: SandboxEnvVar exceeds {MaxSandboxEnvVarChars} characters (lease handles embed it).");
-            if (!IsEnvVarName(mapping.SandboxEnvVar))
-                errors.Add($"{where}: SandboxEnvVar must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*).");
-            if (!seen.Add(mapping.SandboxEnvVar))
-                errors.Add($"{where}: duplicate SandboxEnvVar; each sandbox variable maps once.");
             var secretName = string.IsNullOrWhiteSpace(mapping.SecretName) ? mapping.SandboxEnvVar : mapping.SecretName;
             if (secretName.Length > MaxSecretNameChars)
                 errors.Add($"{where}: secret name exceeds {MaxSecretNameChars} characters.");
@@ -243,13 +223,6 @@ public sealed record DopplerOptions
 
         return errors.AsReadOnly();
     }
-
-    /// <summary>
-    /// Maximum sandbox-variable length accepted in a mapping. Lease handles
-    /// embed the variable name, and handles are capped at
-    /// <c>SecretLeasingOptions.MaxLeaseIdLength</c> (256).
-    /// </summary>
-    internal const int MaxSandboxEnvVarChars = 64;
 
     internal const int MaxSecretNameChars = 128;
 
@@ -270,20 +243,4 @@ public sealed record DopplerOptions
         }
         return mappings.AsReadOnly();
     }
-
-    private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
-        => CredentialOptions.ReadBool(section, key, fallback);
-
-    private static int ReadInt(
-        IConfigurationSection section, string key, int fallback, List<string>? warnings)
-        => CredentialOptions.ReadInt(section, key, fallback, warnings);
-
-    private static string ReadNonEmpty(IConfigurationSection section, string key, string fallback)
-        => CredentialOptions.ReadNonEmpty(section, key, fallback);
-
-    internal static bool IsLoopbackHost(string host)
-        => CredentialOptions.IsLoopbackHost(host);
-
-    private static bool IsEnvVarName(string value)
-        => CredentialOptions.IsEnvVarName(value);
 }

@@ -44,10 +44,8 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
 
     private IPluginHost? _host;
     private ILogger _logger = NullLogger.Instance;
-    private HttpClient? _http;
-    private bool _ownsHttp;
+    private readonly LazyCredentialClient<DopplerRestClient> _clients;
     private DopplerRestClient? _api;
-    private readonly object _clientLock = new();
     private readonly ConcurrentDictionary<string, IssuedLeaseContext> _issued = new(StringComparer.Ordinal);
 
     /// <summary>
@@ -66,6 +64,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
     {
         _clock = clock ?? TimeProvider.System;
         _env = Environment.GetEnvironmentVariable;
+        _clients = NewClientCache(null);
     }
 
     /// <summary>Test constructor: explicit client, config, clock, and environment.</summary>
@@ -76,11 +75,12 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
         Func<string, string?>? env = null,
         ILogger? log = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
+        ArgumentNullException.ThrowIfNull(http);
         _testConfig = config ?? throw new ArgumentNullException(nameof(config));
         _clock = clock ?? TimeProvider.System;
         _env = env ?? Environment.GetEnvironmentVariable;
         _logger = log ?? NullLogger.Instance;
+        _clients = NewClientCache(http);
     }
 
     /// <inheritdoc />
@@ -167,8 +167,8 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
                     $"Doppler secret '{secretName}' returned an empty value.");
             var leaseId = DopplerLeaseIds.BuildIdentity(mapping.SandboxEnvVar);
             context = new IssuedLeaseContext(
-                DopplerLeaseIds.LeaseKind.Identity, mapping, project, config, secretName,
-                minted.Token, minted.ExpiresAt, minted.ExpiresAt);
+                mapping, project, config, secretName,
+                minted.Token, minted.ExpiresAt);
             material = new LeasedSecretMaterial
             {
                 LeaseId = SecretLeasePolicy.ValidateLeaseId(leaseId, nameof(leaseId)),
@@ -190,12 +190,12 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 throw new DopplerException(
                     CredentialFailureKind.InvalidResponse,
                     $"Doppler secret '{secretName}' returned an empty value.");
-            var window = StaticWindow(options, requestedTtl);
+            var window = CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, requestedTtl);
             var expiresAt = _clock.GetUtcNow() + window;
             var leaseId = DopplerLeaseIds.BuildStatic(mapping.SandboxEnvVar);
             context = new IssuedLeaseContext(
-                DopplerLeaseIds.LeaseKind.Static, mapping, project, config, secretName,
-                IdentityToken: null, TokenExpiresAt: default, expiresAt);
+                mapping, project, config, secretName,
+                IdentityToken: null, TokenExpiresAt: default);
             material = new LeasedSecretMaterial
             {
                 LeaseId = SecretLeasePolicy.ValidateLeaseId(leaseId, nameof(leaseId)),
@@ -230,8 +230,11 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
             await _api!.GetSecretAsync(
                 options.ApiUrl, token, context.Project, context.Config, context.SecretName,
                 options.MaxResponseBytes, ct).ConfigureAwait(false);
-            var expiresAt = _clock.GetUtcNow() + StaticWindow(options, TimeSpan.Zero);
-            _issued[leaseId] = context with { ExpiresAt = expiresAt };
+            var expiresAt = _clock.GetUtcNow()
+                + CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, TimeSpan.Zero);
+            // Re-register the (possibly rebuilt) context so revocation can
+            // still address it.
+            _issued[leaseId] = context;
             _logger.LogDebug("Doppler renewed static lease '{LeaseId}'.", leaseId);
             return expiresAt;
         }
@@ -241,7 +244,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
         // OIDC token itself is short-lived, so renewal past that point
         // fails loudly as infrastructure (never a diff verdict) while the
         // sweep keeps retrying. See the README's honest lease statement.
-        var skew = TimeSpan.FromSeconds(Math.Clamp(options.TokenRefreshSkewSeconds, 0, 3600));
+        var skew = CredentialOptions.TokenSkewSpan(options.TokenRefreshSkewSeconds);
         string bearer = string.Empty;
         DateTimeOffset tokenExpiry = default;
         if (!string.IsNullOrEmpty(context.IdentityToken)
@@ -263,7 +266,6 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
         {
             IdentityToken = bearer,
             TokenExpiresAt = tokenExpiry,
-            ExpiresAt = tokenExpiry,
         };
         _logger.LogDebug("Doppler renewed identity lease '{LeaseId}' to {ExpiresAt}.", leaseId, tokenExpiry);
         return tokenExpiry;
@@ -337,10 +339,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
             if (_issued.TryGetValue(key, out var context) && context.IdentityToken is not null)
                 _issued[key] = context with { IdentityToken = null };
         }
-        if (_ownsHttp)
-        {
-            try { _http?.Dispose(); } catch (Exception) { }
-        }
+        _clients.Dispose();
     }
 
     internal DopplerOptions CurrentOptions()
@@ -363,7 +362,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 CredentialFailureKind.Misconfigured,
                 $"Doppler OIDC token env '{options.OidcTokenEnvVar}' is empty. Provision a fresh OIDC token from the host credential chain.");
         EnsureClients();
-        var skew = TimeSpan.FromSeconds(Math.Clamp(options.TokenRefreshSkewSeconds, 0, 3600));
+        var skew = CredentialOptions.TokenSkewSpan(options.TokenRefreshSkewSeconds);
         var minted = await _api!.ExchangeOidcAsync(
             options.ApiUrl, options.IdentityId, oidcToken, skew,
             options.MaxResponseBytes, ct).ConfigureAwait(false);
@@ -389,19 +388,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
     }
 
     private DopplerOptions RequireUsableOptions()
-    {
-        var options = CurrentOptions();
-        if (!options.Enabled)
-            throw new DopplerException(
-                CredentialFailureKind.Misconfigured,
-                "Doppler provider is disabled (Enabled=false); enable it to issue.");
-        var errors = options.Validate();
-        if (errors.Count > 0)
-            throw new DopplerException(
-                CredentialFailureKind.Misconfigured,
-                $"Doppler configuration is invalid: {errors[0]}");
-        return options;
-    }
+        => CredentialOptions.RequireUsable(CurrentOptions(), DopplerException.BackendName, DopplerException.Create);
 
     private static bool UseIdentity(DopplerOptions options, DopplerSecretMapping mapping)
     {
@@ -459,60 +446,27 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 $"Doppler lease '{leaseId}' names sandbox variable '{parsed.SandboxEnvVar}' with no current mapping; restore the mapping or revoke server-side.");
         var (project, config, secretName) = ResolveTriple(options, mapping);
         return new IssuedLeaseContext(
-            parsed.Kind, mapping, project, config, secretName,
-            IdentityToken: null, TokenExpiresAt: default, _clock.GetUtcNow());
+            mapping, project, config, secretName,
+            IdentityToken: null, TokenExpiresAt: default);
     }
 
     private static DopplerLeaseIds.ParsedLeaseId ParseOurs(string leaseId)
-    {
-        if (!DopplerLeaseIds.TryParse(leaseId, out var parsed))
-            throw new DopplerException(
-                CredentialFailureKind.Misconfigured,
-                $"Lease '{leaseId ?? string.Empty}' is not a Doppler lease handle.");
-        return parsed;
-    }
+        => LeaseHandles.ParseOrThrow<DopplerLeaseIds.ParsedLeaseId>(
+            leaseId, DopplerException.BackendName, DopplerLeaseIds.TryParse, DopplerException.Create);
 
-    private static TimeSpan StaticWindow(DopplerOptions options, TimeSpan requestedTtl)
-    {
-        var configured = TimeSpan.FromMinutes(Math.Clamp(options.StaticLeaseTtlMinutes, 1, 1440));
-        return requestedTtl > TimeSpan.Zero && requestedTtl < configured ? requestedTtl : configured;
-    }
+    private void EnsureClients() => _api = _clients.Get();
 
-    private static TimeSpan ClientTimeout(DopplerOptions options) =>
-        TimeSpan.FromSeconds(Math.Clamp(options.TimeoutSeconds, 1, 300));
-
-    private void EnsureClients()
-    {
-        if (_api is not null)
-            return;
-        lock (_clientLock)
-        {
-            if (_api is not null)
-                return;
-            if (_http is null)
-            {
-                _http = CredentialHttp.CreateNoRedirectClient(ClientTimeout(CurrentOptions()));
-                _ownsHttp = true;
-            }
-            try
-            {
-                _http.Timeout = ClientTimeout(CurrentOptions());
-            }
-            catch (InvalidOperationException)
-            {
-                // A request is already in flight; keep the existing timeout.
-            }
-            _api = new DopplerRestClient(_http, _clock, _logger);
-        }
-    }
+    private LazyCredentialClient<DopplerRestClient> NewClientCache(HttpClient? injected)
+        => new(
+            () => CredentialOptions.TimeoutSpan(CurrentOptions().TimeoutSeconds),
+            http => new DopplerRestClient(http, _clock, _logger),
+            injected);
 
     private sealed record IssuedLeaseContext(
-        DopplerLeaseIds.LeaseKind Kind,
         DopplerSecretMapping Mapping,
         string Project,
         string Config,
         string SecretName,
         string? IdentityToken,
-        DateTimeOffset TokenExpiresAt,
-        DateTimeOffset ExpiresAt);
+        DateTimeOffset TokenExpiresAt);
 }

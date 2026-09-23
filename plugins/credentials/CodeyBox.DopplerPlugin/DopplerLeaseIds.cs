@@ -25,7 +25,7 @@ internal static class DopplerLeaseIds
         Identity = 2,
     }
 
-    internal sealed record ParsedLeaseId(LeaseKind Kind, string SandboxEnvVar, string Tail);
+    internal sealed record ParsedLeaseId(LeaseKind Kind, string SandboxEnvVar);
 
     internal static string BuildStatic(string sandboxEnvVar)
         => LeaseHandles.Build(Prefix, "s", sandboxEnvVar);
@@ -35,8 +35,8 @@ internal static class DopplerLeaseIds
 
     internal static bool TryParse(string? leaseId, out ParsedLeaseId parsed)
     {
-        parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty, string.Empty);
-        if (!LeaseHandles.TryParse(leaseId, Prefix, out var kindLetter, out var sandboxVar, out var tail))
+        parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty);
+        if (!LeaseHandles.TryParse(leaseId, Prefix, out var kindLetter, out var sandboxVar, out _))
             return false;
         var kind = kindLetter switch
         {
@@ -46,7 +46,7 @@ internal static class DopplerLeaseIds
         };
         if (kind == LeaseKind.Unknown)
             return false;
-        parsed = new ParsedLeaseId(kind, sandboxVar, tail);
+        parsed = new ParsedLeaseId(kind, sandboxVar);
         return true;
     }
 }

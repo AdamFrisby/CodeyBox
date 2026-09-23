@@ -12,15 +12,19 @@ namespace CodeyBox.OnePasswordPlugin;
 /// </summary>
 public sealed class OnePasswordException : CredentialException
 {
+    /// <summary>Display name stamped on every 1Password failure and transport message.</summary>
+    internal const string BackendName = "1Password";
+
     public OnePasswordException(
         CredentialFailureKind kind, string message, int? statusCode = null, int? retryAfterSeconds = null)
-        : base("1Password", kind, message, statusCode, retryAfterSeconds)
+        : base(BackendName, kind, message, statusCode, retryAfterSeconds)
     {
     }
 
     public OnePasswordException(
-        CredentialFailureKind kind, string message, Exception inner, int? statusCode = null)
-        : base("1Password", kind, message, inner, statusCode)
+        CredentialFailureKind kind, string message, Exception inner,
+        int? statusCode = null, int? retryAfterSeconds = null)
+        : base(BackendName, kind, message, inner, statusCode, retryAfterSeconds)
     {
     }
 
@@ -29,5 +33,5 @@ public sealed class OnePasswordException : CredentialException
         CredentialFailureKind kind, string message, Exception? inner, int? statusCode, int? retryAfterSeconds)
         => inner is null
             ? new OnePasswordException(kind, message, statusCode, retryAfterSeconds)
-            : new OnePasswordException(kind, message, inner, statusCode);
+            : new OnePasswordException(kind, message, inner, statusCode, retryAfterSeconds);
 }

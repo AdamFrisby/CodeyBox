@@ -94,22 +94,10 @@ public sealed record BitwardenSecretMapping
 /// machine-account client id is not a secret and is configured directly.
 /// </para>
 /// </summary>
-public sealed record BitwardenOptions
+public sealed record BitwardenOptions : ICredentialOptions
 {
     /// <summary>Plugin ID used in <c>CodeyBox:Plugins:&lt;id&gt;</c>.</summary>
     public const string PluginId = "codeybox.bitwarden";
-
-    /// <summary>Smallest accepted <see cref="StaticLeaseTtlMinutes"/>.</summary>
-    public const int MinStaticLeaseTtlMinutes = 1;
-
-    /// <summary>Largest accepted <see cref="StaticLeaseTtlMinutes"/> (one day).</summary>
-    public const int MaxStaticLeaseTtlMinutes = 1440;
-
-    /// <summary>Smallest accepted <see cref="TimeoutSeconds"/>.</summary>
-    public const int MinTimeoutSeconds = 1;
-
-    /// <summary>Largest accepted <see cref="TimeoutSeconds"/>.</summary>
-    public const int MaxTimeoutSeconds = 300;
 
     /// <summary>Master switch. Default false: off unless an operator enables it.</summary>
     public bool Enabled { get; init; }
@@ -163,7 +151,7 @@ public sealed record BitwardenOptions
     /// expiry additionally never exceeds the access token's own server
     /// lifetime. Kept in step with the host
     /// <c>SecretLeasing:DefaultLeaseTtl</c> default (20 min). Range
-    /// <see cref="MinStaticLeaseTtlMinutes"/>–<see cref="MaxStaticLeaseTtlMinutes"/>
+    /// <see cref="CredentialOptions.MinStaticLeaseTtlMinutes"/>–<see cref="CredentialOptions.MaxStaticLeaseTtlMinutes"/>
     /// minutes.
     /// </summary>
     public int StaticLeaseTtlMinutes { get; init; } = 20;
@@ -176,7 +164,7 @@ public sealed record BitwardenOptions
 
     /// <summary>
     /// Per-request timeout, in seconds
-    /// (<see cref="MinTimeoutSeconds"/>–<see cref="MaxTimeoutSeconds"/>,
+    /// (<see cref="CredentialOptions.MinTimeoutSeconds"/>–<see cref="CredentialOptions.MaxTimeoutSeconds"/>,
     /// default 30).
     /// </summary>
     public int TimeoutSeconds { get; init; } = 30;
@@ -208,22 +196,20 @@ public sealed record BitwardenOptions
 
         return new BitwardenOptions
         {
-            Enabled = ReadBool(section, "Enabled", defaults.Enabled),
-            ApiUrl = ReadNonEmpty(section, "ApiUrl", defaults.ApiUrl).TrimEnd('/'),
-            IdentityUrl = ReadNonEmpty(section, "IdentityUrl", defaults.IdentityUrl).TrimEnd('/'),
+            Enabled = CredentialOptions.ReadBool(section, "Enabled", defaults.Enabled, warnings),
+            ApiUrl = CredentialOptions.ReadNonEmpty(section, "ApiUrl", defaults.ApiUrl).TrimEnd('/'),
+            IdentityUrl = CredentialOptions.ReadNonEmpty(section, "IdentityUrl", defaults.IdentityUrl).TrimEnd('/'),
             ClientId = (section["ClientId"] ?? string.Empty).Trim(),
-            ClientSecretEnvVar = ReadNonEmpty(section, "ClientSecretEnvVar", defaults.ClientSecretEnvVar),
+            ClientSecretEnvVar = CredentialOptions.ReadNonEmpty(section, "ClientSecretEnvVar", defaults.ClientSecretEnvVar),
             OrganizationId = (section["OrganizationId"] ?? string.Empty).Trim(),
-            StaticLeaseTtlMinutes = Math.Clamp(
-                ReadInt(section, "StaticLeaseTtlMinutes", defaults.StaticLeaseTtlMinutes, warnings),
-                MinStaticLeaseTtlMinutes, MaxStaticLeaseTtlMinutes),
-            TokenRefreshSkewSeconds = Math.Clamp(
-                ReadInt(section, "TokenRefreshSkewSeconds", defaults.TokenRefreshSkewSeconds, warnings), 0, 3600),
-            TimeoutSeconds = Math.Clamp(
-                ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings),
-                MinTimeoutSeconds, MaxTimeoutSeconds),
-            MaxResponseBytes = Math.Max(
-                ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings), 1024),
+            StaticLeaseTtlMinutes = CredentialOptions.ReadStaticLeaseTtlMinutes(
+                section, defaults.StaticLeaseTtlMinutes, warnings),
+            TokenRefreshSkewSeconds = CredentialOptions.ReadTokenRefreshSkewSeconds(
+                section, defaults.TokenRefreshSkewSeconds, warnings),
+            TimeoutSeconds = CredentialOptions.ReadTimeoutSeconds(
+                section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings),
+            MaxResponseBytes = CredentialOptions.ReadByteCap(
+                section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings),
             Mappings = ReadMappings(section.GetSection("Mappings")),
         };
     }
@@ -236,42 +222,14 @@ public sealed record BitwardenOptions
     public IReadOnlyList<string> Validate()
     {
         var errors = new List<string>();
-        if (!Uri.TryCreate(ApiUrl, UriKind.Absolute, out var api)
-            || (api.Scheme != Uri.UriSchemeHttps && api.Scheme != Uri.UriSchemeHttp))
-        {
-            errors.Add($"ApiUrl '{ApiUrl}' must be an absolute http(s) URL.");
-        }
-        else if (api.Scheme == Uri.UriSchemeHttp && !IsLoopbackHost(api.Host))
-        {
-            errors.Add($"ApiUrl '{ApiUrl}' uses plain http against a non-loopback host; use https.");
-        }
-        if (!Uri.TryCreate(IdentityUrl, UriKind.Absolute, out var identity)
-            || (identity.Scheme != Uri.UriSchemeHttps && identity.Scheme != Uri.UriSchemeHttp))
-        {
-            errors.Add($"IdentityUrl '{IdentityUrl}' must be an absolute http(s) URL.");
-        }
-        else if (identity.Scheme == Uri.UriSchemeHttp && !IsLoopbackHost(identity.Host))
-        {
-            errors.Add($"IdentityUrl '{IdentityUrl}' uses plain http against a non-loopback host; use https.");
-        }
+        CredentialOptions.ValidateEndpointUrl("ApiUrl", ApiUrl, errors);
+        CredentialOptions.ValidateEndpointUrl("IdentityUrl", IdentityUrl, errors);
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var mapping in Mappings)
         {
-            var where = string.IsNullOrWhiteSpace(mapping.SandboxEnvVar)
-                ? "mapping with an empty SandboxEnvVar"
-                : $"mapping for '{mapping.SandboxEnvVar}'";
-            if (string.IsNullOrWhiteSpace(mapping.SandboxEnvVar))
-            {
-                errors.Add("A mapping has an empty SandboxEnvVar; every mapping must name its sandbox variable.");
+            if (!CredentialOptions.ValidateSandboxEnvVar(mapping.SandboxEnvVar, seen, errors, out var where))
                 continue;
-            }
-            if (mapping.SandboxEnvVar.Length > MaxSandboxEnvVarChars)
-                errors.Add($"{where}: SandboxEnvVar exceeds {MaxSandboxEnvVarChars} characters (lease handles embed it).");
-            if (!IsEnvVarName(mapping.SandboxEnvVar))
-                errors.Add($"{where}: SandboxEnvVar must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*).");
-            if (!seen.Add(mapping.SandboxEnvVar))
-                errors.Add($"{where}: duplicate SandboxEnvVar; each sandbox variable maps once.");
             var hasId = !string.IsNullOrWhiteSpace(mapping.SecretId);
             var hasKey = !string.IsNullOrWhiteSpace(mapping.SecretKey);
             if (hasId == hasKey)
@@ -297,13 +255,6 @@ public sealed record BitwardenOptions
         return errors.AsReadOnly();
     }
 
-    /// <summary>
-    /// Maximum sandbox-variable length accepted in a mapping. Lease handles
-    /// embed the variable name, and handles are capped at
-    /// <c>SecretLeasingOptions.MaxLeaseIdLength</c> (256).
-    /// </summary>
-    internal const int MaxSandboxEnvVarChars = 64;
-
     internal const int MaxSecretKeyChars = 128;
 
     private static IReadOnlyList<BitwardenSecretMapping> ReadMappings(IConfigurationSection section)
@@ -325,20 +276,4 @@ public sealed record BitwardenOptions
         }
         return mappings.AsReadOnly();
     }
-
-    private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
-        => CredentialOptions.ReadBool(section, key, fallback);
-
-    private static int ReadInt(
-        IConfigurationSection section, string key, int fallback, List<string>? warnings)
-        => CredentialOptions.ReadInt(section, key, fallback, warnings);
-
-    private static string ReadNonEmpty(IConfigurationSection section, string key, string fallback)
-        => CredentialOptions.ReadNonEmpty(section, key, fallback);
-
-    internal static bool IsLoopbackHost(string host)
-        => CredentialOptions.IsLoopbackHost(host);
-
-    private static bool IsEnvVarName(string value)
-        => CredentialOptions.IsEnvVarName(value);
 }

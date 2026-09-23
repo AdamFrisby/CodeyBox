@@ -12,15 +12,19 @@ namespace CodeyBox.InfisicalPlugin;
 /// </summary>
 public sealed class InfisicalException : CredentialException
 {
+    /// <summary>Display name stamped on every Infisical failure and transport message.</summary>
+    internal const string BackendName = "Infisical";
+
     public InfisicalException(
         CredentialFailureKind kind, string message, int? statusCode = null, int? retryAfterSeconds = null)
-        : base("Infisical", kind, message, statusCode, retryAfterSeconds)
+        : base(BackendName, kind, message, statusCode, retryAfterSeconds)
     {
     }
 
     public InfisicalException(
-        CredentialFailureKind kind, string message, Exception inner, int? statusCode = null)
-        : base("Infisical", kind, message, inner, statusCode)
+        CredentialFailureKind kind, string message, Exception inner,
+        int? statusCode = null, int? retryAfterSeconds = null)
+        : base(BackendName, kind, message, inner, statusCode, retryAfterSeconds)
     {
     }
 
@@ -29,5 +33,5 @@ public sealed class InfisicalException : CredentialException
         CredentialFailureKind kind, string message, Exception? inner, int? statusCode, int? retryAfterSeconds)
         => inner is null
             ? new InfisicalException(kind, message, statusCode, retryAfterSeconds)
-            : new InfisicalException(kind, message, inner, statusCode);
+            : new InfisicalException(kind, message, inner, statusCode, retryAfterSeconds);
 }

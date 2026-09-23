@@ -35,7 +35,7 @@ public sealed class DopplerRestClient
     {
         _transport = new CredentialTransport(
             http ?? throw new ArgumentNullException(nameof(http)),
-            "Doppler",
+            DopplerException.BackendName,
             DopplerException.Create,
             ErrorDetailFields,
             relayRawErrorText: true,
@@ -77,7 +77,7 @@ public sealed class DopplerRestClient
                 throw new DopplerException(
                     CredentialFailureKind.InvalidResponse,
                     $"Doppler fetch of secret '{secretName}' returned no value object.");
-            if (!CredentialJson.TryGetString(value, "computed", out var computed) || computed is null)
+            if (!CredentialJson.TryGetString(value, "computed", out var computed) || string.IsNullOrEmpty(computed))
                 throw new DopplerException(
                     CredentialFailureKind.InvalidResponse,
                     $"Doppler fetch of secret '{secretName}' returned no computed value.");
@@ -153,7 +153,6 @@ public sealed class DopplerRestClient
         try
         {
             using var response = await _transport.SendAsync(request, "revoke identity token", ct).ConfigureAwait(false);
-            response.Dispose();
             _log.LogInformation("Doppler revoked identity token.");
         }
         catch (DopplerException ex) when (ex.Kind == CredentialFailureKind.NotFound)

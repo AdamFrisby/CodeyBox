@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using CodeyBox.PluginSdk.Credentials;
+using Microsoft.Extensions.Configuration;
 
 namespace CodeyBox.Tests.PluginSdk;
 
@@ -9,8 +10,11 @@ namespace CodeyBox.Tests.PluginSdk;
 /// message sanitisation flattens every control character (never only
 /// CR/LF), the shared error-detail reader applies one bounded/extraction
 /// policy per backend, lease-handle construction refuses segments its own
-/// parser cannot round-trip, and the capped copy never buffers past
-/// cap+1 bytes.
+/// parser cannot round-trip, the capped copy never buffers past cap+1
+/// bytes, the option readers clamp to one bound set and warn on
+/// unparseable input, the endpoint-URL and sandbox-variable rules hold,
+/// the lease-parse gate throws the backend's typed exception, the
+/// enabled+valid gate is uniform, and the lazy client holder builds once.
 /// </summary>
 public sealed class CredentialPlumbingTests
 {
@@ -339,6 +343,262 @@ public sealed class CredentialPlumbingTests
         Assert.True(ex.IsInfrastructure);
         // Server text is sanitised (newline flattened) before relay.
         Assert.Contains("slow down", ex.Message, StringComparison.Ordinal);
+    }
+
+    // ── Shared option readers ────────────────────────────────────────────
+
+    [Fact]
+    public void ReadBool_Unparseable_Warns_And_Falls_Back()
+    {
+        var warnings = new List<string>();
+        var section = Section(new Dictionary<string, string?> { ["Enabled"] = "ture" });
+        Assert.True(CredentialOptions.ReadBool(section, "Enabled", true, warnings));
+        Assert.Single(warnings);
+        Assert.Contains("'Enabled'", warnings[0], StringComparison.Ordinal);
+        // No warnings collector: still falls back silently by design.
+        Assert.False(CredentialOptions.ReadBool(section, "Enabled", false));
+        // A clean parse never warns.
+        var clean = new List<string>();
+        Assert.True(CredentialOptions.ReadBool(
+            Section(new Dictionary<string, string?> { ["Enabled"] = "true" }), "Enabled", false, clean));
+        Assert.Empty(clean);
+    }
+
+    [Fact]
+    public void ReadInt_Unparseable_Warns_And_Falls_Back()
+    {
+        var warnings = new List<string>();
+        var section = Section(new Dictionary<string, string?> { ["TimeoutSeconds"] = "soon" });
+        Assert.Equal(30, CredentialOptions.ReadInt(section, "TimeoutSeconds", 30, warnings));
+        Assert.Single(warnings);
+    }
+
+    [Theory]
+    [InlineData("0", CredentialOptions.MinStaticLeaseTtlMinutes)]
+    [InlineData("99999", CredentialOptions.MaxStaticLeaseTtlMinutes)]
+    [InlineData("45", 45)]
+    public void ReadStaticLeaseTtlMinutes_Clamps_To_Shared_Bounds(string raw, int expected)
+    {
+        var section = Section(new Dictionary<string, string?> { ["StaticLeaseTtlMinutes"] = raw });
+        Assert.Equal(expected, CredentialOptions.ReadStaticLeaseTtlMinutes(section, 20, null));
+    }
+
+    [Theory]
+    [InlineData("0", CredentialOptions.MinTimeoutSeconds)]
+    [InlineData("9999", CredentialOptions.MaxTimeoutSeconds)]
+    public void ReadTimeoutSeconds_Clamps_To_Shared_Bounds(string raw, int expected)
+    {
+        var section = Section(new Dictionary<string, string?> { ["OpTimeoutSeconds"] = raw });
+        Assert.Equal(expected, CredentialOptions.ReadTimeoutSeconds(section, "OpTimeoutSeconds", 30, null));
+    }
+
+    [Theory]
+    [InlineData("-5", CredentialOptions.MinTokenRefreshSkewSeconds)]
+    [InlineData("99999", CredentialOptions.MaxTokenRefreshSkewSeconds)]
+    public void ReadTokenRefreshSkewSeconds_Clamps_To_Shared_Bounds(string raw, int expected)
+    {
+        var section = Section(new Dictionary<string, string?> { ["TokenRefreshSkewSeconds"] = raw });
+        Assert.Equal(expected, CredentialOptions.ReadTokenRefreshSkewSeconds(section, 60, null));
+    }
+
+    [Fact]
+    public void ReadByteCap_Floors_At_Minimum()
+    {
+        var section = Section(new Dictionary<string, string?> { ["MaxResponseBytes"] = "10" });
+        Assert.Equal(CredentialOptions.MinBodyBytes,
+            CredentialOptions.ReadByteCap(section, "MaxResponseBytes", 256 * 1024, null));
+    }
+
+    [Fact]
+    public void Span_Helpers_Clamp_Like_The_Readers()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(CredentialOptions.MaxTimeoutSeconds),
+            CredentialOptions.TimeoutSpan(99999));
+        Assert.Equal(TimeSpan.FromSeconds(CredentialOptions.MinTokenRefreshSkewSeconds),
+            CredentialOptions.TokenSkewSpan(-5));
+        // The static window is the configured TTL tightened by a shorter
+        // request, never longer than the configured bound.
+        Assert.Equal(TimeSpan.FromMinutes(20), CredentialOptions.StaticLeaseWindow(20, TimeSpan.Zero));
+        Assert.Equal(TimeSpan.FromMinutes(5),
+            CredentialOptions.StaticLeaseWindow(20, TimeSpan.FromMinutes(5)));
+        Assert.Equal(TimeSpan.FromMinutes(CredentialOptions.MaxStaticLeaseTtlMinutes),
+            CredentialOptions.StaticLeaseWindow(99999, TimeSpan.Zero));
+        Assert.Equal(TimeSpan.FromMinutes(CredentialOptions.MinStaticLeaseTtlMinutes),
+            CredentialOptions.StaticLeaseWindow(0, TimeSpan.Zero));
+    }
+
+    // ── Endpoint acceptance rule ─────────────────────────────────────────
+
+    [Theory]
+    [InlineData("https://api.example.com", true)]
+    [InlineData("http://127.0.0.1:8080", true)]
+    [InlineData("http://localhost:8080", true)]
+    [InlineData("http://api.example.com", false)]
+    [InlineData("ftp://api.example.com", false)]
+    [InlineData("not-a-url", false)]
+    public void ValidateEndpointUrl_Enforces_One_Rule(string url, bool valid)
+    {
+        var errors = new List<string>();
+        CredentialOptions.ValidateEndpointUrl("ApiUrl", url, errors);
+        Assert.Equal(valid, errors.Count == 0);
+    }
+
+    [Fact]
+    public void ValidateEndpointUrl_Context_Prefixes_The_Error()
+    {
+        var errors = new List<string>();
+        CredentialOptions.ValidateEndpointUrl(
+            "BrokerUpstreamBaseUrl", "http://api.example.com", errors, "mapping for 'X'");
+        Assert.Single(errors);
+        Assert.StartsWith("mapping for 'X': BrokerUpstreamBaseUrl", errors[0], StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("https://api.example.com", true)]
+    [InlineData("http://localhost", true)]
+    [InlineData("http://api.example.com", false)]
+    public void IsCredentialEndpoint_Matches_The_Validation_Rule(string url, bool expected)
+        => Assert.Equal(expected, CredentialOptions.IsCredentialEndpoint(new Uri(url)));
+
+    // ── Sandbox-variable validation ──────────────────────────────────────
+
+    [Fact]
+    public void ValidateSandboxEnvVar_Covers_Presence_Shape_Length_And_Duplicates()
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var errors = new List<string>();
+
+        Assert.True(CredentialOptions.ValidateSandboxEnvVar("MY_VAR", seen, errors, out var label));
+        Assert.Equal("mapping for 'MY_VAR'", label);
+        Assert.Empty(errors);
+
+        // Duplicate within the same mapping set.
+        Assert.True(CredentialOptions.ValidateSandboxEnvVar("MY_VAR", seen, errors, out _));
+        Assert.Single(errors);
+
+        // Empty: the caller skips the rest of that mapping's checks.
+        errors.Clear();
+        Assert.False(CredentialOptions.ValidateSandboxEnvVar("  ", seen, errors, out label));
+        Assert.Equal("mapping with an empty SandboxEnvVar", label);
+        Assert.Single(errors);
+
+        errors.Clear();
+        CredentialOptions.ValidateSandboxEnvVar("9BAD", seen, errors, out _);
+        CredentialOptions.ValidateSandboxEnvVar(new string('x', CredentialOptions.MaxSandboxEnvVarChars + 1), seen, errors, out _);
+        Assert.Equal(2, errors.Count);
+    }
+
+    // ── Lease-parse and options gates ────────────────────────────────────
+
+    [Fact]
+    public void ParseOrThrow_Parses_Ours_And_Rejects_Foreign_With_Typed_Error()
+    {
+        var parsed = LeaseHandles.ParseOrThrow<string>(
+            "acme.s.MY_VAR.tail", "Acme", TestParser, TestCredentialException.Create);
+        Assert.Equal("MY_VAR", parsed);
+
+        var ex = Assert.Throws<TestCredentialException>(
+            () => LeaseHandles.ParseOrThrow<string>(
+                "other.s.MY_VAR.tail", "Acme", TestParser, TestCredentialException.Create));
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
+        Assert.False(ex.IsInfrastructure);
+        Assert.Equal("TestBackend", ex.Backend);
+
+        Assert.Throws<TestCredentialException>(
+            () => LeaseHandles.ParseOrThrow<string>(null, "Acme", TestParser, TestCredentialException.Create));
+    }
+
+    private static bool TestParser(string? leaseId, out string parsed)
+    {
+        parsed = string.Empty;
+        if (!LeaseHandles.TryParse(leaseId, "acme", out _, out var envVar, out _))
+            return false;
+        parsed = envVar;
+        return true;
+    }
+
+    [Fact]
+    public void RequireUsable_Gates_Disabled_And_Invalid_Identically()
+    {
+        var disabled = Assert.Throws<TestCredentialException>(
+            () => CredentialOptions.RequireUsable(
+                new TestCredentialOptions(Enabled: false), "Acme", TestCredentialException.Create));
+        Assert.Equal(CredentialFailureKind.Misconfigured, disabled.Kind);
+        Assert.Contains("Acme provider is disabled", disabled.Message, StringComparison.Ordinal);
+
+        var invalid = Assert.Throws<TestCredentialException>(
+            () => CredentialOptions.RequireUsable(
+                new TestCredentialOptions(Enabled: true, Errors: ["first problem", "second"]),
+                "Acme", TestCredentialException.Create));
+        Assert.Equal(CredentialFailureKind.Misconfigured, invalid.Kind);
+        Assert.Contains("first problem", invalid.Message, StringComparison.Ordinal);
+
+        var usable = new TestCredentialOptions(Enabled: true);
+        Assert.Same(usable, CredentialOptions.RequireUsable(usable, "Acme", TestCredentialException.Create));
+    }
+
+    private sealed record TestCredentialOptions(bool Enabled, IReadOnlyList<string>? Errors = null)
+        : ICredentialOptions
+    {
+        public IReadOnlyList<string> Validate() => Errors ?? [];
+    }
+
+    // ── Lazy client holder ───────────────────────────────────────────────
+
+    [Fact]
+    public void LazyClient_Builds_Once_And_Caches()
+    {
+        var builds = 0;
+        using var holder = new LazyCredentialClient<CountingHandler>(
+            () => TimeSpan.FromSeconds(30),
+            http =>
+            {
+                Interlocked.Increment(ref builds);
+                Assert.NotNull(http);
+                return new CountingHandler((r, c) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)));
+            });
+        Assert.Same(holder.Get(), holder.Get());
+        Assert.Equal(1, builds);
+    }
+
+    [Fact]
+    public void LazyClient_Concurrent_Getters_Share_One_Build()
+    {
+        var builds = 0;
+        using var holder = new LazyCredentialClient<object>(
+            () => TimeSpan.FromSeconds(30),
+            _ =>
+            {
+                Interlocked.Increment(ref builds);
+                return new object();
+            });
+        var clients = new object?[16];
+        Parallel.For(0, clients.Length, i => clients[i] = holder.Get());
+        Assert.Equal(1, builds);
+        Assert.All(clients, c => Assert.Same(clients[0], c));
+    }
+
+    [Fact]
+    public void LazyClient_Injected_Client_Is_Used_And_Never_Disposed()
+    {
+        using var injected = new HttpClient(new CountingHandler(
+            (r, c) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK))));
+        var holder = new LazyCredentialClient<HttpClient>(
+            () => TimeSpan.FromSeconds(30), http => http, injected);
+        Assert.Same(injected, holder.Get());
+        holder.Dispose();
+        // The injected client stays usable — the holder never owned it.
+        Assert.Equal(TimeSpan.FromSeconds(30), injected.Timeout);
+    }
+
+    private static IConfigurationSection Section(Dictionary<string, string?> values)
+    {
+        var full = values.ToDictionary(
+            kv => $"x:{kv.Key}", kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+        return new ConfigurationBuilder()
+            .AddInMemoryCollection(full!)
+            .Build()
+            .GetSection("x");
     }
 
     private static CredentialTransport CreateTransport(HttpClient http)

@@ -46,11 +46,9 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
 
     private IPluginHost? _host;
     private ILogger _logger = NullLogger.Instance;
-    private HttpClient? _http;
-    private bool _ownsHttp;
+    private readonly LazyCredentialClient<OnePasswordRestClient> _clients;
     private OnePasswordRestClient? _api;
     private OnePasswordServiceAccountClient? _cli;
-    private readonly object _clientLock = new();
     private readonly ConcurrentDictionary<string, IssuedLeaseContext> _issued = new(StringComparer.Ordinal);
 
     /// <summary>
@@ -68,6 +66,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
     {
         _clock = clock ?? TimeProvider.System;
         _env = Environment.GetEnvironmentVariable;
+        _clients = NewClientCache(null);
     }
 
     /// <summary>Test constructor: explicit client, config, clock, environment, and CLI runner.</summary>
@@ -79,12 +78,13 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         ILogger? log = null,
         IOnePasswordProcessRunner? cliRunner = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
+        ArgumentNullException.ThrowIfNull(http);
         _testConfig = config ?? throw new ArgumentNullException(nameof(config));
         _clock = clock ?? TimeProvider.System;
         _env = env ?? Environment.GetEnvironmentVariable;
         _logger = log ?? NullLogger.Instance;
         _testRunner = cliRunner;
+        _clients = NewClientCache(http);
     }
 
     /// <inheritdoc />
@@ -161,7 +161,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
             throw new OnePasswordException(
                 CredentialFailureKind.InvalidResponse,
                 $"1Password secret '{secret.SandboxEnvVar}' returned an empty value.");
-        var window = StaticWindow(options, requestedTtl);
+        var window = CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, requestedTtl);
         var expiresAt = _clock.GetUtcNow() + window;
         var kind = mapping.UseServiceAccount
             ? OnePasswordLeaseIds.LeaseKind.ServiceAccount
@@ -169,7 +169,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         var leaseId = kind == OnePasswordLeaseIds.LeaseKind.Connect
             ? OnePasswordLeaseIds.BuildConnect(mapping.SandboxEnvVar)
             : OnePasswordLeaseIds.BuildServiceAccount(mapping.SandboxEnvVar);
-        _issued[leaseId] = new IssuedLeaseContext(kind, mapping, expiresAt);
+        _issued[leaseId] = new IssuedLeaseContext(kind, mapping);
         _logger.LogInformation(
             "1Password issued {Transport} lease '{LeaseId}' for '{Var}' (scope {Scope}).",
             mapping.UseServiceAccount ? "service-account" : "Connect",
@@ -205,8 +205,11 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         // within one window; the fresh value reaches the guest on next
         // provisioning.
         await FetchValueAsync(options, context.Mapping, ct).ConfigureAwait(false);
-        var expiresAt = _clock.GetUtcNow() + StaticWindow(options, TimeSpan.Zero);
-        _issued[leaseId] = context with { ExpiresAt = expiresAt };
+        var expiresAt = _clock.GetUtcNow()
+            + CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, TimeSpan.Zero);
+        // Re-register the (possibly rebuilt) context so revocation can
+        // still address it.
+        _issued[leaseId] = context;
         _logger.LogDebug("1Password renewed lease '{LeaseId}'.", leaseId);
         return expiresAt;
     }
@@ -238,10 +241,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
             return;
         _disposed = true;
         _issued.Clear();
-        if (_ownsHttp)
-        {
-            try { _http?.Dispose(); } catch (Exception) { }
-        }
+        _clients.Dispose();
     }
 
     internal OnePasswordOptions CurrentOptions()
@@ -259,7 +259,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         {
             EnsureClients();
             var token = ReadServiceAccountToken(options);
-            var opTimeout = TimeSpan.FromSeconds(Math.Clamp(options.OpTimeoutSeconds, 1, 300));
+            var opTimeout = CredentialOptions.TimeoutSpan(options.OpTimeoutSeconds);
             return await _cli!.ReadFieldAsync(
                 options.OpBinaryPath,
                 token,
@@ -310,19 +310,8 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         => string.IsNullOrWhiteSpace(mapping.ItemId) ? mapping.ItemTitle.Trim() : mapping.ItemId.Trim();
 
     private OnePasswordOptions RequireUsableOptions()
-    {
-        var options = CurrentOptions();
-        if (!options.Enabled)
-            throw new OnePasswordException(
-                CredentialFailureKind.Misconfigured,
-                "1Password provider is disabled (Enabled=false); enable it to issue.");
-        var errors = options.Validate();
-        if (errors.Count > 0)
-            throw new OnePasswordException(
-                CredentialFailureKind.Misconfigured,
-                $"1Password configuration is invalid: {errors[0]}");
-        return options;
-    }
+        => CredentialOptions.RequireUsable(
+            CurrentOptions(), OnePasswordException.BackendName, OnePasswordException.Create);
 
     private static OnePasswordSecretMapping? FindMapping(OnePasswordOptions options, ProjectSandboxSecret secret)
     {
@@ -361,56 +350,26 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
         var expectedKind = mapping.UseServiceAccount
             ? OnePasswordLeaseIds.LeaseKind.ServiceAccount
             : OnePasswordLeaseIds.LeaseKind.Connect;
-        return new IssuedLeaseContext(expectedKind, mapping, _clock.GetUtcNow());
+        return new IssuedLeaseContext(expectedKind, mapping);
     }
 
     private static OnePasswordLeaseIds.ParsedLeaseId ParseOurs(string leaseId)
-    {
-        if (!OnePasswordLeaseIds.TryParse(leaseId, out var parsed))
-            throw new OnePasswordException(
-                CredentialFailureKind.Misconfigured,
-                $"Lease '{leaseId ?? string.Empty}' is not a 1Password lease handle.");
-        return parsed;
-    }
-
-    private static TimeSpan StaticWindow(OnePasswordOptions options, TimeSpan requestedTtl)
-    {
-        var configured = TimeSpan.FromMinutes(Math.Clamp(options.StaticLeaseTtlMinutes, 1, 1440));
-        return requestedTtl > TimeSpan.Zero && requestedTtl < configured ? requestedTtl : configured;
-    }
-
-    private static TimeSpan ClientTimeout(OnePasswordOptions options) =>
-        TimeSpan.FromSeconds(Math.Clamp(options.TimeoutSeconds, 1, 300));
+        => LeaseHandles.ParseOrThrow<OnePasswordLeaseIds.ParsedLeaseId>(
+            leaseId, OnePasswordException.BackendName, OnePasswordLeaseIds.TryParse, OnePasswordException.Create);
 
     private void EnsureClients()
     {
-        if (_api is not null && _cli is not null)
-            return;
-        lock (_clientLock)
-        {
-            if (_api is null)
-            {
-                if (_http is null)
-                {
-                    _http = CredentialHttp.CreateNoRedirectClient(ClientTimeout(CurrentOptions()));
-                    _ownsHttp = true;
-                }
-                try
-                {
-                    _http.Timeout = ClientTimeout(CurrentOptions());
-                }
-                catch (InvalidOperationException)
-                {
-                    // A request is already in flight; keep the existing timeout.
-                }
-                _api = new OnePasswordRestClient(_http, _clock, _logger);
-            }
-            _cli ??= new OnePasswordServiceAccountClient(_testRunner, _logger);
-        }
+        _api = _clients.Get();
+        _cli ??= new OnePasswordServiceAccountClient(_testRunner, _logger);
     }
+
+    private LazyCredentialClient<OnePasswordRestClient> NewClientCache(HttpClient? injected)
+        => new(
+            () => CredentialOptions.TimeoutSpan(CurrentOptions().TimeoutSeconds),
+            http => new OnePasswordRestClient(http, _clock, _logger),
+            injected);
 
     private sealed record IssuedLeaseContext(
         OnePasswordLeaseIds.LeaseKind Kind,
-        OnePasswordSecretMapping Mapping,
-        DateTimeOffset ExpiresAt);
+        OnePasswordSecretMapping Mapping);
 }

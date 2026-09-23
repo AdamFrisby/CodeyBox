@@ -111,12 +111,14 @@ public abstract class CredentialException : Exception
         CredentialFailureKind kind,
         string message,
         Exception inner,
-        int? statusCode = null)
+        int? statusCode = null,
+        int? retryAfterSeconds = null)
         : base(Truncate(backend, message), inner)
     {
         Backend = backend;
         Kind = kind;
         StatusCode = statusCode;
+        RetryAfterSeconds = retryAfterSeconds;
     }
 
     /// <summary>

@@ -12,15 +12,19 @@ namespace CodeyBox.DopplerPlugin;
 /// </summary>
 public sealed class DopplerException : CredentialException
 {
+    /// <summary>Display name stamped on every Doppler failure and transport message.</summary>
+    internal const string BackendName = "Doppler";
+
     public DopplerException(
         CredentialFailureKind kind, string message, int? statusCode = null, int? retryAfterSeconds = null)
-        : base("Doppler", kind, message, statusCode, retryAfterSeconds)
+        : base(BackendName, kind, message, statusCode, retryAfterSeconds)
     {
     }
 
     public DopplerException(
-        CredentialFailureKind kind, string message, Exception inner, int? statusCode = null)
-        : base("Doppler", kind, message, inner, statusCode)
+        CredentialFailureKind kind, string message, Exception inner,
+        int? statusCode = null, int? retryAfterSeconds = null)
+        : base(BackendName, kind, message, inner, statusCode, retryAfterSeconds)
     {
     }
 
@@ -29,5 +33,5 @@ public sealed class DopplerException : CredentialException
         CredentialFailureKind kind, string message, Exception? inner, int? statusCode, int? retryAfterSeconds)
         => inner is null
             ? new DopplerException(kind, message, statusCode, retryAfterSeconds)
-            : new DopplerException(kind, message, inner, statusCode);
+            : new DopplerException(kind, message, inner, statusCode, retryAfterSeconds);
 }

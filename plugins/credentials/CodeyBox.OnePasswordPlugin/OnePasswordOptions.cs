@@ -101,7 +101,7 @@ public sealed record OnePasswordSecretMapping
 /// (vault agent, systemd credentials, container secrets). Only the names
 /// are configured.</para>
 /// </summary>
-public sealed record OnePasswordOptions
+public sealed record OnePasswordOptions : ICredentialOptions
 {
     /// <summary>Plugin ID used in <c>CodeyBox:Plugins:&lt;id&gt;</c>.</summary>
     public const string PluginId = "codeybox.onepassword";
@@ -193,20 +193,20 @@ public sealed record OnePasswordOptions
 
         return new OnePasswordOptions
         {
-            Enabled = ReadBool(section, "Enabled", defaults.Enabled),
-            ServerUrl = ReadNonEmpty(section, "ServerUrl", defaults.ServerUrl).TrimEnd('/'),
-            ConnectTokenEnvVar = ReadNonEmpty(section, "ConnectTokenEnvVar", defaults.ConnectTokenEnvVar),
+            Enabled = CredentialOptions.ReadBool(section, "Enabled", defaults.Enabled, warnings),
+            ServerUrl = CredentialOptions.ReadNonEmpty(section, "ServerUrl", defaults.ServerUrl).TrimEnd('/'),
+            ConnectTokenEnvVar = CredentialOptions.ReadNonEmpty(section, "ConnectTokenEnvVar", defaults.ConnectTokenEnvVar),
             ServiceAccountTokenEnvVar = (section["ServiceAccountTokenEnvVar"] ?? string.Empty).Trim(),
-            OpBinaryPath = ReadNonEmpty(section, "OpBinaryPath", defaults.OpBinaryPath),
-            StaticLeaseTtlMinutes = Math.Clamp(
-                ReadInt(section, "StaticLeaseTtlMinutes", defaults.StaticLeaseTtlMinutes, warnings), 1, 1440),
-            TimeoutSeconds = Math.Clamp(
-                ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings), 1, 300),
-            OpTimeoutSeconds = Math.Clamp(
-                ReadInt(section, "OpTimeoutSeconds", defaults.OpTimeoutSeconds, warnings), 1, 300),
-            MaxResponseBytes = Math.Max(
-                ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings), 1024),
-            Mappings = ReadMappings(section.GetSection("Mappings")),
+            OpBinaryPath = CredentialOptions.ReadNonEmpty(section, "OpBinaryPath", defaults.OpBinaryPath),
+            StaticLeaseTtlMinutes = CredentialOptions.ReadStaticLeaseTtlMinutes(
+                section, defaults.StaticLeaseTtlMinutes, warnings),
+            TimeoutSeconds = CredentialOptions.ReadTimeoutSeconds(
+                section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings),
+            OpTimeoutSeconds = CredentialOptions.ReadTimeoutSeconds(
+                section, "OpTimeoutSeconds", defaults.OpTimeoutSeconds, warnings),
+            MaxResponseBytes = CredentialOptions.ReadByteCap(
+                section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings),
+            Mappings = ReadMappings(section.GetSection("Mappings"), warnings),
         };
     }
 
@@ -219,15 +219,7 @@ public sealed record OnePasswordOptions
     public IReadOnlyList<string> Validate()
     {
         var errors = new List<string>();
-        if (!Uri.TryCreate(ServerUrl, UriKind.Absolute, out var server)
-            || (server.Scheme != Uri.UriSchemeHttps && server.Scheme != Uri.UriSchemeHttp))
-        {
-            errors.Add($"ServerUrl '{ServerUrl}' must be an absolute http(s) URL.");
-        }
-        else if (server.Scheme == Uri.UriSchemeHttp && !IsLoopbackHost(server.Host))
-        {
-            errors.Add($"ServerUrl '{ServerUrl}' uses plain http against a non-loopback host; use https.");
-        }
+        CredentialOptions.ValidateEndpointUrl("ServerUrl", ServerUrl, errors);
 
         if (string.IsNullOrWhiteSpace(OpBinaryPath))
             errors.Add("OpBinaryPath must not be empty (service-account mappings spawn the 1Password CLI).");
@@ -239,20 +231,8 @@ public sealed record OnePasswordOptions
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var mapping in Mappings)
         {
-            var where = string.IsNullOrWhiteSpace(mapping.SandboxEnvVar)
-                ? "mapping with an empty SandboxEnvVar"
-                : $"mapping for '{mapping.SandboxEnvVar}'";
-            if (string.IsNullOrWhiteSpace(mapping.SandboxEnvVar))
-            {
-                errors.Add("A mapping has an empty SandboxEnvVar; every mapping must name its sandbox variable.");
+            if (!CredentialOptions.ValidateSandboxEnvVar(mapping.SandboxEnvVar, seen, errors, out var where))
                 continue;
-            }
-            if (mapping.SandboxEnvVar.Length > MaxSandboxEnvVarChars)
-                errors.Add($"{where}: SandboxEnvVar exceeds {MaxSandboxEnvVarChars} characters (lease handles embed it).");
-            if (!IsEnvVarName(mapping.SandboxEnvVar))
-                errors.Add($"{where}: SandboxEnvVar must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*).");
-            if (!seen.Add(mapping.SandboxEnvVar))
-                errors.Add($"{where}: duplicate SandboxEnvVar; each sandbox variable maps once.");
 
             var hasVaultId = !string.IsNullOrWhiteSpace(mapping.VaultId);
             var hasVaultName = !string.IsNullOrWhiteSpace(mapping.VaultName);
@@ -287,18 +267,12 @@ public sealed record OnePasswordOptions
     /// <summary>Default item field read when a mapping names none.</summary>
     internal const string DefaultField = "password";
 
-    /// <summary>
-    /// Maximum sandbox-variable length accepted in a mapping. Lease handles
-    /// embed the variable name, and handles are capped at
-    /// <c>SecretLeasingOptions.MaxLeaseIdLength</c> (256).
-    /// </summary>
-    internal const int MaxSandboxEnvVarChars = 64;
-
     internal const int MaxVaultChars = 128;
     internal const int MaxItemChars = 256;
     internal const int MaxFieldChars = 128;
 
-    private static IReadOnlyList<OnePasswordSecretMapping> ReadMappings(IConfigurationSection section)
+    private static IReadOnlyList<OnePasswordSecretMapping> ReadMappings(
+        IConfigurationSection section, List<string>? warnings)
     {
         var mappings = new List<OnePasswordSecretMapping>();
         foreach (var child in section.GetChildren())
@@ -311,27 +285,11 @@ public sealed record OnePasswordOptions
                 VaultName = (child["VaultName"] ?? string.Empty).Trim(),
                 ItemId = (child["ItemId"] ?? string.Empty).Trim(),
                 ItemTitle = (child["ItemTitle"] ?? string.Empty).Trim(),
-                Field = ReadNonEmpty(child, "Field", DefaultField),
-                UseServiceAccount = ReadBool(child, "UseServiceAccount", false),
+                Field = CredentialOptions.ReadNonEmpty(child, "Field", DefaultField),
+                UseServiceAccount = CredentialOptions.ReadBool(child, "UseServiceAccount", false, warnings),
                 TokenEnvVar = (child["TokenEnvVar"] ?? string.Empty).Trim(),
             });
         }
         return mappings.AsReadOnly();
     }
-
-    private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
-        => CredentialOptions.ReadBool(section, key, fallback);
-
-    private static int ReadInt(
-        IConfigurationSection section, string key, int fallback, List<string>? warnings)
-        => CredentialOptions.ReadInt(section, key, fallback, warnings);
-
-    private static string ReadNonEmpty(IConfigurationSection section, string key, string fallback)
-        => CredentialOptions.ReadNonEmpty(section, key, fallback);
-
-    internal static bool IsLoopbackHost(string host)
-        => CredentialOptions.IsLoopbackHost(host);
-
-    private static bool IsEnvVarName(string value)
-        => CredentialOptions.IsEnvVarName(value);
 }

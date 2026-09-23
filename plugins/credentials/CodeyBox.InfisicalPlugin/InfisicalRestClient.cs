@@ -44,7 +44,7 @@ public sealed class InfisicalRestClient
     {
         _transport = new CredentialTransport(
             http ?? throw new ArgumentNullException(nameof(http)),
-            "Infisical",
+            InfisicalException.BackendName,
             InfisicalException.Create,
             ErrorDetailFields,
             relayRawErrorText: true,
@@ -119,7 +119,7 @@ public sealed class InfisicalRestClient
                 throw new InfisicalException(
                     CredentialFailureKind.InvalidResponse,
                     $"Infisical fetch of secret '{secretKey}' returned no secret object.");
-            if (!CredentialJson.TryGetString(secret, "secretValue", out var value) || value is null)
+            if (!CredentialJson.TryGetString(secret, "secretValue", out var value) || string.IsNullOrEmpty(value))
                 throw new InfisicalException(
                     CredentialFailureKind.InvalidResponse,
                     $"Infisical fetch of secret '{secretKey}' returned no secretValue.");
@@ -128,7 +128,7 @@ public sealed class InfisicalRestClient
             _log.LogDebug(
                 "Infisical fetched secret '{Key}' (id {Id}, version {Version}).",
                 secretKey, string.IsNullOrEmpty(id) ? "unknown" : id, version);
-            return new InfisicalStaticSecret(id ?? string.Empty, version, value);
+            return new InfisicalStaticSecret(id, version, value);
         }
     }
 
@@ -259,7 +259,6 @@ public sealed class InfisicalRestClient
         try
         {
             using var response = await _transport.SendAsync(request, $"revoke dynamic lease '{serverLeaseId}'", ct).ConfigureAwait(false);
-            response.Dispose();
             _log.LogInformation("Infisical revoked dynamic lease '{LeaseId}'.", serverLeaseId);
         }
         catch (InfisicalException ex) when (ex.Kind == CredentialFailureKind.NotFound)

@@ -109,7 +109,7 @@ public sealed record InfisicalSecretMapping
 /// credential chain (vault agent, systemd credentials, container secrets).
 /// Only the names are configured.</para>
 /// </summary>
-public sealed record InfisicalOptions
+public sealed record InfisicalOptions : ICredentialOptions
 {
     /// <summary>Plugin ID used in <c>CodeyBox:Plugins:&lt;id&gt;</c>.</summary>
     public const string PluginId = "codeybox.infisical";
@@ -221,34 +221,34 @@ public sealed record InfisicalOptions
 
         return new InfisicalOptions
         {
-            Enabled = ReadBool(section, "Enabled", defaults.Enabled),
-            SiteUrl = ReadNonEmpty(section, "SiteUrl", defaults.SiteUrl).TrimEnd('/'),
-            ClientIdEnvVar = ReadNonEmpty(section, "ClientIdEnvVar", defaults.ClientIdEnvVar),
-            ClientSecretEnvVar = ReadNonEmpty(section, "ClientSecretEnvVar", defaults.ClientSecretEnvVar),
+            Enabled = CredentialOptions.ReadBool(section, "Enabled", defaults.Enabled, warnings),
+            SiteUrl = CredentialOptions.ReadNonEmpty(section, "SiteUrl", defaults.SiteUrl).TrimEnd('/'),
+            ClientIdEnvVar = CredentialOptions.ReadNonEmpty(section, "ClientIdEnvVar", defaults.ClientIdEnvVar),
+            ClientSecretEnvVar = CredentialOptions.ReadNonEmpty(section, "ClientSecretEnvVar", defaults.ClientSecretEnvVar),
             AccessTokenEnvVar = (section["AccessTokenEnvVar"] ?? string.Empty).Trim(),
             WorkspaceId = (section["WorkspaceId"] ?? string.Empty).Trim(),
             ProjectSlug = (section["ProjectSlug"] ?? string.Empty).Trim(),
-            Environment = ReadNonEmpty(section, "Environment", defaults.Environment),
-            StaticLeaseTtlMinutes = Math.Clamp(
-                ReadInt(section, "StaticLeaseTtlMinutes", defaults.StaticLeaseTtlMinutes, warnings), 1, 1440),
-            TimeoutSeconds = Math.Clamp(
-                ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings), 1, 300),
-            MaxResponseBytes = Math.Max(
-                ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings), 1024),
-            TokenRefreshSkewSeconds = Math.Clamp(
-                ReadInt(section, "TokenRefreshSkewSeconds", defaults.TokenRefreshSkewSeconds, warnings), 0, 3600),
-            Mappings = ReadMappings(section.GetSection("Mappings")),
-            BrokerEnabled = ReadBool(section, "BrokerEnabled", defaults.BrokerEnabled),
-            BrokerBindHost = ReadNonEmpty(section, "BrokerBindHost", defaults.BrokerBindHost),
+            Environment = CredentialOptions.ReadNonEmpty(section, "Environment", defaults.Environment),
+            StaticLeaseTtlMinutes = CredentialOptions.ReadStaticLeaseTtlMinutes(
+                section, defaults.StaticLeaseTtlMinutes, warnings),
+            TimeoutSeconds = CredentialOptions.ReadTimeoutSeconds(
+                section, "TimeoutSeconds", defaults.TimeoutSeconds, warnings),
+            MaxResponseBytes = CredentialOptions.ReadByteCap(
+                section, "MaxResponseBytes", defaults.MaxResponseBytes, warnings),
+            TokenRefreshSkewSeconds = CredentialOptions.ReadTokenRefreshSkewSeconds(
+                section, defaults.TokenRefreshSkewSeconds, warnings),
+            Mappings = ReadMappings(section.GetSection("Mappings"), warnings),
+            BrokerEnabled = CredentialOptions.ReadBool(section, "BrokerEnabled", defaults.BrokerEnabled, warnings),
+            BrokerBindHost = CredentialOptions.ReadNonEmpty(section, "BrokerBindHost", defaults.BrokerBindHost),
             BrokerBindPort = Math.Clamp(
-                ReadInt(section, "BrokerBindPort", defaults.BrokerBindPort, warnings), 0, 65535),
+                CredentialOptions.ReadInt(section, "BrokerBindPort", defaults.BrokerBindPort, warnings), 0, 65535),
             BrokerAdvertiseHost = (section["BrokerAdvertiseHost"] ?? string.Empty).Trim(),
-            BrokerMaxBodyBytes = Math.Max(
-                ReadInt(section, "BrokerMaxBodyBytes", defaults.BrokerMaxBodyBytes, warnings), 1024),
+            BrokerMaxBodyBytes = CredentialOptions.ReadByteCap(
+                section, "BrokerMaxBodyBytes", defaults.BrokerMaxBodyBytes, warnings),
             BrokerMaxConcurrency = Math.Clamp(
-                ReadInt(section, "BrokerMaxConcurrency", defaults.BrokerMaxConcurrency, warnings), 1, 256),
+                CredentialOptions.ReadInt(section, "BrokerMaxConcurrency", defaults.BrokerMaxConcurrency, warnings), 1, 256),
             BrokerMaxPathChars = Math.Clamp(
-                ReadInt(section, "BrokerMaxPathChars", defaults.BrokerMaxPathChars, warnings), 64, 4096),
+                CredentialOptions.ReadInt(section, "BrokerMaxPathChars", defaults.BrokerMaxPathChars, warnings), 64, 4096),
         };
     }
 
@@ -260,15 +260,7 @@ public sealed record InfisicalOptions
     public IReadOnlyList<string> Validate()
     {
         var errors = new List<string>();
-        if (!Uri.TryCreate(SiteUrl, UriKind.Absolute, out var site)
-            || (site.Scheme != Uri.UriSchemeHttps && site.Scheme != Uri.UriSchemeHttp))
-        {
-            errors.Add($"SiteUrl '{SiteUrl}' must be an absolute http(s) URL.");
-        }
-        else if (site.Scheme == Uri.UriSchemeHttp && !IsLoopbackHost(site.Host))
-        {
-            errors.Add($"SiteUrl '{SiteUrl}' uses plain http against a non-loopback host; use https.");
-        }
+        CredentialOptions.ValidateEndpointUrl("SiteUrl", SiteUrl, errors);
 
         if (string.IsNullOrWhiteSpace(WorkspaceId))
             errors.Add("WorkspaceId is required (the Infisical project ID).");
@@ -281,20 +273,8 @@ public sealed record InfisicalOptions
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var mapping in Mappings)
         {
-            var where = string.IsNullOrWhiteSpace(mapping.SandboxEnvVar)
-                ? "mapping with an empty SandboxEnvVar"
-                : $"mapping for '{mapping.SandboxEnvVar}'";
-            if (string.IsNullOrWhiteSpace(mapping.SandboxEnvVar))
-            {
-                errors.Add("A mapping has an empty SandboxEnvVar; every mapping must name its sandbox variable.");
+            if (!CredentialOptions.ValidateSandboxEnvVar(mapping.SandboxEnvVar, seen, errors, out var where))
                 continue;
-            }
-            if (mapping.SandboxEnvVar.Length > MaxSandboxEnvVarChars)
-                errors.Add($"{where}: SandboxEnvVar exceeds {MaxSandboxEnvVarChars} characters (lease handles embed it).");
-            if (!IsEnvVarName(mapping.SandboxEnvVar))
-                errors.Add($"{where}: SandboxEnvVar must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*).");
-            if (!seen.Add(mapping.SandboxEnvVar))
-                errors.Add($"{where}: duplicate SandboxEnvVar; each sandbox variable maps once.");
             var hasStatic = !string.IsNullOrWhiteSpace(mapping.SecretKey);
             var hasDynamic = !string.IsNullOrWhiteSpace(mapping.DynamicSecretName);
             if (hasStatic == hasDynamic)
@@ -305,9 +285,11 @@ public sealed record InfisicalOptions
             {
                 if (!BrokerEnabled)
                     errors.Add($"{where}: brokered but BrokerEnabled is false; enable the broker or drop Brokered.");
-                if (!Uri.TryCreate(mapping.BrokerUpstreamBaseUrl, UriKind.Absolute, out var upstream)
-                    || (upstream.Scheme != Uri.UriSchemeHttps && upstream.Scheme != Uri.UriSchemeHttp))
-                    errors.Add($"{where}: BrokerUpstreamBaseUrl must be an absolute http(s) URL.");
+                // The broker attaches the credential upstream-side: the
+                // same https-everywhere rule as SiteUrl applies here, so an
+                // injected secret never crosses the network in clear.
+                CredentialOptions.ValidateEndpointUrl(
+                    "BrokerUpstreamBaseUrl", mapping.BrokerUpstreamBaseUrl, errors, where);
                 if (string.IsNullOrWhiteSpace(mapping.BrokerInjectHeader))
                     errors.Add($"{where}: brokered mappings require BrokerInjectHeader.");
             }
@@ -316,14 +298,8 @@ public sealed record InfisicalOptions
         return errors.AsReadOnly();
     }
 
-    /// <summary>
-    /// Maximum sandbox-variable length accepted in a mapping. Lease handles
-    /// embed the variable name, and handles are capped at
-    /// <c>SecretLeasingOptions.MaxLeaseIdLength</c> (256).
-    /// </summary>
-    internal const int MaxSandboxEnvVarChars = 64;
-
-    private static IReadOnlyList<InfisicalSecretMapping> ReadMappings(IConfigurationSection section)
+    private static IReadOnlyList<InfisicalSecretMapping> ReadMappings(
+        IConfigurationSection section, List<string>? warnings)
     {
         var mappings = new List<InfisicalSecretMapping>();
         foreach (var child in section.GetChildren())
@@ -335,11 +311,11 @@ public sealed record InfisicalOptions
                 SecretKey = (child["SecretKey"] ?? string.Empty).Trim(),
                 DynamicSecretName = (child["DynamicSecretName"] ?? string.Empty).Trim(),
                 DataField = (child["DataField"] ?? string.Empty).Trim(),
-                SecretPath = ReadNonEmpty(child, "SecretPath", "/"),
+                SecretPath = CredentialOptions.ReadNonEmpty(child, "SecretPath", "/"),
                 Ttl = (child["Ttl"] ?? string.Empty).Trim(),
-                Brokered = ReadBool(child, "Brokered", false),
+                Brokered = CredentialOptions.ReadBool(child, "Brokered", false, warnings),
                 BrokerUpstreamBaseUrl = (child["BrokerUpstreamBaseUrl"] ?? string.Empty).Trim().TrimEnd('/'),
-                BrokerInjectHeader = ReadNonEmpty(child, "BrokerInjectHeader", "Authorization"),
+                BrokerInjectHeader = CredentialOptions.ReadNonEmpty(child, "BrokerInjectHeader", "Authorization"),
                 BrokerInjectScheme = (child["BrokerInjectScheme"] ?? "Bearer").Trim(),
                 BrokerAllowedPaths = ReadList(child.GetSection("BrokerAllowedPaths")),
             });
@@ -358,20 +334,4 @@ public sealed record InfisicalOptions
         }
         return values.AsReadOnly();
     }
-
-    private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
-        => CredentialOptions.ReadBool(section, key, fallback);
-
-    private static int ReadInt(
-        IConfigurationSection section, string key, int fallback, List<string>? warnings)
-        => CredentialOptions.ReadInt(section, key, fallback, warnings);
-
-    private static string ReadNonEmpty(IConfigurationSection section, string key, string fallback)
-        => CredentialOptions.ReadNonEmpty(section, key, fallback);
-
-    internal static bool IsLoopbackHost(string host)
-        => CredentialOptions.IsLoopbackHost(host);
-
-    private static bool IsEnvVarName(string value)
-        => CredentialOptions.IsEnvVarName(value);
 }
