@@ -1,7 +1,7 @@
-using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -29,16 +29,26 @@ public sealed record InfisicalDynamicLease(
 /// </summary>
 public sealed class InfisicalRestClient
 {
-    private readonly HttpClient _http;
+    private readonly CredentialTransport _transport;
     private readonly TimeProvider _clock;
     private readonly ILogger _log;
 
-    /// <summary>Maximum characters kept from a server-echoed error message.</summary>
-    public const int MaxServerDetailChars = 200;
+    /// <summary>JSON error-body fields relayed as detail, in preference order.</summary>
+    private static readonly string[] ErrorDetailFields = ["message"];
+
+    // A universal-auth login response is a JSON object with a JWT accessToken — typically
+    // a few hundred bytes; bound generously so real tokens fit while still capping the buffer.
+    private const int MaxLoginResponseBytes = 4 * 1024;
 
     public InfisicalRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
+        _transport = new CredentialTransport(
+            http ?? throw new ArgumentNullException(nameof(http)),
+            InfisicalException.BackendName,
+            InfisicalException.Create,
+            ErrorDetailFields,
+            relayRawErrorText: true,
+            clock: clock);
         _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger.Instance;
     }
@@ -61,18 +71,18 @@ public sealed class InfisicalRestClient
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
-        using var response = await SendAsync(request, "universal-auth login", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, "universal-auth login", MaxServerDetailChars, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, "universal-auth login", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, "universal-auth login", MaxLoginResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
-            if (!TryGetString(root, "accessToken", out var token) || string.IsNullOrEmpty(token))
+            if (!CredentialJson.TryGetString(root, "accessToken", out var token) || string.IsNullOrEmpty(token))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse, "Infisical universal-auth login returned no accessToken.");
-            var expiresInSeconds = TryGetDouble(root, "expiresIn", out var seconds) ? seconds : 0;
+                    CredentialFailureKind.InvalidResponse, "Infisical universal-auth login returned no accessToken.");
+            var expiresInSeconds = CredentialJson.TryGetDouble(root, "expiresIn", out var seconds) ? seconds : 0;
             if (expiresInSeconds <= 0)
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse, "Infisical universal-auth login returned no expiresIn.");
+                    CredentialFailureKind.InvalidResponse, "Infisical universal-auth login returned no expiresIn.");
             _log.LogDebug("Infisical universal-auth login succeeded; token valid for {Seconds}s.", (long)expiresInSeconds);
             return (token, _clock.GetUtcNow() + TimeSpan.FromSeconds(expiresInSeconds) - skew);
         }
@@ -100,25 +110,25 @@ public sealed class InfisicalRestClient
         url.Append("&expandSecretReferences=true");
         using var request = new HttpRequestMessage(HttpMethod.Get, url.ToString());
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var response = await SendAsync(request, $"fetch secret '{secretKey}'", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, $"fetch secret '{secretKey}'", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, $"fetch secret '{secretKey}'", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, $"fetch secret '{secretKey}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             if (!doc.RootElement.TryGetProperty("secret", out var secret)
                 || secret.ValueKind != JsonValueKind.Object)
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical fetch of secret '{secretKey}' returned no secret object.");
-            if (!TryGetString(secret, "secretValue", out var value) || value is null)
+            if (!CredentialJson.TryGetString(secret, "secretValue", out var value) || string.IsNullOrEmpty(value))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical fetch of secret '{secretKey}' returned no secretValue.");
-            TryGetString(secret, "id", out var id);
-            var version = TryGetInt64(secret, "version", out var v) ? v : 0;
+            CredentialJson.TryGetString(secret, "id", out var id);
+            var version = CredentialJson.TryGetInt64(secret, "version", out var v) ? v : 0;
             _log.LogDebug(
                 "Infisical fetched secret '{Key}' (id {Id}, version {Version}).",
                 secretKey, string.IsNullOrEmpty(id) ? "unknown" : id, version);
-            return new InfisicalStaticSecret(id ?? string.Empty, version, value);
+            return new InfisicalStaticSecret(id, version, value);
         }
     }
 
@@ -151,23 +161,23 @@ public sealed class InfisicalRestClient
             Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"),
         };
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var response = await SendAsync(request, $"create dynamic lease '{dynamicSecretName}'", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, $"create dynamic lease '{dynamicSecretName}'", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, $"create dynamic lease '{dynamicSecretName}'", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, $"create dynamic lease '{dynamicSecretName}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
             if (!root.TryGetProperty("lease", out var lease) || lease.ValueKind != JsonValueKind.Object)
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical create of dynamic lease '{dynamicSecretName}' returned no lease object.");
-            if (!TryGetString(lease, "id", out var leaseId) || string.IsNullOrEmpty(leaseId))
+            if (!CredentialJson.TryGetString(lease, "id", out var leaseId) || string.IsNullOrEmpty(leaseId))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical create of dynamic lease '{dynamicSecretName}' returned no lease id.");
-            var expiresAt = TryGetDateTime(lease, "expireAt", out var exp) ? exp : (DateTimeOffset?)null;
+            var expiresAt = CredentialJson.TryGetDateTime(lease, "expireAt", out var exp) ? exp : (DateTimeOffset?)null;
             if (expiresAt is null)
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical create of dynamic lease '{dynamicSecretName}' returned no expireAt.");
             var data = ReadDataFields(root, $"dynamic lease '{dynamicSecretName}'");
             _log.LogInformation(
@@ -205,14 +215,14 @@ public sealed class InfisicalRestClient
             Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"),
         };
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var response = await SendAsync(request, $"renew dynamic lease '{serverLeaseId}'", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, $"renew dynamic lease '{serverLeaseId}'", maxResponseBytes, ct).ConfigureAwait(false);
+        using var response = await _transport.SendAsync(request, $"renew dynamic lease '{serverLeaseId}'", ct).ConfigureAwait(false);
+        var doc = await _transport.ReadJsonAsync(response, $"renew dynamic lease '{serverLeaseId}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             if (!doc.RootElement.TryGetProperty("lease", out var lease)
-                || !TryGetDateTime(lease, "expireAt", out var expiresAt))
+                || !CredentialJson.TryGetDateTime(lease, "expireAt", out var expiresAt))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical renew of dynamic lease '{serverLeaseId}' returned no expireAt.");
             _log.LogDebug("Infisical renewed dynamic lease '{LeaseId}' to {ExpiresAt}.", serverLeaseId, expiresAt);
             return expiresAt;
@@ -248,194 +258,16 @@ public sealed class InfisicalRestClient
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         try
         {
-            using var response = await SendAsync(request, $"revoke dynamic lease '{serverLeaseId}'", ct).ConfigureAwait(false);
-            response.Dispose();
+            using var response = await _transport.SendAsync(request, $"revoke dynamic lease '{serverLeaseId}'", ct).ConfigureAwait(false);
             _log.LogInformation("Infisical revoked dynamic lease '{LeaseId}'.", serverLeaseId);
         }
-        catch (InfisicalException ex) when (ex.Kind == InfisicalFailureKind.NotFound)
+        catch (InfisicalException ex) when (ex.Kind == CredentialFailureKind.NotFound)
         {
             // Already gone server-side: revocation is complete by definition.
             _log.LogInformation(
                 "Infisical dynamic lease '{LeaseId}' was already absent; treating revocation as complete.",
                 serverLeaseId);
         }
-    }
-
-    private async Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request, string operation, CancellationToken ct)
-    {
-        HttpResponseMessage response;
-        try
-        {
-            response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
-        {
-            throw new InfisicalException(
-                InfisicalFailureKind.Unreachable, $"Infisical {operation} timed out.", ex);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new InfisicalException(
-                InfisicalFailureKind.Unreachable, $"Infisical {operation} could not reach the backend.", ex);
-        }
-
-        if (InfisicalHttpClients.IsRedirect(response.StatusCode))
-        {
-            // Never follow: the backend's 3xx (and its Location) is
-            // untrusted runtime output, and re-sending would carry the
-            // bearer token or client secret to the redirect target. Fail
-            // closed as a backend fault — never a verdict on the item.
-            var redirect = (int)response.StatusCode;
-            response.Dispose();
-            throw new InfisicalException(
-                InfisicalFailureKind.InvalidResponse,
-                $"Infisical {operation} returned redirect HTTP {redirect}; refusing to follow.",
-                redirect);
-        }
-
-        if (response.RequestMessage?.RequestUri is { } finalUri
-            && request.RequestUri is { } originalUri
-            && !InfisicalHttpClients.IsSameOrigin(finalUri, originalUri))
-        {
-            // The handler followed a redirect before this code saw the
-            // response (only possible with an externally supplied
-            // following client — the plugin builds non-following ones).
-            // The credential may already have been re-sent off-origin,
-            // so fail loudly rather than trusting this response.
-            var followedStatus = (int)response.StatusCode;
-            response.Dispose();
-            throw new InfisicalException(
-                InfisicalFailureKind.InvalidResponse,
-                $"Infisical {operation} was redirected to another origin; refusing the response.",
-                followedStatus);
-        }
-
-        if (response.IsSuccessStatusCode)
-            return response;
-
-        var status = (int)response.StatusCode;
-        var detail = await ReadErrorDetailAsync(response, ct).ConfigureAwait(false);
-        var retryAfter = ParseRetryAfter(response);
-        response.Dispose();
-        throw InfisicalException.FromStatus(status, operation, detail, retryAfter);
-    }
-
-    private async Task<JsonDocument> ReadJsonAsync(
-        HttpResponseMessage response, string operation, int maxBytes, CancellationToken ct)
-    {
-        byte[] body;
-        try
-        {
-            body = await ReadBoundedAsync(response, maxBytes, ct).ConfigureAwait(false);
-        }
-        catch (InfisicalException)
-        {
-            response.Dispose();
-            throw;
-        }
-        response.Dispose();
-        JsonDocument doc;
-        try
-        {
-            doc = JsonDocument.Parse(body);
-        }
-        catch (JsonException ex)
-        {
-            // The body may contain secret-adjacent text; never echo it.
-            throw new InfisicalException(
-                InfisicalFailureKind.InvalidResponse,
-                $"Infisical {operation} returned a non-JSON success body.", ex);
-        }
-        if (doc.RootElement.ValueKind != JsonValueKind.Object)
-        {
-            doc.Dispose();
-            throw new InfisicalException(
-                InfisicalFailureKind.InvalidResponse,
-                $"Infisical {operation} returned an unexpected JSON shape.");
-        }
-        return doc;
-    }
-
-    private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, int maxBytes, CancellationToken ct)
-    {
-        var contentLength = response.Content.Headers.ContentLength;
-        if (contentLength.HasValue && contentLength.Value > maxBytes)
-            throw new InfisicalException(
-                InfisicalFailureKind.InvalidResponse,
-                $"Infisical response declares {contentLength.Value} bytes, above the {maxBytes}-byte cap.");
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        // Cap BEFORE buffering: a lying or missing content-length can never
-        // fill host memory.
-        var buffer = new byte[Math.Min(maxBytes + 1, 64 * 1024)];
-        using var sink = new MemoryStream();
-        int read;
-        while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
-        {
-            sink.Write(buffer, 0, read);
-            if (sink.Length > maxBytes)
-                throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
-                    $"Infisical response exceeds the {maxBytes}-byte cap.");
-        }
-        return sink.ToArray();
-    }
-
-    private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
-    {
-        string text;
-        try
-        {
-            await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var buffer = new byte[2049];
-            using var sink = new MemoryStream();
-            int read;
-            while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
-            {
-                sink.Write(buffer, 0, read);
-                if (sink.Length > 2048)
-                    break;
-            }
-            text = Encoding.UTF8.GetString(sink.ToArray());
-        }
-        catch (Exception)
-        {
-            return "no readable error body";
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object
-                && doc.RootElement.TryGetProperty("message", out var message)
-                && message.ValueKind == JsonValueKind.String)
-            {
-                var detail = message.GetString() ?? string.Empty;
-                return detail.Length <= MaxServerDetailChars ? detail : detail[..MaxServerDetailChars];
-            }
-        }
-        catch (JsonException)
-        {
-            // Fall through to the truncated raw text (status context only).
-        }
-        var flat = text.Replace('\n', ' ').Replace('\r', ' ');
-        return flat.Length <= MaxServerDetailChars ? flat : flat[..MaxServerDetailChars];
-    }
-
-    private static int? ParseRetryAfter(HttpResponseMessage response)
-    {
-        try
-        {
-            if (response.Headers.RetryAfter?.Delta is TimeSpan delta)
-                return (int)Math.Clamp(delta.TotalSeconds, 0, 3600);
-            if (response.Headers.RetryAfter?.Date is DateTimeOffset date)
-                return (int)Math.Clamp((date - DateTimeOffset.UtcNow).TotalSeconds, 0, 3600);
-        }
-        catch (FormatException)
-        {
-            // Malformed header: no backoff hint.
-        }
-        return null;
     }
 
     private static IReadOnlyDictionary<string, string> ReadDataFields(JsonElement root, string where)
@@ -458,47 +290,6 @@ public sealed class InfisicalRestClient
         return fields.AsReadOnlyDictionary();
     }
 
-    private static bool TryGetString(JsonElement element, string name, out string value)
-    {
-        value = string.Empty;
-        if (!element.TryGetProperty(name, out var property))
-            return false;
-        if (property.ValueKind == JsonValueKind.String)
-        {
-            value = property.GetString() ?? string.Empty;
-            return true;
-        }
-        if (property.ValueKind == JsonValueKind.Null)
-            return true;
-        return false;
-    }
-
-    private static bool TryGetDouble(JsonElement element, string name, out double value)
-    {
-        value = 0;
-        return element.TryGetProperty(name, out var property)
-            && property.ValueKind == JsonValueKind.Number
-            && property.TryGetDouble(out value);
-    }
-
-    private static bool TryGetInt64(JsonElement element, string name, out long value)
-    {
-        value = 0;
-        return element.TryGetProperty(name, out var property)
-            && property.ValueKind == JsonValueKind.Number
-            && property.TryGetInt64(out value);
-    }
-
-    private static bool TryGetDateTime(JsonElement element, string name, out DateTimeOffset value)
-    {
-        value = default;
-        if (!element.TryGetProperty(name, out var property)
-            || property.ValueKind != JsonValueKind.String)
-            return false;
-        var text = property.GetString();
-        return !string.IsNullOrEmpty(text)
-            && DateTimeOffset.TryParse(text, out value);
-    }
 }
 
 internal static class DictionaryExtensions

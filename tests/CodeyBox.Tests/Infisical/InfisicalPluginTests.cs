@@ -4,6 +4,7 @@ using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.InfisicalPlugin;
 using CodeyBox.Orchestrator;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -626,11 +627,11 @@ public sealed class InfisicalPluginTests : IDisposable
     }
 
     [Theory]
-    [InlineData(401, InfisicalFailureKind.Unauthorized)]
-    [InlineData(403, InfisicalFailureKind.Unauthorized)]
-    [InlineData(429, InfisicalFailureKind.RateLimited)]
-    [InlineData(500, InfisicalFailureKind.BackendError)]
-    public async Task Backend_Faults_Classify_As_Infrastructure(int status, InfisicalFailureKind kind)
+    [InlineData(401, CredentialFailureKind.Unauthorized)]
+    [InlineData(403, CredentialFailureKind.Unauthorized)]
+    [InlineData(429, CredentialFailureKind.RateLimited)]
+    [InlineData(500, CredentialFailureKind.BackendError)]
+    public async Task Backend_Faults_Classify_As_Infrastructure(int status, CredentialFailureKind kind)
     {
         _handler.LoginJson = Fixture("login.json");
         _handler.RawJson = Fixture("raw-secret.json");
@@ -673,7 +674,7 @@ public sealed class InfisicalPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<InfisicalException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(InfisicalFailureKind.Unauthorized, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unauthorized, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, ex.FailureKindForWorkItem);
     }
@@ -690,7 +691,7 @@ public sealed class InfisicalPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<InfisicalException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(InfisicalFailureKind.Unreachable, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Unreachable, ex.Kind);
         Assert.True(ex.IsInfrastructure);
 
         var store = new MemorySecretLeaseStore();
@@ -715,7 +716,7 @@ public sealed class InfisicalPluginTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<InfisicalException>(() => provider.IssueAsync(
             Secret("PAID_API_TOKEN"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
-        Assert.Equal(InfisicalFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
         Assert.False(ex.IsInfrastructure);
         Assert.Equal(WorkItemFailureKinds.Configuration, ex.FailureKindForWorkItem);
     }
@@ -840,7 +841,7 @@ public sealed class InfisicalPluginTests : IDisposable
         // A backend 3xx is never followed: it fails closed as a backend
         // fault (infrastructure, never a diff verdict), with exactly one
         // request sent — the client secret goes nowhere else.
-        Assert.Equal(InfisicalFailureKind.InvalidResponse, ex.Kind);
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
         Assert.Contains("redirect", ex.Message);
         Assert.Equal(1, Volatile.Read(ref followed));
@@ -854,7 +855,7 @@ public sealed class InfisicalPluginTests : IDisposable
         // sink would see the secret-bearing body and this test would fail.
         using var sink = new RecordingStub(_ => (200, null, "sink"));
         using var redirector = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
-        using var client = InfisicalHttpClients.Create(TimeSpan.FromSeconds(10));
+        using var client = CredentialHttp.CreateNoRedirectClient(TimeSpan.FromSeconds(10));
         using var response = await client.PostAsync(
             redirector.Url,
             new StringContent("""{"clientSecret":"must-not-leak"}""", Encoding.UTF8, "application/json"));
@@ -869,7 +870,7 @@ public sealed class InfisicalPluginTests : IDisposable
     {
         using var sink = new RecordingStub(_ => (200, null, "sink"));
         using var upstream = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
-        using var forward = InfisicalHttpClients.Create(TimeSpan.FromSeconds(10));
+        using var forward = CredentialHttp.CreateNoRedirectClient(TimeSpan.FromSeconds(10));
         using var server = new InfisicalBrokerServer(forward, log: NullLogger.Instance);
         server.Start("127.0.0.1", 0);
         const string leaseId = "redirect-lease-handle";

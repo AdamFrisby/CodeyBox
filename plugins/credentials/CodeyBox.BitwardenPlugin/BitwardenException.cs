@@ -1,27 +1,27 @@
 using CodeyBox.PluginSdk.Credentials;
 
-namespace CodeyBox.OnePasswordPlugin;
+namespace CodeyBox.BitwardenPlugin;
 
 /// <summary>
-/// Typed failure for every 1Password backend call. The failure taxonomy,
+/// Typed failure for every Bitwarden backend call. The failure taxonomy,
 /// infrastructure classification, status mapping, and message-truncation
 /// discipline are the shared <see cref="CredentialException"/> contract —
-/// this type exists so callers can catch a 1Password-typed failure.
-/// Messages carry only safe fields — HTTP status, host, vault/item/field
-/// names, lease ids (identity, never values).
+/// this type exists so callers can catch a Bitwarden-typed failure.
+/// Messages carry only safe fields — HTTP status, host, secret ids/keys,
+/// organisation and project ids, lease ids (identity, never values).
 /// </summary>
-public sealed class OnePasswordException : CredentialException
+public sealed class BitwardenException : CredentialException
 {
-    /// <summary>Display name stamped on every 1Password failure and transport message.</summary>
-    internal const string BackendName = "1Password";
+    /// <summary>Display name stamped on every Bitwarden failure and transport message.</summary>
+    internal const string BackendName = "Bitwarden";
 
-    public OnePasswordException(
+    public BitwardenException(
         CredentialFailureKind kind, string message, int? statusCode = null, int? retryAfterSeconds = null)
         : base(BackendName, kind, message, statusCode, retryAfterSeconds)
     {
     }
 
-    public OnePasswordException(
+    public BitwardenException(
         CredentialFailureKind kind, string message, Exception inner,
         int? statusCode = null, int? retryAfterSeconds = null)
         : base(BackendName, kind, message, inner, statusCode, retryAfterSeconds)
@@ -29,9 +29,9 @@ public sealed class OnePasswordException : CredentialException
     }
 
     /// <summary>Factory matching <see cref="CredentialExceptionFactory"/> for the shared transport.</summary>
-    internal static OnePasswordException Create(
+    internal static BitwardenException Create(
         CredentialFailureKind kind, string message, Exception? inner, int? statusCode, int? retryAfterSeconds)
         => inner is null
-            ? new OnePasswordException(kind, message, statusCode, retryAfterSeconds)
-            : new OnePasswordException(kind, message, inner, statusCode, retryAfterSeconds);
+            ? new BitwardenException(kind, message, statusCode, retryAfterSeconds)
+            : new BitwardenException(kind, message, inner, statusCode, retryAfterSeconds);
 }

@@ -1,3 +1,5 @@
+using CodeyBox.PluginSdk.Credentials;
+
 namespace CodeyBox.OnePasswordPlugin;
 
 /// <summary>
@@ -24,30 +26,20 @@ internal static class OnePasswordLeaseIds
         ServiceAccount = 2,
     }
 
-    internal sealed record ParsedLeaseId(LeaseKind Kind, string SandboxEnvVar, string Tail);
+    internal sealed record ParsedLeaseId(LeaseKind Kind, string SandboxEnvVar);
 
     internal static string BuildConnect(string sandboxEnvVar)
-        => $"{Prefix}.c.{sandboxEnvVar}.{Guid.NewGuid():N}";
+        => LeaseHandles.Build(Prefix, "c", sandboxEnvVar);
 
     internal static string BuildServiceAccount(string sandboxEnvVar)
-        => $"{Prefix}.o.{sandboxEnvVar}.{Guid.NewGuid():N}";
-
-    internal static bool IsOurs(string? leaseId)
-        => leaseId is not null
-            && leaseId.StartsWith(Prefix + ".", StringComparison.Ordinal);
+        => LeaseHandles.Build(Prefix, "o", sandboxEnvVar);
 
     internal static bool TryParse(string? leaseId, out ParsedLeaseId parsed)
     {
-        parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty, string.Empty);
-        if (string.IsNullOrWhiteSpace(leaseId))
+        parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty);
+        if (!LeaseHandles.TryParse(leaseId, Prefix, out var kindLetter, out var sandboxVar, out _))
             return false;
-        var parts = leaseId.Split('.');
-        if (parts.Length != 4
-            || !string.Equals(parts[0], Prefix, StringComparison.Ordinal)
-            || string.IsNullOrWhiteSpace(parts[2])
-            || string.IsNullOrWhiteSpace(parts[3]))
-            return false;
-        var kind = parts[1] switch
+        var kind = kindLetter switch
         {
             "c" => LeaseKind.Connect,
             "o" => LeaseKind.ServiceAccount,
@@ -55,7 +47,7 @@ internal static class OnePasswordLeaseIds
         };
         if (kind == LeaseKind.Unknown)
             return false;
-        parsed = new ParsedLeaseId(kind, parts[2], parts[3]);
+        parsed = new ParsedLeaseId(kind, sandboxVar);
         return true;
     }
 }

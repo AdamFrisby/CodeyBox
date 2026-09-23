@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -46,10 +47,8 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
 
     private IPluginHost? _host;
     private ILogger _logger = NullLogger.Instance;
-    private HttpClient? _http;
-    private HttpClient? _brokerForward;
-    private bool _ownsHttp;
-    private bool _ownsBrokerForward;
+    private readonly LazyCredentialClient<InfisicalRestClient> _clients;
+    private readonly LazyCredentialClient<HttpClient> _brokerForwardClient;
     private InfisicalRestClient? _api;
     private InfisicalBrokerServer? _broker;
     private readonly object _clientLock = new();
@@ -62,7 +61,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
 
     /// <summary>
     /// Production constructor. The plugin builds its own redirect-proof
-    /// HTTP clients (see <see cref="InfisicalHttpClients"/>) rather than
+    /// HTTP clients (see <see cref="CredentialHttp"/>) rather than
     /// the shared factory's redirect-following defaults, so a backend 3xx
     /// can never re-send a credential off-origin.
     /// </summary>
@@ -70,6 +69,8 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
     {
         _clock = clock ?? TimeProvider.System;
         _env = Environment.GetEnvironmentVariable;
+        _clients = NewClientCache(null);
+        _brokerForwardClient = NewBrokerForwardCache(null);
     }
 
     /// <summary>Test constructor: explicit clients, config, clock, and environment.</summary>
@@ -81,12 +82,13 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         HttpClient? brokerForwardClient = null,
         ILogger? log = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
+        ArgumentNullException.ThrowIfNull(http);
         _testConfig = config ?? throw new ArgumentNullException(nameof(config));
         _clock = clock ?? TimeProvider.System;
         _env = env ?? Environment.GetEnvironmentVariable;
-        _brokerForward = brokerForwardClient;
         _logger = log ?? NullLogger.Instance;
+        _clients = NewClientCache(http);
+        _brokerForwardClient = NewBrokerForwardCache(brokerForwardClient);
     }
 
     /// <inheritdoc />
@@ -153,7 +155,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         var options = RequireUsableOptions();
         var mapping = FindMapping(options, secret)
             ?? throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical has no mapping for sandbox variable '{secret.SandboxEnvVar}'; the operator never put this secret against this backend.");
         EnsureClients();
 
@@ -167,14 +169,13 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
                 mapping.SecretKey, mapping.SecretPath, options.MaxResponseBytes, ct).ConfigureAwait(false);
             if (string.IsNullOrEmpty(fetched.Value))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical secret '{mapping.SecretKey}' returned an empty value.");
-            var window = StaticWindow(options, requestedTtl);
+            var window = CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, requestedTtl);
             var expiresAt = _clock.GetUtcNow() + window;
             var leaseId = InfisicalLeaseIds.BuildStatic(mapping.SandboxEnvVar, mapping.Brokered);
             context = new IssuedLeaseContext(
-                InfisicalLeaseIds.LeaseKind.Static, mapping, ServerLeaseId: null,
-                Version: fetched.Version, ExpiresAt: expiresAt);
+                InfisicalLeaseIds.LeaseKind.Static, mapping, ServerLeaseId: null);
             material = new LeasedSecretMaterial
             {
                 LeaseId = SecretLeasePolicy.ValidateLeaseId(leaseId, nameof(leaseId)),
@@ -195,11 +196,11 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         {
             if (!options.BrokerEnabled)
                 throw new InfisicalException(
-                    InfisicalFailureKind.Misconfigured,
+                    CredentialFailureKind.Misconfigured,
                     $"Infisical mapping for '{mapping.SandboxEnvVar}' is brokered but BrokerEnabled is false; refusing a silent downgrade to direct issue.");
             if (string.IsNullOrEmpty(material.Value))
                 throw new InfisicalException(
-                    InfisicalFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"Infisical brokered issue for '{mapping.SandboxEnvVar}' produced no value to hold proxy-side.");
             var endpoint = EnsureBroker(options, mapping, material.LeaseId, material.Value, material.ExpiresAt);
             material = material with { Value = null, Brokered = true, Endpoint = endpoint };
@@ -233,8 +234,9 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
             // Renewal extends the window; the fresh value reaches the guest
             // on the next provisioning, and refreshes a broker entry that
             // survived alongside the lease.
-            var expiresAt = _clock.GetUtcNow() + StaticWindow(options, TimeSpan.Zero);
-            _issued[leaseId] = context with { Version = fetched.Version, ExpiresAt = expiresAt };
+            var expiresAt = _clock.GetUtcNow()
+                + CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, TimeSpan.Zero);
+            _issued[leaseId] = context;
             RefreshBrokerEntry(options, leaseId, context, fetched.Value, expiresAt);
             _logger.LogDebug("Infisical renewed static lease '{LeaseId}' (key version {Version}).", leaseId, fetched.Version);
             return expiresAt;
@@ -250,7 +252,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
             mapping.Ttl,
             options.MaxResponseBytes,
             ct).ConfigureAwait(false);
-        _issued[leaseId] = context with { ExpiresAt = renewed };
+        _issued[leaseId] = context;
         if (context.Brokered && _broker is not null && !_broker.Extend(leaseId, renewed))
         {
             // The broker entry is gone (orchestrator restart drops host
@@ -305,16 +307,8 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         _disposed = true;
         try { _broker?.Dispose(); } catch (Exception) { }
         _token = string.Empty;
-        // Only provider-built clients are disposed here; test-injected
-        // clients stay owned by their test.
-        if (_ownsHttp)
-        {
-            try { _http?.Dispose(); } catch (Exception) { }
-        }
-        if (_ownsBrokerForward)
-        {
-            try { _brokerForward?.Dispose(); } catch (Exception) { }
-        }
+        _clients.Dispose();
+        _brokerForwardClient.Dispose();
     }
 
     internal InfisicalOptions CurrentOptions()
@@ -337,9 +331,23 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
             options.MaxResponseBytes, ct).ConfigureAwait(false);
         if (!created.Data.TryGetValue(mapping.DataField, out var value) || string.IsNullOrEmpty(value))
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical dynamic lease for '{mapping.DynamicSecretName}' has no field '{mapping.DataField}'; check DataField against the dynamic-secret type.");
-        var leaseId = InfisicalLeaseIds.BuildDynamic(mapping.SandboxEnvVar, created.LeaseId, mapping.Brokered);
+        string leaseId;
+        try
+        {
+            leaseId = InfisicalLeaseIds.BuildDynamic(mapping.SandboxEnvVar, created.LeaseId, mapping.Brokered);
+        }
+        catch (ArgumentException ex)
+        {
+            // The server lease id embeds in the handle: a response carrying
+            // one that cannot round-trip is a backend response failure,
+            // typed like every sibling failure.
+            throw new InfisicalException(
+                CredentialFailureKind.InvalidResponse,
+                "Infisical dynamic-secret response carried a lease id that cannot round-trip a lease handle.",
+                ex);
+        }
         var material = new LeasedSecretMaterial
         {
             LeaseId = SecretLeasePolicy.ValidateLeaseId(leaseId, nameof(leaseId)),
@@ -348,8 +356,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
             Brokered = false,
         };
         var context = new IssuedLeaseContext(
-            InfisicalLeaseIds.LeaseKind.Dynamic, mapping, created.LeaseId,
-            Version: 0, ExpiresAt: created.ExpiresAt);
+            InfisicalLeaseIds.LeaseKind.Dynamic, mapping, created.LeaseId);
         _logger.LogInformation(
             "Infisical issued dynamic lease '{LeaseId}' for '{Var}' (scope {Scope}, server lease {ServerLease}).",
             leaseId, mapping.SandboxEnvVar, scope, created.LeaseId);
@@ -385,14 +392,8 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         {
             if (_broker is { Running: true })
                 return;
-            if (_brokerForward is null)
-            {
-                _brokerForward = InfisicalHttpClients.Create(ClientTimeout(options));
-                _ownsBrokerForward = true;
-            }
-            _brokerForward.Timeout = ClientTimeout(options);
             var server = new InfisicalBrokerServer(
-                _brokerForward, _clock, _logger,
+                _brokerForwardClient.Get(), _clock, _logger,
                 options.BrokerMaxBodyBytes, options.BrokerMaxConcurrency, options.BrokerMaxPathChars);
             try
             {
@@ -404,7 +405,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
                 // unbindable interface) — loud, and the secret is skipped
                 // rather than downgraded to a direct lease.
                 throw new InfisicalException(
-                    InfisicalFailureKind.Misconfigured,
+                    CredentialFailureKind.Misconfigured,
                     $"Infisical broker could not bind {options.BrokerBindHost}:{options.BrokerBindPort}.",
                     ex);
             }
@@ -462,7 +463,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         if (!string.IsNullOrWhiteSpace(clientId) && !string.IsNullOrWhiteSpace(clientSecret))
         {
             EnsureClients();
-            var skew = TimeSpan.FromSeconds(Math.Clamp(options.TokenRefreshSkewSeconds, 0, 3600));
+            var skew = CredentialOptions.TokenSkewSpan(options.TokenRefreshSkewSeconds);
             (token, expiresAt) = await _api!.LoginUniversalAuthAsync(
                 options.SiteUrl, clientId, clientSecret, skew, ct).ConfigureAwait(false);
         }
@@ -478,7 +479,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         else
         {
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical provider credentials are not set: env '{options.ClientIdEnvVar}'/'{options.ClientSecretEnvVar}' (universal auth) and " +
                 (string.IsNullOrWhiteSpace(options.AccessTokenEnvVar)
                     ? "no access-token variable is configured."
@@ -495,23 +496,8 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
     }
 
     private InfisicalOptions RequireUsableOptions()
-    {
-        var options = CurrentOptions();
-        if (!options.Enabled)
-            throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
-                "Infisical provider is disabled (Enabled=false); enable it to issue.");
-        var errors = options.Validate();
-        if (errors.Count > 0)
-            throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
-                $"Infisical configuration is invalid: {errors[0]}");
-        if (string.IsNullOrWhiteSpace(options.WorkspaceId))
-            throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
-                "Infisical WorkspaceId is required (the Infisical project ID).");
-        return options;
-    }
+        => CredentialOptions.RequireUsable(
+            CurrentOptions(), InfisicalException.BackendName, InfisicalException.Create);
 
     private static InfisicalSecretMapping? FindMapping(InfisicalOptions options, ProjectSandboxSecret secret)
     {
@@ -559,22 +545,17 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         }
         if (mapping is null)
             throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"Infisical lease '{leaseId}' names sandbox variable '{parsed.SandboxEnvVar}' with no current mapping; restore the mapping or revoke server-side.");
         return new IssuedLeaseContext(
             parsed.Kind, mapping,
             parsed.Kind == InfisicalLeaseIds.LeaseKind.Dynamic ? parsed.Tail : null,
-            Version: 0, ExpiresAt: _clock.GetUtcNow(), Brokered: parsed.Brokered);
+            Brokered: parsed.Brokered);
     }
 
     private static InfisicalLeaseIds.ParsedLeaseId ParseOurs(string leaseId)
-    {
-        if (!InfisicalLeaseIds.TryParse(leaseId, out var parsed))
-            throw new InfisicalException(
-                InfisicalFailureKind.Misconfigured,
-                $"Lease '{leaseId ?? string.Empty}' is not an Infisical lease handle.");
-        return parsed;
-    }
+        => LeaseHandles.ParseOrThrow<InfisicalLeaseIds.ParsedLeaseId>(
+            leaseId, InfisicalException.BackendName, InfisicalLeaseIds.TryParse, InfisicalException.Create);
 
     private static string RequireProjectSlug(InfisicalOptions options)
     {
@@ -584,49 +565,27 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
         if (!string.IsNullOrWhiteSpace(options.ProjectSlug))
             return options.ProjectSlug;
         throw new InfisicalException(
-            InfisicalFailureKind.Misconfigured,
+            CredentialFailureKind.Misconfigured,
             "Infisical ProjectSlug is required for dynamic-secret leases (dynamic-lease endpoints address the project by slug).");
     }
 
-    private static TimeSpan StaticWindow(InfisicalOptions options, TimeSpan requestedTtl)
-    {
-        var configured = TimeSpan.FromMinutes(Math.Clamp(options.StaticLeaseTtlMinutes, 1, 1440));
-        return requestedTtl > TimeSpan.Zero && requestedTtl < configured ? requestedTtl : configured;
-    }
+    private void EnsureClients() => _api = _clients.Get();
 
-    private static TimeSpan ClientTimeout(InfisicalOptions options) =>
-        TimeSpan.FromSeconds(Math.Clamp(options.TimeoutSeconds, 1, 300));
+    private LazyCredentialClient<InfisicalRestClient> NewClientCache(HttpClient? injected)
+        => new(
+            () => CredentialOptions.TimeoutSpan(CurrentOptions().TimeoutSeconds),
+            http => new InfisicalRestClient(http, _clock, _logger),
+            injected);
 
-    private void EnsureClients()
-    {
-        if (_api is not null)
-            return;
-        lock (_clientLock)
-        {
-            if (_api is not null)
-                return;
-            if (_http is null)
-            {
-                _http = InfisicalHttpClients.Create(ClientTimeout(CurrentOptions()));
-                _ownsHttp = true;
-            }
-            try
-            {
-                _http.Timeout = ClientTimeout(CurrentOptions());
-            }
-            catch (InvalidOperationException)
-            {
-                // A request is already in flight; keep the existing timeout.
-            }
-            _api = new InfisicalRestClient(_http, _clock, _logger);
-        }
-    }
+    private LazyCredentialClient<HttpClient> NewBrokerForwardCache(HttpClient? injected)
+        => new(
+            () => CredentialOptions.TimeoutSpan(CurrentOptions().TimeoutSeconds),
+            http => http,
+            injected);
 
     private sealed record IssuedLeaseContext(
         InfisicalLeaseIds.LeaseKind Kind,
         InfisicalSecretMapping Mapping,
         string? ServerLeaseId,
-        long Version,
-        DateTimeOffset ExpiresAt,
         bool Brokered = false);
 }

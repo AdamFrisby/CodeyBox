@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -73,12 +74,12 @@ public sealed class ProcessOnePasswordRunner : IOnePasswordProcessRunner
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or FileNotFoundException or UnauthorizedAccessException)
         {
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password CLI '{fileName}' could not start. Install it and set OpBinaryPath.", ex);
         }
         if (child is null)
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password CLI '{fileName}' could not start. Install it and set OpBinaryPath.");
 
         using (child)
@@ -162,7 +163,7 @@ public sealed class OnePasswordServiceAccountClient
     /// <summary>
     /// Reads one field value with <c>op read</c>. Returns the exact stdout
     /// (no trimming: <c>--no-newline</c> already removes the record
-    /// separator); empty output is an <see cref="OnePasswordFailureKind.InvalidResponse"/>.
+    /// separator); empty output is an <see cref="CredentialFailureKind.InvalidResponse"/>.
     /// </summary>
     public async Task<string> ReadFieldAsync(
         string opBinaryPath,
@@ -207,22 +208,22 @@ public sealed class OnePasswordServiceAccountClient
         catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
         {
             throw new OnePasswordException(
-                OnePasswordFailureKind.Unreachable, "1Password CLI read was cancelled.", ex);
+                CredentialFailureKind.Unreachable, "1Password CLI read was cancelled.", ex);
         }
 
         if (result.TimedOut)
             throw new OnePasswordException(
-                OnePasswordFailureKind.Unreachable,
+                CredentialFailureKind.Unreachable,
                 $"1Password CLI read of '{reference}' timed out.");
         if (result.ExitCode == 0)
         {
             if (result.StandardOutput.Length == 0)
                 throw new OnePasswordException(
-                    OnePasswordFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"1Password CLI read of '{reference}' returned an empty value.");
             if (result.StandardOutput.Length > ProcessOnePasswordRunner.MaxOutputBytes)
                 throw new OnePasswordException(
-                    OnePasswordFailureKind.InvalidResponse,
+                    CredentialFailureKind.InvalidResponse,
                     $"1Password CLI read of '{reference}' exceeded the output cap.");
             _log.LogDebug("1Password CLI read field '{Field}' from item '{Item}'.", fieldComponent, itemComponent);
             return result.StandardOutput;
@@ -240,7 +241,7 @@ public sealed class OnePasswordServiceAccountClient
             || lowered.Contains("isn't found", StringComparison.Ordinal)
             || lowered.Contains("no such", StringComparison.Ordinal))
             return new OnePasswordException(
-                OnePasswordFailureKind.NotFound,
+                CredentialFailureKind.NotFound,
                 $"1Password CLI read of '{reference}' failed: {detail}", exitCode);
         if (lowered.Contains("unauthorized", StringComparison.Ordinal)
             || lowered.Contains("invalid token", StringComparison.Ordinal)
@@ -249,10 +250,10 @@ public sealed class OnePasswordServiceAccountClient
             || lowered.Contains("401", StringComparison.Ordinal)
             || lowered.Contains("403", StringComparison.Ordinal))
             return new OnePasswordException(
-                OnePasswordFailureKind.Unauthorized,
+                CredentialFailureKind.Unauthorized,
                 $"1Password CLI read of '{reference}' failed: {detail}", exitCode);
         return new OnePasswordException(
-            OnePasswordFailureKind.BackendError,
+            CredentialFailureKind.BackendError,
             $"1Password CLI read of '{reference}' failed with exit {exitCode}: {detail}", exitCode);
     }
 
@@ -268,19 +269,19 @@ public sealed class OnePasswordServiceAccountClient
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password op:// reference component '{parameterName}' must not be empty.");
         if (value.Length > OnePasswordOptions.MaxItemChars)
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password op:// reference component '{parameterName}' exceeds {OnePasswordOptions.MaxItemChars} characters.");
         if (value.Any(char.IsControl))
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password op:// reference component '{parameterName}' must not contain control characters.");
         if (value.Contains('/', StringComparison.Ordinal))
             throw new OnePasswordException(
-                OnePasswordFailureKind.Misconfigured,
+                CredentialFailureKind.Misconfigured,
                 $"1Password op:// reference component '{parameterName}' must not contain '/'.");
         return value;
     }
