@@ -30,8 +30,20 @@ internal static class BitwardenCrypto
     /// <summary>Wire size of the access-token <c>:key</c> seed, in bytes.</summary>
     internal const int AccessTokenSeedSize = 16;
 
+    /// <summary>AES block size in bytes; CBC ciphertext is always a whole number of blocks.</summary>
+    internal const int AesBlockSizeBytes = 16;
+
     /// <summary>Maximum decrypted plaintext accepted, in bytes (values are small).</summary>
     internal const int MaxPlaintextBytes = 1024 * 1024;
+
+    /// <summary>
+    /// Slack above <see cref="MaxPlaintextBytes"/> accepted in ciphertext:
+    /// PKCS7 padding plus a block of envelope headroom.
+    /// </summary>
+    internal const int MaxCipherEnvelopeOverheadBytes = 64;
+
+    /// <summary>Maximum characters of decrypted <c>encrypted_payload</c> JSON inspected for an organisation key.</summary>
+    internal const int MaxEncryptedPayloadChars = 16 * 1024;
 
     /// <summary>
     /// Parses a machine-account credential from the host credential chain.
@@ -158,8 +170,8 @@ internal static class BitwardenCrypto
             || mac is not { Length: MacSize }
             || data is null
             || data.Length == 0
-            || data.Length > MaxPlaintextBytes + 64
-            || data.Length % 16 != 0)
+            || data.Length > MaxPlaintextBytes + MaxCipherEnvelopeOverheadBytes
+            || data.Length % AesBlockSizeBytes != 0)
             return false;
 
         var encKey = new byte[EncKeySize];
@@ -233,7 +245,7 @@ internal static class BitwardenCrypto
         if (!TryDecryptCipherString(encryptedPayload.Trim(), accessKey, out var json))
             return null;
         var trimmed = json.Trim();
-        if (trimmed.Length == 0 || trimmed.Length > 16 * 1024)
+        if (trimmed.Length == 0 || trimmed.Length > MaxEncryptedPayloadChars)
             return null;
         var direct = DecodeKeyMaterial(trimmed.Trim('"'));
         if (direct is not null)

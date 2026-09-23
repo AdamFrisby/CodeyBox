@@ -4,6 +4,7 @@ using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.InfisicalPlugin;
 using CodeyBox.Orchestrator;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -854,7 +855,7 @@ public sealed class InfisicalPluginTests : IDisposable
         // sink would see the secret-bearing body and this test would fail.
         using var sink = new RecordingStub(_ => (200, null, "sink"));
         using var redirector = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
-        using var client = InfisicalHttpClients.Create(TimeSpan.FromSeconds(10));
+        using var client = CredentialHttp.CreateNoRedirectClient(TimeSpan.FromSeconds(10));
         using var response = await client.PostAsync(
             redirector.Url,
             new StringContent("""{"clientSecret":"must-not-leak"}""", Encoding.UTF8, "application/json"));
@@ -869,7 +870,7 @@ public sealed class InfisicalPluginTests : IDisposable
     {
         using var sink = new RecordingStub(_ => (200, null, "sink"));
         using var upstream = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
-        using var forward = InfisicalHttpClients.Create(TimeSpan.FromSeconds(10));
+        using var forward = CredentialHttp.CreateNoRedirectClient(TimeSpan.FromSeconds(10));
         using var server = new InfisicalBrokerServer(forward, log: NullLogger.Instance);
         server.Start("127.0.0.1", 0);
         const string leaseId = "redirect-lease-handle";

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -358,7 +359,7 @@ public sealed class InfisicalBrokerServer : IDisposable
         using var upstream = await _forward.SendAsync(
             forward, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         if (upstream.RequestMessage?.RequestUri is { } finalUpstream
-            && !InfisicalHttpClients.IsSameOrigin(finalUpstream, target))
+            && !CredentialHttp.IsSameOrigin(finalUpstream, target))
         {
             // The forward client followed an upstream redirect (only
             // possible with an externally supplied following client —
@@ -371,7 +372,7 @@ public sealed class InfisicalBrokerServer : IDisposable
             await WriteErrorAsync(context.Response, 502, "upstream redirect refused", ct).ConfigureAwait(false);
             return;
         }
-        if (InfisicalHttpClients.IsRedirect(upstream.StatusCode))
+        if (CredentialHttp.IsRedirect(upstream.StatusCode))
         {
             // Never follow: the upstream 3xx passes through to the guest
             // untouched (no Location forwarding, no credential attached

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -490,7 +491,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 return;
             if (_http is null)
             {
-                _http = DopplerHttpClients.Create(ClientTimeout(CurrentOptions()));
+                _http = CredentialHttp.CreateNoRedirectClient(ClientTimeout(CurrentOptions()));
                 _ownsHttp = true;
             }
             try

@@ -1,5 +1,4 @@
 using System.Net.Http.Headers;
-using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Logging;
@@ -23,14 +22,16 @@ namespace CodeyBox.OnePasswordPlugin;
 public sealed class OnePasswordRestClient
 {
     private readonly HttpClient _http;
+    private readonly TimeProvider _clock;
     private readonly ILogger _log;
 
-    /// <summary>Maximum characters kept from a server-echoed error message.</summary>
-    public const int MaxServerDetailChars = 200;
+    /// <summary>JSON error-body fields relayed as detail, in preference order.</summary>
+    private static readonly string[] ErrorDetailFields = ["message", "error"];
 
-    public OnePasswordRestClient(HttpClient http, ILogger? log = null)
+    public OnePasswordRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
+        _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger.Instance;
     }
 
@@ -75,12 +76,12 @@ public sealed class OnePasswordRestClient
             {
                 if (candidate.ValueKind != JsonValueKind.Object)
                     continue;
-                var label = GetString(candidate, "label");
-                var id = GetString(candidate, "id");
+                var label = CredentialJson.GetString(candidate, "label");
+                var id = CredentialJson.GetString(candidate, "id");
                 if (!string.Equals(label, field, StringComparison.Ordinal)
                     && !string.Equals(id, field, StringComparison.Ordinal))
                     continue;
-                var value = GetString(candidate, "value");
+                var value = CredentialJson.GetString(candidate, "value");
                 if (value is null)
                     throw new OnePasswordException(
                         OnePasswordFailureKind.InvalidResponse,
@@ -128,9 +129,9 @@ public sealed class OnePasswordRestClient
             {
                 if (vault.ValueKind != JsonValueKind.Object)
                     continue;
-                if (!string.Equals(GetString(vault, "name"), vaultName, StringComparison.Ordinal))
+                if (!string.Equals(CredentialJson.GetString(vault, "name"), vaultName, StringComparison.Ordinal))
                     continue;
-                var id = GetString(vault, "id");
+                var id = CredentialJson.GetString(vault, "id");
                 if (string.IsNullOrEmpty(id))
                     continue;
                 if (match is not null)
@@ -180,9 +181,9 @@ public sealed class OnePasswordRestClient
             {
                 if (item.ValueKind != JsonValueKind.Object)
                     continue;
-                if (!string.Equals(GetString(item, "title"), itemTitle, StringComparison.Ordinal))
+                if (!string.Equals(CredentialJson.GetString(item, "title"), itemTitle, StringComparison.Ordinal))
                     continue;
-                var id = GetString(item, "id");
+                var id = CredentialJson.GetString(item, "id");
                 if (string.IsNullOrEmpty(id))
                     continue;
                 if (match is not null)
@@ -218,7 +219,7 @@ public sealed class OnePasswordRestClient
                 OnePasswordFailureKind.Unreachable, $"1Password {operation} could not reach the backend.", ex);
         }
 
-        if (OnePasswordHttpClients.IsRedirect(response.StatusCode))
+        if (CredentialHttp.IsRedirect(response.StatusCode))
         {
             // Never follow: the backend's 3xx (and its Location) is
             // untrusted runtime output, and re-sending would carry the
@@ -234,7 +235,7 @@ public sealed class OnePasswordRestClient
 
         if (response.RequestMessage?.RequestUri is { } finalUri
             && request.RequestUri is { } originalUri
-            && !OnePasswordHttpClients.IsSameOrigin(finalUri, originalUri))
+            && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
         {
             // The handler followed a redirect before this code saw the
             // response (only possible with an externally supplied
@@ -253,7 +254,8 @@ public sealed class OnePasswordRestClient
             return response;
 
         var status = (int)response.StatusCode;
-        var detail = await ReadErrorDetailAsync(response, ct).ConfigureAwait(false);
+        var detail = await CredentialMessages.ReadServerDetailAsync(
+            response, ErrorDetailFields, relayRawText: true, ct).ConfigureAwait(false);
         var retryAfter = ParseRetryAfter(response);
         response.Dispose();
         throw OnePasswordException.FromStatus(status, operation, detail, retryAfter);
@@ -314,72 +316,6 @@ public sealed class OnePasswordRestClient
         return bytes;
     }
 
-    private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
-    {
-        string text;
-        try
-        {
-            await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var (bytes, _) = await CredentialBodies.CopyCappedAsync(stream, 2048, ct).ConfigureAwait(false);
-            text = Encoding.UTF8.GetString(bytes);
-        }
-        catch (IOException)
-        {
-            return "no readable error body";
-        }
-        catch (HttpRequestException)
-        {
-            return "no readable error body";
-        }
-        catch (ObjectDisposedException)
-        {
-            return "no readable error body";
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object)
-            {
-                foreach (var key in new[] { "message", "error" })
-                {
-                    if (doc.RootElement.TryGetProperty(key, out var message)
-                        && message.ValueKind == JsonValueKind.String)
-                    {
-                        var detail = message.GetString() ?? string.Empty;
-                        if (!string.IsNullOrWhiteSpace(detail))
-                        {
-                            // Flatten CR/LF: this text flows into exception
-                            // messages, host logs, and the lease store, so a
-                            // newline-bearing server message must not forge
-                            // log lines.
-                            var flatDetail = detail.Replace('\n', ' ').Replace('\r', ' ');
-                            return flatDetail.Length <= MaxServerDetailChars ? flatDetail : flatDetail[..MaxServerDetailChars];
-                        }
-                    }
-                }
-            }
-        }
-        catch (JsonException)
-        {
-            // Fall through to the truncated raw text (status context only).
-        }
-        var flat = text.Replace('\n', ' ').Replace('\r', ' ');
-        return flat.Length <= MaxServerDetailChars ? flat : flat[..MaxServerDetailChars];
-    }
-
-    private static int? ParseRetryAfter(HttpResponseMessage response)
-        => CredentialRetryAfter.Parse(response, DateTimeOffset.UtcNow);
-
-    private static string? GetString(JsonElement element, string name)
-    {
-        if (!element.TryGetProperty(name, out var property))
-            return null;
-        return property.ValueKind switch
-        {
-            JsonValueKind.String => property.GetString(),
-            JsonValueKind.Null => null,
-            _ => null,
-        };
-    }
+    private int? ParseRetryAfter(HttpResponseMessage response)
+        => CredentialRetryAfter.Parse(response, _clock);
 }

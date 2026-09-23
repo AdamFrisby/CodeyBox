@@ -34,8 +34,11 @@ public sealed class InfisicalRestClient
     private readonly TimeProvider _clock;
     private readonly ILogger _log;
 
-    /// <summary>Maximum characters kept from a server-echoed error message.</summary>
-    public const int MaxServerDetailChars = 200;
+    /// <summary>JSON error-body fields relayed as detail, in preference order.</summary>
+    private static readonly string[] ErrorDetailFields = ["message"];
+
+    /// <summary>Cap on the universal-auth login response body (token + expiry only).</summary>
+    private const int MaxLoginResponseBytes = 200;
 
     public InfisicalRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
@@ -63,14 +66,14 @@ public sealed class InfisicalRestClient
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
         using var response = await SendAsync(request, "universal-auth login", ct).ConfigureAwait(false);
-        var doc = await ReadJsonAsync(response, "universal-auth login", MaxServerDetailChars, ct).ConfigureAwait(false);
+        var doc = await ReadJsonAsync(response, "universal-auth login", MaxLoginResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             var root = doc.RootElement;
-            if (!TryGetString(root, "accessToken", out var token) || string.IsNullOrEmpty(token))
+            if (!CredentialJson.TryGetString(root, "accessToken", out var token) || string.IsNullOrEmpty(token))
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse, "Infisical universal-auth login returned no accessToken.");
-            var expiresInSeconds = TryGetDouble(root, "expiresIn", out var seconds) ? seconds : 0;
+            var expiresInSeconds = CredentialJson.TryGetDouble(root, "expiresIn", out var seconds) ? seconds : 0;
             if (expiresInSeconds <= 0)
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse, "Infisical universal-auth login returned no expiresIn.");
@@ -110,12 +113,12 @@ public sealed class InfisicalRestClient
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse,
                     $"Infisical fetch of secret '{secretKey}' returned no secret object.");
-            if (!TryGetString(secret, "secretValue", out var value) || value is null)
+            if (!CredentialJson.TryGetString(secret, "secretValue", out var value) || value is null)
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse,
                     $"Infisical fetch of secret '{secretKey}' returned no secretValue.");
-            TryGetString(secret, "id", out var id);
-            var version = TryGetInt64(secret, "version", out var v) ? v : 0;
+            CredentialJson.TryGetString(secret, "id", out var id);
+            var version = CredentialJson.TryGetInt64(secret, "version", out var v) ? v : 0;
             _log.LogDebug(
                 "Infisical fetched secret '{Key}' (id {Id}, version {Version}).",
                 secretKey, string.IsNullOrEmpty(id) ? "unknown" : id, version);
@@ -161,11 +164,11 @@ public sealed class InfisicalRestClient
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse,
                     $"Infisical create of dynamic lease '{dynamicSecretName}' returned no lease object.");
-            if (!TryGetString(lease, "id", out var leaseId) || string.IsNullOrEmpty(leaseId))
+            if (!CredentialJson.TryGetString(lease, "id", out var leaseId) || string.IsNullOrEmpty(leaseId))
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse,
                     $"Infisical create of dynamic lease '{dynamicSecretName}' returned no lease id.");
-            var expiresAt = TryGetDateTime(lease, "expireAt", out var exp) ? exp : (DateTimeOffset?)null;
+            var expiresAt = CredentialJson.TryGetDateTime(lease, "expireAt", out var exp) ? exp : (DateTimeOffset?)null;
             if (expiresAt is null)
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse,
@@ -211,7 +214,7 @@ public sealed class InfisicalRestClient
         using (doc)
         {
             if (!doc.RootElement.TryGetProperty("lease", out var lease)
-                || !TryGetDateTime(lease, "expireAt", out var expiresAt))
+                || !CredentialJson.TryGetDateTime(lease, "expireAt", out var expiresAt))
                 throw new InfisicalException(
                     InfisicalFailureKind.InvalidResponse,
                     $"Infisical renew of dynamic lease '{serverLeaseId}' returned no expireAt.");
@@ -281,7 +284,7 @@ public sealed class InfisicalRestClient
                 InfisicalFailureKind.Unreachable, $"Infisical {operation} could not reach the backend.", ex);
         }
 
-        if (InfisicalHttpClients.IsRedirect(response.StatusCode))
+        if (CredentialHttp.IsRedirect(response.StatusCode))
         {
             // Never follow: the backend's 3xx (and its Location) is
             // untrusted runtime output, and re-sending would carry the
@@ -297,7 +300,7 @@ public sealed class InfisicalRestClient
 
         if (response.RequestMessage?.RequestUri is { } finalUri
             && request.RequestUri is { } originalUri
-            && !InfisicalHttpClients.IsSameOrigin(finalUri, originalUri))
+            && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
         {
             // The handler followed a redirect before this code saw the
             // response (only possible with an externally supplied
@@ -316,7 +319,8 @@ public sealed class InfisicalRestClient
             return response;
 
         var status = (int)response.StatusCode;
-        var detail = await ReadErrorDetailAsync(response, ct).ConfigureAwait(false);
+        var detail = await CredentialMessages.ReadServerDetailAsync(
+            response, ErrorDetailFields, relayRawText: true, ct).ConfigureAwait(false);
         var retryAfter = ParseRetryAfter(response);
         response.Dispose();
         throw InfisicalException.FromStatus(status, operation, detail, retryAfter);
@@ -377,39 +381,6 @@ public sealed class InfisicalRestClient
         return bytes;
     }
 
-    private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
-    {
-        string text;
-        try
-        {
-            await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var (bytes, _) = await CredentialBodies.CopyCappedAsync(stream, 2048, ct).ConfigureAwait(false);
-            text = Encoding.UTF8.GetString(bytes);
-        }
-        catch (Exception)
-        {
-            return "no readable error body";
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object
-                && doc.RootElement.TryGetProperty("message", out var message)
-                && message.ValueKind == JsonValueKind.String)
-            {
-                var detail = message.GetString() ?? string.Empty;
-                return detail.Length <= MaxServerDetailChars ? detail : detail[..MaxServerDetailChars];
-            }
-        }
-        catch (JsonException)
-        {
-            // Fall through to the truncated raw text (status context only).
-        }
-        var flat = text.Replace('\n', ' ').Replace('\r', ' ');
-        return flat.Length <= MaxServerDetailChars ? flat : flat[..MaxServerDetailChars];
-    }
-
     private int? ParseRetryAfter(HttpResponseMessage response)
         => CredentialRetryAfter.Parse(response, _clock);
 
@@ -433,47 +404,6 @@ public sealed class InfisicalRestClient
         return fields.AsReadOnlyDictionary();
     }
 
-    private static bool TryGetString(JsonElement element, string name, out string value)
-    {
-        value = string.Empty;
-        if (!element.TryGetProperty(name, out var property))
-            return false;
-        if (property.ValueKind == JsonValueKind.String)
-        {
-            value = property.GetString() ?? string.Empty;
-            return true;
-        }
-        if (property.ValueKind == JsonValueKind.Null)
-            return true;
-        return false;
-    }
-
-    private static bool TryGetDouble(JsonElement element, string name, out double value)
-    {
-        value = 0;
-        return element.TryGetProperty(name, out var property)
-            && property.ValueKind == JsonValueKind.Number
-            && property.TryGetDouble(out value);
-    }
-
-    private static bool TryGetInt64(JsonElement element, string name, out long value)
-    {
-        value = 0;
-        return element.TryGetProperty(name, out var property)
-            && property.ValueKind == JsonValueKind.Number
-            && property.TryGetInt64(out value);
-    }
-
-    private static bool TryGetDateTime(JsonElement element, string name, out DateTimeOffset value)
-    {
-        value = default;
-        if (!element.TryGetProperty(name, out var property)
-            || property.ValueKind != JsonValueKind.String)
-            return false;
-        var text = property.GetString();
-        return !string.IsNullOrEmpty(text)
-            && DateTimeOffset.TryParse(text, out value);
-    }
 }
 
 internal static class DictionaryExtensions

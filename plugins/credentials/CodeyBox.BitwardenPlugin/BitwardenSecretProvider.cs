@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -242,6 +243,8 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
         _tokenLock.Dispose();
         if (_ownsHttp)
         {
+            // Dispose must not throw: a faulted handler teardown must not
+            // mask the real teardown outcome.
             try { _http?.Dispose(); } catch (Exception) { }
         }
     }
@@ -442,7 +445,7 @@ public sealed class BitwardenSecretProvider : ILeaseCapableSecretProvider, IPlug
             {
                 if (_http is null)
                 {
-                    _http = BitwardenHttpClients.Create(ClientTimeout(CurrentOptions()));
+                    _http = CredentialHttp.CreateNoRedirectClient(ClientTimeout(CurrentOptions()));
                     _ownsHttp = true;
                 }
                 try

@@ -99,7 +99,10 @@ public sealed record InfisicalSecretMapping
 /// Operator knobs for the Infisical credential plugin, bound from
 /// <c>CodeyBox:Plugins:codeybox.infisical</c>. Every operational value lives
 /// here — never as a literal in source — and the section is re-read on every
-/// issue/renew/revoke so edits take effect without a host restart.
+/// issue/renew/revoke so edits take effect without a host restart. The one
+/// exception is <c>TimeoutSeconds</c>: it is baked into the HTTP client when
+/// that client is first built, so changing it takes effect on the next host
+/// restart.
 /// <para>Secrets never appear here: <see cref="ClientIdEnvVar"/>,
 /// <see cref="ClientSecretEnvVar"/> and <see cref="AccessTokenEnvVar"/> name
 /// environment variables whose values the operator provisions from the host

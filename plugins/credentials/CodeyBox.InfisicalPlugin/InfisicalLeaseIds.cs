@@ -30,9 +30,6 @@ internal static class InfisicalLeaseIds
     internal static string BuildDynamic(string sandboxEnvVar, string serverLeaseId, bool brokered)
         => LeaseHandles.Build(Prefix, brokered ? "D" : "d", sandboxEnvVar, serverLeaseId);
 
-    internal static bool IsOurs(string? leaseId)
-        => LeaseHandles.IsOurs(leaseId, Prefix);
-
     internal static bool TryParse(string? leaseId, out ParsedLeaseId parsed)
     {
         parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty, string.Empty, false);

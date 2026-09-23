@@ -83,7 +83,10 @@ public sealed record BitwardenSecretMapping
 /// Operator knobs for the Bitwarden credential plugin, bound from
 /// <c>CodeyBox:Plugins:codeybox.bitwarden</c>. Every operational value lives
 /// here — never as a literal in source — and the section is re-read on every
-/// issue/renew/revoke so edits take effect without a host restart.
+/// issue/renew/revoke so edits take effect without a host restart. The one
+/// exception is <see cref="TimeoutSeconds"/>: it is baked into the HTTP
+/// client when that client is first built, so changing it takes effect on
+/// the next host restart.
 /// <para>Secrets never appear here: <see cref="ClientSecretEnvVar"/> and
 /// per-mapping overrides name environment variables whose values the
 /// operator provisions from the host credential chain (vault agent, systemd

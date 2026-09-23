@@ -92,6 +92,9 @@ public sealed record OnePasswordSecretMapping
 /// <c>CodeyBox:Plugins:codeybox.onepassword</c>. Every operational value
 /// lives here — never as a literal in source — and the section is re-read
 /// on every issue/renew/revoke so edits take effect without a host restart.
+/// The one exception is <c>TimeoutSeconds</c>: it is baked into the HTTP
+/// client when that client is first built, so changing it takes effect on
+/// the next host restart.
 /// <para>Secrets never appear here: <see cref="ConnectTokenEnvVar"/> and
 /// <see cref="ServiceAccountTokenEnvVar"/> name environment variables
 /// whose values the operator provisions from the host credential chain

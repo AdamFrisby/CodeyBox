@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -391,7 +392,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
             {
                 if (_http is null)
                 {
-                    _http = OnePasswordHttpClients.Create(ClientTimeout(CurrentOptions()));
+                    _http = CredentialHttp.CreateNoRedirectClient(ClientTimeout(CurrentOptions()));
                     _ownsHttp = true;
                 }
                 try
@@ -402,7 +403,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
                 {
                     // A request is already in flight; keep the existing timeout.
                 }
-                _api = new OnePasswordRestClient(_http, _logger);
+                _api = new OnePasswordRestClient(_http, _clock, _logger);
             }
             _cli ??= new OnePasswordServiceAccountClient(_testRunner, _logger);
         }

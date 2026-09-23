@@ -63,7 +63,10 @@ public sealed record DopplerSecretMapping
 /// Operator knobs for the Doppler credential plugin, bound from
 /// <c>CodeyBox:Plugins:codeybox.doppler</c>. Every operational value lives
 /// here — never as a literal in source — and the section is re-read on every
-/// issue/renew/revoke so edits take effect without a host restart.
+/// issue/renew/revoke so edits take effect without a host restart. The one
+/// exception is <c>TimeoutSeconds</c>: it is baked into the HTTP client when
+/// that client is first built, so changing it takes effect on the next host
+/// restart.
 /// <para>Secrets never appear here: <see cref="ServiceTokenEnvVar"/>,
 /// per-mapping <c>TokenEnvVar</c> overrides, and
 /// <see cref="OidcTokenEnvVar"/> name environment variables whose values

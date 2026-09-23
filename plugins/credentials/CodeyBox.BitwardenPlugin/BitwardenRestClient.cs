@@ -1,5 +1,4 @@
 using System.Net.Http.Headers;
-using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Logging;
@@ -46,9 +45,10 @@ internal sealed class BitwardenAccessToken
     }
 
     /// <summary>
-    /// Never renders the bearer value or key material: the synthesized
-    /// record-style dump would leak the credential into any log or
-    /// exception-data capture.
+    /// Never renders the bearer value or key material. Defensive redaction:
+    /// if this type ever becomes a record or struct, the synthesized member
+    /// dump would leak the credential into any log or exception-data
+    /// capture — the override keeps the safe rendering either way.
     /// </summary>
     public override string ToString() => "BitwardenAccessToken (redacted)";
 
@@ -97,9 +97,6 @@ internal sealed class BitwardenRestClient
     /// <summary>Sanity cap on an accepted token lifetime; larger values are clamped, not trusted.</summary>
     internal const int MaxAcceptedTokenLifetimeSeconds = 24 * 3600;
 
-    /// <summary>Cap on an error response body kept for error-code extraction.</summary>
-    internal const int MaxErrorBodyBytes = 2048;
-
     /// <summary>
     /// Machine-readable OAuth/API <c>error</c> codes safe to relay into an
     /// exception message. Anything else the server sends — free-text
@@ -119,6 +116,9 @@ internal sealed class BitwardenRestClient
         "server_error",
         "temporarily_unavailable",
     };
+
+    /// <summary>JSON error-body fields carrying the machine-readable code.</summary>
+    private static readonly string[] ErrorCodeFields = ["error"];
 
     public BitwardenRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
@@ -167,11 +167,11 @@ internal sealed class BitwardenRestClient
         using (doc)
         {
             var root = doc.RootElement;
-            if (!TryGetString(root, "access_token", out var token) || string.IsNullOrEmpty(token))
+            if (!CredentialJson.TryGetString(root, "access_token", out var token) || string.IsNullOrEmpty(token))
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
                     "Bitwarden identity server returned no access token.");
-            var expiresIn = TryGetInt32(root, "expires_in", out var seconds) ? seconds : DefaultTokenLifetimeSeconds;
+            var expiresIn = CredentialJson.TryGetInt32(root, "expires_in", out var seconds) ? seconds : DefaultTokenLifetimeSeconds;
             if (expiresIn <= 0)
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
@@ -179,7 +179,7 @@ internal sealed class BitwardenRestClient
             var expiresAt = _clock.GetUtcNow() + TimeSpan.FromSeconds(Math.Min(expiresIn, MaxAcceptedTokenLifetimeSeconds));
             byte[]? organizationKey = null;
             if (accessTokenKey is { Length: BitwardenCrypto.KeySize }
-                && TryGetString(root, "encrypted_payload", out var payload)
+                && CredentialJson.TryGetString(root, "encrypted_payload", out var payload)
                 && !string.IsNullOrWhiteSpace(payload))
             {
                 // A payload that does not open is not fatal: values are
@@ -234,7 +234,7 @@ internal sealed class BitwardenRestClient
         using (doc)
         {
             var root = doc.RootElement;
-            if (!TryGetString(root, "value", out var value) || string.IsNullOrEmpty(value))
+            if (!CredentialJson.TryGetString(root, "value", out var value) || string.IsNullOrEmpty(value))
                 throw new BitwardenException(
                     BitwardenFailureKind.InvalidResponse,
                     $"Bitwarden secret '{trimmedId}' returned no value.");
@@ -289,7 +289,7 @@ internal sealed class BitwardenRestClient
             foreach (var project in projects.EnumerateArray())
             {
                 if (project.ValueKind == JsonValueKind.Object
-                    && TryGetString(project, "id", out var id)
+                    && CredentialJson.TryGetString(project, "id", out var id)
                     && !string.IsNullOrWhiteSpace(id))
                     yield return id.Trim();
             }
@@ -347,12 +347,12 @@ internal sealed class BitwardenRestClient
             {
                 if (candidate.ValueKind != JsonValueKind.Object)
                     continue;
-                if (!TryGetString(candidate, "key", out var candidateKey)
+                if (!CredentialJson.TryGetString(candidate, "key", out var candidateKey)
                     || !string.Equals(candidateKey, trimmedKey, StringComparison.Ordinal))
                     continue;
                 if (projectFilter is not null && !ListsProject(candidate, projectFilter))
                     continue;
-                if (!TryGetString(candidate, "id", out var id) || string.IsNullOrWhiteSpace(id))
+                if (!CredentialJson.TryGetString(candidate, "id", out var id) || string.IsNullOrWhiteSpace(id))
                     continue;
                 var trimmedId = id.Trim();
                 if (!Guid.TryParse(trimmedId, out _))
@@ -424,7 +424,7 @@ internal sealed class BitwardenRestClient
                 BitwardenFailureKind.Unreachable, $"Bitwarden {operation} could not reach the backend.", ex);
         }
 
-        if (BitwardenHttpClients.IsRedirect(response.StatusCode))
+        if (CredentialHttp.IsRedirect(response.StatusCode))
         {
             // Never follow: the backend's 3xx (and its Location) is
             // untrusted runtime output, and re-sending would carry the
@@ -440,7 +440,7 @@ internal sealed class BitwardenRestClient
 
         if (response.RequestMessage?.RequestUri is { } finalUri
             && request.RequestUri is { } originalUri
-            && !BitwardenHttpClients.IsSameOrigin(finalUri, originalUri))
+            && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
         {
             // The handler followed a redirect before this code saw the
             // response (only possible with an externally supplied
@@ -459,7 +459,12 @@ internal sealed class BitwardenRestClient
             return response;
 
         var status = (int)response.StatusCode;
-        var detail = await ReadErrorDetailAsync(response, ct).ConfigureAwait(false);
+        // Only the allowlisted machine-readable error code is safe to
+        // relay: server free text is untrusted runtime output that may echo
+        // request content (including credentials), so the raw body is never
+        // relayed — the shared reader applies the cap and sanitisation.
+        var detail = await CredentialMessages.ReadServerDetailAsync(
+            response, ErrorCodeFields, relayRawText: false, ct, SafeErrorCodes).ConfigureAwait(false);
         var retryAfter = ParseRetryAfter(response);
         response.Dispose();
         if (status == 400 && IsIdentityCredentialRejection(detail))
@@ -530,85 +535,6 @@ internal sealed class BitwardenRestClient
         return bytes;
     }
 
-    /// <summary>
-    /// Extracts the safe part of an error response: the machine-readable
-    /// <c>error</c> code, and only when it is on the allowlist. Server
-    /// free text (<c>message</c>, <c>error_description</c>) and raw bodies
-    /// are untrusted dependency output that may echo request content — a
-    /// reflected client secret or bearer token must never reach exception
-    /// messages (which the host logs and persists in the lease store) — so
-    /// they are never relayed. Anything without an allowlisted code yields
-    /// a fixed placeholder; the HTTP status travels separately.
-    /// </summary>
-    private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
-    {
-        string text;
-        try
-        {
-            await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var (bytes, _) = await CredentialBodies.CopyCappedAsync(stream, MaxErrorBodyBytes, ct).ConfigureAwait(false);
-            text = Encoding.UTF8.GetString(bytes);
-        }
-        catch (IOException)
-        {
-            return "no readable error body";
-        }
-        catch (HttpRequestException)
-        {
-            return "no readable error body";
-        }
-        catch (ObjectDisposedException)
-        {
-            return "no readable error body";
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object
-                && doc.RootElement.TryGetProperty("error", out var error)
-                && error.ValueKind == JsonValueKind.String)
-            {
-                var code = (error.GetString() ?? string.Empty).Trim();
-                if (SafeErrorCodes.Contains(code))
-                    return code;
-            }
-        }
-        catch (JsonException)
-        {
-            // No allowlisted code: fall through to the fixed placeholder.
-        }
-        return "no readable error body";
-    }
-
     private int? ParseRetryAfter(HttpResponseMessage response)
         => CredentialRetryAfter.Parse(response, _clock);
-
-    private static bool TryGetString(JsonElement element, string name, out string value)
-    {
-        value = string.Empty;
-        if (!element.TryGetProperty(name, out var property))
-            return false;
-        if (property.ValueKind == JsonValueKind.String)
-        {
-            value = property.GetString() ?? string.Empty;
-            return true;
-        }
-        if (property.ValueKind == JsonValueKind.Null)
-            return true;
-        return false;
-    }
-
-    private static bool TryGetInt32(JsonElement element, string name, out int value)
-    {
-        value = 0;
-        if (!element.TryGetProperty(name, out var property))
-            return false;
-        if (property.ValueKind == JsonValueKind.Number && property.TryGetInt32(out var parsed))
-        {
-            value = parsed;
-            return true;
-        }
-        return false;
-    }
 }

@@ -15,10 +15,11 @@ public static class CredentialBodies
 
     /// <summary>
     /// Copies at most <paramref name="cap"/>+1 bytes from
-    /// <paramref name="source"/>. When the source exceeds
-    /// <paramref name="cap"/>, copying stops early and
-    /// <c>Truncated</c> is true (the returned bytes are the
-    /// <paramref name="cap"/>+1-byte prefix read so far).
+    /// <paramref name="source"/>: each read is sized so the accumulated
+    /// bytes can never pass <paramref name="cap"/>+1. When the source
+    /// exceeds <paramref name="cap"/>, copying stops at that boundary and
+    /// <c>Truncated</c> is true (the returned bytes are the prefix read so
+    /// far, at most <paramref name="cap"/>+1).
     /// </summary>
     public static async Task<(byte[] Bytes, bool Truncated)> CopyCappedAsync(
         Stream source, int cap, CancellationToken ct)
@@ -28,7 +29,9 @@ public static class CredentialBodies
         var buffer = new byte[Math.Min(cap, BufferSize)];
         using var sink = new MemoryStream();
         int read;
-        while ((read = await source.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+        while ((read = await source.ReadAsync(
+                    buffer.AsMemory(0, (int)Math.Min(buffer.Length, cap + 1L - sink.Length)),
+                    ct).ConfigureAwait(false)) > 0)
         {
             sink.Write(buffer, 0, read);
             if (sink.Length > cap)

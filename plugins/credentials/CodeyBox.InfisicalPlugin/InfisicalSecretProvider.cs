@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -62,7 +63,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
 
     /// <summary>
     /// Production constructor. The plugin builds its own redirect-proof
-    /// HTTP clients (see <see cref="InfisicalHttpClients"/>) rather than
+    /// HTTP clients (see <see cref="CredentialHttp"/>) rather than
     /// the shared factory's redirect-following defaults, so a backend 3xx
     /// can never re-send a credential off-origin.
     /// </summary>
@@ -387,7 +388,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
                 return;
             if (_brokerForward is null)
             {
-                _brokerForward = InfisicalHttpClients.Create(ClientTimeout(options));
+                _brokerForward = CredentialHttp.CreateNoRedirectClient(ClientTimeout(options));
                 _ownsBrokerForward = true;
             }
             _brokerForward.Timeout = ClientTimeout(options);
@@ -607,7 +608,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
                 return;
             if (_http is null)
             {
-                _http = InfisicalHttpClients.Create(ClientTimeout(CurrentOptions()));
+                _http = CredentialHttp.CreateNoRedirectClient(ClientTimeout(CurrentOptions()));
                 _ownsHttp = true;
             }
             try

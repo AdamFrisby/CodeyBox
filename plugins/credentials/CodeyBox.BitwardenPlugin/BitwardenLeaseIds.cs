@@ -29,9 +29,6 @@ internal static class BitwardenLeaseIds
     internal static string BuildStatic(string sandboxEnvVar)
         => LeaseHandles.Build(Prefix, "s", sandboxEnvVar);
 
-    internal static bool IsOurs(string? leaseId)
-        => LeaseHandles.IsOurs(leaseId, Prefix);
-
     internal static bool TryParse(string? leaseId, out ParsedLeaseId parsed)
     {
         parsed = new ParsedLeaseId(LeaseKind.Unknown, string.Empty, string.Empty);

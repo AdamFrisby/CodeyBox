@@ -30,8 +30,8 @@ public sealed class DopplerRestClient
     private readonly TimeProvider _clock;
     private readonly ILogger _log;
 
-    /// <summary>Maximum characters kept from a server-echoed error message.</summary>
-    public const int MaxServerDetailChars = 200;
+    /// <summary>JSON error-body fields relayed as detail, in preference order.</summary>
+    private static readonly string[] ErrorDetailFields = ["message", "error"];
 
     public DopplerRestClient(HttpClient http, TimeProvider? clock = null, ILogger? log = null)
     {
@@ -74,7 +74,7 @@ public sealed class DopplerRestClient
                 throw new DopplerException(
                     DopplerFailureKind.InvalidResponse,
                     $"Doppler fetch of secret '{secretName}' returned no value object.");
-            if (!TryGetString(value, "computed", out var computed) || computed is null)
+            if (!CredentialJson.TryGetString(value, "computed", out var computed) || computed is null)
                 throw new DopplerException(
                     DopplerFailureKind.InvalidResponse,
                     $"Doppler fetch of secret '{secretName}' returned no computed value.");
@@ -114,11 +114,11 @@ public sealed class DopplerRestClient
         using (doc)
         {
             var root = doc.RootElement;
-            if (!TryGetString(root, "token", out var token) || string.IsNullOrEmpty(token))
+            if (!CredentialJson.TryGetString(root, "token", out var token) || string.IsNullOrEmpty(token))
                 throw new DopplerException(
                     DopplerFailureKind.InvalidResponse,
                     "Doppler OIDC exchange returned no token.");
-            if (!TryGetDateTime(root, "expires_at", out var expiresAt))
+            if (!CredentialJson.TryGetDateTime(root, "expires_at", out var expiresAt))
                 throw new DopplerException(
                     DopplerFailureKind.InvalidResponse,
                     "Doppler OIDC exchange returned no expires_at.");
@@ -180,7 +180,7 @@ public sealed class DopplerRestClient
                 DopplerFailureKind.Unreachable, $"Doppler {operation} could not reach the backend.", ex);
         }
 
-        if (DopplerHttpClients.IsRedirect(response.StatusCode))
+        if (CredentialHttp.IsRedirect(response.StatusCode))
         {
             // Never follow: the backend's 3xx (and its Location) is
             // untrusted runtime output, and re-sending would carry the
@@ -196,7 +196,7 @@ public sealed class DopplerRestClient
 
         if (response.RequestMessage?.RequestUri is { } finalUri
             && request.RequestUri is { } originalUri
-            && !DopplerHttpClients.IsSameOrigin(finalUri, originalUri))
+            && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
         {
             // The handler followed a redirect before this code saw the
             // response (only possible with an externally supplied
@@ -215,7 +215,8 @@ public sealed class DopplerRestClient
             return response;
 
         var status = (int)response.StatusCode;
-        var detail = await ReadErrorDetailAsync(response, ct).ConfigureAwait(false);
+        var detail = await CredentialMessages.ReadServerDetailAsync(
+            response, ErrorDetailFields, relayRawText: true, ct).ConfigureAwait(false);
         var retryAfter = ParseRetryAfter(response);
         response.Dispose();
         throw DopplerException.FromStatus(status, operation, detail, retryAfter);
@@ -276,89 +277,6 @@ public sealed class DopplerRestClient
         return bytes;
     }
 
-    private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
-    {
-        string text;
-        try
-        {
-            await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var (bytes, _) = await CredentialBodies.CopyCappedAsync(stream, 2048, ct).ConfigureAwait(false);
-            text = Encoding.UTF8.GetString(bytes);
-        }
-        catch (IOException)
-        {
-            return "no readable error body";
-        }
-        catch (HttpRequestException)
-        {
-            return "no readable error body";
-        }
-        catch (ObjectDisposedException)
-        {
-            return "no readable error body";
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object)
-            {
-                foreach (var key in new[] { "message", "error" })
-                {
-                    if (doc.RootElement.TryGetProperty(key, out var message)
-                        && message.ValueKind == JsonValueKind.String)
-                    {
-                        var detail = message.GetString() ?? string.Empty;
-                        if (!string.IsNullOrWhiteSpace(detail))
-                        {
-                            // Flatten CR/LF like the raw branch below: this
-                            // text flows into exception messages, host logs,
-                            // and the lease store, so a newline-bearing
-                            // server message must not forge log lines.
-                            var flatDetail = detail.Replace('\n', ' ').Replace('\r', ' ');
-                            return flatDetail.Length <= MaxServerDetailChars ? flatDetail : flatDetail[..MaxServerDetailChars];
-                        }
-                    }
-                }
-            }
-        }
-        catch (JsonException)
-        {
-            // Fall through to the truncated raw text (status context only).
-        }
-        var flat = text.Replace('\n', ' ').Replace('\r', ' ');
-        return flat.Length <= MaxServerDetailChars ? flat : flat[..MaxServerDetailChars];
-    }
-
     private int? ParseRetryAfter(HttpResponseMessage response)
         => CredentialRetryAfter.Parse(response, _clock);
-
-    private static bool TryGetString(JsonElement element, string name, out string value)
-    {
-        value = string.Empty;
-        if (!element.TryGetProperty(name, out var property))
-            return false;
-        if (property.ValueKind == JsonValueKind.String)
-        {
-            value = property.GetString() ?? string.Empty;
-            return true;
-        }
-        if (property.ValueKind == JsonValueKind.Null)
-            return true;
-        return false;
-    }
-
-    private static bool TryGetDateTime(JsonElement element, string name, out DateTimeOffset value)
-    {
-        value = default;
-        if (!element.TryGetProperty(name, out var property))
-            return false;
-        if (property.ValueKind == JsonValueKind.String
-            && DateTimeOffset.TryParse(property.GetString(), out var parsed))
-        {
-            value = parsed;
-            return true;
-        }
-        return false;
-    }
 }

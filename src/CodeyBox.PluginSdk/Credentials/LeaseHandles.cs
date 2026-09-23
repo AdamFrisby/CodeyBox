@@ -1,3 +1,5 @@
+using CodeyBox.Core;
+
 namespace CodeyBox.PluginSdk.Credentials;
 
 /// <summary>
@@ -11,29 +13,32 @@ namespace CodeyBox.PluginSdk.Credentials;
 /// </summary>
 public static class LeaseHandles
 {
-    /// <summary>Maximum handle length accepted (matches the host lease-id cap).</summary>
-    public const int MaxHandleLength = 256;
-
-    /// <summary>True when the handle claims this backend's prefix.</summary>
-    public static bool IsOurs(string? leaseId, string prefix)
-    {
-        ArgumentNullException.ThrowIfNull(prefix);
-        return leaseId is not null
-            && leaseId.StartsWith(prefix + ".", StringComparison.Ordinal);
-    }
+    /// <summary>Maximum handle length accepted (the host lease-id cap).</summary>
+    public const int MaxHandleLength = SecretLeasingOptions.MaxLeaseIdLength;
 
     /// <summary>Builds a handle with a fresh random tail.</summary>
     public static string Build(string prefix, string kindLetter, string sandboxEnvVar)
         => Build(prefix, kindLetter, sandboxEnvVar, Guid.NewGuid().ToString("N"));
 
-    /// <summary>Builds a handle with a caller-supplied tail (e.g. a server lease id).</summary>
+    /// <summary>
+    /// Builds a handle with a caller-supplied tail (e.g. a server lease id).
+    /// Every segment must be non-empty and free of <c>.</c> and control
+    /// characters: a segment violating that would produce a handle
+    /// <see cref="TryParse"/> cannot round-trip (and the host lease-id
+    /// policy refuses), so the failure surfaces here at issue time instead
+    /// of minting a lease that can never be renewed or revoked.
+    /// </summary>
     public static string Build(string prefix, string kindLetter, string sandboxEnvVar, string tail)
     {
-        ArgumentNullException.ThrowIfNull(prefix);
-        ArgumentNullException.ThrowIfNull(kindLetter);
-        ArgumentNullException.ThrowIfNull(sandboxEnvVar);
-        ArgumentNullException.ThrowIfNull(tail);
-        return $"{prefix}.{kindLetter}.{sandboxEnvVar}.{tail}";
+        ValidateSegment(prefix, nameof(prefix));
+        ValidateSegment(kindLetter, nameof(kindLetter));
+        ValidateSegment(sandboxEnvVar, nameof(sandboxEnvVar));
+        ValidateSegment(tail, nameof(tail));
+        var handle = $"{prefix}.{kindLetter}.{sandboxEnvVar}.{tail}";
+        if (handle.Length > MaxHandleLength)
+            throw new ArgumentException(
+                $"Lease handle exceeds {MaxHandleLength} characters.");
+        return handle;
     }
 
     /// <summary>
@@ -60,5 +65,14 @@ public static class LeaseHandles
         sandboxEnvVar = parts[2];
         tail = parts[3];
         return true;
+    }
+
+    private static void ValidateSegment(string? value, string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("Lease-handle segment must be non-empty.", parameterName);
+        if (value.IndexOf('.') >= 0 || value.Any(static c => char.IsControl(c)))
+            throw new ArgumentException(
+                "Lease-handle segment must not contain '.' or control characters.", parameterName);
     }
 }

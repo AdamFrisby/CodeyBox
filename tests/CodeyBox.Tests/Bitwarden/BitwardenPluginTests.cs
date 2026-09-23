@@ -3,6 +3,7 @@ using System.Text;
 using CodeyBox.Core;
 using CodeyBox.BitwardenPlugin;
 using CodeyBox.Orchestrator;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using FakeClock = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
@@ -970,7 +971,7 @@ public sealed class BitwardenPluginTests : IDisposable
         // sink would see the token-bearing request and this test would fail.
         using var sink = new RecordingStub(_ => (200, null, "sink"));
         using var redirector = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
-        using var client = BitwardenHttpClients.Create(TimeSpan.FromSeconds(10));
+        using var client = CredentialHttp.CreateNoRedirectClient(TimeSpan.FromSeconds(10));
         using var response = await client.GetAsync(
             redirector.Url + "secrets/" + SecretId);
         Assert.Equal(HttpStatusCode.Found, response.StatusCode);
