@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.Google;
@@ -40,15 +41,31 @@ var googleEnabled = !string.IsNullOrWhiteSpace(googleClientId)
 var allowedEmailDomains = builder.Configuration
     .GetSection("CodeyBoxAdmin:Authentication:AllowedEmailDomains")
     .Get<string[]>() ?? [];
+// A configured local password is a real production authentication method, not a
+// development convenience: it is the only one available for a LAN address, since
+// Google OAuth refuses plain-HTTP redirect URIs for anything but localhost.
+var localLoginEnabled = AdminAuthPolicies.LocalLoginEnabled(
+    builder.Environment.IsDevelopment(), Environment.GetEnvironmentVariable("CODEYBOX_ADMIN_PASSWORD"));
 if (!builder.Environment.IsDevelopment() && requireAuth)
 {
-    if (!cloudflareEnabled && !googleEnabled)
+    if (!cloudflareEnabled && !googleEnabled && !localLoginEnabled)
         throw new InvalidOperationException(
-            "Production authentication requires Cloudflare Access or Google OAuth.");
-    if (allowedEmailDomains.Length == 0)
+            "Production authentication requires Cloudflare Access, Google OAuth, or a configured local password (CODEYBOX_ADMIN_PASSWORD).");
+    // The email-domain list gates identity-provider sign-ins, which carry an email.
+    // It is meaningless for a local password, so it is only demanded when a
+    // provider that issues one is enabled.
+    if ((cloudflareEnabled || googleEnabled) && allowedEmailDomains.Length == 0)
         throw new InvalidOperationException(
-            "Production authentication requires at least one allowed email domain.");
+            "Production authentication via Cloudflare Access or Google OAuth requires at least one allowed email domain.");
 }
+
+// The session cookie is Secure in production, so a browser never returns it over
+// plain HTTP and a login there appears to succeed then loops back to /login.
+// Serving the local login over HTTP is therefore a deliberate, named opt-in —
+// the session cookie crosses the network in the clear, exactly as the password
+// does — and it only takes effect when the local login actually exists.
+var allowInsecureLocalTransport = localLoginEnabled
+    && builder.Configuration.GetValue("CodeyBoxAdmin:Authentication:Local:AllowInsecureTransport", false);
 var dataProtectionKeysPath = builder.Configuration["CodeyBoxAdmin:DataProtectionKeysPath"];
 if (!string.IsNullOrWhiteSpace(dataProtectionKeysPath))
 {
@@ -77,7 +94,7 @@ var authentication = builder.Services.AddAuthentication(options =>
         // Strict prevents the auth cookie from being sent on any cross-site request.
         opts.Cookie.SameSite = SameSiteMode.Strict;
         opts.Cookie.HttpOnly = true;
-        opts.Cookie.SecurePolicy = builder.Environment.IsDevelopment()
+        opts.Cookie.SecurePolicy = builder.Environment.IsDevelopment() || allowInsecureLocalTransport
             ? CookieSecurePolicy.SameAsRequest
             : CookieSecurePolicy.Always;
     });
@@ -126,7 +143,11 @@ if (requireAuth)
             .RequireAssertion(context =>
             {
                 // A configured domain list is an origin-side backstop to Cloudflare/Google policy.
-                // Local emergency credentials remain usable when explicitly configured.
+                // Local credentials remain usable when explicitly configured: a local sign-in
+                // carries no email to check, so it is recognised by its authentication method
+                // rather than failing the domain test and locking the operator out.
+                if (AdminAuthPolicies.IsLocalSignIn(context.User))
+                    return true;
                 if (allowedEmailDomains.Length == 0)
                     return true;
                 var email = context.User.FindFirstValue(ClaimTypes.Email)
@@ -165,6 +186,28 @@ builder.Services.Configure<FleetMapOptions>(
 var hubUrl = new Uri(new Uri(apiBaseUrl), "/hubs/agent-stdout").ToString();
 builder.Services.AddSingleton(new OrchestratorHubSettings(hubUrl, orchestratorApiKey));
 
+// The local password login is the only guard once the admin listens beyond
+// loopback, and the admin carries the orchestrator API key on every call it
+// proxies — so a guessable login is a guessable orchestrator. Bound attempts
+// per client address in a fixed window and queue nothing, so a burst is refused
+// rather than delayed. Hot values are read once here: the limiter is built at
+// startup, and changing them is a restart.
+var loginMaxAttempts = Math.Max(1, builder.Configuration.GetValue("CodeyBoxAdmin:Authentication:Local:MaxAttemptsPerWindow", 5));
+var loginWindow = TimeSpan.FromSeconds(Math.Max(1, builder.Configuration.GetValue("CodeyBoxAdmin:Authentication:Local:WindowSeconds", 60)));
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy(AdminAuthPolicies.LocalLoginRateLimit, httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = loginMaxAttempts,
+                Window = loginWindow,
+                QueueLimit = 0,
+            }));
+});
+
 var app = builder.Build();
 
 if (!app.Environment.IsDevelopment())
@@ -178,6 +221,7 @@ app.UseAntiforgery();
 // Auth middleware must run before Blazor components so the user principal is available.
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 // Defensive response headers on every response.
 app.Use(async (ctx, next) =>
@@ -194,7 +238,12 @@ app.Use(async (ctx, next) =>
 // Cookie-based login — credentials read exclusively from env vars (CODEYBOX_ADMIN_USERNAME /
 // CODEYBOX_ADMIN_PASSWORD), never from config files or code.
 // Login.razor includes <AntiforgeryToken />, so antiforgery is enforced without DisableAntiforgery().
-if (app.Environment.IsDevelopment())
+//
+// Registered in Development, and in any environment where a password has been
+// explicitly configured. Without a password the endpoint does not exist in
+// Production at all, so an operator who never opted in has no password login
+// to attack; setting CODEYBOX_ADMIN_PASSWORD is the opt-in.
+if (localLoginEnabled)
 {
     app.MapPost("/account/login", async (HttpContext ctx) =>
     {
@@ -216,7 +265,11 @@ if (app.Environment.IsDevelopment())
         if (!usernameOk || !passwordOk)
             return Results.Redirect("/login?error=1");
 
-        var claims = new[] { new Claim(ClaimTypes.Name, username) };
+        var claims = new[]
+        {
+            new Claim(ClaimTypes.Name, username),
+            new Claim(ClaimTypes.AuthenticationMethod, AdminAuthPolicies.LocalAuthenticationMethod),
+        };
         var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
         await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
 
@@ -227,7 +280,7 @@ if (app.Environment.IsDevelopment())
             ? returnUrl
             : "/";
         return Results.Redirect(redirect);
-    }).AllowAnonymous();
+    }).AllowAnonymous().RequireRateLimiting(AdminAuthPolicies.LocalLoginRateLimit);
 }
 
 app.MapGet("/account/google-login", (string? returnUrl) =>
