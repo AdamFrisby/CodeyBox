@@ -178,6 +178,27 @@ public sealed class MajordomoVocabularyTests
     }
 
     [Fact]
+    public void PlannedChain_RevalidatesShape_EvenThroughWith()
+    {
+        // A WorkItemChainNode alone cannot see its own position, so a node
+        // built by hand can carry a forward edge; assembling it into a
+        // planned CreateChain re-checks the chain shape.
+        var good = new MajordomoPlannedChange.CreateChain(
+            [new WorkItemChainNode(Spec()), new WorkItemChainNode(Spec(), [0])]);
+        Assert.Equal(2, good.Nodes.Count);
+
+        Assert.Throws<ArgumentException>(() => new MajordomoPlannedChange.CreateChain(
+            [new WorkItemChainNode(Spec()), new WorkItemChainNode(Spec(), [1])]));
+
+        // A 'with' copy runs the init setter again — it cannot smuggle a
+        // bad edge past the guard.
+        Assert.Throws<ArgumentException>(() => good with
+        {
+            Nodes = [new WorkItemChainNode(Spec()), new WorkItemChainNode(Spec(), [7])],
+        });
+    }
+
+    [Fact]
     public void Chain_BlastRadius_IsItemCount()
     {
         var chain = new CreateWorkItemChainArgs(

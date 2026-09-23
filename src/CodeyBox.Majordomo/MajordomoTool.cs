@@ -5,9 +5,10 @@ namespace CodeyBox.Majordomo;
 /// snake_case name, the typed argument contract, the typed result contract,
 /// and the READ/MUTATE classification the authorization layer gates on.
 ///
-/// The constructor is internal — descriptors exist only inside
-/// <see cref="MajordomoTools"/>, so a tool outside the vocabulary cannot be
-/// minted downstream.
+/// The constructor is internal, so the catalog in
+/// <see cref="MajordomoTools"/> is intended as the single source of
+/// descriptors — off-catalog descriptors can only be minted from inside
+/// this assembly, never by a transport or caller.
 /// </summary>
 public sealed record MajordomoTool
 {

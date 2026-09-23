@@ -141,6 +141,35 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         Assert.Contains("..", ex.Message);
     }
 
+    [Fact]
+    public async Task LoadAsync_ControlCharactersInRef_AreStrippedFromNotFoundMessage()
+    {
+        // The template ref is untrusted input echoed into the 404 body — a
+        // terminal-escape-bearing ref must not reach the caller raw.
+        var registry = new FileTaskTemplateRegistry(_templateDir);
+        var ex = await Assert.ThrowsAsync<TaskTemplateNotFoundException>(
+            () => registry.LoadAsync("missing\u001b[31m"));
+
+        Assert.DoesNotContain(ex.Message, c => char.IsControl(c));
+        Assert.Contains("missing[31m", ex.Message);
+    }
+
+    [Fact]
+    public async Task ListAsync_ControlCharactersInFileName_AreStrippedFromSummaryAndError()
+    {
+        // A planted filename carrying a terminal escape is a legal filename
+        // on Linux; the summary name and the load error must be sanitised.
+        await File.WriteAllTextAsync(
+            Path.Combine(_templateDir, "ev\u001bil.json"), "{not json");
+
+        var registry = new FileTaskTemplateRegistry(_templateDir);
+        var entry = Assert.Single(await registry.ListAsync());
+
+        Assert.Equal("evil", entry.Name);
+        Assert.DoesNotContain(entry.Error!, c => char.IsControl(c));
+        Assert.Contains("'evil'", entry.Error);
+    }
+
     [Theory]
     [MemberData(nameof(InvalidTemplateRefCases))]
     public async Task LoadAsync_InvalidTemplateReferences_AreRejected(string templateRef, string expectedMessage)

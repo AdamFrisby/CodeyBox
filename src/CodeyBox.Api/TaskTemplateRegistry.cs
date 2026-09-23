@@ -88,7 +88,10 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
         foreach (var path in Directory.EnumerateFiles(root, "*.json", SearchOption.TopDirectoryOnly)
                      .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
         {
-            var name = Path.GetFileNameWithoutExtension(path);
+            // The filename is untrusted input echoed into caller-presentable
+            // summaries and error messages — strip control/format characters
+            // and bound it before it can ride either one.
+            var name = Validation.DescribeUntrustedValue(Path.GetFileNameWithoutExtension(path));
             try
             {
                 var template = await LoadFromPathAsync(name, path, maxCheckCount, ct);
@@ -110,7 +113,7 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
         var (name, path) = ResolveTemplatePath(root, templateRef);
         if (!File.Exists(path))
             throw new TaskTemplateNotFoundException(
-                $"template '{templateRef}' was not found under '{root}'");
+                $"template '{name}' was not found under '{root}'");
 
         return await LoadFromPathAsync(name, path, maxCheckCount, ct);
     }
@@ -149,7 +152,14 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
         if (!path.StartsWith(rootWithSeparator, StringComparison.Ordinal))
             throw new TaskTemplateLoadException("template path escapes the templates directory");
 
-        return (normalised.Replace('/', Path.DirectorySeparatorChar), path);
+        // The caller-supplied ref becomes the template's display name and is
+        // echoed into caller-presentable errors — sanitise it once here so
+        // every downstream message and the stored Name carry a bounded,
+        // control/format-free identifier. Path resolution above deliberately
+        // uses the raw normalised ref.
+        return (
+            Validation.DescribeUntrustedValue(normalised.Replace('/', Path.DirectorySeparatorChar)),
+            path);
     }
 
     private static async Task<TaskTemplateDefinition> LoadFromPathAsync(

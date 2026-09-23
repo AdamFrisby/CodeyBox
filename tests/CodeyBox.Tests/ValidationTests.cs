@@ -114,6 +114,28 @@ public sealed class ValidationTests
     }
 
     [Fact]
+    public void DescribeUntrustedValue_StripsUnicodeSpoofingCharacters()
+    {
+        // Format characters — bidi overrides/isolates, zero-width spaces,
+        // BOM, astral tag characters — plus line/paragraph separators are
+        // display-spoofing vectors that char.IsControl alone would pass.
+        Assert.Equal("abc", Validation.DescribeUntrustedValue("a\u202Eb\u2066c\uFEFF"));
+        Assert.Equal("ab", Validation.DescribeUntrustedValue("a\u200Bb\uFEFF"));
+        Assert.Equal("ab", Validation.DescribeUntrustedValue("a\u2028b\u2029"));
+        Assert.Equal("ab", Validation.DescribeUntrustedValue("a\U000E0001b"));
+
+        // A lone surrogate is undecodable input — dropped, never echoed.
+        Assert.Equal("ab", Validation.DescribeUntrustedValue("a\uD83Db"));
+
+        // A genuine astral character is judged as one scalar and survives;
+        // truncation that lands between the halves drops the pair cleanly.
+        Assert.Equal("a\U0001F600b", Validation.DescribeUntrustedValue("a\U0001F600b"));
+        var cutInsidePair = Validation.DescribeUntrustedValue(
+            "a" + new string('x', Validation.MaxEchoedValueLength - 2) + "\U0001F600");
+        Assert.DoesNotContain(cutInsidePair, char.IsSurrogate);
+    }
+
+    [Fact]
     public void RejectedBranchName_ErrorEchoIsBoundedAndControlFree()
     {
         var ex = Assert.Throws<ArgumentException>(() =>

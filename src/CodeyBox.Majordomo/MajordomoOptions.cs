@@ -21,12 +21,27 @@ public sealed record MajordomoOptions
     /// </summary>
     public const int MaxAllowedMutatedItemsPerTurn = 100;
 
+    private MajordomoAutonomyMode _mode = MajordomoAutonomyMode.Proposed;
+
     /// <summary>
     /// Whether MUTATE tools execute immediately or produce operator proposals.
     /// Defaults to <see cref="MajordomoAutonomyMode.Proposed"/> so a fresh
-    /// install is review-first until the operator opts into autonomy.
+    /// install is review-first until the operator opts into autonomy. A
+    /// config-bound value outside <see cref="MajordomoAutonomyMode"/> is
+    /// rejected at set time rather than silently read as Proposed.
     /// </summary>
-    public MajordomoAutonomyMode Mode { get; init; } = MajordomoAutonomyMode.Proposed;
+    public MajordomoAutonomyMode Mode
+    {
+        get => _mode;
+        init
+        {
+            if (!Enum.IsDefined(value))
+                throw new ArgumentOutOfRangeException(
+                    nameof(Mode), value,
+                    $"Mode must be a defined {nameof(MajordomoAutonomyMode)}");
+            _mode = value;
+        }
+    }
 
     private int _maxMutatedItemsPerTurn = DefaultMaxMutatedItemsPerTurn;
 

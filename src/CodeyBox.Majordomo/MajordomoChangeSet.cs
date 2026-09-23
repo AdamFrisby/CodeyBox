@@ -17,9 +17,23 @@ public abstract record MajordomoPlannedChange
     /// <summary>
     /// Create a dependent chain. Nodes are ordered; each node's
     /// <see cref="WorkItemChainNode.DependsOnIndexes"/> references earlier
-    /// positions in the same list.
+    /// positions in the same list. The <see cref="Nodes"/> init accessor
+    /// re-runs <see cref="WorkItemChainNode.RequireChainShape"/>, so the
+    /// chain-shape invariant holds even for nodes assembled without
+    /// <see cref="CreateWorkItemChainArgs"/> or rewritten via <c>with</c>.
     /// </summary>
-    public sealed record CreateChain(IReadOnlyList<WorkItemChainNode> Nodes) : MajordomoPlannedChange;
+    public sealed record CreateChain(IReadOnlyList<WorkItemChainNode> Nodes) : MajordomoPlannedChange
+    {
+        private readonly IReadOnlyList<WorkItemChainNode> _nodes =
+            WorkItemChainNode.RequireChainShape(Nodes, nameof(Nodes));
+
+        /// <summary>Ordered chain nodes; assigning re-validates the chain shape.</summary>
+        public IReadOnlyList<WorkItemChainNode> Nodes
+        {
+            get => _nodes;
+            init => _nodes = WorkItemChainNode.RequireChainShape(value, nameof(Nodes));
+        }
+    }
 
     /// <summary>Apply a replace-set field edit to one item.</summary>
     public sealed record UpdateItem(WorkItemId Id, WorkItemPatch Patch) : MajordomoPlannedChange;

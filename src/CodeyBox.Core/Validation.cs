@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -281,22 +282,50 @@ public static partial class Validation
 
     /// <summary>
     /// Renders an untrusted value for a caller-presentable error or detail
-    /// string: control characters are stripped and the value is truncated, so
-    /// terminal escapes and unbounded echoes cannot ride the message.
+    /// string: characters that are invisible or that spoof display are
+    /// stripped — control characters (terminal escapes), Unicode format
+    /// characters (bidi overrides/isolates, zero-width spaces, BOM, astral
+    /// tag characters), line/paragraph separators, and surrogate,
+    /// private-use, or unassigned code points — and the value is truncated,
+    /// so escapes and unbounded echoes cannot ride the message. A valid
+    /// surrogate pair is judged as one scalar, so genuine astral characters
+    /// survive while lone surrogates are dropped.
     /// </summary>
     public static string DescribeUntrustedValue(string? value)
     {
         if (value is null)
             return "<null>";
         var truncated = value.Length > MaxEchoedValueLength;
-        var builder = new StringBuilder(Math.Min(value.Length, MaxEchoedValueLength) + 1);
-        foreach (var c in value.AsSpan(0, Math.Min(value.Length, MaxEchoedValueLength)))
+        var length = Math.Min(value.Length, MaxEchoedValueLength);
+        var builder = new StringBuilder(length + 1);
+        for (var i = 0; i < length; i++)
         {
-            if (!char.IsControl(c))
-                builder.Append(c);
+            var width = char.IsHighSurrogate(value[i])
+                && i + 1 < length
+                && char.IsLowSurrogate(value[i + 1])
+                ? 2
+                : 1;
+            // GetUnicodeCategory(string, int) decodes a surrogate pair to the
+            // pair's category; a lone surrogate resolves to Surrogate and is
+            // dropped below.
+            var category = width == 2
+                ? char.GetUnicodeCategory(value, i)
+                : char.GetUnicodeCategory(value[i]);
+            if (IsEchoableCategory(category))
+                builder.Append(value, i, width);
+            i += width - 1;
         }
         if (truncated)
             builder.Append('…');
         return builder.ToString();
     }
+
+    private static bool IsEchoableCategory(UnicodeCategory category)
+        => category is not (UnicodeCategory.Control
+            or UnicodeCategory.Format
+            or UnicodeCategory.Surrogate
+            or UnicodeCategory.PrivateUse
+            or UnicodeCategory.OtherNotAssigned
+            or UnicodeCategory.LineSeparator
+            or UnicodeCategory.ParagraphSeparator);
 }

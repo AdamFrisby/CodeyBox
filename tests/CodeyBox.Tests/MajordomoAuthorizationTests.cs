@@ -292,6 +292,15 @@ public sealed class MajordomoAuthorizationTests
     }
 
     [Fact]
+    public void Options_RejectUndefinedMode()
+    {
+        // A config typo binding an out-of-vocabulary mode must fail at set
+        // time, not silently read as Proposed.
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new MajordomoOptions { Mode = (MajordomoAutonomyMode)999 });
+    }
+
+    [Fact]
     public void Options_Defaults_AreReviewFirst()
     {
         var options = new MajordomoOptions();

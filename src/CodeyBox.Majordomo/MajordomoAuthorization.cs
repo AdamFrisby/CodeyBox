@@ -78,6 +78,17 @@ public static class MajordomoAuthorization
 
         var cap = options.MaxMutatedItemsPerTurn;
         var affected = mutate.AffectedItemCount;
+
+        // A mutate contract reporting fewer than one affected item would slip
+        // past both budget checks and execute without consuming turn budget —
+        // fail closed rather than trust the count.
+        if (affected < 1)
+        {
+            return new MajordomoDecision.Refuse(
+                MajordomoRefusalReason.ArgumentContractMismatch,
+                $"tool '{tool.Name}' reported {affected} affected items; a mutation must affect at least one");
+        }
+
         if (affected > cap)
         {
             return new MajordomoDecision.Refuse(

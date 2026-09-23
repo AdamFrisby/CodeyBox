@@ -30,35 +30,35 @@ public sealed record WorkItemPatch
         IReadOnlyDictionary<string, string>? externalIds = null,
         IReadOnlyDictionary<string, string>? knobs = null)
     {
-        Title = title is null ? null : WorkItemFieldValidation.Title(title);
-        Prompt = prompt is null ? null : WorkItemFieldValidation.Prompt(prompt);
-        Agent = agent;
-        AgentClassId = agentClassId is null ? null : WorkItemFieldValidation.AgentClassId(agentClassId);
-        Priority = priority is { } p ? WorkItemFieldValidation.Priority(p) : null;
-        WorkTimeout = workTimeout is { } wt ? WorkItemFieldValidation.WorkTimeout(wt) : null;
-        MergeTimeout = mergeTimeout is { } mt ? WorkItemFieldValidation.MergeTimeout(mt) : null;
-        MinModelScore = minModelScore is { } mms ? WorkItemFieldValidation.MinModelScore(mms) : null;
-        AuditMaxIterations = auditMaxIterations is { } ami ? WorkItemFieldValidation.AuditMaxIterations(ami) : null;
-        AuditComplexity = WorkItemFieldValidation.AuditComplexity(auditComplexity);
-        RequiredCapabilities = requiredCapabilities is null
-            ? null
-            : WorkItemFieldValidation.RequiredCapabilities(requiredCapabilities);
-        DependsOn = dependsOn is null ? null : WorkItemFieldValidation.DependsOn(dependsOn);
-        ExternalIds = externalIds is null ? null : WorkItemFieldValidation.ExternalIds(externalIds);
-        Knobs = knobs is null ? null : WorkItemFieldValidation.Knobs(knobs);
+        // Every field's assignment is an element of this array, so the
+        // no-change guard inspects the normalised values themselves rather
+        // than a parallel list of property names — a new field's assignment
+        // belongs in the same array, where it is counted automatically.
+        // The guard runs on the NORMALISED values: an input that normalises
+        // away (a whitespace auditComplexity) is not a change, so a patch
+        // carrying only that is still unrepresentable.
+        object?[] normalised =
+        [
+            Title = title is null ? null : WorkItemFieldValidation.Title(title),
+            Prompt = prompt is null ? null : WorkItemFieldValidation.Prompt(prompt),
+            Agent = agent,
+            AgentClassId = agentClassId is null ? null : WorkItemFieldValidation.AgentClassId(agentClassId),
+            Priority = priority is { } p ? WorkItemFieldValidation.Priority(p) : null,
+            WorkTimeout = workTimeout is { } wt ? WorkItemFieldValidation.WorkTimeout(wt) : null,
+            MergeTimeout = mergeTimeout is { } mt ? WorkItemFieldValidation.MergeTimeout(mt) : null,
+            MinModelScore = minModelScore is { } mms ? WorkItemFieldValidation.MinModelScore(mms) : null,
+            AuditMaxIterations = auditMaxIterations is { } ami ? WorkItemFieldValidation.AuditMaxIterations(ami) : null,
+            AuditComplexity = WorkItemFieldValidation.AuditComplexity(auditComplexity),
+            RequiredCapabilities = requiredCapabilities is null
+                ? null
+                : WorkItemFieldValidation.RequiredCapabilities(requiredCapabilities),
+            DependsOn = dependsOn is null ? null : WorkItemFieldValidation.DependsOn(dependsOn),
+            ExternalIds = externalIds is null ? null : WorkItemFieldValidation.ExternalIds(externalIds),
+            Knobs = knobs is null ? null : WorkItemFieldValidation.Knobs(knobs),
+        ];
 
-        // The no-change guard runs on the NORMALISED properties: an input
-        // that normalises away (a whitespace auditComplexity) is not a
-        // change, so a patch carrying only that is still unrepresentable.
-        // Keep this list in sync with the properties above.
-        if (Title is null && Prompt is null && Agent is null && AgentClassId is null
-            && Priority is null && WorkTimeout is null && MergeTimeout is null
-            && MinModelScore is null && AuditMaxIterations is null && AuditComplexity is null
-            && RequiredCapabilities is null && DependsOn is null && ExternalIds is null
-            && Knobs is null)
-        {
+        if (normalised.All(v => v is null))
             throw new ArgumentException("patch must change at least one field");
-        }
     }
 
     /// <summary>New title; null = unchanged.</summary>

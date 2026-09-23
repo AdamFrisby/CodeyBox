@@ -21,7 +21,12 @@ namespace CodeyBox.Core;
 /// </summary>
 public static class WorkItemFieldRules
 {
-    /// <summary>Required title: non-whitespace, no option-like/control characters, bounded length.</summary>
+    /// <summary>
+    /// Required title: non-whitespace, no option-like/control characters,
+    /// bounded length. On success returns the input VERBATIM — validate-only,
+    /// not trimmed; whether to store the trimmed form is each surface's
+    /// choice (the REST surface stores as-sent, the template loader trims).
+    /// </summary>
     public static (string? Value, string? Error) NormalizeTitle(string? value, string field = "title")
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -33,7 +38,11 @@ public static class WorkItemFieldRules
         return (value, null);
     }
 
-    /// <summary>Required prompt: non-whitespace, bounded length.</summary>
+    /// <summary>
+    /// Required prompt: non-whitespace, bounded length. On success returns
+    /// the input VERBATIM — validate-only, not trimmed, same as
+    /// <see cref="NormalizeTitle"/>.
+    /// </summary>
     public static (string? Value, string? Error) NormalizePrompt(string? value, string field = "prompt")
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -135,7 +144,7 @@ public static class WorkItemFieldRules
             if (CheckExternalIdNamespace(ns, $"{field} key '{nsLabel}'") is { } nsError)
                 return (null, nsError);
             if (id is null)
-                return (null, $"{field}['{nsLabel}'] must not be null");
+                return (null, $"{field}['{nsLabel}'] must not be null — to delete a namespace, omit it from the replacement map (REST: PATCH /workitems/{{id}}/external-ids)");
             if (CheckExternalId(id, $"{field}['{nsLabel}']") is { } idError)
                 return (null, idError);
             copy[ns] = id;
@@ -184,10 +193,12 @@ public static class WorkItemFieldRules
             return $"{field} key must not be empty";
         if (key.Length > WorkItemLimits.MaxKnobKeyLength || key.Any(char.IsControl))
             return $"{field} keys must be <= {WorkItemLimits.MaxKnobKeyLength} chars with no control characters";
+        // The key is caller-supplied input echoed into the error label.
+        var keyLabel = Validation.DescribeUntrustedValue(key);
         if (knobValue is null)
-            return $"knob '{key}' value must not be null";
+            return $"{field}['{keyLabel}'] must not be null";
         if (knobValue.Length > WorkItemLimits.MaxKnobValueLength || knobValue.Any(char.IsControl))
-            return $"{field}['{key}'] must be <= {WorkItemLimits.MaxKnobValueLength} chars with no control characters";
+            return $"{field}['{keyLabel}'] must be <= {WorkItemLimits.MaxKnobValueLength} chars with no control characters";
         return null;
     }
 

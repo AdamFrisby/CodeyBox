@@ -1,4 +1,3 @@
-using System.Collections.Immutable;
 using CodeyBox.Core;
 
 namespace CodeyBox.Majordomo;
@@ -30,38 +29,10 @@ public sealed record CreateWorkItemChainArgs : MajordomoMutateArgs
 
     public CreateWorkItemChainArgs(IReadOnlyList<WorkItemChainNode> items)
     {
-        if (items is null) throw new ArgumentNullException(nameof(items));
-        if (items.Count is < 2 or > MaxItems)
-            throw new ArgumentException(
-                $"a chain must contain between 2 and {MaxItems} items; use create_work_item for a single item",
-                nameof(items));
-
-        var hasAnyEdge = false;
-        for (var i = 0; i < items.Count; i++)
-        {
-            var node = items[i] ?? throw new ArgumentException("chain nodes must not be null", nameof(items));
-            var seen = new HashSet<int>();
-            foreach (var edge in node.DependsOnIndexes)
-            {
-                if (edge < 0 || edge >= i)
-                    throw new ArgumentException(
-                        $"items[{i}].dependsOnIndexes entry {edge} must reference an earlier position (0..{i - 1})",
-                        nameof(items));
-                if (!seen.Add(edge))
-                    throw new ArgumentException(
-                        $"items[{i}].dependsOnIndexes contains duplicate edge {edge}", nameof(items));
-                hasAnyEdge = true;
-            }
-        }
-
-        if (!hasAnyEdge)
-            throw new ArgumentException(
-                "a chain must contain at least one dependency edge; use create_work_item for independent items",
-                nameof(items));
-
-        // ImmutableArray: the validated node list cannot be rewritten through
-        // a mutable cast of the exposed IReadOnlyList.
-        Items = ImmutableArray.CreateRange(items);
+        // The whole chain-shape contract — count, backward unique edges, at
+        // least one edge — is shared with MajordomoPlannedChange.CreateChain
+        // so the planned change carries the same invariants as the call.
+        Items = WorkItemChainNode.RequireChainShape(items, nameof(items));
     }
 
     /// <summary>Ordered chain nodes; <c>Items[i].DependsOnIndexes</c> only references positions &lt; i.</summary>

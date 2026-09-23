@@ -5,7 +5,9 @@ namespace CodeyBox.Majordomo;
 
 /// <summary>
 /// Arguments for <c>get_queue_status</c>: global queue gate state and
-/// per-state work-item counts. Takes no parameters.
+/// per-state work-item counts. Takes no parameters — a transport decoding
+/// an empty payload must substitute <see cref="Instance"/>; the constructor
+/// is private by design.
 /// </summary>
 public sealed record GetQueueStatusArgs : MajordomoToolArgs
 {
@@ -17,7 +19,9 @@ public sealed record GetQueueStatusArgs : MajordomoToolArgs
 
 /// <summary>
 /// Arguments for <c>get_dispatch_status</c>: dispatcher concurrency and the
-/// slots currently occupied by in-flight work. Takes no parameters.
+/// slots currently occupied by in-flight work. Takes no parameters — a
+/// transport decoding an empty payload must substitute
+/// <see cref="Instance"/>; the constructor is private by design.
 /// </summary>
 public sealed record GetDispatchStatusArgs : MajordomoToolArgs
 {
