@@ -312,6 +312,22 @@ public sealed class AnswerEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task DismissQuestion_ControlCharReason_Returns400()
+    {
+        // The dismiss reason follows the shared AgentPauseValidation rule —
+        // control characters are rejected here exactly as on every other
+        // reason surface.
+        var item = await CreateWorkItemAsync();
+        await CreateQuestionAsync(item, "q-001");
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{item.Id}/dismiss-question",
+            new { questionId = "q-001", reason = "no\u001b[31mt needed" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
     public async Task DismissQuestion_OversizedReason_Returns400()
     {
         var item = await CreateWorkItemAsync();

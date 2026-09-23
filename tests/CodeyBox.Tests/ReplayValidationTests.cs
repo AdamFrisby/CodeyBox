@@ -106,6 +106,20 @@ public sealed class ReplayValidationTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
+    [Fact]
+    public async Task Replay_AgentClassIdWithControlCharacters_Returns400()
+    {
+        // Same field rule as create/PATCH: control characters are rejected,
+        // not silently stored onto the replayed item.
+        var source = Item(WorkItemState.Done);
+        await _factory.Store.CreateAsync(source);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/workitems/{source.Id}/replay",
+            new { agentClassId = "worker-class\u001b" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     // ── 400 for invalid work branch ───────────────────────────────────────────
 
     [Fact]

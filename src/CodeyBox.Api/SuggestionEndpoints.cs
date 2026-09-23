@@ -36,9 +36,9 @@ internal static class SuggestionEndpoints
         if (offset < 0)
             return Results.BadRequest(new { error = "offset must be >= 0" });
         if (category is not null && !ValidCategories.Contains(category))
-            return Results.BadRequest(new { error = $"unknown category '{category}'" });
+            return Results.BadRequest(new { error = $"unknown category '{Validation.DescribeUntrustedValue(category)}'" });
         if (severity is not null && !ValidSeverities.Contains(severity))
-            return Results.BadRequest(new { error = $"unknown severity '{severity}'" });
+            return Results.BadRequest(new { error = $"unknown severity '{Validation.DescribeUntrustedValue(severity)}'" });
         if (project is not null && project.Length > 200)
             return Results.BadRequest(new { error = "project must be <= 200 chars" });
 
@@ -82,8 +82,8 @@ internal static class SuggestionEndpoints
     {
         if (body.State != "dismissed")
             return Results.BadRequest(new { error = "only state='dismissed' is accepted via PATCH" });
-        if (body.DismissReason is not null && body.DismissReason.Length > 500)
-            return Results.BadRequest(new { error = "dismissReason must be <= 500 chars" });
+        if (AgentPauseValidation.ValidateOptionalReason(body.DismissReason, "dismissReason") is { } dismissError)
+            return Results.BadRequest(new { error = dismissError });
 
         if (!await store.TryDismissAsync(id, body.DismissReason, ct))
         {
@@ -126,8 +126,19 @@ internal static class SuggestionEndpoints
         {
             var kind = new AgentKind(body.Agent);
             if (!agents.TryGet(kind, out _))
-                return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'" });
+                return Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(body.Agent)}'" });
             agentOverride = kind;
+        }
+
+        // Same field rule as every other queue-facing entry point: trim,
+        // bound, reject control characters.
+        string? agentClassId = null;
+        if (!string.IsNullOrWhiteSpace(body?.AgentClassId))
+        {
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(body.AgentClassId);
+            if (classIdError is not null)
+                return Results.BadRequest(new { error = classIdError });
+            agentClassId = normalizedClassId;
         }
 
         var workBranch = body?.WorkBranch;
@@ -201,7 +212,7 @@ internal static class SuggestionEndpoints
             BaseBranch = baseBranch,
             WorkBranch = workBranch,
             PushUpstream = body?.PushUpstream ?? true,
-            AgentClassId = body?.AgentClassId,
+            AgentClassId = agentClassId,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
             ExternalIds = externalId is null
                 ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)

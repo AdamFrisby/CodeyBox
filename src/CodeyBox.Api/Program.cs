@@ -6106,7 +6106,7 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     // 404 only when neither layer knows this agent — a typo, not a healthy agent
     // that simply has one probe layer.
     if (hostResult is null && inVmAvailability is null)
-        return Results.NotFound(new { error = $"no smoke probe registered for agent '{name}'" });
+        return Results.NotFound(new { error = $"no smoke probe registered for agent '{Validation.DescribeUntrustedValue(name)}'" });
 
     var availability = registry.GetAvailability(kind);
     object? hostSmoke = hostResult is null ? null : new
@@ -6154,7 +6154,7 @@ app.MapPost("/admin/agent/{name}/reset", (
     // (e.g. /admin/agent/curser/reset) silently returns 200 and the operator
     // never realises the call did nothing.
     if (!agents.Available.Contains(kind))
-        return Results.NotFound(new { error = $"unknown agent '{name}'" });
+        return Results.NotFound(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(name)}'" });
     // Single reset port: clears the registry AND invalidates the in-VM smoke
     // cache together, so a stale cached pass can't reconcile straight back onto
     // the registry before the operator's fix is re-verified. The same call

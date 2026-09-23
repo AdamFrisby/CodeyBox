@@ -52,7 +52,7 @@ internal static class AgentPauseEndpoints
     {
         var agent = NormaliseKind(kind);
         if (!agents.Available.Contains(agent))
-            return Results.NotFound(new { error = $"unknown agent '{kind}'", available = agents.Available.Select(a => a.Value) });
+            return Results.NotFound(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(kind)}'", available = agents.Available.Select(a => a.Value) });
 
         var validation = ValidateReason(body.Reason);
         if (validation is not null) return validation;
@@ -118,7 +118,7 @@ internal static class AgentPauseEndpoints
     {
         var agent = NormaliseKind(kind);
         if (!agents.Available.Contains(agent))
-            return Results.NotFound(new { error = $"unknown agent '{kind}'", available = agents.Available.Select(a => a.Value) });
+            return Results.NotFound(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(kind)}'", available = agents.Available.Select(a => a.Value) });
 
         var validation = ValidateResumeReason(body?.Reason);
         if (validation is not null) return validation;

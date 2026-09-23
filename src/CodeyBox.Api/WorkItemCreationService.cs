@@ -5,11 +5,6 @@ namespace CodeyBox.Api;
 
 internal sealed class WorkItemCreationService
 {
-    private const int GlobalMinPriority = -1000;
-    private const int GlobalMaxPriority = 1000;
-    private const int MaxRequiredCapabilities = 16;
-    private const int MaxCapabilityLength = 64;
-
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
     private readonly IProjectRepository _projects;
@@ -46,8 +41,10 @@ internal sealed class WorkItemCreationService
         WorkItemCreationProvenance? provenance,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(req.Title)) return Error("title is required");
-        if (string.IsNullOrWhiteSpace(req.Prompt)) return Error("prompt is required");
+        var (title, titleError) = WorkItemFieldRules.NormalizeTitle(req.Title);
+        if (titleError is not null) return Error(titleError);
+        var (prompt, promptError) = WorkItemFieldRules.NormalizePrompt(req.Prompt);
+        if (promptError is not null) return Error(promptError);
         if (string.IsNullOrWhiteSpace(req.ProjectId)) return Error("projectId is required");
 
         ProjectId pid;
@@ -67,42 +64,17 @@ internal sealed class WorkItemCreationService
         {
             if (req.BaseBranch is not null) Validation.ValidateBranchName(req.BaseBranch, nameof(req.BaseBranch));
             if (req.WorkBranch is not null) Validation.ValidateBranchName(req.WorkBranch, nameof(req.WorkBranch));
-            Validation.ValidateNoOptionLikeOrControl(req.Title, nameof(req.Title));
-
-            if (req.WorkBranch is not null && req.BaseBranch is not null
-                && string.Equals(req.WorkBranch, req.BaseBranch, StringComparison.Ordinal))
-            {
-                return Error("workBranch must differ from baseBranch");
-            }
-
-            if (req.Title.Length > 200)
-                return Error("title must be <= 200 chars");
-            if (req.Prompt.Length > 64 * 1024)
-                return Error("prompt must be <= 64KB");
         }
         catch (ArgumentException ex)
         {
             return Error(ex.Message);
         }
+        if (WorkItemFieldRules.CheckDistinctBranches(req.BaseBranch, req.WorkBranch) is { } branchError)
+            return Error(branchError);
 
-        var canonicalExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (req.ExternalIds is { Count: > 0 })
-        {
-            if (req.ExternalIds.Count > 16)
-                return Error("externalIds may contain at most 16 entries per work item");
-            foreach (var (ns, value) in req.ExternalIds)
-            {
-                if (value is null)
-                    return Error($"externalIds['{ns}'] must not be null on create - use PATCH /external-ids to delete");
-                try
-                {
-                    Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{ns}'");
-                    Validation.ValidateExternalId(value, $"externalIds['{ns}']");
-                }
-                catch (ArgumentException ex) { return Error(ex.Message); }
-                canonicalExternalIds[ns] = value;
-            }
-        }
+        var (validExternalIds, externalIdsError) = WorkItemFieldRules.NormalizeExternalIds(req.ExternalIds);
+        if (externalIdsError is not null) return Error(externalIdsError);
+        var canonicalExternalIds = new Dictionary<string, string>(validExternalIds!, StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrEmpty(req.ExternalId))
         {
             try { Validation.ValidateExternalId(req.ExternalId, nameof(req.ExternalId)); }
@@ -126,15 +98,17 @@ internal sealed class WorkItemCreationService
             if (!_agents.TryGet(kind, out _))
                 return new PreparedWorkItemCreationResult(
                     null,
-                    Results.BadRequest(new { error = $"unknown agent '{req.Agent}'", available = _agents.Available.Select(a => a.Value) }));
+                    Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(req.Agent)}'", available = _agents.Available.Select(a => a.Value) }));
             agentOverride = kind;
         }
 
         string? auditorProfile = null;
         if (!string.IsNullOrWhiteSpace(req.AuditorProfile))
         {
-            auditorProfile = req.AuditorProfile.Trim();
-            if (!AuditProfileExists(project.Audit, auditorProfile))
+            var (normalizedProfile, profileError) = WorkItemFieldRules.NormalizeAuditorProfile(req.AuditorProfile);
+            if (profileError is not null) return Error(profileError);
+            auditorProfile = normalizedProfile;
+            if (!AuditProfileExists(project.Audit, auditorProfile!))
                 return new PreparedWorkItemCreationResult(
                     null,
                     Results.BadRequest(new
@@ -144,8 +118,8 @@ internal sealed class WorkItemCreationService
                     }));
         }
 
-        if ((req.DependsOn?.Length ?? 0) > 100)
-            return Error("dependsOn must contain at most 100 entries");
+        if (WorkItemFieldRules.CheckDependsOnCount(req.DependsOn?.Length ?? 0) is { } dependsOnCountError)
+            return Error(dependsOnCountError);
 
         var allItems = new List<WorkItem>();
         var byNamespacedExternalId = new Dictionary<(string Namespace, string Value), WorkItem>();
@@ -179,15 +153,15 @@ internal sealed class WorkItemCreationService
             if (Validation.TryParseNamespacedExternalId(rawId, out var depNs, out var depValue) && depNs is not null)
             {
                 if (!byNamespacedExternalId.TryGetValue((depNs, depValue), out var depByNs))
-                    return Error($"dependency '{rawId}' could not be resolved: no work item with externalId '{depValue}' in namespace '{depNs}' in project '{pid}'");
+                    return Error($"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(depValue)}' in namespace '{depNs}' in project '{pid}'");
                 dependsOnIds.Add(depByNs.Id);
                 continue;
             }
             if (!byBareExternalId.TryGetValue(rawId, out var matches) || matches.Count == 0)
-                return Error($"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{pid}'");
+                return Error($"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(rawId)}' in project '{pid}'");
             var distinctItems = matches.Select(m => m.Item.Id).Distinct().ToList();
             if (distinctItems.Count > 1)
-                return Error($"dependency '{rawId}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} - qualify as 'namespace:value'");
+                return Error($"dependency '{Validation.DescribeUntrustedValue(rawId)}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} - qualify as 'namespace:value'");
             dependsOnIds.Add(distinctItems[0]);
         }
 
@@ -233,9 +207,9 @@ internal sealed class WorkItemCreationService
         string? agentClassId = null;
         if (!string.IsNullOrWhiteSpace(req.AgentClassId))
         {
-            if (req.AgentClassId.Length > 200)
-                return Error("agentClassId must be <= 200 chars");
-            agentClassId = req.AgentClassId.Trim();
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(req.AgentClassId);
+            if (classIdError is not null) return Error(classIdError);
+            agentClassId = normalizedClassId;
         }
 
         var priority = 0;
@@ -250,7 +224,7 @@ internal sealed class WorkItemCreationService
         int? auditMaxIterations = null;
         if (req.AuditMaxIterations is { } auditBudget)
         {
-            var auditBudgetError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditBudget);
+            var auditBudgetError = WorkItemFieldRules.CheckAuditMaxIterations(auditBudget);
             if (auditBudgetError is not null)
                 return Error(auditBudgetError);
             auditMaxIterations = auditBudget;
@@ -259,7 +233,7 @@ internal sealed class WorkItemCreationService
         string? auditComplexity = null;
         if (req.AuditComplexity is not null)
         {
-            var (normalised, complexityError) = AuditBudgetRequestValidation.NormaliseAuditComplexity(req.AuditComplexity);
+            var (normalised, complexityError) = WorkItemFieldRules.NormalizeAuditComplexity(req.AuditComplexity);
             if (complexityError is not null)
                 return Error(complexityError);
             auditComplexity = normalised;
@@ -268,9 +242,9 @@ internal sealed class WorkItemCreationService
         IReadOnlyList<string> requiredCapabilities = [];
         if (req.RequiredCapabilities is { } reqCaps)
         {
-            var (normalised, capErr) = NormaliseRequiredCapabilities(reqCaps);
+            var (normalised, capErr) = WorkItemFieldRules.NormalizeRequiredCapabilities(reqCaps);
             if (capErr is not null)
-                return new PreparedWorkItemCreationResult(null, capErr);
+                return new PreparedWorkItemCreationResult(null, Results.BadRequest(new { error = capErr }));
             requiredCapabilities = normalised!;
         }
 
@@ -295,25 +269,17 @@ internal sealed class WorkItemCreationService
                 return Error("check and isRefactor cannot both be provided");
 
             var check = req.Check;
-            if (string.IsNullOrWhiteSpace(check.Question))
-                return Error("check.question is required");
-            if (check.Question.Length > 64 * 1024)
-                return Error("check.question must be <= 64KB");
+            var (question, questionError) = WorkItemFieldRules.NormalizePrompt(check.Question, "check.question");
+            if (questionError is not null) return Error(questionError);
             if (!CheckAndActModes.TryNormalise(check.Mode, out var checkMode))
                 return Error("check.mode must be 'agentic' or 'completion'");
             if (check.OnYes is null)
                 return Error("check.onYes is required when check is provided");
             var onYes = check.OnYes;
-            if (string.IsNullOrWhiteSpace(onYes.Title))
-                return Error("check.onYes.title is required");
-            try { Validation.ValidateNoOptionLikeOrControl(onYes.Title, "check.onYes.title"); }
-            catch (ArgumentException ex) { return Error(ex.Message); }
-            if (onYes.Title.Length > 200)
-                return Error("check.onYes.title must be <= 200 chars");
-            if (string.IsNullOrWhiteSpace(onYes.Prompt))
-                return Error("check.onYes.prompt is required");
-            if (onYes.Prompt.Length > 64 * 1024)
-                return Error("check.onYes.prompt must be <= 64KB");
+            var (onYesTitle, onYesTitleError) = WorkItemFieldRules.NormalizeTitle(onYes.Title, "check.onYes.title");
+            if (onYesTitleError is not null) return Error(onYesTitleError);
+            var (onYesPrompt, onYesPromptError) = WorkItemFieldRules.NormalizePrompt(onYes.Prompt, "check.onYes.prompt");
+            if (onYesPromptError is not null) return Error(onYesPromptError);
             if (!string.IsNullOrWhiteSpace(onYes.Agent))
             {
                 var kind = new AgentKind(onYes.Agent);
@@ -326,15 +292,22 @@ internal sealed class WorkItemCreationService
                         null,
                         Results.BadRequest(new
                         {
-                            error = $"unknown agent '{onYes.Agent}' on {onYesLocation}",
+                            error = $"unknown agent '{Validation.DescribeUntrustedValue(onYes.Agent)}' on {onYesLocation}",
                             available = _agents.Available.Select(a => a.Value),
                         }));
                 }
             }
-            if (onYes.AgentClassId is { Length: > 200 })
-                return Error("check.onYes.agentClassId must be <= 200 chars");
-            if (onYes.DependsOn is { Length: > 100 })
-                return Error("check.onYes.dependsOn must contain at most 100 entries");
+            string? onYesAgentClassId = null;
+            if (onYes.AgentClassId is not null)
+            {
+                var (normalizedOnYesClassId, onYesClassIdError) =
+                    WorkItemFieldRules.NormalizeAgentClassId(onYes.AgentClassId, "check.onYes.agentClassId");
+                if (onYesClassIdError is not null) return Error(onYesClassIdError);
+                onYesAgentClassId = normalizedOnYesClassId;
+            }
+            if (WorkItemFieldRules.CheckDependsOnCount(
+                    onYes.DependsOn?.Length ?? 0, "check.onYes.dependsOn") is { } onYesDepsError)
+                return Error(onYesDepsError);
             IReadOnlyDictionary<string, string> onYesKnobs = EmptyKnobs;
             if (onYes.Knobs is { Count: > 0 })
             {
@@ -346,17 +319,17 @@ internal sealed class WorkItemCreationService
 
             checkSpec = new CheckAndActSpec
             {
-                Question = check.Question,
+                Question = question!,
                 Mode = checkMode,
                 ActionableAnswer = check.ActionableAnswer ?? true,
                 OnYes = new OnYesActionSpec
                 {
-                    Title = onYes.Title,
-                    Prompt = onYes.Prompt,
+                    Title = onYesTitle!,
+                    Prompt = onYesPrompt!,
                     MinModelScore = onYes.MinModelScore,
                     Priority = onYes.Priority,
                     Agent = string.IsNullOrWhiteSpace(onYes.Agent) ? null : onYes.Agent.Trim(),
-                    AgentClassId = string.IsNullOrWhiteSpace(onYes.AgentClassId) ? null : onYes.AgentClassId.Trim(),
+                    AgentClassId = onYesAgentClassId,
                     DependsOn = onYes.DependsOn is null
                         ? null
                         : onYes.DependsOn.Where(d => !string.IsNullOrWhiteSpace(d)).Select(d => d.Trim()).ToList(),
@@ -376,7 +349,7 @@ internal sealed class WorkItemCreationService
             if (!_agents.TryGet(controlAgent, out _))
                 return new PreparedWorkItemCreationResult(
                     null,
-                    Results.BadRequest(new { error = $"unknown agent '{control.Agent}'", available = _agents.Available.Select(a => a.Value) }));
+                    Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(control.Agent)}'", available = _agents.Available.Select(a => a.Value) }));
 
             var actionText = control.Action?.Trim();
             AgentControlAction action;
@@ -421,8 +394,8 @@ internal sealed class WorkItemCreationService
         {
             Id = newId,
             ProjectId = pid,
-            Title = req.Title,
-            Prompt = req.Prompt,
+            Title = title!,
+            Prompt = prompt!,
             BaseBranch = req.BaseBranch,
             WorkBranch = req.WorkBranch,
             Agent = agentOverride,
@@ -446,11 +419,11 @@ internal sealed class WorkItemCreationService
             TemplateEntryIndex = provenance?.TemplateEntryIndex,
         };
         if (req.WorkTimeoutMinutes is { } w)
-            item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
+            item = item with { WorkTimeout = WorkItemFieldRules.ClampWorkTimeoutMinutes(w) };
         if (req.MergeTimeoutMinutes is { } m)
-            item = item with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)) };
+            item = item with { MergeTimeout = WorkItemFieldRules.ClampMergeTimeoutMinutes(m) };
         if (req.MinModelScore is { } minScore)
-            item = item with { MinModelScore = Math.Clamp(minScore, 0, 200) };
+            item = item with { MinModelScore = WorkItemFieldRules.ClampMinModelScore(minScore) };
 
         return new PreparedWorkItemCreationResult(
             new PreparedWorkItemCreation(item, project, boundRelease, canonicalExternalIds),
@@ -524,6 +497,15 @@ internal sealed class WorkItemCreationService
         IReadOnlyDictionary<string, string> raw,
         IKnobRegistry registry)
     {
+        if (WorkItemFieldRules.CheckKnobOverrideCount(raw.Count) is { } countError)
+            return (null, Results.BadRequest(new { error = countError }));
+
+        // The registry runs first so its errors (unknown key, rejected value)
+        // keep their wording — it renders echoed keys/values through
+        // Validation.DescribeUntrustedValue at the source, so unbounded or
+        // escape-bearing raw input cannot ride the failure reason. The shared
+        // shape rules then bound the canonical output the same way they bound
+        // the majordomo contract's input.
         var normalised = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (rawKey, rawValue) in raw)
         {
@@ -533,52 +515,18 @@ internal sealed class WorkItemCreationService
             normalised[verdict.Key!] = verdict.Value!;
         }
 
-        return (normalised, null);
-    }
+        var (bounded, boundsError) = WorkItemFieldRules.NormalizeKnobOverrides(normalised);
+        if (boundsError is not null)
+            return (null, Results.BadRequest(new { error = boundsError }));
 
-    private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(
-        IReadOnlyList<string> raw)
-    {
-        if (raw.Count > MaxRequiredCapabilities)
-            return (null, Results.BadRequest(new
-            {
-                error = $"requiredCapabilities may contain at most {MaxRequiredCapabilities} entries",
-            }));
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var result = new List<string>();
-        foreach (var entry in raw)
-        {
-            if (entry is null) continue;
-            var tag = entry.Trim();
-            if (tag.Length == 0) continue;
-            if (tag.Length > MaxCapabilityLength)
-                return (null, Results.BadRequest(new
-                {
-                    error = $"requiredCapabilities entry '{tag}' exceeds {MaxCapabilityLength} chars",
-                }));
-            if (tag.Any(char.IsControl))
-                return (null, Results.BadRequest(new
-                {
-                    error = "requiredCapabilities entries must not contain control characters",
-                }));
-            if (seen.Add(tag)) result.Add(tag);
-        }
-        return (result, null);
+        return (bounded, null);
     }
 
     private static IResult? ValidatePriority(int priority, Project project)
     {
-        if (priority < GlobalMinPriority || priority > GlobalMaxPriority)
-            return Results.BadRequest(new
-            {
-                error = $"priority must be within [{GlobalMinPriority}, {GlobalMaxPriority}]",
-            });
-        if (project.MaxPriority is { } maxPriority && priority > maxPriority)
-            return Results.BadRequest(new
-            {
-                error = $"priority {priority} exceeds project '{project.Id}' maxPriority {maxPriority}",
-            });
-        return null;
+        var error = WorkItemFieldRules.CheckPriorityBounds(priority)
+            ?? WorkItemFieldRules.CheckProjectPriorityCeiling(priority, project);
+        return error is null ? null : Results.BadRequest(new { error });
     }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)

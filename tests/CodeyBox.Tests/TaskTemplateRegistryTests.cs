@@ -141,6 +141,35 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         Assert.Contains("..", ex.Message);
     }
 
+    [Fact]
+    public async Task LoadAsync_ControlCharactersInRef_AreStrippedFromNotFoundMessage()
+    {
+        // The template ref is untrusted input echoed into the 404 body — a
+        // terminal-escape-bearing ref must not reach the caller raw.
+        var registry = new FileTaskTemplateRegistry(_templateDir);
+        var ex = await Assert.ThrowsAsync<TaskTemplateNotFoundException>(
+            () => registry.LoadAsync("missing\u001b[31m"));
+
+        Assert.DoesNotContain(ex.Message, c => char.IsControl(c));
+        Assert.Contains("missing[31m", ex.Message);
+    }
+
+    [Fact]
+    public async Task ListAsync_ControlCharactersInFileName_AreStrippedFromSummaryAndError()
+    {
+        // A planted filename carrying a terminal escape is a legal filename
+        // on Linux; the summary name and the load error must be sanitised.
+        await File.WriteAllTextAsync(
+            Path.Combine(_templateDir, "ev\u001bil.json"), "{not json");
+
+        var registry = new FileTaskTemplateRegistry(_templateDir);
+        var entry = Assert.Single(await registry.ListAsync());
+
+        Assert.Equal("evil", entry.Name);
+        Assert.DoesNotContain(entry.Error!, c => char.IsControl(c));
+        Assert.Contains("'evil'", entry.Error);
+    }
+
     [Theory]
     [MemberData(nameof(InvalidTemplateRefCases))]
     public async Task LoadAsync_InvalidTemplateReferences_AreRejected(string templateRef, string expectedMessage)
@@ -194,7 +223,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         yield return Case(TemplateWithCheck(
             "{\"question\":" + JsonString(new string('q', 64 * 1024 + 1)) +
             ",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
-            ".question must be <= 64KB");
+            ".question must be <= 65536 chars");
         yield return Case("""{"checks":[null]}""", "checks[0] must be an object");
         yield return Case("""{"checks":[1]}""", "not a valid check entry");
         yield return Case("{", "not valid JSON");
@@ -220,7 +249,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         yield return Case(TemplateWithCheck(
             "{\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":" +
             JsonString(new string('p', 64 * 1024 + 1)) + "}}"),
-            ".onYes.prompt must be <= 64KB");
+            ".onYes.prompt must be <= 65536 chars");
         yield return Case(TemplateWithCheck(
             "{\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\",\"agentClassId\":" +
             JsonString(new string('c', 201)) + "}}"),
@@ -240,7 +269,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
         yield return Case(TemplateWithCheck(
             "{\"question\":\"q\",\"prompt\":" + JsonString(new string('p', 64 * 1024 + 1)) +
             ",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
-            ".prompt must be <= 64KB");
+            ".prompt must be <= 65536 chars");
     }
 
     public static IEnumerable<object[]> InvalidTemplateRefCases()

@@ -294,6 +294,18 @@ public sealed class SuggestionsApiTests : IDisposable
     }
 
     [Fact]
+    public async Task PatchSuggestion_DismissReasonWithControlChars_Returns400()
+    {
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var resp = await _client.PatchAsJsonAsync(
+            $"/suggestions/{s.Id}",
+            new { state = "dismissed", dismissReason = "not\u0007relevant" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
     public async Task PatchSuggestion_ReasonTooLong_Returns400()
     {
         var s = MakeSuggestion();
@@ -335,6 +347,20 @@ public sealed class SuggestionsApiTests : IDisposable
     {
         var resp = await _client.PostAsJsonAsync("/suggestions/no-such-id/promote", new { });
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task PromoteSuggestion_AgentClassIdWithControlCharacters_Returns400()
+    {
+        // Same field rule as create/PATCH/replay: control characters are
+        // rejected rather than stored onto the promoted work item.
+        var s = MakeSuggestion();
+        await _factory.SuggestionStore.CreateAsync(s);
+
+        var resp = await _client.PostAsJsonAsync(
+            $"/suggestions/{s.Id}/promote",
+            new { agentClassId = "worker-class\u001b" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
     // ── Local response shapes ─────────────────────────────────────────────────

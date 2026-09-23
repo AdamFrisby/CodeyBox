@@ -1,5 +1,7 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace CodeyBox.Core;
@@ -47,7 +49,7 @@ public static partial class Validation
         if (name.AsSpan().IndexOfAny(['\n', '\r', '\0', '~', '^', ':', '?', '*', '[', '\\']) >= 0)
             throw new ArgumentException($"{fieldName} contains characters invalid in a git refname", fieldName);
         if (!TagNameRegex().IsMatch(name))
-            throw new ArgumentException($"{fieldName} '{name}' is not a valid tag name", fieldName);
+            throw new ArgumentException($"{fieldName} '{DescribeUntrustedValue(name)}' is not a valid tag name", fieldName);
     }
 
     /// <summary>
@@ -69,7 +71,7 @@ public static partial class Validation
         if (name.EndsWith(".lock", StringComparison.Ordinal))
             throw new ArgumentException($"{fieldName} must not end with '.lock'", fieldName);
         if (!BranchNameRegex().IsMatch(name))
-            throw new ArgumentException($"{fieldName} '{name}' is not a valid branch name", fieldName);
+            throw new ArgumentException($"{fieldName} '{DescribeUntrustedValue(name)}' is not a valid branch name", fieldName);
     }
 
     public static void ValidateCommitSha(string sha, string fieldName)
@@ -77,7 +79,7 @@ public static partial class Validation
         if (string.IsNullOrWhiteSpace(sha))
             throw new ArgumentException($"{fieldName} must not be empty", fieldName);
         if (!CommitShaRegex().IsMatch(sha))
-            throw new ArgumentException($"{fieldName} '{sha}' is not a valid commit sha", fieldName);
+            throw new ArgumentException($"{fieldName} '{DescribeUntrustedValue(sha)}' is not a valid commit sha", fieldName);
     }
 
     public static void ValidateRepositoryUrl(string url, string fieldName)
@@ -142,7 +144,7 @@ public static partial class Validation
                 {
                     if (IsRestrictedAddress(addr))
                         throw new ArgumentException(
-                            $"{fieldName} hostname '{host}' resolves to a private or reserved address", fieldName);
+                            $"{fieldName} hostname '{DescribeUntrustedValue(host)}' resolves to a private or reserved address", fieldName);
                 }
             }
             catch (ArgumentException)
@@ -232,7 +234,7 @@ public static partial class Validation
             throw new ArgumentException($"{fieldName} must not be empty", fieldName);
         if (!ExternalIdNamespaceRegex().IsMatch(value))
             throw new ArgumentException(
-                $"{fieldName} '{value}' must be 1–32 lowercase alphanumeric characters or dashes, starting with a letter or digit",
+                $"{fieldName} '{DescribeUntrustedValue(value)}' must be 1–32 lowercase alphanumeric characters or dashes, starting with a letter or digit",
                 fieldName);
     }
 
@@ -268,7 +270,62 @@ public static partial class Validation
         if (value is null) throw new ArgumentNullException(fieldName);
         if (value.StartsWith('-'))
             throw new ArgumentException($"{fieldName} must not start with '-'", fieldName);
-        if (value.AsSpan().IndexOfAny(['\n', '\r', '\0']) >= 0)
+        if (value.Any(char.IsControl))
             throw new ArgumentException($"{fieldName} must not contain control characters", fieldName);
     }
+
+    /// <summary>
+    /// Largest slice of an untrusted value echoed into a caller-presentable
+    /// validation message.
+    /// </summary>
+    public const int MaxEchoedValueLength = 128;
+
+    /// <summary>
+    /// Renders an untrusted value for a caller-presentable error or detail
+    /// string: characters that are invisible or that spoof display are
+    /// stripped — control characters (terminal escapes), Unicode format
+    /// characters (bidi overrides/isolates, zero-width spaces, BOM, astral
+    /// tag characters), line/paragraph separators, and surrogate,
+    /// private-use, or unassigned code points — and the value is truncated,
+    /// so escapes and unbounded echoes cannot ride the message. A valid
+    /// surrogate pair is judged as one scalar, so genuine astral characters
+    /// survive while lone surrogates are dropped.
+    /// </summary>
+    public static string DescribeUntrustedValue(string? value)
+    {
+        if (value is null)
+            return "<null>";
+        var truncated = value.Length > MaxEchoedValueLength;
+        var length = Math.Min(value.Length, MaxEchoedValueLength);
+        var builder = new StringBuilder(length + 1);
+        for (var i = 0; i < length; i++)
+        {
+            var width = char.IsHighSurrogate(value[i])
+                && i + 1 < length
+                && char.IsLowSurrogate(value[i + 1])
+                ? 2
+                : 1;
+            // GetUnicodeCategory(string, int) decodes a surrogate pair to the
+            // pair's category; a lone surrogate resolves to Surrogate and is
+            // dropped below.
+            var category = width == 2
+                ? char.GetUnicodeCategory(value, i)
+                : char.GetUnicodeCategory(value[i]);
+            if (IsEchoableCategory(category))
+                builder.Append(value, i, width);
+            i += width - 1;
+        }
+        if (truncated)
+            builder.Append('…');
+        return builder.ToString();
+    }
+
+    private static bool IsEchoableCategory(UnicodeCategory category)
+        => category is not (UnicodeCategory.Control
+            or UnicodeCategory.Format
+            or UnicodeCategory.Surrogate
+            or UnicodeCategory.PrivateUse
+            or UnicodeCategory.OtherNotAssigned
+            or UnicodeCategory.LineSeparator
+            or UnicodeCategory.ParagraphSeparator);
 }

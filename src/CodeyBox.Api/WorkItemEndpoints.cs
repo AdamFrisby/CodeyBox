@@ -769,16 +769,17 @@ internal static class WorkItemEndpoints
         {
             var kind = new AgentKind(body.Agent);
             if (!agents.TryGet(kind, out _))
-                return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'", available = agents.Available.Select(a => a.Value) });
+                return Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(body.Agent)}'", available = agents.Available.Select(a => a.Value) });
             agentOverride = kind;
             agentClassOverride = null; // agent-specific override clears class routing
         }
 
         if (!string.IsNullOrWhiteSpace(body?.AgentClassId))
         {
-            if (body.AgentClassId.Length > 200)
-                return Results.BadRequest(new { error = "agentClassId must be <= 200 chars" });
-            agentClassOverride = body.AgentClassId.Trim();
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(body.AgentClassId);
+            if (classIdError is not null)
+                return Results.BadRequest(new { error = classIdError });
+            agentClassOverride = normalizedClassId;
             agentOverride = null; // class routing takes precedence
         }
 
@@ -796,9 +797,8 @@ internal static class WorkItemEndpoints
             try { Validation.ValidateBranchName(body.WorkBranch, nameof(body.WorkBranch)); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
 
-            if (source.BaseBranch is not null &&
-                string.Equals(body.WorkBranch, source.BaseBranch, StringComparison.Ordinal))
-                return Results.BadRequest(new { error = "workBranch must differ from baseBranch" });
+            if (WorkItemFieldRules.CheckDistinctBranches(source.BaseBranch, body.WorkBranch) is { } branchError)
+                return Results.BadRequest(new { error = branchError });
 
             workBranch = body.WorkBranch;
         }
@@ -946,13 +946,8 @@ internal static class WorkItemEndpoints
         // Validate optional close-out metadata. Same shape as /resume's reason
         // guard (no control chars, ≤500 chars); resolutionSha is a Git-shaped
         // hex SHA so triage tooling can link the manual-resolution commit.
-        if (reason is not null)
-        {
-            if (reason.Any(char.IsControl))
-                return Results.BadRequest(new { error = "reason must not contain control characters" });
-            if (reason.Length > 500)
-                return Results.BadRequest(new { error = "reason must be <= 500 chars" });
-        }
+        if (AgentPauseValidation.ValidateOptionalReason(reason, "reason") is { } reasonError)
+            return Results.BadRequest(new { error = reasonError });
         if (resolutionSha is not null)
         {
             if (resolutionSha.Length is < 7 or > 40
@@ -1231,13 +1226,8 @@ internal static class WorkItemEndpoints
         if (err is not null) return err;
 
         var reason = body?.Reason;
-        if (reason is not null)
-        {
-            if (reason.Any(char.IsControl))
-                return Results.BadRequest(new { error = "reason must not contain control characters" });
-            if (reason.Length > 500)
-                return Results.BadRequest(new { error = "reason must be <= 500 chars" });
-        }
+        if (AgentPauseValidation.ValidateOptionalReason(reason, "reason") is { } reasonError)
+            return Results.BadRequest(new { error = reasonError });
 
         var outcome = await retrier.ResumeAsync(item!, body?.From ?? "work", reason, ct);
 
@@ -1300,8 +1290,8 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = $"unknown project '{item.ProjectId}'" });
 
         var highestAllowedPriority = project.MaxPriority is { } cap
-            ? Math.Min(cap, GlobalMaxPriority)
-            : GlobalMaxPriority;
+            ? Math.Min(cap, WorkItemLimits.MaxPriority)
+            : WorkItemLimits.MaxPriority;
         var promotedPriority = Math.Max(item.Priority, highestAllowedPriority);
         if (item.Priority == promotedPriority)
             return Results.Ok(new { id = item.Id.ToString(), state = item.State.ToString() });
@@ -1511,11 +1501,10 @@ internal static class WorkItemEndpoints
         string? oldAgentClassId = item!.AgentClassId;
         if (agentClassPatch)
         {
-            var trimmed = body.AgentClassId!.Trim();
-            if (trimmed.Length == 0)
-                return Results.BadRequest(new { error = "agentClassId must not be empty" });
-            if (trimmed.Length > 200)
-                return Results.BadRequest(new { error = "agentClassId must be <= 200 chars" });
+            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(body.AgentClassId);
+            if (classIdError is not null)
+                return Results.BadRequest(new { error = classIdError });
+            var trimmed = normalizedClassId!;
             var knownClasses = router.ClassIds;
             if (!knownClasses.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
                 return Results.BadRequest(new
@@ -1560,20 +1549,20 @@ internal static class WorkItemEndpoints
 
         if (body.Title is not null)
         {
-            try { Validation.ValidateNoOptionLikeOrControl(body.Title, nameof(body.Title)); }
-            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
-            if (body.Title.Length > 200) return Results.BadRequest(new { error = "title must be <= 200 chars" });
-            updated = updated with { Title = body.Title, UpdatedAt = now };
+            var (newTitle, titleError) = WorkItemFieldRules.NormalizeTitle(body.Title);
+            if (titleError is not null) return Results.BadRequest(new { error = titleError });
+            updated = updated with { Title = newTitle!, UpdatedAt = now };
         }
 
         if (body.Prompt is not null)
         {
-            if (body.Prompt.Length > 64 * 1024) return Results.BadRequest(new { error = "prompt must be <= 64KB" });
+            var (newPrompt, promptError) = WorkItemFieldRules.NormalizePrompt(body.Prompt);
+            if (promptError is not null) return Results.BadRequest(new { error = promptError });
             if (deferPromptReplace)
             {
                 updated = updated with
                 {
-                    Prompt = body.Prompt,
+                    Prompt = newPrompt!,
                     PromptRevision = updated.PromptRevision + 1,
                     UpdatedAt = now,
                 };
@@ -1587,14 +1576,14 @@ internal static class WorkItemEndpoints
                 // guard inside TryReplacePromptAsync mirrors the Queued check
                 // above; success refreshes our in-memory snapshot for the rest
                 // of the PATCH so the response DTO reflects the new revision.
-                var promptResult = await store.TryReplacePromptAsync(updated.Id, body.Prompt, now, ct);
+                var promptResult = await store.TryReplacePromptAsync(updated.Id, newPrompt!, now, ct);
                 if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
                     return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
                 if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
                     return Results.Conflict(new { error = $"cannot edit item in terminal state" });
                 updated = updated with
                 {
-                    Prompt = body.Prompt,
+                    Prompt = newPrompt!,
                     PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
                     UpdatedAt = now,
                 };
@@ -1606,23 +1595,23 @@ internal static class WorkItemEndpoints
         {
             var kind = new AgentKind(body.Agent);
             if (!agents.TryGet(kind, out _))
-                return Results.BadRequest(new { error = $"unknown agent '{body.Agent}'", available = agents.Available.Select(a => a.Value) });
+                return Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(body.Agent)}'", available = agents.Available.Select(a => a.Value) });
             updated = updated with { Agent = kind, UpdatedAt = now };
         }
 
         if (body.WorkTimeoutMinutes is { } w)
-            updated = updated with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)), UpdatedAt = now };
+            updated = updated with { WorkTimeout = WorkItemFieldRules.ClampWorkTimeoutMinutes(w), UpdatedAt = now };
 
         if (body.MergeTimeoutMinutes is { } m)
-            updated = updated with { MergeTimeout = TimeSpan.FromMinutes(Math.Clamp(m, 1, 240)), UpdatedAt = now };
+            updated = updated with { MergeTimeout = WorkItemFieldRules.ClampMergeTimeoutMinutes(m), UpdatedAt = now };
 
         if (body.MinModelScore is { } minScore)
-            updated = updated with { MinModelScore = Math.Clamp(minScore, 0, 200), UpdatedAt = now };
+            updated = updated with { MinModelScore = WorkItemFieldRules.ClampMinModelScore(minScore), UpdatedAt = now };
 
         if (body.RequiredCapabilities is { } patchCaps)
         {
-            var (normalised, capErr) = NormaliseRequiredCapabilities(patchCaps);
-            if (capErr is not null) return capErr;
+            var (normalised, capErr) = WorkItemFieldRules.NormalizeRequiredCapabilities(patchCaps);
+            if (capErr is not null) return Results.BadRequest(new { error = capErr });
             updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
         }
 
@@ -1636,7 +1625,7 @@ internal static class WorkItemEndpoints
 
         if (body.AuditMaxIterations is { } auditMaxIterations)
         {
-            var auditMaxIterationsError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditMaxIterations);
+            var auditMaxIterationsError = WorkItemFieldRules.CheckAuditMaxIterations(auditMaxIterations);
             if (auditMaxIterationsError is not null)
                 return Results.BadRequest(new { error = auditMaxIterationsError });
             updated = updated with { AuditMaxIterations = auditMaxIterations, UpdatedAt = now };
@@ -1644,7 +1633,7 @@ internal static class WorkItemEndpoints
 
         if (body.AuditComplexity is not null)
         {
-            var (normalised, complexityErr) = AuditBudgetRequestValidation.NormaliseAuditComplexity(body.AuditComplexity);
+            var (normalised, complexityErr) = WorkItemFieldRules.NormalizeAuditComplexity(body.AuditComplexity);
             if (complexityErr is not null) return Results.BadRequest(new { error = complexityErr });
             updated = updated with { AuditComplexity = normalised, UpdatedAt = now };
         }
@@ -1837,8 +1826,8 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         CancellationToken ct)
     {
-        if (rawDeps.Length > 100)
-            return (Results.BadRequest(new { error = "dependsOn must contain at most 100 entries" }), null);
+        if (WorkItemFieldRules.CheckDependsOnCount(rawDeps.Length) is { } depsCountError)
+            return (Results.BadRequest(new { error = depsCountError }), null);
 
         var allItems = new List<WorkItem>();
         await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
@@ -1871,7 +1860,7 @@ internal static class WorkItemEndpoints
                 if (!byNamespacedExternalId.TryGetValue((depNs, depValue), out var depByNs))
                     return (Results.BadRequest(new
                     {
-                        error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{depValue}' in namespace '{depNs}' in project '{projectId}'",
+                        error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(depValue)}' in namespace '{depNs}' in project '{projectId}'",
                     }), null);
                 dependsOnIds.Add(depByNs.Id);
                 continue;
@@ -1879,13 +1868,13 @@ internal static class WorkItemEndpoints
             if (!byBareExternalId.TryGetValue(rawId, out var matches) || matches.Count == 0)
                 return (Results.BadRequest(new
                 {
-                    error = $"dependency '{rawId}' could not be resolved: no work item with externalId '{rawId}' in project '{projectId}'",
+                    error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(rawId)}' in project '{projectId}'",
                 }), null);
             var distinctItems = matches.Select(m => m.Item.Id).Distinct().ToList();
             if (distinctItems.Count > 1)
                 return (Results.BadRequest(new
                 {
-                    error = $"dependency '{rawId}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} — qualify as 'namespace:value'",
+                    error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} — qualify as 'namespace:value'",
                 }), null);
             dependsOnIds.Add(distinctItems[0]);
         }
@@ -1946,20 +1935,23 @@ internal static class WorkItemEndpoints
 
         foreach (var (ns, value) in body.ExternalIds)
         {
-            try { Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{ns}'"); }
+            // ns is untrusted input echoed into the error field label — strip
+            // control characters and bound it before interpolating.
+            var nsLabel = Validation.DescribeUntrustedValue(ns);
+            try { Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{nsLabel}'"); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
             if (value is null)
             {
                 resulting.Remove(ns);
                 continue;
             }
-            try { Validation.ValidateExternalId(value, $"externalIds['{ns}']"); }
+            try { Validation.ValidateExternalId(value, $"externalIds['{nsLabel}']"); }
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
             resulting[ns] = value;
         }
 
-        if (resulting.Count > 16)
-            return Results.BadRequest(new { error = "externalIds may contain at most 16 entries per work item" });
+        if (resulting.Count > WorkItemLimits.MaxExternalIds)
+            return Results.BadRequest(new { error = $"externalIds may contain at most {WorkItemLimits.MaxExternalIds} entries per work item" });
 
         // Pre-check for conflicts on namespaced IDs newly assigned to this item
         // (additions and changed values). We don't pre-check unchanged entries —
@@ -2027,15 +2019,16 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         CancellationToken ct)
     {
-        if (body is null || string.IsNullOrEmpty(body.Prompt))
+        if (body is null)
             return Results.BadRequest(new { error = "prompt is required" });
-        if (body.Prompt.Length > 64 * 1024)
-            return Results.BadRequest(new { error = "prompt must be <= 64KB" });
+        var (newPrompt, promptError) = WorkItemFieldRules.NormalizePrompt(body.Prompt);
+        if (promptError is not null)
+            return Results.BadRequest(new { error = promptError });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var result = await store.TryReplacePromptAsync(item!.Id, body.Prompt, DateTimeOffset.UtcNow, ct);
+        var result = await store.TryReplacePromptAsync(item!.Id, newPrompt!, DateTimeOffset.UtcNow, ct);
         return result.Outcome switch
         {
             PromptReplaceOutcome.NotFound => Results.NotFound(new { error = $"work item '{id}' no longer exists" }),
@@ -2140,7 +2133,7 @@ internal static class WorkItemEndpoints
         foreach (var raw in rawIds)
         {
             if (!Guid.TryParse(raw, out var g))
-                return Results.BadRequest(new { error = $"'{raw}' is not a valid work item id" });
+                return Results.BadRequest(new { error = $"'{Validation.DescribeUntrustedValue(raw)}' is not a valid work item id" });
             parsedIds.Add(new WorkItemId(g));
         }
 
@@ -2199,9 +2192,6 @@ internal static class WorkItemEndpoints
         });
     }
 
-    /// <summary>Maximum length of a queue pause/drain reason (characters).</summary>
-    public const int MaxQueueReasonLength = 500;
-
     /// <summary>Minimum drain wait (seconds) accepted by the drain endpoint.</summary>
     public const int MinDrainTimeoutSeconds = 1;
 
@@ -2211,18 +2201,13 @@ internal static class WorkItemEndpoints
     /// <summary>
     /// Shared required-reason guard for the queue pause/drain endpoints: the
     /// reason must be present, contain no control characters, and fit within
-    /// <see cref="MaxQueueReasonLength"/> characters. Returns a BadRequest
-    /// result when invalid, null when the reason is acceptable.
+    /// <see cref="AgentPauseValidation.MaxReasonLength"/> characters. Returns a
+    /// BadRequest result when invalid, null when the reason is acceptable.
     /// </summary>
     private static IResult? ValidateQueueReason(string? reason)
     {
-        if (string.IsNullOrWhiteSpace(reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (reason.Any(char.IsControl))
-            return Results.BadRequest(new { error = "reason must not contain control characters" });
-        if (reason.Length > MaxQueueReasonLength)
-            return Results.BadRequest(new { error = $"reason must be <= {MaxQueueReasonLength} chars" });
-        return null;
+        var error = AgentPauseValidation.ValidateRequiredReason(reason, "reason");
+        return error is null ? null : Results.BadRequest(new { error });
     }
 
     private static async Task<IResult> PauseQueueAsync(
@@ -2460,10 +2445,8 @@ internal static class WorkItemEndpoints
             return Results.BadRequest(new { error = "questionId is required" });
         if (!System.Text.RegularExpressions.Regex.IsMatch(req.QuestionId, @"^[a-zA-Z0-9_-]{1,64}$"))
             return Results.BadRequest(new { error = "questionId must be 1-64 alphanumeric/hyphen/underscore characters" });
-        if (string.IsNullOrWhiteSpace(req.Reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (req.Reason.Length > 500)
-            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        if (AgentPauseValidation.ValidateRequiredReason(req.Reason, "reason") is { } reasonError)
+            return Results.BadRequest(new { error = reasonError });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
@@ -2841,46 +2824,6 @@ internal static class WorkItemEndpoints
                 grant.IsImplicit)).ToList());
     }
 
-    private const int GlobalMinPriority = -1000;
-    private const int GlobalMaxPriority = 1000;
-    private const int MaxRequiredCapabilities = 16;
-    private const int MaxCapabilityLength = 64;
-
-    /// <summary>
-    /// Normalises and validates a caller-supplied list of required-capability
-    /// tags. Returns the normalised list, or null + error result on failure.
-    /// Trims whitespace, drops empties, de-duplicates case-insensitively.
-    /// </summary>
-    private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(
-        IReadOnlyList<string> raw)
-    {
-        if (raw.Count > MaxRequiredCapabilities)
-            return (null, Results.BadRequest(new
-            {
-                error = $"requiredCapabilities may contain at most {MaxRequiredCapabilities} entries",
-            }));
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var result = new List<string>();
-        foreach (var entry in raw)
-        {
-            if (entry is null) continue;
-            var tag = entry.Trim();
-            if (tag.Length == 0) continue;
-            if (tag.Length > MaxCapabilityLength)
-                return (null, Results.BadRequest(new
-                {
-                    error = $"requiredCapabilities entry '{tag}' exceeds {MaxCapabilityLength} chars",
-                }));
-            if (tag.Any(char.IsControl))
-                return (null, Results.BadRequest(new
-                {
-                    error = "requiredCapabilities entries must not contain control characters",
-                }));
-            if (seen.Add(tag)) result.Add(tag);
-        }
-        return (result, null);
-    }
-
     private static AgentControlDto? ToAgentControlDto(AgentControlSpec? spec) =>
         spec is null
             ? null
@@ -2902,17 +2845,9 @@ internal static class WorkItemEndpoints
     /// </summary>
     private static IResult? ValidatePriority(int priority, Project project)
     {
-        if (priority < GlobalMinPriority || priority > GlobalMaxPriority)
-            return Results.BadRequest(new
-            {
-                error = $"priority must be within [{GlobalMinPriority}, {GlobalMaxPriority}]",
-            });
-        if (project.MaxPriority is { } maxPriority && priority > maxPriority)
-            return Results.BadRequest(new
-            {
-                error = $"priority {priority} exceeds project '{project.Id}' max priority {maxPriority}",
-            });
-        return null;
+        var error = WorkItemFieldRules.CheckPriorityBounds(priority)
+            ?? WorkItemFieldRules.CheckProjectPriorityCeiling(priority, project);
+        return error is null ? null : Results.BadRequest(new { error });
     }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)
@@ -3173,7 +3108,7 @@ public sealed record PauseQueueRequest(string Reason = "");
 /// <summary>
 /// Pause-and-wait drain request. <c>Reason</c> follows the shared queue-reason
 /// guard (required, no control characters, at most
-/// <c>WorkItemEndpoints.MaxQueueReasonLength</c> characters).
+/// <c>AgentPauseValidation.MaxReasonLength</c> characters).
 /// <c>TimeoutSeconds</c> bounds how long the endpoint waits for in-flight work
 /// to reach a safe boundary (<c>WorkItemEndpoints.MinDrainTimeoutSeconds</c> to
 /// <c>WorkItemEndpoints.MaxDrainTimeoutSeconds</c>); on expiry the endpoint

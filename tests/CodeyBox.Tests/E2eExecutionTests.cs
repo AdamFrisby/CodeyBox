@@ -1709,8 +1709,11 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
         await provider.ExecStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.True(registry.Cancel(runId));
+        // Same order as the cancel endpoint: mark the record first, then signal
+        // the in-flight replay. Reversing these lets the dispatcher's own
+        // cancellation persist race the store update for the write lock.
         Assert.True(await _runs.CancelAsync(runId));
+        Assert.True(registry.Cancel(runId));
 
         var terminal = await WaitForRunStatusAsync(runId, E2eRunStatus.Canceled);
         await WaitForDispatcherIdleAsync(dispatcher);

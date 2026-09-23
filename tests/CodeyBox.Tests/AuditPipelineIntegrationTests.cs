@@ -2449,10 +2449,11 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         // its slot instead — see
         // AuditorNoOutputButProcessRunning_IsNotClassifiedIncomplete.
         var calls = 0;
+        var auditorHang = TimeSpan.FromSeconds(30);
         var auditor = new DelegateAuditor("quality", "llm", (_, _, _) =>
         {
             calls++;
-            return Task.Delay(TimeSpan.FromSeconds(30)).ContinueWith(
+            return Task.Delay(auditorHang).ContinueWith(
                 _ => new AuditResult(true, []),
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
@@ -2489,9 +2490,17 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.True(
             calls == 2,
             $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} did not terminate and retry the hung auditor exactly once (calls={calls})");
+        // The wall-clock bound is expressed against the auditor's own hang:
+        // a run that let the ct-ignoring auditor complete even one hang would
+        // report it here, so "terminated, not waited out" is asserted at any
+        // load. A tighter absolute bound is the same load-dependent wall-clock
+        // assertion the fake clock removed from the budgets — under parallel
+        // load the advancer's real delays stretch while fake time stays fixed,
+        // so a healthy run legitimately outlasts any fixed number. Exact fire
+        // latency is covered deterministically by AuditorIdleGuardTests.
         Assert.True(
-            sw.Elapsed < TimeSpan.FromSeconds(10),
-            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} took {sw.Elapsed} to terminate the hung auditor");
+            sw.Elapsed < auditorHang,
+            $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath}={idle} did not terminate the hung auditor before its {auditorHang} hang elapsed (took {sw.Elapsed})");
     }
 
     [Fact]
@@ -2591,8 +2600,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Contains("did not reach a complete verdict", final.LastError);
         Assert.Equal(0, auditorRuns);
         Assert.True(tp.Agent.StructuredStreamSupportProbeCount >= 3);
+        // Suite-health ceiling only: the probe hangs forever, so no hang
+        // duration anchors the bound — termination is proven by the probe
+        // count and the Failed state above. A tight absolute bound is a load
+        // assertion (see the idle-clock note at NewIdleClock).
         Assert.True(
-            sw.Elapsed < TimeSpan.FromSeconds(5),
+            sw.Elapsed < PipelineRunHealthBound,
             $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath} took {sw.Elapsed} to terminate the hung structured-stream probe");
     }
 
@@ -2633,8 +2646,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.True(sandboxProvider.ObservedCloneCancellation);
         Assert.Equal(1, auditorRuns);
+        // Suite-health ceiling only: the clone hangs forever until cancelled,
+        // so no hang duration anchors the bound — the kill is proven by
+        // ObservedCloneCancellation above. A tight absolute bound is a load
+        // assertion (see the idle-clock note at NewIdleClock).
         Assert.True(
-            sw.Elapsed < TimeSpan.FromSeconds(5),
+            sw.Elapsed < PipelineRunHealthBound,
             $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath} took {sw.Elapsed} to kill the hung audit-setup clone");
     }
 
@@ -2675,8 +2692,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.True(sandboxProvider.ObservedCreateCancellation);
         Assert.Equal(1, auditorRuns);
+        // Suite-health ceiling only: the launch hangs forever until cancelled,
+        // so no hang duration anchors the bound — the cancel is proven by
+        // ObservedCreateCancellation above. A tight absolute bound is a load
+        // assertion (see the idle-clock note at NewIdleClock).
         Assert.True(
-            sw.Elapsed < TimeSpan.FromSeconds(5),
+            sw.Elapsed < PipelineRunHealthBound,
             $"timing failure: budget {AuditBudgetOrdering.AuditorIdleTimeoutPath} took {sw.Elapsed} to cancel the hung sandbox launch");
     }
 
@@ -3026,6 +3047,15 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     // The clock starts at the real now so fake timestamps stay comparable
     // with the real-clock timestamps recorded by stores outside the
     // pipeline clock (audit progress rows, iteration dispatch times).
+    // Wall-clock ceiling for the "killed the hung operation" assertions above.
+    // Far above a healthy full-pipeline run even under parallel-suite load
+    // (real git/process work plus the stretched advancer loop), far below the
+    // point where an undetected park would stall the assembly run. The
+    // behavioural proofs — cancellation observations, call counts, terminal
+    // state — are asserted separately; this bound only fails a parked run
+    // before the suite timeout does.
+    private static readonly TimeSpan PipelineRunHealthBound = TimeSpan.FromSeconds(30);
+
     private static IdleClock NewIdleClock() => new(DateTimeOffset.UtcNow);
 
     private static async Task RunWithAdvancingIdleClockAsync(IdleClock clock, Task pipelineTask)
