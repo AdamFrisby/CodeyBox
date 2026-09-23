@@ -1,4 +1,5 @@
 using System.Text;
+using CodeyBox.Core;
 
 namespace CodeyBox.Notifications;
 
@@ -36,7 +37,7 @@ public sealed class HmacInteractionVerifier : InteractionVerifierBase
 
         var signatureHeader = Options?.SignatureHeader;
         if (string.IsNullOrWhiteSpace(signatureHeader))
-            signatureHeader = "X-CodeyBox-Signature";
+            signatureHeader = InteractionContract.DefaultSignatureHeader;
         var timestampHeader = Options?.TimestampHeader;
         if (string.IsNullOrWhiteSpace(timestampHeader))
             timestampHeader = "X-CodeyBox-Timestamp";

@@ -22,9 +22,11 @@ public sealed record InteractionVerificationResult
 
 /// <summary>
 /// Verifies that an inbound interaction genuinely came from the claimed
-/// platform. Implementations check the signature over the raw body bytes
-/// plus the sender timestamp for replay protection. Secrets resolve from
-/// the environment (never from config values).
+/// platform. Implementations check a signature over the raw body bytes;
+/// schemes whose platform signs a sender timestamp (hmac-sha256, slack-v0)
+/// also enforce the replay window, while schemes without one (ntfy-hmac)
+/// leave replay rejection to the endpoint's dedup and state checks.
+/// Secrets resolve from the environment (never from config values).
 /// </summary>
 public interface IInteractionVerifier
 {

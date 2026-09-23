@@ -2,7 +2,7 @@ namespace CodeyBox.Notifications;
 
 /// <summary>
 /// Hot-reloadable options for the generic inbound interaction endpoint
-/// (<c>POST /interactions/{provider}</c>). Bound from
+/// (<c>POST /webhooks/interactions/{provider}</c>). Bound from
 /// <c>CodeyBox:Notifications:Interactions</c>. Disabled by default so a
 /// deployment using only outbound providers is never forced to expose or
 /// configure an inbound path.
@@ -30,11 +30,15 @@ public sealed class InteractionsOptions
 /// </summary>
 public sealed class InteractionProviderOptions
 {
-    /// <summary>Provider name as it appears in <c>/interactions/{provider}</c>.
+    /// <summary>Provider name as it appears in
+    /// <c>/webhooks/interactions/{provider}</c>.
     /// Matched exactly (case-insensitive); unknown names are refused.</summary>
     public string Provider { get; set; } = string.Empty;
 
-    /// <summary>Verification scheme: "hmac-sha256" (generic) or "slack-v0".</summary>
+    /// <summary>Verification scheme: "hmac-sha256" (generic), "slack-v0"
+    /// (Slack platform signatures), or "ntfy-hmac" (publish-time MAC over the
+    /// exact callback body — ntfy clients invoke the URL themselves, so there
+    /// is no platform signature or sender timestamp).</summary>
     public string Scheme { get; set; } = "hmac-sha256";
 
     /// <summary>Environment variable holding the provider signing secret.
@@ -42,7 +46,9 @@ public sealed class InteractionProviderOptions
     public string? SigningSecretEnvVar { get; set; }
 
     /// <summary>Request header carrying the signature. Defaults per scheme
-    /// (<c>X-CodeyBox-Signature</c>, or <c>X-Slack-Signature</c> for slack-v0).</summary>
+    /// (<c>X-CodeyBox-Signature</c>, or <c>X-Slack-Signature</c> for slack-v0).
+    /// Has no effect on <c>ntfy-hmac</c>: the provider mints buttons with the
+    /// contract header, so that verifier always reads it.</summary>
     public string? SignatureHeader { get; set; }
 
     /// <summary>Request header carrying the sender timestamp used for replay

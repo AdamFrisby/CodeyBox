@@ -75,6 +75,7 @@
     <Project Path="plugins/upstream/CodeyBox.ForgejoUpstreamPlugin/CodeyBox.ForgejoUpstreamPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.SlackPlugin/CodeyBox.SlackPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.GotifyPlugin/CodeyBox.GotifyPlugin.csproj" />
+    <Project Path="plugins/notifications/CodeyBox.NtfyPlugin/CodeyBox.NtfyPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
