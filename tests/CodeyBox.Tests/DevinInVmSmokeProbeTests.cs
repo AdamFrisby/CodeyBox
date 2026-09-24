@@ -6,7 +6,7 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Tests for <see cref="DevinInVmSmokeProbe"/>: the step list must track the
 /// runner's real dispatch contract (binary check always; auth materialisation
-/// + authenticated <c>models list</c> + a real print-mode turn only when the
+/// + authenticated <c>models list</c> + a real ACP turn only when the
 /// credential bundle carries the auth TOML).
 /// </summary>
 public sealed class DevinInVmSmokeProbeTests
@@ -63,14 +63,19 @@ public sealed class DevinInVmSmokeProbeTests
         // `auth status` would pass even logged out, so it is not the check.
         Assert.Equal(["devin", "models", "list", "--format", "json"], steps[2].Argv.ToArray());
 
-        // The turn exercises the same permission/trust contract as dispatch AND
-        // the same prompt delivery: the probe runs the runner's own wrapper
-        // script, so a prompt the CLI cannot open fails the probe too.
+        // The turn exercises the same ACP contract as dispatch AND the same
+        // framed-stdin delivery: the probe runs the runner's own wrapper
+        // script and stdin frame, so a prompt the shim cannot read fails the
+        // probe too.
         Assert.Equal(
-            ["bash", "-c", DevinAgentRunner.BuildPromptFileScript(
-                DevinAgentRunner.FullAutonomyInvocationPrefix(DevinAgentRunner.DefaultBinary))],
+            ["bash", "-c", DevinAgentRunner.BuildAcpDispatchScript(
+                DevinAgentRunner.AcpShimArgs(
+                    DevinAgentRunner.DefaultBinary,
+                    modelId: null,
+                    DevinAgentRunner.FullAutonomyAcpMode))],
             steps[3].Argv.ToArray());
         Assert.DoesNotContain("/dev/stdin", steps[3].Argv[2], StringComparison.Ordinal);
         Assert.NotNull(steps[3].Stdin);
+        Assert.EndsWith("Reply with the single word: OK", steps[3].Stdin);
     }
 }

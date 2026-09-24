@@ -1,14 +1,16 @@
 using System.Text.Json;
+using CodeyBox.Agents;
 using CodeyBox.Agents.Devin;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Pins <see cref="DevinStreamParser"/>'s claim discipline: devin print mode
-/// emits plaintext only (no stream-json exists in devin 3000.11.1), so the
-/// parser must never claim a shape — mis-tagging another agent's NDJSON would
-/// corrupt stream attribution.
+/// Pins <see cref="DevinStreamParser"/>'s claim discipline and event mapping
+/// for the <c>devin.acp</c> NDJSON envelopes the dispatch shim emits:
+/// envelope lines are claimed (they are CodeyBox's own shape), foreign JSON
+/// is never claimed, and session_update / turn_complete envelopes map to
+/// tool calls, assistant chunks, token totals, and the final message.
 /// </summary>
 public sealed class DevinStreamParserTests
 {
@@ -20,10 +22,18 @@ public sealed class DevinStreamParserTests
     [InlineData("""{"type":"assistant","message":"hi"}""")]
     [InlineData("""{"type":"result","result":"done"}""")]
     [InlineData("""{}""")]
-    public void TryClaim_AnyJsonShape_NeverClaimed(string line)
+    [InlineData("""{"type":"devin.acpish","event":"session_update"}""")]
+    public void TryClaim_ForeignJsonShape_NeverClaimed(string line)
     {
         using var doc = JsonDocument.Parse(line);
         Assert.False(new DevinStreamParser().TryClaim(doc.RootElement));
+    }
+
+    [Fact]
+    public void TryClaim_DevinAcpEnvelope_Claimed()
+    {
+        using var doc = JsonDocument.Parse("""{"type":"devin.acp","event":"session_started","sessionId":"s-1"}""");
+        Assert.True(new DevinStreamParser().TryClaim(doc.RootElement));
     }
 
     [Fact]
@@ -33,5 +43,73 @@ public sealed class DevinStreamParserTests
         Assert.True(parser.CanEmitShapeOf(AgentKind.Devin));
         Assert.False(parser.CanEmitShapeOf(AgentKind.Cursor));
         Assert.False(parser.CanEmitShapeOf(AgentKind.Claude));
+    }
+
+    [Fact]
+    public async Task ParseAsync_ToolCallLifecycle_ProducesCompletedToolInvocation()
+    {
+        var stream = StreamOf(
+            """{"type":"devin.acp","event":"session_started","sessionId":"s-1"}""",
+            """{"type":"devin.acp","event":"session_update","sessionId":"s-1","update":{"sessionUpdate":"tool_call","toolCallId":"exec:0#abc","title":"Ran dotnet test","kind":"execute"}}""",
+            """{"type":"devin.acp","event":"session_update","sessionId":"s-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#abc","status":"in_progress"}}""",
+            """{"type":"devin.acp","event":"session_update","sessionId":"s-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#abc","status":"completed"}}""",
+            """{"type":"devin.acp","event":"turn_complete","stopReason":"end_turn","usage":{"inputTokens":11,"outputTokens":7},"finalText":"DONE"}""");
+
+        var summary = await new DevinStreamParser().ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("exec:0#abc", tool.ToolUseId);
+        Assert.Equal("Ran dotnet test", tool.ToolName);
+        Assert.True(tool.Succeeded);
+        Assert.Equal(11, summary.InputTokens);
+        Assert.Equal(7, summary.OutputTokens);
+        Assert.Equal("DONE", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_FailedToolCallUpdate_MarksToolUnsuccessful()
+    {
+        var stream = StreamOf(
+            """{"type":"devin.acp","event":"session_update","sessionId":"s-1","update":{"sessionUpdate":"tool_call","toolCallId":"t-1","title":"Ran bash","kind":"execute"}}""",
+            """{"type":"devin.acp","event":"session_update","sessionId":"s-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t-1","status":"failed"}}""",
+            """{"type":"devin.acp","event":"turn_complete","stopReason":"end_turn"}""");
+
+        var summary = await new DevinStreamParser().ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.False(tool.Succeeded);
+    }
+
+    [Fact]
+    public async Task ParseAsync_UsageUpdateMeta_FeedsTokenTotals()
+    {
+        var stream = StreamOf(
+            """{"type":"devin.acp","event":"session_update","sessionId":"s-1","update":{"sessionUpdate":"usage_update","used":100,"size":200,"_meta":{"cognition.ai/inputTokens":50,"cognition.ai/outputTokens":9,"cognition.ai/cachedReadTokens":4}}}""",
+            """{"type":"devin.acp","event":"turn_complete","stopReason":"end_turn"}""");
+
+        var summary = await new DevinStreamParser().ParseAsync(stream);
+
+        Assert.Equal(50, summary.InputTokens);
+        Assert.Equal(9, summary.OutputTokens);
+        Assert.Equal(4, summary.CachedInputTokens);
+    }
+
+    [Fact]
+    public async Task ParseAsync_EmptyStream_IsUnsupported()
+    {
+        var summary = await new DevinStreamParser().ParseAsync(StreamOf());
+        Assert.True(summary.IsUnsupported);
+    }
+
+    private static MemoryStream StreamOf(params string[] lines)
+    {
+        var stream = new MemoryStream();
+        using var writer = new StreamWriter(stream, leaveOpen: true);
+        foreach (var line in lines)
+            writer.WriteLine(line);
+        writer.Flush();
+        stream.Position = 0;
+        return stream;
     }
 }

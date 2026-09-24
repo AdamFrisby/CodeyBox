@@ -13,9 +13,10 @@ namespace CodeyBox.Agents.Devin;
 ///   the credentials file landed where the CLI reads it AND the api_server_url
 ///   inside is reachable. <c>devin auth status</c> is deliberately NOT the
 ///   check: it prints "Not logged in." and still exits 0.</item>
-///   <item>a real print-mode turn using the exact dispatch argv
-///   (<see cref="DevinAgentRunner.FullAutonomyInvocationPrefix"/>) so the
-///   workspace-trust and permission-mode contract is exercised end to end.</item>
+///   <item>a real ACP turn using the exact dispatch wrapper
+///   (<see cref="DevinAgentRunner.BuildAcpDispatchScript"/> +
+///   <see cref="DevinAcpShim.BuildDispatchStdin"/>) so the shim delivery,
+///   prompt-file, and session-mode contract is exercised end to end.</item>
 /// </list>
 ///
 /// <para>When the auth credential is absent — no credential bundle, or one
@@ -47,13 +48,18 @@ public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
             steps.Add(new(
                 [DevinAgentRunner.DefaultBinary, "models", "list", "--format", "json"],
                 FailureHint: "devin models list failed (credentials path drift or invalid token)"));
-            // Runs through the runner's own prompt-file wrapper, so the probe
-            // fails whenever a real dispatch would fail to deliver its prompt.
+            // Runs through the runner's own ACP dispatch wrapper and framed
+            // stdin, so the probe fails whenever a real dispatch would fail:
+            // shim decode, prompt-file delivery, handshake, and the
+            // full-autonomy session mode all exercise the production path.
             steps.Add(new(
-                ["bash", "-c", DevinAgentRunner.BuildPromptFileScript(
-                    DevinAgentRunner.FullAutonomyInvocationPrefix(DevinAgentRunner.DefaultBinary))],
-                Stdin: "Reply with the single word: OK",
-                FailureHint: "devin print-mode turn failed (prompt delivery, workspace-trust or permission-mode contract drift)"));
+                ["bash", "-c", DevinAgentRunner.BuildAcpDispatchScript(
+                    DevinAgentRunner.AcpShimArgs(
+                        DevinAgentRunner.DefaultBinary,
+                        modelId: null,
+                        DevinAgentRunner.FullAutonomyAcpMode))],
+                Stdin: DevinAcpShim.BuildDispatchStdin("Reply with the single word: OK"),
+                FailureHint: "devin acp turn failed (shim delivery, prompt-file, handshake or session-mode contract drift)"));
         }
 
         return steps;

@@ -5,12 +5,16 @@ using CodeyBox.Sandbox;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Tests for <see cref="DevinAgentRunner"/>. Argv pins encode the transport
-/// decision verified against devin 3000.11.1: <c>devin -p --permission-mode
-/// dangerous --respect-workspace-trust false --prompt-file /dev/stdin</c> with
-/// the prompt on stdin (bare <c>-p</c> ignores piped stdin; MAX_ARG_STRLEN
-/// caps positional prompts), <c>--model</c> only when a model is configured,
-/// and the credentials.toml contents materialised in-guest from
+/// Tests for <see cref="DevinAgentRunner"/>. Dispatch argv pins encode the
+/// transport decision verified against devin 3000.11.1: <c>devin acp</c>
+/// driven by the embedded Python shim (<c>initialize</c> →
+/// <c>session/new</c> → <c>session/set_mode bypass</c> →
+/// <c>session/prompt</c>) so <c>session/update</c> notifications keep the
+/// agent stream advancing during long turns. The shim + prompt travel on
+/// stdin as a framed payload (base64 shim, end marker, verbatim prompt) —
+/// never in argv or the environment (<c>MAX_ARG_STRLEN</c> is 128 KiB per
+/// element). <c>--model</c> only when a model is configured, and the
+/// credentials.toml contents materialised in-guest from
 /// <c>CODEYBOX_DEVIN_AUTH_TOML</c>.
 /// </summary>
 public sealed class DevinAgentRunnerTests
@@ -26,18 +30,22 @@ public sealed class DevinAgentRunnerTests
             new Dictionary<string, string> { [DevinAgentRunner.AuthTomlEnvironmentVariable] = toml },
             new Dictionary<string, string>());
 
+    private const string TurnCompleteStdout =
+        "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}\n"
+        + "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":11,\"outputTokens\":7},\"finalText\":\"done\"}\n";
+
     /// <summary>
     /// The devin dispatch exec. The CLI is wrapped in a bash script that
-    /// materialises the piped prompt into a temp file (see
-    /// <c>DevinAgentRunner.BuildPromptFileScript</c>), so the exec to find is
-    /// the one whose script declares that file — not the sibling bash exec
+    /// materialises the framed stdin into a per-run <c>mktemp</c> dir (see
+    /// <c>DevinAgentRunner.BuildAcpDispatchScript</c>), so the exec to find is
+    /// the one whose script declares that dir — not the sibling bash exec
     /// that materialises credentials.
     /// </summary>
     private static SandboxExec DevinExec(RecordingSandbox sandbox) =>
         Assert.Single(sandbox.Execs, e => e.Argv.Count == 3 && e.Argv[0] == "bash"
-            && e.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal));
+            && e.Argv[2].Contains("cb_dir=", StringComparison.Ordinal));
 
-    /// <summary>The devin command line the wrapper script ends with.</summary>
+    /// <summary>The shim command line the wrapper script ends with.</summary>
     private static string DevinCommandLine(RecordingSandbox sandbox) =>
         DevinExec(sandbox).Argv[2].Split('\n')[^1];
 
@@ -54,7 +62,7 @@ public sealed class DevinAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_Argv_IsPrintModeWithDangerousPermissions()
+    public async Task RunAsync_DispatchesAcpShim_WithBypassModeAndModel()
     {
         var sandbox = new RecordingSandbox();
         var runner = RunnerWithDefault();
@@ -62,17 +70,18 @@ public sealed class DevinAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "do the thing", Cred());
 
         Assert.Equal(
-            $"'devin' '-p' '--permission-mode' 'dangerous' '--respect-workspace-trust' 'false' "
-            + $"'--model' '{ConfiguredModel}' --prompt-file \"$cb_prompt\"",
+            $"python3 \"$cb_shim\" --prompt-file \"$cb_prompt\" '--binary' 'devin' "
+            + $"'--model' '{ConfiguredModel}' '--mode' 'bypass'",
             DevinCommandLine(sandbox));
     }
 
     [Fact]
-    public async Task RunAsync_Prompt_TravelsViaStdin_NotArgv()
+    public async Task RunAsync_Prompt_TravelsViaFramedStdin_NotArgv()
     {
         // Linux MAX_ARG_STRLEN is 128 KiB per element and applies to argv AND
-        // the environment, so neither can carry a rework prompt. The prompt is
-        // piped and `cat` writes it to the file the CLI opens.
+        // the environment, so neither can carry a rework prompt. The prompt
+        // is piped verbatim after the base64 shim + end-marker frame and
+        // `cat` writes it to the file the shim opens.
         var sandbox = new RecordingSandbox();
         var runner = RunnerWithDefault();
         const string prompt = "implement the widget with extra care";
@@ -80,7 +89,9 @@ public sealed class DevinAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", prompt, Cred());
 
         var devin = DevinExec(sandbox);
-        Assert.Equal(prompt, devin.Stdin);
+        Assert.NotNull(devin.Stdin);
+        Assert.EndsWith(prompt, devin.Stdin);
+        Assert.Contains(DevinAcpShim.StdinEndMarker, devin.Stdin, StringComparison.Ordinal);
         Assert.DoesNotContain(devin.Argv, a => a.Contains("widget", StringComparison.Ordinal));
         Assert.All(devin.ExtraEnvironment ?? new Dictionary<string, string>(),
             kv => Assert.DoesNotContain("widget", kv.Value, StringComparison.Ordinal));
@@ -102,7 +113,7 @@ public sealed class DevinAgentRunnerTests
         Assert.DoesNotContain("/dev/stdin", script, StringComparison.Ordinal);
         Assert.Contains("cat > \"$cb_prompt\"", script, StringComparison.Ordinal);
         Assert.Contains("umask 077", script, StringComparison.Ordinal);
-        Assert.Contains("trap 'rm -f \"$cb_prompt\"' EXIT INT TERM", script, StringComparison.Ordinal);
+        Assert.Contains("trap 'rm -rf \"$cb_dir\"' EXIT INT TERM", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -128,8 +139,7 @@ public sealed class DevinAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "x", Cred());
 
-        var argv = DevinExec(sandbox).Argv.ToList();
-        Assert.DoesNotContain("--model", argv);
+        Assert.DoesNotContain("--model", DevinCommandLine(sandbox), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -218,9 +228,70 @@ public sealed class DevinAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_AcpTurnErrorEnvelope_LiftsTypedTerminalDiagnostic()
+    {
+        // A session/prompt JSON-RPC error is the shim's typed failure shape;
+        // it must surface verbatim in TerminalDiagnostic rather than as a
+        // bare "agent exited 2".
+        var sandbox = new RecordingSandbox
+        {
+            DevinExitCode = 2,
+            DevinStderr = string.Empty,
+            DevinStdout = "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}\n"
+                + "{\"type\":\"devin.acp\",\"event\":\"turn_error\",\"code\":-32001,\"message\":\"usage limit reached\"}\n",
+        };
+        var runner = RunnerWithDefault();
+
+        var result = await runner.RunAsync(sandbox, "/work", "x", Cred());
+
+        Assert.False(result.Success);
+        Assert.NotNull(result.TerminalDiagnostic);
+        Assert.Contains("turn error", result.TerminalDiagnostic, StringComparison.Ordinal);
+        Assert.Contains("usage limit reached", result.TerminalDiagnostic, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunAsync_AcpFatalEnvelope_LiftsTypedTerminalDiagnostic()
+    {
+        var sandbox = new RecordingSandbox
+        {
+            DevinExitCode = 2,
+            DevinStderr = string.Empty,
+            DevinStdout = "{\"type\":\"devin.acp\",\"event\":\"fatal\",\"stage\":\"session/new\",\"message\":\"session refused\"}\n",
+        };
+        var runner = RunnerWithDefault();
+
+        var result = await runner.RunAsync(sandbox, "/work", "x", Cred());
+
+        Assert.False(result.Success);
+        Assert.NotNull(result.TerminalDiagnostic);
+        Assert.Contains("session/new", result.TerminalDiagnostic, StringComparison.Ordinal);
+        Assert.Contains("session refused", result.TerminalDiagnostic, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunAsync_ExitZeroWithoutTurnComplete_FailsHonestly()
+    {
+        // A zero exit with no terminal envelope means the run was cut short
+        // before the turn outcome was written — never report silent success.
+        var sandbox = new RecordingSandbox
+        {
+            DevinExitCode = 0,
+            DevinStderr = string.Empty,
+            DevinStdout = "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}\n",
+        };
+        var runner = RunnerWithDefault();
+
+        var result = await runner.RunAsync(sandbox, "/work", "x", Cred());
+
+        Assert.False(result.Success);
+        Assert.Contains("turn outcome", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task RunAsync_HealthyRun_LeavesTerminalDiagnosticNull()
     {
-        var sandbox = new RecordingSandbox { DevinStdout = "done\n", DevinStderr = string.Empty };
+        var sandbox = new RecordingSandbox { DevinStdout = TurnCompleteStdout, DevinStderr = string.Empty };
         var runner = RunnerWithDefault();
 
         var result = await runner.RunAsync(sandbox, "/work", "x", Cred());
@@ -257,24 +328,49 @@ public sealed class DevinAgentRunnerTests
     }
 
     [Fact]
+    public async Task SupportsStructuredStream_ProbesAcpSubcommand()
+    {
+        var sandbox = new RecordingSandbox();
+        var runner = new DevinAgentRunner();
+
+        Assert.True(await runner.SupportsStructuredStreamAsync(sandbox, CancellationToken.None));
+        Assert.Contains(sandbox.Execs, e =>
+            e.Argv.Count == 3 && e.Argv[0] == "devin" && e.Argv[1] == "acp" && e.Argv[2] == "--help");
+    }
+
+    [Fact]
+    public async Task SupportsStructuredStream_ReturnsFalse_WhenAcpUnavailable()
+    {
+        var sandbox = new RecordingSandbox { AcpHelpExitCode = 1 };
+        var runner = new DevinAgentRunner();
+
+        Assert.False(await runner.SupportsStructuredStreamAsync(sandbox, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task RunTextOnlyAsync_DispatchesInSandbox_WithoutDangerousMode()
     {
-        // Text-only omits --permission-mode so the CLI default (auto:
-        // read-only tools only) applies — the conservative shape for
-        // answering questions on untrusted resolver input.
+        // Text-only stays on print mode and omits --permission-mode (the CLI
+        // default `auto` auto-approves read-only tools only) — the
+        // conservative shape for answering questions on untrusted resolver
+        // input.
         var sandbox = new RecordingSandbox();
         var runner = RunnerWithDefault();
 
         var result = await runner.RunTextOnlyAsync("summarise", Cred(), sandbox: sandbox, workingDirectory: "/work");
 
         Assert.True(result.Success);
-        var command = DevinCommandLine(sandbox);
+        var textOnly = Assert.Single(sandbox.Execs, e => e.Argv.Count == 3 && e.Argv[0] == "bash"
+            && e.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal)
+            && !e.Argv[2].Contains("cb_dir=", StringComparison.Ordinal));
+        var command = textOnly.Argv[2].Split('\n')[^1];
         Assert.Equal(
             $"'devin' '-p' '--respect-workspace-trust' 'false' "
             + $"'--model' '{ConfiguredModel}' --prompt-file \"$cb_prompt\"",
             command);
         Assert.DoesNotContain("--permission-mode", command, StringComparison.Ordinal);
         Assert.DoesNotContain("dangerous", command, StringComparison.Ordinal);
+        Assert.DoesNotContain("bypass", command, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -321,8 +417,9 @@ public sealed class DevinAgentRunnerTests
     {
         public int MaterialiseExitCode { get; set; }
         public int DevinExitCode { get; set; }
-        public string DevinStdout { get; set; } = "stdout";
+        public string DevinStdout { get; set; } = TurnCompleteStdout;
         public string DevinStderr { get; set; } = "stderr";
+        public int AcpHelpExitCode { get; set; }
 
         public string Id => "fake-devin";
         public List<SandboxExec> Execs { get; } = [];
@@ -335,10 +432,14 @@ public sealed class DevinAgentRunnerTests
             {
                 return Task.FromResult(new SandboxExecResult(MaterialiseExitCode, "", "auth stderr"));
             }
-            // The dispatch exec is the prompt-file wrapper (bash -c <script>),
-            // not a bare `devin` argv — the script declares cb_prompt.
+            if (exec.Argv.Count == 3 && exec.Argv[0] == "devin" && exec.Argv[1] == "acp")
+            {
+                return Task.FromResult(new SandboxExecResult(AcpHelpExitCode, "acp help", ""));
+            }
+            // The dispatch exec is the framed-stdin wrapper (bash -c <script>),
+            // not a bare `devin` argv — the script declares cb_dir.
             if (exec.Argv.Count == 3 && exec.Argv[0] == "bash"
-                && exec.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal))
+                && exec.Argv[2].Contains("cb_dir=", StringComparison.Ordinal))
             {
                 return Task.FromResult(new SandboxExecResult(DevinExitCode, DevinStdout, DevinStderr));
             }

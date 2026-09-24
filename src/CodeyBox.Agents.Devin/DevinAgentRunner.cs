@@ -6,36 +6,58 @@ namespace CodeyBox.Agents.Devin;
 
 /// <summary>
 /// Drives the Devin CLI (binary <c>devin</c>, installed by
-/// <c>https://cli.devin.ai/install.sh</c>) in non-interactive print mode:
-/// <c>devin -p</c> with the prompt on stdin via
-/// <c>--prompt-file /dev/stdin</c>.
+/// <c>https://cli.devin.ai/install.sh</c>) over Agent Client Protocol:
+/// <c>devin acp</c> is a stdio JSON-RPC server (verified against devin
+/// 3000.11.1), so the dispatch exec runs an embedded Python 3 client shim
+/// (<see cref="DevinAcpShim"/>, <c>Resources/devin-acp-client.py</c>) that
+/// performs the <c>initialize</c> → <c>session/new</c> →
+/// <c>session/set_mode</c> → <c>session/prompt</c> handshake and folds every
+/// inbound ACP frame into a single-line <c>devin.acp</c> NDJSON envelope on
+/// stdout.
 ///
-/// <para><b>Transport decision (verified against devin 3000.11.1).</b>
-/// <c>-p/--print [&lt;PROMPT&gt;]</c> runs a single non-interactive session and
-/// exits. A bare <c>-p</c> does NOT read a piped prompt from stdin — verified
-/// live that stdin is ignored unless <c>--prompt-file /dev/stdin</c> is passed,
-/// which reads the pipe correctly. The prompt therefore travels on stdin via a
-/// prompt file rather than positional <c>-- &lt;prompt&gt;</c> argv: Linux's
-/// <c>MAX_ARG_STRLEN</c> is 128 KiB per argv element and rework prompts can
-/// exceed it (same constraint as opencode/aider). Print mode writes the
-/// assistant's answer as plain text on stdout — there is no stream-json flag —
-/// so no structured-stream capture is offered.</para>
+/// <para><b>Why ACP (verified against devin 3000.11.1).</b>
+/// <c>-p/--print</c> writes the assistant's answer as plain text only when
+/// the run ends — there is no incremental stream — so a long turn (e.g. a
+/// full test suite) never touched the agent-stream file and the
+/// worker-progress watchdog recycled live runs as stuck. ACP emits a
+/// <c>session/update</c> notification per tool call, message chunk, and
+/// usage tick; the shim flushes each as an envelope, so stream mtime
+/// advances for the life of the turn and a genuinely wedged run still
+/// stalls (and is recycled) exactly as before.</para>
 ///
-/// <para><b>Autonomy.</b> <c>--permission-mode</c> accepts
-/// <c>auto|accept-edits|smart|dangerous</c> (default <c>auto</c>, read-only
-/// tools only). A headless run has no human to approve anything, so the runner
-/// passes <c>dangerous</c> (auto-approves all tools) — the VM boundary is the
-/// security perimeter, matching <c>cursor --force</c> /
-/// <c>claude --dangerously-skip-permissions</c>.
-/// <c>--respect-workspace-trust false</c> is REQUIRED: print mode cannot show
-/// the workspace-trust prompt and fails outright in an untrusted directory
-/// (verified: exits nonzero with a trust error without it).</para>
+/// <para><b>Reuse note.</b> The repo's other ACP transport
+/// (<c>AcpClaudeTransport</c> + the NativeAOT <c>claude-acp-bridge</c>)
+/// impersonates an IDE WebSocket for <c>claude --ide</c>; it cannot speak
+/// to a stdio ACP server, so devin gets its own thin client — the two share
+/// only the framed-stdin payload delivery shape.</para>
 ///
-/// <para><b>Model selection.</b> <c>--model &lt;id&gt;</c> (or the
-/// <c>DEVIN_MODEL</c> env var) selects the model; when neither is configured
-/// the CLI uses the account's server-side default. The runner passes the
-/// member's <c>ModelId</c>, else the config-sourced
-/// <see cref="DefaultModelId"/>, else omits the flag.</para>
+/// <para><b>Autonomy.</b> ACP sessions expose modes
+/// (<c>accept-edits|smart|ask|plan|bypass</c>); the global
+/// <c>--permission-mode</c> flag does NOT apply to <c>devin acp</c>
+/// sessions (verified: the session still opens in <c>accept-edits</c>), so
+/// the shim issues <c>session/set_mode bypass</c> before the prompt — the
+/// ACP equivalent of print mode's <c>--permission-mode dangerous</c>,
+/// matching <c>cursor --force</c> /
+/// <c>claude --dangerously-skip-permissions</c>: a headless run has no human
+/// to approve tools and the VM boundary is the security perimeter.
+/// <c>session/request_permission</c> requests that still arrive are
+/// answered with the most durable allow option as a defence in depth.</para>
+///
+/// <para><b>Model selection.</b> <c>devin acp --model &lt;id&gt;</c> pins
+/// the session model, exactly like print mode's <c>--model</c>. The runner
+/// passes the member's <c>ModelId</c>, else the config-sourced
+/// <see cref="DefaultModelId"/>, else omits the flag (account server-side
+/// default). The shim scrubs <c>DEVIN_REFUSAL_FALLBACK</c> from the child
+/// environment: that variable switches refused requests to OTHER Devin
+/// models, which are paid — a dispatch must never drift off the configured
+/// model.</para>
+///
+/// <para><b>Prompt delivery.</b> The prompt travels on stdin after the
+/// base64 shim block and is piped into a <c>mktemp</c> file the shim reads;
+/// it never enters argv or the environment (<c>MAX_ARG_STRLEN</c> is 128 KiB
+/// per element and rework prompts exceed it — same constraint as
+/// opencode/aider, and the reason positional <c>-- &lt;prompt&gt;</c> argv
+/// is not used).</para>
 ///
 /// <para><b>Auth.</b> The CLI reads <c>~/.local/share/devin/credentials.toml</c>
 /// (XDG data dir) written by <c>devin auth login</c>/<c>auth import</c>; there
@@ -46,17 +68,16 @@ namespace CodeyBox.Agents.Devin;
 /// absent this is a no-op and image-provisioned auth applies.</para>
 ///
 /// <para><b>Sessions.</b> The CLI persists sessions in a sqlite database at
-/// <c>~/.local/share/devin/cli/sessions.db</c>; <c>-c</c>/<c>-r</c> resume them.
-/// The scratchpad allowlist captures the database (and its WAL/SHM siblings)
-/// so a preempted/turn-checkpointed sandbox keeps session state, but the
-/// resume hook is not wired: <c>-c</c> combined with <c>-p</c> is unverified,
-/// so a restored run re-dispatches fresh like the other file-state agents.
-/// Terminal failures are surfaced on stderr as <c>Error: …</c> lines (verified:
-/// "Error: Not logged in", auth/ACP failures); <see cref="RunAsync"/> lifts the
-/// first such line into <see cref="AgentResult.TerminalDiagnostic"/> so the
-/// pipeline parks quota/auth failures instead of dead-lettering them.</para>
+/// <c>~/.local/share/devin/cli/sessions.db</c>; ACP advertises
+/// <c>loadSession</c> but the resume hook is not wired — a restored run
+/// re-dispatches fresh like the other file-state agents. Terminal failures
+/// surface either as shim <c>turn_error</c>/<c>fatal</c> envelopes
+/// (<see cref="DevinAcpOutcome"/>) or as <c>Error: …</c> lines on stderr
+/// (<see cref="DevinTerminalDiagnoser"/>); <see cref="RunAsync"/> lifts the
+/// first into <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline
+/// parks quota/auth failures instead of dead-lettering them.</para>
 /// </summary>
-public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IStructuredStreamAgentRunner
 {
     /// <summary>
     /// Sandbox environment variable carrying the Devin credentials.toml
@@ -97,10 +118,20 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     public string Binary { get; init; } = DefaultBinary;
 
     /// <summary>
-    /// Default model passed to <c>--model</c> when no per-item override is
-    /// provided. Sourced live from <see cref="AgentDefaultsSnapshot"/> (config
-    /// key <c>CodeyBox:AgentDefaults[devin]</c>). When neither is set the flag
-    /// is omitted and the account's server-side default applies.
+    /// ACP session mode applied via <c>session/set_mode</c> for full-autonomy
+    /// workspace dispatches — the ACP equivalent of print mode's
+    /// <c>--permission-mode dangerous</c> (verified against devin 3000.11.1:
+    /// <c>bypass</c> is the CLI's "Bypass Permissions" mode and auto-approves
+    /// all tools).
+    /// </summary>
+    public const string FullAutonomyAcpMode = "bypass";
+
+    /// <summary>
+    /// Default model passed to <c>devin acp --model</c> when no per-item
+    /// override is provided. Sourced live from
+    /// <see cref="AgentDefaultsSnapshot"/> (config key
+    /// <c>CodeyBox:AgentDefaults[devin]</c>). When neither is set the flag is
+    /// omitted and the account's server-side default applies.
     /// </summary>
     public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
@@ -129,6 +160,25 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
 
     protected override string PreemptProcessPattern => Binary;
 
+    /// <summary>
+    /// Structured-stream capability probe: the runner's only dispatch
+    /// transport is <c>devin acp</c>, whose session-update envelopes ARE the
+    /// structured stream. <c>devin acp --help</c> exits 0 on builds that ship
+    /// the subcommand (3000.11.1 onward); older CLIs fail the probe and the
+    /// pipeline falls back to plaintext capture — while the dispatch itself
+    /// fails fast in the shim spawn stage rather than silently re-running
+    /// the stream-less print mode that tripped the watchdog.
+    /// </summary>
+    public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
+    {
+        var help = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = [Binary, "acp", "--help"],
+        }, ct).ConfigureAwait(false);
+
+        return help.Success;
+    }
+
     protected override AgentInvocation BuildInvocation(
         string prompt,
         AgentCredential? credential,
@@ -136,43 +186,111 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         string? reasoningMode = null,
         bool captureStructuredStream = false)
     {
-        var argv = new List<string>(FullAutonomyInvocationPrefix(Binary));
-
-        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
-        if (!string.IsNullOrEmpty(effectiveModel))
-        {
-            argv.Add("--model");
-            argv.Add(effectiveModel);
-        }
-
         // The Devin CLI has no reasoning-effort flag; ReasoningMode is accepted
         // so the agent-class config schema stays uniform but is not threaded
-        // into argv.
+        // into argv. ACP envelopes are the only output mode this runner
+        // speaks, so captureStructuredStream needs no argv switch.
         _ = reasoningMode;
         _ = credential;
         _ = captureStructuredStream;
 
-        return PromptFileInvocation(argv, prompt);
+        return new AgentInvocation(
+            ["bash", "-c", BuildAcpDispatchScript(AcpShimArgs(Binary, EffectiveModelId(modelId), FullAutonomyAcpMode))],
+            Stdin: DevinAcpShim.BuildDispatchStdin(prompt));
+    }
+
+    private string? EffectiveModelId(string? modelId)
+        => !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
+
+    /// <summary>
+    /// Sandbox path template for the per-run ACP working directory. A per-run
+    /// <c>mktemp</c> dir under <c>$TMPDIR</c>, so two phases in one sandbox
+    /// never collide.
+    /// </summary>
+    private const string AcpDirTemplate = "${TMPDIR:-/tmp}/codeybox-devin-acp.XXXXXX";
+
+    /// <summary>
+    /// The shim argv (after the script path) for one ACP turn.
+    /// <paramref name="modelId"/> is passed verbatim to
+    /// <c>devin acp --model</c> — the configured swe-2 id, never a fallback;
+    /// omit when null so the account server-side default applies.
+    /// <paramref name="mode"/> is applied via <c>session/set_mode</c> before
+    /// the prompt (<see cref="FullAutonomyAcpMode"/> for dispatches).
+    /// </summary>
+    public static IReadOnlyList<string> AcpShimArgs(string binary, string? modelId, string? mode)
+    {
+        var args = new List<string> { "--binary", binary };
+        if (!string.IsNullOrEmpty(modelId))
+        {
+            args.Add("--model");
+            args.Add(modelId);
+        }
+        if (!string.IsNullOrEmpty(mode))
+        {
+            args.Add("--mode");
+            args.Add(mode);
+        }
+        return args;
     }
 
     /// <summary>
-    /// Sandbox path template for the prompt file. A per-run <c>mktemp</c> name
-    /// under <c>$TMPDIR</c>, so two phases in one sandbox never collide.
+    /// The <c>bash -c</c> script that materialises the embedded shim and the
+    /// piped prompt into a private <c>mktemp</c> dir, then runs the shim.
+    /// Public so <c>DevinInVmSmokeProbe</c> exercises the exact dispatch path
+    /// — a probe that passed while dispatch failed is what let the
+    /// <c>/dev/stdin</c> fault reach production.
+    ///
+    /// <para>Stdin is framed as
+    /// <see cref="DevinAcpShim.BuildDispatchStdin"/> produces: base64 shim
+    /// lines, the end-marker line, then the verbatim prompt which
+    /// <c>cat</c> pipes to the prompt file. <c>umask 077</c> + the EXIT trap
+    /// keep the materialised files 0600 and remove them however the turn
+    /// ends, so a later phase sharing the sandbox cannot read a previous
+    /// prompt. Python is NOT <c>exec</c>'d, so the trap still runs; bash then
+    /// exits with the shim's own status, and
+    /// <see cref="PreemptProcessPattern"/> still matches the
+    /// <c>devin acp</c> child process.</para>
+    /// </summary>
+    public static string BuildAcpDispatchScript(IReadOnlyList<string> shimArgs)
+    {
+        ArgumentNullException.ThrowIfNull(shimArgs);
+        if (shimArgs.Count == 0)
+            throw new ArgumentException("Devin ACP shim args must be non-empty.", nameof(shimArgs));
+
+        return string.Join('\n',
+            "set -eu",
+            "umask 077",
+            $"cb_dir=$(mktemp -d \"{AcpDirTemplate}\")",
+            "trap 'rm -rf \"$cb_dir\"' EXIT INT TERM",
+            "cb_shim=\"$cb_dir/acp_client.py\"",
+            "cb_shim_b64=\"$cb_dir/acp_client.b64\"",
+            "cb_prompt=\"$cb_dir/prompt.txt\"",
+            "cb_found=0",
+            "while IFS= read -r line; do",
+            $"  if [ \"$line\" = '{DevinAcpShim.StdinEndMarker}' ]; then cb_found=1; break; fi",
+            "  printf '%s\\n' \"$line\" >> \"$cb_shim_b64\"",
+            "done",
+            "[ \"$cb_found\" = 1 ] || { echo 'missing devin acp shim terminator' >&2; exit 1; }",
+            "base64 -d \"$cb_shim_b64\" > \"$cb_shim\"",
+            "cat > \"$cb_prompt\"",
+            "python3 \"$cb_shim\" --prompt-file \"$cb_prompt\" "
+                + string.Join(' ', shimArgs.Select(ShellQuote)));
+    }
+
+    /// <summary>
+    /// Sandbox path template for the print-mode prompt file used by the
+    /// text-only path. A per-run <c>mktemp</c> name under <c>$TMPDIR</c>, so
+    /// two phases in one sandbox never collide.
     /// </summary>
     private const string PromptFileTemplate = "${TMPDIR:-/tmp}/codeybox-devin-prompt.XXXXXX";
 
     /// <summary>
     /// Wraps a devin argv so the prompt reaches the CLI as a file it can open,
-    /// and returns the invocation to execute.
+    /// and returns the invocation to execute. Used by the text-only path,
+    /// which stays on print mode: <c>devin -p</c> answers about the worktree
+    /// without exposing a tool runtime to untrusted resolver input.
     ///
-    /// <para><b>Why not <c>--prompt-file /dev/stdin</c>.</b> That path must be
-    /// RE-OPENED by the CLI, and the in-VM exec wrapper pipes stdin in before
-    /// dropping to the sandbox user, so the open fails
-    /// <c>Permission denied (os error 13)</c> and every dispatch dies in under
-    /// a second. The pipe itself is delivered fine — only re-opening it is
-    /// refused.</para>
-    ///
-    /// <para><b>Why the prompt still arrives on stdin.</b> <c>MAX_ARG_STRLEN</c>
+    /// <para><b>Why the prompt arrives on stdin.</b> <c>MAX_ARG_STRLEN</c>
     /// (128 KiB per element) caps argv <i>and</i> the environment alike, and
     /// rework prompts exceed it, so neither can carry the prompt. <c>cat</c>
     /// reads the already-open descriptor 0 rather than re-opening it, which is
@@ -191,12 +309,11 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
 
     /// <summary>
     /// The <c>bash -c</c> script body that materialises the piped prompt and
-    /// runs <paramref name="devinArgv"/> against it. Public so
-    /// <c>DevinInVmSmokeProbe</c> exercises the exact prompt path a real
-    /// dispatch uses — a probe that passed while dispatch failed is what let
-    /// the <c>/dev/stdin</c> fault reach production.
+    /// runs <paramref name="devinArgv"/> against it (print mode, text-only
+    /// calls only — workspace dispatches go through
+    /// <see cref="BuildAcpDispatchScript"/>).
     /// </summary>
-    public static string BuildPromptFileScript(IReadOnlyList<string> devinArgv)
+    private static string BuildPromptFileScript(IReadOnlyList<string> devinArgv)
     {
         ArgumentNullException.ThrowIfNull(devinArgv);
         if (devinArgv.Count == 0)
@@ -212,16 +329,6 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
             command + " --prompt-file \"$cb_prompt\"");
     }
 
-    /// <summary>
-    /// The leading argv every real workspace invocation uses:
-    /// <c>devin -p --permission-mode dangerous --respect-workspace-trust
-    /// false</c>. Extracted as a single builder so <see cref="BuildInvocation"/>
-    /// (real dispatch) and <c>DevinInVmSmokeProbe</c> (the in-VM turn check)
-    /// construct the exact same prefix.
-    /// </summary>
-    public static IReadOnlyList<string> FullAutonomyInvocationPrefix(string binary) =>
-        [binary, "-p", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"];
-
     protected override AgentInvocation BuildTextOnlyInvocation(
         string prompt,
         AgentCredential? credential,
@@ -229,14 +336,15 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         string? reasoningMode = null)
     {
         _ = credential;
-        // Text-only calls omit --permission-mode (the CLI default `auto`
-        // auto-approves read-only tools only), so the run can answer about the
-        // worktree but cannot write it or run arbitrary commands on untrusted
-        // merge-conflict/resolver input — the same conservative shape cursor's
-        // text-only path takes when it drops --force.
+        // Text-only calls stay on print mode and omit --permission-mode (the
+        // CLI default `auto` auto-approves read-only tools only), so the run
+        // can answer about the worktree but cannot write it or run arbitrary
+        // commands on untrusted merge-conflict/resolver input — the same
+        // conservative shape cursor's text-only path takes when it drops
+        // --force.
         var argv = new List<string> { Binary, "-p", "--respect-workspace-trust", "false" };
 
-        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
+        var effectiveModel = EffectiveModelId(modelId);
         if (!string.IsNullOrEmpty(effectiveModel))
         {
             argv.Add("--model");
@@ -300,15 +408,69 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
             stdoutChunkCallback,
             captureStructuredStream).ConfigureAwait(false);
 
-        // Devin reports run failures on stderr as `Error: …` lines (verified
-        // against devin 3000.11.1: auth failures exit nonzero with
-        // "Error: Not logged in…"). Lift the terminal error so the pipeline can
-        // classify it; without this a quota/auth give-up with no file changes
-        // terminal-fails as "produced no changes".
-        if (string.IsNullOrEmpty(result.TerminalDiagnostic)
-            && DevinTerminalDiagnoser.TryExtractTerminalError(result.Stderr, result.Stdout) is { } terminalError)
-        {
+        return PostProcessAcpResult(result);
+    }
+
+    public override async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        // Checkpoint-resumed dispatches drive the same ACP shim, so they get
+        // the same outcome verification and typed-failure lifting.
+        var result = await base.RunResumedAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            resume,
+            modelId,
+            reasoningMode,
+            ct,
+            stdoutChunkCallback).ConfigureAwait(false);
+
+        return PostProcessAcpResult(result);
+    }
+
+    /// <summary>
+    /// Maps the exec result through the shim's terminal outcome. Two failure
+    /// surfaces exist: the shim reports protocol/turn failures as typed
+    /// terminal envelopes (<c>turn_error</c> / <c>fatal</c>), and the CLI
+    /// itself reports auth/startup failures on stderr as <c>Error: …</c>
+    /// lines (verified against devin 3000.11.1: "Error: Not logged in…"
+    /// exits nonzero before ACP starts). Whichever fired is lifted into
+    /// <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline can
+    /// classify it; without this a quota/auth give-up with no file changes
+    /// terminal-fails as "produced no changes".
+    /// </summary>
+    private static AgentResult PostProcessAcpResult(AgentResult result)
+    {
+        if (!string.IsNullOrEmpty(result.TerminalDiagnostic))
+            return result;
+
+        var outcome = DevinAcpOutcome.Extract(result.Stdout);
+        if (outcome.Diagnostic is { } acpFailure)
+            return result with { TerminalDiagnostic = acpFailure };
+
+        if (DevinTerminalDiagnoser.TryExtractTerminalError(result.Stderr, result.Stdout) is { } terminalError)
             return result with { TerminalDiagnostic = terminalError };
+
+        // A zero exit without the shim's terminal envelope means the run was
+        // cut short before the turn outcome was written (killed shim, capped
+        // stdout) — honest failure, not a silent success.
+        if (result.Success && outcome.Event != DevinAcpOutcome.TerminalEvent.TurnComplete)
+        {
+            return result with
+            {
+                Success = false,
+                Summary = "devin acp exited without reporting a turn outcome",
+            };
         }
 
         return result;

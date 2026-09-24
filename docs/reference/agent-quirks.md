@@ -428,25 +428,41 @@ non-login PATH the dispatcher uses (or symlink `devin` onto PATH).
    `~/.local/share/devin/credentials.toml` inside the VM before invoking
    the binary. The host credentials directory is not bind-mounted.
 
-**Non-interactive invocation:**
-`devin -p --permission-mode dangerous --respect-workspace-trust false
---prompt-file /dev/stdin` with the prompt on stdin.
+**Non-interactive invocation:** `devin acp` — an Agent Client Protocol
+server over stdio — driven by the embedded Python shim
+(`Resources/devin-acp-client.py`) through a `bash -c` wrapper that
+materialises the shim and a prompt file from a framed stdin payload
+(base64 shim, end-marker line, verbatim prompt).
 
-- A bare `devin -p` does NOT read a piped prompt from stdin — verified
-  live; `--prompt-file /dev/stdin` is required. The prompt travels on stdin
-  rather than positional argv (Linux MAX_ARG_STRLEN is 128 KiB per argv
-  element).
-- `--permission-mode` accepts `auto|accept-edits|smart|dangerous` (default
-  `auto` auto-approves read-only tools only). The runner passes `dangerous`
-  for workspace dispatches — the VM is the security perimeter — and omits
-  the flag for text-only calls so the read-only `auto` default applies.
-- `--respect-workspace-trust false` is REQUIRED: print mode cannot show the
-  workspace-trust prompt and fails outright in an untrusted directory.
-- `--model <id>` selects the model (env `DEVIN_MODEL` also works); unset
-  falls back to the account's server-side default.
-- Failure text surfaces as `Error: …` lines on stderr (verified: `Error:
-  Not logged in` exits 1); `DevinTerminalDiagnoser` lifts the first such
-  line into `TerminalDiagnostic`.
+- ACP was chosen over `devin -p` because print mode only emits plain text
+  when the run ends — a long turn never touched the agent-stream file and
+  the worker-progress watchdog recycled live runs as stuck. The shim folds
+  every `session/update` notification (tool calls, message chunks, usage
+  ticks) into a `{"type":"devin.acp",…}` NDJSON envelope on stdout, so
+  stream mtime advances for the life of the turn.
+- Handshake: `initialize` → `session/new {cwd}` → `session/set_mode
+  {modeId:"bypass"}` → `session/prompt`. The global `--permission-mode`
+  flag does NOT apply to `devin acp` sessions (verified: sessions still
+  open in `accept-edits`), so `bypass` — the CLI's "Bypass Permissions"
+  mode — is set per session. `session/request_permission` requests are
+  auto-answered with the most durable allow option as defence in depth.
+- `devin acp --model <id>` selects the session model (env `DEVIN_MODEL`
+  also works); unset falls back to the account's server-side default. The
+  shim scrubs `DEVIN_REFUSAL_FALLBACK` from the child environment — that
+  variable switches refused requests to other (paid) Devin models and must
+  never act on a dispatch.
+- The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
+  128 KiB per argv element and rework prompts exceed it) and reaches the
+  agent only as `session/prompt` JSON — never in argv or the environment.
+- Failure text surfaces either as shim `turn_error`/`fatal` envelopes
+  (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
+  `Error: …` lines on stderr (verified: `Error: Not logged in` exits
+  nonzero before the handshake); `DevinTerminalDiagnoser` lifts the first
+  such line as a fallback.
+- The text-only path (`RunTextOnlyAsync`) still uses
+  `devin -p --respect-workspace-trust false` with no permission flag —
+  the read-only `auto` default is the conservative shape for answering
+  questions on untrusted resolver input.
 
 **Default model:** `claude-sonnet-5-medium` (verified live catalog variant;
 the documented examples `sonnet`/`opus`/`swe`/`fable` are also accepted
@@ -484,7 +500,8 @@ logged in`, …) and accepts operator extras via
 (`api_key` or `windsurf_api_key`) — no network call. The in-VM probe runs `devin --version`, then (when auth is
 present) materialises the credentials file with the runner's exact script,
 runs `devin models list --format json` (exits 1 unauthenticated — the real
-auth check), and performs a real print-mode turn with the dispatch argv.
+auth check), and performs a real ACP turn through the same dispatch wrapper
+and framed-stdin delivery a real run uses.
 
 **Model list probe:** `DevinModelListProbe` execs `devin models list
 --format json` on the host (account-scoped catalog; requires the CLI
@@ -498,8 +515,9 @@ seed stays the warn-only validation surface.
 **Sessions / scratchpad:** the CLI persists sessions in
 `~/.local/share/devin/cli/sessions.db` (sqlite + WAL/SHM); the scratchpad
 allowlist captures the database so preempted sandboxes keep session state.
-Resume is not wired: `-c` combined with `-p` is unverified, so a restored
-run re-dispatches fresh like the other file-state agents.
+Resume is not wired: ACP advertises `loadSession` but session restore is
+unverified, so a restored run re-dispatches fresh like the other file-state
+agents.
 
 ### Google Antigravity CLI (`agy`)
 
