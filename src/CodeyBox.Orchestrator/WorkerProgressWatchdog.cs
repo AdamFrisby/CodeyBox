@@ -194,9 +194,18 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 if (workerActivity is not null)
                 {
                     _workerActivityProgress[activityKey] = new WorkerActivityProgress(now, workerActivity.Reason);
-                    _log.LogDebug(
-                        "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason}; treating as progress",
-                        worker.WorkerId, itemId, workerActivity.Reason);
+                    if (workerActivity.CpuFraction is { } cpuFraction)
+                    {
+                        _log.LogDebug(
+                            "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason} (cpu={CpuFraction:P1}); treating as progress",
+                            worker.WorkerId, itemId, workerActivity.Reason, cpuFraction);
+                    }
+                    else
+                    {
+                        _log.LogDebug(
+                            "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason}; treating as progress",
+                            worker.WorkerId, itemId, workerActivity.Reason);
+                    }
                     continue;
                 }
 

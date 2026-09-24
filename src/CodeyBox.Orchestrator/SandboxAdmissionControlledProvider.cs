@@ -312,6 +312,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() =>
         _progressProvider?.SnapshotActiveSandboxProgress() ?? [];
 
+    public ValueTask<IReadOnlyList<ActiveSandboxProgress>> SnapshotActiveSandboxProgressAsync(CancellationToken ct = default) =>
+        _progressProvider?.SnapshotActiveSandboxProgressAsync(ct) ?? ValueTask.FromResult<IReadOnlyList<ActiveSandboxProgress>>([]);
+
     public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() =>
         _hostPoolSnapshot?.SnapshotHostPool() ?? [];
 

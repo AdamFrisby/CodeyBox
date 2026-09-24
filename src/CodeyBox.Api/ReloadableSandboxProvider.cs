@@ -207,6 +207,18 @@ internal sealed class ReloadableSandboxProvider :
             .SelectMany(static provider => provider.Progress.SnapshotActiveSandboxProgress())
             .ToArray();
 
+    public async ValueTask<IReadOnlyList<ActiveSandboxProgress>> SnapshotActiveSandboxProgressAsync(CancellationToken ct = default)
+    {
+        var activated = ActivatedProviders;
+        var results = new List<ActiveSandboxProgress>();
+        foreach (var provider in activated)
+        {
+            var progress = await provider.Progress.SnapshotActiveSandboxProgressAsync(ct).ConfigureAwait(false);
+            results.AddRange(progress);
+        }
+        return results;
+    }
+
     public IReadOnlyList<DiskGuardSample> SampleDiskGuardState() =>
         ActivatedProviders
             .SelectMany(static provider => provider.DiskGuard.SampleDiskGuardState())

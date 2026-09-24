@@ -818,7 +818,7 @@ public interface IActiveSandboxProvider
 /// signal for detached VM-local work and use <see cref="Status"/> to report a
 /// richer reason when providers can expose changing activity.
 /// </summary>
-public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string SandboxId, string? Status = null);
+public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string SandboxId, string? Status = null, double? CpuFraction = null);
 
 /// <summary>
 /// Optional provider capability for reporting active sandbox ownership.
@@ -831,6 +831,13 @@ public interface IActiveSandboxProgressProvider
     /// monitoring needs.
     /// </summary>
     IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress();
+
+    /// <summary>
+    /// Asynchronously samples and snapshots currently-active sandboxes, refreshing
+    /// activity projections such as guest CPU metrics where supported.
+    /// </summary>
+    ValueTask<IReadOnlyList<ActiveSandboxProgress>> SnapshotActiveSandboxProgressAsync(CancellationToken ct = default)
+        => ValueTask.FromResult(SnapshotActiveSandboxProgress());
 }
 
 /// <summary>

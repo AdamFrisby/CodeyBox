@@ -8,7 +8,7 @@ namespace CodeyBox.Orchestrator;
 /// A live worker-side signal that should count as watchdog progress even when
 /// the work item row and agent stream files are quiet.
 /// </summary>
-public sealed record WorkerProgressActivity(string Reason);
+public sealed record WorkerProgressActivity(string Reason, double? CpuFraction = null);
 
 /// <summary>
 /// Narrow activity probe settings resolved by the watchdog for the current
@@ -92,7 +92,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         _initialCpuSampleAttempts = Math.Max(1, initialCpuSampleAttempts);
     }
 
-    public ValueTask<WorkerProgressActivity?> ObserveAsync(
+    public async ValueTask<WorkerProgressActivity?> ObserveAsync(
         WorkerRegistration worker,
         WorkItemId itemId,
         WorkerProgressActivityProbe probe,
@@ -100,45 +100,45 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     {
         ct.ThrowIfCancellationRequested();
         if (!string.Equals(worker.CurrentWorkItemId, itemId.ToString(), StringComparison.Ordinal))
-            return ValueTask.FromResult<WorkerProgressActivity?>(null);
+            return null;
 
         if (probe.ProcessCpuProgressSignalEnabled
             && TryObserveProcessCpu(itemId, out var cpuReason))
         {
-            return ValueTask.FromResult<WorkerProgressActivity?>(
-                new WorkerProgressActivity(cpuReason));
+            return new WorkerProgressActivity(cpuReason);
         }
 
         if (probe.ActiveSandboxProgressSignalEnabled
-            && TryObserveActiveSandbox(itemId, out var sandboxReason))
+            && await TryObserveActiveSandboxAsync(itemId, ct).ConfigureAwait(false) is { } sandboxActivity)
         {
-            return ValueTask.FromResult<WorkerProgressActivity?>(
-                new WorkerProgressActivity(sandboxReason));
+            return sandboxActivity;
         }
 
-        return ValueTask.FromResult<WorkerProgressActivity?>(null);
+        return null;
     }
 
-    private bool TryObserveActiveSandbox(WorkItemId itemId, out string reason)
+    private async ValueTask<WorkerProgressActivity?> TryObserveActiveSandboxAsync(WorkItemId itemId, CancellationToken ct)
     {
-        reason = "";
         if (_activeSandboxProvider is not { } activeProvider)
-            return false;
+            return null;
 
         IReadOnlyList<ActiveSandboxProgress> snapshot;
         try
         {
-            snapshot = activeProvider.SnapshotActiveSandboxProgress();
+            snapshot = await activeProvider.SnapshotActiveSandboxProgressAsync(ct).ConfigureAwait(false);
         }
         catch
         {
-            return false;
+            return null;
         }
 
-        var signatureParts = snapshot
+        var matchingEntries = snapshot
             .Where(entry =>
                 entry.WorkItemId == itemId &&
                 !string.IsNullOrWhiteSpace(entry.SandboxId))
+            .ToArray();
+
+        var signatureParts = matchingEntries
             .Select(entry => $"{entry.SandboxId}\0{entry.Status ?? ""}")
             .Order(StringComparer.Ordinal)
             .ToArray();
@@ -146,23 +146,23 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         if (signatureParts.Length == 0)
         {
             _activeSandboxSignatures.TryRemove(itemId, out _);
-            return false;
+            return null;
         }
 
         var signature = string.Join("\0\0", signatureParts);
+        var cpuFraction = matchingEntries.Select(e => e.CpuFraction).FirstOrDefault(f => f.HasValue);
+
         if (!_activeSandboxSignatures.TryGetValue(itemId, out var previous))
         {
             _activeSandboxSignatures[itemId] = signature;
-            reason = "active-sandbox";
-            return true;
+            return new WorkerProgressActivity("active-sandbox", cpuFraction);
         }
 
         if (string.Equals(signature, previous, StringComparison.Ordinal))
-            return false;
+            return null;
 
         _activeSandboxSignatures[itemId] = signature;
-        reason = "active-sandbox-change";
-        return true;
+        return new WorkerProgressActivity("active-sandbox-change", cpuFraction);
     }
 
     private bool TryObserveProcessCpu(WorkItemId itemId, out string reason)
