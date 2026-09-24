@@ -83,7 +83,9 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
 
     private static AgentClassRouter BuildRouter(
         double codexAvailablePct,
-        bool includeClaude = false)
+        bool includeClaude = false,
+        IAgentRunningCounters? runningCounters = null,
+        AgentConcurrencySnapshot? concurrencySnapshot = null)
     {
         var classes = includeClaude
             ? new[] { SingleAgentClass("codex-cls", Codex), SingleAgentClass("claude-cls", Claude) }
@@ -100,7 +102,9 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
                 QuotaRecheckInterval = QuotaRecheckInterval,
                 CapRetryRecheckInterval = CapRetryRecheckInterval,
             },
-            NullLogger<AgentClassRouter>.Instance);
+            NullLogger<AgentClassRouter>.Instance,
+            runningCounters: runningCounters,
+            concurrencySnapshot: concurrencySnapshot);
     }
 
     private static AgentConcurrencyOptions Caps(int codexMax) => new()
@@ -123,13 +127,22 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
     {
         var queue = new InMemoryTaskQueue();
         var pipeline = new ItemGatedPipeline(_store);
+        // Wire the router the way production DI does: the live pool's running
+        // counters plus the shared cap snapshot, so cap detection takes the
+        // pre-gate IsAtAgentCap path — the dominant path in production — rather
+        // than only the post-gate TryReserve race.
+        var counters = new LateBoundRunningCounters();
+        var caps = new AgentConcurrencySnapshot(Caps(codexMax: 1));
         var svc = new OrchestratorService(
             queue, _store, pipeline, new CancellationRegistry(CancellationToken.None),
             new OrchestratorOptions { MaxConcurrentWorkers = 3 },
             NullLogger<OrchestratorService>.Instance,
-            router: BuildRouter(codexAvailablePct: 100.0, includeClaude: true),
-            agentConcurrency: Caps(codexMax: 1),
+            router: BuildRouter(codexAvailablePct: 100.0, includeClaude: true,
+                runningCounters: counters, concurrencySnapshot: caps),
+            agentConcurrencySnapshot: caps,
             timeProvider: new ControllableTimeProvider());
+        counters.Inner = svc;
+        Assert.Equal(DispatchCandidateOrdering.InFlightBeforeFresh, svc.CurrentDispatchOrdering);
 
         var occupant = Item();
         var filler1 = Item(agentClassId: "claude-cls");
@@ -152,13 +165,17 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
         // already past the work phase) defers at the cap; B is a fresh Queued
         // item at the same priority with a LATER queue position. Releasing the
         // slot must dispatch A — the ranked order keeps deferred in-flight
-        // work ahead of fresh starts — not B. The second claude filler pins
-        // the remaining global slot so B cannot spawn a racing worker while
-        // the freed slot is decided.
+        // work ahead of fresh starts — not B. A carries a created_at LATER
+        // than B's so the legacy ordering (created_at tiebreak) would pick B:
+        // A can only win through the in-flight bucket, which pins the ordering
+        // preference end-to-end rather than by creation-order coincidence.
+        // The second claude filler pins the remaining global slot so B cannot
+        // spawn a racing worker while the freed slot is decided.
         var (svc, queue, pipeline, occupant, filler1) = await StartContendedPoolAsync();
         try
         {
-            var a = Item(WorkItemState.WorkComplete, priority: 20, queuePosition: 10);
+            var a = Item(WorkItemState.WorkComplete, priority: 20, queuePosition: 10,
+                createdAt: DateTimeOffset.UtcNow.AddSeconds(10));
             await _store.CreateAsync(a);
             await queue.EnqueueAsync(a.Id);
             Assert.True(await WaitUntilAsync(() => svc.IsDeferredForTest(a.Id), DeferralWaitTimeout));
@@ -241,14 +258,18 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
         var time = new ControllableTimeProvider();
         var queue = new InMemoryTaskQueue();
         var pipeline = new ItemGatedPipeline(_store);
+        var counters = new LateBoundRunningCounters();
+        var caps = new AgentConcurrencySnapshot(Caps(codexMax: 1));
         using var registry = new CancellationRegistry(CancellationToken.None);
         using var svc = new OrchestratorService(
             queue, _store, pipeline, registry,
             new OrchestratorOptions { MaxConcurrentWorkers = 2 },
             NullLogger<OrchestratorService>.Instance,
-            router: BuildRouter(codexAvailablePct: 100.0),
-            agentConcurrency: Caps(codexMax: 1),
+            router: BuildRouter(codexAvailablePct: 100.0,
+                runningCounters: counters, concurrencySnapshot: caps),
+            agentConcurrencySnapshot: caps,
             timeProvider: time);
+        counters.Inner = svc;
 
         Assert.True(svc.TryReserveAgentSlotForTest(Codex));
 
@@ -339,14 +360,18 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
         var time = new ControllableTimeProvider();
         var queue = new InMemoryTaskQueue();
         var pipeline = new ItemGatedPipeline(_store);
+        var counters = new LateBoundRunningCounters();
+        var caps = new AgentConcurrencySnapshot(Caps(codexMax: 1));
         using var registry = new CancellationRegistry(CancellationToken.None);
         using var svc = new OrchestratorService(
             queue, _store, pipeline, registry,
             new OrchestratorOptions { MaxConcurrentWorkers = 3, PreferInFlightOverFresh = false },
             NullLogger<OrchestratorService>.Instance,
-            router: BuildRouter(codexAvailablePct: 100.0, includeClaude: true),
-            agentConcurrency: Caps(codexMax: 1),
+            router: BuildRouter(codexAvailablePct: 100.0, includeClaude: true,
+                runningCounters: counters, concurrencySnapshot: caps),
+            agentConcurrencySnapshot: caps,
             timeProvider: time);
+        counters.Inner = svc;
         Assert.Equal(DispatchCandidateOrdering.FinishingThenPriority, svc.CurrentDispatchOrdering);
 
         var occupant = Item();
@@ -461,6 +486,64 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
             ordered);
     }
 
+    [Fact]
+    public async Task DispatchOrdering_SqliteAndDefaultLinqEngines_AgreeOnMixedFixture()
+    {
+        // Parity pin between the two implementations of the ranked candidate
+        // order: the SQL ORDER BY in SqliteWorkItemStore and the default LINQ
+        // implementation of
+        // IWorkItemStore.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync.
+        // A shared fixture mixing finishing states, past-work-phase states,
+        // fresh Queued rows, scrambled queue positions/created_at, and due
+        // quota-retry rows (whose ordering state flows through the derived
+        // dispatch_ordering_state path) makes any sort-key divergence between
+        // the two engines fail here.
+        var now = DateTimeOffset.UtcNow;
+        WorkItem[] fixture =
+        [
+            Item(WorkItemState.AuditPassed, priority: 5, queuePosition: 3, createdAt: now.AddSeconds(-9)),
+            Item(WorkItemState.Merging, priority: 50, queuePosition: 0, createdAt: now.AddSeconds(-8)),
+            Item(WorkItemState.Queued, priority: 60, queuePosition: 99, createdAt: now.AddSeconds(-7)),
+            Item(WorkItemState.WorkComplete, priority: 20, queuePosition: 10, createdAt: now),
+            Item(WorkItemState.Reworking, priority: 20, queuePosition: 90, createdAt: now.AddSeconds(-3)),
+            Item(WorkItemState.Queued, priority: 20, queuePosition: 5, createdAt: now.AddSeconds(-1)),
+            Item(WorkItemState.Queued, priority: 20, queuePosition: 50, createdAt: now.AddSeconds(-2)),
+            Item(WorkItemState.WaitingForQuotaReset, priority: 40, queuePosition: 7, createdAt: now.AddSeconds(-6))
+                with { QuotaRetryFrom = QuotaRetryPhasePolicy.AuditPhase },
+            Item(WorkItemState.WaitingForQuotaReset, priority: 20, queuePosition: 1, createdAt: now.AddSeconds(-5))
+                with { QuotaRetryFrom = QuotaRetryPhasePolicy.WorkPhase },
+        ];
+        foreach (var item in fixture)
+            await _store.CreateAsync(item);
+
+        var linqStore = new DefaultLinqOrderingStore(_store);
+        foreach (var ordering in new[]
+        {
+            DispatchCandidateOrdering.FinishingThenPriority,
+            DispatchCandidateOrdering.InFlightBeforeFresh,
+        })
+        {
+            var sqlOrder = await CollectIdsAsync(
+                _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+                    new HashSet<WorkItemId>(), now, limit: 100, ordering));
+            // DefaultLinqOrderingStore does not override the unified dispatch
+            // query, so through the interface this invokes the default (LINQ)
+            // implementation — the ordering engine being compared against SQL.
+            var linqOrder = await CollectIdsAsync(
+                ((IWorkItemStore)linqStore).ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+                    new HashSet<WorkItemId>(), now, limit: 100, ordering));
+            Assert.Equal(sqlOrder, linqOrder);
+        }
+    }
+
+    private static async Task<List<WorkItemId>> CollectIdsAsync(IAsyncEnumerable<WorkItem> items)
+    {
+        var ids = new List<WorkItemId>();
+        await foreach (var item in items)
+            ids.Add(item.Id);
+        return ids;
+    }
+
     private static async Task<bool> WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
     {
         var deadline = DateTimeOffset.UtcNow + timeout;
@@ -472,6 +555,34 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
         }
         return predicate();
     }
+
+    /// <summary>
+    /// <see cref="IAgentRunningCounters"/> that delegates to the orchestrator
+    /// once it exists — the same wiring production DI uses (the router holds
+    /// the live pool's counters), so cap detection takes the pre-gate
+    /// IsAtAgentCap path production hits rather than only the post-gate
+    /// TryReserve race. <see cref="Inner"/> must be set before the service
+    /// starts dispatching.
+    /// </summary>
+    private sealed class LateBoundRunningCounters : IAgentRunningCounters
+    {
+        public IAgentRunningCounters? Inner { get; set; }
+
+        public int GetRunning(AgentKind agent) => Inner?.GetRunning(agent) ?? 0;
+
+        public int GetRunning(AgentMembership member) => Inner?.GetRunning(member) ?? 0;
+
+        public IReadOnlyDictionary<AgentKind, int> Snapshot() =>
+            Inner?.Snapshot() ?? new Dictionary<AgentKind, int>();
+    }
+
+    /// <summary>
+    /// Forwards every store member to the real SQLite store and deliberately
+    /// does NOT override the unified dispatch query — on this subclass it runs
+    /// the <see cref="IWorkItemStore"/> default (LINQ) implementation, the
+    /// second ordering engine the SQL override must agree with.
+    /// </summary>
+    private sealed class DefaultLinqOrderingStore(SqliteWorkItemStore inner) : ForwardingWorkItemStore(inner);
 
     /// <summary>
     /// Pipeline that records entry order and blocks each item until released,

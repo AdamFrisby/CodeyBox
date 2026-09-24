@@ -1,3 +1,5 @@
+using System.Collections.Frozen;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -91,18 +93,18 @@ public static class QuotaRetryPhasePolicy
     /// <see cref="DispatchPhaseBucket"/> precedence is evaluated first, so
     /// listing them here keeps the bucket honest without double-counting.
     /// </summary>
-    public static IReadOnlyList<WorkItemState> InFlightDispatchStates { get; } =
-    [
-        WorkItemState.WorkComplete,
-        WorkItemState.Auditing,
-        WorkItemState.Reworking,
-        WorkItemState.ReworkingForConflict,
-        WorkItemState.AuditPassed,
-        WorkItemState.Merging,
-        WorkItemState.Merged,
-        WorkItemState.UpstreamPushing,
-        WorkItemState.Delegating,
-    ];
+    public static IReadOnlySet<WorkItemState> InFlightDispatchStates { get; } =
+        FrozenSet.ToFrozenSet([
+            WorkItemState.WorkComplete,
+            WorkItemState.Auditing,
+            WorkItemState.Reworking,
+            WorkItemState.ReworkingForConflict,
+            WorkItemState.AuditPassed,
+            WorkItemState.Merging,
+            WorkItemState.Merged,
+            WorkItemState.UpstreamPushing,
+            WorkItemState.Delegating,
+        ]);
 
     /// <summary>
     /// Tie-break bucket used by

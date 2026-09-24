@@ -594,6 +594,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var atCapAgents = new List<AgentKind>();
         var atCapMembers = new List<AgentMembership>();
 
+        // Route keys of every cap-blocked member — pre-gate saturated AND
+        // post-gate refused — so a deferral can wait on the exact routes whose
+        // release clears it. Evaluated at decision time (not eagerly) so
+        // PayPerApi-fallback refusals added later in this method are included.
+        IReadOnlyList<string> CapWaitRouteKeys() =>
+            capSaturatedMembers
+                .Concat(atCapMembers)
+                .Select(static m => m.RouteKey)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
         // Members the per-agent failure circuit breaker is currently benching
         // (Open within cooldown, or all half-open trials outstanding). Excluded
         // BEFORE the quota probe so a benched agent burns no probe round-trip,
@@ -1082,6 +1093,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 AnyMemberAtCap = capBlocked,
                 AtCapAgents = atCapAgents,
                 AtCapMembers = atCapMembers,
+                CapWaitRoutes = CapWaitRouteKeys(),
                 Reason = reason,
                 PausedAgents = pausedRejected
                     .Select(p => p.Agent)
@@ -1207,6 +1219,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             AnyMemberAtCap = fallbackCapBlocked,
             AtCapAgents = atCapAgents,
             AtCapMembers = atCapMembers,
+            CapWaitRoutes = CapWaitRouteKeys(),
             Reason = parkReason,
             PausedAgents = pausedRejected
                 .Select(p => p.Agent)
@@ -3378,6 +3391,17 @@ public sealed record AgentRoutingDecision
     /// callers that only use per-kind gates.
     /// </summary>
     public IReadOnlyList<AgentMembership> AtCapMembers { get; init; } = [];
+
+    /// <summary>
+    /// Route keys of every member whose per-agent concurrency cap blocked it
+    /// during this dispatch — both members rejected by the pre-gate
+    /// cap-saturation check and members refused by the post-gate slot
+    /// reservation. Unlike <see cref="AtCapMembers"/>, which carries only the
+    /// post-gate refusals for audit emission, this covers every cap-blocked
+    /// route so the caller can wake the deferred item the moment a slot frees
+    /// on any of them. Empty when no member was cap-blocked.
+    /// </summary>
+    public IReadOnlyList<string> CapWaitRoutes { get; init; } = [];
 
     /// <summary>
     /// True when every otherwise-eligible member was excluded because an

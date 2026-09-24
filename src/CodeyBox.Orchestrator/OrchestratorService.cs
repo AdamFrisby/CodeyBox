@@ -41,29 +41,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // Wake the dispatch loop so it observes the flag immediately rather
             // than blocking on the next natural kick.
             // The loop checks IsDispatchPaused immediately after dequeue, before
-            // it can call PickNextEligibleAsync.
-            //
-            // ContinueWith observes (rather than discards) any fault on the
-            // returned task so an asynchronous channel-writer exception during
-            // shutdown surfaces as a debug log instead of an unobserved task
-            // exception bubbling up to TaskScheduler.UnobservedTaskException
-            // (which some deployments promote to a fatal AppDomain.Unhandled —
-            // SIGKILL during shutdown is exactly the wedge case this gate
-            // exists to prevent).
-            try
-            {
-                var kickTask = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
-                if (!kickTask.IsCompletedSuccessfully)
-                {
-                    kickTask.AsTask().ContinueWith(
-                        t => _log.LogDebug(t.Exception, "PauseDispatch wake-up kick faulted"),
-                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.LogDebug(ex, "PauseDispatch wake-up kick threw synchronously; queue likely already shutting down");
-            }
+            // it can call PickNextEligibleAsync. The observed kick is the guard
+            // against a channel-writer fault during shutdown surfacing as an
+            // unobserved task exception — exactly the wedge case this gate
+            // exists to prevent.
+            KickDispatchWakeUnobserved("PauseDispatch");
         }
     }
 
@@ -182,8 +164,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // Tracks work item IDs that are currently sleeping in a deferred-requeue
     // delay (budget / quota / project-pause defer). They remain Queued in the
     // store; the pickup query skips them until the delay fires and removes them.
-    private readonly ConcurrentDictionary<WorkItemId, DeferredItemLease> _deferredItems = new();
-    private long _deferredItemGeneration;
+    private readonly DeferredItemRegistry _deferredItems = new();
 
     // Project-scoped drain claims created when a queued Refactor reaches its
     // normal dispatch turn but the project still has in-flight work. While the
@@ -551,7 +532,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             var delta = result.NewTarget - result.OldTarget;
             for (var i = 0; i < delta; i++)
-                _ = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
+                KickDispatchWakeUnobserved("Worker-pool slot growth");
         }
     }
 
@@ -806,45 +787,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// or queue position — deferred work then starves behind new starts.
     ///
     /// <para>
-    /// Each cleared item is removed via the same lease-checked
-    /// <see cref="RemoveDeferredItem"/> path the timer uses, so the still
-    /// sleeping requeue timer becomes a no-op: the item is woken exactly once.
-    /// The timer is kept (not cancelled) as the backstop for releases that
-    /// never arrive — e.g. a cap raised by hot-reload, or an orphaned worker
-    /// slot reclaimed without a route release. Quota-only, budget, pause, and
-    /// no-progress deferrals are untouched and still recheck on their own
-    /// interval.
+    /// Each cleared item goes through the same lease-checked removal the
+    /// requeue timer uses (<see cref="DeferredItemRegistry.WakeAgentCapWaiters"/>),
+    /// so the still sleeping timer becomes a no-op: the item is woken exactly
+    /// once. The timer is kept (not cancelled) as the backstop for releases
+    /// that never arrive — e.g. a cap raised by hot-reload, or an orphaned
+    /// worker slot reclaimed without a route release. Quota-only, budget,
+    /// pause, and no-progress deferrals are untouched and still recheck on
+    /// their own interval.
     /// </para>
     /// </summary>
     private void WakeAgentCapWaitersForRouteRelease(string routeKey)
     {
-        if (_deferredItems.IsEmpty)
-            return;
-
-        var woken = 0;
-        foreach (var (id, lease) in _deferredItems)
-        {
-            if (lease.Kind != DeferredItemKind.AgentCap || lease.WaitingOnRoutes is null)
-                continue;
-
-            var waitsOnRoute = false;
-            foreach (var route in lease.WaitingOnRoutes)
-            {
-                if (string.Equals(route, routeKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    waitsOnRoute = true;
-                    break;
-                }
-            }
-            if (!waitsOnRoute)
-                continue;
-
-            // Lease-checked remove: if a re-deferral or the timer already
-            // claimed this item, leave it — exactly one wake per deferral.
-            if (RemoveDeferredItem(id, lease))
-                woken++;
-        }
-
+        var woken = _deferredItems.WakeAgentCapWaiters(routeKey);
         if (woken == 0)
             return;
 
@@ -852,21 +807,33 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             "Agent slot released on route {RouteKey}: woke {Count} cap-deferred work item(s) back into dispatch ordering",
             routeKey, woken);
 
-        // Observe-but-don't-await the wake kick (same pattern as PauseDispatch):
-        // a faulted channel write must not escape into the worker's finally.
+        KickDispatchWakeUnobserved("Agent-cap slot-release");
+    }
+
+    /// <summary>
+    /// Enqueues a dispatcher wake without awaiting it, observing any fault so
+    /// a failed channel write surfaces as a debug log instead of an
+    /// unobserved task exception bubbling up to
+    /// TaskScheduler.UnobservedTaskException (which some deployments promote
+    /// to a fatal AppDomain.Unhandled). Used from synchronous paths —
+    /// shutdown pause, slot-growth fan-out, cap-release wake — where a
+    /// faulted kick must not escape into the caller.
+    /// </summary>
+    private void KickDispatchWakeUnobserved(string context)
+    {
         try
         {
-            var wakeTask = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
-            if (!wakeTask.IsCompletedSuccessfully)
+            var kickTask = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
+            if (!kickTask.IsCompletedSuccessfully)
             {
-                wakeTask.AsTask().ContinueWith(
-                    t => _log.LogDebug(t.Exception, "Agent-cap slot-release wake kick faulted"),
+                kickTask.AsTask().ContinueWith(
+                    t => _log.LogDebug(t.Exception, "{Context} wake kick faulted", context),
                     TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
             }
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "Agent-cap slot-release wake kick threw synchronously; queue likely already shutting down");
+            _log.LogDebug(ex, "{Context} wake kick threw synchronously; queue likely already shutting down", context);
         }
     }
 
@@ -1467,27 +1434,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
-    private void ClearRefactorDeferredItem(WorkItemId id)
-    {
-        if (!_deferredItems.TryGetValue(id, out var lease)
-            || lease.Kind != DeferredItemKind.RefactorGate)
-        {
-            return;
-        }
+    private void ClearRefactorDeferredItem(WorkItemId id) =>
+        _deferredItems.ClearIfKind(id, DeferredItemKind.RefactorGate);
 
-        RemoveDeferredItem(id, lease);
-    }
-
-    private IReadOnlyList<WorkItemId> RefactorDeferredItemIds()
-    {
-        var ids = new List<WorkItemId>();
-        foreach (var (id, lease) in _deferredItems)
-        {
-            if (lease.Kind == DeferredItemKind.RefactorGate)
-                ids.Add(id);
-        }
-        return ids;
-    }
+    private IReadOnlyList<WorkItemId> RefactorDeferredItemIds() =>
+        _deferredItems.IdsOfKind(DeferredItemKind.RefactorGate);
 
     private async ValueTask EnqueueRequiredDispatchWakeAsync(WorkerSlotLease lease, CancellationToken ct)
     {
@@ -2089,7 +2040,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private async Task<WorkItemId?> PickNextEligibleAsync(CancellationToken stoppingToken)
     {
         var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
-        foreach (var deferredId in _deferredItems.Keys) skipIds.Add(deferredId);
+        foreach (var deferredId in _deferredItems.Ids) skipIds.Add(deferredId);
 
         // Build the state map lazily only when we encounter an item with deps.
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
@@ -2476,10 +2427,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal Task<WorkItemId?> PickNextEligibleForTestAsync(CancellationToken ct)
         => PickNextEligibleAsync(ct);
     internal void MarkDeferredForTest(WorkItemId id) =>
-        _deferredItems[id] = new DeferredItemLease(0, DeferredItemKind.Generic);
-    internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+        _deferredItems.MarkForTest(id);
+    internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.Contains(id);
     internal long? DeferredGenerationForTest(WorkItemId id) =>
-        _deferredItems.TryGetValue(id, out var lease) ? lease.Generation : null;
+        _deferredItems.TryGet(id, out var lease) ? lease.Generation : null;
     internal bool IsActiveForTest(WorkItemId id) => _activeItems.ContainsKey(id);
     internal Func<WorkItemId, TimeSpan, CancellationToken, Task>? DeferredRequeueDelayForTest { get; set; }
     internal void SetLastSpawnAtForTest(DateTimeOffset at)
@@ -2491,7 +2442,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _activeItems.Keys.ToList();
 
     internal void ClearDeferredForHealthRecovery(WorkItemId id) =>
-        _deferredItems.TryRemove(id, out _);
+        _deferredItems.Remove(id);
 
     // Exposed as internal so tests can directly exercise the per-agent cap
     // reservation/release cycle without spinning the full BackgroundService.
@@ -2608,7 +2559,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         foreach (var item in allItems)
         {
-            if (_deferredItems.ContainsKey(item.Id))
+            if (_deferredItems.Contains(item.Id))
                 continue;
 
             if (_reaper is not null && _reaper.HasRecoveredItemInCurrentProcess(item.Id))
@@ -3125,10 +3076,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 AuditLog.ConcurrencyGated(item.Id, atCapMember.Agent,
                                     GetRunning(atCapMember), GetAgentCap(atCapMember));
                             }
-                            capWaitRoutes = decision.AtCapMembers
-                                .Select(static m => m.RouteKey)
-                                .Distinct(StringComparer.OrdinalIgnoreCase)
-                                .ToArray();
                         }
                         else
                         {
@@ -3137,11 +3084,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 AuditLog.ConcurrencyGated(item.Id, atCapAgent,
                                     GetRunning(atCapAgent), GetAgentCap(atCapAgent));
                             }
-                            capWaitRoutes = decision.AtCapAgents
-                                .Select(static a => a.Value)
+                        }
+
+                        // The router surfaces every cap-blocked route — the
+                        // pre-gate saturated members AND post-gate slot-gate
+                        // refusals — so the release wake sees the dominant
+                        // pre-gate path too, not just the TryReserve race.
+                        // Fall back to deriving keys from AtCapAgents through
+                        // the same route-key helper the release side uses, for
+                        // any decision that reports cap-blocked agents without
+                        // carrying the resolved route list.
+                        capWaitRoutes = decision.CapWaitRoutes.Count > 0
+                            ? decision.CapWaitRoutes
+                            : decision.AtCapAgents
+                                .Select(static a => ResolveDirectRouteKey(a, null))
                                 .Distinct(StringComparer.OrdinalIgnoreCase)
                                 .ToArray();
-                        }
                     }
                     AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
                     ClearPreStartRefactorDrainClaim(item);
@@ -3149,8 +3107,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         item.Id,
                         deferDelay,
                         ct,
-                        capWaitRoutes is { Count: > 0 } ? DeferredItemKind.AgentCap : DeferredItemKind.Generic,
-                        capWaitRoutes);
+                        capWaitRoutes is { Count: > 0 }
+                            ? DeferredWait.AgentCap(capWaitRoutes)
+                            : DeferredWait.None);
                     return;
                 }
                 if (decision.Chosen is { } chosen)
@@ -3252,8 +3211,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             item.Id,
                             _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval,
                             ct,
-                            DeferredItemKind.AgentCap,
-                            [routeKey]);
+                            DeferredWait.AgentCap([routeKey]));
                         return;
                     }
                     // Reservation successful — outer finally releases on exit.
@@ -3508,7 +3466,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // would re-pick it instantly. Defer with escalating backoff so a loop is
         // delayed/no work, never a high-load spawn storm; fail after a cap so a
         // genuinely poisoned item is cleared rather than looping forever.
-        if (!_deferredItems.ContainsKey(id))
+        if (!_deferredItems.Contains(id))
         {
             var afterRun = await _store.GetAsync(id, CancellationToken.None);
             if (afterRun is not null
@@ -3791,6 +3749,43 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private sealed record BudgetDeferral(string Reason, TimeSpan RecheckIn);
 
+    /// <summary>
+    /// What kind of deferral a requeue is and what, if anything, can clear it
+    /// before the timer fires. The closed factory shape keeps invalid
+    /// combinations unrepresentable: <see cref="DeferredItemKind.AgentCap"/>
+    /// always carries its wait routes and no other kind can carry any.
+    /// </summary>
+    private readonly record struct DeferredWait
+    {
+        private DeferredWait(DeferredItemKind kind, IReadOnlyList<string>? routes)
+        {
+            Kind = kind;
+            Routes = routes;
+        }
+
+        public DeferredItemKind Kind { get; }
+        public IReadOnlyList<string>? Routes { get; }
+
+        /// <summary>Plain timed deferral — only the recheck timer re-queues the item.</summary>
+        public static DeferredWait None => new(DeferredItemKind.Generic, null);
+
+        /// <summary>
+        /// Refactor-exclusivity drain deferral — cleared by drain-claim state
+        /// on a slot release, never by route-cap release.
+        /// </summary>
+        public static DeferredWait RefactorGate => new(DeferredItemKind.RefactorGate, null);
+
+        /// <summary>
+        /// Deferral waiting on the given at-cap routes; a slot release on any
+        /// of them wakes the item back into dispatch ordering immediately.
+        /// </summary>
+        public static DeferredWait AgentCap(IReadOnlyList<string> routes) =>
+            routes is { Count: > 0 }
+                ? new(DeferredItemKind.AgentCap, routes)
+                : throw new ArgumentException(
+                    "An agent-cap deferral requires at least one wait route", nameof(routes));
+    }
+
     private enum DeferredItemKind
     {
         Generic,
@@ -3809,6 +3804,110 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         long Generation,
         DeferredItemKind Kind,
         IReadOnlyList<string>? WaitingOnRoutes = null);
+
+    /// <summary>
+    /// The deferred-dispatch bookkeeping: which items are sleeping on a
+    /// requeue timer, what kind of deferral each is under, and which at-cap
+    /// routes can clear it early. Owns the lease generation counter so a
+    /// removed-then-re-added deferral can never be confused with a stale
+    /// lease — one wake per deferral, no duplicates. The requeue timer itself
+    /// stays on the service (it needs the queue, clock, and test hooks); this
+    /// registry holds the shared state and the route-matching/wake policy.
+    /// </summary>
+    private sealed class DeferredItemRegistry
+    {
+        private readonly ConcurrentDictionary<WorkItemId, DeferredItemLease> _items = new();
+        private long _generation;
+
+        public bool IsEmpty => _items.IsEmpty;
+
+        /// <summary>Snapshot of the currently-deferred item ids.</summary>
+        public ICollection<WorkItemId> Ids => _items.Keys;
+
+        public bool Contains(WorkItemId id) => _items.ContainsKey(id);
+
+        public bool TryGet(WorkItemId id, out DeferredItemLease lease) =>
+            _items.TryGetValue(id, out lease);
+
+        /// <summary>
+        /// Registers a deferral under a fresh lease generation. Returns false
+        /// when the item is already deferred — the existing timer stays the
+        /// single owner so duplicate pickups cannot amplify wakeups.
+        /// </summary>
+        public bool TryAdd(WorkItemId id, DeferredWait wait, out DeferredItemLease lease)
+        {
+            lease = new DeferredItemLease(
+                Interlocked.Increment(ref _generation), wait.Kind, wait.Routes);
+            return _items.TryAdd(id, lease);
+        }
+
+        /// <summary>
+        /// Lease-checked remove: returns false when a newer deferral (or no
+        /// deferral) owns the slot, so a stale timer or release wake cannot
+        /// clear a re-deferral it did not create.
+        /// </summary>
+        public bool Remove(WorkItemId id, DeferredItemLease lease) =>
+            ((ICollection<KeyValuePair<WorkItemId, DeferredItemLease>>)_items)
+                .Remove(new KeyValuePair<WorkItemId, DeferredItemLease>(id, lease));
+
+        /// <summary>Unconditional remove — recovery/test paths that own the item.</summary>
+        public void Remove(WorkItemId id) => _items.TryRemove(id, out _);
+
+        /// <summary>Direct set for test hooks that need a deferral without a timer.</summary>
+        public void MarkForTest(WorkItemId id) =>
+            _items[id] = new DeferredItemLease(0, DeferredItemKind.Generic);
+
+        public IReadOnlyList<WorkItemId> IdsOfKind(DeferredItemKind kind)
+        {
+            var ids = new List<WorkItemId>();
+            foreach (var (id, lease) in _items)
+                if (lease.Kind == kind)
+                    ids.Add(id);
+            return ids;
+        }
+
+        /// <summary>Lease-checked remove when the item is deferred under <paramref name="kind"/>.</summary>
+        public bool ClearIfKind(WorkItemId id, DeferredItemKind kind) =>
+            _items.TryGetValue(id, out var lease)
+            && lease.Kind == kind
+            && Remove(id, lease);
+
+        /// <summary>
+        /// Clears every <see cref="DeferredItemKind.AgentCap"/> deferral
+        /// waiting on <paramref name="routeKey"/> and returns how many items
+        /// were woken. Each cleared item goes through the same lease-checked
+        /// removal the requeue timer uses, so the still-sleeping timer
+        /// becomes a no-op — exactly one wake per deferral.
+        /// </summary>
+        public int WakeAgentCapWaiters(string routeKey)
+        {
+            if (_items.IsEmpty)
+                return 0;
+
+            var woken = 0;
+            foreach (var (id, lease) in _items)
+            {
+                if (lease.Kind != DeferredItemKind.AgentCap || lease.WaitingOnRoutes is null)
+                    continue;
+
+                var waitsOnRoute = false;
+                foreach (var route in lease.WaitingOnRoutes)
+                {
+                    if (string.Equals(route, routeKey, StringComparison.OrdinalIgnoreCase))
+                    {
+                        waitsOnRoute = true;
+                        break;
+                    }
+                }
+                if (!waitsOnRoute)
+                    continue;
+
+                if (Remove(id, lease))
+                    woken++;
+            }
+            return woken;
+        }
+    }
 
     /// <summary>
     /// Checks per-project budget caps against the store. Returns a
@@ -3946,7 +4045,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 skipIds.Add(activeId);
         }
 
-        foreach (var deferredId in _deferredItems.Keys)
+        foreach (var deferredId in _deferredItems.Ids)
         {
             if (deferredId != candidate.Id)
                 skipIds.Add(deferredId);
@@ -4024,7 +4123,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private void ScheduleRefactorExclusivityRequeue(WorkItemId id, CancellationToken ct)
-        => ScheduleDeferredRequeue(id, RefactorExclusivityRecheckInterval, ct, DeferredItemKind.RefactorGate);
+        => ScheduleDeferredRequeue(id, RefactorExclusivityRecheckInterval, ct, DeferredWait.RefactorGate);
 
     private async Task<bool> TryClaimOrDeferRefactorDrainAsync(WorkItem item, CancellationToken ct)
     {
@@ -4224,17 +4323,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         WorkItemId id,
         TimeSpan delay,
         CancellationToken stoppingToken,
-        DeferredItemKind kind = DeferredItemKind.Generic,
-        IReadOnlyList<string>? waitingOnRoutes = null)
+        DeferredWait wait = default)
     {
         // A concurrent pickup race can try to defer the same queued item from
         // more than one worker. Keep one timer owner per item so stale duplicate
         // retries do not amplify dispatcher wakeups or deferral backlog.
-        var lease = new DeferredItemLease(
-            Interlocked.Increment(ref _deferredItemGeneration),
-            kind,
-            waitingOnRoutes);
-        if (!_deferredItems.TryAdd(id, lease))
+        if (!_deferredItems.TryAdd(id, wait, out var lease))
             return;
 
         var count = Interlocked.Increment(ref _pendingDeferrals);
@@ -4298,8 +4392,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private bool RemoveDeferredItem(WorkItemId id, DeferredItemLease lease)
-        => ((ICollection<KeyValuePair<WorkItemId, DeferredItemLease>>)_deferredItems)
-            .Remove(new KeyValuePair<WorkItemId, DeferredItemLease>(id, lease));
+        => _deferredItems.Remove(id, lease);
 
     /// <summary>
     /// Called after a work item reaches a terminal state. Scans the store for
