@@ -207,6 +207,17 @@ internal sealed class ReloadableSandboxProvider :
             .SelectMany(static provider => provider.Progress.SnapshotActiveSandboxProgress())
             .ToArray();
 
+    public async ValueTask<IReadOnlyList<ActiveSandboxProgress>> SnapshotActiveSandboxProgressAsync(CancellationToken ct = default)
+    {
+        // Fan out in parallel: providers that sample live signals (guest CPU
+        // queries) would otherwise serialize their per-call timeouts.
+        var snapshots = ActivatedProviders
+            .Select(provider => provider.Progress.SnapshotActiveSandboxProgressAsync(ct).AsTask())
+            .ToArray();
+        var results = await Task.WhenAll(snapshots).ConfigureAwait(false);
+        return results.SelectMany(static snapshot => snapshot).ToArray();
+    }
+
     public IReadOnlyList<DiskGuardSample> SampleDiskGuardState() =>
         ActivatedProviders
             .SelectMany(static provider => provider.DiskGuard.SampleDiskGuardState())

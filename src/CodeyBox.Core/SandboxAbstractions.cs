@@ -818,7 +818,15 @@ public interface IActiveSandboxProvider
 /// signal for detached VM-local work and use <see cref="Status"/> to report a
 /// richer reason when providers can expose changing activity.
 /// </summary>
-public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string SandboxId, string? Status = null);
+/// <param name="WorkItemId">Work item that owns the sandbox.</param>
+/// <param name="SandboxId">Provider-side sandbox identifier.</param>
+/// <param name="Status">Provider-defined activity marker. Watchdog signature
+/// tracking treats a changed value as progress, so a provider that emits a
+/// live signal must keep it stable while the sandbox is idle.</param>
+/// <param name="CpuFraction">Latest measured CPU activity as a fraction of one
+/// core averaged over the provider's sample interval (1.0 = one fully busy
+/// core); null when the provider does not measure CPU.</param>
+public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string SandboxId, string? Status = null, double? CpuFraction = null);
 
 /// <summary>
 /// Optional provider capability for reporting active sandbox ownership.
@@ -827,10 +835,23 @@ public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string Sandbox
 public interface IActiveSandboxProgressProvider
 {
     /// <summary>
-    /// Snapshot of currently-active sandboxes, projected to the fields progress
-    /// monitoring needs.
+    /// Last-known snapshot of currently-active sandboxes, projected to the
+    /// fields progress monitoring needs. This member never refreshes activity
+    /// projections: providers that sample live signals (e.g. guest CPU) return
+    /// the cached values produced by the most recent
+    /// <see cref="SnapshotActiveSandboxProgressAsync"/>, so both members report
+    /// the same projection.
     /// </summary>
     IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress();
+
+    /// <summary>
+    /// Asynchronously samples and snapshots currently-active sandboxes, refreshing
+    /// activity projections such as guest CPU metrics where supported. The
+    /// default delegates to the non-refreshing
+    /// <see cref="SnapshotActiveSandboxProgress"/>.
+    /// </summary>
+    ValueTask<IReadOnlyList<ActiveSandboxProgress>> SnapshotActiveSandboxProgressAsync(CancellationToken ct = default)
+        => ValueTask.FromResult(SnapshotActiveSandboxProgress());
 }
 
 /// <summary>

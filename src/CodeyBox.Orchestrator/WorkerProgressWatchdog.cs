@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -194,9 +195,12 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 if (workerActivity is not null)
                 {
                     _workerActivityProgress[activityKey] = new WorkerActivityProgress(now, workerActivity.Reason);
+                    var cpuText = workerActivity.CpuFraction is { } cpuFraction
+                        ? cpuFraction.ToString("P1", CultureInfo.InvariantCulture)
+                        : "n/a";
                     _log.LogDebug(
-                        "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason}; treating as progress",
-                        worker.WorkerId, itemId, workerActivity.Reason);
+                        "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason} (cpu={CpuFraction}); treating as progress",
+                        worker.WorkerId, itemId, workerActivity.Reason, cpuText);
                     continue;
                 }
 
