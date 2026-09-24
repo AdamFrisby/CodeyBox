@@ -202,6 +202,14 @@ def run_turn(client, prompt, cwd, mode):
             return EXIT_TURN_FAILED
 
         if stage == "initialize":
+            # The negotiated version must be the one this client drives; a
+            # peer speaking anything else would only fail later, in a less
+            # diagnosable stage.
+            if result.get("protocolVersion") != ACP_PROTOCOL_VERSION:
+                emit("fatal", stage="initialize",
+                     message="devin acp spoke protocolVersion %r; expected %d"
+                             % (result.get("protocolVersion"), ACP_PROTOCOL_VERSION))
+                return EXIT_TURN_FAILED
             client.request("session/new", "session/new",
                            {"cwd": cwd, "mcpServers": []})
         elif stage == "session/new":
@@ -235,6 +243,10 @@ def run_turn(client, prompt, cwd, mode):
             return 0
         else:
             emit("protocol_error", message="response for unhandled stage", stage=stage)
+            # The pending request was already popped and no follow-up is
+            # sent, so continuing here would deadlock the turn until the
+            # agent closes stdout — fail fast instead.
+            return EXIT_TURN_FAILED
 
 
 def send_prompt(client, session_id, prompt):

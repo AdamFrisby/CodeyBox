@@ -460,6 +460,12 @@ materialises the shim and a prompt file from a framed stdin payload
   `Error: …` lines on stderr (verified: `Error: Not logged in` exits
   nonzero before the handshake); `DevinTerminalDiagnoser` lifts the first
   such line as a fallback.
+- Envelope provenance: `devin.acp` lines are claimed by their type tag, so
+  exec stderr — the CLI inherits it, including tool-subprocess output —
+  is wrapped into `codeybox.stderr` envelopes before joining the captured
+  stream, whatever the pipeline's capture flag. A line the model prints to
+  stderr can never impersonate a shim envelope and falsify usage/cost
+  records.
 - The text-only path (`RunTextOnlyAsync`) still uses
   `devin -p --respect-workspace-trust false` with no permission flag —
   the read-only `auto` default is the conservative shape for answering

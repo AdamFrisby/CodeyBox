@@ -34,14 +34,14 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
         if (!TryClaim(root))
             return base.ParseEvent(root);
 
-        var eventName = FirstString(root, "event") ?? "unknown";
+        var eventName = FirstString(root, DevinAcpEnvelope.EventPropertyName) ?? "unknown";
         var timestamp = TryTimestamp(root);
         return eventName switch
         {
             DevinAcpEnvelope.EventSessionUpdate => ParseSessionUpdate(root, timestamp),
             DevinAcpEnvelope.EventTurnComplete => ParseTurnComplete(root, timestamp),
             DevinAcpEnvelope.EventTurnError or DevinAcpEnvelope.EventFatal => new ParsedEvent(
-                EventType: eventName,
+                EventType: $"devin.acp.{eventName}",
                 Timestamp: timestamp,
                 IsAssistant: false,
                 ToolStarts: [],
@@ -78,9 +78,9 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
         var isAssistant = false;
         int? inputTokens = null, outputTokens = null, cachedInputTokens = null;
 
-        if (TryGet(root, out var update, "update") && update.ValueKind == JsonValueKind.Object)
+        if (DevinAcpEnvelope.TryGetUpdate(root, out var update))
         {
-            switch (FirstString(update, "sessionUpdate"))
+            switch (FirstString(update, DevinAcpEnvelope.SessionUpdatePropertyName))
             {
                 case "tool_call":
                 {
@@ -116,7 +116,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                     // `used`/`size` are context-window occupancy, not
                     // cumulative billing; the _meta counters carry the
                     // per-turn token totals.
-                    if (TryGet(update, out var meta, "_meta"))
+                    if (TryGet(update, out var meta, DevinAcpEnvelope.MetaPropertyName))
                     {
                         (inputTokens, outputTokens, cachedInputTokens) = DevinAcpEnvelope.ReadUsage(meta);
                     }
@@ -149,7 +149,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
     private static ParsedEvent ParseTurnComplete(JsonElement root, DateTimeOffset? timestamp)
     {
         int? inputTokens = null, outputTokens = null, cachedInputTokens = null;
-        if (TryGet(root, out var usage, "usage"))
+        if (DevinAcpEnvelope.TryGetTurnUsage(root, out var usage))
         {
             (inputTokens, outputTokens, cachedInputTokens) = DevinAcpEnvelope.ReadUsage(usage);
         }

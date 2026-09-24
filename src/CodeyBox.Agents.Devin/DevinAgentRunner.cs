@@ -29,7 +29,8 @@ namespace CodeyBox.Agents.Devin;
 /// (<c>AcpClaudeTransport</c> + the NativeAOT <c>claude-acp-bridge</c>)
 /// impersonates an IDE WebSocket for <c>claude --ide</c>; it cannot speak
 /// to a stdio ACP server, so devin gets its own thin client — the two share
-/// only the framed-stdin payload delivery shape.</para>
+/// the framed-stdin payload delivery contract
+/// (<c>CodeyBox.Agents.FramedStdin</c>).</para>
 ///
 /// <para><b>Autonomy.</b> ACP sessions expose modes
 /// (<c>accept-edits|smart|ask|plan|bypass</c>); the global
@@ -190,14 +191,19 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         // The Devin CLI has no reasoning-effort flag; ReasoningMode is accepted
         // so the agent-class config schema stays uniform but is not threaded
         // into argv. ACP envelopes are the only output mode this runner
-        // speaks, so captureStructuredStream needs no argv switch.
+        // speaks, so captureStructuredStream needs no argv switch — but the
+        // envelope framing is still declared so the exec layer wraps stderr
+        // instead of teeing it raw into the envelope channel (a
+        // model-controlled stderr line shaped like devin.acp output would
+        // otherwise forge stream events and falsify cost records).
         _ = reasoningMode;
         _ = credential;
         _ = captureStructuredStream;
 
         return new AgentInvocation(
             ["bash", "-c", BuildAcpDispatchScript(AcpShimArgs(Binary, EffectiveModelId(modelId), FullAutonomyAcpMode))],
-            Stdin: DevinAcpShim.BuildDispatchStdin(prompt));
+            Stdin: DevinAcpShim.BuildDispatchStdin(prompt),
+            StdoutIsEnvelopeFramed: true);
     }
 
     private string? EffectiveModelId(string? modelId)
@@ -218,7 +224,7 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// <paramref name="mode"/> is applied via <c>session/set_mode</c> before
     /// the prompt (<see cref="FullAutonomyAcpMode"/> for dispatches).
     /// </summary>
-    public static IReadOnlyList<string> AcpShimArgs(string binary, string? modelId, string? mode)
+    internal static IReadOnlyList<string> AcpShimArgs(string binary, string? modelId, string? mode)
     {
         var args = new List<string> { "--binary", binary };
         if (!string.IsNullOrEmpty(modelId))
@@ -237,9 +243,9 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// <summary>
     /// The <c>bash -c</c> script that materialises the embedded shim and the
     /// piped prompt into a private <c>mktemp</c> dir, then runs the shim.
-    /// Public so <c>DevinInVmSmokeProbe</c> exercises the exact dispatch path
-    /// — a probe that passed while dispatch failed is what let the
-    /// <c>/dev/stdin</c> fault reach production.
+    /// Internal so <c>DevinInVmSmokeProbe</c> (same assembly) exercises the
+    /// exact dispatch path — a probe that passed while dispatch failed is
+    /// what let the <c>/dev/stdin</c> fault reach production.
     ///
     /// <para>Stdin is framed as
     /// <see cref="DevinAcpShim.BuildDispatchStdin"/> produces: base64 shim
@@ -252,7 +258,7 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// <see cref="PreemptProcessPattern"/> still matches the
     /// <c>devin acp</c> child process.</para>
     /// </summary>
-    public static string BuildAcpDispatchScript(IReadOnlyList<string> shimArgs)
+    internal static string BuildAcpDispatchScript(IReadOnlyList<string> shimArgs)
     {
         ArgumentNullException.ThrowIfNull(shimArgs);
         if (shimArgs.Count == 0)
@@ -266,11 +272,7 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
             "cb_shim=\"$cb_dir/acp_client.py\"",
             "cb_shim_b64=\"$cb_dir/acp_client.b64\"",
             "cb_prompt=\"$cb_dir/prompt.txt\"",
-            "cb_found=0",
-            "while IFS= read -r line; do",
-            $"  if [ \"$line\" = '{DevinAcpShim.StdinEndMarker}' ]; then cb_found=1; break; fi",
-            "  printf '%s\\n' \"$line\" >> \"$cb_shim_b64\"",
-            "done",
+            FramedStdin.BashReaderBlock(DevinAcpShim.StdinEndMarker, "cb_shim_b64", "cb_found"),
             "[ \"$cb_found\" = 1 ] || { echo 'missing devin acp shim terminator' >&2; exit 1; }",
             "base64 -d \"$cb_shim_b64\" > \"$cb_shim\"",
             "cat > \"$cb_prompt\"",
@@ -456,23 +458,26 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
             return result;
 
         var outcome = DevinAcpOutcome.Extract(result.Stdout);
-        if (outcome.Diagnostic is { } acpFailure)
-            return result with { TerminalDiagnostic = acpFailure };
-
-        if (DevinTerminalDiagnoser.TryExtractTerminalError(result.Stderr, result.Stdout) is { } terminalError)
-            return result with { TerminalDiagnostic = terminalError };
 
         // A zero exit without the shim's terminal envelope means the run was
         // cut short before the turn outcome was written (killed shim, capped
-        // stdout) — honest failure, not a silent success.
+        // stdout) — honest failure, not a silent success. The flip runs
+        // before the diagnostic lifts so a turn_error/fatal envelope can
+        // never keep Success=true even if the exec layer reported 0.
         if (result.Success && outcome.Event != DevinAcpOutcome.TerminalEvent.TurnComplete)
         {
-            return result with
+            result = result with
             {
                 Success = false,
                 Summary = "devin acp exited without reporting a turn outcome",
             };
         }
+
+        if (outcome.Diagnostic is { } acpFailure)
+            return result with { TerminalDiagnostic = acpFailure };
+
+        if (DevinTerminalDiagnoser.TryExtractTerminalError(result.Stderr, result.Stdout) is { } terminalError)
+            return result with { TerminalDiagnostic = terminalError };
 
         return result;
     }

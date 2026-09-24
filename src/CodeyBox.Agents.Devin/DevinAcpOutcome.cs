@@ -76,10 +76,19 @@ internal static class DevinAcpOutcome
             && stageEl.ValueKind == JsonValueKind.String
             ? stageEl.GetString()
             : null;
+        // The shim stamps the peer's JSON-RPC error code on terminal
+        // envelopes; keep it so classification sees the same numeric
+        // signal the wire carried.
+        var code = root.TryGetProperty("code", out var codeEl)
+            && codeEl.ValueKind is JsonValueKind.Number or JsonValueKind.String
+            ? codeEl.ToString()
+            : null;
 
         var text = stage is null
             ? $"devin acp {prefix}: {message ?? "unknown"}"
             : $"devin acp {prefix} during {stage}: {message ?? "unknown"}";
+        if (code is not null)
+            text += $" (code {code})";
         return text.Length <= MaxDiagnosticChars
             ? text
             : text[..MaxDiagnosticChars] + "…";

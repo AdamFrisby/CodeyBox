@@ -1,5 +1,5 @@
 using System.Reflection;
-using System.Text;
+using CodeyBox.Agents;
 
 namespace CodeyBox.Agents.Devin;
 
@@ -16,8 +16,8 @@ namespace CodeyBox.Agents.Devin;
 /// IDE WebSocket for <c>claude --ide</c>), <c>devin acp</c> IS the ACP
 /// server — it needs a plain stdio JSON-RPC client, which is what this shim
 /// is. The two share only the framed-stdin delivery shape (base64 payload +
-/// terminator + prompt), mirroring
-/// <c>AcpClaudeTransport.BuildBridgeLauncherStdin</c>.</para>
+/// terminator + prompt), implemented once in
+/// <c>CodeyBox.Agents.FramedStdin</c>.</para>
 /// </summary>
 internal static class DevinAcpShim
 {
@@ -54,34 +54,22 @@ internal static class DevinAcpShim
     }
 
     /// <summary>
-    /// Line width of the base64 shim block in the dispatch stdin frame —
-    /// the MIME/base64 convention; the bash wrapper re-collects the block
-    /// line-by-line before decoding, so the wrap width is part of the
-    /// framing contract.
-    /// </summary>
-    private const int Base64LineWidth = 76;
-
-    /// <summary>
-    /// The dispatch exec stdin frame: the base64-encoded shim (wrapped at
-    /// <see cref="Base64LineWidth"/>), the end marker on its own line, then
-    /// the prompt verbatim. The wrapper script decodes the shim to a temp
-    /// file and pipes the rest to the prompt file, so the prompt never
-    /// enters argv, the environment, or <c>/proc/&lt;pid&gt;/environ</c> —
-    /// the same delivery guarantee the print-mode prompt file had.
+    /// The dispatch exec stdin frame, built by
+    /// <see cref="FramedStdin.Build"/>: the base64-encoded shim (wrapped at
+    /// <see cref="FramedStdin.Base64LineWidth"/>), the end marker on its own
+    /// line, then the prompt verbatim. The wrapper script decodes the shim
+    /// to a temp file and pipes the rest to the prompt file, so the prompt
+    /// never enters argv, the environment, or
+    /// <c>/proc/&lt;pid&gt;/environ</c> — the same delivery guarantee the
+    /// print-mode prompt file had.
     /// </summary>
     public static string BuildDispatchStdin(string prompt)
     {
         ArgumentNullException.ThrowIfNull(prompt);
 
-        var base64 = Convert.ToBase64String(LoadScriptBytes().Span);
-        var sb = new StringBuilder(base64.Length + prompt.Length + StdinEndMarker.Length + 32);
-        for (var i = 0; i < base64.Length; i += Base64LineWidth)
-        {
-            var len = Math.Min(Base64LineWidth, base64.Length - i);
-            sb.Append(base64, i, len).Append('\n');
-        }
-        sb.Append(StdinEndMarker).Append('\n');
-        sb.Append(prompt);
-        return sb.ToString();
+        return FramedStdin.Build(
+            Convert.ToBase64String(LoadScriptBytes().Span),
+            StdinEndMarker,
+            prompt);
     }
 }

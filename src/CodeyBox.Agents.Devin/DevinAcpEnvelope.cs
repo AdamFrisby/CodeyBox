@@ -5,8 +5,9 @@ namespace CodeyBox.Agents.Devin;
 /// <summary>
 /// The single reader for the shim's <c>devin.acp</c> NDJSON envelope
 /// contract (<c>Resources/devin-acp-client.py</c>): the line scan, the
-/// envelope validation, the event-name vocabulary, and the usage-counter
-/// key policy. Every consumer — <see cref="DevinAcpOutcome"/>,
+/// envelope validation, the event-name vocabulary, the nested
+/// <c>update</c>/<c>usage</c> shape navigation, and the usage-counter key
+/// policy. Every consumer — <see cref="DevinAcpOutcome"/>,
 /// <see cref="DevinCostExtractor"/>, <see cref="DevinStreamParser"/> —
 /// reads through this type so a wire change lands in one place instead of
 /// drifting across three scans (a snake_case usage object must feed the
@@ -16,6 +17,14 @@ internal static class DevinAcpEnvelope
 {
     /// <summary>The <c>type</c> tag stamped on every envelope the shim emits.</summary>
     internal const string EnvelopeType = "devin.acp";
+
+    // Property names on the envelope root and inside the `update` object.
+    // Centralised so no consumer re-literals the contract strings.
+    internal const string EventPropertyName = "event";
+    internal const string UpdatePropertyName = "update";
+    internal const string SessionUpdatePropertyName = "sessionUpdate";
+    internal const string MetaPropertyName = "_meta";
+    internal const string UsagePropertyName = "usage";
 
     // Envelope `event` values the C# consumers dispatch on. The Python shim
     // owns the emitting vocabulary — keep these in lockstep with its
@@ -71,7 +80,7 @@ internal static class DevinAcpEnvelope
             {
                 var root = doc.RootElement;
                 if (IsEnvelope(root)
-                    && root.TryGetProperty("event", out var eventEl)
+                    && root.TryGetProperty(EventPropertyName, out var eventEl)
                     && eventEl.ValueKind == JsonValueKind.String
                     && eventEl.GetString() is { } eventName)
                 {
@@ -92,6 +101,48 @@ internal static class DevinAcpEnvelope
         && root.TryGetProperty("type", out var typeEl)
         && typeEl.ValueKind == JsonValueKind.String
         && typeEl.GetString() == EnvelopeType;
+
+    /// <summary>
+    /// Reads the envelope's <c>update</c> object — the ACP
+    /// <c>session/update</c> params carried by an
+    /// <see cref="EventSessionUpdate"/> envelope.
+    /// </summary>
+    internal static bool TryGetUpdate(JsonElement root, out JsonElement update)
+    {
+        update = default;
+        return root.TryGetProperty(UpdatePropertyName, out update)
+            && update.ValueKind == JsonValueKind.Object;
+    }
+
+    /// <summary>
+    /// Reads the <c>_meta</c> counter bag of a
+    /// <see cref="EventSessionUpdate"/> envelope whose
+    /// <c>update.sessionUpdate</c> discriminator is
+    /// <see cref="UpdateKindUsageUpdate"/> — the nested-shape rule every
+    /// usage consumer must agree on.
+    /// </summary>
+    internal static bool TryGetUsageUpdateMeta(JsonElement root, out JsonElement meta)
+    {
+        meta = default;
+        return TryGetUpdate(root, out var update)
+            && update.TryGetProperty(SessionUpdatePropertyName, out var sessionUpdate)
+            && sessionUpdate.ValueKind == JsonValueKind.String
+            && sessionUpdate.GetString() == UpdateKindUsageUpdate
+            && update.TryGetProperty(MetaPropertyName, out meta)
+            && meta.ValueKind == JsonValueKind.Object;
+    }
+
+    /// <summary>
+    /// Reads the <c>usage</c> totals object on a
+    /// <see cref="EventTurnComplete"/> envelope — the ACP
+    /// <c>session/prompt</c> result's usage bag.
+    /// </summary>
+    internal static bool TryGetTurnUsage(JsonElement root, out JsonElement usage)
+    {
+        usage = default;
+        return root.TryGetProperty(UsagePropertyName, out usage)
+            && usage.ValueKind == JsonValueKind.Object;
+    }
 
     /// <summary>
     /// Reads the per-turn token counters from a usage-shaped bag — either

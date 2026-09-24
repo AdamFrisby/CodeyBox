@@ -47,10 +47,22 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// protected so argv/environment/stdin details do not leak into Core's
     /// domain/plugin-facing API.
     /// </summary>
+    /// <param name="StdoutIsEnvelopeFramed">
+    /// True when the invocation's stdout is a structured NDJSON envelope
+    /// stream regardless of the pipeline's
+    /// <c>captureStructuredStream</c> flag (e.g. the devin ACP shim, which
+    /// always emits <c>devin.acp</c> envelopes). The exec layer must then
+    /// wrap stderr lines in <c>codeybox.stderr</c> envelopes before they
+    /// join the chunk channel: tee'd raw stderr lines would be
+    /// indistinguishable from genuine envelopes, so agent-controlled stderr
+    /// could forge stream events and falsify persisted cost/summary
+    /// records.
+    /// </param>
     protected sealed record AgentInvocation(
         IReadOnlyList<string> Argv,
         IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
-        string? Stdin = null);
+        string? Stdin = null,
+        bool StdoutIsEnvelopeFramed = false);
 
     /// <summary>
     /// Build the argv to execute inside the sandbox for a given prompt. The
@@ -912,10 +924,15 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         // line JSON envelope and forwards it through the same callback, so
         // the .jsonl carries a recoverable record of stderr (auth/usage
         // diagnostics that fire before any structured event is emitted)
-        // without any framing risk.
+        // without any framing risk. The same wrapping applies whenever the
+        // invocation declares envelope-framed stdout even when the pipeline
+        // asked for a plaintext capture: a raw stderr line shaped like a
+        // stream envelope would otherwise be claimed as genuine output and
+        // corrupt the stream summary and cost records built from the
+        // aggregated chunks.
         StderrEnvelopeForwarder? envelopeForwarder = null;
         Action<string>? stderrChunkCallback;
-        if (captureStructuredStream)
+        if (captureStructuredStream || invocation.StdoutIsEnvelopeFramed)
         {
             envelopeForwarder = stdoutChunkCallback is null
                 ? null
@@ -1890,7 +1907,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// by file) quotes argv the same way rather than re-implementing it.
     /// </summary>
     protected static string ShellQuote(string value) =>
-        "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
+        FramedStdin.ShellQuote(value);
 
     private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>
         $"{Kind.Value}\n{sandbox.Id}\n{workingDirectory}";

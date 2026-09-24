@@ -1,4 +1,3 @@
-using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 
@@ -12,10 +11,11 @@ namespace CodeyBox.Agents.Devin;
 /// <c>turn_complete</c> wraps the ACP <c>session/prompt</c> response whose
 /// <c>usage</c> object reports the turn's token totals (verified against
 /// devin 3000.11.1: <c>inputTokens</c>/<c>outputTokens</c>/
-/// <c>totalTokens</c>). The last <c>usage_update</c> envelope's
-/// <c>_meta["cognition.ai/cachedReadTokens"]</c> supplies the cached-input
-/// bucket. A stream with neither yields <c>null</c> so the pipeline still
-/// records a zero-token row whose timestamps feed
+/// <c>totalTokens</c>). The <c>usage_update</c> envelopes'
+/// <c>_meta["cognition.ai/*"]</c> bags are cumulative per turn, so the
+/// LAST tick's counters win — supplying buckets the terminal usage object
+/// lacks (e.g. cached input). A stream with neither yields <c>null</c> so
+/// the pipeline still records a zero-token row whose timestamps feed
 /// <c>usageTotal.elapsedMs</c>.</para>
 ///
 /// <para><see cref="DefaultPricing"/> is null because cost is unknown —
@@ -41,8 +41,7 @@ public sealed class DevinCostExtractor : IAgentCostExtractor
         {
             var root = envelope.Root;
             if (envelope.Event == DevinAcpEnvelope.EventTurnComplete
-                && root.TryGetProperty("usage", out var usage)
-                && usage.ValueKind == JsonValueKind.Object)
+                && DevinAcpEnvelope.TryGetTurnUsage(root, out var usage))
             {
                 // The terminal envelope's totals win over every
                 // intermediate usage_update tick.
@@ -53,11 +52,14 @@ public sealed class DevinCostExtractor : IAgentCostExtractor
                 sawUsage = true;
             }
             else if (envelope.Event == DevinAcpEnvelope.EventSessionUpdate
-                     && TryGetUsageUpdateMeta(root, out var meta))
+                     && DevinAcpEnvelope.TryGetUsageUpdateMeta(root, out var meta))
             {
+                // The _meta counters are cumulative over the turn, so the
+                // last tick carries the totals — same last-wins policy as
+                // the terminal envelope for every bucket.
                 var tick = DevinAcpEnvelope.ReadUsage(meta);
-                inputTokens ??= tick.Input;
-                outputTokens ??= tick.Output;
+                inputTokens = tick.Input ?? inputTokens;
+                outputTokens = tick.Output ?? outputTokens;
                 cachedInputTokens = tick.CachedInput ?? cachedInputTokens;
                 sawUsage = true;
             }
@@ -66,17 +68,5 @@ public sealed class DevinCostExtractor : IAgentCostExtractor
         return sawUsage
             ? new AgentCostSnapshot(inputTokens ?? 0, cachedInputTokens ?? 0, outputTokens ?? 0, ModelId: null)
             : null;
-    }
-
-    private static bool TryGetUsageUpdateMeta(JsonElement root, out JsonElement meta)
-    {
-        meta = default;
-        return root.TryGetProperty("update", out var update)
-            && update.ValueKind == JsonValueKind.Object
-            && update.TryGetProperty("sessionUpdate", out var sessionUpdate)
-            && sessionUpdate.ValueKind == JsonValueKind.String
-            && sessionUpdate.GetString() == DevinAcpEnvelope.UpdateKindUsageUpdate
-            && update.TryGetProperty("_meta", out meta)
-            && meta.ValueKind == JsonValueKind.Object;
     }
 }

@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Claude;
@@ -144,7 +145,6 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             "set -eu\n" +
             "fail(){ msg=$1; cat >/dev/null 2>/dev/null || true; echo \"$msg\" >&2; exit 1; }\n" +
             "expected_sha=" + ShellSingleQuote(expectedSha256) + "\n" +
-            "payload_end=" + ShellSingleQuote(BridgePayloadEndMarker) + "\n" +
             baseDirLine +
             "case \"$base_dir\" in /*) ;; *) fail \"ACP bridge install directory must be absolute: $base_dir\";; esac\n" +
             "[ ! -L \"$base_dir\" ] || fail \"refusing symlinked bridge directory: $base_dir\"\n" +
@@ -156,11 +156,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             "bridge=\"$tmpdir/" + BridgeFileName + "\"\n" +
             "b64=\"$tmpdir/payload.b64\"\n" +
             "trap 'rc=$?; rm -rf \"$tmpdir\"; exit $rc' EXIT INT TERM\n" +
-            "found=0\n" +
-            "while IFS= read -r line; do\n" +
-            "  if [ \"$line\" = \"$payload_end\" ]; then found=1; break; fi\n" +
-            "  printf '%s\\n' \"$line\" >> \"$b64\"\n" +
-            "done\n" +
+            FramedStdin.BashReaderBlock(BridgePayloadEndMarker, "b64", "found") + "\n" +
             "[ \"$found\" = 1 ] || fail \"missing ACP bridge payload terminator\"\n" +
             "[ -s \"$b64\" ] || fail \"missing ACP bridge payload\"\n" +
             "base64 -d \"$b64\" > \"$bridge\" || fail \"failed to decode ACP bridge payload\"\n" +
@@ -179,20 +175,10 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     }
 
     private static string ShellSingleQuote(string value)
-        => "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
+        => FramedStdin.ShellQuote(value);
 
     internal static string BuildBridgeLauncherStdin(string bridgeBase64, string bridgeStdin)
-    {
-        var sb = new StringBuilder(bridgeBase64.Length + bridgeStdin.Length + 128);
-        for (var i = 0; i < bridgeBase64.Length; i += 76)
-        {
-            var len = Math.Min(76, bridgeBase64.Length - i);
-            sb.Append(bridgeBase64, i, len).Append('\n');
-        }
-        sb.Append(BridgePayloadEndMarker).Append('\n');
-        sb.Append(bridgeStdin);
-        return sb.ToString();
-    }
+        => FramedStdin.Build(bridgeBase64, BridgePayloadEndMarker, bridgeStdin);
 
     internal sealed class AcpSession : ICredentialRefreshableClaudeTransportSession
     {
