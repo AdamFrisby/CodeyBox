@@ -6,6 +6,7 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
+using IdleClock = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -285,6 +286,8 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -293,12 +296,13 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             maxAuditIterations: 1,
             credentials: AuditCredentials(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            pipelineTimeProvider: idleClock);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
@@ -1159,6 +1163,8 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var auditAgentKind = new AgentKind("codex");
         var extraRunners = new[] { new ScriptedAgent(Array.Empty<MergeStrategy>()) { Kind = auditAgentKind } };
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -1176,12 +1182,13 @@ public sealed class BuildTestGateOrderingTests : IDisposable
                 MaxIterations = 1
             },
             extraAgentRunners: extraRunners,
+            pipelineTimeProvider: idleClock,
             logger: captLogger);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
@@ -1219,6 +1226,10 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var extraRunners = new[] { new ScriptedAgent(Array.Empty<MergeStrategy>()) { Kind = auditAgentKind } };
         var defaultProvider = new ProcessSandboxProvider(Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance);
         var launchTimeoutProvider = new AuditCredentialLaunchTimeoutSandboxProvider(defaultProvider);
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock
+        // scheduling — a slow non-credentialed sandbox launch/setup under suite load
+        // must not trip the 100 ms budget before the credentialed launch does.
+        var idleClock = NewIdleClock();
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -1237,12 +1248,13 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             },
             extraAgentRunners: extraRunners,
             sandboxProvider: launchTimeoutProvider,
+            pipelineTimeProvider: idleClock,
             logger: captLogger);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
@@ -1280,6 +1292,8 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         // Wrap the default sandbox provider to force kill/dispose timeouts
         var defaultProvider = new ProcessSandboxProvider(Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance);
         await using var timeoutProvider = new TimeoutSandboxProvider(defaultProvider, forceKillTimeout: true, forceDisposeTimeout: true);
+        // Idle budget elapses on the fake clock (advanced below), not on wall-clock scheduling.
+        var idleClock = NewIdleClock();
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -1298,12 +1312,13 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             },
             extraAgentRunners: extraRunners,
             sandboxProvider: timeoutProvider,
+            pipelineTimeProvider: idleClock,
             logger: captLogger);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        await RunWithAdvancingIdleClockAsync(idleClock, tp.Pipeline.RunAsync(item, CancellationToken.None));
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
 
@@ -1351,6 +1366,36 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
             UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
             UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+
+    // Sub-second AuditorIdleTimeout budgets in this class elapse on a fake
+    // clock (pipelineTimeProvider), advanced in lockstep with real time by
+    // RunWithAdvancingIdleClockAsync while the pipeline runs. A wall-clock
+    // 100 ms budget is a race under parallel-suite load: a genuinely slow
+    // sandbox launch or quiet audit-setup exec (e.g. git clone) trips the
+    // idle guard and the timeout is attributed to whichever auditor was being
+    // provisioned — not the auditor the test intends to time out. With the
+    // fake clock the budget only advances while the advancer runs, and under
+    // load the advancer's real delays stretch while its fake step stays fixed,
+    // so timeouts fire late rather than spuriously early. The clock starts at
+    // the real now so fake timestamps stay comparable with the real-clock
+    // timestamps recorded by stores outside the pipeline clock.
+    private static IdleClock NewIdleClock() => new(DateTimeOffset.UtcNow);
+
+    private static async Task RunWithAdvancingIdleClockAsync(IdleClock clock, Task pipelineTask)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        ArgumentNullException.ThrowIfNull(pipelineTask);
+        // 10 ms fake per ~10 ms real — never faster. A faster rate would
+        // tighten every pipeline budget in real terms and kill real work
+        // (e.g. audit-setup git clone) spuriously.
+        while (!pipelineTask.IsCompleted)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(10));
+            await Task.Delay(10);
+        }
+
+        await pipelineTask;
     }
 
     private static ConstantCredentialProvider AuditCredentials()

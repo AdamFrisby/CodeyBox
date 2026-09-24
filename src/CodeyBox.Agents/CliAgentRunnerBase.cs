@@ -64,6 +64,19 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         bool captureStructuredStream = false);
 
     /// <summary>
+    /// Build the argv to execute inside the sandbox for a given prompt and working directory.
+    /// Overridden by runners that require the working directory to configure CLI flags.
+    /// </summary>
+    protected virtual AgentInvocation BuildInvocation(
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
+
+    /// <summary>
     /// CLI state paths under HOME whose contents are useful for graceful
     /// preemption. The default preempt hook captures only these allowlisted
     /// relative paths, with size/type/path validation, into the checkpointed
@@ -142,6 +155,20 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string? reasoningMode = null,
         bool captureStructuredStream = false)
         => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
+
+    /// <summary>
+    /// Build the invocation used after a checkpoint restore with a given working directory.
+    /// Overridden by runners that require the working directory to configure CLI flags.
+    /// </summary>
+    protected virtual AgentInvocation BuildResumeInvocation(
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode, captureStructuredStream);
 
     /// <summary>
     /// Build the invocation used to continue a crashed native CLI session in
@@ -411,7 +438,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (preparation is not null)
             return preparation;
 
-        var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
+        var invocation = BuildInvocation(workingDirectory, prompt, credential, modelId, reasoningMode, captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
             sandbox,
             workingDirectory,
@@ -496,6 +523,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             return PreserveNativeSessionId(preparation, resume.NativeSessionId);
 
         var invocation = BuildResumeInvocation(
+            workingDirectory,
             prompt,
             credential,
             resume,
@@ -1058,6 +1086,18 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         => null;
 
     /// <summary>
+    /// Build argv for text-only sandbox calls with a given working directory.
+    /// Overridden by runners that require the working directory to configure CLI flags.
+    /// </summary>
+    protected virtual AgentInvocation? BuildTextOnlyInvocation(
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null)
+        => BuildTextOnlyInvocation(prompt, credential, modelId, reasoningMode);
+
+    /// <summary>
     /// Viability probe for subscription CLIs whose sandbox auth materialisation
     /// no-ops when the auth-json env var is absent (image-baked CLI auth).
     /// Returns null when text-only may proceed (including with no host credential).
@@ -1110,7 +1150,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (preparation is not null)
             return new TextOnlyAgentResult(false, preparation.Summary, preparation.Stdout, preparation.Stderr);
 
-        var invocation = BuildTextOnlyInvocation(prompt, credential, modelId, reasoningMode);
+        var invocation = BuildTextOnlyInvocation(workingDirectory, prompt, credential, modelId, reasoningMode);
         if (invocation is null)
         {
             return new TextOnlyAgentResult(
