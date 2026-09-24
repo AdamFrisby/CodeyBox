@@ -8,6 +8,11 @@ namespace CodeyBox.Orchestrator;
 /// A live worker-side signal that should count as watchdog progress even when
 /// the work item row and agent stream files are quiet.
 /// </summary>
+/// <param name="Reason">Short machine-readable label naming the signal that
+/// fired (e.g. <c>process-cpu</c>, <c>active-sandbox-change</c>).</param>
+/// <param name="CpuFraction">Measured CPU activity as a fraction of one core
+/// averaged over the provider's sample interval (1.0 = one fully busy core);
+/// null when the signal carries no CPU measurement.</param>
 public sealed record WorkerProgressActivity(string Reason, double? CpuFraction = null);
 
 /// <summary>
@@ -126,6 +131,12 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         try
         {
             snapshot = await activeProvider.SnapshotActiveSandboxProgressAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Caller-driven cancellation aborts the sweep; it is not the
+            // best-effort "no signal" the blanket catch below encodes.
+            throw;
         }
         catch
         {

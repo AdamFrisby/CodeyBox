@@ -230,8 +230,22 @@ public sealed record IncusSandboxOptions
     public bool CaptureResourceMetrics { get; init; }
     public TimeSpan ResourceMetricsCaptureTimeout { get; init; } = TimeSpan.FromSeconds(5);
     public TimeSpan ResourceMetricsSampleInterval { get; init; } = TimeSpan.FromSeconds(10);
+    /// <summary>
+    /// Guest-CPU activity threshold for the watchdog's active-sandbox signal,
+    /// as a percentage of one CPU core averaged over
+    /// <see cref="ActivitySampleInterval"/> (5 = 5% of one core). The emitted
+    /// progress signature changes only while the guest meets this threshold.
+    /// </summary>
     public double ActivityCpuThresholdPercent { get; init; } = 5.0;
+    /// <summary>
+    /// Minimum wall-clock interval between guest-CPU state queries for a given
+    /// sandbox. Snapshots requested sooner reuse the last sampled projection.
+    /// </summary>
     public TimeSpan ActivitySampleInterval { get; init; } = TimeSpan.FromSeconds(5);
+    /// <summary>
+    /// Per-call deadline for each <c>incus query /1.0/instances/&lt;name&gt;/state</c>
+    /// read. A timed-out query contributes no activity signal.
+    /// </summary>
     public TimeSpan ActivityQueryTimeout { get; init; } = TimeSpan.FromSeconds(5);
     public IncusDiskGuardOptions? DiskGuard { get; init; } = new();
 

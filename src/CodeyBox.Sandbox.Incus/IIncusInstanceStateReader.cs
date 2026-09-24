@@ -23,8 +23,12 @@ internal sealed class DefaultIncusInstanceStateReader(
         string instanceName,
         CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(options);
-        ArgumentException.ThrowIfNullOrWhiteSpace(instanceName);
+        // The instance name and project are interpolated into the Incus REST
+        // path below, so they must carry the same identifier guard every other
+        // Incus call site applies — an unvalidated name could smuggle '/',
+        // '?', or '%' escapes and redirect the query at a different endpoint.
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateInstanceName(instanceName, nameof(instanceName));
 
         var result = await cli.RunAllowFailureAsync(
             options,

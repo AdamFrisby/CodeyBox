@@ -209,14 +209,13 @@ internal sealed class ReloadableSandboxProvider :
 
     public async ValueTask<IReadOnlyList<ActiveSandboxProgress>> SnapshotActiveSandboxProgressAsync(CancellationToken ct = default)
     {
-        var activated = ActivatedProviders;
-        var results = new List<ActiveSandboxProgress>();
-        foreach (var provider in activated)
-        {
-            var progress = await provider.Progress.SnapshotActiveSandboxProgressAsync(ct).ConfigureAwait(false);
-            results.AddRange(progress);
-        }
-        return results;
+        // Fan out in parallel: providers that sample live signals (guest CPU
+        // queries) would otherwise serialize their per-call timeouts.
+        var snapshots = ActivatedProviders
+            .Select(provider => provider.Progress.SnapshotActiveSandboxProgressAsync(ct).AsTask())
+            .ToArray();
+        var results = await Task.WhenAll(snapshots).ConfigureAwait(false);
+        return results.SelectMany(static snapshot => snapshot).ToArray();
     }
 
     public IReadOnlyList<DiskGuardSample> SampleDiskGuardState() =>

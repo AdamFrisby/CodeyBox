@@ -92,6 +92,7 @@ public sealed class IncusSandboxProvider :
     private readonly Func<IncusSandboxOptions> _optionsAccessor;
     private readonly ILogger<IncusSandboxProvider> _log;
     private readonly IncusCliRunner _cli;
+    private readonly IIncusInstanceStateReader _stateReader;
     private readonly ITimingStore? _timings;
     private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly IDiskSpaceProbe _diskProbe;
@@ -102,6 +103,10 @@ public sealed class IncusSandboxProvider :
     private readonly string _lifecycleStagingRootPath;
     private readonly SemaphoreSlim _hostPreflightLock = new(1, 1);
     private readonly SemaphoreSlim _hostProvisioningInputGate = new(1, 1);
+    // Fan-out cap for the lightweight per-sandbox `incus query .../state`
+    // reads behind SnapshotActiveSandboxProgressAsync — deliberately outside
+    // the heavy-operation gate so watchdog probes never starve lifecycle ops.
+    private const int MaxConcurrentGuestStateQueries = 4;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _baselineLocks = new(StringComparer.Ordinal);
     private readonly IncusSharedPackageArchiveCache _sharedPackageArchives = new();
     // Boot gate: staggers concurrent VM boots (incus start + guest-agent wait)
@@ -112,6 +117,8 @@ public sealed class IncusSandboxProvider :
     private int _bootGateCapacity;
     private readonly ConcurrentDictionary<string, bool> _activeNames = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ActiveOwner> _activeOwners = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, GuestActivityState> _guestActivity = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _guestActivityRefreshLock = new(1, 1);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _uncertainBaselines = new(StringComparer.Ordinal);
     private long _lastPoolFreeBytes = -1;
     private string? _lastPoolName;
@@ -145,7 +152,8 @@ public sealed class IncusSandboxProvider :
         IDiskSpaceProbe? diskProbe = null,
         TimeProvider? timeProvider = null,
         Func<Guid>? newGuid = null,
-        Func<string, string?>? environmentVariableReader = null)
+        Func<string, string?>? environmentVariableReader = null,
+        IIncusInstanceStateReader? stateReader = null)
     {
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log ?? throw new ArgumentNullException(nameof(log));
@@ -156,6 +164,7 @@ public sealed class IncusSandboxProvider :
         _newGuid = newGuid ?? Guid.NewGuid;
         _environmentVariableReader = environmentVariableReader ?? Environment.GetEnvironmentVariable;
         _cli = new IncusCliRunner(runner, _timeProvider);
+        _stateReader = stateReader ?? new DefaultIncusInstanceStateReader(_cli, _timeProvider);
         var initialOptions = ReadValidatedOptions();
         _lifecycleProjectName = initialOptions.ProjectName;
         _lifecycleStagingRootPath = ResolveStagingRootPath(initialOptions);
@@ -1046,10 +1055,158 @@ public sealed class IncusSandboxProvider :
             .Select(owner => (owner.WorkItemId, (IShutdownTeardownSandbox)owner.Sandbox))
             .ToArray();
 
+    /// <summary>
+    /// Last-known projection without refreshing guest state — the same values
+    /// the most recent <see cref="SnapshotActiveSandboxProgressAsync"/>
+    /// produced, or the never-active baseline before the first refresh.
+    /// </summary>
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() =>
-        _activeOwners.Values
-            .Select(owner => new ActiveSandboxProgress(owner.WorkItemId, owner.Sandbox.Id, "incus-running"))
+        _activeOwners
+            .Select(pair => ProjectActiveSandboxProgress(pair.Key, pair.Value.WorkItemId))
             .ToArray();
+
+    /// <summary>
+    /// Refreshes the per-sandbox guest-CPU projection before snapshotting so
+    /// the watchdog sees a signature that changes while the guest is busy and
+    /// stays stable while it is idle or unreachable. Each owned instance is
+    /// queried at most once per
+    /// <see cref="IncusSandboxOptions.ActivitySampleInterval"/>; a failed or
+    /// timed-out query contributes no signal and never throws into the caller.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<ActiveSandboxProgress>> SnapshotActiveSandboxProgressAsync(CancellationToken ct = default)
+    {
+        var options = ReadOptions();
+        var owners = _activeOwners
+            .Select(static pair => (pair.Value.WorkItemId, InstanceName: pair.Key))
+            .ToArray();
+        await RefreshGuestActivityAsync(options, owners, ct).ConfigureAwait(false);
+        return SnapshotActiveSandboxProgress();
+    }
+
+    private ActiveSandboxProgress ProjectActiveSandboxProgress(string instanceName, WorkItemId workItemId)
+    {
+        if (_guestActivity.TryGetValue(instanceName, out var state))
+        {
+            lock (state)
+                return new ActiveSandboxProgress(workItemId, instanceName, state.Status, state.CpuFraction);
+        }
+        return new ActiveSandboxProgress(workItemId, instanceName, FormatGuestActivityStatus(0), CpuFraction: null);
+    }
+
+    private async Task RefreshGuestActivityAsync(
+        IncusSandboxOptions options,
+        IReadOnlyList<(WorkItemId WorkItemId, string InstanceName)> owners,
+        CancellationToken ct)
+    {
+        // Serialize refreshes: two concurrent snapshots must not double-sample
+        // or double-count the same guest-CPU interval.
+        await _guestActivityRefreshLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var live = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var owner in owners)
+                live.Add(owner.InstanceName);
+            foreach (var cached in _guestActivity.Keys)
+            {
+                if (!live.Contains(cached))
+                    _guestActivity.TryRemove(cached, out _);
+            }
+            if (owners.Count == 0)
+                return;
+
+            var now = _timeProvider.GetUtcNow();
+            var due = new List<string>(owners.Count);
+            foreach (var owner in owners)
+            {
+                var state = _guestActivity.GetOrAdd(owner.InstanceName, static _ => new GuestActivityState());
+                lock (state)
+                {
+                    if (now - state.LastQueryAt >= options.ActivitySampleInterval)
+                        due.Add(owner.InstanceName);
+                }
+            }
+            if (due.Count == 0)
+                return;
+
+            using var gate = new SemaphoreSlim(MaxConcurrentGuestStateQueries);
+            await Task.WhenAll(due.Select(
+                instanceName => SampleGuestActivityAsync(options, instanceName, gate, ct))).ConfigureAwait(false);
+        }
+        finally
+        {
+            _guestActivityRefreshLock.Release();
+        }
+    }
+
+    private async Task SampleGuestActivityAsync(
+        IncusSandboxOptions options,
+        string instanceName,
+        SemaphoreSlim gate,
+        CancellationToken ct)
+    {
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            IncusGuestCpuSample? sample;
+            try
+            {
+                sample = await _stateReader.ReadStateAsync(options, instanceName, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Best-effort probe: a failed query yields no fresh sample and
+                // must never surface to the watchdog.
+                _log.LogDebug(ex, "Incus guest CPU query failed for {InstanceName}; no activity signal", instanceName);
+                sample = null;
+            }
+
+            var queryAt = _timeProvider.GetUtcNow();
+            if (!_guestActivity.TryGetValue(instanceName, out var state))
+                return;
+
+            lock (state)
+            {
+                // Rate-limit failed queries too, not just successful reads.
+                state.LastQueryAt = queryAt;
+                if (sample is not { } current)
+                    return;
+
+                var previous = state.LastSample;
+                var elapsed = previous is { } prev ? current.Timestamp - prev.Timestamp : TimeSpan.Zero;
+                var evaluation = IncusCpuActivityEvaluator.Evaluate(
+                    previous, current, elapsed, options.ActivityCpuThresholdPercent);
+                state.LastSample = current;
+                state.CpuFraction = previous is null ? null : evaluation.CpuFraction;
+                if (evaluation.IsActive)
+                    state.ActiveEpochs++;
+            }
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static string FormatGuestActivityStatus(long activeEpochs) =>
+        string.Create(CultureInfo.InvariantCulture, $"incus-cpu-{activeEpochs}");
+
+    /// <summary>
+    /// Per-sandbox guest-CPU sampling state. <see cref="ActiveEpochs"/> counts
+    /// the number of intervals that met the activity threshold, so the emitted
+    /// <see cref="Status"/> changes only while the guest is measurably busy.
+    /// </summary>
+    private sealed class GuestActivityState
+    {
+        internal DateTimeOffset LastQueryAt;
+        internal IncusGuestCpuSample? LastSample;
+        internal long ActiveEpochs;
+        internal double? CpuFraction;
+        internal string Status => FormatGuestActivityStatus(ActiveEpochs);
+    }
 
     private async Task<string> ResolveOrEnsureBaselineAsync(
         IncusSandboxOptions options,
@@ -3023,6 +3180,7 @@ public sealed class IncusSandboxProvider :
     {
         _activeNames.TryRemove(name, out _);
         _activeOwners.TryRemove(name, out _);
+        _guestActivity.TryRemove(name, out _);
     }
 
     private static bool ProjectListContains(string json, string projectName)

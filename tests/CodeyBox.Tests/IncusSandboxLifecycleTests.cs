@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -3152,6 +3153,447 @@ public sealed class IncusSandboxLifecycleTests
                 SandboxLiveCounter.Decrement();
             if (Directory.Exists(root))
                 Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // ── Guest-CPU activity signal ────────────────────────────────────────────
+
+    [Fact]
+    public async Task ActiveSandboxProgress_BusyGuest_ChangesSignatureBetweenSnapshots()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-cpu-busy");
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var reader = new ScriptedInstanceStateReader(time)
+        {
+            NextCpuUsage = BusyCpuCounter(time),
+        };
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var options = fixture.Options with
+        {
+            // The boot stagger is awaited through the injected clock; a fake
+            // clock would hang CreateAsync until the test advances it.
+            BootLaunchDelay = TimeSpan.Zero,
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: time,
+            stateReader: reader);
+
+        try
+        {
+            var adopted = await provider.CreateAsync(fixture.RequestSpec);
+            var workItemId = fixture.RequestSpec.TimingWorkItemId!.Value;
+
+            var first = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            Assert.Equal(workItemId, first.WorkItemId);
+            Assert.Equal(fixture.SandboxName, first.SandboxId);
+            Assert.Null(first.CpuFraction);
+
+            // ~80% of one core over the 5-second sample interval exceeds the
+            // default 5% threshold, so the emitted status advances.
+            time.Advance(TimeSpan.FromSeconds(5));
+            var second = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            Assert.NotEqual(first.Status, second.Status);
+            Assert.Equal(0.8, second.CpuFraction!.Value, precision: 3);
+
+            // The non-refreshing view exposes the same projection.
+            Assert.Equal(second.Status, Assert.Single(provider.SnapshotActiveSandboxProgress()).Status);
+
+            time.Advance(TimeSpan.FromSeconds(5));
+            var third = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            Assert.NotEqual(second.Status, third.Status);
+
+            await adopted.DisposeAsync();
+            Assert.Empty(provider.SnapshotActiveSandboxProgress());
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ActiveSandboxProgress_IdleGuest_KeepsStableSignature()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-cpu-idle");
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var reader = new ScriptedInstanceStateReader(time)
+        {
+            NextCpuUsage = () => 1_000_000_000,
+        };
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var options = fixture.Options with
+        {
+            // The boot stagger is awaited through the injected clock; a fake
+            // clock would hang CreateAsync until the test advances it.
+            BootLaunchDelay = TimeSpan.Zero,
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: time,
+            stateReader: reader);
+
+        try
+        {
+            await provider.CreateAsync(fixture.RequestSpec);
+
+            var first = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            time.Advance(TimeSpan.FromSeconds(5));
+            var second = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            time.Advance(TimeSpan.FromSeconds(5));
+            var third = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+
+            Assert.Equal(first.Status, second.Status);
+            Assert.Equal(first.Status, third.Status);
+            Assert.Equal(3, reader.Calls);
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ActiveSandboxProgress_FailedQuery_YieldsNoSignalAndKeepsStableSignature()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-cpu-failure");
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var reader = new ScriptedInstanceStateReader(time);
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var options = fixture.Options with
+        {
+            // The boot stagger is awaited through the injected clock; a fake
+            // clock would hang CreateAsync until the test advances it.
+            BootLaunchDelay = TimeSpan.Zero,
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: time,
+            stateReader: reader);
+
+        try
+        {
+            await provider.CreateAsync(fixture.RequestSpec);
+
+            reader.NextCpuUsage = () => 1_000_000_000;
+            var first = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+
+            // A throwing reader must not propagate into the watchdog probe and
+            // must not alter the signature.
+            reader.Failure = new InvalidOperationException("incus query exploded");
+            time.Advance(TimeSpan.FromSeconds(5));
+            var second = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            Assert.Equal(first.Status, second.Status);
+
+            // A reader that returns no usable sample behaves identically.
+            reader.Failure = null;
+            reader.NextCpuUsage = () => null;
+            time.Advance(TimeSpan.FromSeconds(5));
+            var third = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            Assert.Equal(first.Status, third.Status);
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ActiveSandboxProgress_WithinSampleInterval_ReusesCachedProjection()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-cpu-gated");
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var reader = new ScriptedInstanceStateReader(time)
+        {
+            NextCpuUsage = () => 1_000_000_000,
+        };
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var options = fixture.Options with
+        {
+            // The boot stagger is awaited through the injected clock; a fake
+            // clock would hang CreateAsync until the test advances it.
+            BootLaunchDelay = TimeSpan.Zero,
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: time,
+            stateReader: reader);
+
+        try
+        {
+            await provider.CreateAsync(fixture.RequestSpec);
+
+            var first = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            // Inside ActivitySampleInterval the cached projection is reused —
+            // no second query, no signature change.
+            var second = Assert.Single(await provider.SnapshotActiveSandboxProgressAsync());
+            Assert.Equal(1, reader.Calls);
+            Assert.Equal(first.Status, second.Status);
+
+            time.Advance(fixture.Options.ActivitySampleInterval);
+            _ = await provider.SnapshotActiveSandboxProgressAsync();
+            Assert.Equal(2, reader.Calls);
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Watchdog_SilentStreamBusyIncusGuest_KeepsWorkerAlivePastProgressTimeout()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-cpu-watchdog-busy");
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var reader = new ScriptedInstanceStateReader(time)
+        {
+            // Each query reports ~80% of one core consumed since the previous
+            // sample, whatever the interval between watchdog sweeps.
+            NextCpuUsage = BusyCpuCounter(time),
+        };
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var options = fixture.Options with
+        {
+            // The boot stagger is awaited through the injected clock; a fake
+            // clock would hang CreateAsync until the test advances it.
+            BootLaunchDelay = TimeSpan.Zero,
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: time,
+            stateReader: reader);
+
+        using var scratch = TestScratchDirectory.Create("codeybox-incus-watchdog-");
+        var dbPath = scratch.DbPath("watchdog.db");
+        using var store = new SqliteWorkItemStore(dbPath);
+        using var registry = new SqliteWorkerRegistry(dbPath);
+        var queue = new InMemoryTaskQueue();
+        try
+        {
+            var adopted = await provider.CreateAsync(fixture.RequestSpec);
+            var itemId = fixture.RequestSpec.TimingWorkItemId!.Value;
+            var item = WatchdogItem(itemId, time.GetUtcNow() - TimeSpan.FromMinutes(45));
+            await store.CreateAsync(item);
+            await PlantWatchdogWorkerAsync(registry, itemId, time.GetUtcNow());
+
+            // streams: null — a completely silent agent stream, the exact
+            // scenario that used to get busy Incus guests killed.
+            var watchdog = new WorkerProgressWatchdog(
+                registry, store, queue,
+                new WorkerProgressWatchdogOptions
+                {
+                    ProgressTimeout = TimeSpan.FromMinutes(30),
+                    CheckInterval = TimeSpan.FromMinutes(1),
+                    ProcessCpuProgressSignalEnabled = false,
+                    ActiveSandboxProgressSignalEnabled = true,
+                },
+                NullLogger<WorkerProgressWatchdog>.Instance,
+                streams: null,
+                activitySource: new DefaultWorkerProgressActivitySource(provider),
+                timeProvider: time);
+
+            // Three sweeps each a full ProgressTimeout apart: the changing
+            // guest-CPU signature keeps registering fresh progress.
+            for (var sweep = 0; sweep < 3; sweep++)
+            {
+                await watchdog.RunOnceAsync(CancellationToken.None);
+                time.Advance(TimeSpan.FromMinutes(31));
+            }
+
+            var after = await store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Working, after!.State);
+            Assert.Equal(0, after.RecoveryAttempts);
+            Assert.Equal(0, queue.Count);
+            Assert.True(reader.Calls >= 3, $"expected at least 3 guest-state queries, saw {reader.Calls}");
+
+            await adopted.DisposeAsync();
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Watchdog_SilentStreamIdleIncusGuest_RecoversWorkerPastProgressTimeout()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-cpu-watchdog-idle");
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var reader = new ScriptedInstanceStateReader(time)
+        {
+            // A genuinely hung guest: the cpu.usage counter never advances.
+            NextCpuUsage = () => 1_000_000_000,
+        };
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var options = fixture.Options with
+        {
+            // The boot stagger is awaited through the injected clock; a fake
+            // clock would hang CreateAsync until the test advances it.
+            BootLaunchDelay = TimeSpan.Zero,
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: time,
+            stateReader: reader);
+
+        using var scratch = TestScratchDirectory.Create("codeybox-incus-watchdog-");
+        var dbPath = scratch.DbPath("watchdog.db");
+        using var store = new SqliteWorkItemStore(dbPath);
+        using var registry = new SqliteWorkerRegistry(dbPath);
+        var queue = new InMemoryTaskQueue();
+        try
+        {
+            await provider.CreateAsync(fixture.RequestSpec);
+            var itemId = fixture.RequestSpec.TimingWorkItemId!.Value;
+            var item = WatchdogItem(itemId, time.GetUtcNow() - TimeSpan.FromMinutes(45));
+            await store.CreateAsync(item);
+            await PlantWatchdogWorkerAsync(registry, itemId, time.GetUtcNow());
+
+            var watchdog = new WorkerProgressWatchdog(
+                registry, store, queue,
+                new WorkerProgressWatchdogOptions
+                {
+                    ProgressTimeout = TimeSpan.FromMinutes(30),
+                    CheckInterval = TimeSpan.FromMinutes(1),
+                    ProcessCpuProgressSignalEnabled = false,
+                    ActiveSandboxProgressSignalEnabled = true,
+                },
+                NullLogger<WorkerProgressWatchdog>.Instance,
+                streams: null,
+                activitySource: new DefaultWorkerProgressActivitySource(provider),
+                timeProvider: time);
+
+            // First sweep records the initial signature (first sighting counts
+            // as progress); the second, a full timeout later, sees the
+            // unchanged idle signature and recovers the worker.
+            await watchdog.RunOnceAsync(CancellationToken.None);
+            time.Advance(TimeSpan.FromMinutes(31));
+            await watchdog.RunOnceAsync(CancellationToken.None);
+
+            var after = await store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Queued, after!.State);
+            Assert.Equal(1, after.RecoveryAttempts);
+            Assert.Equal(1, queue.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    private static WorkItem WatchdogItem(WorkItemId itemId, DateTimeOffset updatedAt) => new()
+    {
+        Id = itemId,
+        ProjectId = new ProjectId("test"),
+        Title = "t",
+        Prompt = "p",
+        State = WorkItemState.Working,
+        UpdatedAt = updatedAt,
+        DependsOn = [],
+    };
+
+    private static async Task PlantWatchdogWorkerAsync(
+        SqliteWorkerRegistry registry, WorkItemId itemId, DateTimeOffset now)
+    {
+        // A fresh heartbeat — the watchdog must NOT rely on heartbeat staleness;
+        // progress is decided from item.UpdatedAt + stream/activity signals.
+        await registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = Guid.NewGuid().ToString(),
+            HostName = "host",
+            ProcessId = 1,
+            StartedAt = now.AddHours(-1),
+            LastHeartbeatAt = now,
+            CurrentWorkItemId = itemId.ToString(),
+        });
+    }
+
+    /// <summary>
+    /// A cpu.usage counter that grows at a fixed fraction of one core against
+    /// the injected clock, so the sampled fraction is identical regardless of
+    /// the interval between queries.
+    /// </summary>
+    private static Func<long?> BusyCpuCounter(TimeProvider time, double fractionOfCore = 0.8)
+    {
+        var cpu = 1_000_000_000L;
+        var lastAt = time.GetUtcNow();
+        return () =>
+        {
+            var now = time.GetUtcNow();
+            cpu += (long)((now - lastAt).TotalSeconds * fractionOfCore * 1_000_000_000.0);
+            lastAt = now;
+            return cpu;
+        };
+    }
+
+    private sealed class ScriptedInstanceStateReader(TimeProvider timeProvider) : IIncusInstanceStateReader
+    {
+        internal int Calls { get; private set; }
+        internal List<string> QueriedInstances { get; } = [];
+        internal Exception? Failure { get; set; }
+        internal Func<long?> NextCpuUsage { get; set; } = static () => null;
+
+        public Task<IncusGuestCpuSample?> ReadStateAsync(
+            IncusSandboxOptions options,
+            string instanceName,
+            CancellationToken ct)
+        {
+            Calls++;
+            QueriedInstances.Add(instanceName);
+            if (Failure is { } failure)
+                throw failure;
+            var usage = NextCpuUsage();
+            return Task.FromResult(usage is { } nanoseconds
+                ? new IncusGuestCpuSample(nanoseconds, timeProvider.GetUtcNow())
+                : (IncusGuestCpuSample?)null);
         }
     }
 
