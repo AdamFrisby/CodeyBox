@@ -7,7 +7,8 @@ namespace CodeyBox.Agents.Devin;
 /// <summary>
 /// Cost extractor for devin ACP-mode output.
 ///
-/// <para>The dispatch stream carries the shim's <c>devin.acp</c> envelopes;
+/// <para>The dispatch stream carries the shim's <c>devin.acp</c> envelopes
+/// (scanned via <see cref="DevinAcpEnvelope"/>, the shared reader);
 /// <c>turn_complete</c> wraps the ACP <c>session/prompt</c> response whose
 /// <c>usage</c> object reports the turn's token totals (verified against
 /// devin 3000.11.1: <c>inputTokens</c>/<c>outputTokens</c>/
@@ -33,60 +34,32 @@ public sealed class DevinCostExtractor : IAgentCostExtractor
 
     public AgentCostSnapshot? TryExtract(string? agentStdout, string? agentStderr)
     {
-        if (string.IsNullOrWhiteSpace(agentStdout))
-            return null;
-
         int? inputTokens = null, outputTokens = null, cachedInputTokens = null;
         var sawUsage = false;
 
-        foreach (var rawLine in agentStdout.Split('\n'))
+        foreach (var envelope in DevinAcpEnvelope.Enumerate(agentStdout))
         {
-            var line = rawLine.Trim();
-            if (line.Length == 0 || line[0] != '{')
-                continue;
-
-            JsonDocument doc;
-            try { doc = JsonDocument.Parse(line); }
-            catch (JsonException) { continue; }
-            using (doc)
+            var root = envelope.Root;
+            if (envelope.Event == DevinAcpEnvelope.EventTurnComplete
+                && root.TryGetProperty("usage", out var usage)
+                && usage.ValueKind == JsonValueKind.Object)
             {
-                var root = doc.RootElement;
-                if (root.ValueKind != JsonValueKind.Object
-                    || !root.TryGetProperty("type", out var typeEl)
-                    || typeEl.ValueKind != JsonValueKind.String
-                    || typeEl.GetString() != DevinAcpOutcome.EnvelopeType
-                    || !root.TryGetProperty("event", out var eventEl)
-                    || eventEl.ValueKind != JsonValueKind.String)
-                {
-                    continue;
-                }
-
-                if (eventEl.GetString() == "turn_complete"
-                    && root.TryGetProperty("usage", out var usage)
-                    && usage.ValueKind == JsonValueKind.Object)
-                {
-                    // The terminal envelope's totals win over every
-                    // intermediate usage_update tick.
-                    inputTokens = IntOf(usage, "inputTokens") ?? inputTokens;
-                    outputTokens = IntOf(usage, "outputTokens") ?? outputTokens;
-                    sawUsage = true;
-                }
-                else if (eventEl.GetString() == "session_update"
-                         && root.TryGetProperty("update", out var update)
-                         && update.ValueKind == JsonValueKind.Object
-                         && update.TryGetProperty("sessionUpdate", out var su)
-                         && su.ValueKind == JsonValueKind.String
-                         && su.GetString() == "usage_update"
-                         && update.TryGetProperty("_meta", out var meta)
-                         && meta.ValueKind == JsonValueKind.Object)
-                {
-                    inputTokens ??= IntOf(meta, "cognition.ai/inputTokens");
-                    outputTokens ??= IntOf(meta, "cognition.ai/outputTokens");
-                    cachedInputTokens = IntOf(meta, "cognition.ai/cachedReadTokens")
-                        ?? IntOf(meta, "cognition.ai/cached_input_tokens")
-                        ?? cachedInputTokens;
-                    sawUsage = true;
-                }
+                // The terminal envelope's totals win over every
+                // intermediate usage_update tick.
+                var turn = DevinAcpEnvelope.ReadUsage(usage);
+                inputTokens = turn.Input ?? inputTokens;
+                outputTokens = turn.Output ?? outputTokens;
+                cachedInputTokens = turn.CachedInput ?? cachedInputTokens;
+                sawUsage = true;
+            }
+            else if (envelope.Event == DevinAcpEnvelope.EventSessionUpdate
+                     && TryGetUsageUpdateMeta(root, out var meta))
+            {
+                var tick = DevinAcpEnvelope.ReadUsage(meta);
+                inputTokens ??= tick.Input;
+                outputTokens ??= tick.Output;
+                cachedInputTokens = tick.CachedInput ?? cachedInputTokens;
+                sawUsage = true;
             }
         }
 
@@ -95,8 +68,15 @@ public sealed class DevinCostExtractor : IAgentCostExtractor
             : null;
     }
 
-    private static int? IntOf(JsonElement el, string name)
-        => el.TryGetProperty(name, out var value) && value.TryGetInt32(out var parsed)
-            ? parsed
-            : null;
+    private static bool TryGetUsageUpdateMeta(JsonElement root, out JsonElement meta)
+    {
+        meta = default;
+        return root.TryGetProperty("update", out var update)
+            && update.ValueKind == JsonValueKind.Object
+            && update.TryGetProperty("sessionUpdate", out var sessionUpdate)
+            && sessionUpdate.ValueKind == JsonValueKind.String
+            && sessionUpdate.GetString() == DevinAcpEnvelope.UpdateKindUsageUpdate
+            && update.TryGetProperty("_meta", out meta)
+            && meta.ValueKind == JsonValueKind.Object;
+    }
 }

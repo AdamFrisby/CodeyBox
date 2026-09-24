@@ -3183,7 +3183,8 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CopilotInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
-builder.Services.AddSingleton<IInVmSmokeProbe, DevinInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe>(sp => new DevinInVmSmokeProbe(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CavemanCodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();

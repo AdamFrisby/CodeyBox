@@ -47,10 +47,11 @@ namespace CodeyBox.Agents.Devin;
 /// the session model, exactly like print mode's <c>--model</c>. The runner
 /// passes the member's <c>ModelId</c>, else the config-sourced
 /// <see cref="DefaultModelId"/>, else omits the flag (account server-side
-/// default). The shim scrubs <c>DEVIN_REFUSAL_FALLBACK</c> from the child
-/// environment: that variable switches refused requests to OTHER Devin
-/// models, which are paid — a dispatch must never drift off the configured
-/// model.</para>
+/// default). The shim scrubs <c>DEVIN_REFUSAL_FALLBACK</c> and
+/// <c>DEVIN_MODEL</c> from the child environment: the first switches
+/// refused requests to OTHER Devin models (paid), the second silently
+/// picks the session model when no flag is passed — a dispatch must never
+/// drift off the configured model.</para>
 ///
 /// <para><b>Prompt delivery.</b> The prompt travels on stdin after the
 /// base64 shim block and is piped into a <c>mktemp</c> file the shim reads;

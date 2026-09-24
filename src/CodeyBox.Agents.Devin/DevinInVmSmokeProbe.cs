@@ -16,7 +16,8 @@ namespace CodeyBox.Agents.Devin;
 ///   <item>a real ACP turn using the exact dispatch wrapper
 ///   (<see cref="DevinAgentRunner.BuildAcpDispatchScript"/> +
 ///   <see cref="DevinAcpShim.BuildDispatchStdin"/>) so the shim delivery,
-///   prompt-file, and session-mode contract is exercised end to end.</item>
+///   prompt-file, session-mode, and <c>--model</c> contract is exercised
+///   end to end.</item>
 /// </list>
 ///
 /// <para>When the auth credential is absent — no credential bundle, or one
@@ -27,6 +28,20 @@ namespace CodeyBox.Agents.Devin;
 /// </summary>
 public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
 {
+    private readonly AgentDefaultsSnapshot? _defaults;
+
+    /// <param name="defaults">
+    /// Live snapshot of per-agent default model IDs (see
+    /// <see cref="AgentDefaultsSnapshot"/>). The probe's real ACP turn pins
+    /// the configured devin model so it exercises the same
+    /// <c>--model</c> argv leg a dispatch does — and never silently bills
+    /// the account's server-side default model.
+    /// </param>
+    public DevinInVmSmokeProbe(AgentDefaultsSnapshot? defaults = null)
+    {
+        _defaults = defaults;
+    }
+
     public AgentKind Kind => AgentKind.Devin;
 
     public IReadOnlyList<InVmSmokeStep> BuildSteps(AgentCredential? credential)
@@ -50,13 +65,14 @@ public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
                 FailureHint: "devin models list failed (credentials path drift or invalid token)"));
             // Runs through the runner's own ACP dispatch wrapper and framed
             // stdin, so the probe fails whenever a real dispatch would fail:
-            // shim decode, prompt-file delivery, handshake, and the
-            // full-autonomy session mode all exercise the production path.
+            // shim decode, prompt-file delivery, handshake, the
+            // full-autonomy session mode, and the configured --model pin all
+            // exercise the production path.
             steps.Add(new(
                 ["bash", "-c", DevinAgentRunner.BuildAcpDispatchScript(
                     DevinAgentRunner.AcpShimArgs(
                         DevinAgentRunner.DefaultBinary,
-                        modelId: null,
+                        _defaults?.GetDefault(Kind.Value),
                         DevinAgentRunner.FullAutonomyAcpMode))],
                 Stdin: DevinAcpShim.BuildDispatchStdin("Reply with the single word: OK"),
                 FailureHint: "devin acp turn failed (shim delivery, prompt-file, handshake or session-mode contract drift)"));

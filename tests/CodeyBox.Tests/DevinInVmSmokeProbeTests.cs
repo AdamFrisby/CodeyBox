@@ -78,4 +78,18 @@ public sealed class DevinInVmSmokeProbeTests
         Assert.NotNull(steps[3].Stdin);
         Assert.EndsWith("Reply with the single word: OK", steps[3].Stdin);
     }
+
+    [Fact]
+    public void BuildSteps_WithConfiguredDefault_PinsModelOnRealTurn()
+    {
+        // The probe turn must exercise the same --model argv leg a dispatch
+        // uses; an unpinned probe would silently bill the account's
+        // server-side default model.
+        var probe = new DevinInVmSmokeProbe(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?> { ["devin"] = "swe-2-high" }));
+
+        var steps = probe.BuildSteps(CredWithToml());
+
+        Assert.Contains("'--model' 'swe-2-high'", steps[3].Argv[2], StringComparison.Ordinal);
+    }
 }

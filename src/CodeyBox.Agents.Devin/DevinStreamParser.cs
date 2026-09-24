@@ -27,10 +27,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
     /// carry it.
     /// </summary>
     public override bool TryClaim(JsonElement line) =>
-        line.ValueKind == JsonValueKind.Object
-        && line.TryGetProperty("type", out var type)
-        && type.ValueKind == JsonValueKind.String
-        && string.Equals(type.GetString(), DevinAcpOutcome.EnvelopeType, StringComparison.Ordinal);
+        DevinAcpEnvelope.IsEnvelope(line);
 
     protected override ParsedEvent ParseEvent(JsonElement root)
     {
@@ -41,9 +38,9 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
         var timestamp = TryTimestamp(root);
         return eventName switch
         {
-            "session_update" => ParseSessionUpdate(root, timestamp),
-            "turn_complete" => ParseTurnComplete(root, timestamp),
-            "turn_error" or "fatal" => new ParsedEvent(
+            DevinAcpEnvelope.EventSessionUpdate => ParseSessionUpdate(root, timestamp),
+            DevinAcpEnvelope.EventTurnComplete => ParseTurnComplete(root, timestamp),
+            DevinAcpEnvelope.EventTurnError or DevinAcpEnvelope.EventFatal => new ParsedEvent(
                 EventType: eventName,
                 Timestamp: timestamp,
                 IsAssistant: false,
@@ -115,15 +112,13 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                 case "agent_message_chunk":
                     isAssistant = true;
                     break;
-                case "usage_update":
+                case DevinAcpEnvelope.UpdateKindUsageUpdate:
                     // `used`/`size` are context-window occupancy, not
                     // cumulative billing; the _meta counters carry the
                     // per-turn token totals.
                     if (TryGet(update, out var meta, "_meta"))
                     {
-                        inputTokens = FirstInt(meta, "cognition.ai/inputTokens");
-                        outputTokens = FirstInt(meta, "cognition.ai/outputTokens");
-                        cachedInputTokens = FirstInt(meta, "cognition.ai/cachedReadTokens", "cognition.ai/cached_input_tokens");
+                        (inputTokens, outputTokens, cachedInputTokens) = DevinAcpEnvelope.ReadUsage(meta);
                     }
                     break;
             }
@@ -153,11 +148,10 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
 
     private static ParsedEvent ParseTurnComplete(JsonElement root, DateTimeOffset? timestamp)
     {
-        int? inputTokens = null, outputTokens = null;
+        int? inputTokens = null, outputTokens = null, cachedInputTokens = null;
         if (TryGet(root, out var usage, "usage"))
         {
-            inputTokens = FirstInt(usage, "inputTokens", "input_tokens");
-            outputTokens = FirstInt(usage, "outputTokens", "output_tokens");
+            (inputTokens, outputTokens, cachedInputTokens) = DevinAcpEnvelope.ReadUsage(usage);
         }
 
         return new ParsedEvent(
@@ -168,7 +162,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
             ToolResults: [],
             InputTokens: inputTokens,
             OutputTokens: outputTokens,
-            CachedInputTokens: null,
+            CachedInputTokens: cachedInputTokens,
             EstimatedUsd: null,
             TotalDuration: null,
             TimeToFirstToken: null,

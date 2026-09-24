@@ -14,7 +14,7 @@ watchdog on long turns. Envelope shape:
 
 Events: session_started, prompt_sent, session_update, notification,
 permission_auto_granted, permission_auto_cancelled, unhandled_request,
-mode_set, mode_set_failed, turn_complete, turn_error, fatal, protocol_error.
+mode_set, turn_complete, turn_error, fatal, protocol_error.
 
 Exit status: 0 only after a session/prompt response carrying a stopReason;
 2 for any protocol, spawn, or turn-level failure. The CLI's own stderr is
@@ -158,7 +158,7 @@ def run_turn(client, prompt, cwd, mode):
 
         try:
             frame = json.loads(raw)
-        except (UnicodeDecodeError, ValueError):
+        except ValueError:
             emit("protocol_error", message="non-JSON frame from devin acp")
             continue
         if not isinstance(frame, dict):
@@ -194,8 +194,12 @@ def run_turn(client, prompt, cwd, mode):
 
         result = frame.get("result")
         if not isinstance(result, dict):
-            emit("protocol_error", message="response without an object result", stage=stage)
-            continue
+            # The pending request was already popped and no follow-up is
+            # sent, so continuing here would deadlock the turn until the
+            # agent closes stdout — fail fast instead.
+            emit("fatal", stage=stage,
+                 message="response for %s did not carry an object result" % stage)
+            return EXIT_TURN_FAILED
 
         if stage == "initialize":
             client.request("session/new", "session/new",
@@ -216,8 +220,16 @@ def run_turn(client, prompt, cwd, mode):
             emit("mode_set", modeId=mode)
             send_prompt(client, session_id, prompt)
         elif stage == "prompt":
+            stop_reason = result.get("stopReason")
+            if not isinstance(stop_reason, str) or not stop_reason:
+                # Exit 0 is contracted to mean a completed turn; a result
+                # without a stopReason is a protocol violation, never a
+                # silent success.
+                emit("fatal", stage="session/prompt",
+                     message="session/prompt result did not carry a stopReason")
+                return EXIT_TURN_FAILED
             emit("turn_complete",
-                 stopReason=result.get("stopReason"),
+                 stopReason=stop_reason,
                  usage=result.get("usage"),
                  finalText="".join(final_text_parts) or None)
             return 0
@@ -319,9 +331,11 @@ def main(argv=None):
 
     env = dict(os.environ)
     # DEVIN_REFUSAL_FALLBACK switches to OTHER Devin models (paid) when the
-    # provider refuses a request. Never allow ambient config to opt a
-    # dispatch into a model the operator did not configure.
+    # provider refuses a request, and DEVIN_MODEL silently picks the session
+    # model when no --model flag is passed. Never allow ambient config to
+    # opt a dispatch into a model the operator did not configure.
     env.pop("DEVIN_REFUSAL_FALLBACK", None)
+    env.pop("DEVIN_MODEL", None)
 
     spawn_argv = [args.binary, "acp"]
     if args.model:

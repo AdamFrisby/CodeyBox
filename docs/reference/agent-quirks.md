@@ -446,11 +446,12 @@ materialises the shim and a prompt file from a framed stdin payload
   open in `accept-edits`), so `bypass` — the CLI's "Bypass Permissions"
   mode — is set per session. `session/request_permission` requests are
   auto-answered with the most durable allow option as defence in depth.
-- `devin acp --model <id>` selects the session model (env `DEVIN_MODEL`
-  also works); unset falls back to the account's server-side default. The
-  shim scrubs `DEVIN_REFUSAL_FALLBACK` from the child environment — that
-  variable switches refused requests to other (paid) Devin models and must
-  never act on a dispatch.
+- `devin acp --model <id>` selects the session model; unset falls back to
+  the account's server-side default. The shim scrubs both
+  `DEVIN_REFUSAL_FALLBACK` and `DEVIN_MODEL` from the child environment —
+  the first switches refused requests to other (paid) Devin models, the
+  second would silently pick the session model when no `--model` flag is
+  passed; neither may act on a dispatch.
 - The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
   128 KiB per argv element and rework prompts exceed it) and reaches the
   agent only as `session/prompt` JSON — never in argv or the environment.

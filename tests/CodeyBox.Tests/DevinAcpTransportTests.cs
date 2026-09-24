@@ -29,6 +29,8 @@ public sealed class DevinAcpTransportTests
     ///   end_turn.</item>
     ///   <item><c>turn_error</c> — answers session/prompt with a JSON-RPC
     ///   error.</item>
+    ///   <item><c>no_stop_reason</c> — answers session/prompt with an object
+    ///   result that omits stopReason (protocol violation).</item>
     ///   <item><c>die_after_new</c> — exits immediately after session/new,
     ///   simulating a crashed agent mid-handshake.</item>
     /// </list>
@@ -52,7 +54,9 @@ public sealed class DevinAcpTransportTests
             sys.stdout.write(json.dumps(obj) + "\n")
             sys.stdout.flush()
 
-        rec({"argv": sys.argv[1:], "refusal_fallback": os.environ.get("DEVIN_REFUSAL_FALLBACK")})
+        rec({"argv": sys.argv[1:],
+             "refusal_fallback": os.environ.get("DEVIN_REFUSAL_FALLBACK"),
+             "devin_model": os.environ.get("DEVIN_MODEL")})
 
         if "--help" in sys.argv[1:]:
             print("Usage: devin acp [OPTIONS]")
@@ -104,6 +108,9 @@ public sealed class DevinAcpTransportTests
                 if behavior == "turn_error":
                     send({"jsonrpc": "2.0", "id": msg["id"],
                           "error": {"code": -32001, "message": "synthetic turn failure"}})
+                elif behavior == "no_stop_reason":
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                          "usage": {"totalTokens": 18, "inputTokens": 11, "outputTokens": 7}}})
                 else:
                     send({"jsonrpc": "2.0", "id": msg["id"], "result": {
                           "stopReason": "end_turn",
@@ -123,8 +130,17 @@ public sealed class DevinAcpTransportTests
         var (binDir, recordPath) = WriteFakeDevin(temp.Path);
         var gatePath = Path.Combine(temp.Path, "gate");
 
+        // The model-drift guard variables are deliberately SET in the
+        // sandbox environment: the shim must scrub both before spawning the
+        // agent, so a null record below proves the scrub rather than the
+        // variable simply being absent.
         await using var sandbox = await CreateSandboxAsync(binDir, temp.Path, "complete",
-            extraEnv: new Dictionary<string, string> { ["FAKE_GATE"] = gatePath });
+            extraEnv: new Dictionary<string, string>
+            {
+                ["FAKE_GATE"] = gatePath,
+                ["DEVIN_REFUSAL_FALLBACK"] = "swe-1.7",
+                ["DEVIN_MODEL"] = "claude-opus-5",
+            });
 
         var runner = new DevinAgentRunner();
         var streamed = new StringBuilder();
@@ -157,10 +173,17 @@ public sealed class DevinAcpTransportTests
             < streamText.IndexOf("\"turn_complete\"", StringComparison.Ordinal),
             "progress envelopes must precede the terminal envelope");
 
+        // The fake peer offered [reject_once, allow_always]; the shim must
+        // answer with the durable allow, not a reject or a cancel.
+        Assert.Contains("\"permission_auto_granted\"", streamText, StringComparison.Ordinal);
+        Assert.Contains("\"optionId\": \"allow_always\"", streamText, StringComparison.Ordinal);
+        Assert.DoesNotContain("permission_auto_cancelled", streamText, StringComparison.Ordinal);
+
         var records = ReadRecords(recordPath);
         var argv = Assert.Single(records, r => r.Contains("\"argv\""));
         Assert.Contains($"\"acp\", \"--model\", \"{ConfiguredModel}\"", argv, StringComparison.Ordinal);
         Assert.Contains("\"refusal_fallback\": null", argv, StringComparison.Ordinal);
+        Assert.Contains("\"devin_model\": null", argv, StringComparison.Ordinal);
 
         var setMode = Assert.Single(records, r => r.Contains("\"set_mode\""));
         Assert.Contains("\"modeId\": \"bypass\"", setMode, StringComparison.Ordinal);
@@ -191,6 +214,29 @@ public sealed class DevinAcpTransportTests
         Assert.NotNull(result.TerminalDiagnostic);
         Assert.Contains("turn error", result.TerminalDiagnostic, StringComparison.Ordinal);
         Assert.Contains("synthetic turn failure", result.TerminalDiagnostic, StringComparison.Ordinal);
+    }
+
+    [SkippableFact]
+    public async Task RunAsync_FakeAcpPeer_PromptResultWithoutStopReason_MapsToTypedFailure()
+    {
+        // The shim's exit-0 contract is "a session/prompt response carrying
+        // a stopReason". A spec-violating {"result":{}} must NOT emit
+        // turn_complete — the shim reports fatal and the run fails typed
+        // rather than PostProcessAcpResult trusting a false success.
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox ACP test requires Unix exec semantics.");
+        Skip.IfNot(HasCommand("python3"), "python3 is required for the devin acp shim.");
+
+        using var temp = new TemporaryDir("codeybox-devin-acp-");
+        var (binDir, _) = WriteFakeDevin(temp.Path);
+        await using var sandbox = await CreateSandboxAsync(binDir, temp.Path, "no_stop_reason");
+
+        var runner = new DevinAgentRunner();
+        var result = await runner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, "do the thing", credential: null);
+
+        Assert.False(result.Success);
+        Assert.NotNull(result.TerminalDiagnostic);
+        Assert.Contains("stopReason", result.TerminalDiagnostic, StringComparison.Ordinal);
     }
 
     [SkippableFact]
