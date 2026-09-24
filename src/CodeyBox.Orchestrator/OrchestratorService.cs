@@ -1388,38 +1388,58 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         WorkerSlotLease lease,
         CancellationToken ct)
     {
-        if (_deferredItems.IsEmpty)
-            return;
-
         try
         {
             var releasedItem = await _store.GetAsync(lease.WorkItemId, ct);
             if (releasedItem is null)
                 return;
 
-            var activeClaims = await CollectActiveRefactorDrainClaimsAsync(ct);
-            var claim = activeClaims.FirstOrDefault(c => c.ProjectId == releasedItem.ProjectId);
-            if (claim is not null)
+            // The check-and-clear runs under the same per-project lock the
+            // pickup-side drain decision (PickNextEligibleAsync) and the
+            // worker-side exclusivity re-check hold while reading in-flight
+            // counts and registering the deferral lease. Without it a lease
+            // registered after this clear — but justified by a count read taken
+            // before the release committed — would sleep out the whole
+            // exclusivity recheck on an already-drained project. For the same
+            // reason the empty-registry fast path must live INSIDE the lock:
+            // checked outside, a release can observe an empty deferred set
+            // while the pickup that just counted it as in-flight is still
+            // mid-decision, then the lease lands after this clear and strands.
+            var projectLock = GetBudgetLock(releasedItem.ProjectId);
+            await projectLock.WaitAsync(ct);
+            try
             {
-                var counts = await _store.CountInFlightSplitByRefactorAsync(
-                    claim.ProjectId,
-                    ct,
-                    claim.RefactorWorkItemId);
-                if (counts.Refactor == 0 && counts.Other == 0)
-                    ClearRefactorDeferredItem(claim.RefactorWorkItemId);
-                return;
+                if (_deferredItems.IsEmpty)
+                    return;
+
+                var activeClaims = await CollectActiveRefactorDrainClaimsAsync(ct);
+                var claim = activeClaims.FirstOrDefault(c => c.ProjectId == releasedItem.ProjectId);
+                if (claim is not null)
+                {
+                    var counts = await _store.CountInFlightSplitByRefactorAsync(
+                        claim.ProjectId,
+                        ct,
+                        claim.RefactorWorkItemId);
+                    if (counts.Refactor == 0 && counts.Other == 0)
+                        ClearRefactorDeferredItem(claim.RefactorWorkItemId);
+                    return;
+                }
+
+                var (refactorInFlight, _) =
+                    await _store.CountInFlightSplitByRefactorAsync(releasedItem.ProjectId, ct);
+                if (refactorInFlight > 0)
+                    return;
+
+                foreach (var deferredId in RefactorDeferredItemIds())
+                {
+                    var deferredItem = await _store.GetAsync(deferredId, ct);
+                    if (deferredItem?.ProjectId == releasedItem.ProjectId)
+                        ClearRefactorDeferredItem(deferredId);
+                }
             }
-
-            var (refactorInFlight, _) =
-                await _store.CountInFlightSplitByRefactorAsync(releasedItem.ProjectId, ct);
-            if (refactorInFlight > 0)
-                return;
-
-            foreach (var deferredId in RefactorDeferredItemIds())
+            finally
             {
-                var deferredItem = await _store.GetAsync(deferredId, ct);
-                if (deferredItem?.ProjectId == releasedItem.ProjectId)
-                    ClearRefactorDeferredItem(deferredId);
+                projectLock.Release();
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -2096,82 +2116,100 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (await TryDeferForProjectPauseAtPickupAsync(candidate, stoppingToken))
                     continue;
 
-                if (candidate.JobType == JobType.Refactor)
+                // The refactor-exclusivity decision — the in-flight split read,
+                // the drain-claim write, and the deferral lease registration —
+                // must be atomic against the slot-release clear in
+                // ClearReadyRefactorGateDeferralsForSlotReleaseAsync. Without
+                // the shared per-project lock a deferral can be registered
+                // after the last in-flight item's release already checked for
+                // (and cleared) project deferrals: the item then sleeps out
+                // the whole RefactorExclusivityRecheck interval on a project
+                // that has already drained.
+                var refactorGateLock = GetBudgetLock(candidate.ProjectId);
+                await refactorGateLock.WaitAsync(stoppingToken);
+                try
                 {
-                    if (candidate.StartedAt is not null)
+                    if (candidate.JobType == JobType.Refactor)
+                    {
+                        if (candidate.StartedAt is not null)
+                            return candidate.Id;
+
+                        if (pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var ownerRefactorId)
+                            && ownerRefactorId != candidate.Id)
+                        {
+                            DeferBehindRefactorDrainOwner(candidate, ownerRefactorId, stoppingToken);
+                            continue;
+                        }
+
+                        if (await TryClaimOrDeferRefactorDrainAsync(candidate, stoppingToken))
+                        {
+                            pendingRefactorProjects[candidate.ProjectId.Value] = candidate.Id;
+                            continue;
+                        }
+
+                        if (candidate.StartedAt is null)
+                            SetRefactorDrainClaim(candidate, RefactorStartReservationReason(candidate));
                         return candidate.Id;
-
-                    if (pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var ownerRefactorId)
-                        && ownerRefactorId != candidate.Id)
-                    {
-                        DeferBehindRefactorDrainOwner(candidate, ownerRefactorId, stoppingToken);
-                        continue;
                     }
 
-                    if (await TryClaimOrDeferRefactorDrainAsync(candidate, stoppingToken))
+                    if (candidate.StartedAt is null
+                        && pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var refactorId))
                     {
-                        pendingRefactorProjects[candidate.ProjectId.Value] = candidate.Id;
-                        continue;
-                    }
-
-                    if (candidate.StartedAt is null)
-                        SetRefactorDrainClaim(candidate, RefactorStartReservationReason(candidate));
-                    return candidate.Id;
-                }
-
-                if (candidate.StartedAt is null
-                    && pendingRefactorProjects.TryGetValue(candidate.ProjectId.Value, out var refactorId))
-                {
-                    var reason = RefactorDrainHoldReason(candidate.ProjectId, refactorId);
-                    AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
-                    ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
-                    continue;
-                }
-
-                if (candidate.StartedAt is null)
-                {
-                    var (refactorInFlight, _) =
-                        await _store.CountInFlightSplitByRefactorAsync(
-                            candidate.ProjectId,
-                            stoppingToken,
-                            candidate.Id);
-                    if (refactorInFlight > 0)
-                    {
-                        var reason =
-                            $"refactor exclusivity: a refactor is in flight for project '{candidate.ProjectId.Value}'; non-refactor items wait until it completes";
+                        var reason = RefactorDrainHoldReason(candidate.ProjectId, refactorId);
                         AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
                         ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
                         continue;
                     }
 
-                    var drainOwnerRefactor = await FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
-                        RefactorDispatchCandidate.FromWorkItem(candidate),
-                        stoppingToken);
-                    if (drainOwnerRefactor is not null)
+                    if (candidate.StartedAt is null)
                     {
-                        var (claimedRefactorInFlight, claimedOtherInFlight) =
+                        var (refactorInFlight, _) =
                             await _store.CountInFlightSplitByRefactorAsync(
-                                drainOwnerRefactor.ProjectId,
+                                candidate.ProjectId,
                                 stoppingToken,
-                                drainOwnerRefactor.Id);
-                        if (claimedRefactorInFlight > 0 || claimedOtherInFlight > 0)
+                                candidate.Id);
+                        if (refactorInFlight > 0)
                         {
-                            var claimReason = RefactorCandidateBlockedReason(
-                                drainOwnerRefactor,
-                                claimedRefactorInFlight,
-                                claimedOtherInFlight);
-                            SetRefactorDrainClaim(drainOwnerRefactor, claimReason);
-                            pendingRefactorProjects[candidate.ProjectId.Value] = drainOwnerRefactor.Id;
-
-                            var reason = RefactorDrainHoldReason(candidate.ProjectId, drainOwnerRefactor.Id);
+                            var reason =
+                                $"refactor exclusivity: a refactor is in flight for project '{candidate.ProjectId.Value}'; non-refactor items wait until it completes";
                             AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
                             ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
                             continue;
                         }
-                    }
-                }
 
-                return candidate.Id;
+                        var drainOwnerRefactor = await FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
+                            RefactorDispatchCandidate.FromWorkItem(candidate),
+                            stoppingToken);
+                        if (drainOwnerRefactor is not null)
+                        {
+                            var (claimedRefactorInFlight, claimedOtherInFlight) =
+                                await _store.CountInFlightSplitByRefactorAsync(
+                                    drainOwnerRefactor.ProjectId,
+                                    stoppingToken,
+                                    drainOwnerRefactor.Id);
+                            if (claimedRefactorInFlight > 0 || claimedOtherInFlight > 0)
+                            {
+                                var claimReason = RefactorCandidateBlockedReason(
+                                    drainOwnerRefactor,
+                                    claimedRefactorInFlight,
+                                    claimedOtherInFlight);
+                                SetRefactorDrainClaim(drainOwnerRefactor, claimReason);
+                                pendingRefactorProjects[candidate.ProjectId.Value] = drainOwnerRefactor.Id;
+
+                                var reason = RefactorDrainHoldReason(candidate.ProjectId, drainOwnerRefactor.Id);
+                                AuditLog.RefactorExclusivityDeferred(candidate.Id, candidate.ProjectId, reason);
+                                ScheduleRefactorExclusivityRequeue(candidate.Id, stoppingToken);
+                                continue;
+                            }
+                        }
+                    }
+
+                    return candidate.Id;
+                }
+                finally
+                {
+                    refactorGateLock.Release();
+                }
             }
 
             if (scanProgress.ExhaustedBudget)
