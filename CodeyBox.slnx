@@ -59,6 +59,7 @@
   <Folder Name="/plugins/">
     <Project Path="plugins/auditors-architecture/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/CodeyBox.ExampleSarifAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.EslintAuditorPlugin/CodeyBox.EslintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/CodeyBox.GitleaksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-schema/CodeyBox.SpectralAuditorPlugin/CodeyBox.SpectralAuditorPlugin.csproj" />
     <Project Path="plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/CodeyBox.DotnetTestRunnerPlugin.csproj" />
