@@ -2412,3 +2412,87 @@ unknown model id is configuration, not quota — mirroring kilo's `Model not
 found` exclusion), `Unknown flag` (dispatch construction, which the
 runner's pinned argv cannot produce), and quota/401 prose from reviewed
 repository content (patterns stay anchored to provider-shaped sentences).
+
+### Unreal Agent (`unreal`)
+
+**Install in the sandbox image** — add the install line to
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider (verified against unreal-agent v0.1.1, commit `b7c9bf1c5c`, 2026-09-24):
+
+```sh
+UNREAL_AGENT_VERSION=v0.1.1
+curl -fsSL -o /tmp/unreal-agent-runner "https://github.com/unreallabsai/unreal-agent/releases/download/${UNREAL_AGENT_VERSION}/unreal-agent-runner-linux-amd64"
+printf '%s  %s\n' "fad9cb9e6e6272a8d16fb4b90f985abb3132572413588f96622c6b1a82e34fcd" /tmp/unreal-agent-runner | sha256sum -c -
+install -m 0755 /tmp/unreal-agent-runner /usr/local/bin/unreal-agent-runner
+rm /tmp/unreal-agent-runner
+```
+
+Go-based autonomous agent runner ([repo](https://github.com/unreallabsai/unreal-agent), binary `unreal-agent-runner`).
+The installer downloads the pinned release binary with its SHA256 checksum verified before execution
+(`fad9cb9e6e6272a8d16fb4b90f985abb3132572413588f96622c6b1a82e34fcd` for `linux_amd64`,
+`0e61571dc9b83b429aaf9c89d8af372ff39a7ef50313fa2fd0ef15c6fa527d02` for `linux_arm64`),
+dropping `unreal-agent-runner` on PATH.
+
+**Non-interactive invocation (Trap 1: JSON on stdin).** The runner does NOT use `-p`,
+`--prompt`, or `/dev/stdin`. The CLI expects a non-interactive JSON request payload
+piped directly to standard input:
+
+```json
+{"prompt":"<prompt>","model":"<model>","thinking_level":"<level>"}
+```
+
+This bypasses Linux's `MAX_ARG_STRLEN` (128 KiB per argv element) entirely, allowing
+rework prompts and large contexts (> 128 KiB) to be delivered intact without truncation
+or shell escape hazards.
+
+**Session and log isolation (Trap 2: Directories outside workspace).** By default,
+`unreal-agent-runner` attempts to create session and log directories inside the current
+working directory (`.unreal/logs`, `.unreal/sessions`). In CodeyBox, git working trees must
+remain clean and unpolluted by runner operational artifacts. The runner always supplies:
+
+```sh
+unreal-agent-runner -workspace <workingDirectory> -log-directory /tmp/codeybox-unreal/<runId>/logs -session-directory /tmp/codeybox-unreal/<runId>/sessions
+```
+
+This ensures session operations, scratchpad files, and internal operation logs remain
+isolated outside the workspace worktree.
+
+**Workspace `.env` quarantine (Trap 3: Preventing configuration injection).** Unreal agent
+automatically parses `.env` files located in the workspace directory. A malicious or
+compromised repository containing a `.env` file could override:
+- `SANDBOX_EGRESS_PROXY` (hijacking outbound agent network traffic to an untrusted proxy)
+- `UNREAL_HARNESS_LLM_PROVIDER` or `UNREAL_HARNESS_LLM_BASE_URL` (tampering with model endpoints)
+- Provider API keys and credentials
+
+To prevent configuration injection, `UnrealAgentRunner` probes for `.env` files in the workspace
+prior to execution, moves them to a unique quarantine path (`.env.codeybox-quarantined-<runId>`),
+and safely restores them in a `finally` block upon completion. If quarantine fails, the run is
+aborted immediately to fail closed.
+
+**Account safety: Codex subscription rejection.** Unreal agent supports pay-per-API providers
+(OpenAI API, OpenRouter, etc.). It does NOT support OpenAI Codex web subscription tokens or
+session credentials. Attempting to use subscription credentials with raw API endpoints risks
+account suspension or billing errors. `UnrealAgentRunner` and `UnrealSmokeProbe` actively inspect
+credentials and reject subscription tokens (`codex_subscription` kind or Bearer JWT subscription shapes)
+before any dispatch occurs.
+
+**Reasoning effort & model mapping.** `ReasoningMode` maps to `thinking_level` in the JSON request:
+- `ReasoningMode.Low` -> `"low"`
+- `ReasoningMode.Medium` -> `"medium"`
+- `ReasoningMode.High` -> `"high"`
+- `ReasoningMode.ExtraHigh` -> `"xhigh"`
+- `ReasoningMode.Maximum` -> `"max"`
+
+Supported catalog models include `gpt-6-astra` and `openrouter/nvidia/nemotron-3.5-lightning:free`.
+Custom model IDs are passed verbatim with startup warnings if unrecognized.
+
+**Exit codes & failure classification.**
+- `0`: Success.
+- `1`: Error (lifted to `TerminalDiagnostic` bounded to 500 chars via `UnrealTerminalDiagnoser`).
+- `130`: Interrupted (SIGINT/SIGTERM), classified as `AgentFailureKind.Infrastructure` so the orchestrator retries or reschedules rather than treating it as an agent task failure.
+
+**Cost attribution & stream parsing.** `UnrealStreamParser` parses NDJSON session items emitted to stdout:
+- `model_response`: Extracts assistant text, tool calls, and token usage (`Usage.InputTokens`, `Usage.OutputTokens`, `Usage.CachedInputTokens`).
+- `tool_call_status`: Tracks tool execution results and byte sizes from shell operations.
+- `type: "error"`: Extracts terminal error messages.
+`UnrealCostExtractor` attributes costs based on token usage reported in `model_response` frames.

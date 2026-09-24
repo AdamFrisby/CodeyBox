@@ -30,6 +30,7 @@ using CodeyBox.Agents.Prime;
 using CodeyBox.Agents.Qwen;
 using CodeyBox.Agents.Vibe;
 using CodeyBox.Agents.DotNetOpencode;
+using CodeyBox.Agents.Unreal;
 using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
@@ -1660,6 +1661,15 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CrushAgentRunner(
 // docs/reference/agent-quirks.md.
 builder.Services.AddSingleton<IAgentRunner>(sp => new DotNetOpencodeAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
+// Unreal: Unreal Labs' unreal-agent CLI (unreal-agent-runner, pinned release v0.1.1,
+// commit b7c9bf1c5c). Transport delivers prompt, model, and thinking_level on stdin
+// as a JSON request (NO -p, NO /dev/stdin). Log and session directories are placed
+// strictly outside the workspace (/home/ubuntu/.unreal-agent/logs and sessions).
+// The runner quarantines workspace .env before dispatch to neutralize egress proxy
+// redirection and provider override attacks. See docs/concepts/agents.md and
+// docs/reference/agent-quirks.md.
+builder.Services.AddSingleton<IAgentRunner>(sp => new UnrealAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 // Seeded fake-agent run mode for the admin E2E/demo instance (see
 // docs/concepts/admin-e2e.md). Opt-in via CodeyBox:SeededFakeAgents:Enabled;
 // when disabled nothing here registers and production routing is untouched.
@@ -2237,6 +2247,12 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // {env:VAR} indirection inside the JSON and add that provider's
         // variable as a second mapping row.
         new AgentCredentialMapping(AgentKind.DotNetOpencode, "CODEYBOX_DOTNETOPENCODE_CONFIG_JSON", "DOTNETOPENCODE_CONFIG_JSON"),
+        // Unreal: provider API-key auth read directly from environment.
+        // Shipped mapping routes host CODEYBOX_UNREAL_API_KEY to OPENROUTER_API_KEY.
+        new AgentCredentialMapping(AgentKind.Unreal, "CODEYBOX_UNREAL_API_KEY", "OPENROUTER_API_KEY"),
+        new AgentCredentialMapping(AgentKind.Unreal, "CODEYBOX_UNREAL_PROVIDER", "UNREAL_HARNESS_LLM_PROVIDER"),
+        new AgentCredentialMapping(AgentKind.Unreal, "CODEYBOX_UNREAL_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.Unreal, "CODEYBOX_UNREAL_FIREWORKS_API_KEY", "FIREWORKS_API_KEY"),
     }));
     // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
     // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
@@ -2272,6 +2288,9 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         new AgentCredentialMapping(AgentKind.CavemanCode, "OPENAI_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.CavemanCode, "GEMINI_API_KEY", "GEMINI_API_KEY"),
         new AgentCredentialMapping(AgentKind.CavemanCode, "OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
+        new AgentCredentialMapping(AgentKind.Unreal, "OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
+        new AgentCredentialMapping(AgentKind.Unreal, "OPENAI_API_KEY", "OPENAI_API_KEY"),
+        new AgentCredentialMapping(AgentKind.Unreal, "FIREWORKS_API_KEY", "FIREWORKS_API_KEY"),
     }));
 
     return new ChainedCredentialProvider(
@@ -3136,6 +3155,12 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new DotNetOpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<DotNetOpencodeSmokeProbe>()));
+// Unreal: credential-presence check (OPENROUTER_API_KEY, OPENAI_API_KEY,
+// FIREWORKS_API_KEY, or UNREAL_HARNESS_LLM_API_KEY in the bundle) and
+// rejection of Codex subscription credentials for account-safety.
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new UnrealSmokeProbe(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<UnrealSmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -3165,6 +3190,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, QwenInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CmdInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CrushInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, DotNetOpencodeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, UnrealInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents on
@@ -3342,6 +3368,7 @@ builder.Services.AddSingleton<IAgentModelListProbe, CrushModelListProbe>();
 // DotNetOpencodeKnownModels seed is authoritative; operator-configured ids
 // absent from the seed surface as a startup warning, not a hard reject.
 builder.Services.AddSingleton<IAgentModelListProbe, DotNetOpencodeModelListProbe>();
+builder.Services.AddSingleton<IAgentModelListProbe, UnrealModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -4417,6 +4444,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Cmd] = new CmdCostExtractor(),
         [AgentKind.Crush] = new CrushCostExtractor(),
         [AgentKind.Devin] = new DevinCostExtractor(),
+        [AgentKind.Unreal] = new UnrealCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -4555,6 +4583,7 @@ builder.Services.AddSingleton<IAgentStreamParser, CmdStreamParser>();
 // Crush work items to AgentKind.Crush rather than unknown (same as
 // aider/opencode/continue).
 builder.Services.AddSingleton<IAgentStreamParser, CrushStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, UnrealStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator
@@ -4822,6 +4851,21 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
             .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
             .ToArray();
     return new CrushQuotaFailureDetector(extras);
+});
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Unreal detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:unreal, mirroring the crush hook above.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Unreal.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new UnrealQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CavemanCodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();

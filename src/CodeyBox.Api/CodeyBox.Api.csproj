@@ -30,6 +30,7 @@
     <ProjectReference Include="..\CodeyBox.Agents.Crush\CodeyBox.Agents.Crush.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.DotNetOpencode\CodeyBox.Agents.DotNetOpencode.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.CavemanCode\CodeyBox.Agents.CavemanCode.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Unreal\CodeyBox.Agents.Unreal.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Devin\CodeyBox.Agents.Devin.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream.GitHub\CodeyBox.Upstream.GitHub.csproj" />
     <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />

@@ -30,6 +30,7 @@ public readonly record struct AgentKind(string Value)
     public static AgentKind Cmd { get; } = new("cmd");
     public static AgentKind Crush { get; } = new("crush");
     public static AgentKind Devin { get; } = new("devin");
+    public static AgentKind Unreal { get; } = new("unreal");
 
     public override string ToString() => Value;
 }
