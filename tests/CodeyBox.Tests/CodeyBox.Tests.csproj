@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -51,6 +51,7 @@
     <ProjectReference Include="..\..\plugins\auditors-architecture\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ExampleSarifAuditorPlugin\CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.GitleaksAuditorPlugin\CodeyBox.GitleaksAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SpectralAuditorPlugin\CodeyBox.SpectralAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
