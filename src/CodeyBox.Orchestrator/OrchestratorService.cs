@@ -210,6 +210,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // snapshot for diagnostics.
     private long _minSpawnIntervalTicks;
 
+    // Live "in-flight before fresh" ordering preference
+    // (CodeyBox:WorkerPool:PreferInFlightOverFresh), seeded from
+    // OrchestratorOptions at startup and switchable via
+    // ApplyPreferInFlightOverFreshReload. 1 = pickup ordering ranks
+    // past-work-phase items ahead of equal-priority fresh starts, tie-broken
+    // by queue position; 0 = legacy ordering (finishing bucket, priority,
+    // created_at). Independent of the cap-deferral release wake, which is
+    // unconditional. Stored as an int for a single volatile read on the
+    // dispatch path.
+    private int _preferInFlightOverFresh;
+
     // Worker index counter — monotonically increasing, used for log identity.
     private int _nextWorkerId = 0;
 
@@ -368,6 +379,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _failureTracker = failureTracker;
         _concurrencyGate = new ResizableConcurrencyGate(opts.MaxConcurrentWorkers);
         _minSpawnIntervalTicks = opts.MinSpawnInterval.Ticks;
+        _preferInFlightOverFresh = opts.PreferInFlightOverFresh ? 1 : 0;
         LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "startup");
     }
 
@@ -594,6 +606,49 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     /// <summary>
+    /// Live "in-flight before fresh" ordering preference
+    /// (<c>CodeyBox:WorkerPool:PreferInFlightOverFresh</c>). When on, pickup
+    /// ordering ranks past-work-phase items ahead of equal-priority fresh
+    /// starts, tie-broken by queue position. Seeded from
+    /// <see cref="OrchestratorOptions.PreferInFlightOverFresh"/> at startup;
+    /// <see cref="ApplyPreferInFlightOverFreshReload"/> takes effect on the
+    /// next pickup without restart.
+    /// </summary>
+    public bool PreferInFlightOverFresh => Volatile.Read(ref _preferInFlightOverFresh) != 0;
+
+    /// <summary>
+    /// The candidate ordering pickup queries currently run with — the live
+    /// mapping of <see cref="PreferInFlightOverFresh"/> onto
+    /// <see cref="DispatchCandidateOrdering"/>. Read once per candidate
+    /// enumeration so a hot-reload mid-scan cannot mix the two orderings
+    /// inside one ranked set.
+    /// </summary>
+    internal DispatchCandidateOrdering CurrentDispatchOrdering =>
+        PreferInFlightOverFresh
+            ? DispatchCandidateOrdering.InFlightBeforeFresh
+            : DispatchCandidateOrdering.FinishingThenPriority;
+
+    /// <summary>
+    /// Hot-reloads the "in-flight before fresh" ordering preference
+    /// (<c>CodeyBox:WorkerPool:PreferInFlightOverFresh</c>). Turning it off
+    /// restores the legacy candidate ordering — finishing bucket, then
+    /// priority, then <c>created_at</c> — while cap-deferred items keep
+    /// waking on matching slot releases and rejoining ordering (that
+    /// mechanism is unconditional). Applies to the next pickup.
+    /// <para>Idempotent: a reload with the same value is a no-op (no log).</para>
+    /// </summary>
+    public void ApplyPreferInFlightOverFreshReload(bool newPreferInFlightOverFresh)
+    {
+        var next = newPreferInFlightOverFresh ? 1 : 0;
+        if (Interlocked.Exchange(ref _preferInFlightOverFresh, next) == next)
+            return;
+
+        _log.LogInformation(
+            "Hot-reloaded WorkerPool:PreferInFlightOverFresh: {NewValue}",
+            newPreferInFlightOverFresh);
+    }
+
+    /// <summary>
     /// Emits the effective per-agent caps to the log so operators can confirm
     /// (a) what the config-binder actually produced at startup, and (b) what a
     /// hot-reload landed. Agents with no entry are listed as "unlimited" so
@@ -715,6 +770,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private void ReleaseRoute(string routeKey)
     {
+        if (TryReleaseRouteSlot(routeKey))
+            WakeAgentCapWaitersForRouteRelease(routeKey);
+    }
+
+    private bool TryReleaseRouteSlot(string routeKey)
+    {
         // Decrement-or-remove: drop the key when it hits 0 so the next
         // TryReserveAgentSlot takes the TryAdd branch cleanly. Holding the key
         // at 0 would cause TryUpdate(..., 1, 0) to be the only valid path —
@@ -722,16 +783,90 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // the dictionary and turns Snapshot/GetConcurrencyState into a fuller scan.
         while (true)
         {
-            if (!_runningPerRoute.TryGetValue(routeKey, out var current)) return;
+            if (!_runningPerRoute.TryGetValue(routeKey, out var current)) return false;
             if (current <= 1)
             {
-                if (_runningPerRoute.TryRemove(new KeyValuePair<string, int>(routeKey, current))) return;
+                if (_runningPerRoute.TryRemove(new KeyValuePair<string, int>(routeKey, current))) return true;
             }
             else
             {
-                if (_runningPerRoute.TryUpdate(routeKey, current - 1, current)) return;
+                if (_runningPerRoute.TryUpdate(routeKey, current - 1, current)) return true;
             }
             // Lost a race; retry.
+        }
+    }
+
+    /// <summary>
+    /// Per-agent release signal for cap-deferred items: a slot freed on
+    /// <paramref name="routeKey"/>, so items deferred against that route's cap
+    /// rejoin the ranked pickup set immediately instead of sleeping out the
+    /// rest of their cap-retry timer. Without this, a deferred in-flight item
+    /// (e.g. WorkComplete waiting on audit) loses the freed slot to any fresh
+    /// Queued item that happens to be evaluated first, regardless of priority
+    /// or queue position — deferred work then starves behind new starts.
+    ///
+    /// <para>
+    /// Each cleared item is removed via the same lease-checked
+    /// <see cref="RemoveDeferredItem"/> path the timer uses, so the still
+    /// sleeping requeue timer becomes a no-op: the item is woken exactly once.
+    /// The timer is kept (not cancelled) as the backstop for releases that
+    /// never arrive — e.g. a cap raised by hot-reload, or an orphaned worker
+    /// slot reclaimed without a route release. Quota-only, budget, pause, and
+    /// no-progress deferrals are untouched and still recheck on their own
+    /// interval.
+    /// </para>
+    /// </summary>
+    private void WakeAgentCapWaitersForRouteRelease(string routeKey)
+    {
+        if (_deferredItems.IsEmpty)
+            return;
+
+        var woken = 0;
+        foreach (var (id, lease) in _deferredItems)
+        {
+            if (lease.Kind != DeferredItemKind.AgentCap || lease.WaitingOnRoutes is null)
+                continue;
+
+            var waitsOnRoute = false;
+            foreach (var route in lease.WaitingOnRoutes)
+            {
+                if (string.Equals(route, routeKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    waitsOnRoute = true;
+                    break;
+                }
+            }
+            if (!waitsOnRoute)
+                continue;
+
+            // Lease-checked remove: if a re-deferral or the timer already
+            // claimed this item, leave it — exactly one wake per deferral.
+            if (RemoveDeferredItem(id, lease))
+                woken++;
+        }
+
+        if (woken == 0)
+            return;
+
+        _log.LogInformation(
+            "Agent slot released on route {RouteKey}: woke {Count} cap-deferred work item(s) back into dispatch ordering",
+            routeKey, woken);
+
+        // Observe-but-don't-await the wake kick (same pattern as PauseDispatch):
+        // a faulted channel write must not escape into the worker's finally.
+        try
+        {
+            var wakeTask = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
+            if (!wakeTask.IsCompletedSuccessfully)
+            {
+                wakeTask.AsTask().ContinueWith(
+                    t => _log.LogDebug(t.Exception, "Agent-cap slot-release wake kick faulted"),
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Agent-cap slot-release wake kick threw synchronously; queue likely already shutting down");
         }
     }
 
@@ -2167,9 +2302,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct,
         PickupCandidateScanProgress? scanProgress = null)
     {
+        // Snapshot the live ordering once per enumeration so a hot-reload of
+        // PreferInFlightOverFresh mid-scan cannot mix the two orderings inside
+        // one ranked candidate set.
+        var ordering = CurrentDispatchOrdering;
+
         if (_quotaRetryDispatchPromoter is null)
         {
-            await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+            await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct))
                 yield return item;
             yield break;
         }
@@ -2186,6 +2326,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 pageSkipIds,
                 _time.GetUtcNow(),
                 pageLimit,
+                ordering,
                 ct: ct))
             {
                 pageCount++;
@@ -2974,6 +3115,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     // use the longer QuotaRecheckInterval. AnyMemberAtCap only
                     // drives the per-agent ConcurrencyGated audit emission.
                     var deferDelay = decision.SuggestedRecheckIn;
+                    IReadOnlyList<string>? capWaitRoutes = null;
                     if (decision.AnyMemberAtCap)
                     {
                         if (decision.AtCapMembers.Count > 0)
@@ -2983,6 +3125,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 AuditLog.ConcurrencyGated(item.Id, atCapMember.Agent,
                                     GetRunning(atCapMember), GetAgentCap(atCapMember));
                             }
+                            capWaitRoutes = decision.AtCapMembers
+                                .Select(static m => m.RouteKey)
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToArray();
                         }
                         else
                         {
@@ -2991,11 +3137,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                                 AuditLog.ConcurrencyGated(item.Id, atCapAgent,
                                     GetRunning(atCapAgent), GetAgentCap(atCapAgent));
                             }
+                            capWaitRoutes = decision.AtCapAgents
+                                .Select(static a => a.Value)
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToArray();
                         }
                     }
                     AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
                     ClearPreStartRefactorDrainClaim(item);
-                    ScheduleDeferredRequeue(item.Id, deferDelay, ct);
+                    ScheduleDeferredRequeue(
+                        item.Id,
+                        deferDelay,
+                        ct,
+                        capWaitRoutes is { Count: > 0 } ? DeferredItemKind.AgentCap : DeferredItemKind.Generic,
+                        capWaitRoutes);
                     return;
                 }
                 if (decision.Chosen is { } chosen)
@@ -3093,7 +3248,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             workerIndex, id, routeKey, running, cap);
                         AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
                         ClearPreStartRefactorDrainClaim(item);
-                        ScheduleDeferredRequeue(item.Id, _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval, ct);
+                        ScheduleDeferredRequeue(
+                            item.Id,
+                            _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval,
+                            ct,
+                            DeferredItemKind.AgentCap,
+                            [routeKey]);
                         return;
                     }
                     // Reservation successful — outer finally releases on exit.
@@ -3635,9 +3795,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     {
         Generic,
         RefactorGate,
+        /// <summary>
+        /// Deferred because every quota-passing route for the item was at its
+        /// per-agent concurrency cap. <see cref="DeferredItemLease.WaitingOnRoutes"/>
+        /// carries the route keys that can clear the deferral early: a slot
+        /// release on any of them wakes the item back into dispatch ordering
+        /// instead of leaving it asleep for the whole recheck interval.
+        /// </summary>
+        AgentCap,
     }
 
-    private readonly record struct DeferredItemLease(long Generation, DeferredItemKind Kind);
+    private readonly record struct DeferredItemLease(
+        long Generation,
+        DeferredItemKind Kind,
+        IReadOnlyList<string>? WaitingOnRoutes = null);
 
     /// <summary>
     /// Checks per-project budget caps against the store. Returns a
@@ -3853,7 +4024,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private void ScheduleRefactorExclusivityRequeue(WorkItemId id, CancellationToken ct)
-        => ScheduleDeferredRequeue(id, RefactorExclusivityRecheckInterval, ct, refactorGateDeferral: true);
+        => ScheduleDeferredRequeue(id, RefactorExclusivityRecheckInterval, ct, DeferredItemKind.RefactorGate);
 
     private async Task<bool> TryClaimOrDeferRefactorDrainAsync(WorkItem item, CancellationToken ct)
     {
@@ -4053,14 +4224,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         WorkItemId id,
         TimeSpan delay,
         CancellationToken stoppingToken,
-        bool refactorGateDeferral = false)
+        DeferredItemKind kind = DeferredItemKind.Generic,
+        IReadOnlyList<string>? waitingOnRoutes = null)
     {
         // A concurrent pickup race can try to defer the same queued item from
         // more than one worker. Keep one timer owner per item so stale duplicate
         // retries do not amplify dispatcher wakeups or deferral backlog.
         var lease = new DeferredItemLease(
             Interlocked.Increment(ref _deferredItemGeneration),
-            refactorGateDeferral ? DeferredItemKind.RefactorGate : DeferredItemKind.Generic);
+            kind,
+            waitingOnRoutes);
         if (!_deferredItems.TryAdd(id, lease))
             return;
 
@@ -4193,6 +4366,18 @@ public sealed record OrchestratorOptions
     /// <c>CodeyBox:WorkerPool:MaxNoProgressRedispatches</c>). Default 10.
     /// </summary>
     public int MaxNoProgressRedispatches { get; init; } = 10;
+
+    /// <summary>
+    /// "In-flight before fresh" ordering preference (see
+    /// <c>CodeyBox:WorkerPool:PreferInFlightOverFresh</c>). When on — the
+    /// default — pickup ordering ranks past-work-phase items ahead of
+    /// equal-priority fresh starts, tie-broken by queue position. When off,
+    /// ordering falls back to finishing bucket, then priority, then creation
+    /// order. Independent of the cap-deferral release wake, which is
+    /// unconditional. Hot-reloadable via
+    /// <see cref="OrchestratorService.ApplyPreferInFlightOverFreshReload"/>.
+    /// </summary>
+    public bool PreferInFlightOverFresh { get; init; } = true;
 
     /// <summary>
     /// Maximum number of times the recovery loop will reset a mid-flight work

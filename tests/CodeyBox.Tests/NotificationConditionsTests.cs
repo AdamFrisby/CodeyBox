@@ -607,7 +607,7 @@ public sealed class StubWorkItemStore : IWorkItemStore
     }
     public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotImplementedException();
     public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => throw new NotImplementedException();
-    public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => throw new NotImplementedException();
+    public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => throw new NotImplementedException();

@@ -577,7 +577,7 @@ public sealed class ObservableMetricsTests : IDisposable
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotSupportedException();
         public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => throw new NotSupportedException();
-        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => throw new NotSupportedException();

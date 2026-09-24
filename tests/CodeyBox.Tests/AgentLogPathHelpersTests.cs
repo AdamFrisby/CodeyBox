@@ -220,7 +220,7 @@ public sealed class AgentLogPathHelpersTests : IDisposable
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => Empty();
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => Task.FromResult(0);
         public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => Task.CompletedTask;
-        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => Empty();
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) => Empty();
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => Task.FromResult(0);
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => Task.FromResult(0);
         public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);

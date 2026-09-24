@@ -413,8 +413,8 @@ public sealed class WorkItemAuditBudgetApiTests : IDisposable
         public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) =>
             inner.ReorderAsync(orderedIds, ct);
 
-        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) =>
-            inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) =>
+            inner.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct);
 
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) =>
             inner.CountStartedInWindowAsync(projectId, since, ct);

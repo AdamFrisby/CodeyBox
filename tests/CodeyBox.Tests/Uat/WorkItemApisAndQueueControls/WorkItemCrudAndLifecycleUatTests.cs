@@ -236,7 +236,7 @@ public sealed class WorkItemCrudAndLifecycleUatTests : IDisposable
         // other terminal states, so listing pickup candidates must not include
         // this item.
         var candidates = new List<WorkItem>();
-        await foreach (var c in _factory.Store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+        await foreach (var c in _factory.Store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>(), DispatchCandidateOrdering.FinishingThenPriority))
             candidates.Add(c);
         Assert.DoesNotContain(candidates, c => c.Id == item.Id);
     }

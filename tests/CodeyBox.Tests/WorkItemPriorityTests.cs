@@ -119,7 +119,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await _store.CreateAsync(lowOlder);
 
         var ordered = new List<WorkItemId>();
-        await foreach (var w in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+        await foreach (var w in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>(), DispatchCandidateOrdering.FinishingThenPriority))
             ordered.Add(w.Id);
 
         Assert.Equal(new[] { high.Id, lowOlder.Id, lowNewer.Id, negative.Id }, ordered);
@@ -134,7 +134,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await _store.CreateAsync(b);
 
         var ordered = new List<WorkItemId>();
-        await foreach (var w in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId> { a.Id }))
+        await foreach (var w in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId> { a.Id }, DispatchCandidateOrdering.FinishingThenPriority))
             ordered.Add(w.Id);
 
         Assert.Equal(new[] { b.Id }, ordered);
@@ -165,7 +165,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await _store.CreateAsync(working);
 
         var ordered = new List<WorkItemId>();
-        await foreach (var w in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+        await foreach (var w in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>(), DispatchCandidateOrdering.FinishingThenPriority))
             ordered.Add(w.Id);
 
         Assert.Equal(new[] { working.Id, queued.Id }, ordered);

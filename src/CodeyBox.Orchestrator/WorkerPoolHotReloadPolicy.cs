@@ -11,6 +11,8 @@ namespace CodeyBox.Orchestrator;
 /// <item><c>MaxConcurrentWorkers</c> — resizes the dispatcher concurrency gate.</item>
 /// <item><c>MaxConcurrentSandboxes</c> — resizes the sandbox admission gate.</item>
 /// <item><c>MinSpawnInterval</c> — replaces the live spawn-pacing floor.</item>
+/// <item><c>PreferInFlightOverFresh</c> — switches the live
+/// in-flight-before-fresh candidate-ordering preference.</item>
 /// </list>
 /// </para>
 ///
@@ -41,6 +43,7 @@ public static class WorkerPoolHotReloadPolicy
         nameof(WorkerPoolOptions.MaxConcurrentWorkers),
         nameof(WorkerPoolOptions.MaxConcurrentSandboxes),
         nameof(WorkerPoolOptions.MinSpawnInterval),
+        nameof(WorkerPoolOptions.PreferInFlightOverFresh),
     ];
 
     /// <summary>WorkerPool fields that require a restart to take effect.</summary>

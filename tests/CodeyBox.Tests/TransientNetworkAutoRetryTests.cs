@@ -1327,7 +1327,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.ListByStateAsync(state, ct);
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.CountByStateAsync(state, ct);
         public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => _inner.ReorderAsync(orderedIds, ct);
-        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => _inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) => _inner.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct);
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => _inner.CountStartedInWindowAsync(projectId, since, ct);
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => _inner.CountInFlightAsync(projectId, ct);
         public Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(ProjectId projectId, CancellationToken ct = default, WorkItemId? excludeId = null) => _inner.CountInFlightSplitByRefactorAsync(projectId, ct, excludeId);

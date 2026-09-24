@@ -1809,8 +1809,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
 
         public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
             IReadOnlySet<WorkItemId> skipIds,
+            DispatchCandidateOrdering ordering,
             CancellationToken ct = default) =>
-            _inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+            _inner.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct);
 
         public Task<int> CountStartedInWindowAsync(
             ProjectId projectId,

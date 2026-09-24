@@ -2997,8 +2997,33 @@ public sealed class SqliteWorkItemStore :
         return result is long l ? (int)l : 0;
     }
 
+    // CSV of QuotaRetryPhasePolicy.InFlightDispatchStates ints, embedded into
+    // the dispatch-ordering CASE fragments below so the past-work-phase state
+    // set stays single-source with the policy.
+    private static readonly string InFlightDispatchStateIdsCsv =
+        string.Join(", ", QuotaRetryPhasePolicy.InFlightDispatchStates.Select(static s => (int)s));
+
+    /// <summary>
+    /// Trailing ORDER BY keys appended after <c>priority DESC</c> when the
+    /// caller requests <see cref="DispatchCandidateOrdering.InFlightBeforeFresh"/>:
+    /// in-flight progress (states in <see cref="QuotaRetryPhasePolicy.InFlightDispatchStates"/>)
+    /// before fresh starts, then explicit queue position (0 sorts last, same
+    /// convention as the admin queue listing). The fragment is built only
+    /// from enum ints — never from untrusted input.
+    /// </summary>
+    private static string DispatchInFlightThenQueuePositionKeysSql(
+        DispatchCandidateOrdering ordering,
+        string stateColumn = "state") =>
+        ordering == DispatchCandidateOrdering.InFlightBeforeFresh
+            ? $"""
+                CASE WHEN {stateColumn} IN ({InFlightDispatchStateIdsCsv}) THEN 0 ELSE 1 END ASC,
+                CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
+            """
+            : "";
+
     public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
         IReadOnlySet<WorkItemId> skipIds,
+        DispatchCandidateOrdering ordering,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
@@ -3016,6 +3041,11 @@ public sealed class SqliteWorkItemStore :
             // fresh Queued work regardless of item priority. These items have already
             // spent agent/audit time and only need merge/push completion to drain,
             // so they must not sit behind a high-priority starting backlog.
+            //
+            // InFlightBeforeFresh adds, after priority, an in-flight-progress
+            // bucket (items past the work phase before fresh starts) and the
+            // queue_position tiebreak so a deferred-then-woken item keeps its
+            // queue rank against equal-priority fresh work.
             cmd.CommandText = $"""
                 SELECT * FROM work_items
                 WHERE state NOT IN (
@@ -3042,6 +3072,7 @@ public sealed class SqliteWorkItemStore :
                         ELSE 1
                     END ASC,
                     priority DESC,
+                    {DispatchInFlightThenQueuePositionKeysSql(ordering)}
                     created_at ASC;
                 """;
             using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -3061,6 +3092,7 @@ public sealed class SqliteWorkItemStore :
         IReadOnlySet<WorkItemId> skipIds,
         DateTimeOffset now,
         int limit,
+        DispatchCandidateOrdering ordering,
         QuotaRetryDispatchEligibility quotaRetryEligibility = QuotaRetryDispatchEligibility.DueOnly,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -3077,6 +3109,9 @@ public sealed class SqliteWorkItemStore :
 
         using (var cmd = readConn.CreateCommand())
         {
+            // Verbatim (non-interpolated) parts: the query carries $param-style
+            // SQLite parameters, so the ordering fragment is concatenated
+            // rather than interpolated.
             cmd.CommandText = """
                 SELECT * FROM (
                     SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
@@ -3133,6 +3168,7 @@ public sealed class SqliteWorkItemStore :
                         ELSE 1
                     END ASC,
                     priority DESC,
+                """ + DispatchInFlightThenQueuePositionKeysSql(ordering, "dispatch_ordering_state") + """
                     created_at ASC,
                     dispatch_source_order ASC
                 LIMIT $limit;

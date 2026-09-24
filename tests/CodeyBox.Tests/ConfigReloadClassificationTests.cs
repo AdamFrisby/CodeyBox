@@ -589,6 +589,9 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(WorkerPoolOptions.MaxNoProgressRedispatches):
                 opts.MaxNoProgressRedispatches = 99;
                 break;
+            case nameof(WorkerPoolOptions.PreferInFlightOverFresh):
+                opts.PreferInFlightOverFresh = !opts.PreferInFlightOverFresh;
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(field), field, "No mutator for this WorkerPool field.");
         }

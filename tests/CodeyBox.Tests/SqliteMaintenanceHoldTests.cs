@@ -452,6 +452,7 @@ public sealed class SqliteMaintenanceHoldTests : IDisposable
 
         public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
             IReadOnlySet<WorkItemId> skipIds,
+            DispatchCandidateOrdering ordering,
             [EnumeratorCancellation] CancellationToken ct = default)
         {
             if (Interlocked.Decrement(ref _remaining) >= 0)
@@ -461,7 +462,7 @@ public sealed class SqliteMaintenanceHoldTests : IDisposable
                     TimeSpan.FromMilliseconds(1),
                     holderKind,
                     withinExpectedHold);
-            await foreach (var item in inner.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+            await foreach (var item in inner.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct))
                 yield return item;
         }
 
