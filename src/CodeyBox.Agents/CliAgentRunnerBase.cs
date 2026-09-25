@@ -56,7 +56,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// join the chunk channel: tee'd raw stderr lines would be
     /// indistinguishable from genuine envelopes, so agent-controlled stderr
     /// could forge stream events and falsify persisted cost/summary
-    /// records.
+    /// records. The flag also scopes the claimable channel: the dispatch is
+    /// pinned to the attached exec-pipe transport (never the HTTP ingest
+    /// transport, whose bearer credential is recoverable inside the sandbox,
+    /// and never a credential-authenticated detached exit report), and the
+    /// in-VM exec wrapper is told via
+    /// <see cref="CodeyBox.Sandbox.SandboxConventions.EnvelopeFramedStdoutEnv"/>
+    /// to keep stderr off the stdout stream even under the log-file tee.
     /// </param>
     protected sealed record AgentInvocation(
         IReadOnlyList<string> Argv,
@@ -948,12 +954,25 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, runId),
+            ExtraEnvironment = BuildExecEnvironment(
+                invocation.ExtraEnvironment, runId, invocation.StdoutIsEnvelopeFramed),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
-            AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),
-            LaunchMode = SelectBatchLaunchMode(sandbox),
+            // Envelope-framed stdout is a claimable channel, so it must ride
+            // the attached exec pipe only: on the HTTP ingest transport the
+            // bearer credential authenticating the stream endpoint is
+            // recoverable inside the sandbox (the agent has sudo), which
+            // would let agent content POST forged envelopes — and a forged
+            // exit code — straight into the claimable channel. Attached exec
+            // anchors both the bytes and the outcome to the real process's
+            // fd chain and exit status instead.
+            AgentOutputTransport = invocation.StdoutIsEnvelopeFramed
+                ? SandboxAgentOutputTransportPreference.ExecPipe
+                : SelectBatchAgentOutputTransport(sandbox),
+            LaunchMode = invocation.StdoutIsEnvelopeFramed
+                ? SandboxExecLaunchMode.Attached
+                : SelectBatchLaunchMode(sandbox),
         };
 
         SandboxExecResult result;
@@ -1914,7 +1933,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     protected IReadOnlyDictionary<string, string>? BuildExecEnvironment(
         IReadOnlyDictionary<string, string>? environment,
-        string? runId = null)
+        string? runId = null,
+        bool stdoutIsEnvelopeFramed = false)
     {
         var merged = environment is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
@@ -1930,6 +1950,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         var logPath = AgentInvocationLogContext.CurrentLogPath;
         if (!string.IsNullOrEmpty(logPath))
             merged[SandboxConventions.AgentLogFileEnv] = logPath;
+        // Envelope-framed stdout tells the in-VM exec wrapper that stdout is a
+        // claimable envelope stream, so its tee'd log capture must keep stderr
+        // on a separate channel instead of merging it in with `2>&1`.
+        if (stdoutIsEnvelopeFramed)
+            merged[SandboxConventions.EnvelopeFramedStdoutEnv] = "1";
         return merged.Count == 0 ? null : merged;
     }
 

@@ -74,10 +74,23 @@ namespace CodeyBox.Agents.Devin;
 /// <c>loadSession</c> but the resume hook is not wired — a restored run
 /// re-dispatches fresh like the other file-state agents. Terminal failures
 /// surface either as shim <c>turn_error</c>/<c>fatal</c> envelopes
-/// (<see cref="DevinAcpOutcome"/>) or as <c>Error: …</c> lines on stderr
-/// (<see cref="DevinTerminalDiagnoser"/>); <see cref="RunAsync"/> lifts the
+/// (<see cref="DevinAcpOutcome"/>) or as <c>Error: …</c> lines lifted by
+/// <see cref="DevinTerminalDiagnoser"/>; <see cref="RunAsync"/> lifts the
 /// first into <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline
 /// parks quota/auth failures instead of dead-lettering them.</para>
+///
+/// <para><b>Envelope provenance.</b> <c>devin.acp</c> lines are claimed by
+/// type tag, so nothing agent-controlled may ever land as a bare line on the
+/// claimable stdout stream. Two mechanisms enforce that: the shim retargets
+/// its whole stderr surface (inherited by the CLI and every tool subprocess)
+/// through a relay that re-emits each line as a <c>codeybox.stderr</c>
+/// envelope — provenance at the emission point, safe even where the exec
+/// wrapper's log-file tee merges streams — and
+/// <c>AgentInvocation.StdoutIsEnvelopeFramed</c> pins the dispatch to the
+/// attached exec-pipe transport so no bearer credential exists in-VM that
+/// could POST forged bytes into the stream. See
+/// <see cref="DevinAcpEnvelope.IsEnvelope"/> for the residual trust boundary.
+/// </para>
 /// </summary>
 public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IStructuredStreamAgentRunner
 {
@@ -192,10 +205,11 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         // so the agent-class config schema stays uniform but is not threaded
         // into argv. ACP envelopes are the only output mode this runner
         // speaks, so captureStructuredStream needs no argv switch — but the
-        // envelope framing is still declared so the exec layer wraps stderr
-        // instead of teeing it raw into the envelope channel (a
+        // envelope framing is still declared so the exec layer keeps stderr
+        // off the claimable channel end to end (host-side wrapping, the
+        // wrapper's no-merge tee, and the attached exec-pipe transport) — a
         // model-controlled stderr line shaped like devin.acp output would
-        // otherwise forge stream events and falsify cost records).
+        // otherwise forge stream events and falsify cost records.
         _ = reasoningMode;
         _ = credential;
         _ = captureStructuredStream;

@@ -22,9 +22,10 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
     }
 
     /// <summary>
-    /// The devin.acp envelope is emitted only by CodeyBox's own devin shim,
-    /// so claiming by type tag is unambiguous — no other agent's stream can
-    /// carry it.
+    /// Claims by the devin.acp type tag; see
+    /// <see cref="DevinAcpEnvelope.IsEnvelope"/> for why the tag is
+    /// unambiguous (provenance is enforced at the emission point and the
+    /// claimable channel is pinned to the attached exec pipe).
     /// </summary>
     public override bool TryClaim(JsonElement line) =>
         DevinAcpEnvelope.IsEnvelope(line);
@@ -40,20 +41,6 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
         {
             DevinAcpEnvelope.EventSessionUpdate => ParseSessionUpdate(root, timestamp),
             DevinAcpEnvelope.EventTurnComplete => ParseTurnComplete(root, timestamp),
-            DevinAcpEnvelope.EventTurnError or DevinAcpEnvelope.EventFatal => new ParsedEvent(
-                EventType: $"devin.acp.{eventName}",
-                Timestamp: timestamp,
-                IsAssistant: false,
-                ToolStarts: [],
-                ToolResults: [],
-                InputTokens: null,
-                OutputTokens: null,
-                CachedInputTokens: null,
-                EstimatedUsd: null,
-                TotalDuration: null,
-                TimeToFirstToken: null,
-                FinalText: FirstString(root, "message"),
-                IsRecognized: true),
             _ => new ParsedEvent(
                 EventType: $"devin.acp.{eventName}",
                 Timestamp: timestamp,
@@ -66,7 +53,11 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                 EstimatedUsd: null,
                 TotalDuration: null,
                 TimeToFirstToken: null,
-                FinalText: null,
+                // Terminal failure envelopes carry the shim's diagnostic in
+                // `message`; every other envelope leaves FinalText unset.
+                FinalText: eventName is DevinAcpEnvelope.EventTurnError or DevinAcpEnvelope.EventFatal
+                    ? FirstString(root, "message")
+                    : null,
                 IsRecognized: true),
         };
     }
@@ -82,7 +73,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
         {
             switch (FirstString(update, DevinAcpEnvelope.SessionUpdatePropertyName))
             {
-                case "tool_call":
+                case DevinAcpEnvelope.UpdateKindToolCall:
                 {
                     var id = FirstString(update, "toolCallId") ?? "unknown";
                     var name = FirstString(update, "title")
@@ -91,7 +82,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                     starts.Add(new ToolBuilder(id, name, InputSummary(update), timestamp));
                     break;
                 }
-                case "tool_call_update":
+                case DevinAcpEnvelope.UpdateKindToolCallUpdate:
                 {
                     // Only terminal statuses close a tool call; in_progress /
                     // pending ticks are liveness envelopes.
@@ -109,7 +100,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                     }
                     break;
                 }
-                case "agent_message_chunk":
+                case DevinAcpEnvelope.UpdateKindAgentMessageChunk:
                     isAssistant = true;
                     break;
                 case DevinAcpEnvelope.UpdateKindUsageUpdate:

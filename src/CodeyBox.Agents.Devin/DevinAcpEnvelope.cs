@@ -35,11 +35,15 @@ internal static class DevinAcpEnvelope
     internal const string EventFatal = "fatal";
 
     /// <summary>
-    /// The <c>sessionUpdate</c> discriminator value marking a usage tick
-    /// inside an <see cref="EventSessionUpdate"/> envelope's <c>update</c>
-    /// object.
+    /// The <c>sessionUpdate</c> discriminator values inside an
+    /// <see cref="EventSessionUpdate"/> envelope's <c>update</c> object —
+    /// the ACP notification kinds the stream parser folds into stream
+    /// events.
     /// </summary>
     internal const string UpdateKindUsageUpdate = "usage_update";
+    internal const string UpdateKindToolCall = "tool_call";
+    internal const string UpdateKindToolCallUpdate = "tool_call_update";
+    internal const string UpdateKindAgentMessageChunk = "agent_message_chunk";
 
     // Devin-specific `usage_update` _meta counters (verified against devin
     // 3000.11.1); the ACP session/prompt `usage` object spells the same
@@ -93,8 +97,15 @@ internal static class DevinAcpEnvelope
     /// <summary>
     /// True when <paramref name="root"/> carries the devin.acp type tag —
     /// the claim check the stream parser runs on each candidate line. The
-    /// tag is emitted only by CodeyBox's own devin shim, so claiming by it
-    /// is unambiguous.
+    /// tag is emitted only by CodeyBox's own devin shim; the claim is sound
+    /// because provenance is enforced at the emission point — the shim
+    /// folds its entire stderr surface (including tool-subprocess output)
+    /// into <c>codeybox.stderr</c> envelopes — and because
+    /// envelope-framed dispatches are pinned to the attached exec-pipe
+    /// transport whose stdout fd chain only the shim's process tree can
+    /// write (no bearer credential exists in-VM for them, and the exec
+    /// wrapper never merges stderr into the stream under
+    /// <c>CODEYBOX_STDOUT_ENVELOPE_FRAMED</c>).
     /// </summary>
     internal static bool IsEnvelope(JsonElement root) =>
         root.ValueKind == JsonValueKind.Object

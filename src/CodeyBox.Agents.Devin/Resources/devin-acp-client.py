@@ -17,8 +17,19 @@ permission_auto_granted, permission_auto_cancelled, unhandled_request,
 mode_set, turn_complete, turn_error, fatal, protocol_error.
 
 Exit status: 0 only after a session/prompt response carrying a stopReason;
-2 for any protocol, spawn, or turn-level failure. The CLI's own stderr is
-inherited, so `Error: ...` diagnostics still reach the exec stderr untouched.
+2 for any protocol, spawn, or turn-level failure.
+
+Stderr is NOT inherited into the exec channel: fd 2 is retargeted to a pipe
+drained by a relay thread that re-emits every line on stdout as a
+{"type":"codeybox.stderr","text":...} envelope. Envelope provenance must be
+established at the emission point — the in-VM exec wrapper merges the
+command's stderr into its stdout whenever the invocation log tee is active
+(CODEYBOX_AGENT_LOG_FILE), so a tool subprocess printing a forged devin.acp
+line to stderr would otherwise arrive host-side as a bare, claimable
+envelope and falsify persisted usage/outcome records. Wrapped at the
+source, a merged or injected stream can never yield a bare devin.acp line
+sourced from stderr; `Error: ...` diagnostics still surface as envelope
+text for the host-side diagnoser.
 """
 
 from __future__ import annotations
@@ -29,8 +40,17 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 
 ENVELOPE_TYPE = "devin.acp"
+# Mirror of the host stream parser's stderr-envelope tag
+# (CliAgentRunnerBase.StderrEnvelopeType). Duplicated because this shim
+# ships as a self-contained script.
+STDERR_ENVELOPE_TYPE = "codeybox.stderr"
+# Mirror of the host StderrEnvelopeForwarder bound: a runaway stderr writer
+# must not grow the relay's pending buffer without bound.
+STDERR_MAX_LINE_CHARS = 64 * 1024
+STDERR_TRUNCATION_MARKER = "[...stderr line truncated]"
 ACP_PROTOCOL_VERSION = 1
 CLIENT_NAME = "codeybox"
 CLIENT_VERSION = "1"
@@ -51,11 +71,95 @@ FINAL_TEXT_TRUNCATION_MARKER = "[...final text truncated]"
 EXIT_TURN_FAILED = 2
 
 
+_stdout_lock = threading.Lock()
+
+
+def _write_stdout_line(line):
+    # The relay thread and emit() share fd 1; serialise so a stderr envelope
+    # can never interleave mid-line with a devin.acp envelope.
+    with _stdout_lock:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
 def emit(event, **fields):
     envelope = {"type": ENVELOPE_TYPE, "event": event}
     envelope.update(fields)
-    sys.stdout.write(json.dumps(envelope) + "\n")
-    sys.stdout.flush()
+    _write_stdout_line(json.dumps(envelope))
+
+
+def _emit_stderr_line(raw):
+    text = raw.decode("utf-8", errors="replace").rstrip("\r")
+    _write_stdout_line(json.dumps({"type": STDERR_ENVELOPE_TYPE, "text": text}))
+
+
+def _stderr_relay_loop(read_fd):
+    """Drain the stderr pipe and re-emit each line on stdout as a
+    codeybox.stderr envelope. Keeps draining on envelope-write failure so a
+    dead stdout can never block writers on a full pipe; bounded per line so
+    a runaway writer cannot grow the buffer without limit."""
+    pending = bytearray()
+    overflowed = False
+
+    def flush_line(raw):
+        if len(raw) > STDERR_MAX_LINE_CHARS:
+            raw = raw[:STDERR_MAX_LINE_CHARS] + STDERR_TRUNCATION_MARKER.encode("utf-8")
+        try:
+            _emit_stderr_line(raw)
+        except Exception:
+            pass
+
+    while True:
+        try:
+            chunk = os.read(read_fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if newline < 0:
+                break
+            line = bytes(pending[:newline])
+            del pending[:newline + 1]
+            if overflowed:
+                # Tail of a line whose truncated prefix was already emitted.
+                overflowed = False
+                continue
+            flush_line(line)
+        if len(pending) > STDERR_MAX_LINE_CHARS:
+            # Enforce the bound even mid-overflow — a writer emitting a
+            # never-ending line must not grow the buffer without limit.
+            if not overflowed:
+                flush_line(bytes(pending))
+                overflowed = True
+            pending.clear()
+    if pending and not overflowed:
+        flush_line(bytes(pending))
+
+
+def install_stderr_envelope_relay():
+    """Retarget fd 2 to a pipe drained by a daemon relay thread that
+    re-emits every line on stdout as a codeybox.stderr envelope.
+
+    Provenance is established at the emission point, inside the sandbox,
+    rather than relying on the transport to keep stderr off the claimable
+    stdout stream: the exec wrapper merges the command's stderr into its
+    stdout whenever the invocation log tee is active, so without this relay
+    a tool subprocess could print a bare forged devin.acp envelope to
+    stderr and have it claimed as genuine shim output host-side. The CLI
+    and every tool subprocess inherit fd 2, so all of their stderr passes
+    through the relay — including this shim's own tracebacks.
+    """
+    read_fd, write_fd = os.pipe()
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+    thread = threading.Thread(
+        target=_stderr_relay_loop, args=(read_fd,), daemon=True,
+        name="stderr-envelope-relay")
+    thread.start()
+    return thread
 
 
 class FrameTooLargeError(Exception):
@@ -333,6 +437,20 @@ def read_prompt(path):
 def main(argv=None):
     args = parse_args(argv)
 
+    # Everything the CLI and its tool subprocesses write to fd 2 from here on
+    # is folded into codeybox.stderr envelopes on stdout — a bare stderr line
+    # can never reach the claimable envelope stream.
+    stderr_relay = install_stderr_envelope_relay()
+    try:
+        return run(args)
+    finally:
+        # Best-effort drain: once the CLI and any grandchildren close their
+        # copies of the pipe's write end the relay sees EOF; a lingering
+        # holder just loses the un-emitted tail after the grace window.
+        stderr_relay.join(timeout=2.0)
+
+
+def run(args):
     try:
         prompt = read_prompt(args.prompt_file)
     except (OSError, ValueError) as exc:
@@ -358,7 +476,7 @@ def main(argv=None):
             spawn_argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,  # inherit: CLI `Error: ...` lines reach exec stderr untouched
+            stderr=None,  # inherits fd 2, which the relay retargeted to the envelope pipe
             cwd=cwd,
             env=env)
     except OSError as exc:

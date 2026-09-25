@@ -21,7 +21,12 @@ namespace CodeyBox.Agents.Devin;
 /// </summary>
 internal static class DevinAcpOutcome
 {
-    internal const int MaxDiagnosticChars = 500;
+    /// <summary>
+    /// Single source of truth is <see cref="DevinTerminalDiagnoser"/> — both
+    /// extractors cap text lifted into <see cref="AgentResult.TerminalDiagnostic"/>
+    /// at the same bound.
+    /// </summary>
+    internal const int MaxDiagnosticChars = DevinTerminalDiagnoser.MaxDiagnosticChars;
 
     internal enum TerminalEvent
     {
@@ -89,8 +94,6 @@ internal static class DevinAcpOutcome
             : $"devin acp {prefix} during {stage}: {message ?? "unknown"}";
         if (code is not null)
             text += $" (code {code})";
-        return text.Length <= MaxDiagnosticChars
-            ? text
-            : text[..MaxDiagnosticChars] + "…";
+        return DevinTerminalDiagnoser.TruncateDiagnostic(text);
     }
 }

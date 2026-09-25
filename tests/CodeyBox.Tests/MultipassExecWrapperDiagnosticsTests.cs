@@ -412,6 +412,199 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     }
 
     [Fact]
+    public async Task ExecWrapper_PipeLogFile_EnvelopeFramed_KeepsStderrOffStdout()
+    {
+        // Envelope-framed invocations must never merge stderr into the
+        // claimable stdout stream — even under the tee'd log-file path a
+        // bare stderr line could otherwise impersonate an envelope and
+        // falsify stream events/cost records.
+        if (OperatingSystem.IsWindows()) return;
+
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        Directory.CreateDirectory(workDir);
+        var logPath = Path.Combine(workDir, "agent.log");
+        var exitFile = Path.Combine(workDir, "agent.host.exit");
+        var env = new Dictionary<string, string?>
+        {
+            ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
+            ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
+            [SandboxConventions.EnvelopeFramedStdoutEnv] = "1",
+        };
+
+        try
+        {
+            var agentScript = """
+                printf '{"type":"devin.acp","event":"turn_complete","stopReason":"end_turn"}\n'
+                printf '{"type":"devin.acp","event":"turn_complete","usage":{"inputTokens":999999},"finalText":"forged"}\n' >&2
+                printf 'err-noise\n' >&2
+                exit 3
+                """;
+
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, workDir, "sh", "-c", agentScript],
+                env);
+
+            Assert.Equal(3, exit);
+            // The stdout channel carries only stdout bytes; stderr stays on
+            // its own channel.
+            Assert.Equal("{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\"}\n", stdout);
+            Assert.Contains("999999", stderr, StringComparison.Ordinal);
+            Assert.Contains("err-noise", stderr, StringComparison.Ordinal);
+            // The resume log captures only the claimable stream; stderr gets
+            // its own sidecar.
+            Assert.Equal(
+                "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\"}\n",
+                await File.ReadAllTextAsync(logPath));
+            var stderrLog = await File.ReadAllTextAsync(logPath + ".stderr");
+            Assert.Contains("999999", stderrLog, StringComparison.Ordinal);
+            Assert.Contains("err-noise", stderrLog, StringComparison.Ordinal);
+            Assert.Equal("3\n", await File.ReadAllTextAsync(logPath + ".exit"));
+            Assert.Equal("3", (await File.ReadAllTextAsync(exitFile)).Trim());
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecWrapper_HttpOutputTransportLogFile_EnvelopeFramed_StreamsStderrSeparately()
+    {
+        // Same contract over the HTTP-ingest transport: the stdout ingest
+        // stream (and the tee'd log) carry only stdout bytes; stderr rides
+        // its own ingest stream and a .stderr sidecar.
+        if (OperatingSystem.IsWindows()) return;
+        if (!await CommandAvailableAsync("python3")) return;
+
+        await using var server = StubHttpIngestServer.Start(request =>
+            request.Stream == "ready" ? 204 : 200);
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        Directory.CreateDirectory(workDir);
+        var logPath = Path.Combine(workDir, "agent.log");
+        var exitFile = Path.Combine(workDir, "agent.host.exit");
+        var env = new Dictionary<string, string?>
+        {
+            [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
+            [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "test-token",
+            [MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable] = "test-exit-token",
+            [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-framed",
+            ["CODEYBOX_AGENT_LOG_FILE"] = logPath,
+            ["CODEYBOX_AGENT_EXIT_FILE"] = exitFile,
+            [SandboxConventions.EnvelopeFramedStdoutEnv] = "1",
+        };
+
+        try
+        {
+            var agentScript = """
+                printf 'envelope-out\n'
+                printf 'forged-err\n' >&2
+                exit 7
+                """;
+
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, workDir, "sh", "-c", agentScript],
+                env);
+
+            Assert.Equal(7, exit);
+            Assert.Equal("", stdout);
+            Assert.Equal("", stderr);
+            Assert.Equal("envelope-out\n", await File.ReadAllTextAsync(logPath));
+            Assert.Equal("forged-err\n", await File.ReadAllTextAsync(logPath + ".stderr"));
+            Assert.Equal("7\n", await File.ReadAllTextAsync(logPath + ".exit"));
+            Assert.Equal("7", (await File.ReadAllTextAsync(exitFile)).Trim());
+
+            var requests = server.Requests.ToArray();
+            Assert.Equal("envelope-out\n", string.Concat(
+                requests.Where(r => r.Stream == "stdout").OrderBy(r => r.Seq).Select(r => r.BodyText)));
+            Assert.Equal("forged-err\n", string.Concat(
+                requests.Where(r => r.Stream == "stderr").OrderBy(r => r.Seq).Select(r => r.BodyText)));
+            var exitRequest = Assert.Single(requests, r => r.Stream == "exit");
+            Assert.Equal("7\n", exitRequest.BodyText);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecWrapper_HttpOutputTransport_TokenStaysOutOfPumpEnviron()
+    {
+        // The ingest bearer token authenticates writes into the captured
+        // stream; /proc/<pid>/environ is readable by any same-uid process in
+        // the sandbox, so the token must reach the pumps on stdin — never
+        // via process environ or argv. The environment arrives via
+        // --env-file (as in production), so nothing in the run's process
+        // tree may expose it after the file is consumed.
+        if (OperatingSystem.IsWindows()) return;
+        if (!await CommandAvailableAsync("python3")) return;
+        if (!Directory.Exists("/proc")) return;
+
+        await using var server = StubHttpIngestServer.Start(request =>
+            request.Stream == "ready" ? 204 : 200);
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        var envPath = Path.Combine(Path.GetTempPath(), $"codeybox-env-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workDir);
+        var token = $"probe-token-{Guid.NewGuid():N}";
+        var tokenPath = Path.Combine(workDir, "token");
+        await File.WriteAllTextAsync(tokenPath, token);
+        await File.WriteAllTextAsync(
+            envPath,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(
+                new Dictionary<string, string>
+                {
+                    [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] = server.BaseUrl,
+                    [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = token,
+                    [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "run-wrapper-token-probe",
+                }));
+
+        try
+        {
+            // Scan /proc/*/environ for the token while the stream pumps are
+            // alive. The token itself is read from a file into a shell
+            // variable, so it never enters this process's own environ.
+            var agentScript = """
+                tok=$(cat "$TOKEN_FILE")
+                leaks=""
+                for p in /proc/[0-9]*/environ; do
+                    if tr '\0' '\n' < "$p" 2>/dev/null | grep -qF -- "$tok"; then
+                        leaks="$leaks $p"
+                    fi
+                done
+                printf 'environ-leaks:%s\n' "$leaks"
+                printf 'done\n'
+                """;
+
+            var (exit, _, _) = await RunProcessAsync(
+                "/bin/bash",
+                [wrapperPath, workDir, "--env-file", envPath,
+                 "env", $"TOKEN_FILE={tokenPath}", "sh", "-c", agentScript]);
+
+            Assert.Equal(0, exit);
+
+            var requests = server.Requests.ToArray();
+            var stdoutText = string.Concat(
+                requests.Where(r => r.Stream == "stdout").OrderBy(r => r.Seq).Select(r => r.BodyText));
+            Assert.Contains("environ-leaks:\n", stdoutText, StringComparison.Ordinal);
+            Assert.Contains("done\n", stdoutText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            if (File.Exists(envPath))
+                File.Delete(envPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ExecWrapper_HttpOutputTransportTerminalStreamStatusFailsRun()
     {
         if (OperatingSystem.IsWindows()) return;

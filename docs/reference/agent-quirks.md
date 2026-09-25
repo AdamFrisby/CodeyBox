@@ -457,15 +457,26 @@ materialises the shim and a prompt file from a framed stdin payload
   agent only as `session/prompt` JSON — never in argv or the environment.
 - Failure text surfaces either as shim `turn_error`/`fatal` envelopes
   (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
-  `Error: …` lines on stderr (verified: `Error: Not logged in` exits
-  nonzero before the handshake); `DevinTerminalDiagnoser` lifts the first
-  such line as a fallback.
+  `Error: …` lines — the CLI prints them to stderr (verified: `Error: Not
+  logged in` exits nonzero before the handshake), which the shim's stderr
+  relay delivers inside `codeybox.stderr` envelopes;
+  `DevinTerminalDiagnoser` unwraps and lifts the first such line as a
+  fallback.
 - Envelope provenance: `devin.acp` lines are claimed by their type tag, so
-  exec stderr — the CLI inherits it, including tool-subprocess output —
-  is wrapped into `codeybox.stderr` envelopes before joining the captured
-  stream, whatever the pipeline's capture flag. A line the model prints to
-  stderr can never impersonate a shim envelope and falsify usage/cost
-  records.
+  nothing agent-controlled may reach the claimable stream as a bare line.
+  The shim retargets its own fd 2 — inherited by the CLI and every tool
+  subprocess — through a relay that re-emits each line on stdout as a
+  `codeybox.stderr` envelope, so even a transport that merges stderr into
+  stdout (the wrapper's `CODEYBOX_AGENT_LOG_FILE` tee) can never yield a
+  bare forged envelope. For framed invocations the wrapper additionally
+  keeps stderr on its own channel end to end (`CODEYBOX_STDOUT_ENVELOPE_FRAMED`;
+  stderr tees to a `.stderr` sidecar instead of the log) and the dispatch
+  is pinned to the attached exec-pipe transport — never the HTTP ingest
+  transport or a detached launch — because the ingest bearer credential is
+  recoverable inside the VM (the agent has sudo) and would let agent content
+  POST forged envelopes straight into the claimable stream. A line the model
+  prints to stderr can never impersonate a shim envelope and falsify
+  usage/cost records.
 - The text-only path (`RunTextOnlyAsync`) still uses
   `devin -p --respect-workspace-trust false` with no permission flag —
   the read-only `auto` default is the conservative shape for answering

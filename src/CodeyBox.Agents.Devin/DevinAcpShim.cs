@@ -1,4 +1,3 @@
-using System.Reflection;
 using CodeyBox.Agents;
 
 namespace CodeyBox.Agents.Devin;
@@ -40,7 +39,7 @@ internal static class DevinAcpShim
     private static readonly Lazy<byte[]> ScriptBytes = new(LoadScriptBytesCore);
 
     /// <summary>Read the embedded shim script bytes (loaded once, then cached).</summary>
-    public static ReadOnlyMemory<byte> LoadScriptBytes() => ScriptBytes.Value;
+    internal static ReadOnlyMemory<byte> LoadScriptBytes() => ScriptBytes.Value;
 
     private static byte[] LoadScriptBytesCore()
     {
@@ -63,7 +62,7 @@ internal static class DevinAcpShim
     /// <c>/proc/&lt;pid&gt;/environ</c> — the same delivery guarantee the
     /// print-mode prompt file had.
     /// </summary>
-    public static string BuildDispatchStdin(string prompt)
+    internal static string BuildDispatchStdin(string prompt)
     {
         ArgumentNullException.ThrowIfNull(prompt);
 
