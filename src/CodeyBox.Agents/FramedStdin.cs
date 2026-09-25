@@ -99,7 +99,7 @@ internal static class FramedStdin
     private static string ReaderLoopCore(string endMarker, string foundVariable, string collectLine)
         => string.Join('\n',
             "while IFS= read -r line; do",
-            $"  if [ \"$line\" = {ShellQuote(endMarker)} ]; then {foundVariable}=1; break; fi",
+            $"  if [ \"$line\" = {ShellQuoting.Quote(endMarker)} ]; then {foundVariable}=1; break; fi",
             $"  {collectLine}",
             "done");
 
@@ -114,14 +114,4 @@ internal static class FramedStdin
 
         static bool IsAsciiLetter(char ch) => ch is >= 'a' and <= 'z' or >= 'A' and <= 'Z';
     }
-
-    /// <summary>
-    /// Single-quotes <paramref name="value"/> for safe interpolation into a
-    /// <c>bash</c>/<c>sh</c> script, escaping embedded single quotes. The
-    /// one POSIX-quoting implementation shared by every generated-script
-    /// helper in this assembly (and by sibling agent assemblies via
-    /// InternalsVisibleTo).
-    /// </summary>
-    internal static string ShellQuote(string value) =>
-        "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
 }

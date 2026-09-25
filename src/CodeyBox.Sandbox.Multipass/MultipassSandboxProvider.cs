@@ -3604,8 +3604,11 @@ test "$work" = present && test "$exec_wrapper" = present
     /// The exec wrapper script content. Sources the env file (if present),
     /// cds to the target working directory, exec's the user command. Lives
     /// at /usr/local/bin/codeybox-exec inside the VM, owned by root with
-    /// mode 0755 so the agent (running as the unprivileged ubuntu user
-    /// without sudo) can run but cannot modify it.
+    /// mode 0755 so the agent's unprivileged ubuntu user can run it but an
+    /// accidental write cannot modify it. Note the ubuntu user holds
+    /// passwordless sudo inside the sandbox, so in-VM file ownership is not
+    /// a trust boundary against the agent — the wrapper's value is keeping
+    /// user commands out of a root context by default.
     ///
     /// <para>R8-core: when <c>CODEYBOX_AGENT_LOG_FILE</c> is set in the user
     /// environment, both stdout and stderr are tee'd to that path inside the

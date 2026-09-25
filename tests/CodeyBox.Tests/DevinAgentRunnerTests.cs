@@ -297,6 +297,29 @@ public sealed class DevinAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_ExitZeroWithTurnErrorEnvelope_HeadlinesReportedOutcome()
+    {
+        // A zero exit WITH a terminal failure envelope must headline what
+        // the stream actually reported — the summary claiming "no turn
+        // outcome" while TerminalDiagnostic carried the real failure would
+        // state the opposite of the capture.
+        var sandbox = new RecordingSandbox
+        {
+            DevinExitCode = 0,
+            DevinStderr = string.Empty,
+            DevinStdout = "{\"type\":\"devin.acp\",\"event\":\"turn_error\",\"code\":-32001,\"message\":\"usage limit reached\"}\n",
+        };
+        var runner = RunnerWithDefault();
+
+        var result = await runner.RunAsync(sandbox, "/work", "x", Cred());
+
+        Assert.False(result.Success);
+        Assert.Contains("usage limit reached", result.Summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("without reporting a turn outcome", result.Summary, StringComparison.Ordinal);
+        Assert.NotNull(result.TerminalDiagnostic);
+    }
+
+    [Fact]
     public async Task RunAsync_HealthyRun_LeavesTerminalDiagnosticNull()
     {
         var sandbox = new RecordingSandbox { DevinStdout = TurnCompleteStdout, DevinStderr = string.Empty };

@@ -596,7 +596,17 @@ public sealed partial class PipelineRunner
                 runner.Kind, item.AgentInstanceId, item.Id, ConflictReworkPhaseKey, iteration: null, startedAt, endedAt,
                 ResolveObservedModelId(runner, item.ModelId));
 
-            var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
+            // The SEMANTIC_INCOMPATIBLE marker is agent-visible text: under
+            // the devin.acp dispatch it arrives JSON-escaped inside
+            // agent_message_chunk / finalText envelopes (and may split
+            // across chunk boundaries), so captured stdout must be
+            // projected through the runner's extractor before scanning —
+            // the same contract the verdict / question / PR-text consumers
+            // already follow (see AgentVisibleStdout).
+            var visibleStdout = agentResult.Stdout is { } capturedStdout
+                ? AgentVisibleStdout(runner, capturedStdout)
+                : string.Empty;
+            var combined = visibleStdout + "\n" + (agentResult.Stderr ?? string.Empty);
             var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);
             var agentFailureClassification = !agentResult.Success
                 ? _authFailureClassifier.ClassifyFailure(runner, agentResult)

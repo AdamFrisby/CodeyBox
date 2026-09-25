@@ -512,17 +512,22 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
 
         var outcome = DevinAcpOutcome.Extract(result.Stdout);
 
-        // A zero exit without the shim's terminal envelope means the run was
-        // cut short before the turn outcome was written (killed shim, capped
-        // stdout) — honest failure, not a silent success. The flip runs
-        // before the diagnostic lifts so a turn_error/fatal envelope can
-        // never keep Success=true even if the exec layer reported 0.
+        // A zero exit without a turn_complete envelope is never a silent
+        // success: either the run was cut short before the turn outcome was
+        // written (killed shim, capped stdout — no terminal envelope), or the
+        // shim DID report a terminal failure envelope, in which case the
+        // summary must headline what the stream actually contained rather
+        // than claim no outcome arrived. The flip runs before the diagnostic
+        // lift so a turn_error/fatal envelope can never keep Success=true
+        // even if the exec layer reported 0.
         if (result.Success && outcome.Event != DevinAcpOutcome.TerminalEvent.TurnComplete)
         {
             result = result with
             {
                 Success = false,
-                Summary = "devin acp exited without reporting a turn outcome",
+                Summary = outcome.Event == DevinAcpOutcome.TerminalEvent.None
+                    ? "devin acp exited without reporting a turn outcome"
+                    : outcome.Diagnostic ?? $"devin acp reported {outcome.Event}",
             };
         }
 

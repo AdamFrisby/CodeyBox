@@ -1963,7 +1963,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// by file) quotes argv the same way rather than re-implementing it.
     /// </summary>
     protected static string ShellQuote(string value) =>
-        FramedStdin.ShellQuote(value);
+        ShellQuoting.Quote(value);
 
     private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>
         $"{Kind.Value}\n{sandbox.Id}\n{workingDirectory}";

@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import secrets
 import signal
@@ -60,8 +61,9 @@ ENVELOPE_TYPE = "devin.acp"
 # ships as a self-contained script.
 STDERR_ENVELOPE_TYPE = "codeybox.stderr"
 # Mirror of the host StderrEnvelopeForwarder bound: a runaway stderr writer
-# must not grow the relay's pending buffer without bound.
-STDERR_MAX_LINE_CHARS = 64 * 1024
+# must not grow the relay's pending buffer without bound. The bound applies
+# to raw bytes before UTF-8 decode — a byte cap, not a char count.
+STDERR_MAX_LINE_BYTES = 64 * 1024
 STDERR_TRUNCATION_MARKER = "[...stderr line truncated]"
 ACP_PROTOCOL_VERSION = 1
 CLIENT_NAME = "codeybox"
@@ -114,8 +116,8 @@ def _stderr_relay_loop(read_fd):
     overflowed = False
 
     def flush_line(raw):
-        if len(raw) > STDERR_MAX_LINE_CHARS:
-            raw = raw[:STDERR_MAX_LINE_CHARS] + STDERR_TRUNCATION_MARKER.encode("utf-8")
+        if len(raw) > STDERR_MAX_LINE_BYTES:
+            raw = raw[:STDERR_MAX_LINE_BYTES] + STDERR_TRUNCATION_MARKER.encode("utf-8")
         try:
             _emit_stderr_line(raw)
         except Exception:
@@ -140,7 +142,7 @@ def _stderr_relay_loop(read_fd):
                 overflowed = False
                 continue
             flush_line(line)
-        if len(pending) > STDERR_MAX_LINE_CHARS:
+        if len(pending) > STDERR_MAX_LINE_BYTES:
             # Enforce the bound even mid-overflow — a writer emitting a
             # never-ending line must not grow the buffer without limit.
             if not overflowed:
@@ -259,7 +261,6 @@ def truncated_append(parts, total, text):
 
 
 def run_turn(client, prompt, cwd, mode):
-    session_id = None
     final_text_parts = []
     final_text_chars = 0
 
@@ -390,11 +391,17 @@ def numeric_map(value):
     accounting."""
     if not isinstance(value, dict):
         return None
+    # Floats only through if finite: a peer can send 1e999 / NaN as valid
+    # JSON, and json.dumps would re-emit them as bare Infinity / NaN tokens,
+    # producing an invalid JSON envelope line the host then skips entirely —
+    # dropping a turn_complete envelope flips a successful run to failure.
+    # Arbitrarily large ints serialise fine, so they stay.
     return {
         key: entry
         for key, entry in value.items()
         if isinstance(key, str) and isinstance(entry, (int, float))
         and not isinstance(entry, bool)
+        and (isinstance(entry, int) or math.isfinite(entry))
     }
 
 
@@ -418,15 +425,19 @@ def handle_notification(client, frame, final_text_parts, final_text_chars):
     method = frame.get("method")
     params = frame.get("params")
     if method == "session/update" and isinstance(params, dict):
-        if params.get("sessionId") != client.session_id:
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str) or session_id != client.session_id:
             # The wire pipe is writable by anything that inherited the
             # agent's stdout fd; session frames must name the negotiated
-            # session id or they are not the peer's to emit.
+            # session id or they are not the peer's to emit. The isinstance
+            # check also drops frames that arrive before session/new has
+            # answered (client.session_id still None) — a missing or
+            # non-string sessionId must never satisfy the pin.
             emit("protocol_error",
                  message="session/update for a session id this client did not open")
             return final_text_chars
         update = sanitise_update(params.get("update"))
-        emit("session_update", sessionId=params.get("sessionId"), update=update)
+        emit("session_update", sessionId=session_id, update=update)
         if isinstance(update, dict) and update.get("sessionUpdate") == "agent_message_chunk":
             content = update.get("content")
             if isinstance(content, dict) and isinstance(content.get("text"), str):
@@ -442,10 +453,13 @@ def handle_agent_request(client, frame):
     params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
 
     if method == "session/request_permission":
-        if params.get("sessionId") != client.session_id:
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str) or session_id != client.session_id:
             # Answer (so a genuinely-misshaped peer is not left waiting on
             # a response it needs) but never honour the request: a frame
-            # for a session this client did not open is not the peer's.
+            # for a session this client did not open is not the peer's. The
+            # isinstance check keeps the pin closed before session/new has
+            # negotiated an id (client.session_id still None).
             client.respond_error(request_id, -32602,
                                  "sessionId does not match the negotiated session")
             emit("protocol_error",

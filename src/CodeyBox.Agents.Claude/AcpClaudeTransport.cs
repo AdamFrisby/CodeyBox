@@ -174,7 +174,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     }
 
     private static string ShellSingleQuote(string value)
-        => FramedStdin.ShellQuote(value);
+        => ShellQuoting.Quote(value);
 
     internal static string BuildBridgeLauncherStdin(string bridgeBase64, string bridgeStdin)
         => FramedStdin.Build(bridgeBase64, BridgePayloadEndMarker, bridgeStdin);

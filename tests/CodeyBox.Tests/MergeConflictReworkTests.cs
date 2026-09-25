@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Devin;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox.Process;
@@ -1308,6 +1309,93 @@ public sealed class MergeConflictReworkTests : IDisposable
     }
 
     /// <summary>
+    /// Envelope-framed regression: under the devin.acp dispatch the agent's
+    /// text arrives JSON-escaped inside <c>agent_message_chunk</c> envelopes
+    /// and the SEMANTIC_INCOMPATIBLE marker may split across chunk
+    /// boundaries. The orchestrator must project captured stdout through the
+    /// runner's <see cref="IAgentVisibleTextExtractor"/> before scanning — a
+    /// raw scan never matches the split marker (the declaration would
+    /// silently degrade to a generic agent failure) and would tail-capture
+    /// the envelope's closing JSON into the parked reason.
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_SemanticIncompatible_EnvelopeFramed_ParksWithProjectedReason()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var webhooks = new CapturingWebhookDispatcher();
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed,
+            auditors: [auditor], webhookDispatcher: webhooks,
+            involvement: involvement, agentOverride: new EnvelopeFramedScriptedAgent());
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        var envelopeStdout = string.Concat(
+            EnvelopeLine(new { type = "devin.acp", @event = "session_started", sessionId = "s-1" }),
+            EnvelopeLine(new
+            {
+                type = "devin.acp",
+                @event = "session_update",
+                sessionId = "s-1",
+                update = new
+                {
+                    sessionUpdate = "agent_message_chunk",
+                    content = new { type = "text", text = "I cannot reconcile these.\nSEMANTIC_INCOMP" },
+                },
+            }),
+            EnvelopeLine(new
+            {
+                type = "devin.acp",
+                @event = "session_update",
+                sessionId = "s-1",
+                update = new
+                {
+                    sessionUpdate = "agent_message_chunk",
+                    content = new { type = "text", text = "ATIBLE: events have diverged\n" },
+                },
+            }),
+            EnvelopeLine(new
+            {
+                type = "devin.acp",
+                @event = "turn_complete",
+                stopReason = "end_turn",
+                finalText = "I cannot reconcile these.\nSEMANTIC_INCOMPATIBLE: events have diverged\n",
+            }));
+
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox;
+            _ = workDir;
+            _ = ct;
+            return Task.FromResult(new AgentResult(
+                Success: false,
+                Summary: "incompatible",
+                Stdout: envelopeStdout,
+                Stderr: null));
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+
+        // Exact-match: on a raw-envelope scan the reason tail would absorb
+        // JSON residue up to the envelope line's first literal newline.
+        var finishedEvt = Assert.Single(webhooks.Events, e => e.Event == "work_item.conflict_rework_finished");
+        var finishedDetails = Assert.IsType<ConflictReworkFinishedDetails>(finishedEvt.Details);
+        Assert.Equal("events have diverged", finishedDetails.SemanticIncompatibleReason);
+
+        var conflictRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "conflict_rework");
+        Assert.Equal("failure:semantic-incompatible", conflictRow.Outcome);
+    }
+
+    /// <summary>
     /// Restart-recovery: a worker dying mid-<see cref="WorkItemState.ReworkingForConflict"/>
     /// must surface back at <see cref="WorkItemState.AuditPassed"/> via the
     /// reaper, with <see cref="WorkItem.ConflictReworkAttempts"/> preserved
@@ -1368,6 +1456,9 @@ public sealed class MergeConflictReworkTests : IDisposable
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
+
+    /// <summary>Serialises one NDJSON envelope line for a scripted devin.acp capture.</summary>
+    private static string EnvelopeLine(object payload) => JsonSerializer.Serialize(payload) + "\n";
 
     private static async Task Run(ISandbox sandbox, params string[] argv)
     {
@@ -1651,5 +1742,23 @@ public sealed class MergeConflictReworkTests : IDisposable
         }
 
         public ModelRateConfig? DefaultPricing => null;
+    }
+
+    /// <summary>
+    /// A <see cref="ScriptedAgent"/> whose scripted stdout is a devin.acp
+    /// envelope stream — the shape <see cref="DevinAgentRunner.RunAsync"/>
+    /// produces. Implements <see cref="IAgentVisibleTextExtractor"/> by
+    /// delegating to the real runner so the test exercises the production
+    /// projection, not a copy.
+    /// </summary>
+    private sealed class EnvelopeFramedScriptedAgent : ScriptedAgent, IAgentVisibleTextExtractor
+    {
+        public EnvelopeFramedScriptedAgent()
+            : base([MergeStrategy.RealMerge])
+        {
+        }
+
+        public string? ExtractAgentVisibleText(string rawStdout)
+            => new DevinAgentRunner().ExtractAgentVisibleText(rawStdout);
     }
 }
