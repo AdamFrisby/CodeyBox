@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Schema;
@@ -50,6 +51,15 @@ internal static class MajordomoJson
     }
 
     /// <summary>
+    /// The wire name of a contract member under this surface's naming policy.
+    /// Every place that patches or reads a serialized property by name goes
+    /// through here so a contract rename cannot silently drift the wire
+    /// shape, the advertised schema, or refusal field names apart.
+    /// </summary>
+    internal static string WirePropertyName(string clrName) =>
+        Options.PropertyNamingPolicy?.ConvertName(clrName) ?? clrName;
+
+    /// <summary>
     /// The JSON schema a tool advertises for its argument contract. Generated
     /// from the typed contract so the schema cannot drift from the
     /// deserializer; the custom-converter types (ids, durations) are
@@ -79,15 +89,26 @@ internal static class MajordomoJson
         {
             // AffectedItemCount is a computed read-back on the mutate contract
             // base — an output, never an input. The exporter cannot know that;
-            // strip it so the advertised schema matches what binds.
-            properties.Remove("affected_item_count");
+            // strip it so the advertised schema matches what binds. Absent on
+            // a mutate contract means the exporter shape drifted — fail loudly
+            // at registration rather than advertise a computed property as
+            // input.
+            if (typeof(MajordomoMutateArgs).IsAssignableFrom(argumentsType)
+                && !properties.Remove(WirePropertyName(nameof(MajordomoMutateArgs.AffectedItemCount))))
+                throw new InvalidOperationException(
+                    $"the generated schema for {argumentsType.Name} lacks the '{WirePropertyName(nameof(MajordomoMutateArgs.AffectedItemCount))}' " +
+                    $"read-back property — {nameof(InputSchemaFor)} must be updated alongside the contract");
 
             // The chain node's custom converter makes the exporter treat
             // items[] as opaque. Pin the real wire shape, embedding the full
             // NewWorkItemSpec schema so the advertised contract is complete.
-            if (argumentsType == typeof(CreateWorkItemChainArgs)
-                && properties["items"] is JsonObject itemsSchema)
+            if (argumentsType == typeof(CreateWorkItemChainArgs))
             {
+                var itemsName = WirePropertyName(nameof(CreateWorkItemChainArgs.Items));
+                if (properties[itemsName] is not JsonObject itemsSchema)
+                    throw new InvalidOperationException(
+                        $"the generated schema for {argumentsType.Name} lacks the '{itemsName}' array — " +
+                        $"{nameof(InputSchemaFor)} must be updated alongside the contract");
                 var specSchema = JsonSchemaExporter.GetJsonSchemaAsNode(
                     Options, typeof(NewWorkItemSpec), exporterOptions);
                 if (specSchema is JsonObject specObj && specObj["type"] is JsonArray)
@@ -95,11 +116,11 @@ internal static class MajordomoJson
                 itemsSchema["items"] = new JsonObject
                 {
                     ["type"] = "object",
-                    ["required"] = new JsonArray("item"),
+                    ["required"] = new JsonArray(WorkItemChainNodeConverter.ItemField),
                     ["properties"] = new JsonObject
                     {
-                        ["item"] = specSchema,
-                        ["depends_on_indexes"] = new JsonObject
+                        [WorkItemChainNodeConverter.ItemField] = specSchema,
+                        [WorkItemChainNodeConverter.DependsOnIndexesField] = new JsonObject
                         {
                             ["type"] = "array",
                             ["items"] = new JsonObject { ["type"] = "integer" },
@@ -216,14 +237,22 @@ internal static class MajordomoJson
     /// </summary>
     private sealed class WorkItemChainNodeConverter : JsonConverter<WorkItemChainNode>
     {
+        // The wire field names, derived through the contract's naming policy
+        // and shared with the schema patch in InputSchemaFor — one source of
+        // truth so a contract rename cannot drift reader/writer/schema apart.
+        // Properties, not fields: this type is constructed inside Create()
+        // while Options is still being assigned.
+        internal static string ItemField => WirePropertyName(nameof(WorkItemChainNode.Item));
+        internal static string DependsOnIndexesField => WirePropertyName(nameof(WorkItemChainNode.DependsOnIndexes));
+
         public override WorkItemChainNode Read(
             ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
         {
             var node = JsonNode.Parse(ref reader) as JsonObject
                 ?? throw new JsonException("chain node must be a JSON object");
-            var item = node["item"]?.Deserialize<NewWorkItemSpec>(options)
-                ?? throw new JsonException("chain node requires an 'item' object");
-            var edges = node["depends_on_indexes"]?.Deserialize<int[]>(options) ?? [];
+            var item = node[ItemField]?.Deserialize<NewWorkItemSpec>(options)
+                ?? throw new JsonException($"chain node requires an '{ItemField}' object");
+            var edges = node[DependsOnIndexesField]?.Deserialize<int[]>(options) ?? [];
             return new WorkItemChainNode(item, edges);
         }
 
@@ -231,9 +260,9 @@ internal static class MajordomoJson
             Utf8JsonWriter writer, WorkItemChainNode value, JsonSerializerOptions options)
         {
             writer.WriteStartObject();
-            writer.WritePropertyName("item");
+            writer.WritePropertyName(ItemField);
             JsonSerializer.Serialize(writer, value.Item, options);
-            writer.WritePropertyName("depends_on_indexes");
+            writer.WritePropertyName(DependsOnIndexesField);
             JsonSerializer.Serialize(writer, value.DependsOnIndexes, options);
             writer.WriteEndObject();
         }
@@ -256,11 +285,15 @@ internal static class MajordomoJson
                 case JsonTokenType.Number:
                     if (!reader.TryGetDouble(out var minutes))
                         throw new JsonException("duration must be a whole number of minutes or an 'hh:mm:ss' string");
-                    value = TimeSpan.FromMinutes(minutes);
+                    value = FromMinutes(minutes);
                     break;
                 case JsonTokenType.String:
                     var raw = reader.GetString();
-                    if (!TimeSpan.TryParse(raw, out value))
+                    // A bare numeric string is a minute count, same as a JSON
+                    // number — TimeSpan.TryParse would read "120" as 120 days.
+                    if (double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedMinutes))
+                        value = FromMinutes(parsedMinutes);
+                    else if (!TimeSpan.TryParse(raw, out value))
                         throw new JsonException($"duration '{Validation.DescribeUntrustedValue(raw)}' must be a number of minutes or an 'hh:mm:ss' string");
                     break;
                 default:
@@ -273,6 +306,23 @@ internal static class MajordomoJson
                 throw new JsonException(
                     $"duration '{value}' is not a whole number of minutes — this surface expresses timeouts in minutes");
             return value;
+        }
+
+        // FromMinutes throws OverflowException/ArgumentException on
+        // out-of-range or non-finite input; converter errors must surface as
+        // JsonException so the binder maps them to a refusal with the field
+        // path instead of an unhandled transport error.
+        private static TimeSpan FromMinutes(double minutes)
+        {
+            try
+            {
+                return TimeSpan.FromMinutes(minutes);
+            }
+            catch (Exception ex) when (ex is ArgumentException or OverflowException)
+            {
+                throw new JsonException(
+                    $"duration of {minutes.ToString(CultureInfo.InvariantCulture)} minutes is outside the representable range");
+            }
         }
 
         public override void Write(Utf8JsonWriter writer, TimeSpan value, JsonSerializerOptions options)

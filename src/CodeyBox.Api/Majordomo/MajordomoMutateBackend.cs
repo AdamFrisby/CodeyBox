@@ -333,22 +333,24 @@ internal sealed class MajordomoMutateBackend
                 new MajordomoChangeSet(true, [new MajordomoPlannedChange.UpdateItem(args.Id, patch)], []));
 
         // Commit in field-group order: field patch, then priority, then
-        // external ids. Each write is individually guarded; a mid-sequence
-        // failure reports exactly what was applied.
+        // external ids. Each write is individually guarded; the outcome
+        // reports whether a write landed so a mid-sequence failure charges
+        // the ledger for the partial work rather than a free retry.
         var writesApplied = false;
         if (patchPlan is not null)
         {
             var outcome = await _commands.CommitPatchAsync(patchPlan.Plan!, ct).ConfigureAwait(false);
-            writesApplied = true;
+            writesApplied |= outcome.WritesApplied;
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
                     new MajordomoRefusal(MajordomoRefusalReasons.Conflict, outcome.Error ?? "patch failed", Item: args.Id.ToString()),
-                    writesApplied: outcome.StatusCode != 404);
+                    writesApplied: writesApplied);
         }
 
         if (priorityPlan is not null)
         {
             var outcome = await _commands.CommitPriorityAsync(priorityPlan.Plan!, ct).ConfigureAwait(false);
+            writesApplied |= outcome.WritesApplied;
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
                     new MajordomoRefusal(
@@ -356,13 +358,14 @@ internal sealed class MajordomoMutateBackend
                         (outcome.Error ?? "priority update failed") + (writesApplied ? " (earlier field edits were applied)" : string.Empty),
                         Item: args.Id.ToString(),
                         Field: "patch.priority"),
-                    writesApplied: true);
+                    writesApplied: writesApplied);
             writesApplied = true;
         }
 
         if (extIdsPlan is not null)
         {
             var outcome = await _commands.CommitExternalIdsAsync(extIdsPlan.Plan!, ct).ConfigureAwait(false);
+            writesApplied |= outcome.WritesApplied;
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
                     new MajordomoRefusal(
@@ -370,7 +373,7 @@ internal sealed class MajordomoMutateBackend
                         (outcome.Error ?? "external ids update failed") + (writesApplied ? " (earlier edits were applied)" : string.Empty),
                         Item: args.Id.ToString(),
                         Field: "patch.external_ids"),
-                    writesApplied: true);
+                    writesApplied: writesApplied);
         }
 
         return MajordomoMutationResult.Committed(
@@ -433,10 +436,10 @@ internal sealed class MajordomoMutateBackend
         if (!commit)
             return MajordomoMutationResult.Planned(new MajordomoChangeSet(true, changes, []));
 
+        // CommitCancelAsync only produces 202 outcomes — a mid-commit
+        // failure propagates as an exception, which the executor charges
+        // against the ledger as a faulted mutation.
         var outcome = await _commands.CommitCancelAsync(plan, ct).ConfigureAwait(false);
-        if (!outcome.Succeeded)
-            throw new InvalidOperationException(
-                $"cancel commit returned {outcome.StatusCode} for work item {args.Id}: {outcome.Error}");
 
         var affected = new List<WorkItemId> { args.Id };
         if (outcome.AlsoAffected is { } cascaded)
@@ -481,7 +484,7 @@ internal sealed class MajordomoMutateBackend
         if (!outcome.Succeeded)
             return MajordomoMutationResult.Refused(
                 new MajordomoRefusal(MajordomoRefusalReasons.Conflict, outcome.Error ?? "retry failed", Item: args.Id.ToString()),
-                writesApplied: plan is { NeedsStaleFence: true });
+                writesApplied: outcome.WritesApplied);
 
         return MajordomoMutationResult.Committed(
             new MajordomoChangeSet(

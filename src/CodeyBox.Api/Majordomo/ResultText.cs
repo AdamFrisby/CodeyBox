@@ -13,6 +13,13 @@ namespace CodeyBox.Api.Majordomo;
 /// </summary>
 internal static class ResultText
 {
+    /// <summary>
+    /// Bound on untrusted error body text echoed into a refusal detail —
+    /// without it a pathological response body would ride the refusal
+    /// unbounded.
+    /// </summary>
+    private const int MaxErrorBodyChars = 2000;
+
     // Minimal service provider for result execution — the JSON writer only
     // needs IOptions<HttpJsonOptions>-style lookups, which resolve to defaults
     // here. Shared and read-only; constructed once.
@@ -45,6 +52,6 @@ internal static class ResultText
             // fall through — return the raw body below
         }
 
-        return body.Length > 2000 ? body[..2000] : body;
+        return body.Length > MaxErrorBodyChars ? body[..MaxErrorBodyChars] : body;
     }
 }

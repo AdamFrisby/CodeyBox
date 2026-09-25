@@ -31,8 +31,7 @@ public sealed class MajordomoMcpTests
 
     // ── helpers ────────────────────────────────────────────────────────────
 
-    private static async Task<McpClient> ConnectAsync(
-        WebApplicationFactory<Program> factory, HttpClient http)
+    private static async Task<McpClient> ConnectAsync(HttpClient http)
     {
         var transport = new HttpClientTransport(
             new HttpClientTransportOptions
@@ -113,7 +112,7 @@ public sealed class MajordomoMcpTests
     {
         using var factory = new WorkItemApiFactory();
         using var http = factory.CreateClient();
-        await using var mcp = await ConnectAsync(factory, http);
+        await using var mcp = await ConnectAsync(http);
 
         var tools = await mcp.ListToolsAsync();
         var names = tools.Select(t => t.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
@@ -130,7 +129,7 @@ public sealed class MajordomoMcpTests
     {
         using var factory = new WorkItemApiFactory();
         using var http = factory.CreateClient();
-        await using var mcp = await ConnectAsync(factory, http);
+        await using var mcp = await ConnectAsync(http);
 
         // A name outside the vocabulary never reaches a handler: the server
         // refuses it at the protocol level.
@@ -152,7 +151,7 @@ public sealed class MajordomoMcpTests
         await factory.Store.CreateAsync(done);
 
         using var http = factory.CreateClient();
-        await using var mcp = await ConnectAsync(factory, http);
+        await using var mcp = await ConnectAsync(http);
         var noArgs = new Dictionary<string, object?>();
 
         // get_queue_status — state + per-state counts match the store.
@@ -262,7 +261,7 @@ public sealed class MajordomoMcpTests
 
         // Default mode is Proposed — no config override.
         using var http = factory.CreateClient();
-        await using var mcp = await ConnectAsync(factory, http);
+        await using var mcp = await ConnectAsync(http);
 
         var proposals = new[]
         {
@@ -323,7 +322,7 @@ public sealed class MajordomoMcpTests
         using var factory = new WorkItemApiFactory();
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         // depends_on_indexes may only point backward; a forward edge is the
         // chain's nearest representable cycle and is refused at the contract.
@@ -355,7 +354,7 @@ public sealed class MajordomoMcpTests
         using var factory = new WorkItemApiFactory();
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
         {
@@ -384,7 +383,7 @@ public sealed class MajordomoMcpTests
         using var factory = new WorkItemApiFactory();
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var missingId = WorkItemId.New();
         var result = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
@@ -417,7 +416,7 @@ public sealed class MajordomoMcpTests
         await factory.Store.CreateAsync(terminal);
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
         {
@@ -447,7 +446,7 @@ public sealed class MajordomoMcpTests
         using var factory = new WorkItemApiFactory();
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
         {
@@ -476,7 +475,7 @@ public sealed class MajordomoMcpTests
         factory.AdditionalKnobs.Add(new EnumTestKnob("mergeStyle", ["rebase", "squash"]));
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
         {
@@ -506,7 +505,7 @@ public sealed class MajordomoMcpTests
         await factory.Store.CreateAsync(done);
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         // Patching a terminal item contradicts its state — refused, not applied.
         var result = await mcp.CallToolAsync("update_work_item", new Dictionary<string, object?>
@@ -534,7 +533,7 @@ public sealed class MajordomoMcpTests
         await factory.Store.CreateAsync(y);
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("update_work_item", new Dictionary<string, object?>
         {
@@ -560,7 +559,7 @@ public sealed class MajordomoMcpTests
         using var factory = new WorkItemApiFactory();
         using var autonomous = AutonomousFactory(factory, maxMutatedItemsPerTurn: 1);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         // A single call exceeding the per-call cap is refused.
         var overCap = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
@@ -612,7 +611,7 @@ public sealed class MajordomoMcpTests
 
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         // The dry-run reviews the full cascade — the dependents are named in
         // the change set, not discovered only in the commit.
@@ -670,7 +669,7 @@ public sealed class MajordomoMcpTests
         // cap of 2 must refuse it even though the contract declares 1 item.
         using var autonomous = AutonomousFactory(factory, maxMutatedItemsPerTurn: 2);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("cancel_work_item", new Dictionary<string, object?>
         {
@@ -698,7 +697,7 @@ public sealed class MajordomoMcpTests
 
         using var autonomous = AutonomousFactory(factory, maxMutatedItemsPerTurn: 3);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         // Spend one unit of turn budget first.
         var first = await mcp.CallToolAsync("create_work_item", new Dictionary<string, object?>
@@ -737,7 +736,7 @@ public sealed class MajordomoMcpTests
         // Default mode is Proposed — the operator's review must see the whole
         // blast radius, not just the item the call named.
         using var http = factory.CreateClient();
-        await using var mcp = await ConnectAsync(factory, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("cancel_work_item", new Dictionary<string, object?>
         {
@@ -864,7 +863,7 @@ public sealed class MajordomoMcpTests
         using var factory = new WorkItemApiFactory();
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var args = new Dictionary<string, object?> { ["item"] = Spec("dry-run item") };
         var dry = await mcp.CallToolAsync("create_work_item",
@@ -899,7 +898,7 @@ public sealed class MajordomoMcpTests
         await factory.Store.CreateAsync(queued);
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var dry = await mcp.CallToolAsync("update_work_item", new Dictionary<string, object?>
         {
@@ -931,7 +930,7 @@ public sealed class MajordomoMcpTests
         using var factory = new WorkItemApiFactory();
         using var autonomous = AutonomousFactory(factory);
         using var http = autonomous.CreateClient();
-        await using var mcp = await ConnectAsync(autonomous, http);
+        await using var mcp = await ConnectAsync(http);
 
         var result = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
         {
@@ -1115,7 +1114,7 @@ public sealed class MajordomoMcpTests
             majordomoHttp.DefaultRequestHeaders.Authorization =
                 new System.Net.Http.Headers.AuthenticationHeaderValue(
                     "Bearer", Environment.GetEnvironmentVariable(tokenVar));
-            await using var mcp = await ConnectAsync(authed, majordomoHttp);
+            await using var mcp = await ConnectAsync(majordomoHttp);
             var result = await mcp.CallToolAsync("get_queue_status", new Dictionary<string, object?>());
             AssertOutcome(result, "executed");
         }
@@ -1124,6 +1123,104 @@ public sealed class MajordomoMcpTests
             Environment.SetEnvironmentVariable(tokenVar, null);
             Environment.SetEnvironmentVariable(apiKeyVar, priorApiKey);
         }
+    }
+
+    // ── quota probe conflicts ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task AgentCapacity_ConflictingProbes_FailClosed()
+    {
+        // A second probe claiming claude at the same specificity as the
+        // registered one is a configuration conflict: the resolution contract
+        // says callers must fail closed for the contested key. The capacity
+        // read must report quota_exhausted — not treat the kind as unmetered
+        // and report it routable.
+        using var factory = new WorkItemApiFactory();
+        using var autonomous = AutonomousFactory(factory);
+        using var conflicted = autonomous.WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+                services.AddSingleton<IAgentQuotaProbe>(new ClaimAllProbe(AgentKind.Claude))));
+        using var http = conflicted.CreateClient();
+        await using var mcp = await ConnectAsync(http);
+
+        var result = await mcp.CallToolAsync("get_agent_capacity", new Dictionary<string, object?>
+        {
+            ["agent"] = "claude",
+        });
+
+        AssertOutcome(result, "executed");
+        var entry = Structured(result).GetProperty("result").GetProperty("entries").EnumerateArray().Single();
+        Assert.False(entry.GetProperty("routable").GetBoolean());
+        Assert.True(entry.GetProperty("quota_exhausted").GetBoolean());
+    }
+
+    // ── argument contract edge cases ───────────────────────────────────────
+
+    [Fact]
+    public async Task ParameterlessTool_NonObjectArguments_IsRefused()
+    {
+        using var factory = new WorkItemApiFactory();
+        using var autonomous = AutonomousFactory(factory);
+        _ = autonomous.CreateClient(); // boot the host so Services resolves
+        var executor = autonomous.Services
+            .GetRequiredService<CodeyBox.Api.Majordomo.MajordomoExecutor>();
+
+        // The MCP client can only send object payloads, but the contract bind
+        // sees whatever the transport decoded — a scalar or array must refuse
+        // as argument_contract_mismatch, not silently execute.
+        var scalar = await executor.ExecuteAsync(
+            "get_queue_status", JsonValue.Create(42), CancellationToken.None);
+        AssertOutcome(scalar, "refused");
+        Assert.Equal("argument_contract_mismatch",
+            RefusalOf(scalar).GetProperty("reason").GetString());
+
+        var array = await executor.ExecuteAsync(
+            "get_queue_status", JsonNode.Parse("[1]"), CancellationToken.None);
+        AssertOutcome(array, "refused");
+        Assert.Equal("argument_contract_mismatch",
+            RefusalOf(array).GetProperty("reason").GetString());
+    }
+
+    [Fact]
+    public async Task DurationOutOfRange_IsRefused_NotATransportError()
+    {
+        using var factory = new WorkItemApiFactory();
+        using var autonomous = AutonomousFactory(factory);
+        _ = autonomous.CreateClient(); // boot the host so Services resolves
+        var executor = autonomous.Services
+            .GetRequiredService<CodeyBox.Api.Majordomo.MajordomoExecutor>();
+
+        // 1e300 minutes overflows TimeSpan — the converter must surface a
+        // bind refusal (with an audited call record), not an unhandled
+        // OverflowException escaping ExecuteAsync.
+        var result = await executor.ExecuteAsync(
+            "create_work_item",
+            JsonNode.Parse("""{"item":{"project_id":"test-project","title":"t","prompt":"p","work_timeout":1e300},"dry_run":true}"""),
+            CancellationToken.None);
+        AssertOutcome(result, "refused");
+        Assert.Equal("argument_contract_mismatch",
+            RefusalOf(result).GetProperty("reason").GetString());
+        Assert.Contains("work_timeout",
+            RefusalOf(result).GetProperty("field").GetString()!);
+    }
+
+    [Fact]
+    public async Task DurationNumericString_MeansMinutes()
+    {
+        using var factory = new WorkItemApiFactory();
+        using var autonomous = AutonomousFactory(factory);
+        _ = autonomous.CreateClient(); // boot the host so Services resolves
+        var executor = autonomous.Services
+            .GetRequiredService<CodeyBox.Api.Majordomo.MajordomoExecutor>();
+
+        // A bare numeric string is a minute count, same as a JSON number —
+        // "120" is 120 minutes (in bounds), not the 120 days TimeSpan.TryParse
+        // would produce (out of bounds → refused).
+        var result = await executor.ExecuteAsync(
+            "create_work_item",
+            JsonNode.Parse("""{"item":{"project_id":"test-project","title":"t","prompt":"p","work_timeout":"120"},"dry_run":true}"""),
+            CancellationToken.None);
+        AssertOutcome(result, "dry_run");
     }
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -1135,6 +1232,15 @@ public sealed class MajordomoMcpTests
         foreach (var (k, v) in extra)
             copy[k] = v;
         return copy;
+    }
+
+    /// <summary>Claims every member of its kind — pairs with a real probe to form an equally-specific conflict.</summary>
+    private sealed class ClaimAllProbe(AgentKind kind) : IAgentQuotaProbe
+    {
+        public AgentKind Kind { get; } = kind;
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
+            Task.FromResult(new AgentQuotaSnapshot { AvailablePct = 100 });
     }
 
     /// <summary>Enum-valued test knob: only the listed values are legal.</summary>

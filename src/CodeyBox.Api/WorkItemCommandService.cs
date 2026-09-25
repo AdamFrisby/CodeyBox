@@ -83,7 +83,14 @@ internal sealed class WorkItemCommandService
         string? Location = null,
         WorkItem? Item = null,
         IReadOnlyList<WorkItemId>? AlsoAffected = null,
-        string? Error = null)
+        string? Error = null,
+        /// <summary>
+        /// True once a guarded store write inside the commit landed. A failure
+        /// outcome carrying this means the mutation partially committed —
+        /// callers accounting per-write (the majordomo turn ledger) must
+        /// charge the call rather than treat it as a free retry.
+        /// </summary>
+        bool WritesApplied = false)
     {
         public bool Succeeded => StatusCode is >= 200 and < 300;
 
@@ -385,6 +392,7 @@ internal sealed class WorkItemCommandService
         var newAgentClassId = plan.NewAgentClassId;
         var oldAgentClassId = plan.OldAgentClassId;
         var normalisedPatchKnobs = plan.NormalisedKnobs;
+        var writesApplied = false;
 
         if (plan.PromptViaReplace)
         {
@@ -404,6 +412,7 @@ internal sealed class WorkItemCommandService
             {
                 PromptRevision = promptResult.NewRevision ?? updated.PromptRevision,
             };
+            writesApplied = true;
             queuedUpdateExpectedUpdatedAt = now;
         }
 
@@ -446,7 +455,9 @@ internal sealed class WorkItemCommandService
                     queuedUpdateExpectedUpdatedAt,
                     ct);
             if (!written)
-                return WorkItemCommandOutcome.Conflict("item changed before the queued-field update could be written");
+                return WorkItemCommandOutcome.Conflict("item changed before the queued-field update could be written")
+                    with { WritesApplied = writesApplied };
+            writesApplied = true;
             queuedUpdateExpectedUpdatedAt = now;
         }
         if (plan.AuditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate)
@@ -460,11 +471,14 @@ internal sealed class WorkItemCommandService
             switch (budgetResult.Outcome)
             {
                 case AuditBudgetUpdateOutcome.NotFound:
-                    return WorkItemCommandOutcome.NotFound($"work item '{item.Id}' no longer exists");
+                    return WorkItemCommandOutcome.NotFound($"work item '{item.Id}' no longer exists")
+                        with { WritesApplied = writesApplied };
                 case AuditBudgetUpdateOutcome.TerminalState:
                     return WorkItemCommandOutcome.Conflict(
-                        $"work item transitioned to terminal state '{budgetResult.Item!.State}' before audit budget could be updated");
+                        $"work item transitioned to terminal state '{budgetResult.Item!.State}' before audit budget could be updated")
+                        with { WritesApplied = writesApplied };
                 case AuditBudgetUpdateOutcome.Updated:
+                    writesApplied = true;
                     updated = budgetResult.Item ?? updated;
                     break;
             }
@@ -484,11 +498,14 @@ internal sealed class WorkItemCommandService
             switch (classResult.Outcome)
             {
                 case AgentClassUpdateOutcome.NotFound:
-                    return WorkItemCommandOutcome.NotFound($"work item '{item.Id}' no longer exists");
+                    return WorkItemCommandOutcome.NotFound($"work item '{item.Id}' no longer exists")
+                        with { WritesApplied = writesApplied };
                 case AgentClassUpdateOutcome.TerminalState:
                     return WorkItemCommandOutcome.Conflict(
-                        $"work item transitioned to terminal state '{classResult.Item!.State}' before agent class could be updated");
+                        $"work item transitioned to terminal state '{classResult.Item!.State}' before agent class could be updated")
+                        with { WritesApplied = writesApplied };
                 case AgentClassUpdateOutcome.Updated:
+                    writesApplied = true;
                     oldAgentClassId = classResult.OldAgentClassId ?? oldAgentClassId;
                     updated = classResult.Item ?? updated with { AgentClassId = newAgentClassId, UpdatedAt = now };
                     break;
@@ -500,11 +517,14 @@ internal sealed class WorkItemCommandService
             switch (depResult.Outcome)
             {
                 case DependsOnUpdateOutcome.NotFound:
-                    return WorkItemCommandOutcome.NotFound($"work item '{item.Id}' no longer exists");
+                    return WorkItemCommandOutcome.NotFound($"work item '{item.Id}' no longer exists")
+                        with { WritesApplied = writesApplied };
                 case DependsOnUpdateOutcome.TerminalState:
                     return WorkItemCommandOutcome.Conflict(
-                        $"work item transitioned to terminal state '{depResult.Item!.State}' before dependencies could be updated");
+                        $"work item transitioned to terminal state '{depResult.Item!.State}' before dependencies could be updated")
+                        with { WritesApplied = writesApplied };
             }
+            writesApplied = true;
             oldDependsOn = depResult.OldDependsOn ?? oldDependsOn;
             updated = depResult.Item ?? updated with { DependsOn = newDependsOn!, UpdatedAt = now };
         }
@@ -554,7 +574,8 @@ internal sealed class WorkItemCommandService
         return new WorkItemCommandOutcome(
             StatusCodes.Status200OK,
             WorkItemEndpoints.ToDto(updated, project, statesById, depExternalIds),
-            Item: updated);
+            Item: updated,
+            WritesApplied: writesApplied);
     }
 
     public async Task<WorkItemCommandOutcome> PatchAsync(
@@ -734,7 +755,8 @@ internal sealed class WorkItemCommandService
         return new WorkItemCommandOutcome(
             StatusCodes.Status200OK,
             new { id = updated.Id.ToString(), priority = updated.Priority },
-            Item: updated);
+            Item: updated,
+            WritesApplied: true);
     }
 
     public async Task<WorkItemCommandOutcome> PriorityAsync(
@@ -863,7 +885,8 @@ internal sealed class WorkItemCommandService
         return new WorkItemCommandOutcome(
             StatusCodes.Status200OK,
             WorkItemEndpoints.ToDto(updated, project, depStates, depExtIds),
-            Item: updated);
+            Item: updated,
+            WritesApplied: true);
     }
 
     public async Task<WorkItemCommandOutcome> ExternalIdsAsync(
@@ -977,6 +1000,11 @@ internal sealed class WorkItemCommandService
             new WorkItemCancelPlan(item, WorkItemCancelKind.Cancel, reason, resolutionSha, cascadeTargets));
     }
 
+    /// <summary>
+    /// Performs the cancel the plan describes. Always succeeds with 202 —
+    /// classification happens in <see cref="PlanCancel"/>, so a mid-commit
+    /// failure surfaces as an exception, never an outcome.
+    /// </summary>
     public async Task<WorkItemCommandOutcome> CommitCancelAsync(WorkItemCancelPlan plan, CancellationToken ct)
     {
         var item = plan.Item;
@@ -1011,7 +1039,7 @@ internal sealed class WorkItemCommandService
                     },
                 }, ct);
             return new WorkItemCommandOutcome(
-                StatusCodes.Status202Accepted, Location: $"/workitems/{workItemId}", Item: affected);
+                StatusCodes.Status202Accepted, Location: $"/workitems/{workItemId}", Item: affected, WritesApplied: true);
         }
 
         if (plan.Kind == WorkItemCancelKind.AlreadyCancelled)
@@ -1080,15 +1108,21 @@ internal sealed class WorkItemCommandService
             StatusCodes.Status202Accepted,
             Location: $"/workitems/{workItemId}",
             Item: affected,
-            AlsoAffected: cascaded);
+            AlsoAffected: cascaded,
+            WritesApplied: true);
     }
 
     public async Task<WorkItemCommandOutcome> CancelAsync(
         WorkItem item, string? reason, string? resolutionSha, CancellationToken ct)
     {
-        var (plan, error) = PlanCancel(
-            item, reason, resolutionSha, await FindCancelCascadeTargetsAsync(item.Id, ct));
-        return error ?? await CommitCancelAsync(plan!, ct);
+        // Classify before enumerating the cascade: refused and no-op cancels
+        // discard the set, so they must not pay the whole-store scan.
+        var (plan, error) = PlanCancel(item, reason, resolutionSha, []);
+        if (error is not null)
+            return error;
+        if (plan!.Kind == WorkItemCancelKind.Cancel)
+            plan = plan with { CascadeTargets = await FindCancelCascadeTargetsAsync(item.Id, ct) };
+        return await CommitCancelAsync(plan, ct);
     }
 
     private static bool IsTerminalFailureCloseable(WorkItemState state) =>
@@ -1203,13 +1237,17 @@ internal sealed class WorkItemCommandService
                 ct);
             if (!recovery.Recovered)
             {
+                // The fence ran — conservatively count it as applied even
+                // though the transition did not land.
                 return WorkItemCommandOutcome.Conflict(
-                    $"cannot retry stale worker-held item {item.Id}: {recovery.Error ?? "recovery did not transition the work item"}");
+                    $"cannot retry stale worker-held item {item.Id}: {recovery.Error ?? "recovery did not transition the work item"}")
+                    with { WritesApplied = true };
             }
 
             var fenced = await _store.GetAsync(item.Id, ct);
             if (fenced is null)
-                return WorkItemCommandOutcome.Conflict("work item no longer exists");
+                return WorkItemCommandOutcome.Conflict("work item no longer exists")
+                    with { WritesApplied = true };
             item = fenced;
         }
 
@@ -1224,22 +1262,26 @@ internal sealed class WorkItemCommandService
         {
             if (openQuestions is { Count: > 0 })
                 return new WorkItemCommandOutcome(
-                    StatusCodes.Status409Conflict, new { error, openQuestions }, Error: error);
+                    StatusCodes.Status409Conflict, new { error, openQuestions }, Error: error,
+                    WritesApplied: plan.NeedsStaleFence);
 
             if (error!.Contains("no longer exists"))
                 return new WorkItemCommandOutcome(
                     StatusCodes.Status409Conflict,
                     new { error, hint = "retry with from=\"work\" to start over from a fresh clone" },
-                    Error: error);
+                    Error: error,
+                    WritesApplied: plan.NeedsStaleFence);
 
-            return WorkItemCommandOutcome.Conflict(error!);
+            return WorkItemCommandOutcome.Conflict(error!)
+                with { WritesApplied = plan.NeedsStaleFence };
         }
 
         return new WorkItemCommandOutcome(
             StatusCodes.Status202Accepted,
             new { id = item.Id.ToString(), from = plan.RequestedFrom ?? "auto", actualFrom = actualFrom!, state = resumeState!.Value.ToString() },
             Location: $"/workitems/{item.Id}",
-            Item: item);
+            Item: item,
+            WritesApplied: true);
     }
 
     public async Task<WorkItemCommandOutcome> RetryAsync(

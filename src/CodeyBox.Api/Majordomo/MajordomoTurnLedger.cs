@@ -14,9 +14,12 @@ namespace CodeyBox.Api.Majordomo;
 /// it does not permanently disable the account.
 /// </summary>
 /// <remarks>
-/// Entries are appended only after a mutation actually executes — reads,
-/// proposals, refusals, and dry-runs never consume budget, matching the
-/// <see cref="MajordomoTurnUsage"/> contract. The ledger is bounded: each key
+/// Entries are appended for executed mutations — reads, proposals, refusals,
+/// and dry-runs never consume budget, matching the
+/// <see cref="MajordomoTurnUsage"/> contract. A mutation that throws
+/// mid-commit is also charged: its write status is unknown, so the executor
+/// conservatively spends the projected count rather than grant a free retry.
+/// The ledger is bounded: each key
 /// keeps at most <see cref="MaxTrackedMutationsPerKey"/> timestamps (newer
 /// entries are what the window check reads, so capping history is safe), and
 /// keys are pruned when their newest entry ages out of the window.
@@ -60,7 +63,9 @@ internal sealed class MajordomoTurnLedger
 
     /// <summary>
     /// Records <paramref name="count"/> mutations by <paramref name="key"/> at
-    /// the current instant. Call only after the mutation executed.
+    /// the current instant. Call after the mutation executed — including a
+    /// commit that faulted partway, where the charge is the conservative
+    /// projection since writes may have landed.
     /// </summary>
     public void Record(string key, int count)
     {

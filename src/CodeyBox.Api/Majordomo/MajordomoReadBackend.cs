@@ -199,20 +199,31 @@ internal sealed class MajordomoReadBackend
         foreach (var member in members)
         {
             var resolution = AgentQuotaProbeCatalog.ResolveSubscriptionProbe(_subscriptionProbes, member, _log);
-            if (resolution.Probe is null)
+            if (resolution.Conflict is null && resolution.Probe is null)
                 continue; // unmetered member — quota can never exhaust it
             anyMetered = true;
 
             AgentQuotaSnapshot snapshot;
-            try
+            if (resolution.Conflict is { } conflict)
             {
-                snapshot = await resolution.Probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+                // Equally specific probes claiming one member is a
+                // configuration error — the resolution contract requires
+                // callers to fail closed for that key, same as /quota and
+                // the dispatch router do.
+                snapshot = AgentQuotaProbeCatalog.ConflictUnknownSnapshot(conflict);
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception ex)
+            else
             {
-                _log.LogWarning(ex, "Majordomo capacity read: quota probe failed for {Agent}", kind.Value);
-                snapshot = AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient);
+                try
+                {
+                    snapshot = await resolution.Probe!.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Majordomo capacity read: quota probe failed for {Agent}", kind.Value);
+                    snapshot = AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient);
+                }
             }
 
             var recentFailure = _quotaFailures is not null
@@ -224,11 +235,21 @@ internal sealed class MajordomoReadBackend
                 break;
             }
 
-            reason = snapshot.IsKnown
-                ? $"quota exhausted ({Math.Round(snapshot.AvailablePct, 1)}% remaining)"
-                : $"quota unknown ({snapshot.Unknown?.ToString() ?? "no reading"})"
+            // The reported snapshot masks reset instants on depleting-balance
+            // pools — a balance has no reset instant even when the probe
+            // echoed one. Same reporting rule /quota applies.
+            var poolName = QuotaPoolResolver.NormalizePoolName(member.Pool);
+            var reported = poolName is not null
+                && _quotaOptions.Pools.TryGetValue(poolName, out var poolOpts)
+                && poolOpts?.Kind == QuotaPoolKind.DepletingBalance
+                    ? QuotaPoolMasks.WithoutResetInstants(snapshot)
+                    : snapshot;
+
+            reason = reported.IsKnown
+                ? $"quota exhausted ({Math.Round(reported.AvailablePct, 1)}% remaining)"
+                : $"quota unknown ({reported.Unknown?.ToString() ?? "no reading"})"
                   + (recentFailure ? "; recent quota failure observed" : string.Empty);
-            if (snapshot.ResetAt is { } reset && (earliestReset is null || reset < earliestReset))
+            if (reported.ResetAt is { } reset && (earliestReset is null || reset < earliestReset))
                 earliestReset = reset;
         }
 

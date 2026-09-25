@@ -253,9 +253,9 @@ internal sealed class MajordomoExecutor
                 if (decision is MajordomoDecision.Execute
                     && args is MajordomoMutateArgs { DryRun: false } failed)
                 {
-                    _ledger.Record(
-                        identity,
-                        Math.Max(failed.AffectedItemCount, projectedAffected ?? failed.AffectedItemCount));
+                    // Same charge rule as Decide: the measured projection,
+                    // falling back to the declared blast radius.
+                    _ledger.Record(identity, projectedAffected ?? failed.AffectedItemCount);
                 }
 
                 AuditLog.MajordomoToolOutcome(
@@ -351,9 +351,12 @@ internal sealed class MajordomoExecutor
             }
 
             default:
+                // The wire name is untrusted input — render it through the
+                // echo guard like the call audit record does.
+                var unhandledName = name is null ? "<missing>" : Validation.DescribeUntrustedValue(name);
                 return (Envelope(MajordomoOutcomes.Refused,
                         refusal: new MajordomoRefusal(
-                            MajordomoRefusalReasons.UnknownTool, $"unhandled decision for '{name}'")),
+                            MajordomoRefusalReasons.UnknownTool, $"unhandled decision for '{unhandledName}'")),
                     MajordomoOutcomes.Refused, "unhandled decision", true);
         }
     }
@@ -480,10 +483,13 @@ internal sealed class MajordomoExecutor
         }
         catch (ArgumentException ex)
         {
+            // ParamName is a CLR name ("workBranch"); the refusal contract is
+            // wire-shaped — translate through the surface naming policy so
+            // Field matches the names sibling refusals emit.
             return (null, new MajordomoRefusal(
                 MajordomoRefusalReasons.ArgumentContractMismatch,
                 ex.Message,
-                Field: ex.ParamName));
+                Field: ex.ParamName is { } paramName ? MajordomoJson.WirePropertyName(paramName) : null));
         }
         catch (NotSupportedException ex)
         {
@@ -497,10 +503,26 @@ internal sealed class MajordomoExecutor
         MajordomoTool tool, JsonNode? args, T instance)
         where T : MajordomoToolArgs
     {
-        if (args is JsonObject obj && obj.Count > 0)
-            return (null, new MajordomoRefusal(
-                MajordomoRefusalReasons.ArgumentContractMismatch,
-                $"tool '{tool.Name}' takes no arguments — got {string.Join(", ", obj.Select(kv => kv.Key))}"));
-        return (instance, null);
+        if (args is null || args is JsonObject { Count: 0 })
+            return (instance, null);
+
+        var detail = args is JsonObject obj
+            ? $"unexpected arguments: {DescribeBoundedKeys(obj)}"
+            : $"a JSON {args.GetValueKind().ToString().ToLowerInvariant()} payload";
+        return (null, new MajordomoRefusal(
+            MajordomoRefusalReasons.ArgumentContractMismatch,
+            $"tool '{tool.Name}' takes no arguments — got {detail}"));
+    }
+
+    /// <summary>
+    /// The first few caller-supplied property names plus a remainder count —
+    /// the echo into a refusal is bounded rather than joining an unbounded
+    /// key set.
+    /// </summary>
+    private static string DescribeBoundedKeys(JsonObject obj)
+    {
+        const int maxKeys = 8;
+        var shown = string.Join(", ", obj.Select(kv => kv.Key).Take(maxKeys));
+        return obj.Count > maxKeys ? $"{shown}, … +{obj.Count - maxKeys} more" : shown;
     }
 }
