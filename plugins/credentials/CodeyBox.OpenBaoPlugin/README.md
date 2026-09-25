@@ -40,6 +40,9 @@ workload sandbox ── env (value) ── orchestrator
   self-describing (`openbao.{s|d}.{var}.{tail}`), so renew/revoke keep
   working after an orchestrator restart — for dynamic leases the tail *is*
   the server lease id, so revocation works even if the mapping was deleted.
+  Revocation is also not gated on `Enabled`: disabling the plugin (a
+  natural response to a suspect backend) must not strand already-issued
+  leases until their server TTL.
 
 ## Backend setup (OpenBao side)
 

@@ -103,7 +103,16 @@ public static class LeaseHandles
         return parsed;
     }
 
-    private static bool IsValidSegment(string? value)
+    /// <summary>
+    /// True when <paramref name="value"/> can ride in one handle segment:
+    /// non-empty, no <c>.</c> (the segment delimiter), no control
+    /// characters. This is the same gate
+    /// <see cref="Build(string, string, string, string)"/> enforces —
+    /// exposed so a provider can validate a backend-supplied identifier
+    /// (a server lease id) before it ever reaches a handle, a log line,
+    /// or an exception message.
+    /// </summary>
+    public static bool IsValidSegment(string? value)
         => !string.IsNullOrWhiteSpace(value)
             && value.IndexOf('.') < 0
             && !value.Any(static c => char.IsControl(c));

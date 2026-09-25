@@ -77,4 +77,29 @@ public static class CredentialJson
         var text = property.GetString();
         return !string.IsNullOrEmpty(text) && DateTimeOffset.TryParse(text, out value);
     }
+
+    /// <summary>
+    /// Flattens a response object into string fields — the credential
+    /// payload shape every leasing backend shares. Strings pass through;
+    /// numbers, booleans and other primitives keep their raw JSON text;
+    /// JSON null reads as empty. One coercion so field-shape policy cannot
+    /// fork per backend.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> ReadStringFields(JsonElement data)
+    {
+        var fields = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var property in data.EnumerateObject())
+        {
+            fields[property.Name] = property.Value.ValueKind switch
+            {
+                JsonValueKind.String => property.Value.GetString() ?? string.Empty,
+                JsonValueKind.Number => property.Value.GetRawText(),
+                JsonValueKind.True => "true",
+                JsonValueKind.False => "false",
+                JsonValueKind.Null => string.Empty,
+                _ => property.Value.GetRawText(),
+            };
+        }
+        return fields;
+    }
 }

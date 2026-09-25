@@ -48,8 +48,13 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
     private ILogger _logger = NullLogger.Instance;
     private readonly LazyCredentialClient<OpenBaoRestClient> _clients;
     private OpenBaoRestClient? _api;
-    private readonly ConcurrentDictionary<string, IssuedLeaseContext> _issued = new(StringComparer.Ordinal);
+    // Static leases only: renewal re-fetches through the mapping, so the
+    // registry remembers which mapping served the lease. Dynamic leases
+    // need no entry — renew and revoke derive everything from the handle
+    // tail.
+    private readonly ConcurrentDictionary<string, OpenBaoSecretMapping> _issued = new(StringComparer.Ordinal);
     private readonly object _tokenLock = new();
+    private string? _loggedWarningsSignature;
     private string _tokenFingerprint = string.Empty;
     private string _token = string.Empty;
     private DateTimeOffset _tokenExpiresAt;
@@ -91,8 +96,7 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         EnsureClients();
         var warnings = new List<string>();
         var options = OpenBaoOptions.FromConfiguration(context.ScopedConfig, warnings);
-        foreach (var warning in warnings)
-            _logger.LogWarning("OpenBao plugin option: {Warning}", warning);
+        LogOptionWarnings(warnings);
         foreach (var error in options.Validate())
             _logger.LogError("OpenBao plugin configuration: {Error}", error);
         if (!options.Enabled)
@@ -152,7 +156,6 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         var now = _clock.GetUtcNow();
 
         LeasedSecretMaterial material;
-        IssuedLeaseContext context;
         if (!string.IsNullOrWhiteSpace(mapping.SecretPath))
         {
             var fetched = await _api!.GetStaticSecretAsync(
@@ -162,8 +165,6 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
             var expiresAt = now
                 + CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, requestedTtl);
             var leaseId = OpenBaoLeaseIds.BuildStatic(mapping.SandboxEnvVar);
-            context = new IssuedLeaseContext(
-                OpenBaoLeaseIds.LeaseKind.Static, mapping, ServerLeaseId: null);
             material = new LeasedSecretMaterial
             {
                 LeaseId = SecretLeasePolicy.ValidateLeaseId(leaseId, nameof(leaseId)),
@@ -171,6 +172,9 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 ExpiresAt = expiresAt,
                 Brokered = false,
             };
+            // Static renewal re-fetches through the mapping: remember which
+            // mapping served this lease.
+            _issued[material.LeaseId] = mapping;
             _logger.LogInformation(
                 "OpenBao issued static lease '{LeaseId}' for '{Var}' (scope {Scope}) from '{Path}'.",
                 leaseId, mapping.SandboxEnvVar, scope, mapping.SecretPath);
@@ -213,11 +217,10 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
             }
             catch (OpenBaoException)
             {
-                await TryRevokeIssuedLeaseAsync(options, token, issued.LeaseId, ct).ConfigureAwait(false);
+                await _api!.TryRevokeLeaseAsync(
+                    options.Address, token, issued.LeaseId, options.RevokeSync, ct).ConfigureAwait(false);
                 throw;
             }
-            context = new IssuedLeaseContext(
-                OpenBaoLeaseIds.LeaseKind.Dynamic, mapping, issued.LeaseId);
             material = new LeasedSecretMaterial
             {
                 LeaseId = SecretLeasePolicy.ValidateLeaseId(leaseId, nameof(leaseId)),
@@ -230,7 +233,6 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 leaseId, mapping.SandboxEnvVar, scope, issued.LeaseId, issued.Renewable, expiresAt);
         }
 
-        _issued[material.LeaseId] = context;
         return material;
     }
 
@@ -244,21 +246,21 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
 
         if (parsed.Kind == OpenBaoLeaseIds.LeaseKind.Static)
         {
-            var context = _issued.TryGetValue(leaseId, out var known)
+            var mapping = _issued.TryGetValue(leaseId, out var known)
                 ? known
-                : RebuildContext(leaseId, options, parsed);
+                : RebuildMapping(leaseId, options, parsed);
             var token = await GetTokenAsync(options, ct).ConfigureAwait(false);
             // Static renewal re-fetches so rotation propagates within one
             // window; the fresh value reaches the guest on next provisioning.
             var fetched = await _api!.GetStaticSecretAsync(
-                options.Address, token, context.Mapping.SecretPath, context.Mapping.KvVersion,
+                options.Address, token, mapping.SecretPath, mapping.KvVersion,
                 options.MaxResponseBytes, ct).ConfigureAwait(false);
-            RequireField(fetched.Data, context.Mapping);
+            RequireField(fetched.Data, mapping);
             var expiresAt = _clock.GetUtcNow()
                 + CredentialOptions.StaticLeaseWindow(options.StaticLeaseTtlMinutes, TimeSpan.Zero);
-            // Re-register the (possibly rebuilt) context so revocation can
-            // still address it.
-            _issued[leaseId] = context;
+            // Re-register the (possibly rebuilt) mapping so later renewals
+            // keep resolving the read path.
+            _issued[leaseId] = mapping;
             _logger.LogDebug("OpenBao renewed static lease '{LeaseId}'.", leaseId);
             return expiresAt;
         }
@@ -293,7 +295,7 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
             return;
         }
 
-        var options = RequireUsableOptions();
+        var options = RequireConfiguredOptions();
         EnsureClients();
         var token = await GetTokenAsync(options, ct).ConfigureAwait(false);
         // The handle tail carries the server lease id, so revocation
@@ -302,10 +304,6 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         await _api!.RevokeLeaseAsync(
             options.Address, token, parsed.Tail,
             options.RevokeSync, ct).ConfigureAwait(false);
-        // Drop the registry entry only after the server confirmed: a failed
-        // revoke keeps the context so the sweep can retry instead of
-        // losing track of it.
-        _issued.TryRemove(leaseId, out _);
         _logger.LogInformation("OpenBao revoked dynamic lease '{LeaseId}'.", leaseId);
     }
 
@@ -329,9 +327,33 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
     internal OpenBaoOptions CurrentOptions()
     {
         var section = _host?.ScopedConfig ?? _testConfig;
-        return section is null
-            ? new OpenBaoOptions()
-            : OpenBaoOptions.FromConfiguration(section);
+        if (section is null)
+            return new OpenBaoOptions();
+        var warnings = new List<string>();
+        var options = OpenBaoOptions.FromConfiguration(section, warnings);
+        LogOptionWarnings(warnings);
+        return options;
+    }
+
+    /// <summary>
+    /// Options re-bind on every call for hot-reload, so a parse warning on
+    /// reload (a typo silently falling back to a default — including
+    /// silently disabling the plugin) must surface too. Logged once per
+    /// distinct warning set so a steady bad state does not spam the log.
+    /// </summary>
+    private void LogOptionWarnings(List<string> warnings)
+    {
+        var signature = string.Join('\n', warnings);
+        if (signature.Length == 0)
+        {
+            Volatile.Write(ref _loggedWarningsSignature, null);
+            return;
+        }
+        if (string.Equals(Volatile.Read(ref _loggedWarningsSignature), signature, StringComparison.Ordinal))
+            return;
+        Volatile.Write(ref _loggedWarningsSignature, signature);
+        foreach (var warning in warnings)
+            _logger.LogWarning("OpenBao plugin option: {Warning}", warning);
     }
 
     /// <summary>
@@ -385,28 +407,6 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         return direct;
     }
 
-    /// <summary>
-    /// Best-effort return of a just-issued server lease after the response
-    /// was rejected locally. Never throws and never swallows the real
-    /// failure — the caller rethrows its own exception.
-    /// </summary>
-    private async Task TryRevokeIssuedLeaseAsync(
-        OpenBaoOptions options, string token, string serverLeaseId, CancellationToken ct)
-    {
-        try
-        {
-            await _api!.RevokeLeaseAsync(
-                options.Address, token, serverLeaseId, options.RevokeSync, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(
-                ex,
-                "OpenBao could not return rejected server lease '{LeaseId}'; it expires at its server TTL.",
-                serverLeaseId);
-        }
-    }
-
     private static string RequireField(IReadOnlyDictionary<string, string> data, OpenBaoSecretMapping mapping)
     {
         if (!data.TryGetValue(mapping.DataField, out var value) || string.IsNullOrEmpty(value))
@@ -418,6 +418,14 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
 
     private OpenBaoOptions RequireUsableOptions()
         => CredentialOptions.RequireUsable(CurrentOptions(), OpenBaoException.BackendName, OpenBaoException.Create);
+
+    /// <summary>
+    /// The revocation gate: options must be valid but need not be enabled —
+    /// disabling the plugin is a natural response to a suspect backend and
+    /// must not strand already-issued leases until their server TTL.
+    /// </summary>
+    private OpenBaoOptions RequireConfiguredOptions()
+        => CredentialOptions.RequireValid(CurrentOptions(), OpenBaoException.BackendName, OpenBaoException.Create);
 
     private static OpenBaoSecretMapping? FindMapping(OpenBaoOptions options, ProjectSandboxSecret secret)
     {
@@ -437,7 +445,7 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         return null;
     }
 
-    private static IssuedLeaseContext RebuildContext(
+    private static OpenBaoSecretMapping RebuildMapping(
         string leaseId, OpenBaoOptions options, OpenBaoLeaseIds.ParsedLeaseId parsed)
     {
         // Restart path for static leases: the in-memory issue registry is
@@ -462,7 +470,7 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
             throw new OpenBaoException(
                 CredentialFailureKind.Misconfigured,
                 $"OpenBao lease '{leaseId}' names sandbox variable '{parsed.SandboxEnvVar}' with no current static mapping; restore the mapping or let the lease window expire.");
-        return new IssuedLeaseContext(OpenBaoLeaseIds.LeaseKind.Static, mapping, ServerLeaseId: null);
+        return mapping;
     }
 
     private static OpenBaoLeaseIds.ParsedLeaseId ParseOurs(string leaseId)
@@ -476,9 +484,4 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
             () => CredentialOptions.TimeoutSpan(CurrentOptions().TimeoutSeconds),
             http => new OpenBaoRestClient(http, _clock, _logger),
             injected);
-
-    private sealed record IssuedLeaseContext(
-        OpenBaoLeaseIds.LeaseKind Kind,
-        OpenBaoSecretMapping Mapping,
-        string? ServerLeaseId);
 }

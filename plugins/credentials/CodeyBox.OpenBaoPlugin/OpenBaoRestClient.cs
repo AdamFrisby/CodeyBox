@@ -104,7 +104,8 @@ public sealed class OpenBaoRestClient
             if (!CredentialJson.TryGetString(auth, "client_token", out var token) || string.IsNullOrEmpty(token))
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse, "OpenBao AppRole login returned no client_token.");
-            if (!CredentialJson.TryGetInt64(auth, "lease_duration", out var leaseSeconds) || leaseSeconds <= 0)
+            if (!CredentialJson.TryGetInt64(auth, "lease_duration", out var leaseSeconds)
+                || leaseSeconds <= 0 || leaseSeconds > int.MaxValue)
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     "OpenBao AppRole login returned a token with no usable lifetime.");
@@ -155,7 +156,7 @@ public sealed class OpenBaoRestClient
                         $"OpenBao KV v2 read of '{path}' returned no nested data object.");
             }
             _log.LogDebug("OpenBao fetched static secret at '{Path}' (kv{KvVersion}).", path, kvVersion);
-            return new OpenBaoStaticSecret(ReadFields(data));
+            return new OpenBaoStaticSecret(CredentialJson.ReadStringFields(data));
         }
     }
 
@@ -184,12 +185,26 @@ public sealed class OpenBaoRestClient
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     $"OpenBao read of '{path}' returned no lease_id; DynamicPath requires a leasing engine.");
+            // A minted lease id is dependency output bound for a lease
+            // handle and for log lines: refuse a shape a handle cannot
+            // carry ('.' or control characters) — it could never be
+            // renewed or revoked, and raw control characters would forge
+            // audit-log entries on the way out. The credential is still
+            // live server-side: hand it back before failing.
+            if (!LeaseHandles.IsValidSegment(leaseId))
+            {
+                await TryRevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
+                throw new OpenBaoException(
+                    CredentialFailureKind.InvalidResponse,
+                    $"OpenBao read of '{path}' returned a lease_id that cannot be carried in a lease handle.");
+            }
             // A minted lease id with an unusable rest-of-body is still a
             // live credential: hand it back before failing, or it is
             // orphaned until its TTL.
-            if (!CredentialJson.TryGetInt64(root, "lease_duration", out var leaseSeconds) || leaseSeconds <= 0)
+            if (!CredentialJson.TryGetInt64(root, "lease_duration", out var leaseSeconds)
+                || leaseSeconds <= 0 || leaseSeconds > int.MaxValue)
             {
-                await ReturnLeaseAsync(address, token, leaseId, ct).ConfigureAwait(false);
+                await TryRevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     $"OpenBao read of '{path}' returned no usable lease_duration.");
@@ -198,7 +213,7 @@ public sealed class OpenBaoRestClient
                 && renew.ValueKind == JsonValueKind.True;
             if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
             {
-                await ReturnLeaseAsync(address, token, leaseId, ct).ConfigureAwait(false);
+                await TryRevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     $"OpenBao read of '{path}' returned no data object.");
@@ -207,26 +222,34 @@ public sealed class OpenBaoRestClient
                 "OpenBao issued dynamic credential at '{Path}' under lease '{LeaseId}' for {Seconds}s{Renewable}.",
                 path, leaseId, leaseSeconds, renewable ? string.Empty : " (not renewable)");
             return new OpenBaoDynamicCredential(
-                leaseId, checked((int)leaseSeconds), renewable, ReadFields(data));
+                leaseId, (int)leaseSeconds, renewable, CredentialJson.ReadStringFields(data));
         }
     }
 
     /// <summary>
-    /// Best-effort revoke of a just-issued lease whose response was
-    /// unusable. Never throws — the caller surfaces its own failure.
+    /// Best-effort revoke of a lease the caller is giving up on — a minted
+    /// credential whose response was rejected, or one the provider must
+    /// return after a local validation failure. Never throws: a failed
+    /// give-back is logged (lease id sanitised — it may be exactly the
+    /// shape that failed validation) and the lease expires at its server
+    /// TTL; the caller surfaces its own failure. Callers passing
+    /// <paramref name="sync"/>: issue-path rejections always pass true —
+    /// the rejected credential must be dead before the failure surfaces,
+    /// whatever <c>RevokeSync</c> says.
     /// </summary>
-    private async Task ReturnLeaseAsync(string address, string token, string leaseId, CancellationToken ct)
+    internal async Task TryRevokeLeaseAsync(
+        string address, string token, string leaseId, bool sync, CancellationToken ct)
     {
         try
         {
-            await RevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
+            await RevokeLeaseAsync(address, token, leaseId, sync, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _log.LogWarning(
                 ex,
                 "OpenBao could not return rejected lease '{LeaseId}'; it expires at its server TTL.",
-                leaseId);
+                SafeLeaseId(leaseId));
         }
     }
 
@@ -245,28 +268,30 @@ public sealed class OpenBaoRestClient
         int maxResponseBytes,
         CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(address);
         ArgumentNullException.ThrowIfNull(token);
         ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
+        var displayLeaseId = SafeLeaseId(leaseId);
         var url = $"{address.TrimEnd('/')}/v1/sys/leases/renew";
         var body = JsonSerializer.Serialize(new { lease_id = leaseId, increment = incrementSeconds });
         using var request = new HttpRequestMessage(HttpMethod.Post, url)
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
-        request.Headers.Add(TokenHeader, token);
+        AddTokenHeader(request, token);
         using var response = await _transport.SendAsync(
-            request, $"renew lease '{leaseId}'", ct).ConfigureAwait(false);
+            request, $"renew lease '{displayLeaseId}'", ct).ConfigureAwait(false);
         var doc = await _transport.ReadJsonAsync(
-            response, $"renew lease '{leaseId}'", maxResponseBytes, ct).ConfigureAwait(false);
+            response, $"renew lease '{displayLeaseId}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
             if (!CredentialJson.TryGetInt64(doc.RootElement, "lease_duration", out var leaseSeconds)
-                || leaseSeconds <= 0)
+                || leaseSeconds <= 0 || leaseSeconds > int.MaxValue)
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
-                    $"OpenBao renew of lease '{leaseId}' returned no usable lease_duration.");
-            _log.LogDebug("OpenBao renewed lease '{LeaseId}' for {Seconds}s.", leaseId, leaseSeconds);
-            return checked((int)leaseSeconds);
+                    $"OpenBao renew of lease '{displayLeaseId}' returned no usable lease_duration.");
+            _log.LogDebug("OpenBao renewed lease '{LeaseId}' for {Seconds}s.", displayLeaseId, leaseSeconds);
+            return (int)leaseSeconds;
         }
     }
 
@@ -286,26 +311,29 @@ public sealed class OpenBaoRestClient
         bool sync,
         CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(address);
         ArgumentNullException.ThrowIfNull(token);
         ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
+        var displayLeaseId = SafeLeaseId(leaseId);
         var url = $"{address.TrimEnd('/')}/v1/sys/leases/revoke";
         var body = JsonSerializer.Serialize(new { lease_id = leaseId, sync });
         using var request = new HttpRequestMessage(HttpMethod.Post, url)
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
-        request.Headers.Add(TokenHeader, token);
+        AddTokenHeader(request, token);
         try
         {
             using var response = await _transport.SendAsync(
-                request, $"revoke lease '{leaseId}'", ct).ConfigureAwait(false);
-            _log.LogInformation("OpenBao revoked lease '{LeaseId}'.", leaseId);
+                request, $"revoke lease '{displayLeaseId}'", ct).ConfigureAwait(false);
+            _log.LogInformation("OpenBao revoked lease '{LeaseId}'.", displayLeaseId);
         }
         catch (OpenBaoException ex) when (ex.Kind == CredentialFailureKind.NotFound)
         {
             // Already gone server-side: revocation is complete by definition.
             _log.LogInformation(
-                "OpenBao lease '{LeaseId}' was already absent; treating revocation as complete.", leaseId);
+                "OpenBao lease '{LeaseId}' was already absent; treating revocation as complete.",
+                displayLeaseId);
         }
     }
 
@@ -317,7 +345,7 @@ public sealed class OpenBaoRestClient
         RequireValidPath(path, "read path");
         var url = $"{address.TrimEnd('/')}/v1/{path}";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add(TokenHeader, token);
+        AddTokenHeader(request, token);
         var response = await _transport.SendAsync(request, operation, ct).ConfigureAwait(false);
         return await _transport.ReadJsonAsync(response, operation, maxResponseBytes, ct).ConfigureAwait(false);
     }
@@ -333,21 +361,36 @@ public sealed class OpenBaoRestClient
                 $"OpenBao {what} '{path}' is not a valid relative path (non-empty segments, no '..', no whitespace or control characters).");
     }
 
-    private static IReadOnlyDictionary<string, string> ReadFields(JsonElement data)
+    /// <summary>
+    /// Attaches the provider token to a request. A token the header sink
+    /// cannot carry — control or otherwise invalid header characters,
+    /// possible when the token is dependency output (a server-issued
+    /// client_token) — is a typed invalid response, not a raw
+    /// <see cref="FormatException"/> escaping the transport contract.
+    /// </summary>
+    private static void AddTokenHeader(HttpRequestMessage request, string token)
     {
-        var fields = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var property in data.EnumerateObject())
+        try
         {
-            fields[property.Name] = property.Value.ValueKind switch
-            {
-                JsonValueKind.String => property.Value.GetString() ?? string.Empty,
-                JsonValueKind.Number => property.Value.GetRawText(),
-                JsonValueKind.True => "true",
-                JsonValueKind.False => "false",
-                JsonValueKind.Null => string.Empty,
-                _ => property.Value.GetRawText(),
-            };
+            request.Headers.Add(TokenHeader, token);
         }
-        return fields;
+        catch (FormatException ex)
+        {
+            throw new OpenBaoException(
+                CredentialFailureKind.InvalidResponse,
+                "OpenBao credential cannot be carried in an HTTP header (invalid characters).",
+                ex);
+        }
     }
+
+    /// <summary>
+    /// Display form of a lease id for logs and operation text. A lease id
+    /// is dependency output — control characters must be flattened before
+    /// one reaches a log line or a message, whatever the caller passed.
+    /// The raw id still goes on the wire; only the rendered form is
+    /// sanitised.
+    /// </summary>
+    private static string SafeLeaseId(string leaseId)
+        => CredentialMessages.Truncate(
+            leaseId, "(no lease id)", CredentialMessages.MaxServerDetailChars);
 }

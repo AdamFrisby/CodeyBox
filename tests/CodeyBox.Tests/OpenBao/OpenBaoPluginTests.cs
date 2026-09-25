@@ -67,6 +67,8 @@ public sealed class OpenBaoPluginTests : IDisposable
         public bool Unreachable;
         public int FailReadStatus;
         public bool FailRevokeOnce;
+        public string? LeaseIdOverride;
+        public long? LeaseDurationOverride;
         public readonly List<(string Method, string Path, string Body)> Requests = [];
         public readonly List<string> IssuedLeaseIds = [];
         public readonly HashSet<string> LiveLeases = new(StringComparer.Ordinal);
@@ -101,7 +103,8 @@ public sealed class OpenBaoPluginTests : IDisposable
                     if (!LiveLeases.Contains(leaseId))
                         return Errors("lease not found or expired", HttpStatusCode.BadRequest);
                 }
-                return Raw(LeaseRenewJson.Replace(FixtureLeaseId, leaseId, StringComparison.Ordinal));
+                return Raw(LeaseRenewJson.Replace(
+                    FixtureLeaseId, JsonEncodedText.Encode(leaseId).Value, StringComparison.Ordinal));
             }
 
             if (path == "/v1/sys/leases/revoke")
@@ -138,11 +141,22 @@ public sealed class OpenBaoPluginTests : IDisposable
                     string minted;
                     lock (Requests)
                     {
-                        minted = $"database/creds/readonly/lease-{++_issueCounter:D4}";
+                        minted = LeaseIdOverride ?? $"database/creds/readonly/lease-{++_issueCounter:D4}";
                         LiveLeases.Add(minted);
                         IssuedLeaseIds.Add(minted);
                     }
-                    return Raw(LeaseIssueJson.Replace(FixtureLeaseId, minted, StringComparison.Ordinal));
+                    // Encoded so an override carrying control characters
+                    // still produces a valid JSON body.
+                    var json = LeaseIssueJson.Replace(
+                        FixtureLeaseId, JsonEncodedText.Encode(minted).Value, StringComparison.Ordinal);
+                    if (LeaseDurationOverride is { } durationOverride)
+                    {
+                        json = json.Replace(
+                            "\"lease_duration\": 1200",
+                            $"\"lease_duration\": {durationOverride}",
+                            StringComparison.Ordinal);
+                    }
+                    return Raw(json);
                 }
                 if (path == "/v1/secret/data/myapp")
                     return Raw(Kv2Json);
@@ -285,7 +299,12 @@ public sealed class OpenBaoPluginTests : IDisposable
         public bool IsEnabled(LogLevel logLevel) => true;
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
         {
-            lock (Messages) Messages.Add(formatter(state, exception));
+            // Real sinks render the exception too — capture it so a secret
+            // riding an exception message is still observed by tests.
+            var text = formatter(state, exception);
+            if (exception is not null)
+                text += " " + exception;
+            lock (Messages) Messages.Add(text);
         }
 
         private sealed class NullScope : IDisposable
@@ -984,6 +1003,86 @@ public sealed class OpenBaoPluginTests : IDisposable
         Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
 
         var serverLeaseId = Assert.Single(_handler.IssuedLeaseIds);
+        Assert.Contains(serverLeaseId, _handler.RevokedLeases);
+        Assert.DoesNotContain(serverLeaseId, _handler.LiveLeases);
+    }
+
+    [Fact]
+    public async Task Hostile_Server_Lease_Id_Is_Handed_Back_And_Never_Logged_Raw()
+    {
+        UseRecordedShapes();
+        // A hostile or compromised backend mints a lease id carrying a
+        // newline: the credential must be refused and handed back, and the
+        // raw id must never reach a log line — it would forge entries in
+        // the audit log.
+        const string hostileId = "database/creds/readonly/evil\nFORGED-LOG-LINE";
+        _handler.LeaseIdOverride = hostileId;
+        var log = new CapturingLogger();
+        var provider = CreateProvider(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Mappings:0:SandboxEnvVar"] = "DB_PASSWORD",
+            ["Mappings:0:DynamicPath"] = "database/creds/readonly",
+            ["Mappings:0:DataField"] = "password",
+        }, log: log);
+
+        var ex = await Assert.ThrowsAsync<OpenBaoException>(() => provider.IssueAsync(
+            Secret("DB_PASSWORD"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
+        // The minted credential was handed back — the wire body carries
+        // the real id — while logs carry only the control-flattened form.
+        Assert.Contains(hostileId, _handler.RevokedLeases);
+        Assert.DoesNotContain(hostileId, _handler.LiveLeases);
+        var all = string.Join('\n', log.Messages);
+        Assert.DoesNotContain("evil\nFORGED", all);
+        Assert.Contains("evil FORGED-LOG-LINE", all);
+        Assert.DoesNotContain(hostileId, ex.Message);
+    }
+
+    [Fact]
+    public async Task Oversized_Lease_Duration_Is_Handed_Back_Then_Fails_Typed()
+    {
+        UseRecordedShapes();
+        // A lease_duration above Int32 range must fail as a typed
+        // InvalidResponse — and still hand the minted credential back,
+        // not orphan it until its server TTL.
+        _handler.LeaseDurationOverride = (long)int.MaxValue + 1;
+        var provider = CreateProvider(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Mappings:0:SandboxEnvVar"] = "DB_PASSWORD",
+            ["Mappings:0:DynamicPath"] = "database/creds/readonly",
+            ["Mappings:0:DataField"] = "password",
+        });
+
+        var ex = await Assert.ThrowsAsync<OpenBaoException>(() => provider.IssueAsync(
+            Secret("DB_PASSWORD"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
+        var serverLeaseId = Assert.Single(_handler.IssuedLeaseIds);
+        Assert.Contains(serverLeaseId, _handler.RevokedLeases);
+        Assert.DoesNotContain(serverLeaseId, _handler.LiveLeases);
+    }
+
+    [Fact]
+    public async Task Disabled_Plugin_Still_Revokes_An_Issued_Dynamic_Lease()
+    {
+        UseRecordedShapes();
+        // Disabling the plugin — a natural response to a suspect backend —
+        // must not strand an already-issued lease: revocation needs a
+        // valid configuration, not an enabled one.
+        var provider = CreateProvider(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Enabled"] = "false",
+            ["Mappings:0:SandboxEnvVar"] = "DB_PASSWORD",
+            ["Mappings:0:DynamicPath"] = "database/creds/readonly",
+            ["Mappings:0:DataField"] = "password",
+        });
+        const string serverLeaseId = "database/creds/readonly/still-live-lease";
+        lock (_handler.Requests) _handler.LiveLeases.Add(serverLeaseId);
+        var handle = OpenBaoLeaseIds.BuildDynamic("DB_PASSWORD", serverLeaseId);
+
+        await provider.RevokeAsync(handle);
+
         Assert.Contains(serverLeaseId, _handler.RevokedLeases);
         Assert.DoesNotContain(serverLeaseId, _handler.LiveLeases);
     }
