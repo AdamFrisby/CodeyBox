@@ -65,6 +65,7 @@
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.DopplerPlugin\CodeyBox.DopplerPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.OnePasswordPlugin\CodeyBox.OnePasswordPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.BitwardenPlugin\CodeyBox.BitwardenPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\credentials\CodeyBox.OpenBaoPlugin\CodeyBox.OpenBaoPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.AzureDevOpsUpstreamPlugin\CodeyBox.AzureDevOpsUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.GiteaUpstreamPlugin\CodeyBox.GiteaUpstreamPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\upstream\CodeyBox.ForgejoUpstreamPlugin\CodeyBox.ForgejoUpstreamPlugin.csproj" />
