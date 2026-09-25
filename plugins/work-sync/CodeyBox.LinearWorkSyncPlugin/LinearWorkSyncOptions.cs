@@ -1,4 +1,3 @@
-using System.Globalization;
 using CodeyBox.Core;
 using Microsoft.Extensions.Configuration;
 
@@ -133,67 +132,25 @@ public sealed record LinearWorkSyncOptions
 
         return new LinearWorkSyncOptions
         {
-            Enabled = ReadBool(section, "Enabled", defaults.Enabled),
-            ApiUrl = ReadNonEmpty(section, "ApiUrl", defaults.ApiUrl),
-            TimeoutSeconds = Math.Clamp(ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds), 1, 300),
+            Enabled = PluginConfigReaders.ReadBool(section, "Enabled", defaults.Enabled),
+            ApiUrl = PluginConfigReaders.ReadNonEmpty(section, "ApiUrl", defaults.ApiUrl),
+            TimeoutSeconds = Math.Clamp(PluginConfigReaders.ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds), 1, 300),
             SignalKind = signalKind,
             SignalValue = (section["SignalValue"] ?? defaults.SignalValue).Trim(),
-            TeamProjectMap = ReadMap(section.GetSection("TeamProjectMap")),
-            StateMapping = ReadMap(section.GetSection("StateMapping"), StringComparer.Ordinal),
-            TokenEnvVar = ReadNonEmpty(section, "TokenEnvVar", defaults.TokenEnvVar),
-            OAuthTokenUrl = ReadNonEmpty(section, "OAuthTokenUrl", defaults.OAuthTokenUrl),
+            TeamProjectMap = PluginConfigReaders.ReadMap(section.GetSection("TeamProjectMap")),
+            StateMapping = PluginConfigReaders.ReadMap(section.GetSection("StateMapping"), StringComparer.Ordinal),
+            TokenEnvVar = PluginConfigReaders.ReadNonEmpty(section, "TokenEnvVar", defaults.TokenEnvVar),
+            OAuthTokenUrl = PluginConfigReaders.ReadNonEmpty(section, "OAuthTokenUrl", defaults.OAuthTokenUrl),
             OAuthClientIdEnvVar = (section["OAuthClientIdEnvVar"] ?? string.Empty).Trim(),
             OAuthClientSecretEnvVar = (section["OAuthClientSecretEnvVar"] ?? string.Empty).Trim(),
             OAuthRefreshTokenEnvVar = (section["OAuthRefreshTokenEnvVar"] ?? string.Empty).Trim(),
             WebhookUrl = (section["WebhookUrl"] ?? string.Empty).Trim(),
-            ManageWebhooks = ReadBool(section, "ManageWebhooks", defaults.ManageWebhooks),
-            WebhookSecretEnvVar = ReadNonEmpty(section, "WebhookSecretEnvVar", defaults.WebhookSecretEnvVar),
-            ServiceLogins = ReadList(section.GetSection("ServiceLogins"), defaults.ServiceLogins),
-            MaxItemsPerPoll = Math.Clamp(ReadInt(section, "MaxItemsPerPoll", defaults.MaxItemsPerPoll), 1, 1000),
-            PollPageSize = Math.Clamp(ReadInt(section, "PollPageSize", defaults.PollPageSize), 1, 100),
-            MaxIngestedBodyChars = Math.Clamp(ReadInt(section, "MaxIngestedBodyChars", defaults.MaxIngestedBodyChars), 1024, 256 * 1024),
+            ManageWebhooks = PluginConfigReaders.ReadBool(section, "ManageWebhooks", defaults.ManageWebhooks),
+            WebhookSecretEnvVar = PluginConfigReaders.ReadNonEmpty(section, "WebhookSecretEnvVar", defaults.WebhookSecretEnvVar),
+            ServiceLogins = PluginConfigReaders.ReadList(section.GetSection("ServiceLogins"), defaults.ServiceLogins),
+            MaxItemsPerPoll = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxItemsPerPoll", defaults.MaxItemsPerPoll), 1, 1000),
+            PollPageSize = Math.Clamp(PluginConfigReaders.ReadInt(section, "PollPageSize", defaults.PollPageSize), 1, 100),
+            MaxIngestedBodyChars = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxIngestedBodyChars", defaults.MaxIngestedBodyChars), 1024, 256 * 1024),
         };
-    }
-
-    private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw) || !bool.TryParse(raw.Trim(), out var parsed) ? fallback : parsed;
-    }
-
-    private static int ReadInt(IConfigurationSection section, string key, int fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw)
-            || !int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
-            ? fallback : parsed;
-    }
-
-    private static string ReadNonEmpty(IConfigurationSection section, string key, string fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw) ? fallback : raw.Trim();
-    }
-
-    private static IReadOnlyDictionary<string, string> ReadMap(
-        IConfigurationSection section, IComparer<string>? _ = null)
-    {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var child in section.GetChildren())
-        {
-            if (!string.IsNullOrWhiteSpace(child.Key) && child.Value is not null)
-                map[child.Key.Trim()] = child.Value.Trim();
-        }
-        return map;
-    }
-
-    private static IReadOnlyList<string> ReadList(IConfigurationSection section, IReadOnlyList<string> fallback)
-    {
-        var values = section.GetChildren()
-            .Select(c => c.Value?.Trim())
-            .Where(v => !string.IsNullOrWhiteSpace(v))
-            .Cast<string>()
-            .ToList();
-        return values.Count == 0 ? fallback : values;
     }
 }

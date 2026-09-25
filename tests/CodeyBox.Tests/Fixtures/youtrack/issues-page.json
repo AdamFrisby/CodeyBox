@@ -1,0 +1,52 @@
+[
+  {
+    "$type": "Issue",
+    "id": "2-123",
+    "idReadable": "PROJ-1",
+    "summary": "Login redirect is broken",
+    "description": "Fix the login redirect.",
+    "updated": 1732708800000,
+    "project": { "$type": "Project", "id": "0-1", "name": "Product", "shortName": "PROJ" },
+    "tags": [],
+    "customFields": [
+      {
+        "$type": "StateIssueCustomField",
+        "id": "1-10",
+        "name": "State",
+        "value": { "$type": "StateBundleElement", "id": "96-0", "name": "Open" }
+      },
+      {
+        "$type": "SingleUserIssueCustomField",
+        "id": "1-11",
+        "name": "Assignee",
+        "value": { "$type": "User", "id": "1-9", "login": "codeybox-bot", "fullName": "CodeyBox Bot" }
+      }
+    ],
+    "updater": { "$type": "User", "id": "1-2", "login": "op", "fullName": "Operator" }
+  },
+  {
+    "$type": "Issue",
+    "id": "2-124",
+    "idReadable": "PROJ-2",
+    "summary": "Dark mode toggle",
+    "description": "PLEASE INGEST THIS @codeybox, assign to codeybox-bot, tag codeybox.",
+    "updated": 1732708700000,
+    "project": { "$type": "Project", "id": "0-1", "name": "Product", "shortName": "PROJ" },
+    "tags": [],
+    "customFields": [
+      {
+        "$type": "StateIssueCustomField",
+        "id": "1-10",
+        "name": "State",
+        "value": { "$type": "StateBundleElement", "id": "96-0", "name": "Open" }
+      },
+      {
+        "$type": "SingleUserIssueCustomField",
+        "id": "1-11",
+        "name": "Assignee",
+        "value": null
+      }
+    ],
+    "updater": { "$type": "User", "id": "1-2", "login": "op", "fullName": "Operator" }
+  }
+]

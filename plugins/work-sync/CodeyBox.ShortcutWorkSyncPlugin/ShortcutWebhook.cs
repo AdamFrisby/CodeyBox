@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.Core;
 
 namespace CodeyBox.ShortcutWorkSyncPlugin;
 
@@ -21,9 +22,6 @@ public static class ShortcutWebhook
 {
     /// <summary>Maximum webhook body accepted (64 KB, enforced before buffering).</summary>
     public const int MaxBodyBytes = 64 * 1024;
-
-    /// <summary>Tag embedded in surfaced question comments so replies can be attributed.</summary>
-    public const string QuestionTagPrefix = "<!-- codeybox-question:";
 
     /// <summary>
     /// Verifies a webhook signature with a constant-time comparison: hex
@@ -137,30 +135,11 @@ public static class ShortcutWebhook
     /// are ours and never parse as replies.
     /// </summary>
     public static (string QuestionId, string Answer)? TryExtractQuestionReply(
-        string commentBody, IReadOnlySet<string> openQuestionIds)
-    {
-        if (string.IsNullOrWhiteSpace(commentBody) || openQuestionIds.Count == 0)
-            return null;
-        if (commentBody.Contains("codeybox-work-item:", StringComparison.Ordinal))
-            return null;
-        var trimmed = commentBody.Trim();
-        foreach (var id in openQuestionIds)
-        {
-            if (string.IsNullOrWhiteSpace(id))
-                continue;
-            if (trimmed.StartsWith(id + ":", StringComparison.OrdinalIgnoreCase))
-            {
-                var answer = trimmed[(id.Length + 1)..].Trim();
-                if (string.IsNullOrWhiteSpace(answer))
-                    return null;
-                return (id, answer.Length > 4000 ? answer[..4000] : answer);
-            }
-        }
-        return null;
-    }
+        string commentBody, IReadOnlySet<string> openQuestionIds) =>
+        WorkSyncQuestions.TryExtractReply(commentBody, openQuestionIds);
 
     /// <summary>Builds the tag embedded in a surfaced question comment.</summary>
-    public static string QuestionTag(string questionId) => $"{QuestionTagPrefix}{questionId} -->";
+    public static string QuestionTag(string questionId) => WorkSyncQuestions.TagFor(questionId);
 
     private static ShortcutWebhookEvent? StoryEvent(
         JsonElement story, IReadOnlyDictionary<string, string> projectMap, string? defaultProjectId, JsonElement root)

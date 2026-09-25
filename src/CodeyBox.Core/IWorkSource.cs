@@ -38,10 +38,11 @@ public interface IWorkSource
 
     /// <summary>
     /// Parses an inbound webhook body into a candidate item. The caller MUST
-    /// verify the body's authenticity (HMAC signature over the raw bytes)
-    /// BEFORE invoking this method — mirroring the
-    /// <c>InteractionEndpoints</c> ordering rule — because parsing assigns
-    /// meaning to untrusted bytes. Returns null when the payload carries no
+    /// verify the body's authenticity BEFORE invoking this method — mirroring
+    /// the <c>InteractionEndpoints</c> ordering rule — because parsing assigns
+    /// meaning to untrusted bytes. The mechanism is provider-specific (HMAC
+    /// signature over the raw bytes, or a shared-token comparison). Returns
+    /// null when the payload carries no
     /// candidate work (e.g. an event type this source does not ingest).
     /// Sources without webhook support (<see
     /// cref="WorkSourceCapabilities.SupportsWebhooks"/> false) throw
@@ -72,7 +73,18 @@ public sealed record WorkSignal(
     /// Exact value that must be present (ordinal-ignore-case exact match —
     /// never substring). E.g. label <c>codeybox</c>.
     /// </summary>
-    string Value);
+    string Value)
+{
+    /// <summary>
+    /// True when this signal is among <paramref name="present"/> — same kind
+    /// and an ordinal-ignore-case exact value match. A signal with no value
+    /// (misconfigured source) is present nowhere.
+    /// </summary>
+    public bool IsPresentIn(IReadOnlyList<WorkSignal> present) =>
+        !string.IsNullOrWhiteSpace(Value)
+        && present.Any(s => s.Kind == Kind
+            && string.Equals(s.Value, Value, StringComparison.OrdinalIgnoreCase));
+}
 
 /// <summary>Which upstream field carries the ingestion signal.</summary>
 public enum WorkSignalKind

@@ -1,0 +1,18 @@
+{
+  "event": "commentAdded",
+  "timestamp": "2026-01-01T12:30:00.000Z",
+  "id": "2-123",
+  "numberInProject": 123,
+  "summary": "Login redirect is broken",
+  "project": { "id": "0-1", "name": "Product", "shortName": "PROJ" },
+  "comments": [
+    {
+      "id": "4-7",
+      "text": "q-001: use forward-only migrations",
+      "textPreview": "q-001: use forward-only",
+      "created": 1732709400000,
+      "updated": 1732709400000,
+      "author": { "id": "1-2", "login": "op", "fullName": "Operator", "email": "op@example.com" }
+    }
+  ]
+}

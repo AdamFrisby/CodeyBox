@@ -73,6 +73,7 @@
     <Project Path="plugins/work-sync/CodeyBox.JiraWorkSyncPlugin/CodeyBox.JiraWorkSyncPlugin.csproj" />
     <Project Path="plugins/work-sync/CodeyBox.PlaneWorkSyncPlugin/CodeyBox.PlaneWorkSyncPlugin.csproj" />
     <Project Path="plugins/work-sync/CodeyBox.ShortcutWorkSyncPlugin/CodeyBox.ShortcutWorkSyncPlugin.csproj" />
+    <Project Path="plugins/work-sync/CodeyBox.YouTrackWorkSyncPlugin/CodeyBox.YouTrackWorkSyncPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.InfisicalPlugin/CodeyBox.InfisicalPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.DopplerPlugin/CodeyBox.DopplerPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.OnePasswordPlugin/CodeyBox.OnePasswordPlugin.csproj" />

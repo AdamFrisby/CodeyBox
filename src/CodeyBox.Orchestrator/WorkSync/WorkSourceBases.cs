@@ -67,8 +67,9 @@ public abstract class PollingWorkSourceBase : IWorkSource
 
 /// <summary>
 /// Base for webhook-driven sources. The hosting endpoint MUST verify the
-/// body's authenticity (HMAC over the raw bytes, mirroring the
-/// <c>InteractionEndpoints</c> ordering rule) before calling
+/// body's authenticity (HMAC signature or shared-token comparison,
+/// provider-specific, mirroring the <c>InteractionEndpoints</c> ordering
+/// rule) before calling
 /// <see cref="ParseVerifiedWebhookBody"/>: this method assigns meaning to
 /// untrusted bytes and never verifies. Parsed candidates flow through
 /// <see cref="WorkIngestionService"/>, sharing the funnel with polling.
