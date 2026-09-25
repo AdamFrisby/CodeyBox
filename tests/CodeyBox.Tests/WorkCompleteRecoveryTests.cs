@@ -372,9 +372,9 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
         };
         var fresh = stale with { UpdatedAt = now.AddMinutes(-1) };
 
-        Assert.Equal(watched, WorkItemEndpoints.IsStaleWorkerRetryEligible(stale, now, TimeSpan.FromMinutes(75)));
-        Assert.False(WorkItemEndpoints.IsStaleWorkerRetryEligible(fresh, now, TimeSpan.FromMinutes(75)));
-        Assert.False(WorkItemEndpoints.IsStaleWorkerRetryEligible(stale, now, TimeSpan.Zero));
+        Assert.Equal(watched, WorkItemCommandService.IsStaleWorkerRetryEligible(stale, now, TimeSpan.FromMinutes(75)));
+        Assert.False(WorkItemCommandService.IsStaleWorkerRetryEligible(fresh, now, TimeSpan.FromMinutes(75)));
+        Assert.False(WorkItemCommandService.IsStaleWorkerRetryEligible(stale, now, TimeSpan.Zero));
     }
 
     [Fact]

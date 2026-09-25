@@ -171,6 +171,21 @@ public sealed record WorkItemIteration(
 public interface IWorkItemStore
 {
     Task CreateAsync(WorkItem item, CancellationToken ct = default);
+
+    /// <summary>
+    /// Inserts several items as one unit: transactional stores commit all of
+    /// them or none, so a multi-item chain either files completely or leaves
+    /// the store untouched — a partially valid chain never produces a
+    /// partially persisted one. The default implementation writes the items
+    /// sequentially for stores without transaction support; callers that
+    /// require atomicity must use a store that overrides this.
+    /// </summary>
+    async Task CreateAllAsync(IReadOnlyList<WorkItem> items, CancellationToken ct = default)
+    {
+        foreach (var item in items)
+            await CreateAsync(item, ct).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
     /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,

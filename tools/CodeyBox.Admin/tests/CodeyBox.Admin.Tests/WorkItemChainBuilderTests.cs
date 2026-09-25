@@ -1,4 +1,5 @@
 using CodeyBox.Admin.Model;
+using CodeyBox.Composition;
 
 namespace CodeyBox.Admin.Tests;
 

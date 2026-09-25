@@ -34,6 +34,7 @@ using CodeyBox.Agents.Unreal;
 using CodeyBox.AdminSeed;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
+using CodeyBox.Api.Majordomo;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Llm.PlanAudit;
@@ -324,6 +325,17 @@ builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration))
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplySandboxClassesTo(opts, builder.Configuration));
+// Majordomo MCP surface: hot-reloadable policy (autonomy mode, per-turn
+// blast-radius cap, identity name, turn window) mirroring the vocabulary's
+// MajordomoOptions. Validation fails fast at load rather than silently
+// weakening the gate on a config typo.
+builder.Services.AddOptions<MajordomoServerOptions>()
+    .Bind(builder.Configuration.GetSection(MajordomoServerOptions.SectionName))
+    .Validate(
+        static opts => MajordomoServerOptions.Validate(opts) is null,
+        "invalid CodeyBox:Majordomo configuration — see MajordomoServerOptions.Validate");
+builder.Services.AddMajordomoMcp();
+
 builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
     sp.GetRequiredService<ILoggerFactory>(),
@@ -4262,6 +4274,21 @@ builder.Services.AddSingleton<IAgentPauseSignal>(sp =>
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
 builder.Services.AddSingleton<WorkItemCreationService>();
+builder.Services.AddSingleton(sp => new WorkItemCommandService(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<IKnobRegistry>(),
+    sp.GetRequiredService<IWorkerRegistry>(),
+    sp.GetRequiredService<AgentClassRouter>(),
+    sp.GetRequiredService<CancellationRegistry>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    sp.GetRequiredService<ItemStaleProgressWatchdog>(),
+    sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>(),
+    sp.GetService<ITimingStore>(),
+    sp.GetService<WorkItemRepoReaper>()));
 builder.Services.AddSingleton<ITaskTemplateRegistry, FileTaskTemplateRegistry>();
 
 // --- Dead-worker registry + reaper -------------------------------------------
@@ -5803,6 +5830,7 @@ AgentPauseEndpoints.Map(app);
 TestSelectionSoundnessEndpoints.Map(app);
 ConfigReloadEndpoints.Map(app);
 DeployConsistencyEndpoints.Map(app);
+app.MapMajordomoMcp();
 
 // Prometheus scrape endpoint — registered only when the exporter is enabled
 // so the surface is invisible (route not on the table) by default. Mapped

@@ -418,149 +418,16 @@ internal static class WorkItemEndpoints
         string id,
         RetryWorkItemRequest? body,
         IWorkItemStore store,
-        WorkItemRetrier retrier,
-        IWorkerRegistry registry,
-        ItemStaleProgressWatchdog staleWatchdog,
-        IOptionsMonitor<CodeyBoxOptions> options,
+        WorkItemCommandService commands,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Pass body.From through verbatim (including null) so the retrier can
-        // auto-pick when the operator didn't specify a phase — defaulting at
-        // the API layer would erase that signal. The echoed `from` field in
-        // the response reflects what was requested ("auto" when unspecified)
-        // so operators can distinguish auto-pick from an explicit choice;
-        // `actualFrom` reflects the phase actually resumed from.
-        var requestedFrom = string.IsNullOrWhiteSpace(body?.From)
-            ? null
-            : body!.From!.Trim().ToLowerInvariant();
-
-        // Only resume from terminal-failed states or parked states
-        // (NeedsOperatorInput for operator triage, WaitingForQuotaReset /
-        // WaitingForTransientRetry for operator override of the schedulers,
-        // WaitingForAgentResume for operator override of per-agent runtime
-        // pause controls).
-        // NoActionRequired items are retryable too: the precondition may hold
-        // on a later run, so the operator can re-run the item from scratch.
-        // Done items have nothing to retry; other non-terminal states would
-        // race the pipeline — except a stale worker-held item, which is
-        // fenced first (see below).
-        if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
-            or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
-            or WorkItemState.AbandonedAfterRecoveryAttempts
-            or WorkItemState.NoActionRequired
-            or WorkItemState.NeedsOperatorInput
-            or WorkItemState.WaitingForQuotaReset
-            or WorkItemState.WaitingForAgentResume
-            or WorkItemState.WaitingForTransientRetry))
-        {
-            var fenceError = await TryFenceStaleWorkerItemForRetryAsync(
-                item!, requestedFrom, registry, staleWatchdog, options, ct);
-            if (fenceError is not null)
-                return fenceError;
-            var fenced = await store.GetAsync(item.Id, ct);
-            if (fenced is null)
-                return Results.Conflict(new { error = "work item no longer exists" });
-            item = fenced;
-        }
-
-        var (success, error, resumeState, actualFrom, openQuestions) = await retrier.RetryAsync(
-            item,
-            requestedFrom,
-            trigger: "manual",
-            ct: ct,
-            workTimeoutMinutes: body?.WorkTimeoutMinutes);
-
-        if (!success)
-        {
-            if (openQuestions is { Count: > 0 })
-                return Results.Conflict(new { error, openQuestions });
-
-            if (error!.Contains("no longer exists"))
-                return Results.Conflict(new { error, hint = "retry with from=\"work\" to start over from a fresh clone" });
-
-            return Results.Conflict(new { error });
-        }
-
-        return Results.Accepted(
-            $"/workitems/{item.Id}",
-            new { id = item.Id.ToString(), from = requestedFrom ?? "auto", actualFrom = actualFrom!, state = resumeState!.Value.ToString() });
+        var outcome = await commands.RetryAsync(item!, body?.From, body?.WorkTimeoutMinutes, ct);
+        return outcome.ToHttpResult();
     }
 
-    /// <summary>
-    /// Pure eligibility gate for operator retry of a worker-occupied item:
-    /// the item must sit in a worker-occupiable state and its
-    /// <c>UpdatedAt</c> must be frozen past the item-stale window. A zero or
-    /// negative timeout disables the gate (matches the watchdog sweep's
-    /// per-agent opt-out semantics: no window, no staleness verdict).
-    /// </summary>
-    internal static bool IsStaleWorkerRetryEligible(WorkItem item, DateTimeOffset now, TimeSpan staleTimeout)
-        => WorkItemRecoveryPolicy.IsItemStaleWatchedState(item.State)
-            && staleTimeout > TimeSpan.Zero
-            && item.UpdatedAt <= now - staleTimeout;
-
-    /// <summary>
-    /// Fences a stale worker-held item so an operator retry cannot race the
-    /// wedged pipeline. Returns null when the retry may proceed (fence
-    /// succeeded); otherwise the 409 result to return. Refuses with the
-    /// legacy message when the item is not stale-worker-held at all, and
-    /// with the recovery error when fencing fails closed (unfenceable
-    /// dispatch claim, concurrent advance, attempt budget exhausted into a
-    /// park that itself failed to write).
-    /// </summary>
-    private static async Task<IResult?> TryFenceStaleWorkerItemForRetryAsync(
-        WorkItem item,
-        string? requestedFrom,
-        IWorkerRegistry registry,
-        ItemStaleProgressWatchdog staleWatchdog,
-        IOptionsMonitor<CodeyBoxOptions> options,
-        CancellationToken ct)
-    {
-        var staleTimeout = options.CurrentValue.WorkerProgressWatchdog.ResolveItemStaleTimeout(item.Agent);
-        if (!IsStaleWorkerRetryEligible(item, DateTimeOffset.UtcNow, staleTimeout))
-        {
-            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
-        }
-
-        var idStr = item.Id.ToString();
-        var bound = false;
-        try
-        {
-            var workers = await registry.ListAsync(ct);
-            foreach (var worker in workers)
-            {
-                if (string.Equals(worker.CurrentWorkItemId, idStr, StringComparison.OrdinalIgnoreCase))
-                {
-                    bound = true;
-                    break;
-                }
-            }
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception ex)
-        {
-            return Results.Conflict(new { error = $"cannot retry stale worker-held item {item.Id}: failed to inspect worker bindings: {ex.Message}" });
-        }
-
-        if (!bound)
-        {
-            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
-        }
-
-        var sinceProgressSeconds = (long)(DateTimeOffset.UtcNow - item.UpdatedAt).TotalSeconds;
-        var recovery = await staleWatchdog.RecoverItemAsync(
-            item,
-            $"operator retry from '{requestedFrom ?? "auto"}' fenced stale worker-held item in {item.State} with no progress for {sinceProgressSeconds}s",
-            ct);
-        if (!recovery.Recovered)
-        {
-            return Results.Conflict(new { error = $"cannot retry stale worker-held item {item.Id}: {recovery.Error ?? "recovery did not transition the work item"}" });
-        }
-
-        return null;
-    }
 
     /// <summary>
     /// Delegate a work item to the unconstrained delegation phase: one repair
@@ -930,158 +797,18 @@ internal static class WorkItemEndpoints
     private static async Task<IResult> CancelAsync(
         string id,
         IWorkItemStore store,
-        CancellationRegistry cancellations,
-        IWebhookDispatcher webhooks,
-        IProjectRepository projects,
-        ITimingStore? timings,
-        [FromServices] WorkItemRepoReaper? repoReaper,
+        WorkItemCommandService commands,
         string? reason,
         string? resolutionSha,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
-        var workItemId = item!.Id;
 
-        // Validate optional close-out metadata. Same shape as /resume's reason
-        // guard (no control chars, ≤500 chars); resolutionSha is a Git-shaped
-        // hex SHA so triage tooling can link the manual-resolution commit.
-        if (AgentPauseValidation.ValidateOptionalReason(reason, "reason") is { } reasonError)
-            return Results.BadRequest(new { error = reasonError });
-        if (resolutionSha is not null)
-        {
-            if (resolutionSha.Length is < 7 or > 40
-                || !resolutionSha.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
-                return Results.BadRequest(new { error = "resolutionSha must be a 7-40 character hex string" });
-        }
-
-        // Bookkeeping close-out path: when an operator resolves a terminal-failure
-        // item out-of-band (e.g. manually merges after MergeConflictResolutionFailed),
-        // DELETE used to 409 — leaving the item stranded forever. Transition it to
-        // Cancelled with the same OperatorRequested reason as the in-flight path so
-        // there is a single terminal-closed shape regardless of how it got there.
-        if (IsTerminalFailureCloseable(item.State))
-        {
-            var priorState = item.State;
-            var lastError = BuildCloseLastError(priorState, reason, resolutionSha);
-            var closed = item.With(WorkItemState.Cancelled, lastError,
-                WorkItemCancellationReason.OperatorRequested);
-            await store.UpdateAsync(closed, ct);
-            AuditLog.WorkItemCancelled(workItemId);
-            if (repoReaper is not null)
-                await repoReaper.TryReapWorkItemAsync(workItemId, CancellationToken.None);
-            var project = await projects.GetAsync(item.ProjectId, ct);
-            if (project is not null)
-                await webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = "work_item.cancelled",
-                    WorkItem = closed,
-                    Project = project,
-                    Details = new
-                    {
-                        priorState = priorState.ToString(),
-                        reason,
-                        resolutionSha,
-                    },
-                }, ct);
-            return Results.Accepted($"/workitems/{workItemId}");
-        }
-
-        // Idempotent close: an already-cancelled item is a no-op rather than 409.
-        // Lets operator scripts and the audit UI retry DELETE safely.
-        if (item.State == WorkItemState.Cancelled)
-            return Results.Accepted($"/workitems/{workItemId}");
-
-        if (item.State == WorkItemState.Done)
-            return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
-
-        // A no-action-required resolution is a recorded determination, not a
-        // live run: cancelling it would overwrite the preserved reasoning
-        // with "cancelled via API". Like Done, it has nothing to cancel —
-        // retry it instead if the precondition now holds.
-        if (item.State == WorkItemState.NoActionRequired)
-            return Results.Conflict(new { error = $"cannot cancel item in state {item.State}" });
-
-        var wasActive = cancellations.Cancel(workItemId);
-        if (!wasActive)
-        {
-            var lastError = BuildCloseLastError(item.State, reason, resolutionSha)
-                ?? "cancelled via API";
-            var cancelled = item.With(WorkItemState.Cancelled, lastError,
-                WorkItemCancellationReason.OperatorRequested);
-            await store.UpdateAsync(cancelled, ct);
-            AuditLog.WorkItemCancelled(workItemId);
-            if (repoReaper is not null)
-                await repoReaper.TryReapWorkItemAsync(workItemId, CancellationToken.None);
-            var project = await projects.GetAsync(item.ProjectId, ct);
-            if (project is not null)
-                await webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = "work_item.cancelled",
-                    WorkItem = cancelled,
-                    Project = project,
-                    Details = reason is null && resolutionSha is null ? null : new
-                    {
-                        priorState = item.State.ToString(),
-                        reason,
-                        resolutionSha,
-                    },
-                }, ct);
-
-            // Only delete timing rows when the pipeline was not active. If the
-            // pipeline was running (wasActive=true) it races to Done; deleting
-            // here could erase timing records for a successfully-completed item.
-            if (timings is not null)
-                await timings.DeleteByWorkItemAsync(workItemId, ct);
-        }
-
-        // Cascade: cancel all Queued items that (transitively) depend on this
-        // one. In-flight items (non-Queued) are left to run their course.
-        await CascadeCancelDependentsAsync(workItemId, store, ct);
-
-        // Orphan any replays: clear their replay_of link so they keep running
-        // but are no longer linked to the (now-cancelled) source.
-        await store.OrphanReplaysAsync(workItemId, ct);
-
-        return Results.Accepted($"/workitems/{workItemId}");
+        var outcome = await commands.CancelAsync(item!, reason, resolutionSha, ct);
+        return outcome.ToHttpResult();
     }
 
-    private static bool IsTerminalFailureCloseable(WorkItemState state) =>
-        state is WorkItemState.Failed
-            or WorkItemState.AuditFailed
-            or WorkItemState.MergeConflictResolutionFailed
-            or WorkItemState.AbandonedAfterRecoveryAttempts;
-
-    private static string? BuildCloseLastError(WorkItemState priorState, string? reason, string? resolutionSha)
-    {
-        if (reason is null && resolutionSha is null) return null;
-        var prefix = $"closed by operator from {priorState}";
-        if (resolutionSha is not null) prefix += $" (resolution-sha={resolutionSha})";
-        return reason is null ? prefix : $"{prefix}: {reason}";
-    }
-
-    private static async Task CascadeCancelDependentsAsync(
-        WorkItemId cancelledId,
-        IWorkItemStore store,
-        CancellationToken ct)
-    {
-        var allItems = new List<WorkItem>();
-        await foreach (var i in store.ListAsync(ct)) allItems.Add(i);
-
-        var targets = WorkItemDependencies.FindCascadeCancelTargets(cancelledId, allItems);
-        foreach (var target in targets)
-        {
-            // Atomic conditional update: only writes Cancelled when the item is still
-            // Queued in the DB. If a worker raced and transitioned it to Working between
-            // the ListAsync snapshot and now, the WHERE guard returns 0 rows and we skip
-            // the audit log — no spurious WorkItemDependentCancelled for in-flight items.
-            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled",
-                WorkItemCancellationReason.ParentCascaded);
-            var updated = await store.TryUpdateIfStateAsync(cancelled, WorkItemState.Queued, ct);
-            if (updated)
-                AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
-        }
-    }
 
     /// <summary>
     /// Resets a Cancelled work item back to Queued so it will be retried.
@@ -1411,490 +1138,16 @@ internal static class WorkItemEndpoints
         string id,
         PatchWorkItemRequest body,
         IWorkItemStore store,
-        ITaskQueue queue,
-        IProjectRepository projects,
-        IAgentRegistry agents,
-        IKnobRegistry knobs,
-        IWorkerRegistry registry,
-        AgentClassRouter router,
+        WorkItemCommandService commands,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var depsPatch = body.DependsOn is not null;
-        var queuedOnlyPatch =
-            body.Title is not null
-            || body.Prompt is not null
-            || body.Agent is not null
-            || body.WorkTimeoutMinutes is not null
-            || body.MergeTimeoutMinutes is not null
-            || body.MinModelScore is not null
-            || body.RequiredCapabilities is not null
-            || body.Knobs is not null;
-        var queuedRowPatch =
-            body.Title is not null
-            || body.Prompt is not null
-            || body.Agent is not null
-            || body.WorkTimeoutMinutes is not null
-            || body.MergeTimeoutMinutes is not null
-            || body.MinModelScore is not null
-            || body.RequiredCapabilities is not null;
-        var auditBudgetPatch = body.AuditMaxIterations is not null
-            || body.AuditComplexity is not null;
-        var agentClassPatch = body.AgentClassId is not null;
-
-        // ── State pre-checks: surface 409 before any write ────────────────────
-        // DependsOn is allowed on any non-terminal state — adding a dependency
-        // post-hoc is the whole reason this field exists. Other fields stay
-        // Queued-only because they affect a running pipeline.
-        if (depsPatch && WorkItemDependencies.TerminalStates.Contains(item!.State))
-            return Results.Conflict(new
-            {
-                error = $"cannot edit dependencies of work item in terminal state '{item.State}'",
-            });
-        if (auditBudgetPatch && WorkItemDependencies.TerminalStates.Contains(item!.State))
-            return Results.Conflict(new
-            {
-                error = $"cannot edit audit budget of work item in terminal state '{item.State}'",
-            });
-        // AgentClassId is allowed on any non-terminal state — the motivating
-        // case is a WorkComplete item parked behind an auditor class whose
-        // members are all unavailable (a Queued-only restriction would not
-        // solve it). Terminal items are closed; worker-held items are refused
-        // below rather than racing the dispatch path.
-        if (agentClassPatch && WorkItemDependencies.TerminalStates.Contains(item!.State))
-            return Results.Conflict(new
-            {
-                error = $"cannot edit agent class of work item in terminal state '{item.State}'",
-            });
-        if (queuedOnlyPatch && item!.State != WorkItemState.Queued)
-            return Results.Conflict(new
-            {
-                error = $"cannot edit item in state {item.State}; only Queued items are editable",
-            });
-
-        // ── DependsOn resolution + cycle check (no writes yet, may 400) ──────
-        List<WorkItemId>? newDependsOn = null;
-        if (depsPatch)
-        {
-            var (depErr, ids) = await ResolveAndValidateDependsOnAsync(
-                body.DependsOn!, item!.Id, item.ProjectId, store, ct);
-            if (depErr is not null) return depErr;
-            newDependsOn = ids;
-        }
-
-        IReadOnlyDictionary<string, string>? normalisedPatchKnobs = null;
-        if (body.Knobs is { } patchKnobs)
-        {
-            var (normalisedKnobs, knobErr) = WorkItemCreationService.NormaliseKnobs(patchKnobs, knobs);
-            if (knobErr is not null) return knobErr;
-            normalisedPatchKnobs = normalisedKnobs!;
-        }
-
-        // ── AgentClassId validation (no writes yet, may 400) ─────────────────
-        // Same bounds as the create path (≤200 chars), plus an existence check
-        // against the live router catalog: an unknown class would otherwise
-        // fall through to direct agent pick at dispatch and silently strand
-        // the item outside the class the operator intended.
-        string? newAgentClassId = null;
-        string? oldAgentClassId = item!.AgentClassId;
-        if (agentClassPatch)
-        {
-            var (normalizedClassId, classIdError) = WorkItemFieldRules.NormalizeAgentClassId(body.AgentClassId);
-            if (classIdError is not null)
-                return Results.BadRequest(new { error = classIdError });
-            var trimmed = normalizedClassId!;
-            var knownClasses = router.ClassIds;
-            if (!knownClasses.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
-                return Results.BadRequest(new
-                {
-                    error = $"unknown agent class '{trimmed}'",
-                    available = knownClasses.OrderBy(c => c, StringComparer.OrdinalIgnoreCase),
-                });
-            newAgentClassId = trimmed;
-
-            // Refuse while a worker holds the item rather than racing the
-            // dispatch path, which may be resolving the class concurrently.
-            // Checked last (closest to the write) to minimise the check/write
-            // gap; the store's terminal guard below still fails closed on a
-            // concurrent transition.
-            try
-            {
-                var idStr = item.Id.ToString();
-                var workers = await registry.ListAsync(ct);
-                foreach (var worker in workers)
-                {
-                    if (string.Equals(worker.CurrentWorkItemId, idStr, StringComparison.OrdinalIgnoreCase))
-                        return Results.Conflict(new
-                        {
-                            error = $"cannot change agent class while worker '{worker.WorkerId}' holds work item '{id}'",
-                        });
-                }
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception ex)
-            {
-                return Results.Conflict(new
-                {
-                    error = $"cannot change agent class of work item '{id}': failed to inspect worker bindings: {ex.Message}",
-                });
-            }
-        }
-
-        var updated = item!;
-        var now = DateTimeOffset.UtcNow;
-        var queuedUpdateExpectedUpdatedAt = item!.UpdatedAt;
-        var deferPromptReplace = body.Prompt is not null && normalisedPatchKnobs is not null;
-
-        if (body.Title is not null)
-        {
-            var (newTitle, titleError) = WorkItemFieldRules.NormalizeTitle(body.Title);
-            if (titleError is not null) return Results.BadRequest(new { error = titleError });
-            updated = updated with { Title = newTitle!, UpdatedAt = now };
-        }
-
-        if (body.Prompt is not null)
-        {
-            var (newPrompt, promptError) = WorkItemFieldRules.NormalizePrompt(body.Prompt);
-            if (promptError is not null) return Results.BadRequest(new { error = promptError });
-            if (deferPromptReplace)
-            {
-                updated = updated with
-                {
-                    Prompt = newPrompt!,
-                    PromptRevision = updated.PromptRevision + 1,
-                    UpdatedAt = now,
-                };
-            }
-            else
-            {
-                // Route through TryReplacePromptAsync — the only write path that
-                // touches prompt + prompt_revision. The full-row UPDATE below
-                // deliberately does NOT carry the prompt columns (they would
-                // clobber a concurrent PUT /workitems/{id}/prompt). The state
-                // guard inside TryReplacePromptAsync mirrors the Queued check
-                // above; success refreshes our in-memory snapshot for the rest
-                // of the PATCH so the response DTO reflects the new revision.
-                var promptResult = await store.TryReplacePromptAsync(updated.Id, newPrompt!, now, ct);
-                if (promptResult.Outcome == PromptReplaceOutcome.NotFound)
-                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-                if (promptResult.Outcome == PromptReplaceOutcome.TerminalState)
-                    return Results.Conflict(new { error = $"cannot edit item in terminal state" });
-                updated = updated with
-                {
-                    Prompt = newPrompt!,
-                    PromptRevision = promptResult.NewRevision ?? updated.PromptRevision + 1,
-                    UpdatedAt = now,
-                };
-                queuedUpdateExpectedUpdatedAt = now;
-            }
-        }
-
-        if (body.Agent is not null)
-        {
-            var kind = new AgentKind(body.Agent);
-            if (!agents.TryGet(kind, out _))
-                return Results.BadRequest(new { error = $"unknown agent '{Validation.DescribeUntrustedValue(body.Agent)}'", available = agents.Available.Select(a => a.Value) });
-            updated = updated with { Agent = kind, UpdatedAt = now };
-        }
-
-        if (body.WorkTimeoutMinutes is { } w)
-            updated = updated with { WorkTimeout = WorkItemFieldRules.ClampWorkTimeoutMinutes(w), UpdatedAt = now };
-
-        if (body.MergeTimeoutMinutes is { } m)
-            updated = updated with { MergeTimeout = WorkItemFieldRules.ClampMergeTimeoutMinutes(m), UpdatedAt = now };
-
-        if (body.MinModelScore is { } minScore)
-            updated = updated with { MinModelScore = WorkItemFieldRules.ClampMinModelScore(minScore), UpdatedAt = now };
-
-        if (body.RequiredCapabilities is { } patchCaps)
-        {
-            var (normalised, capErr) = WorkItemFieldRules.NormalizeRequiredCapabilities(patchCaps);
-            if (capErr is not null) return Results.BadRequest(new { error = capErr });
-            updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
-        }
-
-        if (normalisedPatchKnobs is not null)
-        {
-            updated = updated with { Knobs = normalisedPatchKnobs, UpdatedAt = now };
-        }
-
-        if (queuedOnlyPatch)
-            updated = ClearPlanReview(updated) with { UpdatedAt = now };
-
-        if (body.AuditMaxIterations is { } auditMaxIterations)
-        {
-            var auditMaxIterationsError = WorkItemFieldRules.CheckAuditMaxIterations(auditMaxIterations);
-            if (auditMaxIterationsError is not null)
-                return Results.BadRequest(new { error = auditMaxIterationsError });
-            updated = updated with { AuditMaxIterations = auditMaxIterations, UpdatedAt = now };
-        }
-
-        if (body.AuditComplexity is not null)
-        {
-            var (normalised, complexityErr) = WorkItemFieldRules.NormalizeAuditComplexity(body.AuditComplexity);
-            if (complexityErr is not null) return Results.BadRequest(new { error = complexityErr });
-            updated = updated with { AuditComplexity = normalised, UpdatedAt = now };
-        }
-
-        if (newAgentClassId is not null)
-            updated = updated with { AgentClassId = newAgentClassId, UpdatedAt = now };
-
-        IReadOnlyList<WorkItemId> oldDependsOn = updated.DependsOn;
-        if (depsPatch)
-            updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
-
-        // ── Persist ──────────────────────────────────────────────────────────
-        // Queued-only fields go through a guarded row UPDATE. Any PATCH that
-        // touches the knob map routes through the combined guarded row+knob
-        // write so the plan-clearing performed by ClearPlanReview above (which
-        // runs for every queuedOnlyPatch, knobs included) is persisted in the
-        // same transaction as the knob replacement — a partial knob write would
-        // leave stale plan_* columns behind. When knobs and audit budget fields
-        // are sent together, include the audit budget in that same guarded
-        // write; otherwise the later audit-budget write could conflict after
-        // the knob map had already been replaced.
-        var auditBudgetWrittenWithQueuedUpdate = normalisedPatchKnobs is not null && auditBudgetPatch;
-        var needsQueuedRowUpdate =
-            queuedRowPatch
-            || normalisedPatchKnobs is not null
-            || (depsPatch && queuedOnlyPatch)
-            || auditBudgetWrittenWithQueuedUpdate;
-        if (needsQueuedRowUpdate)
-        {
-            var queuedUpdate = auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate
-                ? updated with
-                {
-                    AuditMaxIterations = item!.AuditMaxIterations,
-                    AuditComplexity = item!.AuditComplexity,
-                }
-                : updated;
-            // Guard state and updated_at so queued edits cannot be written over
-            // a concurrent pickup or another accepted queued-field patch.
-            var written = normalisedPatchKnobs is not null
-                ? await store.TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync(
-                    queuedUpdate,
-                    WorkItemState.Queued,
-                    queuedUpdateExpectedUpdatedAt,
-                    ct)
-                : await store.TryUpdateIfStateAndUpdatedAtAsync(
-                    queuedUpdate,
-                    WorkItemState.Queued,
-                    queuedUpdateExpectedUpdatedAt,
-                    ct);
-            if (!written)
-                return Results.Conflict(new { error = "item changed before the queued-field update could be written" });
-            queuedUpdateExpectedUpdatedAt = now;
-        }
-        if (auditBudgetPatch && !auditBudgetWrittenWithQueuedUpdate)
-        {
-            var budgetResult = await store.UpdateAuditBudgetAsync(
-                updated.Id,
-                updated.AuditMaxIterations,
-                updated.AuditComplexity,
-                now,
-                ct);
-            switch (budgetResult.Outcome)
-            {
-                case AuditBudgetUpdateOutcome.NotFound:
-                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-                case AuditBudgetUpdateOutcome.TerminalState:
-                    return Results.Conflict(new
-                    {
-                        error = $"work item transitioned to terminal state '{budgetResult.Item!.State}' before audit budget could be updated",
-                    });
-                case AuditBudgetUpdateOutcome.Updated:
-                    updated = budgetResult.Item ?? updated;
-                    break;
-            }
-        }
-        // AgentClassId on a Queued item with other queued edits rides the
-        // guarded row UPDATE above (its SQL carries agent_class_id); every
-        // other case — notably non-Queued items, where the guarded write is
-        // unavailable — goes through the terminal-guarded partial UPDATE so
-        // pipeline-owned columns are never stomped.
-        if (agentClassPatch && !needsQueuedRowUpdate)
-        {
-            var classResult = await store.UpdateAgentClassAsync(
-                updated.Id,
-                newAgentClassId,
-                now,
-                ct);
-            switch (classResult.Outcome)
-            {
-                case AgentClassUpdateOutcome.NotFound:
-                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-                case AgentClassUpdateOutcome.TerminalState:
-                    return Results.Conflict(new
-                    {
-                        error = $"work item transitioned to terminal state '{classResult.Item!.State}' before agent class could be updated",
-                    });
-                case AgentClassUpdateOutcome.Updated:
-                    oldAgentClassId = classResult.OldAgentClassId ?? oldAgentClassId;
-                    updated = classResult.Item ?? updated with { AgentClassId = newAgentClassId, UpdatedAt = now };
-                    break;
-            }
-        }
-        if (depsPatch && !queuedOnlyPatch)
-        {
-            var depResult = await store.UpdateDependsOnAsync(updated.Id, newDependsOn!, now, ct);
-            switch (depResult.Outcome)
-            {
-                case DependsOnUpdateOutcome.NotFound:
-                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-                case DependsOnUpdateOutcome.TerminalState:
-                    return Results.Conflict(new
-                    {
-                        error = $"work item transitioned to terminal state '{depResult.Item!.State}' before dependencies could be updated",
-                    });
-            }
-            oldDependsOn = depResult.OldDependsOn ?? oldDependsOn;
-            updated = depResult.Item ?? updated with { DependsOn = newDependsOn!, UpdatedAt = now };
-        }
-
-        if (queuedOnlyPatch || auditBudgetPatch)
-        {
-            AuditLog.WorkItemPatched(
-                updated.Id,
-                titleChanged: body.Title is not null,
-                promptChanged: body.Prompt is not null,
-                agentChanged: body.Agent is not null,
-                workTimeoutChanged: body.WorkTimeoutMinutes is not null,
-                mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
-                minModelScoreChanged: body.MinModelScore is not null,
-                requiredCapabilitiesChanged: body.RequiredCapabilities is not null,
-                auditBudgetChanged: auditBudgetPatch,
-                knobsChanged: body.Knobs is not null);
-        }
-        if (depsPatch)
-            AuditLog.WorkItemDependenciesChanged(updated.Id, oldDependsOn, newDependsOn!);
-        if (agentClassPatch)
-            AuditLog.WorkItemAgentClassChanged(updated.Id, oldAgentClassId, newAgentClassId);
-
-        var statesById = new Dictionary<WorkItemId, WorkItemState>();
-        var depExternalIds = new Dictionary<WorkItemId, string?>();
-        foreach (var depId in updated.DependsOn)
-        {
-            var dep = await store.GetAsync(depId, ct);
-            if (dep is not null)
-            {
-                statesById[depId] = dep.State;
-                depExternalIds[depId] = dep.ExternalId;
-            }
-        }
-
-        // If the dep edit on a Queued item left all deps satisfied (typical for
-        // dependsOn=[]), kick the dispatcher so it picks the item up immediately
-        // instead of waiting for the next scan tick. Mirrors the Create path.
-        if (depsPatch
-            && updated.State == WorkItemState.Queued
-            && WorkItemDependencies.AreSatisfied(updated.DependsOn, statesById))
-        {
-            await queue.EnqueueAsync(updated.Id, ct);
-        }
-
-        var project = await projects.GetAsync(updated.ProjectId, ct);
-        return Results.Ok(ToDto(updated, project, statesById, depExternalIds));
+        var outcome = await commands.PatchAsync(item!, body, ct);
+        return outcome.ToHttpResult();
     }
 
-    private static WorkItem ClearPlanReview(WorkItem item) => item with
-    {
-        PlanArtifact = null,
-        PlanGeneratedAt = null,
-        PlanReviewedAt = null,
-        PlanReviewSummary = null,
-        PlanReviewAttempts = 0,
-    };
-
-    /// <summary>
-    /// Resolves and validates a <c>dependsOn</c> string array for a PATCH-time
-    /// dependency edit. Each entry is a GUID, a namespaced <c>'ns:value'</c>
-    /// externalId, or a bare externalId (unambiguous within the project). Caps
-    /// at 100 entries, rejects self-loops and missing deps, and runs full
-    /// cycle detection over the proposed graph.
-    ///
-    /// Returns either the validated WorkItemId list, or an IResult ready to
-    /// short-circuit the endpoint with a 400. Mirrors the inline validation
-    /// block in CreateAsync — the two paths must keep the same shape so
-    /// invariants do not drift.
-    /// </summary>
-    private static async Task<(IResult? Error, List<WorkItemId>? Ids)> ResolveAndValidateDependsOnAsync(
-        string[] rawDeps,
-        WorkItemId targetId,
-        ProjectId projectId,
-        IWorkItemStore store,
-        CancellationToken ct)
-    {
-        if (WorkItemFieldRules.CheckDependsOnCount(rawDeps.Length) is { } depsCountError)
-            return (Results.BadRequest(new { error = depsCountError }), null);
-
-        var allItems = new List<WorkItem>();
-        await foreach (var existing in store.ListAsync(ct)) allItems.Add(existing);
-
-        var byNamespacedExternalId = new Dictionary<(string Namespace, string Value), WorkItem>();
-        var byBareExternalId = new Dictionary<string, List<(string Namespace, WorkItem Item)>>(StringComparer.Ordinal);
-        foreach (var existing in allItems.Where(i => i.ProjectId == projectId))
-        {
-            foreach (var (ns, value) in existing.ExternalIds)
-            {
-                byNamespacedExternalId[(ns, value)] = existing;
-                if (!byBareExternalId.TryGetValue(value, out var list))
-                    byBareExternalId[value] = list = new List<(string, WorkItem)>();
-                list.Add((ns, existing));
-            }
-        }
-
-        var dependsOnIds = new List<WorkItemId>(rawDeps.Length);
-        foreach (var rawId in rawDeps)
-        {
-            if (rawId is null)
-                return (Results.BadRequest(new { error = "dependency could not be resolved: null entry in dependsOn array" }), null);
-            if (Guid.TryParse(rawId, out var g))
-            {
-                dependsOnIds.Add(new WorkItemId(g));
-                continue;
-            }
-            if (Validation.TryParseNamespacedExternalId(rawId, out var depNs, out var depValue) && depNs is not null)
-            {
-                if (!byNamespacedExternalId.TryGetValue((depNs, depValue), out var depByNs))
-                    return (Results.BadRequest(new
-                    {
-                        error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(depValue)}' in namespace '{depNs}' in project '{projectId}'",
-                    }), null);
-                dependsOnIds.Add(depByNs.Id);
-                continue;
-            }
-            if (!byBareExternalId.TryGetValue(rawId, out var matches) || matches.Count == 0)
-                return (Results.BadRequest(new
-                {
-                    error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' could not be resolved: no work item with externalId '{Validation.DescribeUntrustedValue(rawId)}' in project '{projectId}'",
-                }), null);
-            var distinctItems = matches.Select(m => m.Item.Id).Distinct().ToList();
-            if (distinctItems.Count > 1)
-                return (Results.BadRequest(new
-                {
-                    error = $"dependency '{Validation.DescribeUntrustedValue(rawId)}' is ambiguous: matches multiple work items via namespaces {string.Join(", ", matches.Select(m => m.Namespace).Distinct())} — qualify as 'namespace:value'",
-                }), null);
-            dependsOnIds.Add(distinctItems[0]);
-        }
-
-        if (dependsOnIds.Contains(targetId))
-            return (Results.BadRequest(new { error = "a work item cannot depend on itself" }), null);
-
-        var missingDep = WorkItemDependencies.FindMissingDependency(dependsOnIds, allItems);
-        if (missingDep is not null)
-            return (Results.BadRequest(new { error = $"dependency {missingDep} not found" }), null);
-
-        // Cycle detection: FindCycle overrides adj[targetId] = dependsOnIds in
-        // the existing graph, so passing the existing item's own id correctly
-        // models the edit case (its old deps are replaced before DFS).
-        var cyclePath = WorkItemDependencies.FindCycle(targetId, dependsOnIds, allItems);
-        if (cyclePath is not null)
-            return (Results.BadRequest(new { error = $"circular dependency detected: {cyclePath}" }), null);
-
-        return (null, dependsOnIds);
-    }
 
     /// <summary>
     /// Patches the work item's namespaced external IDs.
@@ -1916,93 +1169,17 @@ internal static class WorkItemEndpoints
         string id,
         PatchExternalIdsRequest body,
         IWorkItemStore store,
-        IProjectRepository projects,
+        WorkItemCommandService commands,
         CancellationToken ct)
     {
         if (body is null)
             return Results.BadRequest(new { error = "request body is required" });
-        if (body.ExternalIds is null)
-            return Results.BadRequest(new { error = "externalIds field is required" });
 
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Build the resulting map. Start from current (merge) or empty (replace),
-        // then apply the patch — string values set/overwrite, null values delete.
-        var resulting = body.ReplaceExternalIds == true
-            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, string>(item!.ExternalIds, StringComparer.OrdinalIgnoreCase);
-
-        foreach (var (ns, value) in body.ExternalIds)
-        {
-            // ns is untrusted input echoed into the error field label — strip
-            // control characters and bound it before interpolating.
-            var nsLabel = Validation.DescribeUntrustedValue(ns);
-            try { Validation.ValidateExternalIdNamespace(ns, $"externalIds key '{nsLabel}'"); }
-            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
-            if (value is null)
-            {
-                resulting.Remove(ns);
-                continue;
-            }
-            try { Validation.ValidateExternalId(value, $"externalIds['{nsLabel}']"); }
-            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
-            resulting[ns] = value;
-        }
-
-        if (resulting.Count > WorkItemLimits.MaxExternalIds)
-            return Results.BadRequest(new { error = $"externalIds may contain at most {WorkItemLimits.MaxExternalIds} entries per work item" });
-
-        // Pre-check for conflicts on namespaced IDs newly assigned to this item
-        // (additions and changed values). We don't pre-check unchanged entries —
-        // they already belong to this item.
-        foreach (var (ns, value) in resulting)
-        {
-            if (item!.ExternalIds.TryGetValue(ns, out var existing) && existing == value)
-                continue;
-            var other = await store.GetByNamespacedExternalIdAsync(item.ProjectId, ns, value, ct);
-            if (other is not null && other.Id != item.Id)
-                return Results.Conflict(new
-                {
-                    error = $"externalId '{value}' in namespace '{ns}' already exists in project '{item.ProjectId}' for work item {other.Id} (state: {other.State})"
-                });
-        }
-
-        WorkItem? updated;
-        try
-        {
-            updated = await store.ReplaceExternalIdsAsync(item!.Id, resulting, DateTimeOffset.UtcNow, ct);
-        }
-        catch (WorkItemExternalIdConflictException)
-        {
-            // Re-probe to surface the colliding namespaced ID after a race.
-            foreach (var (ns, value) in resulting)
-            {
-                var other = await store.GetByNamespacedExternalIdAsync(item!.ProjectId, ns, value, ct);
-                if (other is not null && other.Id != item.Id)
-                    return Results.Conflict(new
-                    {
-                        error = $"externalId '{value}' in namespace '{ns}' already exists in project '{item.ProjectId}' for work item {other.Id} (state: {other.State})"
-                    });
-            }
-            return Results.Conflict(new { error = "external id conflict (concurrent duplicate)" });
-        }
-        if (updated is null)
-            return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-
-        var project = await projects.GetAsync(updated.ProjectId, ct);
-        var depStates = new Dictionary<WorkItemId, WorkItemState>();
-        var depExtIds = new Dictionary<WorkItemId, string?>();
-        foreach (var depId in updated.DependsOn)
-        {
-            var dep = await store.GetAsync(depId, ct);
-            if (dep is not null)
-            {
-                depStates[depId] = dep.State;
-                depExtIds[depId] = dep.ExternalId;
-            }
-        }
-        return Results.Ok(ToDto(updated, project, depStates, depExtIds));
+        var outcome = await commands.ExternalIdsAsync(item!, body, ct);
+        return outcome.ToHttpResult();
     }
 
     /// <summary>
@@ -2061,57 +1238,14 @@ internal static class WorkItemEndpoints
         string id,
         PatchPriorityRequest body,
         IWorkItemStore store,
-        IProjectRepository projects,
-        ITaskQueue queue,
+        WorkItemCommandService commands,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var project = await projects.GetAsync(item!.ProjectId, ct);
-        if (project is null)
-            return Results.BadRequest(new { error = $"unknown project '{item.ProjectId}'" });
-
-        var priorityError = ValidatePriority(body.Priority, project);
-        if (priorityError is not null) return priorityError;
-
-        if (WorkItemDependencies.TerminalStates.Contains(item.State))
-            return Results.Conflict(new
-            {
-                error = $"cannot change priority of work item in terminal state '{item.State}'",
-            });
-
-        if (item.Priority == body.Priority)
-            return Results.Ok(new { id = item.Id.ToString(), priority = body.Priority, status = "no-op" });
-
-        var result = await store.UpdatePriorityAsync(item.Id, body.Priority, DateTimeOffset.UtcNow, ct);
-        switch (result.Outcome)
-        {
-            case PriorityUpdateOutcome.NotFound:
-                return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
-            case PriorityUpdateOutcome.TerminalState:
-                // The item raced into a terminal state between the read above and
-                // the partial UPDATE; surface 409 like the pre-check would have.
-                return Results.Conflict(new
-                {
-                    error = $"work item transitioned to terminal state '{result.Item!.State}' before priority could be updated",
-                });
-            case PriorityUpdateOutcome.Updated:
-                break;
-            default:
-                throw new InvalidOperationException($"Unexpected priority update outcome '{result.Outcome}'.");
-        }
-
-        var updated = result.Item!;
-        AuditLog.WorkItemPriorityChanged(updated.Id, result.OldPriority!.Value, updated.Priority);
-
-        // Kick the dispatcher so the new ordering is picked up immediately when the
-        // item is still Queued. Harmless for in-flight items: the dispatch loop will
-        // re-pick from the store and find the highest-priority eligible item.
-        if (updated.State == WorkItemState.Queued)
-            await queue.EnqueueAsync(updated.Id, ct);
-
-        return Results.Ok(new { id = updated.Id.ToString(), priority = updated.Priority });
+        var outcome = await commands.PriorityAsync(item!, body.Priority, ct);
+        return outcome.ToHttpResult();
     }
 
     /// <summary>
@@ -2703,7 +1837,7 @@ internal static class WorkItemEndpoints
         return branch[..len];
     }
 
-    private static WorkItemDto ToDto(
+    internal static WorkItemDto ToDto(
         WorkItem item,
         Project? project,
         IReadOnlyDictionary<WorkItemId, WorkItemState> statesById,
@@ -2839,16 +1973,6 @@ internal static class WorkItemEndpoints
                 spec.DurationSeconds,
                 spec.ExpiresAt);
 
-    /// <summary>
-    /// Validates a requested priority against the global cap and the project's
-    /// per-project ceiling. Returns null on success or a 400 result on failure.
-    /// </summary>
-    private static IResult? ValidatePriority(int priority, Project project)
-    {
-        var error = WorkItemFieldRules.CheckPriorityBounds(priority)
-            ?? WorkItemFieldRules.CheckProjectPriorityCeiling(priority, project);
-        return error is null ? null : Results.BadRequest(new { error });
-    }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)
         => profile.Equals(ProjectAudit.DefaultProfileName, StringComparison.OrdinalIgnoreCase)

@@ -88,6 +88,7 @@ internal static class TaskTemplateEndpoints
             var prepared = await creation.PrepareAsync(
                 BuildCreateRequest(req, i, template.Checks[i]),
                 new WorkItemCreationProvenance(template.Name, i),
+                pendingSiblings: null,
                 ct);
             if (prepared.Error is not null) return prepared.Error;
             preparedItems.Add(prepared.Prepared!);

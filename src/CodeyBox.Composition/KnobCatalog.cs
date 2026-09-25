@@ -1,4 +1,4 @@
-namespace CodeyBox.Admin.Model;
+namespace CodeyBox.Composition;
 
 /// <summary>A per-item knob the orchestrator registers, as the composer offers it.</summary>
 public sealed record KnobDescriptor(
