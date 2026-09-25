@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using CodeyBox.PluginSdk.Tools;
@@ -16,8 +15,8 @@ namespace CodeyBox.EslintAuditorPlugin;
 /// <c>--format json-with-metadata</c>, which embeds the process cwd so the
 /// parser can relativize the absolute <c>filePath</c> values ESLint emits;
 /// the SARIF formatter is a second unpinned npm package, so the native format
-/// is used instead), the pinned tool-version probe via
-/// <see cref="ExternalToolAuditorBase.VerifyToolAsync"/>, and the
+/// is used instead), the pinned tool-version declaration via
+/// <see cref="ExternalToolAuditorBase.VersionPin"/>, and the
 /// repository-suppression posture below.
 ///
 /// <para><b>Gate behaviour: hybrid / severity-driven — not blocking on every
@@ -112,13 +111,6 @@ public sealed class EslintAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// </summary>
     internal const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
 
-    private const int ProbeMaxOutputBytes = 16 * 1024;
-    private const int MessageValueMaxChars = 64;
-    private static readonly TimeSpan ProbeTimeoutCap = TimeSpan.FromSeconds(30);
-    private static readonly Regex VersionPattern = new(
-        @"\d+\.\d+\.\d+[\w.\-]*",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
-
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
         // 0 = clean or warnings only; 1 = error-level findings (or a
@@ -166,6 +158,10 @@ public sealed class EslintAuditor : ExternalToolAuditorBase, IPluginInitializer
     protected override Func<ExternalToolAuditorOptions> OptionsAccessor => _optionsAccessor;
 
     /// <inheritdoc />
+    protected override ToolVersionPin? VersionPin =>
+        new(PluginId, _expectedVersion, DefaultExpectedVersion, ["--version"]);
+
+    /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
         var args = new List<string>
@@ -185,8 +181,7 @@ public sealed class EslintAuditor : ExternalToolAuditorBase, IPluginInitializer
 
         var configPath = _configPath();
         if (!string.IsNullOrWhiteSpace(configPath)
-            && !options.ExtraArguments.Contains("--config", StringComparer.Ordinal)
-            && !options.ExtraArguments.Contains("-c", StringComparer.Ordinal))
+            && !ExtraArgumentsSupplyFlag(options, "--config", "-c"))
         {
             args.Add("--config");
             args.Add(configPath.Trim());
@@ -204,110 +199,12 @@ public sealed class EslintAuditor : ExternalToolAuditorBase, IPluginInitializer
         ArgumentNullException.ThrowIfNull(context);
         var scoped = context.ScopedConfig;
         _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
-        _expectedVersion = () => scoped["ExpectedVersion"];
+        _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _configPath = () => scoped[ConfigPathKey];
         _trustRepositorySuppression = () =>
             bool.TryParse(scoped[TrustRepositorySuppressionKey], out var trust) && trust;
         context.Logger.LogInformation(
             "EslintAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// ESLint-specific precondition on the live path: the installed binary
-    /// must match the pinned release (<c>ExpectedVersion</c>). A mismatch
-    /// fails closed as infrastructure before the scan runs.
-    /// </summary>
-    protected override async Task VerifyToolAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        await ThrowIfToolVersionMismatchAsync(sandbox, workingDirectory, tool, options, ct)
-            .ConfigureAwait(false);
-    }
-
-    private async Task ThrowIfToolVersionMismatchAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var configured = _expectedVersion();
-        var expected = NormalizeVersion(configured);
-        if (expected is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' has an unparseable ExpectedVersion "
-                + $"('{TruncateForMessage(configured)}'); set CodeyBox:Plugins:{PluginId}:ExpectedVersion "
-                + $"to an {tool} release such as '{DefaultExpectedVersion}'.")
-            { IsDeterministic = true };
-
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            "version check",
-            new SandboxExec
-            {
-                Argv = [tool, "--version"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        var reported = ExtractVersion(result.Stdout);
-        if (result.ExecutionUnavailable
-            || result.ExitCode != 0
-            || reported is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' version could not be determined "
-                + $"(exit {result.ExitCode}). The pinned release is required before the scan can run — "
-                + $"a missing or foreign '{tool}' is infrastructure, not a verdict on the diff.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        if (!string.Equals(reported, expected, StringComparison.Ordinal))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is version {reported}, but this auditor is "
-                + $"pinned to {expected}. A different scanner version changes the rule set and the "
-                + "findings; provision the pinned release or set ExpectedVersion to the version you provisioned.")
-            { IsDeterministic = true };
-    }
-
-    private static TimeSpan ProbeTimeout(ExternalToolAuditorOptions options)
-    {
-        var timeout = EffectiveTimeout(options);
-        return timeout > ProbeTimeoutCap ? ProbeTimeoutCap : timeout;
-    }
-
-    private static string? ExtractVersion(string stdout)
-    {
-        // `eslint --version` prints "v10.10.0" — strip the v prefix.
-        var match = VersionPattern.Match(stdout);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string? NormalizeVersion(string? configured)
-    {
-        var value = string.IsNullOrWhiteSpace(configured)
-            ? DefaultExpectedVersion
-            : configured.Trim();
-        var match = VersionPattern.Match(value);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
     }
 }

@@ -267,6 +267,68 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
+    public async Task RepositoryFileProbe_ReportsPresent_AndFailsClosedOnProbeError()
+    {
+        var auditor = new ProbeExposingAuditor();
+
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++;
+            return Task.FromResult(new SandboxExecResult(0, ".hiddenrc\n./stray\n", ""));
+        });
+        // Only names that were actually probed count — output beyond the
+        // requested set is not trusted.
+        var present = await auditor.ProbeAsync(sandbox, [".hiddenrc", ".other"], CancellationToken.None);
+        Assert.Equal([".hiddenrc"], present);
+        Assert.Equal(1, execs);
+
+        // A non-zero probe exit means the check itself failed — never
+        // "file absent".
+        var failing = new FakeSandbox((exec, _) =>
+            Task.FromResult(new SandboxExecResult(2, "", "sh: syntax error")));
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.ProbeAsync(failing, [".hiddenrc"], CancellationToken.None));
+
+        var unavailable = new FakeSandbox((exec, _) =>
+            Task.FromResult(new SandboxExecResult(0, "", "", ExecutionUnavailable: true)));
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.ProbeAsync(unavailable, [".hiddenrc"], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RepositoryFileProbe_RejectsPathsOutsideTheWorktree()
+    {
+        var auditor = new ProbeExposingAuditor();
+        var noop = new FakeSandbox((exec, _) =>
+            Task.FromResult(new SandboxExecResult(0, "", "")));
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeAsync(noop, ["../escape"], CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeAsync(noop, ["/etc/passwd"], CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeAsync(noop, ["a\nb"], CancellationToken.None));
+        Assert.Empty(await auditor.ProbeAsync(noop, ["ok.md"], CancellationToken.None));
+    }
+
+    [Fact]
+    public void ExtraArgumentsSupplyFlag_MatchesSeparatedAttachedAndJoinedForms()
+    {
+        static ExternalToolAuditorOptions With(string arg) => new() { ExtraArguments = [arg] };
+
+        Assert.True(ProbeExposingAuditor.SuppliesFlag(With("--config"), "--config"));
+        Assert.True(ProbeExposingAuditor.SuppliesFlag(With("--config=/x.toml"), "--config"));
+        Assert.True(ProbeExposingAuditor.SuppliesFlag(With("-c/x.toml"), "-c"));
+        Assert.True(ProbeExposingAuditor.SuppliesFlag(With("-c=/x.toml"), "-c"));
+        Assert.True(ProbeExposingAuditor.SuppliesFlag(With("-c/x.toml"), "--config", "-c"));
+        Assert.False(ProbeExposingAuditor.SuppliesFlag(With("--configurations"), "--config"));
+        Assert.False(ProbeExposingAuditor.SuppliesFlag(With("--config"), "-c"));
+        Assert.False(ProbeExposingAuditor.SuppliesFlag(With("--other"), "--config", "-c"));
+        Assert.False(ProbeExposingAuditor.SuppliesFlag(new ExternalToolAuditorOptions(), "--config"));
+    }
+
+    [Fact]
     public void InvalidToolName_IsRejectedFailClosed()
     {
         Assert.Throws<ArgumentException>(() => ExternalToolNames.Validate("x; touch /tmp/pwned"));
@@ -317,6 +379,22 @@ public sealed class ExternalToolAuditorTests
         protected override ExternalToolSeverityMapping SeverityMapping => mapping ?? ExternalToolSeverityMapping.Default;
         protected override Func<ExternalToolAuditorOptions> OptionsAccessor => () => options;
         protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions toolOptions) => ["scan", "."];
+    }
+
+    private sealed class ProbeExposingAuditor : ExternalToolAuditorBase
+    {
+        public override string Name => "test:probe";
+        protected override string ToolName => "fictional-scanner";
+        protected override IExternalToolOutputParser OutputParser { get; } = new SarifToolOutputParser();
+        protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options) => ["scan", "."];
+
+        public Task<IReadOnlyList<string>> ProbeAsync(
+            ISandbox sandbox, IReadOnlyList<string> paths, CancellationToken ct)
+            => ProbeRepositoryFilesPresentAsync(
+                sandbox, "/work", ToolName, paths, new ExternalToolAuditorOptions(), ct);
+
+        public static bool SuppliesFlag(ExternalToolAuditorOptions options, params string[] flags)
+            => ExtraArgumentsSupplyFlag(options, flags);
     }
 
     private sealed class FakeSandbox(Func<SandboxExec, CancellationToken, Task<SandboxExecResult>> onExec) : ISandbox
