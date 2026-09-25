@@ -171,7 +171,7 @@ public sealed class LinearWorkSyncPlugin
             Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = parsed.ActorLogin,
-            HasSignal = SignalPresent(options.RequiredSignal, present),
+            HasSignal = options.RequiredSignal.IsPresentIn(present),
         };
     }
 
@@ -419,7 +419,7 @@ public sealed class LinearWorkSyncPlugin
             Body = Truncate(issue.Description, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = null,
-            HasSignal = SignalPresent(options.RequiredSignal, present),
+            HasSignal = options.RequiredSignal.IsPresentIn(present),
         };
     }
 
@@ -435,11 +435,6 @@ public sealed class LinearWorkSyncPlugin
         }
         return signals;
     }
-
-    internal static bool SignalPresent(WorkSignal required, IReadOnlyList<WorkSignal> present) =>
-        !string.IsNullOrWhiteSpace(required.Value)
-        && present.Any(s => s.Kind == required.Kind
-            && string.Equals(s.Value, required.Value, StringComparison.OrdinalIgnoreCase));
 
     private TrackerPostResult? CheckTracked(string @namespace, string externalId)
     {

@@ -73,3 +73,9 @@ ee80b4ddd9b086f55aa67d06a9e949f0e7f988b8:tests/CodeyBox.Tests/PullRequestDescrip
 # credential. The source now builds the vector at runtime (no literal), so this
 # entry covers the pre-fix commit only.
 2e46611bfda2940204b5e67e480fb5a58dbce4f4:tests/CodeyBox.Tests/Bitwarden/BitwardenPluginTests.cs:generic-api-key:1045
+# Synthetic YouTrack webhook token
+# (tests/CodeyBox.Tests/YouTrack/YouTrackWorkSyncPluginTests.cs): a literal
+# sequential-hex placeholder used only in hermetic tests, never a live
+# credential. The source was replaced with the low-entropy placeholder
+# "youtrack-webhook-test-token"; this entry covers the pre-fix commit only.
+85a788c5922842e30f3a74d7f237069c9f929636:tests/CodeyBox.Tests/YouTrack/YouTrackWorkSyncPluginTests.cs:generic-api-key:516

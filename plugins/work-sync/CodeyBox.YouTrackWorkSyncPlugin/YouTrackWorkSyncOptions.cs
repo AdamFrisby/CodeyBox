@@ -33,12 +33,22 @@ public sealed record YouTrackWorkSyncOptions
     /// <summary>
     /// YouTrack base URL (scheme + host, e.g. <c>https://acme.youtrack.cloud</c>
     /// or a self-hosted origin). Must be http(s). The REST API is reached at
-    /// <c>{ApiBaseUrl}/api</c>.
+    /// <c>{ApiBaseUrl}/api</c>. Required when <see cref="Enabled"/> is set —
+    /// there is deliberately no placeholder default, so enabling the plugin
+    /// without an URL fails loudly instead of sending the bearer credential
+    /// to an operator-unintended host.
     /// </summary>
-    public string ApiBaseUrl { get; init; } = "https://example.youtrack.cloud";
+    public string ApiBaseUrl { get; init; } = string.Empty;
 
-    /// <summary>Per-request timeout, in seconds (1–300, default 30).</summary>
+    /// <summary>Per-request timeout, in seconds (1–300, default 30). Applied per request, so edits hot-reload.</summary>
     public int TimeoutSeconds { get; init; } = 30;
+
+    /// <summary>
+    /// Upper bound on a single REST response body, in bytes (1 MiB–256 MiB,
+    /// default 32 MiB). Enforced before buffering; a larger response fails
+    /// the request rather than exhausting memory.
+    /// </summary>
+    public int MaxResponseBytes { get; init; } = 32 * 1024 * 1024;
 
     /// <summary>Which upstream field carries the ingestion signal. Default Assignee (service account).</summary>
     public WorkSignalKind SignalKind { get; init; } = WorkSignalKind.Assignee;
@@ -132,9 +142,6 @@ public sealed record YouTrackWorkSyncOptions
     /// </summary>
     public string WebhookSecretEnvVar { get; init; } = "YOUTRACK_WEBHOOK_TOKEN";
 
-    /// <summary>YouTrack logins identifying CodeyBox itself, for loop-guard attribution alongside the marker.</summary>
-    public IReadOnlyList<string> ServiceLogins { get; init; } = ["codeybox[bot]"];
-
     /// <summary>Maximum external items accepted from a single poll. Enforced before buffering.</summary>
     public int MaxItemsPerPoll { get; init; } = 100;
 
@@ -198,7 +205,7 @@ public sealed record YouTrackWorkSyncOptions
             OAuthScope = (section["OAuthScope"] ?? string.Empty).Trim(),
             WebhookTokenHeader = ReadNonEmpty(section, "WebhookTokenHeader", defaults.WebhookTokenHeader),
             WebhookSecretEnvVar = ReadNonEmpty(section, "WebhookSecretEnvVar", defaults.WebhookSecretEnvVar),
-            ServiceLogins = ReadList(section.GetSection("ServiceLogins"), defaults.ServiceLogins),
+            MaxResponseBytes = Math.Clamp(ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes), 1024 * 1024, 256 * 1024 * 1024),
             MaxItemsPerPoll = Math.Clamp(ReadInt(section, "MaxItemsPerPoll", defaults.MaxItemsPerPoll), 1, 1000),
             PageSize = Math.Clamp(ReadInt(section, "PageSize", defaults.PageSize), 1, 500),
             MaxIngestedBodyChars = Math.Clamp(ReadInt(section, "MaxIngestedBodyChars", defaults.MaxIngestedBodyChars), 1024, 256 * 1024),
@@ -226,24 +233,14 @@ public sealed record YouTrackWorkSyncOptions
     }
 
     private static IReadOnlyDictionary<string, string> ReadMap(
-        IConfigurationSection section, IComparer<string>? _ = null)
+        IConfigurationSection section, IEqualityComparer<string>? comparer = null)
     {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var map = new Dictionary<string, string>(comparer ?? StringComparer.OrdinalIgnoreCase);
         foreach (var child in section.GetChildren())
         {
             if (!string.IsNullOrWhiteSpace(child.Key) && child.Value is not null)
                 map[child.Key.Trim()] = child.Value.Trim();
         }
         return map;
-    }
-
-    private static IReadOnlyList<string> ReadList(IConfigurationSection section, IReadOnlyList<string> fallback)
-    {
-        var values = section.GetChildren()
-            .Select(c => c.Value?.Trim())
-            .Where(v => !string.IsNullOrWhiteSpace(v))
-            .Cast<string>()
-            .ToList();
-        return values.Count == 0 ? fallback : values;
     }
 }

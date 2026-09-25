@@ -72,7 +72,18 @@ public sealed record WorkSignal(
     /// Exact value that must be present (ordinal-ignore-case exact match —
     /// never substring). E.g. label <c>codeybox</c>.
     /// </summary>
-    string Value);
+    string Value)
+{
+    /// <summary>
+    /// True when this signal is among <paramref name="present"/> — same kind
+    /// and an ordinal-ignore-case exact value match. A signal with no value
+    /// (misconfigured source) is present nowhere.
+    /// </summary>
+    public bool IsPresentIn(IReadOnlyList<WorkSignal> present) =>
+        !string.IsNullOrWhiteSpace(Value)
+        && present.Any(s => s.Kind == Kind
+            && string.Equals(s.Value, Value, StringComparison.OrdinalIgnoreCase));
+}
 
 /// <summary>Which upstream field carries the ingestion signal.</summary>
 public enum WorkSignalKind

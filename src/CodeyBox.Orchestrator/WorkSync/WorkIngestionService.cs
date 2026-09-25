@@ -71,7 +71,7 @@ public sealed class WorkIngestionService
         // The signal gate reads ONLY upstream metadata (present-signals +
         // the provider-computed flag). Title/body never participate: nothing
         // in the issue's own content can cause ingestion or widen it.
-        if (!candidate.HasSignal || !SignalPresent(source.RequiredSignal, candidate.PresentSignals))
+        if (!candidate.HasSignal || !source.RequiredSignal.IsPresentIn(candidate.PresentSignals))
             return await SkippedAsync(candidate, source, WorkIngestionOutcome.SkippedNoSignal, "ingestion signal not present", ct).ConfigureAwait(false);
 
         var existing = await _store.GetByNamespacedExternalIdAsync(
@@ -213,10 +213,6 @@ public sealed class WorkIngestionService
         }, ct).ConfigureAwait(false);
         return new WorkIngestionResult(outcome, null);
     }
-
-    internal static bool SignalPresent(WorkSignal required, IReadOnlyList<WorkSignal> present) =>
-        present.Any(s => s.Kind == required.Kind
-            && string.Equals(s.Value, required.Value, StringComparison.OrdinalIgnoreCase));
 
     internal static string DescribeSignal(WorkSignal signal) =>
         $"{signal.Kind.ToString().ToLowerInvariant()}:{signal.Value}";

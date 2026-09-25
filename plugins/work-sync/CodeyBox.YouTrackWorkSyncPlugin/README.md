@@ -2,11 +2,13 @@
 
 One project, one plugin implementing `IWorkSource` (inbound) and `IWorkTracker`
 (outbound) against the YouTrack REST API. The same `/api` surface serves
-YouTrack Cloud and self-hosted Server; the plugin declares capability from what
-the instance answers (`GET /api/config` at startup) rather than assuming a
-version. Off unless an operator enables it: the assembly loads only when
-allowlisted **and** named in `Plugins:Enabled`, and it polls/posts nothing
-until `Enabled=true` in its own section.
+YouTrack Cloud and self-hosted Server, so capabilities are declared statically;
+at startup the plugin probes `GET /api/config` and logs the reported
+version/build (a missing or forbidden endpoint degrades to "unknown", never a
+startup failure). Off unless an operator enables it: the assembly loads only
+when allowlisted **and** named in `Plugins:Enabled`, and it polls/posts nothing
+until `Enabled=true` in its own section. `ApiBaseUrl` has no default — enabling
+without it fails loudly rather than aiming credentials at a placeholder host.
 
 YouTrack's distinctive surface is its **command syntax**: state changes are
 commands (`{State} {In Progress}`) applied through `POST /api/commands`, not
@@ -105,9 +107,11 @@ operator declarations.
 
 All values are hot-reloadable (re-read per poll/post). Full reference: every
 property on `YouTrackWorkSyncOptions` is a config key (`TimeoutSeconds`,
-`PageSize`, `MaxItemsPerPoll`, `MaxIngestedBodyChars`, `OAuthTokenUrl`,
-`OAuthClientIdEnvVar` / `OAuthClientSecretEnvVar`, `OAuthScope`,
-`ServiceLogins`).
+`PageSize`, `MaxItemsPerPoll`, `MaxIngestedBodyChars`, `MaxResponseBytes`,
+`OAuthTokenUrl`, `OAuthClientIdEnvVar` / `OAuthClientSecretEnvVar`,
+`OAuthScope`). Login-based loop-guard attribution (recognising CodeyBox-authored
+updates by the acting account) is configured once at the host level via
+`CodeyBox:WorkSync:CodeyBoxServiceLogins` — not per plugin.
 
 OAuth2 (instead of a permanent token): create a Hub service (Administration →
 Hub → Services) to get a client id/secret, set the two `OAuth*EnvVar` names

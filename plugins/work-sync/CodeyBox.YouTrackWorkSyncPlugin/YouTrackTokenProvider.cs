@@ -1,4 +1,4 @@
-using System.Net.Http.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace CodeyBox.YouTrackWorkSyncPlugin;
@@ -25,6 +25,15 @@ namespace CodeyBox.YouTrackWorkSyncPlugin;
 /// </summary>
 public sealed class YouTrackTokenProvider : IDisposable
 {
+    /// <summary>Upper bound on the token-endpoint response body (bytes) — a token JSON is small.</summary>
+    private const long MaxTokenResponseBytes = 64 * 1024;
+
+    /// <summary>Tokens with less lifetime left than this are rejected as unusable.</summary>
+    private const long MinTokenLifetimeSeconds = 120;
+
+    /// <summary>Refresh happens this many seconds before the reported expiry.</summary>
+    private const long RefreshSkewSeconds = 60;
+
     private readonly HttpClient _http;
     private readonly Func<string, string?> _env;
     private readonly TimeProvider _clock;
@@ -71,8 +80,7 @@ public sealed class YouTrackTokenProvider : IDisposable
         if (IsOAuthConfigured(options))
         {
             return new YouTrackCredential(
-                Scheme: "Bearer",
-                Value: await GetOAuthTokenAsync(options, ct).ConfigureAwait(false));
+                "Bearer", await GetOAuthTokenAsync(options, ct).ConfigureAwait(false));
         }
 
         var token = Read(options.TokenEnvVar);
@@ -82,7 +90,7 @@ public sealed class YouTrackTokenProvider : IDisposable
                 $"'{options.TokenEnvVar}' must hold a permanent token (perm:…), or the OAuth " +
                 "client id and secret env vars must both be set. " +
                 "Provision them from the host credential chain (vault agent, container secret).");
-        return new YouTrackCredential(Scheme: "Bearer", Value: token);
+        return new YouTrackCredential("Bearer", token);
     }
 
     private async Task<string> GetOAuthTokenAsync(YouTrackWorkSyncOptions options, CancellationToken ct)
@@ -104,6 +112,13 @@ public sealed class YouTrackTokenProvider : IDisposable
                 throw new InvalidOperationException(
                     "YouTrack OAuth is partially configured: client id and secret env vars must both be set.");
 
+            var tokenUrl = options.ResolvedOAuthTokenUrl;
+            if (!Uri.TryCreate(tokenUrl, UriKind.Absolute, out var parsed)
+                || (parsed.Scheme != Uri.UriSchemeHttps && parsed.Scheme != Uri.UriSchemeHttp))
+                throw new InvalidOperationException(
+                    "YouTrack OAuth token endpoint is not an absolute http(s) URL; " +
+                    "set OAuthTokenUrl or ApiBaseUrl in the plugin configuration.");
+
             var form = new Dictionary<string, string>
             {
                 ["grant_type"] = "client_credentials",
@@ -113,22 +128,24 @@ public sealed class YouTrackTokenProvider : IDisposable
             if (!string.IsNullOrWhiteSpace(options.OAuthScope))
                 form["scope"] = options.OAuthScope;
 
-            using var request = new HttpRequestMessage(HttpMethod.Post, options.ResolvedOAuthTokenUrl)
+            using var request = new HttpRequestMessage(HttpMethod.Post, tokenUrl)
             {
                 Content = new FormUrlEncodedContent(form),
             };
-            using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, options.TimeoutSeconds)));
+            using var response = await _http.SendAsync(request, timeout.Token).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
-            var payload = await response.Content
-                .ReadFromJsonAsync<YouTrackOAuthTokenResponse>(cancellationToken: ct)
-                .ConfigureAwait(false);
+            var json = await YouTrackRestClient.ReadBoundedStringAsync(
+                response.Content, MaxTokenResponseBytes, timeout.Token).ConfigureAwait(false);
+            var payload = JsonSerializer.Deserialize<YouTrackOAuthTokenResponse>(json);
             if (payload is null || string.IsNullOrWhiteSpace(payload.AccessToken))
                 throw new InvalidOperationException("YouTrack OAuth refresh returned an empty access token.");
-            if (payload.ExpiresInSeconds <= 120)
+            if (payload.ExpiresInSeconds <= MinTokenLifetimeSeconds)
                 throw new InvalidOperationException("YouTrack OAuth refresh returned an unusable expiry.");
 
             _cachedAccessToken = payload.AccessToken;
-            _refreshAt = now.AddSeconds(payload.ExpiresInSeconds - 60);
+            _refreshAt = now.AddSeconds(payload.ExpiresInSeconds - RefreshSkewSeconds);
             return payload.AccessToken;
         }
         finally
@@ -153,5 +170,22 @@ public sealed class YouTrackTokenProvider : IDisposable
         [property: JsonPropertyName("expires_in")] long ExpiresInSeconds);
 }
 
-/// <summary>Credential plus the header scheme YouTrack expects for it.</summary>
-public sealed record YouTrackCredential(string Scheme, string Value);
+/// <summary>
+/// Credential plus the header scheme YouTrack expects for it. A plain type,
+/// not a record: the generated record <c>ToString</c> would print <see
+/// cref="Value"/> — a live secret — into any log or exception text.
+/// </summary>
+public sealed class YouTrackCredential
+{
+    public YouTrackCredential(string scheme, string value)
+    {
+        Scheme = scheme;
+        Value = value;
+    }
+
+    /// <summary>The Authorization header scheme (always <c>Bearer</c>).</summary>
+    public string Scheme { get; }
+
+    /// <summary>The token value — a secret; never log or interpolate it.</summary>
+    public string Value { get; }
+}

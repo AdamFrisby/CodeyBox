@@ -38,6 +38,26 @@ public static class WorkSyncLoopGuard
     }
 
     /// <summary>
+    /// True when <paramref name="body"/> carries the CodeyBox work-item marker.
+    /// Providers call this to recognise their own writes (e.g. a surfaced
+    /// question comment must never parse back as a reply) without re-encoding
+    /// the marker literal.
+    /// </summary>
+    public static bool CarriesMarker(string? body)
+    {
+        if (string.IsNullOrEmpty(body))
+            return false;
+        if (body.Length <= MaxScanChars)
+            return body.Contains(MarkerPrefix, StringComparison.Ordinal);
+        // Bounded scan: check the head and tail segments so over-long
+        // bodies carrying the marker (appended at the end) are still
+        // recognised without scanning unbounded input.
+        return body.AsSpan(0, MaxScanChars).Contains(MarkerPrefix.AsSpan(), StringComparison.Ordinal)
+            || body.AsSpan(body.Length - MaxScanChars, MaxScanChars).Contains(
+                MarkerPrefix.AsSpan(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// True when upstream content was authored by CodeyBox: the body carries
     /// our marker, or the last actor is one of the configured service logins
     /// (exact match, ordinal-ignore-case — never substring). Either signal
@@ -48,26 +68,8 @@ public static class WorkSyncLoopGuard
         string? lastActorLogin,
         IReadOnlySet<string> serviceLogins)
     {
-        if (!string.IsNullOrEmpty(body))
-        {
-            if (body.Length <= MaxScanChars)
-            {
-                if (body.Contains(MarkerPrefix, StringComparison.Ordinal))
-                    return true;
-            }
-            else
-            {
-                // Bounded scan: check the head and tail segments so over-long
-                // bodies carrying the marker (appended at the end) are still
-                // recognised without scanning unbounded input.
-                if (body.AsSpan(0, MaxScanChars).Contains(
-                        MarkerPrefix.AsSpan(), StringComparison.Ordinal))
-                    return true;
-                if (body.AsSpan(body.Length - MaxScanChars, MaxScanChars).Contains(
-                        MarkerPrefix.AsSpan(), StringComparison.Ordinal))
-                    return true;
-            }
-        }
+        if (CarriesMarker(body))
+            return true;
 
         if (string.IsNullOrWhiteSpace(lastActorLogin))
             return false;

@@ -24,7 +24,7 @@ public static class YouTrackWebhook
     public const int MaxBodyBytes = 64 * 1024;
 
     /// <summary>Tag embedded in surfaced question comments so replies can be attributed.</summary>
-    public const string QuestionTagPrefix = "<!-- codeybox-question:";
+    public const string QuestionTagPrefix = WorkSyncQuestions.TagPrefix;
 
     /// <summary>changedFields names treated as the tag list (label signal).</summary>
     private static readonly HashSet<string> TagFieldNames =
@@ -41,16 +41,9 @@ public static class YouTrackWebhook
     {
         if (string.IsNullOrEmpty(secret) || string.IsNullOrWhiteSpace(presentedToken))
             return false;
-        try
-        {
-            return CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(secret),
-                Encoding.UTF8.GetBytes(presentedToken.Trim()));
-        }
-        catch (Exception)
-        {
-            return false;
-        }
+        return CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(secret),
+            Encoding.UTF8.GetBytes(presentedToken.Trim()));
     }
 
     /// <summary>
@@ -66,7 +59,10 @@ public static class YouTrackWebhook
         string verifiedBody, YouTrackWorkSyncOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        if (string.IsNullOrEmpty(verifiedBody) || verifiedBody.Length > MaxBodyBytes * 4)
+        // The bound is in bytes: measure the UTF-8 encoding so a body of
+        // multi-byte characters cannot slip four times the cap past the guard.
+        if (string.IsNullOrEmpty(verifiedBody)
+            || Encoding.UTF8.GetByteCount(verifiedBody) > MaxBodyBytes)
             return null;
         JsonDocument doc;
         try
@@ -123,30 +119,11 @@ public static class YouTrackWebhook
     /// are ours and never parse as replies.
     /// </summary>
     public static (string QuestionId, string Answer)? TryExtractQuestionReply(
-        string commentBody, IReadOnlySet<string> openQuestionIds)
-    {
-        if (string.IsNullOrWhiteSpace(commentBody) || openQuestionIds.Count == 0)
-            return null;
-        if (commentBody.Contains("codeybox-work-item:", StringComparison.Ordinal))
-            return null;
-        var trimmed = commentBody.Trim();
-        foreach (var id in openQuestionIds)
-        {
-            if (string.IsNullOrWhiteSpace(id))
-                continue;
-            if (trimmed.StartsWith(id + ":", StringComparison.OrdinalIgnoreCase))
-            {
-                var answer = trimmed[(id.Length + 1)..].Trim();
-                if (string.IsNullOrWhiteSpace(answer))
-                    return null;
-                return (id, answer.Length > 4000 ? answer[..4000] : answer);
-            }
-        }
-        return null;
-    }
+        string commentBody, IReadOnlySet<string> openQuestionIds) =>
+        WorkSyncQuestions.TryExtractReply(commentBody, openQuestionIds);
 
     /// <summary>Builds the tag embedded in a surfaced question comment.</summary>
-    public static string QuestionTag(string questionId) => $"{QuestionTagPrefix}{questionId} -->";
+    public static string QuestionTag(string questionId) => WorkSyncQuestions.TagFor(questionId);
 
     private static YouTrackWebhookEvent? IssueEvent(
         JsonElement root, YouTrackWorkSyncOptions options)
@@ -308,8 +285,10 @@ public enum YouTrackWebhookEventKind
     /// <summary>Comment added or updated — a possible question reply (or loop-guard skip).</summary>
     Comment,
     /// <summary>
-    /// Issue deleted — a hint that the ingestion signal is gone. The host
-    /// routes this to signal-removal handling for the tracked item.
+    /// Issue deleted — the signal is gone. Parsed for completeness; the
+    /// <c>IWorkSource</c> contract has no removal channel, so the plugin's
+    /// <c>ParseVerifiedWebhookBody</c> drops this kind. Informational only —
+    /// no signal-removal handling is reachable from here today.
     /// </summary>
     SignalRemovedHint,
 }

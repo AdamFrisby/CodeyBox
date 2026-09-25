@@ -114,11 +114,13 @@ public sealed class YouTrackWorkSyncPlugin
     }
 
     /// <summary>
-    /// Declares capability from what the instance actually exposes: reads
-    /// <c>GET /api/config</c> for the version/build the instance reports.
-    /// Older Server versions and low-privilege tokens may not answer the
-    /// endpoint — that degrades to a logged "unknown" rather than a startup
-    /// failure, and polling remains the fallback path.
+    /// Probes the instance for observability: reads <c>GET /api/config</c>
+    /// for the version/build the instance reports and logs it. Older Server
+    /// versions and low-privilege tokens may not answer the endpoint — that
+    /// degrades to a logged "unknown" rather than a startup failure, and
+    /// polling remains the fallback path. The probe is advisory: declared
+    /// capabilities stay static because webhooks, polling, comments, and
+    /// commands are uniformly available on the <c>/api</c> surface.
     /// </summary>
     private async Task ProbeInstanceAsync(YouTrackWorkSyncOptions options, CancellationToken ct)
     {
@@ -141,7 +143,8 @@ public sealed class YouTrackWorkSyncPlugin
                     string.IsNullOrWhiteSpace(info.Build) ? "unknown" : info.Build);
             }
         }
-        catch (Exception ex) when (ex is YouTrackApiException or HttpRequestException or TaskCanceledException or InvalidOperationException)
+        catch (Exception ex) when (!ct.IsCancellationRequested
+            && (ex is YouTrackApiException or HttpRequestException or TaskCanceledException or InvalidOperationException))
         {
             _logger.LogWarning(ex, "YouTrack instance probe failed; continuing — polling and webhooks still apply");
         }
@@ -182,12 +185,7 @@ public sealed class YouTrackWorkSyncPlugin
                 _logger.LogWarning(ex, "YouTrack poll skipped project {Project}: key cannot be expressed in a query", youTrackProjectKey);
                 continue;
             }
-            catch (Exception ex) when (ex is YouTrackApiException or HttpRequestException or TaskCanceledException)
-            {
-                _logger.LogWarning(ex, "YouTrack poll skipped project {Project}: query failed", youTrackProjectKey);
-                continue;
-            }
-            await foreach (var page in pages.ConfigureAwait(false))
+            await foreach (var page in SkipProjectOnQueryFailure(pages, youTrackProjectKey, ct).ConfigureAwait(false))
             {
                 foreach (var issue in page)
                 {
@@ -197,13 +195,45 @@ public sealed class YouTrackWorkSyncPlugin
                     var candidate = ToCandidate(issue, codeyBoxProject, options);
                     if (candidate is null)
                         continue;
-                    if (!string.Equals(candidate.Namespace, Namespace, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidOperationException(
-                            $"poll yielded namespace '{candidate.Namespace}' from source '{Namespace}'");
                     count++;
                     yield return candidate;
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Enumerates one project's pages, converting an upstream failure raised
+    /// mid-enumeration into a logged skip. <see
+    /// cref="YouTrackRestClient.SearchIssuesPagedAsync"/> is an async
+    /// iterator, so REST errors surface inside the enumeration — the guard
+    /// must wrap <c>MoveNextAsync</c>, not the call that built the iterator —
+    /// or one failing project would abort polling for all remaining projects.
+    /// Real cancellation propagates.
+    /// </summary>
+    private async IAsyncEnumerable<IReadOnlyList<YouTrackIssue>> SkipProjectOnQueryFailure(
+        IAsyncEnumerable<IReadOnlyList<YouTrackIssue>> pages,
+        string youTrackProjectKey,
+        [EnumeratorCancellation] CancellationToken ct)
+    {
+        await using var enumerator = pages.GetAsyncEnumerator(ct);
+        while (true)
+        {
+            bool moved;
+            try
+            {
+                moved = await enumerator.MoveNextAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested
+                && (ex is YouTrackApiException or HttpRequestException
+                    or InvalidOperationException or TaskCanceledException))
+            {
+                _logger.LogWarning(ex, "YouTrack poll skipped project {Project}: query failed", youTrackProjectKey);
+                yield break;
+            }
+            if (!moved)
+                yield break;
+            yield return enumerator.Current;
         }
     }
 
@@ -220,11 +250,16 @@ public sealed class YouTrackWorkSyncPlugin
         {
             // Comments never ingest directly: only a question-id reply prefix can
             // answer a surfaced question, and content alone never triggers work.
+            // A comment whose project is unmapped cannot be attributed to a
+            // work item — drop it rather than guess a project.
+            var commentProject = ProjectFor(parsed.ProjectKey, options);
+            if (commentProject is null)
+                return null;
             return new ExternalWorkItem
             {
                 Namespace = Namespace,
                 ExternalId = parsed.IssueId,
-                ProjectId = new ProjectId(ProjectFor(parsed.ProjectKey, options)),
+                ProjectId = new ProjectId(commentProject),
                 Title = parsed.IssueId,
                 Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
                 PresentSignals = [],
@@ -248,7 +283,7 @@ public sealed class YouTrackWorkSyncPlugin
             Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = parsed.ActorLogin,
-            HasSignal = SignalPresent(options.RequiredSignal, present),
+            HasSignal = options.RequiredSignal.IsPresentIn(present),
         };
     }
 
@@ -373,16 +408,6 @@ public sealed class YouTrackWorkSyncPlugin
             presentedToken, _env(options.WebhookSecretEnvVar) ?? string.Empty);
     }
 
-    /// <summary>
-    /// Builds the YouTrack command that applies a declared state value
-    /// (<c>{State} {In Progress}</c>). Both operands are brace-quoted and
-    /// validated — the status comes from operator config but the command is
-    /// parsed text on the wire, so a value the language cannot express is a
-    /// refused write, never a mangled command.
-    /// </summary>
-    internal static string BuildStateCommand(string stateFieldName, string status) =>
-        $"{YouTrackRestClient.QuoteQueryValue(stateFieldName)} {YouTrackRestClient.QuoteQueryValue(status)}";
-
     public void Dispose()
     {
         if (_disposed)
@@ -422,8 +447,15 @@ public sealed class YouTrackWorkSyncPlugin
         {
             if (_api is not null)
                 return _api;
-            _http ??= _httpFactory!.CreateClient("youtrack-worksync");
-            _http.Timeout = TimeSpan.FromSeconds(CurrentOptions().TimeoutSeconds);
+            if (_http is null)
+            {
+                _http = _httpFactory!.CreateClient("youtrack-worksync");
+                // Request timeouts are enforced per request from the live
+                // TimeoutSeconds option (a linked CTS in SendDocumentAsync),
+                // so edits hot-reload; disable the client-level timeout on
+                // this owned client. An injected client is never mutated.
+                _http.Timeout = Timeout.InfiniteTimeSpan;
+            }
             _tokens = new YouTrackTokenProvider(_http, _env, _clock);
             _api = new YouTrackRestClient(_http, _tokens);
             return _api;
@@ -443,21 +475,20 @@ public sealed class YouTrackWorkSyncPlugin
         string status,
         CancellationToken ct)
     {
-        string command;
         try
         {
-            command = BuildStateCommand(options.StateFieldName, status);
+            // The command is built and quoted at the sink: a value the
+            // command language cannot express throws ArgumentException
+            // before anything is sent — a refused write, never a mangled
+            // command.
+            await api.ApplyCommandAsync(
+                options, externalId, options.StateFieldName, status, ct).ConfigureAwait(false);
+            return null;
         }
         catch (ArgumentException ex)
         {
             return new TrackerPostResult(TrackerPostOutcome.Failed,
                 Detail: $"YouTrack cannot express '{status}' as a command for '{externalId}': {ex.Message}");
-        }
-
-        try
-        {
-            await api.ApplyCommandAsync(options, externalId, command, ct).ConfigureAwait(false);
-            return null;
         }
         catch (YouTrackApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
@@ -467,7 +498,7 @@ public sealed class YouTrackWorkSyncPlugin
         catch (YouTrackApiException ex)
         {
             return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: $"YouTrack rejected the command '{command}' for '{externalId}': {ex.Message}");
+                Detail: $"YouTrack rejected the state command '{status}' for '{externalId}': {ex.Message}");
         }
     }
 
@@ -497,7 +528,7 @@ public sealed class YouTrackWorkSyncPlugin
             Body = Truncate(issue.Description, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = issue.LastActorLogin,
-            HasSignal = SignalPresent(options.RequiredSignal, present),
+            HasSignal = options.RequiredSignal.IsPresentIn(present),
         };
     }
 
@@ -513,19 +544,14 @@ public sealed class YouTrackWorkSyncPlugin
         return signals;
     }
 
-    internal static bool SignalPresent(WorkSignal required, IReadOnlyList<WorkSignal> present) =>
-        !string.IsNullOrWhiteSpace(required.Value)
-        && present.Any(s => s.Kind == required.Kind
-            && string.Equals(s.Value, required.Value, StringComparison.OrdinalIgnoreCase));
-
     private TrackerPostResult? CheckTracked(string @namespace, string externalId)
     {
         if (!string.Equals(@namespace, Namespace, StringComparison.OrdinalIgnoreCase))
             return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
+                Detail: $"namespace '{@namespace}' is not tracked by source '{Namespace}'");
         if (string.IsNullOrWhiteSpace(externalId))
             return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
+                Detail: "no external id to track");
         return null;
     }
 
@@ -535,10 +561,14 @@ public sealed class YouTrackWorkSyncPlugin
         return new TrackerPostResult(TrackerPostOutcome.UnmappedState, Detail: unmapped.Describe());
     }
 
-    private static string ProjectFor(string projectKey, YouTrackWorkSyncOptions options) =>
+    /// <summary>
+    /// Maps a webhook project key to its operator-declared CodeyBox project.
+    /// Null when unmapped — the same "skipped, never guessed" rule as issues.
+    /// </summary>
+    private static string? ProjectFor(string projectKey, YouTrackWorkSyncOptions options) =>
         options.ProjectMap.TryGetValue(projectKey, out var mapped) && !string.IsNullOrWhiteSpace(mapped)
             ? mapped
-            : options.ProjectMap.Values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "youtrack";
+            : null;
 
     private static string Truncate(string value, int maxChars) =>
         value.Length <= maxChars ? value : value[..maxChars];

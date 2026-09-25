@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Http.Headers;
 using System.Text;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -36,7 +35,7 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
     private readonly Dictionary<string, string?> _env = new()
     {
         ["YOUTRACK_TOKEN"] = "perm:test-token",
-        ["YOUTRACK_WEBHOOK_TOKEN"] = "0123456789abcdef0123456789abcdef",
+        ["YOUTRACK_WEBHOOK_TOKEN"] = "youtrack-webhook-test-token",
     };
     private readonly YouTrackFakeHandler _handler = new();
 
@@ -326,7 +325,6 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
             ["StateMapping:Working"] = "In Progress} tag injected",
         });
         UseRest();
-        var tracking = TrackingFor(plugin);
         var candidate = Assert.Single(await PollAllAsync(plugin), c => c.ExternalId == "PROJ-1");
         var item = (await _ingestion.IngestAsync(candidate, plugin)).Item!;
 
@@ -392,8 +390,9 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
     public void QuestionReply_IgnoresOwnCommentsAndUnknownIds()
     {
         var open = new HashSet<string>(["q-001"], StringComparer.Ordinal);
+        // Reply-shaped AND marker-carrying: only the marker guard returns null.
         Assert.Null(YouTrackWebhook.TryExtractQuestionReply(
-            $"note\n\n{WorkSyncLoopGuard.MarkerFor(WorkItemId.New())}", open));
+            $"q-001: yes\n\n{WorkSyncLoopGuard.MarkerFor(WorkItemId.New())}", open));
         Assert.Null(YouTrackWebhook.TryExtractQuestionReply("q-999: something", open));
         Assert.Null(YouTrackWebhook.TryExtractQuestionReply("just chatting", open));
     }
@@ -455,6 +454,32 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
     }
 
     [Fact]
+    public async Task Poll_ProjectQueryFailure_IsSkipped_LaterProjectsStillYield()
+    {
+        // AFAIL sorts before PROJ however the config section orders children,
+        // so the failing project is always enumerated first.
+        var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ProjectMap:AFAIL"] = "test-project",
+        });
+        UseRest();
+        var baseResponder = _handler.Responder;
+        _handler.Responder = (req, body) =>
+            req.Method == HttpMethod.Get
+            && req.RequestUri!.AbsolutePath.EndsWith("/api/issues", StringComparison.Ordinal)
+            && req.RequestUri.Query.Contains("AFAIL", StringComparison.Ordinal)
+                ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                {
+                    Content = new StringContent("upstream is down"),
+                }
+                : baseResponder(req, body);
+
+        var found = await PollAllAsync(plugin);
+
+        Assert.Contains(found, c => c.ExternalId == "PROJ-1");
+    }
+
+    [Fact]
     public async Task DisabledPlugin_PollsAndPostsNothing()
     {
         var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
@@ -513,7 +538,7 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
     [Fact]
     public void WebhookToken_AcceptsOnlyExactSecret()
     {
-        const string secret = "0123456789abcdef0123456789abcdef";
+        const string secret = "youtrack-webhook-test-token";
         Assert.True(YouTrackWebhook.VerifyDelivery(secret, secret));
         Assert.False(YouTrackWebhook.VerifyDelivery("wrong", secret));
         Assert.False(YouTrackWebhook.VerifyDelivery(secret + "-extended", secret));
@@ -580,17 +605,17 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
         var token = Environment.GetEnvironmentVariable("YOUTRACK_TOKEN");
         Skip.If(string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(token),
             "YOUTRACK_BASE_URL and YOUTRACK_TOKEN are not both set; the live YouTrack integration test is opt-in.");
-        using var http = new HttpClient();
-        using var request = new HttpRequestMessage(
-            HttpMethod.Get, baseUrl!.TrimEnd('/') + "/api/users/me?fields=id,login");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.Accept.ParseAdd("application/json");
-        request.Headers.UserAgent.ParseAdd("CodeyBox-YouTrackWorkSync/1.0");
 
-        using var response = await http.SendAsync(request);
-        var payload = await response.Content.ReadAsStringAsync();
-        Assert.True(response.IsSuccessStatusCode, payload);
-        Assert.Contains("login", payload, StringComparison.Ordinal);
+        // Exercises the shipped path end-to-end: credential chain (env) →
+        // token provider → typed REST client → bounded response read.
+        var options = new YouTrackWorkSyncOptions { ApiBaseUrl = baseUrl! };
+        using var http = new HttpClient();
+        using var tokens = new YouTrackTokenProvider(http, Environment.GetEnvironmentVariable);
+        var api = new YouTrackRestClient(http, tokens);
+
+        var login = await api.GetAuthenticatedUserLoginAsync(options);
+
+        Assert.False(string.IsNullOrWhiteSpace(login));
     }
 
     private sealed class YouTrackFakeHandler : HttpMessageHandler
