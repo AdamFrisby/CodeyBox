@@ -140,9 +140,7 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
     /// </summary>
     public const string IgnoreMissingSchemasKey = "IgnoreMissingSchemas";
 
-    private const int ProbeMaxOutputBytes = 16 * 1024;
     private const int MessageValueMaxChars = 64;
-    private static readonly TimeSpan ProbeTimeoutCap = TimeSpan.FromSeconds(30);
     private static readonly Regex VersionPattern = new(
         @"\d+\.\d+\.\d+[\w.\-]*",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
@@ -363,12 +361,6 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
                 + $"pinned to {expected}. A different scanner version changes the findings; provision "
                 + "the pinned release or set ExpectedVersion to the version you provisioned.")
             { IsDeterministic = true };
-    }
-
-    private static TimeSpan ProbeTimeout(ExternalToolAuditorOptions options)
-    {
-        var timeout = EffectiveTimeout(options);
-        return timeout > ProbeTimeoutCap ? ProbeTimeoutCap : timeout;
     }
 
     private static string? ExtractVersion(string stdout)
