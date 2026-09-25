@@ -27,8 +27,9 @@ workload sandbox ── env (value) ── orchestrator
 - **Dynamic mode.** The mapping names a credential endpoint
   (`database/creds/<role>`, `aws/creds/<role>`, …) whose response carries a
   real `lease_id`. The lease identity is the server id itself; renewal is
-  `sys/leases/renew`; revocation is `sys/leases/revoke` with `sync=true`,
-  so the call returns only once the credential genuinely stopped working.
+  `sys/leases/renew`; revocation is `sys/leases/revoke`, `sync=true` by
+  default (`RevokeSync`), so the call returns only once the credential
+  genuinely stopped working.
 - **Authorisation** stays with the host `SecretLeaseManager`: a grant
   decides whether a group applies. A group without a matching grant is
   never fetched, let alone injected. This provider only resolves mapped
@@ -38,8 +39,10 @@ workload sandbox ── env (value) ── orchestrator
   work item's deadline) and `RevokeAsync` on teardown; the reconciliation
   sweep re-revokes terminal items whose teardown failed. Lease handles are
   self-describing (`openbao.{s|d}.{var}.{tail}`), so renew/revoke keep
-  working after an orchestrator restart — for dynamic leases the tail *is*
-  the server lease id, so revocation works even if the mapping was deleted.
+  working after an orchestrator restart — for dynamic leases the tail
+  carries the server lease id behind an issuer fingerprint, so revocation
+  works even if the mapping was deleted yet stays bound to the cluster
+  that minted the lease.
   Revocation is also not gated on `Enabled`: disabling the plugin (a
   natural response to a suspect backend) must not strand already-issued
   leases until their server TTL.
@@ -126,10 +129,10 @@ never fetched. Exactly one of `SecretPath` / `DynamicPath` per mapping;
 
 |                        | Static KV secrets | Dynamic-engine credentials |
 | ---------------------- | ----------------- | -------------------------- |
-| Lease identity         | Client handle embedding sandbox var (`openbao.s.…`) | **Server lease id** (`openbao.d.{var}.{server-lease-id}`) |
+| Lease identity         | Client handle embedding sandbox var (`openbao.s.…`) | **Server lease id** (`openbao.d.{var}.{issuer-fp}~{server-lease-id}`) |
 | Renewal                | Re-fetch (rotation propagates ≤ 1 window) | **`sys/leases/renew`**, new `lease_duration` |
-| Revocation             | Local invalidation + teardown scrub (no server call exists) | **`sys/leases/revoke` with `sync=true`** — verified, not queued (404 = already gone = success) |
-| Restart-safe           | Yes (mapping re-resolves) | Yes (server lease id embedded in handle; no mapping needed) |
+| Revocation             | Local invalidation + teardown scrub (no server call exists) | **`sys/leases/revoke`, `sync=true` by default** (`RevokeSync`) — verified, not queued (404 = already gone = success) |
+| Restart-safe           | Yes (mapping re-resolves) | Yes (server lease id + issuer fingerprint embedded in handle; no mapping needed) |
 
 Not supported, declared rather than faked:
 
@@ -164,10 +167,14 @@ a value, token, or secret ID; lease ids are the auditable unit.
 Things the lease contract cannot express that OpenBao does:
 
 1. **Lease-id routing.** Renew/revoke receive only the handle, so routing
-   (sandbox var → mapping, server lease id) is embedded in the handle
-   format `openbao.{s|d}.{var}.{tail}`. For dynamic leases the tail is the
-   verbatim server lease id (`database/creds/readonly/…`); slashes ride
-   the tail segment, but a server lease id containing `.` cannot
+   (sandbox var → mapping, server lease id, issuing endpoint) is embedded
+   in the handle format `openbao.{s|d}.{var}.{tail}`. For dynamic leases
+   the tail pairs a short fingerprint of the issuing `Address` with the
+   verbatim server lease id
+   (`{issuer-fp}~database/creds/readonly/…`), so a re-pointed or removed
+   `Address` can never silently re-target revocation at a different
+   cluster — it fails loudly instead. Slashes ride the tail segment, but
+   a server lease id containing `.` (or the `~` separator) cannot
    round-trip and is refused at issue as an invalid response.
 2. **Renewal increment.** `RenewAsync` takes only the lease id, so the
    `increment` asked of `sys/leases/renew` comes from the
@@ -203,7 +210,6 @@ OPENBAO_LIVE_ADDR=http://127.0.0.1:8200
 OPENBAO_LIVE_TOKEN=<token>            # or OPENBAO_LIVE_ROLE_ID + OPENBAO_LIVE_SECRET_ID
 OPENBAO_LIVE_DYNAMIC_PATH=database/creds/readonly
 OPENBAO_LIVE_FIELD=password
-OPENBAO_LIVE_STATIC_PATH=secret/data/myapp   # optional
 ```
 
 then `dotnet test --filter FullyQualifiedName~OpenBao`. The test issues,

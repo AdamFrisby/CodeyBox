@@ -27,8 +27,10 @@ namespace CodeyBox.OpenBaoPlugin;
 /// <para>Honest lease surface: dynamic mappings are genuine server-side
 /// leases — the server <c>lease_id</c> is the lease identity, renewal is
 /// <c>sys/leases/renew</c> while the phase runs, and revocation is
-/// <c>sys/leases/revoke</c> with <c>sync=true</c> at teardown, explicit and
-/// immediate. Static KV secrets carry no server-side lease — the lease is
+/// <c>sys/leases/revoke</c> at teardown — <c>sync=true</c> by default
+/// (<c>RevokeSync</c>), explicit and immediate; give-backs of rejected
+/// credentials are always synchronous. Static KV secrets carry no
+/// server-side lease — the lease is
 /// a client-side validity window: renewal re-fetches (rotation propagates
 /// within one window) and revocation is local invalidation plus the
 /// orchestrator's teardown scrub of the per-exec environment. See the
@@ -197,7 +199,7 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
                 value = RequireField(issued.Data, mapping);
                 try
                 {
-                    leaseId = OpenBaoLeaseIds.BuildDynamic(mapping.SandboxEnvVar, issued.LeaseId);
+                    leaseId = OpenBaoLeaseIds.BuildDynamic(mapping.SandboxEnvVar, options.Address, issued.LeaseId);
                 }
                 catch (ArgumentException inner)
                 {
@@ -218,7 +220,7 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
             catch (OpenBaoException)
             {
                 await _api!.TryRevokeLeaseAsync(
-                    options.Address, token, issued.LeaseId, options.RevokeSync, ct).ConfigureAwait(false);
+                    options.Address, token, issued.LeaseId, ct).ConfigureAwait(false);
                 throw;
             }
             material = new LeasedSecretMaterial
@@ -268,6 +270,7 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         // Dynamic renewal needs only the server lease id, which the handle
         // tail carries — no current mapping required, so a live lease
         // stays renewable even if its mapping was later removed.
+        RequireIssuingCluster(options, parsed);
         var dynamicToken = await GetTokenAsync(options, ct).ConfigureAwait(false);
         var seconds = await _api!.RenewLeaseAsync(
             options.Address, dynamicToken, parsed.Tail,
@@ -296,11 +299,15 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         }
 
         var options = RequireConfiguredOptions();
+        // The handle tail carries the server lease id and a fingerprint of
+        // the issuing address, so revocation addresses the lease directly —
+        // a removed mapping can never strand a live server credential, and
+        // a re-pointed Address can never silently re-target it at a
+        // different cluster (whose 404 would read as 'already revoked'
+        // while the credential stays live on the issuer until its TTL).
+        RequireIssuingCluster(options, parsed);
         EnsureClients();
         var token = await GetTokenAsync(options, ct).ConfigureAwait(false);
-        // The handle tail carries the server lease id, so revocation
-        // addresses the lease directly — a removed mapping can never
-        // strand a live server credential.
         await _api!.RevokeLeaseAsync(
             options.Address, token, parsed.Tail,
             options.RevokeSync, ct).ConfigureAwait(false);
@@ -420,12 +427,44 @@ public sealed class OpenBaoSecretProvider : ILeaseCapableSecretProvider, IPlugin
         => CredentialOptions.RequireUsable(CurrentOptions(), OpenBaoException.BackendName, OpenBaoException.Create);
 
     /// <summary>
-    /// The revocation gate: options must be valid but need not be enabled —
-    /// disabling the plugin is a natural response to a suspect backend and
-    /// must not strand already-issued leases until their server TTL.
+    /// The revocation gate: options must be valid and carry an explicitly
+    /// configured <c>Address</c>, but need not be enabled — disabling the
+    /// plugin is a natural response to a suspect backend and must not
+    /// strand already-issued leases until their server TTL. The
+    /// explicit-address requirement stops a removed config section from
+    /// silently re-targeting teardown at the loopback default (where the
+    /// provider token would be POSTed to whatever squats on the port).
     /// </summary>
     private OpenBaoOptions RequireConfiguredOptions()
-        => CredentialOptions.RequireValid(CurrentOptions(), OpenBaoException.BackendName, OpenBaoException.Create);
+    {
+        var options = CredentialOptions.RequireValid(
+            CurrentOptions(), OpenBaoException.BackendName, OpenBaoException.Create);
+        if (!options.AddressConfigured)
+            throw new OpenBaoException(
+                CredentialFailureKind.Misconfigured,
+                "OpenBao Address is not configured; revocation needs the issuing endpoint set explicitly, never the loopback default.");
+        return options;
+    }
+
+    /// <summary>
+    /// The endpoint-binding check for a dynamic lease: the handle carries a
+    /// fingerprint of the address that minted it, and renew/revoke run only
+    /// while the configured <c>Address</c> still names that cluster. A
+    /// re-pointed address fails here — loudly, before any token leaves the
+    /// process — rather than hitting a different cluster where the lease
+    /// is unknown.
+    /// </summary>
+    private static void RequireIssuingCluster(
+        OpenBaoOptions options, OpenBaoLeaseIds.ParsedLeaseId parsed)
+    {
+        if (!string.Equals(
+                parsed.IssuerFingerprint,
+                OpenBaoLeaseIds.IssuerFingerprint(options.Address),
+                StringComparison.Ordinal))
+            throw new OpenBaoException(
+                CredentialFailureKind.Misconfigured,
+                "OpenBao Address no longer names the cluster that issued this lease; restore the issuing Address to renew or revoke it — the lease stays live until then.");
+    }
 
     private static OpenBaoSecretMapping? FindMapping(OpenBaoOptions options, ProjectSandboxSecret secret)
     {

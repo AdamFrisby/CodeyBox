@@ -84,9 +84,14 @@ public static class CredentialJson
     /// numbers, booleans and other primitives keep their raw JSON text;
     /// JSON null reads as empty. One coercion so field-shape policy cannot
     /// fork per backend.
+    /// Requires <paramref name="data"/> to be <see cref="JsonValueKind.Object"/>;
+    /// anything else is a caller bug and throws.
     /// </summary>
     public static IReadOnlyDictionary<string, string> ReadStringFields(JsonElement data)
     {
+        if (data.ValueKind != JsonValueKind.Object)
+            throw new ArgumentException(
+                $"ReadStringFields requires a JSON object, got {data.ValueKind}.", nameof(data));
         var fields = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var property in data.EnumerateObject())
         {

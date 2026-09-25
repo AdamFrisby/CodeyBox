@@ -104,8 +104,7 @@ public sealed class OpenBaoRestClient
             if (!CredentialJson.TryGetString(auth, "client_token", out var token) || string.IsNullOrEmpty(token))
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse, "OpenBao AppRole login returned no client_token.");
-            if (!CredentialJson.TryGetInt64(auth, "lease_duration", out var leaseSeconds)
-                || leaseSeconds <= 0 || leaseSeconds > int.MaxValue)
+            if (!TryReadLeaseDurationSeconds(auth, out var leaseSeconds))
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     "OpenBao AppRole login returned a token with no usable lifetime.");
@@ -123,8 +122,9 @@ public sealed class OpenBaoRestClient
     /// <c>data.data</c>; for KV v1 and other unleased engines directly
     /// under <c>data</c>. A response that arrives carrying a real
     /// <c>lease_id</c> is a backend surprise the mapping declared static —
-    /// refused as an invalid response rather than silently holding an
-    /// unleased-looking but actually leased credential.
+    /// the minted credential is handed back first (it is live), then the
+    /// read is refused as an invalid response rather than silently holding
+    /// an unleased-looking but actually leased credential.
     /// </summary>
     public async Task<OpenBaoStaticSecret> GetStaticSecretAsync(
         string address,
@@ -141,9 +141,12 @@ public sealed class OpenBaoRestClient
         {
             var root = doc.RootElement;
             if (CredentialJson.TryGetString(root, "lease_id", out var leaseId) && !string.IsNullOrEmpty(leaseId))
+            {
+                await TryRevokeLeaseAsync(address, token, leaseId, ct).ConfigureAwait(false);
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     $"OpenBao read of '{path}' returned a server lease; map it with DynamicPath instead of SecretPath.");
+            }
             if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
@@ -185,66 +188,61 @@ public sealed class OpenBaoRestClient
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     $"OpenBao read of '{path}' returned no lease_id; DynamicPath requires a leasing engine.");
-            // A minted lease id is dependency output bound for a lease
+
+            // A minted lease id whose response then fails validation is
+            // still a live credential: every rejection below hands it back
+            // first — synchronously, so it is dead before the failure
+            // surfaces — rather than orphaning it until its server TTL.
+            async Task RejectAndGiveBackAsync(string detail)
+            {
+                await TryRevokeLeaseAsync(address, token, leaseId, ct).ConfigureAwait(false);
+                throw new OpenBaoException(CredentialFailureKind.InvalidResponse, detail);
+            }
+
+            // The minted lease id is dependency output bound for a lease
             // handle and for log lines: refuse a shape a handle cannot
             // carry ('.' or control characters) — it could never be
             // renewed or revoked, and raw control characters would forge
-            // audit-log entries on the way out. The credential is still
-            // live server-side: hand it back before failing.
+            // audit-log entries on the way out.
             if (!LeaseHandles.IsValidSegment(leaseId))
-            {
-                await TryRevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
-                throw new OpenBaoException(
-                    CredentialFailureKind.InvalidResponse,
+                await RejectAndGiveBackAsync(
                     $"OpenBao read of '{path}' returned a lease_id that cannot be carried in a lease handle.");
-            }
-            // A minted lease id with an unusable rest-of-body is still a
-            // live credential: hand it back before failing, or it is
-            // orphaned until its TTL.
-            if (!CredentialJson.TryGetInt64(root, "lease_duration", out var leaseSeconds)
-                || leaseSeconds <= 0 || leaseSeconds > int.MaxValue)
-            {
-                await TryRevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
-                throw new OpenBaoException(
-                    CredentialFailureKind.InvalidResponse,
+            if (!TryReadLeaseDurationSeconds(root, out var leaseSeconds))
+                await RejectAndGiveBackAsync(
                     $"OpenBao read of '{path}' returned no usable lease_duration.");
-            }
             var renewable = root.TryGetProperty("renewable", out var renew)
                 && renew.ValueKind == JsonValueKind.True;
             if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
-            {
-                await TryRevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
-                throw new OpenBaoException(
-                    CredentialFailureKind.InvalidResponse,
+                await RejectAndGiveBackAsync(
                     $"OpenBao read of '{path}' returned no data object.");
-            }
             _log.LogDebug(
                 "OpenBao issued dynamic credential at '{Path}' under lease '{LeaseId}' for {Seconds}s{Renewable}.",
                 path, leaseId, leaseSeconds, renewable ? string.Empty : " (not renewable)");
             return new OpenBaoDynamicCredential(
-                leaseId, (int)leaseSeconds, renewable, CredentialJson.ReadStringFields(data));
+                leaseId, leaseSeconds, renewable, CredentialJson.ReadStringFields(data));
         }
     }
 
     /// <summary>
     /// Best-effort revoke of a lease the caller is giving up on — a minted
     /// credential whose response was rejected, or one the provider must
-    /// return after a local validation failure. Never throws: a failed
-    /// give-back is logged (lease id sanitised — it may be exactly the
-    /// shape that failed validation) and the lease expires at its server
-    /// TTL; the caller surfaces its own failure. Callers passing
-    /// <paramref name="sync"/>: issue-path rejections always pass true —
-    /// the rejected credential must be dead before the failure surfaces,
-    /// whatever <c>RevokeSync</c> says.
+    /// return after a local validation failure. Always synchronous:
+    /// whatever <c>RevokeSync</c> says for teardown, a rejected credential
+    /// must be dead before the failure that rejected it surfaces. Never
+    /// throws: a failed give-back is logged (lease id sanitised — it may
+    /// be exactly the shape that failed validation) and the lease expires
+    /// at its server TTL; the caller surfaces its own failure. Caller
+    /// cancellation still propagates — it is never swallowed as a
+    /// give-back failure.
     /// </summary>
     internal async Task TryRevokeLeaseAsync(
-        string address, string token, string leaseId, bool sync, CancellationToken ct)
+        string address, string token, string leaseId, CancellationToken ct)
     {
         try
         {
-            await RevokeLeaseAsync(address, token, leaseId, sync, ct).ConfigureAwait(false);
+            await RevokeLeaseAsync(address, token, leaseId, sync: true, ct).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(
                 ex,
@@ -285,13 +283,12 @@ public sealed class OpenBaoRestClient
             response, $"renew lease '{displayLeaseId}'", maxResponseBytes, ct).ConfigureAwait(false);
         using (doc)
         {
-            if (!CredentialJson.TryGetInt64(doc.RootElement, "lease_duration", out var leaseSeconds)
-                || leaseSeconds <= 0 || leaseSeconds > int.MaxValue)
+            if (!TryReadLeaseDurationSeconds(doc.RootElement, out var leaseSeconds))
                 throw new OpenBaoException(
                     CredentialFailureKind.InvalidResponse,
                     $"OpenBao renew of lease '{displayLeaseId}' returned no usable lease_duration.");
             _log.LogDebug("OpenBao renewed lease '{LeaseId}' for {Seconds}s.", displayLeaseId, leaseSeconds);
-            return (int)leaseSeconds;
+            return leaseSeconds;
         }
     }
 
@@ -348,6 +345,21 @@ public sealed class OpenBaoRestClient
         AddTokenHeader(request, token);
         var response = await _transport.SendAsync(request, operation, ct).ConfigureAwait(false);
         return await _transport.ReadJsonAsync(response, operation, maxResponseBytes, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads a positive <c>lease_duration</c> bounded to Int32 seconds —
+    /// the one policy for a server-supplied lifetime, applied at login,
+    /// issue, and renew so the bound cannot drift per call site.
+    /// </summary>
+    private static bool TryReadLeaseDurationSeconds(JsonElement root, out int seconds)
+    {
+        seconds = 0;
+        if (!CredentialJson.TryGetInt64(root, "lease_duration", out var value)
+            || value <= 0 || value > int.MaxValue)
+            return false;
+        seconds = (int)value;
+        return true;
     }
 
     private static void RequireValidPath(string path, string what)

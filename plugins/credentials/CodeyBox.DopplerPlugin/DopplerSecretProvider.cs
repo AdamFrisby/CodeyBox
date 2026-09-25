@@ -275,7 +275,7 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
     public async Task RevokeAsync(string leaseId, CancellationToken ct = default)
     {
         var parsed = ParseOurs(leaseId);
-        var options = RequireUsableOptions();
+        var options = RequireConfiguredOptions();
         EnsureClients();
 
         if (parsed.Kind == DopplerLeaseIds.LeaseKind.Static)
@@ -389,6 +389,14 @@ public sealed class DopplerSecretProvider : ILeaseCapableSecretProvider, IPlugin
 
     private DopplerOptions RequireUsableOptions()
         => CredentialOptions.RequireUsable(CurrentOptions(), DopplerException.BackendName, DopplerException.Create);
+
+    /// <summary>
+    /// The revocation gate: options must be valid but need not be enabled —
+    /// disabling the plugin is a natural response to a suspect backend and
+    /// must not strand already-issued leases until their server-side expiry.
+    /// </summary>
+    private DopplerOptions RequireConfiguredOptions()
+        => CredentialOptions.RequireValid(CurrentOptions(), DopplerException.BackendName, DopplerException.Create);
 
     private static bool UseIdentity(DopplerOptions options, DopplerSecretMapping mapping)
     {

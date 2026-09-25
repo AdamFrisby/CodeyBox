@@ -7,7 +7,6 @@ using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using FakeClock = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests.OpenBao;
@@ -982,6 +981,13 @@ public sealed class OpenBaoPluginTests : IDisposable
             Secret("DB_PASSWORD"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
         Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
         Assert.True(ex.IsInfrastructure);
+
+        // The endpoint minted a real server lease under a mapping that
+        // declared static: it must be handed back, not orphaned until its
+        // server TTL.
+        var serverLeaseId = Assert.Single(_handler.IssuedLeaseIds);
+        Assert.Contains(serverLeaseId, _handler.RevokedLeases);
+        Assert.DoesNotContain(serverLeaseId, _handler.LiveLeases);
     }
 
     [Fact]
@@ -1079,12 +1085,102 @@ public sealed class OpenBaoPluginTests : IDisposable
         });
         const string serverLeaseId = "database/creds/readonly/still-live-lease";
         lock (_handler.Requests) _handler.LiveLeases.Add(serverLeaseId);
-        var handle = OpenBaoLeaseIds.BuildDynamic("DB_PASSWORD", serverLeaseId);
+        var handle = OpenBaoLeaseIds.BuildDynamic(
+            "DB_PASSWORD", "https://bao.example.com", serverLeaseId);
 
         await provider.RevokeAsync(handle);
 
         Assert.Contains(serverLeaseId, _handler.RevokedLeases);
         Assert.DoesNotContain(serverLeaseId, _handler.LiveLeases);
+    }
+
+    [Fact]
+    public async Task Renew_And_Revoke_Refuse_A_Repointed_Address()
+    {
+        UseRecordedShapes();
+        var provider = CreateProvider(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Mappings:0:SandboxEnvVar"] = "DB_PASSWORD",
+            ["Mappings:0:DynamicPath"] = "database/creds/readonly",
+            ["Mappings:0:DataField"] = "password",
+        });
+        var material = await provider.IssueAsync(
+            Secret("DB_PASSWORD"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20));
+        var serverLeaseId = Assert.Single(_handler.IssuedLeaseIds);
+
+        // The operator re-pointed Address at a different cluster: the lease
+        // still lives on the issuer, so renew and revoke must refuse loudly
+        // rather than POST the provider token there — a 404 from the wrong
+        // cluster would otherwise be misread as 'already revoked' while the
+        // credential stays live.
+        var repointed = CreateProvider(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Address"] = "https://other-bao.example.com",
+        });
+        var renewEx = await Assert.ThrowsAsync<OpenBaoException>(
+            () => repointed.RenewAsync(material.LeaseId));
+        Assert.Equal(CredentialFailureKind.Misconfigured, renewEx.Kind);
+        var revokeEx = await Assert.ThrowsAsync<OpenBaoException>(
+            () => repointed.RevokeAsync(material.LeaseId));
+        Assert.Equal(CredentialFailureKind.Misconfigured, revokeEx.Kind);
+
+        // Nothing for the lease left the process: the wrong cluster never
+        // saw a renew or revoke, and the credential stays live on the issuer.
+        Assert.Equal(0, _handler.CountRequests(HttpMethod.Post.Method, "/v1/sys/leases/"));
+        Assert.DoesNotContain(serverLeaseId, _handler.RevokedLeases);
+        Assert.Contains(serverLeaseId, _handler.LiveLeases);
+        repointed.Dispose();
+        provider.Dispose();
+    }
+
+    [Fact]
+    public async Task Revoke_Refuses_When_Address_Is_Not_Configured()
+    {
+        UseRecordedShapes();
+        // A present-but-empty Address key falls back to the loopback default,
+        // which never issued anything: revocation must refuse rather than
+        // POST the provider token to whatever squats on the default port.
+        var provider = CreateProvider(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Enabled"] = "false",
+            ["Address"] = "",
+            ["Mappings:0:SandboxEnvVar"] = "DB_PASSWORD",
+            ["Mappings:0:DynamicPath"] = "database/creds/readonly",
+            ["Mappings:0:DataField"] = "password",
+        });
+        const string serverLeaseId = "database/creds/readonly/default-endpoint-lease";
+        lock (_handler.Requests) _handler.LiveLeases.Add(serverLeaseId);
+        var handle = OpenBaoLeaseIds.BuildDynamic(
+            "DB_PASSWORD", "http://127.0.0.1:8200", serverLeaseId);
+
+        var ex = await Assert.ThrowsAsync<OpenBaoException>(() => provider.RevokeAsync(handle));
+
+        Assert.Equal(CredentialFailureKind.Misconfigured, ex.Kind);
+        Assert.Equal(0, _handler.CountRequests(HttpMethod.Post.Method, "/v1/sys/leases/revoke"));
+        Assert.Contains(serverLeaseId, _handler.LiveLeases);
+    }
+
+    [Fact]
+    public async Task Lease_Id_With_Issuer_Separator_Is_Handed_Back_And_Refused()
+    {
+        UseRecordedShapes();
+        // A '~' inside the server lease id would split the handle tail
+        // wrongly: the response is refused as invalid and the minted
+        // credential handed back, never orphaned.
+        _handler.LeaseIdOverride = "database/creds/readonly/lease~with-separator";
+        var provider = CreateProvider(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Mappings:0:SandboxEnvVar"] = "DB_PASSWORD",
+            ["Mappings:0:DynamicPath"] = "database/creds/readonly",
+            ["Mappings:0:DataField"] = "password",
+        });
+
+        var ex = await Assert.ThrowsAsync<OpenBaoException>(() => provider.IssueAsync(
+            Secret("DB_PASSWORD"), Guid.NewGuid(), "work", TimeSpan.FromMinutes(20)));
+
+        Assert.Equal(CredentialFailureKind.InvalidResponse, ex.Kind);
+        Assert.Contains("database/creds/readonly/lease~with-separator", _handler.RevokedLeases);
+        Assert.DoesNotContain("database/creds/readonly/lease~with-separator", _handler.LiveLeases);
     }
 
     [Fact]

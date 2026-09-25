@@ -218,7 +218,7 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
     public async Task RevokeAsync(string leaseId, CancellationToken ct = default)
     {
         var parsed = ParseOurs(leaseId);
-        _ = RequireUsableOptions();
+        _ = RequireConfiguredOptions();
         EnsureClients();
         await Task.CompletedTask.ConfigureAwait(false);
 
@@ -311,6 +311,14 @@ public sealed class OnePasswordSecretProvider : ILeaseCapableSecretProvider, IPl
 
     private OnePasswordOptions RequireUsableOptions()
         => CredentialOptions.RequireUsable(
+            CurrentOptions(), OnePasswordException.BackendName, OnePasswordException.Create);
+
+    /// <summary>
+    /// The revocation gate: options must be valid but need not be enabled —
+    /// disabling the plugin must not strand already-issued leases.
+    /// </summary>
+    private OnePasswordOptions RequireConfiguredOptions()
+        => CredentialOptions.RequireValid(
             CurrentOptions(), OnePasswordException.BackendName, OnePasswordException.Create);
 
     private static OnePasswordSecretMapping? FindMapping(OnePasswordOptions options, ProjectSandboxSecret secret)

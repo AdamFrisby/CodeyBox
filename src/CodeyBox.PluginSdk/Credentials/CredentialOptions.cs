@@ -264,15 +264,7 @@ public static class CredentialOptions
                 $"{backend} provider is disabled (Enabled=false); enable it to issue.",
                 null, null, null);
         }
-        var errors = options.Validate();
-        if (errors.Count > 0)
-        {
-            throw exceptionFactory(
-                CredentialFailureKind.Misconfigured,
-                $"{backend} configuration is invalid: {errors[0]}",
-                null, null, null);
-        }
-        return options;
+        return RequireValid(options, backend, exceptionFactory);
     }
 
     /// <summary>

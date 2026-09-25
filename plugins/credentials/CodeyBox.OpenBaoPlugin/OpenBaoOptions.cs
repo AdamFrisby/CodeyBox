@@ -95,6 +95,16 @@ public sealed record OpenBaoOptions : ICredentialOptions
     public string Address { get; init; } = "http://127.0.0.1:8200";
 
     /// <summary>
+    /// True when the operator set <c>Address</c> explicitly rather than
+    /// inheriting the loopback default. The revocation gate requires it:
+    /// with the section removed or the key absent, teardown must refuse —
+    /// posting the provider token to whatever happens to squat on the
+    /// default loopback port would disclose it to an endpoint that never
+    /// issued the lease.
+    /// </summary>
+    public bool AddressConfigured { get; init; }
+
+    /// <summary>
     /// Name of the env var holding a ready-made OpenBao token. The value is
     /// re-read on every call so an externally rotated token propagates
     /// without a restart. Ignored when the AppRole pair is fully set —
@@ -180,6 +190,7 @@ public sealed record OpenBaoOptions : ICredentialOptions
         {
             Enabled = CredentialOptions.ReadBool(section, "Enabled", defaults.Enabled, warnings),
             Address = CredentialOptions.ReadNonEmpty(section, "Address", defaults.Address).TrimEnd('/'),
+            AddressConfigured = !string.IsNullOrWhiteSpace(section["Address"]),
             TokenEnvVar = CredentialOptions.ReadNonEmpty(section, "TokenEnvVar", defaults.TokenEnvVar),
             AppRoleIdEnvVar = CredentialOptions.ReadNonEmpty(section, "AppRoleIdEnvVar", defaults.AppRoleIdEnvVar),
             AppRoleSecretIdEnvVar = CredentialOptions.ReadNonEmpty(

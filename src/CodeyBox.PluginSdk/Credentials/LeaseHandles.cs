@@ -81,8 +81,10 @@ public static class LeaseHandles
     /// The lease-handle gate every credential provider applies before renew
     /// and revoke: a foreign or malformed handle is a typed
     /// <see cref="CredentialFailureKind.Misconfigured"/> failure carrying the
-    /// backend's own exception type, identical across backends. The handle is
-    /// already segment-sanitised by the parser, so echoing it is safe.
+    /// backend's own exception type, identical across backends. The echoed
+    /// handle is control-flattened and capped — a rejected handle may carry
+    /// exactly the characters the parser refused, so it is never echoed raw
+    /// into a log-persisted message.
     /// </summary>
     public static TParsed ParseOrThrow<TParsed>(
         string? leaseId,
@@ -97,7 +99,7 @@ public static class LeaseHandles
         {
             throw exceptionFactory(
                 CredentialFailureKind.Misconfigured,
-                $"Lease '{leaseId ?? string.Empty}' is not a valid {backend} lease handle.",
+                $"Lease '{CredentialMessages.Truncate(leaseId, "(no lease id)", CredentialMessages.MaxServerDetailChars)}' is not a valid {backend} lease handle.",
                 null, null, null);
         }
         return parsed;
