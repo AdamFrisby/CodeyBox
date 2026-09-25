@@ -1,0 +1,9 @@
+{
+  "event": "issueDeleted",
+  "timestamp": "2026-01-01T13:00:00.000Z",
+  "id": "2-123",
+  "numberInProject": 123,
+  "summary": "Login redirect is broken",
+  "project": { "id": "0-1", "name": "Product", "shortName": "PROJ" },
+  "description": "Fix the login redirect."
+}

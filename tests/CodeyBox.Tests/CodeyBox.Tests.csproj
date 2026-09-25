@@ -61,6 +61,7 @@
     <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.JiraWorkSyncPlugin\CodeyBox.JiraWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.PlaneWorkSyncPlugin\CodeyBox.PlaneWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.ShortcutWorkSyncPlugin\CodeyBox.ShortcutWorkSyncPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\work-sync\CodeyBox.YouTrackWorkSyncPlugin\CodeyBox.YouTrackWorkSyncPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.InfisicalPlugin\CodeyBox.InfisicalPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.DopplerPlugin\CodeyBox.DopplerPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\credentials\CodeyBox.OnePasswordPlugin\CodeyBox.OnePasswordPlugin.csproj" />

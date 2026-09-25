@@ -1,0 +1,18 @@
+{
+  "event": "commentAdded",
+  "timestamp": "2026-01-01T12:35:00.000Z",
+  "id": "2-123",
+  "numberInProject": 123,
+  "summary": "Login redirect is broken",
+  "project": { "id": "0-1", "name": "Product", "shortName": "PROJ" },
+  "comments": [
+    {
+      "id": "4-8",
+      "text": "CodeyBox update: 'Login redirect is broken' is now Working (external status: In Progress).\n\n<!-- codeybox-work-item:wi-01JEXAMPLE0000000000000000 -->",
+      "textPreview": "CodeyBox update: 'Login redirect is broken' is now Working",
+      "created": 1732709700000,
+      "updated": 1732709700000,
+      "author": { "id": "1-9", "login": "codeybox-bot", "fullName": "CodeyBox Bot", "email": "bot@example.com" }
+    }
+  ]
+}

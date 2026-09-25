@@ -1,0 +1,18 @@
+{
+  "event": "issueUpdated",
+  "timestamp": "2026-01-01T12:00:00.000Z",
+  "id": "2-123",
+  "numberInProject": 123,
+  "summary": "Login redirect is broken",
+  "project": { "id": "0-1", "name": "Product", "shortName": "PROJ" },
+  "description": "Fix the login redirect.",
+  "updated": 1732708800000,
+  "updatedBy": { "id": "1-2", "login": "op", "fullName": "Operator", "email": "op@example.com" },
+  "changedFields": [
+    {
+      "name": "Assignee",
+      "oldValue": null,
+      "value": { "id": "1-9", "login": "codeybox-bot", "fullName": "CodeyBox Bot", "email": "bot@example.com" }
+    }
+  ]
+}
