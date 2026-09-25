@@ -62,6 +62,13 @@ quota meter). Give each executor host its own token environment variable and
 matching `ExecutorHostId`, and put that token (not the operator key) in the
 executor's `ApiKeyEnvVar` on that host.
 
+The majordomo MCP endpoint (`/mcp/majordomo`) is another host-scoped surface:
+it accepts only the named API client configured by
+`CodeyBox:Majordomo:ClientName` (default `majordomo`). Every other credential —
+the operator key included — is refused, so the majordomo's calls are
+attributable to its own principal and the token can be revoked without
+rotating the operator key.
+
 ### GitHub App delivery credentials
 
 For team installations, configure the GitHub upstream with a GitHub App

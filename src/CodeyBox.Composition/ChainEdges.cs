@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 
-namespace CodeyBox.Admin.Model;
+namespace CodeyBox.Composition;
 
 /// <summary>
 /// The edge algebra of a chain under composition: items are 1-based

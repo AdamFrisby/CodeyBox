@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using CodeyBox.Core;
 
 namespace CodeyBox.Majordomo;
@@ -7,6 +8,13 @@ namespace CodeyBox.Majordomo;
 /// union mirrors the mutate vocabulary one-to-one — a change kind outside
 /// this set is unrepresentable.
 /// </summary>
+[JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
+[JsonDerivedType(typeof(CreateItem), "create_item")]
+[JsonDerivedType(typeof(CreateChain), "create_chain")]
+[JsonDerivedType(typeof(UpdateItem), "update_item")]
+[JsonDerivedType(typeof(CancelItem), "cancel_item")]
+[JsonDerivedType(typeof(CancelDependents), "cancel_dependents")]
+[JsonDerivedType(typeof(RetryItem), "retry_item")]
 public abstract record MajordomoPlannedChange
 {
     private MajordomoPlannedChange() { }
@@ -41,6 +49,15 @@ public abstract record MajordomoPlannedChange
     /// <summary>Cancel one item with an operator-facing reason.</summary>
     public sealed record CancelItem(WorkItemId Id, string Reason) : MajordomoPlannedChange;
 
+    /// <summary>
+    /// Cancel every queued item that transitively depends on
+    /// <paramref name="ParentId"/> — the cascade a cancel commits alongside
+    /// the named item. Listed explicitly so a dry-run or proposal review sees
+    /// the full blast radius, not just the item the call named.
+    /// </summary>
+    public sealed record CancelDependents(WorkItemId ParentId, IReadOnlyList<WorkItemId> Ids)
+        : MajordomoPlannedChange;
+
     /// <summary>Re-queue one item resuming from a pipeline phase.</summary>
     public sealed record RetryItem(
         WorkItemId Id,
@@ -58,4 +75,16 @@ public abstract record MajordomoPlannedChange
 public sealed record MajordomoChangeSet(
     bool DryRun,
     IReadOnlyList<MajordomoPlannedChange> Changes,
-    IReadOnlyList<WorkItemId> AffectedItems) : MajordomoToolResult;
+    IReadOnlyList<WorkItemId> AffectedItems) : MajordomoToolResult
+{
+    /// <summary>
+    /// How many work items <see cref="Changes"/> would mutate: one per change
+    /// except a chain (its node count) and a dependent cascade (its id count).
+    /// </summary>
+    public int PlannedItemCount => Changes.Sum(static change => change switch
+    {
+        MajordomoPlannedChange.CreateChain chain => chain.Nodes.Count,
+        MajordomoPlannedChange.CancelDependents dependents => dependents.Ids.Count,
+        _ => 1,
+    });
+}

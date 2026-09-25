@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Pure work-item composition layer: no I/O, no clock reads, no package
+         dependencies. Shared by the admin composer (paste path) and the
+         majordomo MCP server (structured path) so a chain is reviewed by one
+         code path regardless of who assembled it. -->
+  </PropertyGroup>
+
+</Project>

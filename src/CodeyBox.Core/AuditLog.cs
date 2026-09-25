@@ -1822,6 +1822,38 @@ public static class AuditLog
         }
     }
 
+    // ── Majordomo MCP calls ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Emitted for every majordomo MCP tool call BEFORE the call is attempted —
+    /// including refused calls — so the audit trail always carries the tool
+    /// name, the caller's identity, the authorization decision, and the raw
+    /// arguments. <paramref name="callId"/> links this record to the matching
+    /// <see cref="MajordomoToolOutcome"/>.
+    /// </summary>
+    /// <param name="argumentsJson">
+    /// The raw call arguments, bounded by the caller; never a secret-bearing
+    /// channel (credentials never enter tool arguments by contract).
+    /// </param>
+    public static void MajordomoToolCall(
+        string callId, string identity, string tool, string decision, string argumentsJson) =>
+        Audit("majordomo.tool_call")
+            .Information(
+                "Majordomo call {CallId}: {Identity} invoked {Tool} — decision {Decision}; args {Arguments}",
+                callId, identity, tool, decision, argumentsJson);
+
+    /// <summary>
+    /// Emitted when a majordomo MCP tool call settles: the outcome the caller
+    /// received (executed, dry-run, proposed, refused) plus optional detail.
+    /// </summary>
+    public static void MajordomoToolOutcome(
+        string callId, string identity, string tool, string outcome, string? detail) =>
+        Audit("majordomo.tool_outcome")
+            .ForContext("Detail", detail ?? "")
+            .Information(
+                "Majordomo call {CallId}: {Identity} {Tool} → {Outcome}",
+                callId, identity, tool, outcome);
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>

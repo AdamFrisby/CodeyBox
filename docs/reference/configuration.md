@@ -1226,6 +1226,28 @@ Read-only parser settings for agent stream analytics.
 | `MaxLineBytes` | `67108864` | Maximum JSONL event size accepted by the parser. Defaults to 64 MiB so large tool-result events fit under the default stream file cap. |
 | `MaxJsonDepth` | `64` | Maximum JSON nesting depth accepted by the parser. |
 
+## `Majordomo`
+
+The majordomo's MCP endpoint (`POST /mcp/majordomo`, stateless streamable
+HTTP) publishes exactly the majordomo tool vocabulary. These values are
+hot-reloadable; the executor reads the current options on every call.
+
+```json
+"Majordomo": {
+  "Mode": "proposed",
+  "MaxMutatedItemsPerTurn": 8,
+  "ClientName": "majordomo",
+  "TurnWindowSeconds": 120
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Mode` | `proposed` | `autonomous` executes mutations immediately; `proposed` returns an operator-reviewable proposal with the validated change set instead of mutating. |
+| `MaxMutatedItemsPerTurn` | `8` | Per-call and cumulative per-turn cap on mutated work items (hard ceiling 100). |
+| `ClientName` | `majordomo` | The `CodeyBox:ApiClients` entry whose token is the majordomo credential. Only that client may reach the endpoint — the operator key and other named clients are refused — so majordomo calls are attributable and the credential is revocable independently. |
+| `TurnWindowSeconds` | `120` | Rolling window over which mutations from one identity accumulate toward the per-turn cap. 1–3600. |
+
 ## `Projects`
 
 See [docs/concepts/projects.md](../concepts/projects.md).

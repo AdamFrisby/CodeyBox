@@ -1420,16 +1420,12 @@ public sealed class SqliteWorkItemStore :
         Exception? innerException = null) =>
         new(workItemId, checkpointRef, reason, innerException);
 
-    public async Task CreateAsync(WorkItem item, CancellationToken ct = default)
-    {
-        await _writeLock.WaitAsync(ct);
-        try
-        {
-            using var tx = _conn.BeginTransaction();
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.Transaction = tx;
-                cmd.CommandText = """
+    /// <summary>
+    /// The INSERT shared by <see cref="CreateAsync"/> and
+    /// <see cref="CreateAllAsync"/> — one column list, one bind call, so a
+    /// batch insert can never drift from the single-row write.
+    /// </summary>
+    private const string InsertWorkItemSql = """
                     INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent, agent_instance_id,
                         work_timeout_ticks, work_timeout_override_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
@@ -1475,24 +1471,33 @@ public sealed class SqliteWorkItemStore :
                         $delegation_attempts, $delegation_requested, $delegation_reason, $delegation_note, $delegation_auto_escalated, $delegation_failed, $terminal_failure_count,
                         $initiator);
                     """;
-                Bind(cmd, item);
-                await cmd.ExecuteNonQueryAsync(ct);
-            }
-            await WriteExternalIdsAsync(tx, item.Id, item.ProjectId, item.ExternalIds, ct);
+
+    /// <summary>
+    /// The write shared by single- and multi-item inserts: the INSERT plus the
+    /// namespaced-external-id side rows, inside the caller's transaction.
+    /// </summary>
+    private async Task InsertWorkItemAsync(SqliteTransaction tx, WorkItem item, CancellationToken ct)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = InsertWorkItemSql;
+        Bind(cmd, item);
+        await cmd.ExecuteNonQueryAsync(ct);
+        await WriteExternalIdsAsync(tx, item.Id, item.ProjectId, item.ExternalIds, ct);
+    }
+
+    public async Task CreateAsync(WorkItem item, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            await InsertWorkItemAsync(tx, item, ct);
             tx.Commit();
         }
         catch (SqliteException sqlex) when (sqlex.SqliteExtendedErrorCode == 2067) // SQLITE_CONSTRAINT_UNIQUE
         {
-            if (item.OriginCheckWorkItemId is { } originCheckId
-                && IsOriginCheckUniqueViolation(sqlex))
-            {
-                throw new WorkItemOriginCheckConflictException(originCheckId);
-            }
-
-            // A concurrent request snuck past the application-level pre-check and
-            // hit either the legacy work_items.external_id UNIQUE index or the
-            // work_item_external_ids UNIQUE index on (project_id, namespace, external_id).
-            throw new WorkItemExternalIdConflictException();
+            throw MapCreateConstraintViolation(sqlex, item);
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
@@ -1511,6 +1516,69 @@ public sealed class SqliteWorkItemStore :
         // failure/park state. Runs after the write gate is released, mirroring
         // the update-path hooks.
         await EmitFailureEventIfEnteringFailureAsync(previous: null, item, ct).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public bool CreateAllIsAtomic => true;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// One write-lock acquisition and one transaction cover every item: a
+    /// constraint violation or failure partway rolls the whole batch back, so
+    /// a chain either files completely or leaves nothing behind.
+    /// </remarks>
+    public async Task CreateAllAsync(IReadOnlyList<WorkItem> items, CancellationToken ct = default)
+    {
+        if (items.Count == 0)
+            return;
+        await _writeLock.WaitAsync(ct);
+        // Track the item being inserted so a constraint violation maps to the
+        // same typed exception a single-row create would have produced.
+        var current = items[0];
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            foreach (var item in items)
+            {
+                current = item;
+                await InsertWorkItemAsync(tx, item, ct);
+            }
+            tx.Commit();
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteExtendedErrorCode == 2067) // SQLITE_CONSTRAINT_UNIQUE
+        {
+            throw MapCreateConstraintViolation(sqlex, current);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("CreateAllAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        foreach (var item in items)
+            await EmitFailureEventIfEnteringFailureAsync(previous: null, item, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Maps a UNIQUE-constraint failure on the items insert to the typed
+    /// exception the create contract publishes: an origin-check collision when
+    /// the item carries one, otherwise an external-id conflict.
+    /// </summary>
+    private Exception MapCreateConstraintViolation(SqliteException sqlex, WorkItem item)
+    {
+        if (item.OriginCheckWorkItemId is { } originCheckId
+            && IsOriginCheckUniqueViolation(sqlex))
+        {
+            return new WorkItemOriginCheckConflictException(originCheckId);
+        }
+
+        // A concurrent request snuck past the application-level pre-check and
+        // hit either the legacy work_items.external_id UNIQUE index or the
+        // work_item_external_ids UNIQUE index on (project_id, namespace, external_id).
+        return new WorkItemExternalIdConflictException();
     }
 
     /// <summary>

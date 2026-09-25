@@ -7,4 +7,12 @@
     <!-- Pure projection layer: no I/O, no clock reads, no package dependencies. -->
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- The composer-validating half of the model (chain edges, composition
+         review, knob catalog, chain builder) lives in src/CodeyBox.Composition
+         so the majordomo MCP server reviews the same shapes with the same
+         rules. Pure and dependency-free, exactly as when it lived here. -->
+    <ProjectReference Include="..\..\..\..\src\CodeyBox.Composition\CodeyBox.Composition.csproj" />
+  </ItemGroup>
+
 </Project>

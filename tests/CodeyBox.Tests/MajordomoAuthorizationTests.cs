@@ -262,6 +262,61 @@ public sealed class MajordomoAuthorizationTests
 
     [Theory]
     [MemberData(nameof(Modes))]
+    public void ProjectedAffectedItems_BoundsTheCall(MajordomoOptions options)
+    {
+        // A cancel declares 1 item; the runtime-measured cascade projects 5.
+        // The cap must bind the real blast radius, not the declared one.
+        var opts = options with { MaxMutatedItemsPerTurn = 3 };
+        var decision = MajordomoAuthorization.Decide(
+            "cancel_work_item",
+            new CancelWorkItemArgs(WorkItemId.New(), "superseded"),
+            opts,
+            MajordomoTurnUsage.None,
+            projectedAffectedItems: 5);
+
+        Assert.Equal(MajordomoRefusalReason.TooManyItemsInOneCall,
+            Assert.IsType<MajordomoDecision.Refuse>(decision).Reason);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public void ProjectedAffectedItems_BindsTheRemainingBudget(MajordomoOptions options)
+    {
+        var opts = options with { MaxMutatedItemsPerTurn = 4 };
+        var usage = new MajordomoTurnUsage { MutatedItems = 2 };
+
+        // Projected 3 exceeds the remaining 2 even though declared is 1.
+        var decision = MajordomoAuthorization.Decide(
+            "cancel_work_item",
+            new CancelWorkItemArgs(WorkItemId.New(), "superseded"),
+            opts,
+            usage,
+            projectedAffectedItems: 3);
+
+        Assert.Equal(MajordomoRefusalReason.TurnMutationBudgetExhausted,
+            Assert.IsType<MajordomoDecision.Refuse>(decision).Reason);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
+    public void ProjectedAffectedItems_CannotLowerTheDeclaredCount(MajordomoOptions options)
+    {
+        // The declared count is the floor: a stale or malicious projection
+        // must never shrink a call below what its contract reports.
+        var opts = options with { MaxMutatedItemsPerTurn = 3 };
+        var decision = MajordomoAuthorization.Decide(
+            "create_work_item_chain",
+            Chain(4),
+            opts,
+            MajordomoTurnUsage.None,
+            projectedAffectedItems: 1);
+
+        Assert.Equal(MajordomoRefusalReason.TooManyItemsInOneCall,
+            Assert.IsType<MajordomoDecision.Refuse>(decision).Reason);
+    }
+
+    [Theory]
+    [MemberData(nameof(Modes))]
     public void Call_ExactlyAtCapBoundary_IsAllowed(MajordomoOptions options)
     {
         var opts = options with { MaxMutatedItemsPerTurn = 3 };

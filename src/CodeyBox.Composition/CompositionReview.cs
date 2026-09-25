@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace CodeyBox.Admin.Model;
+namespace CodeyBox.Composition;
 
 /// <summary>
 /// Everything the composer is about to file, in one value: the shared
@@ -12,6 +12,32 @@ public sealed record Composition(
     ComposerDefaults Defaults,
     IReadOnlyList<ChainItemDraft> Items,
     IReadOnlyList<string> ExistingDependsOn);
+
+/// <summary>
+/// One node of a structured composition — the shape a machine caller (the
+/// majordomo MCP surface) supplies. A structured caller sets every field per
+/// item, so there are no shared <see cref="ComposerDefaults"/> to expand;
+/// this record carries only the projections the whole-set review can check
+/// without touching a store.
+/// </summary>
+/// <param name="DependsOnIndexes">0-based positions of earlier items in the same list this item waits for.</param>
+/// <param name="ExternalIds">The item's namespaced external ids, if any.</param>
+/// <param name="IsRefactor">Whether the item requests the project-exclusive refactor job type.</param>
+public sealed record StructuredCompositionItem(
+    IReadOnlyList<int> DependsOnIndexes,
+    IReadOnlyDictionary<string, string>? ExternalIds = null,
+    bool IsRefactor = false);
+
+/// <summary>
+/// A problem found while reviewing a structured composition. Unlike the
+/// human-facing strings from <see cref="CompositionReview.Validate(Composition)"/>,
+/// a structured problem names the offending item position and field so a
+/// model caller can correct one node and retry.
+/// </summary>
+/// <param name="ItemIndex">0-based position of the offending item, or null when the problem is set-level.</param>
+/// <param name="Field">The field at fault, in the wire's snake_case naming.</param>
+/// <param name="Message">What is wrong and what would be acceptable.</param>
+public sealed record StructuredCompositionProblem(int? ItemIndex, string Field, string Message);
 
 /// <summary>
 /// The composer's last word before filing: the problems the orchestrator
@@ -121,6 +147,112 @@ public static class CompositionReview
         if (d.IsRefactor && composition.Items.Count > 1)
         {
             problems.Add("A refactor is project-exclusive; file the chain as normal items or file one refactor.");
+        }
+
+        return problems;
+    }
+
+    /// <summary>
+    /// Reviews a structured (machine-authored) composition — the majordomo
+    /// tool surface's chain shape — returning problems that name the offending
+    /// item position and field so the caller can correct one node and retry.
+    /// The paste-path <see cref="Validate(Composition)"/> stays human-facing;
+    /// this entry point applies the same whole-set rules (graph shape,
+    /// refactor exclusivity) plus the checks a structured caller needs that
+    /// paste never did: edge indexes that dangle or point forward, and
+    /// external ids colliding between items in the same set (the composer
+    /// stamps its own chain ids, so the conflict never reached it; a
+    /// structured caller's ids are its own).
+    /// </summary>
+    public static IReadOnlyList<StructuredCompositionProblem> ValidateStructured(
+        IReadOnlyList<StructuredCompositionItem> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        var problems = new List<StructuredCompositionProblem>();
+
+        if (items.Count == 0)
+        {
+            problems.Add(new StructuredCompositionProblem(null, "items", "the set must contain at least one item"));
+            return problems;
+        }
+
+        var oneBased = new List<IReadOnlyList<int>>(items.Count);
+        for (var i = 0; i < items.Count; i++)
+        {
+            var edges = new List<int>(items[i].DependsOnIndexes.Count);
+            foreach (var raw in items[i].DependsOnIndexes)
+            {
+                if (raw < 0 || raw >= items.Count)
+                {
+                    problems.Add(new StructuredCompositionProblem(
+                        i, "depends_on_indexes",
+                        $"item {i} waits on index {raw}, but the chain only has {items.Count} item(s); " +
+                        $"indexes are 0-based positions of earlier items (valid range: 0..{items.Count - 1})"));
+                    continue;
+                }
+
+                if (raw == i)
+                {
+                    problems.Add(new StructuredCompositionProblem(
+                        i, "depends_on_indexes", $"item {i} cannot wait on itself"));
+                    continue;
+                }
+
+                if (raw > i)
+                {
+                    problems.Add(new StructuredCompositionProblem(
+                        i, "depends_on_indexes",
+                        $"item {i} waits on index {raw}, which comes later in the chain; " +
+                        "edges may only point at earlier positions"));
+                    continue;
+                }
+
+                edges.Add(raw + 1);
+            }
+
+            oneBased.Add(edges);
+        }
+
+        // Cycle detection re-runs even though the backward-only rule above
+        // already forbids them: the cycle check is the whole-set invariant the
+        // store relies on, so the review proves it on the caller's raw edges
+        // rather than trusting the contract to have normalized them.
+        var cycle = ChainEdges.CycleMembers(oneBased);
+        if (cycle.Count > 0)
+        {
+            problems.Add(new StructuredCompositionProblem(
+                cycle[0] - 1, "depends_on_indexes",
+                $"items {string.Join(", ", cycle.Select(n => (n - 1).ToString()))} wait for each other in a cycle — nothing would ever start"));
+        }
+
+        for (var i = 0; i < items.Count; i++)
+        {
+            if (items[i].IsRefactor && items.Count > 1)
+            {
+                problems.Add(new StructuredCompositionProblem(
+                    i, "is_refactor",
+                    "a refactor is project-exclusive; it cannot share a chain with other items — file it on its own"));
+            }
+        }
+
+        var seenExternalIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < items.Count; i++)
+        {
+            if (items[i].ExternalIds is not { } ids)
+            {
+                continue;
+            }
+
+            foreach (var (ns, value) in ids)
+            {
+                var key = $"{ns}\0{value}";
+                if (!seenExternalIds.TryAdd(key, i))
+                {
+                    problems.Add(new StructuredCompositionProblem(
+                        i, "external_ids",
+                        $"external id '{ns}:{value}' also belongs to item {seenExternalIds[key]} — external ids must be unique within the chain"));
+                }
+            }
         }
 
         return problems;

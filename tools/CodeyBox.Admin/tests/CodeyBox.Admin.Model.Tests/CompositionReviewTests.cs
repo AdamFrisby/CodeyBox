@@ -1,4 +1,6 @@
 using CodeyBox.Admin.Model;
+using CodeyBox.Composition;
+using ComposerComposition = CodeyBox.Composition.Composition;
 
 namespace CodeyBox.Admin.Model.Tests;
 
@@ -6,7 +8,7 @@ public sealed class CompositionReviewTests
 {
     private static ChainItemDraft Item(string title, params int[] deps) => new(title, "body", deps);
 
-    private static Composition Single(ComposerDefaults? defaults = null, string? externalId = null) =>
+    private static ComposerComposition Single(ComposerDefaults? defaults = null, string? externalId = null) =>
         new(defaults ?? new ComposerDefaults("proj"), [new ChainItemDraft("T", "b", [], externalId)], []);
 
     [Fact]
@@ -18,13 +20,13 @@ public sealed class CompositionReviewTests
     [Fact]
     public void Validate_MissingProjectTitleAndItems()
     {
-        var empty = new Composition(new ComposerDefaults(""), [], []);
+        var empty = new ComposerComposition(new ComposerDefaults(""), [], []);
         var problems = CompositionReview.Validate(empty);
 
         Assert.Contains(problems, p => p.Contains("Pick a project"));
         Assert.Contains(problems, p => p.Contains("nothing to file"));
 
-        var untitled = new Composition(new ComposerDefaults("p"), [Item(""), Item("ok", 1)], []);
+        var untitled = new ComposerComposition(new ComposerDefaults("p"), [Item(""), Item("ok", 1)], []);
         Assert.Contains(CompositionReview.Validate(untitled), p => p.Contains("Item 1 needs a title"));
     }
 
@@ -46,7 +48,7 @@ public sealed class CompositionReviewTests
     [Fact]
     public void Validate_CycleIsNamed()
     {
-        var c = new Composition(new ComposerDefaults("p"), [Item("a", 2), Item("b", 1), Item("c", 2)], []);
+        var c = new ComposerComposition(new ComposerDefaults("p"), [Item("a", 2), Item("b", 1), Item("c", 2)], []);
 
         Assert.Contains(CompositionReview.Validate(c), p => p.Contains("Items 1, 2 wait for each other"));
     }
@@ -54,7 +56,7 @@ public sealed class CompositionReviewTests
     [Fact]
     public void Validate_RefactorChainIsRefused()
     {
-        var c = new Composition(new ComposerDefaults("p", IsRefactor: true), [Item("a"), Item("b", 1)], []);
+        var c = new ComposerComposition(new ComposerDefaults("p", IsRefactor: true), [Item("a"), Item("b", 1)], []);
 
         Assert.Contains(CompositionReview.Validate(c), p => p.Contains("refactor is project-exclusive"));
     }
@@ -93,7 +95,7 @@ public sealed class CompositionReviewTests
         var d = new ComposerDefaults("p", Agent: "claude", Priority: 5, AuditMaxIterations: 8,
             AuditorProfile: "strict", RequiredCapabilities: ["gpu"],
             Knobs: new Dictionary<string, string> { ["changeScope"] = "surgical" }, PushUpstream: false);
-        var c = new Composition(d, [Item("a"), Item("b", 1), Item("c", 1)], ["11111111-aaaa"]);
+        var c = new ComposerComposition(d, [Item("a"), Item("b", 1), Item("c", 1)], ["11111111-aaaa"]);
 
         var sentence = CompositionReview.Describe(c, "Proj", id => "ticket " + id[..4]);
 

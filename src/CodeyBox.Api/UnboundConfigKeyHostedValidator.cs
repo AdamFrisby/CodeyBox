@@ -103,6 +103,7 @@ internal sealed class UnboundConfigKeyHostedValidator : IHostedService
             // trip strict validation while typos inside it still surface.
             ["CodeyBox:SeededFakeAgents"] = new(typeof(SeededFakeAgentOptions), AllowsExtensionKeys: false),
             ["CodeyBox:Plugins"] = new(typeof(PluginOptions), AllowsExtensionKeys: true),
+            ["CodeyBox:Majordomo"] = new(typeof(CodeyBox.Api.Majordomo.MajordomoServerOptions), AllowsExtensionKeys: false),
         };
 
     private const string KnobsSectionPath = "CodeyBox:ConfigValidation:UnboundKeys";

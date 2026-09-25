@@ -34,6 +34,7 @@
     <Project Path="src/CodeyBox.Audit.Presets/CodeyBox.Audit.Presets.csproj" />
     <Project Path="src/CodeyBox.Audit.Shell/CodeyBox.Audit.Shell.csproj" />
     <Project Path="src/CodeyBox.Audit/CodeyBox.Audit.csproj" />
+    <Project Path="src/CodeyBox.Composition/CodeyBox.Composition.csproj" />
     <Project Path="src/CodeyBox.Core/CodeyBox.Core.csproj" />
     <Project Path="src/CodeyBox.Deployment/CodeyBox.Deployment.csproj" />
     <Project Path="src/CodeyBox.Executor/CodeyBox.Executor.csproj" />

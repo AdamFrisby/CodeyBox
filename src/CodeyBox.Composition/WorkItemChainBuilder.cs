@@ -1,4 +1,4 @@
-namespace CodeyBox.Admin.Model;
+namespace CodeyBox.Composition;
 
 /// <summary>
 /// Shared defaults applied to every item filed from the composer.

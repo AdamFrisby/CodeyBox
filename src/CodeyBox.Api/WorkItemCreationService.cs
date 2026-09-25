@@ -34,11 +34,19 @@ internal sealed class WorkItemCreationService
     public Task<PreparedWorkItemCreationResult> PrepareAsync(
         CreateWorkItemRequest req,
         CancellationToken ct = default) =>
-        PrepareAsync(req, provenance: null, ct);
+        PrepareAsync(req, provenance: null, pendingSiblings: null, ct);
 
+    /// <param name="pendingSiblings">
+    /// Items already prepared in the same batch but not yet committed (e.g.
+    /// the earlier nodes of a chain). They join the dependency-resolution and
+    /// cycle-detection graph and the external-id conflict pre-check so a
+    /// prepared node may depend on — and must not collide with — a node the
+    /// batch will create alongside it.
+    /// </param>
     public async Task<PreparedWorkItemCreationResult> PrepareAsync(
         CreateWorkItemRequest req,
         WorkItemCreationProvenance? provenance,
+        IReadOnlyList<WorkItem>? pendingSiblings,
         CancellationToken ct = default)
     {
         var (title, titleError) = WorkItemFieldRules.NormalizeTitle(req.Title);
@@ -89,6 +97,12 @@ internal sealed class WorkItemCreationService
             var conflict = await _store.GetByNamespacedExternalIdAsync(pid, ns, value, ct);
             if (conflict is not null)
                 return Error($"externalId '{value}' in namespace '{ns}' already exists in project '{pid}' for work item {conflict.Id} (state: {conflict.State})");
+            var pendingConflict = pendingSiblings?.FirstOrDefault(p =>
+                p.ProjectId == pid
+                && p.ExternalIds.TryGetValue(ns, out var pendingValue)
+                && string.Equals(pendingValue, value, StringComparison.Ordinal));
+            if (pendingConflict is not null)
+                return Error($"externalId '{value}' in namespace '{ns}' is already used by another item in this batch");
         }
 
         AgentKind? agentOverride = null;
@@ -127,6 +141,8 @@ internal sealed class WorkItemCreationService
         if (req.DependsOn?.Length > 0)
         {
             await foreach (var existing in _store.ListAsync(ct)) allItems.Add(existing);
+            if (pendingSiblings is not null)
+                allItems.AddRange(pendingSiblings);
             foreach (var existing in allItems.Where(i => i.ProjectId == pid))
             {
                 foreach (var (ns, value) in existing.ExternalIds)
@@ -253,7 +269,7 @@ internal sealed class WorkItemCreationService
         {
             var (normalisedKnobs, knobErr) = NormaliseKnobs(req.Knobs, _knobs);
             if (knobErr is not null)
-                return new PreparedWorkItemCreationResult(null, knobErr);
+                return new PreparedWorkItemCreationResult(null, Results.BadRequest(new { error = knobErr }));
             knobs = normalisedKnobs!;
         }
 
@@ -313,7 +329,7 @@ internal sealed class WorkItemCreationService
             {
                 var (normalisedOnYesKnobs, onYesKnobErr) = NormaliseKnobs(onYes.Knobs, _knobs);
                 if (onYesKnobErr is not null)
-                    return new PreparedWorkItemCreationResult(null, onYesKnobErr);
+                    return new PreparedWorkItemCreationResult(null, Results.BadRequest(new { error = onYesKnobErr }));
                 onYesKnobs = normalisedOnYesKnobs!;
             }
 
@@ -449,6 +465,28 @@ internal sealed class WorkItemCreationService
             }
             return Error("an external id already exists in this project (concurrent duplicate)");
         }
+
+        return await CompleteCommitAsync(prepared, ct).ConfigureAwait(false);
+
+        CommittedWorkItemCreationResult Error(string message) =>
+            new(
+                item,
+                prepared.Project,
+                new Dictionary<WorkItemId, WorkItemState>(),
+                new Dictionary<WorkItemId, string?>(),
+                Results.BadRequest(new { error = message }));
+    }
+
+    /// <summary>
+    /// The post-write half of a creation commit, shared by
+    /// <see cref="CommitAsync"/> and <see cref="CommitAllAsync"/>: audit
+    /// entry, satisfied-dependency enqueue against fresh dependency states,
+    /// release webhook. Runs only after the row exists.
+    /// </summary>
+    private async Task<CommittedWorkItemCreationResult> CompleteCommitAsync(
+        PreparedWorkItemCreation prepared, CancellationToken ct)
+    {
+        var item = prepared.Item;
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title, item.Initiator);
 
         var freshDepStates = new Dictionary<WorkItemId, WorkItemState>();
@@ -480,25 +518,66 @@ internal sealed class WorkItemCreationService
             freshDepStates,
             freshDepExternalIds,
             null);
+    }
 
-        CommittedWorkItemCreationResult Error(string message) =>
-            new(
-                item,
-                prepared.Project,
-                new Dictionary<WorkItemId, WorkItemState>(),
-                new Dictionary<WorkItemId, string?>(),
-                Results.BadRequest(new { error = message }));
+    /// <summary>
+    /// Commits a set of prepared creations as one store transaction, then runs
+    /// the same per-item post-commit work <see cref="CommitAsync"/> performs —
+    /// audit entry, satisfied-dependency enqueue, release webhook — for each
+    /// item in order. A store failure rolls back the whole batch: the chain
+    /// either files completely or leaves nothing behind.
+    /// </summary>
+    public async Task<CommittedWorkItemChainResult> CommitAllAsync(
+        IReadOnlyList<PreparedWorkItemCreation> preparedItems,
+        CancellationToken ct = default)
+    {
+        // The all-or-nothing contract below is only real when the store
+        // commits the batch in one transaction — the sequential interface
+        // default would leave a partial chain behind on a mid-batch failure.
+        // Fail loudly rather than silently degrade.
+        if (!_store.CreateAllIsAtomic)
+            throw new InvalidOperationException(
+                "chain creation requires a store whose CreateAllAsync commits atomically " +
+                $"({nameof(IWorkItemStore.CreateAllIsAtomic)}), but {_store.GetType().Name} does not provide it");
+
+        try { await _store.CreateAllAsync(preparedItems.Select(p => p.Item).ToList(), ct); }
+        catch (WorkItemExternalIdConflictException)
+        {
+            // Identify which prepared item's external id collided so the caller
+            // can name it — the batch itself rolled back, nothing was filed.
+            foreach (var p in preparedItems)
+            {
+                foreach (var (ns, value) in p.CanonicalExternalIds)
+                {
+                    var conflict = await _store.GetByNamespacedExternalIdAsync(p.Item.ProjectId, ns, value, ct);
+                    if (conflict is not null)
+                        return new CommittedWorkItemChainResult(
+                            [], Results.BadRequest(new
+                            {
+                                error = $"externalId '{value}' in namespace '{ns}' already exists in project '{p.Item.ProjectId}' for work item {conflict.Id} (state: {conflict.State})",
+                            }));
+                }
+            }
+            return new CommittedWorkItemChainResult(
+                [], Results.BadRequest(new { error = "an external id already exists in this project (concurrent duplicate)" }));
+        }
+
+        var committed = new List<CommittedWorkItemCreationResult>(preparedItems.Count);
+        foreach (var prepared in preparedItems)
+            committed.Add(await CompleteCommitAsync(prepared, ct).ConfigureAwait(false));
+
+        return new CommittedWorkItemChainResult(committed, null);
     }
 
     private static readonly IReadOnlyDictionary<string, string> EmptyKnobs
         = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-    internal static (IReadOnlyDictionary<string, string>? Knobs, IResult? Error) NormaliseKnobs(
+    internal static (IReadOnlyDictionary<string, string>? Knobs, string? Error) NormaliseKnobs(
         IReadOnlyDictionary<string, string> raw,
         IKnobRegistry registry)
     {
         if (WorkItemFieldRules.CheckKnobOverrideCount(raw.Count) is { } countError)
-            return (null, Results.BadRequest(new { error = countError }));
+            return (null, countError);
 
         // The registry runs first so its errors (unknown key, rejected value)
         // keep their wording — it renders echoed keys/values through
@@ -511,13 +590,13 @@ internal sealed class WorkItemCreationService
         {
             var verdict = registry.Normalize(rawKey, rawValue);
             if (!verdict.Ok)
-                return (null, Results.BadRequest(new { error = verdict.Error }));
+                return (null, verdict.Error);
             normalised[verdict.Key!] = verdict.Value!;
         }
 
         var (bounded, boundsError) = WorkItemFieldRules.NormalizeKnobOverrides(normalised);
         if (boundsError is not null)
-            return (null, Results.BadRequest(new { error = boundsError }));
+            return (null, boundsError);
 
         return (bounded, null);
     }
@@ -562,4 +641,8 @@ internal sealed record CommittedWorkItemCreationResult(
     Project Project,
     IReadOnlyDictionary<WorkItemId, WorkItemState> DependencyStates,
     IReadOnlyDictionary<WorkItemId, string?> DependencyExternalIds,
+    IResult? Error);
+
+internal sealed record CommittedWorkItemChainResult(
+    IReadOnlyList<CommittedWorkItemCreationResult> Items,
     IResult? Error);

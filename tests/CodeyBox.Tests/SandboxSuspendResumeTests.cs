@@ -56,14 +56,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
     };
 
-    private static async Task WaitUntilAsync(Func<bool> condition)
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
     {
-        await WaitUntilAsync(() => Task.FromResult(condition()));
+        await WaitUntilAsync(() => Task.FromResult(condition()), timeout);
     }
 
-    private static async Task WaitUntilAsync(Func<Task<bool>> condition)
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition, TimeSpan? timeout = null)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(1);
+        var deadline = DateTimeOffset.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(1));
         while (DateTimeOffset.UtcNow < deadline)
         {
             if (await condition())
@@ -2119,15 +2119,15 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // Unlike the resume-hangs bound tests (which can use 50ms because the
         // resume itself is what's being cancelled), this test needs the resume
         // and adoption phases to SUCCEED so the promotion path is reached and
-        // CheckpointPushCalls gets recorded. The resume side spins up a
-        // LongRunning thread to call ResumeSandboxAsync; under CI load the
-        // thread can take well over a second to be scheduled, and if the
-        // resume-side timeout fires first the promotion never runs and the
-        // Assert.Single below sees an empty queue. 3s is far above the
-        // observed scheduling lag (≤2s on the worst CI runs) yet still well
-        // under the 15s outer WaitAsync, so the bound (push hang cancelled by
-        // resume timeout) is still verified.
-        var configuredTimeout = TimeSpan.FromSeconds(3);
+        // CheckpointPushCalls gets recorded. A configured timeout above the
+        // 5s short-wait cutover routes the resume wait through
+        // WaitAsync(timeout, _time, ct) on the injected clock, so the
+        // resume/adoption/push LongRunning threads get effectively unbounded
+        // wall-clock time to be scheduled under CI load — the previous real
+        // 3s/15s bounds lost that race on saturated runners. The bound under
+        // test (the hanging push cancelled by the configured timeout) still
+        // fires deterministically on Advance().
+        var configuredTimeout = TimeSpan.FromSeconds(30);
         var item = MakeItem();
         await _store.CreateAsync(item with
         {
@@ -2141,15 +2141,30 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             AdoptionExitCodeToReturn = 0,
             CheckpointPushHangs = true,
         };
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
             NoopStartupRecoveryInputSink.Instance,
-            resumeTimeout: configuredTimeout);
+            resumeTimeout: configuredTimeout,
+            timeProvider: fakeTime);
 
-        await svc.ResumeAllForTestAsync(CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(15));
+        var resume = svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        // The clock must not be advanced until the push is in flight: an early
+        // Advance could fire the resume/adoption fake-clock timeouts and skip
+        // promotion entirely. The provider records the call inside
+        // PushSuspendedVmCheckpointRefAsync, so observing it proves the
+        // earlier phases completed and only the promotion timers remain armed.
+        // This is the test's only real-time wait.
+        await WaitUntilAsync(() => provider.CheckpointPushCalls.Count == 1, TimeSpan.FromSeconds(30));
+
+        // The push hangs forever; the sweep can only complete when the
+        // configured timeout fires on the injected clock. The outer WaitAsync
+        // is a pure hang backstop, not part of the bound under test.
+        await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout)
+            .WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Single(provider.CheckpointPushCalls);
         var after = await _store.GetAsync(item.Id);
@@ -2161,7 +2176,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task StartupResume_AdoptionExit0_ButPushBlocksBeforeReturningTask_IsBoundedByResumeTimeout()
     {
-        var configuredTimeout = TimeSpan.FromSeconds(3);
+        // Same shape as the push-hangs bound test above: the success phases
+        // run on the injected clock so thread-scheduling lag under CI load
+        // cannot trip them, and only the blocked-push timeout fires on
+        // Advance(). The provider blocks the calling thread before returning
+        // its Task, so the call must be observed before advancing and the
+        // release must run even if an assertion fails (the blocked LongRunning
+        // thread is held until then).
+        var configuredTimeout = TimeSpan.FromSeconds(30);
         var item = MakeItem();
         await _store.CreateAsync(item with
         {
@@ -2175,17 +2197,21 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             AdoptionExitCodeToReturn = 0,
             CheckpointPushBlocksBeforeReturningTask = true,
         };
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
             NoopStartupRecoveryInputSink.Instance,
-            resumeTimeout: configuredTimeout);
+            resumeTimeout: configuredTimeout,
+            timeProvider: fakeTime);
 
+        var resume = svc.ResumeAllForTestAsync(CancellationToken.None);
         try
         {
-            await svc.ResumeAllForTestAsync(CancellationToken.None)
-                .WaitAsync(TimeSpan.FromSeconds(15));
+            await WaitUntilAsync(() => provider.CheckpointPushCalls.Count == 1, TimeSpan.FromSeconds(30));
+            await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout)
+                .WaitAsync(TimeSpan.FromSeconds(60));
         }
         finally
         {
