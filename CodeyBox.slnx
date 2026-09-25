@@ -60,6 +60,7 @@
   </Folder>
   <Folder Name="/plugins/">
     <Project Path="plugins/auditors-architecture/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-documentation/CodeyBox.LycheeAuditorPlugin/CodeyBox.LycheeAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.EslintAuditorPlugin/CodeyBox.EslintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/CodeyBox.GitleaksAuditorPlugin.csproj" />
