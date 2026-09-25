@@ -88,6 +88,7 @@ public static class OrchestratorOptionsFactory
             NoProgressBackoffBase = wp.NoProgressBackoffBase,
             NoProgressBackoffMax = wp.NoProgressBackoffMax,
             MaxNoProgressRedispatches = wp.MaxNoProgressRedispatches,
+            PreferInFlightOverFresh = wp.PreferInFlightOverFresh,
         };
     }
 

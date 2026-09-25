@@ -1840,7 +1840,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.ListByStateAsync(state, ct);
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.CountByStateAsync(state, ct);
         public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => _inner.ReorderAsync(orderedIds, ct);
-        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => _inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) => _inner.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct);
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => _inner.CountStartedInWindowAsync(projectId, since, ct);
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => _inner.CountInFlightAsync(projectId, ct);
         public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => _inner.GetByExternalIdAsync(projectId, externalId, ct);

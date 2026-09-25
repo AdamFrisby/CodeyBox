@@ -504,11 +504,12 @@ public sealed class WorkerPoolSlotLeakTests : IDisposable
 
         public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
             IReadOnlySet<WorkItemId> skipIds,
+            DispatchCandidateOrdering ordering,
             [EnumeratorCancellation] CancellationToken ct = default)
         {
             if (ListDispatchEligibleHook is { } hook)
                 await hook(ct);
-            await foreach (var item in inner.ListDispatchEligibleByPriorityAsync(skipIds, ct).ConfigureAwait(false))
+            await foreach (var item in inner.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct).ConfigureAwait(false))
                 yield return item;
         }
 

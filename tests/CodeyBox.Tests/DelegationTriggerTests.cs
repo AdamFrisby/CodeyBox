@@ -401,7 +401,7 @@ public sealed class DelegationTriggerTests : IDisposable
         // items instead of jumping the queue or taking a reserved lane.
         var eligible = new List<WorkItem>();
         await foreach (var item in store.ListDispatchEligibleByPriorityAsync(
-            new HashSet<WorkItemId>(), CancellationToken.None))
+            new HashSet<WorkItemId>(), DispatchCandidateOrdering.FinishingThenPriority, CancellationToken.None))
         {
             eligible.Add(item);
         }

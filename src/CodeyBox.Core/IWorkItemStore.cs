@@ -41,6 +41,32 @@ public enum QuotaRetryDispatchEligibility
 }
 
 /// <summary>
+/// Candidate ordering applied by dispatch-pickup store queries
+/// (<see cref="IWorkItemStore.ListDispatchEligibleByPriorityAsync"/> and
+/// <see cref="IWorkItemStore.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync"/>).
+/// Both variants lead with the post-audit finishing-phase precedence bucket
+/// (<see cref="QuotaRetryPhasePolicy.DispatchPhaseBucket"/>); they differ in
+/// the keys that follow.
+/// </summary>
+public enum DispatchCandidateOrdering
+{
+    /// <summary>
+    /// Finishing bucket, then <c>priority DESC</c>, then <c>created_at ASC</c>.
+    /// </summary>
+    FinishingThenPriority,
+
+    /// <summary>
+    /// Finishing bucket, then <c>priority DESC</c>, then in-flight progress
+    /// (states in <see cref="QuotaRetryPhasePolicy.InFlightDispatchStates"/>)
+    /// before fresh starts, then <c>queue_position ASC</c> (0 sorts last),
+    /// then <c>created_at ASC</c>. This is the "in-flight before fresh"
+    /// preference: work that already consumed pipeline effort outranks an
+    /// equal-priority fresh start when a slot frees.
+    /// </summary>
+    InFlightBeforeFresh,
+}
+
+/// <summary>
 /// Seek cursor for priority-ordered <see cref="WorkItemState.WaitingForQuotaReset"/> scans.
 /// The ordering is priority descending, then created time ascending, then id ascending.
 /// </summary>
@@ -446,8 +472,9 @@ public interface IWorkItemStore
     /// Returns dispatch-eligible items (Queued plus the mid-pipeline resumable states
     /// produced by recovery: Working with a preempt checkpoint, WorkComplete,
     /// AuditPassed, Merged, etc.) ordered with post-audit finishing phases before
-    /// fresh queued work, then by <c>priority DESC, created_at ASC</c> within each
-    /// phase bucket. Skips any IDs in <paramref name="skipIds"/> (active or deferred
+    /// fresh queued work, then by the trailing keys selected by
+    /// <paramref name="ordering"/> (see <see cref="DispatchCandidateOrdering"/>).
+    /// Skips any IDs in <paramref name="skipIds"/> (active or deferred
     /// work the caller is tracking). Implementations may buffer candidates to hydrate
     /// related data before yielding; callers must not rely on partial reads avoiding
     /// the cost of finding the eligible set. Terminal states plus parked
@@ -455,7 +482,10 @@ public interface IWorkItemStore
     /// <c>WaitingForAgentResume</c>, and <c>WaitingForTransientRetry</c> rows
     /// are excluded.
     /// </summary>
-    IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default);
+    IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        DispatchCandidateOrdering ordering,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Returns the dispatcher pickup set in one unified dispatch order: ordinary
@@ -464,9 +494,9 @@ public interface IWorkItemStore
     /// unless <paramref name="quotaRetryEligibility"/> is
     /// <see cref="QuotaRetryDispatchEligibility.IncludeFuture"/>. Finishing
     /// phases retain the same precedence as
-    /// <see cref="ListDispatchEligibleByPriorityAsync"/>; rows are then ordered
-    /// by <c>priority DESC</c>, then <c>created_at ASC</c> inside each phase
-    /// bucket.
+    /// <see cref="ListDispatchEligibleByPriorityAsync"/>; the trailing keys are
+    /// selected by <paramref name="ordering"/> (see
+    /// <see cref="DispatchCandidateOrdering"/>).
     /// Implementations should apply <paramref name="limit"/> as close to the
     /// storage query as possible so dispatch wakes cannot scan an unbounded
     /// parked-quota backlog.
@@ -475,13 +505,14 @@ public interface IWorkItemStore
         IReadOnlySet<WorkItemId> skipIds,
         DateTimeOffset now,
         int limit,
+        DispatchCandidateOrdering ordering,
         QuotaRetryDispatchEligibility quotaRetryEligibility = QuotaRetryDispatchEligibility.DueOnly,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<(WorkItem Item, WorkItemState OrderingState, int Sequence)>();
         var sequence = 0;
 
-        await foreach (var item in ListDispatchEligibleByPriorityAsync(skipIds, ct).ConfigureAwait(false))
+        await foreach (var item in ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct).ConfigureAwait(false))
             rows.Add((item, item.State, sequence++));
 
         await foreach (var item in ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct).ConfigureAwait(false))
@@ -493,9 +524,17 @@ public interface IWorkItemStore
             rows.Add((item, QuotaRetryPhasePolicy.OrderingStateForQuotaRetryCandidate(item), sequence++));
         }
 
-        foreach (var row in rows
+        var ordered = rows
             .OrderBy(static row => QuotaRetryPhasePolicy.DispatchPhaseBucket(row.OrderingState))
-            .ThenByDescending(static row => row.Item.Priority)
+            .ThenByDescending(static row => row.Item.Priority);
+        if (ordering == DispatchCandidateOrdering.InFlightBeforeFresh)
+        {
+            ordered = ordered
+                .ThenBy(static row => QuotaRetryPhasePolicy.DispatchInFlightBucket(row.OrderingState))
+                .ThenBy(static row => row.Item.QueuePosition > 0 ? row.Item.QueuePosition : long.MaxValue);
+        }
+
+        foreach (var row in ordered
             .ThenBy(static row => row.Item.CreatedAt)
             .ThenBy(static row => row.Sequence)
             .Take(Math.Max(0, limit)))

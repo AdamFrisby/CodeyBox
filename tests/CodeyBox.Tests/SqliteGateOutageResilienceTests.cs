@@ -157,13 +157,13 @@ public sealed class SqliteGateOutageResilienceTests : IDisposable
 
             var eligible = new List<WorkItem>();
             await foreach (var w in store.ListDispatchEligibleByPriorityAsync(
-                new HashSet<WorkItemId>(), cts.Token))
+                new HashSet<WorkItemId>(), DispatchCandidateOrdering.FinishingThenPriority, cts.Token))
                 eligible.Add(w);
             Assert.Contains(eligible, w => w.Id == item.Id);
 
             var eligibleWithQuota = new List<WorkItem>();
             await foreach (var w in store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
-                new HashSet<WorkItemId>(), DateTimeOffset.UtcNow, 10, ct: cts.Token))
+                new HashSet<WorkItemId>(), DateTimeOffset.UtcNow, 10, DispatchCandidateOrdering.FinishingThenPriority, ct: cts.Token))
                 eligibleWithQuota.Add(w);
             Assert.Contains(eligibleWithQuota, w => w.Id == item.Id);
 
@@ -297,12 +297,13 @@ public sealed class SqliteGateOutageResilienceTests : IDisposable
 
         public async IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
             IReadOnlySet<WorkItemId> skipIds,
+            DispatchCandidateOrdering ordering,
             [EnumeratorCancellation] CancellationToken ct = default)
         {
             if (Interlocked.Decrement(ref _remaining) >= 0)
                 throw new SqliteWriteGateAcquisitionTimeoutException(
                     "dispatch pickup (test)", "gate holder (test)", TimeSpan.FromMilliseconds(1));
-            await foreach (var item in inner.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+            await foreach (var item in inner.ListDispatchEligibleByPriorityAsync(skipIds, ordering, ct))
                 yield return item;
         }
 

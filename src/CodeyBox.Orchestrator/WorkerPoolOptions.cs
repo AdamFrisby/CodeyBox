@@ -76,4 +76,17 @@ public sealed class WorkerPoolOptions
     /// being re-dispatched. Default 10.
     /// </summary>
     public int MaxNoProgressRedispatches { get; set; } = 10;
+
+    /// <summary>
+    /// "In-flight before fresh" ordering preference. When on — the default —
+    /// the pickup ordering ranks items already past the work phase
+    /// (WorkComplete / Reworking / AuditPassed / merge phases) ahead of
+    /// equal-priority fresh Queued starts, tie-broken by queue position, so a
+    /// woken deferred item keeps its queue rank against new work competing
+    /// for a freed slot. When off, ordering falls back to finishing bucket,
+    /// then priority, then creation order. Independent of the cap-deferral
+    /// release wake, which is unconditional. Hot-reloadable: the new
+    /// preference applies to the next pickup.
+    /// </summary>
+    public bool PreferInFlightOverFresh { get; set; } = true;
 }

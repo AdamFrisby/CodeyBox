@@ -297,7 +297,7 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
             await _store.CreateAsync(item);
 
         var ordered = new List<WorkItemId>();
-        await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+        await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>(), DispatchCandidateOrdering.FinishingThenPriority))
             ordered.Add(item.Id);
 
         Assert.Equal(

@@ -14,6 +14,7 @@ Three independent knobs control worker admission and sandbox pressure:
 | `CodeyBox:WorkerPool:MaxConcurrentWorkers` | `int` | `1` | Hard cap on simultaneous in-flight work items |
 | `CodeyBox:WorkerPool:MaxConcurrentSandboxes` | `int` | `2 * MaxConcurrentWorkers` | Global cap on live sandboxes/VMs across every phase |
 | `CodeyBox:WorkerPool:MinSpawnInterval` | `string` (TimeSpan) | `"00:00:00"` (none) | Minimum wall-clock gap between consecutive spawns |
+| `CodeyBox:WorkerPool:PreferInFlightOverFresh` | `bool` | `true` | Rank items past the work phase ahead of equal-priority fresh starts in dispatch ordering, tie-broken by queue position |
 | `CodeyBox:WorkerPool:DispatchGateAcquisitionBackoff` | `string` (TimeSpan) | `"00:00:01"` | Backoff between dispatch pickups after a SQLite write-gate acquisition timeout |
 | `CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `int` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit). Waits on an in-budget SQLite maintenance hold do not count. |
 
@@ -146,9 +147,10 @@ already waiting out the old interval keeps the bound it started with).
 
 ### Hot reload vs restart
 
-`MaxConcurrentWorkers`, `MaxConcurrentSandboxes`, and `MinSpawnInterval` are
-re-bound live by `AgentConfigHotReload` — no restart needed, and in-flight
-work is never aborted by a resize. The remaining `WorkerPool` knobs
+`MaxConcurrentWorkers`, `MaxConcurrentSandboxes`, `MinSpawnInterval`, and
+`PreferInFlightOverFresh` are re-bound live by `AgentConfigHotReload` — no
+restart needed, in-flight work is never aborted by a resize, and an ordering
+preference flip applies to the next pickup. The remaining `WorkerPool` knobs
 (`DispatchGateAcquisitionBackoff`,
 `MaxConsecutiveDispatchGateTimeoutsBeforeEscalation`, `NoProgressBackoffBase`,
 `NoProgressBackoffMax`, `MaxNoProgressRedispatches`) are captured into the

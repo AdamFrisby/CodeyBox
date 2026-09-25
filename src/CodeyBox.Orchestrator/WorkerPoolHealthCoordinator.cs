@@ -89,6 +89,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
             skipIds,
             DateTimeOffset.UtcNow,
             scanLimit,
+            _dispatcher.CurrentDispatchOrdering,
             QuotaRetryDispatchEligibility.IncludeFuture,
             ct))
         {

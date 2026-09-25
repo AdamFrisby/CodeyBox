@@ -755,7 +755,7 @@ public sealed class KnobWorkPromptPreprocessorTests
         public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => Empty(ct);
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => throw NS();
         public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => throw NS();
-        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => Empty(ct);
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) => Empty(ct);
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => throw NS();
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => throw NS();
         public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => throw NS();
@@ -798,7 +798,7 @@ public sealed class KnobWorkPromptPreprocessorTests
         public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => Empty(ct);
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => throw NS();
         public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => throw NS();
-        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => Empty(ct);
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, DispatchCandidateOrdering ordering, CancellationToken ct = default) => Empty(ct);
         public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => throw NS();
         public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => throw NS();
         public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => throw NS();

@@ -1,3 +1,5 @@
+using System.Collections.Frozen;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -78,6 +80,40 @@ public static class QuotaRetryPhasePolicy
             or WorkItemState.UpstreamPushing
             ? 0
             : 1;
+
+    /// <summary>
+    /// Dispatch-eligible states that count as "past the work phase": the item
+    /// already consumed pipeline effort and only needs a continuation (audit,
+    /// rework, merge, upstream push, or an in-flight delegation turn) to
+    /// drain. Fresh starts — <see cref="WorkItemState.Queued"/>, the planning
+    /// lifecycle states, and <see cref="WorkItemState.Working"/> re-pickups
+    /// (in the work phase, not past it) — sort behind these at equal priority
+    /// under <see cref="DispatchCandidateOrdering.InFlightBeforeFresh"/>.
+    /// The post-audit finishing states are deliberately also members: the
+    /// <see cref="DispatchPhaseBucket"/> precedence is evaluated first, so
+    /// listing them here keeps the bucket honest without double-counting.
+    /// </summary>
+    public static IReadOnlySet<WorkItemState> InFlightDispatchStates { get; } =
+        FrozenSet.ToFrozenSet([
+            WorkItemState.WorkComplete,
+            WorkItemState.Auditing,
+            WorkItemState.Reworking,
+            WorkItemState.ReworkingForConflict,
+            WorkItemState.AuditPassed,
+            WorkItemState.Merging,
+            WorkItemState.Merged,
+            WorkItemState.UpstreamPushing,
+            WorkItemState.Delegating,
+        ]);
+
+    /// <summary>
+    /// Tie-break bucket used by
+    /// <see cref="DispatchCandidateOrdering.InFlightBeforeFresh"/> after
+    /// priority: 0 for states in <see cref="InFlightDispatchStates"/>, 1 for
+    /// fresh starts.
+    /// </summary>
+    public static int DispatchInFlightBucket(WorkItemState state) =>
+        InFlightDispatchStates.Contains(state) ? 0 : 1;
 
     public static string? RequiredCapabilityForQuotaRetryCandidate(WorkItem item)
     {

@@ -772,6 +772,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             _orchestrator.ApplyWorkerPoolReload(resolvedWorkers);
             _sandboxAdmission?.ApplyMaxConcurrentSandboxesReload(resolvedSandboxes);
             _orchestrator.ApplyMinSpawnIntervalReload(resolvedInterval);
+            _orchestrator.ApplyPreferInFlightOverFreshReload(opts.WorkerPool.PreferInFlightOverFresh);
             _lastWorkerPool = next;
             AuditLog.ConfigReloaded("WorkerPool", prev, next);
         }
@@ -1131,6 +1132,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MaxConcurrentWorkers,
                 opts.MaxConcurrentSandboxes,
                 opts.MinSpawnInterval,
+                opts.PreferInFlightOverFresh,
                 LegacyConcurrency = legacyConcurrency,
             },
             JsonOpts);

@@ -1127,7 +1127,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             new HashSet<WorkItemId>(),
             now,
-            limit: 10))
+            limit: 10,
+            DispatchCandidateOrdering.FinishingThenPriority))
         {
             ordered.Add(item.Id);
         }
@@ -1166,7 +1167,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             new HashSet<WorkItemId>(),
             now,
-            limit: 10))
+            limit: 10,
+            DispatchCandidateOrdering.FinishingThenPriority))
         {
             ordered.Add(item.Id);
         }
@@ -1192,7 +1194,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             new HashSet<WorkItemId>(),
             now,
-            limit: 10))
+            limit: 10,
+            DispatchCandidateOrdering.FinishingThenPriority))
         {
             ordered.Add(item.Id);
         }
@@ -1215,7 +1218,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             new HashSet<WorkItemId> { skippedWaiting.Id },
             now,
-            limit: 10))
+            limit: 10,
+            DispatchCandidateOrdering.FinishingThenPriority))
         {
             ordered.Add(item.Id);
         }
@@ -1242,7 +1246,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             skipIds,
             now,
-            limit: 10))
+            limit: 10,
+            DispatchCandidateOrdering.FinishingThenPriority))
         {
             ordered.Add(item.Id);
         }
@@ -1269,7 +1274,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             new HashSet<WorkItemId>(),
             now,
-            limit: 2))
+            limit: 2,
+            DispatchCandidateOrdering.FinishingThenPriority))
         {
             ordered.Add(item.Id);
         }
@@ -1294,7 +1300,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             new HashSet<WorkItemId>(),
             now,
-            limit: 10))
+            limit: 10,
+            DispatchCandidateOrdering.FinishingThenPriority))
         {
             dueOnly.Add(item.Id);
         }
@@ -1304,6 +1311,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             new HashSet<WorkItemId>(),
             now,
             limit: 10,
+            DispatchCandidateOrdering.FinishingThenPriority,
             quotaRetryEligibility: QuotaRetryDispatchEligibility.IncludeFuture))
         {
             recovery.Add(item.Id);

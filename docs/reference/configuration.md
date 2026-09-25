@@ -63,9 +63,10 @@ Hot-reloadable today:
   fit-in-window. `QuotaCacheTtlSeconds` is still sampled by quota probe
   constructors at startup.
 - `WorkerPool.MaxConcurrentWorkers`, `WorkerPool.MaxConcurrentSandboxes`,
-  `WorkerPool.MinSpawnInterval` — re-applied via `AgentConfigHotReload` to the
-  live dispatcher concurrency gate, the sandbox admission gate, and the
-  spawn-pacing floor. Raising a cap admits queued waiters immediately;
+  `WorkerPool.MinSpawnInterval`, `WorkerPool.PreferInFlightOverFresh` —
+  re-applied via `AgentConfigHotReload` to the live dispatcher concurrency
+  gate, the sandbox admission gate, the spawn-pacing floor, and the pickup
+  candidate ordering. Raising a cap admits queued waiters immediately;
   lowering a cap never aborts in-flight work — new admissions stay blocked
   until holders drain. Each change is logged
   (`Hot-reloaded WorkerPool:<Field>: <old> → <new>`) so the effective value is

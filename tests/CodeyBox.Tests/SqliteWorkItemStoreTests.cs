@@ -472,7 +472,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         var eligible = await RunWithoutHeldGateContext(async () =>
         {
             var collected = new List<WorkItem>();
-            await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+            await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>(), DispatchCandidateOrdering.FinishingThenPriority))
                 collected.Add(item);
             return collected;
         }).WaitAsync(readTimeout);
