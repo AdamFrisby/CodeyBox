@@ -43,14 +43,63 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         => JsonSerializer.Serialize(new { type = StderrEnvelopeType, text }) + "\n";
 
     /// <summary>
+    /// The read side of <see cref="SerializeStderrEnvelopeLine"/>: true when
+    /// <paramref name="root"/> is a <c>codeybox.stderr</c> envelope, with its
+    /// <c>text</c> payload in <paramref name="text"/> (null when the envelope
+    /// carries no string text). Single source of truth for the wire shape —
+    /// consumers call this rather than re-navigating the type/text fields so
+    /// a contract change lands in one place.
+    /// </summary>
+    public static bool TryReadStderrEnvelope(JsonElement root, out string? text)
+    {
+        text = null;
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty("type", out var typeEl)
+            || typeEl.ValueKind != JsonValueKind.String
+            || typeEl.GetString() != StderrEnvelopeType)
+        {
+            return false;
+        }
+
+        if (root.TryGetProperty("text", out var textEl)
+            && textEl.ValueKind == JsonValueKind.String)
+        {
+            text = textEl.GetString();
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Sandbox CLI invocation built by concrete agent runners. This stays
     /// protected so argv/environment/stdin details do not leak into Core's
     /// domain/plugin-facing API.
     /// </summary>
+    /// <param name="StdoutIsEnvelopeFramed">
+    /// True when the invocation's stdout is a structured NDJSON envelope
+    /// stream regardless of the pipeline's
+    /// <c>captureStructuredStream</c> flag (e.g. the devin ACP shim, which
+    /// always emits <c>devin.acp</c> envelopes). The exec layer must then
+    /// wrap stderr lines in <c>codeybox.stderr</c> envelopes before they
+    /// join the chunk channel: tee'd raw stderr lines would be
+    /// indistinguishable from genuine envelopes, so agent-controlled stderr
+    /// could forge stream events and falsify persisted cost/summary
+    /// records. The flag also scopes the claimable channel: the dispatch is
+    /// pinned to the attached exec-pipe transport (never the HTTP ingest
+    /// transport, whose bearer credential is recoverable inside the sandbox,
+    /// and never a credential-authenticated detached exit report), and the
+    /// in-VM exec wrapper is told via
+    /// <see cref="CodeyBox.Sandbox.SandboxConventions.EnvelopeFramedStdoutEnv"/>
+    /// to keep stderr off the stdout stream even under the log-file tee.
+    /// Note the bound: the exec pipe is NOT integrity-protected against a
+    /// same-uid process inside the sandbox (it can write the pipe through
+    /// <c>/proc/&lt;pid&gt;/fd</c>), so consumers of envelope payloads must
+    /// treat them as agent-influenceable telemetry, not authoritative fact.
+    /// </param>
     protected sealed record AgentInvocation(
         IReadOnlyList<string> Argv,
         IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
-        string? Stdin = null);
+        string? Stdin = null,
+        bool StdoutIsEnvelopeFramed = false);
 
     /// <summary>
     /// Build the argv to execute inside the sandbox for a given prompt. The
@@ -593,7 +642,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // so a transient crash is recoverable on the production work/
             // audit/merge paths regardless of AgentStreams. Plain-stdout call
             // sites (verdict-parser shortcuts) intentionally forgo resume to
-            // keep their stdout contract intact.
+            // keep their stdout contract intact. Runners whose stdout is an
+            // envelope stream keep that contract honest through
+            // IAgentVisibleTextExtractor — the caller projects the capture
+            // back to agent-visible text before parsing.
             if (sessionResumeContext is not null
                 && (!sessionResumeContext.Capability.RequiresStructuredStreamForSessionId
                     || sessionResumeContext.CaptureStructuredStream)
@@ -912,10 +964,15 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         // line JSON envelope and forwards it through the same callback, so
         // the .jsonl carries a recoverable record of stderr (auth/usage
         // diagnostics that fire before any structured event is emitted)
-        // without any framing risk.
+        // without any framing risk. The same wrapping applies whenever the
+        // invocation declares envelope-framed stdout even when the pipeline
+        // asked for a plaintext capture: a raw stderr line shaped like a
+        // stream envelope would otherwise be claimed as genuine output and
+        // corrupt the stream summary and cost records built from the
+        // aggregated chunks.
         StderrEnvelopeForwarder? envelopeForwarder = null;
         Action<string>? stderrChunkCallback;
-        if (captureStructuredStream)
+        if (captureStructuredStream || invocation.StdoutIsEnvelopeFramed)
         {
             envelopeForwarder = stdoutChunkCallback is null
                 ? null
@@ -931,12 +988,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, runId),
+            ExtraEnvironment = BuildExecEnvironment(
+                invocation.ExtraEnvironment, runId, invocation.StdoutIsEnvelopeFramed),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
-            AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),
-            LaunchMode = SelectBatchLaunchMode(sandbox),
+            // Envelope-framed stdout is a claimable channel, so it must ride
+            // the attached exec pipe only: on the HTTP ingest transport the
+            // bearer credential authenticating the stream endpoint is
+            // recoverable inside the sandbox (the agent has sudo), which
+            // would let agent content POST forged envelopes — and a forged
+            // exit code — straight into the claimable channel. Attached exec
+            // anchors the bytes to the dispatch's own fd chain and exit
+            // status instead. That pin is not integrity-proof — a same-uid
+            // in-VM process can still reach the pipe via /proc/<pid>/fd —
+            // so envelope payloads remain agent-influenceable telemetry,
+            // not authoritative fact.
+            AgentOutputTransport = invocation.StdoutIsEnvelopeFramed
+                ? SandboxAgentOutputTransportPreference.ExecPipe
+                : SelectBatchAgentOutputTransport(sandbox),
+            LaunchMode = invocation.StdoutIsEnvelopeFramed
+                ? SandboxExecLaunchMode.Attached
+                : SelectBatchLaunchMode(sandbox),
         };
 
         SandboxExecResult result;
@@ -1890,14 +1963,15 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// by file) quotes argv the same way rather than re-implementing it.
     /// </summary>
     protected static string ShellQuote(string value) =>
-        "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
+        ShellQuoting.Quote(value);
 
     private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>
         $"{Kind.Value}\n{sandbox.Id}\n{workingDirectory}";
 
     protected IReadOnlyDictionary<string, string>? BuildExecEnvironment(
         IReadOnlyDictionary<string, string>? environment,
-        string? runId = null)
+        string? runId = null,
+        bool stdoutIsEnvelopeFramed = false)
     {
         var merged = environment is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
@@ -1913,6 +1987,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         var logPath = AgentInvocationLogContext.CurrentLogPath;
         if (!string.IsNullOrEmpty(logPath))
             merged[SandboxConventions.AgentLogFileEnv] = logPath;
+        // Envelope-framed stdout tells the in-VM exec wrapper that stdout is a
+        // claimable envelope stream, so its tee'd log capture must keep stderr
+        // on a separate channel instead of merging it in with `2>&1`.
+        if (stdoutIsEnvelopeFramed)
+            merged[SandboxConventions.EnvelopeFramedStdoutEnv] = "1";
         return merged.Count == 0 ? null : merged;
     }
 

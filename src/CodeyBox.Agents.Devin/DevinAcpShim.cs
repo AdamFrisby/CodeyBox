@@ -1,0 +1,102 @@
+using CodeyBox.Agents;
+
+namespace CodeyBox.Agents.Devin;
+
+/// <summary>
+/// Accessor for the in-sandbox ACP client shim that ships embedded in this
+/// assembly (<c>Resources/devin-acp-client.py</c>). The shim is a Python 3
+/// script — Python 3 is already a hard requirement of every CodeyBox sandbox
+/// image (the credential-file writer execs it) — that spawns
+/// <c>devin acp</c>, drives the JSON-RPC handshake, and folds every ACP
+/// frame into a single-line <c>devin.acp</c> NDJSON envelope on stdout so
+/// the agent-stream file keeps advancing while the agent works.
+///
+/// <para>Unlike the Claude ACP path (a NativeAOT bridge that impersonates an
+/// IDE WebSocket for <c>claude --ide</c>), <c>devin acp</c> IS the ACP
+/// server — it needs a plain stdio JSON-RPC client, which is what this shim
+/// is. The two share only the framed-stdin delivery shape (base64 payload +
+/// terminator + prompt), implemented once in
+/// <c>CodeyBox.Agents.FramedStdin</c>.</para>
+/// </summary>
+internal static class DevinAcpShim
+{
+    internal const string EmbeddedResourceName = "devin-acp-client.py";
+
+    /// <summary>
+    /// Line that terminates the base64 shim block in the dispatch stdin
+    /// frame; everything after it is the verbatim prompt. Base64 output can
+    /// never contain this value, and a matching line inside the prompt is
+    /// harmless — only the FIRST occurrence ends the shim block, and it is
+    /// written before the prompt by construction.
+    /// </summary>
+    internal const string StdinEndMarker = "__CODEYBOX_DEVIN_ACP_SHIM_END__";
+
+    /// <summary>
+    /// Upper bound for the decoded shim: the dispatch passes it as a single
+    /// <c>python3 -c</c> argv element, so it must stay under the kernel's
+    /// per-element cap (<c>MAX_ARG_STRLEN</c> = 128 KiB) with headroom.
+    /// Exceeding it fails the dispatch build here rather than as E2BIG
+    /// inside the sandbox.
+    /// </summary>
+    internal const int MaxShimBytes = 96 * 1024;
+
+    /// <summary>
+    /// The embedded shim bytes, loaded once. Returned to callers only as
+    /// <see cref="ReadOnlyMemory{T}"/> so no caller can mutate the shared
+    /// copy that every later dispatch ships to the sandbox.
+    /// </summary>
+    private static readonly Lazy<byte[]> ScriptBytes = new(LoadScriptBytesCore);
+
+    /// <summary>Read the embedded shim script bytes (loaded once, then cached).</summary>
+    internal static ReadOnlyMemory<byte> LoadScriptBytes() => ScriptBytes.Value;
+
+    private static byte[] LoadScriptBytesCore()
+    {
+        var asm = typeof(DevinAcpShim).Assembly;
+        using var stream = asm.GetManifestResourceStream(EmbeddedResourceName)
+            ?? throw new InvalidOperationException(
+                $"Devin ACP shim resource '{EmbeddedResourceName}' is missing from {asm.GetName().Name}.");
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        var bytes = ms.ToArray();
+        if (bytes.Length > MaxShimBytes)
+        {
+            throw new InvalidOperationException(
+                $"Devin ACP shim resource '{EmbeddedResourceName}' is {bytes.Length} bytes, "
+                + $"exceeding the {MaxShimBytes}-byte cap for single-argv-element delivery.");
+        }
+        return bytes;
+    }
+
+    /// <summary>
+    /// The dispatch exec stdin frame, built by
+    /// <see cref="FramedStdin.Build"/>: the base64-encoded shim (wrapped at
+    /// <see cref="FramedStdin.Base64LineWidth"/>), the end marker on its own
+    /// line, then the prompt verbatim. The wrapper script collects the
+    /// shim block into a variable and execs it via <c>python3 -I -c</c>
+    /// while the prompt tail stays on the inherited descriptor 0
+    /// (<c>--prompt-file -</c>), so neither artifact is ever staged at a
+    /// re-openable path and the prompt never enters argv, the environment,
+    /// or <c>/proc/&lt;pid&gt;/environ</c>.
+    ///
+    /// <para>That framing removes the staged-file swap, NOT the channel's
+    /// forgeability: descriptor 0 is an anonymous pipe a same-uid in-VM
+    /// peer can append to by re-opening <c>/proc/&lt;pid&gt;/fd/0</c> with
+    /// <c>O_WRONLY</c> (a fresh write end regardless of the descriptor's
+    /// mode). The delivered shim block and prompt are therefore
+    /// agent-influenceable — no in-VM mechanism can make the prompt channel
+    /// operator-authentic (sudo defeats even a root-owned sidecar), so
+    /// consumers must not treat delivered prompt bytes as authoritative
+    /// operator input. See the <b>Prompt-channel provenance</b> note on
+    /// <see cref="DevinAgentRunner"/>.</para>
+    /// </summary>
+    internal static string BuildDispatchStdin(string prompt)
+    {
+        ArgumentNullException.ThrowIfNull(prompt);
+
+        return FramedStdin.Build(
+            Convert.ToBase64String(LoadScriptBytes().Span),
+            StdinEndMarker,
+            prompt);
+    }
+}

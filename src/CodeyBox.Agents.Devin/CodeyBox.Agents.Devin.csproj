@@ -17,6 +17,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Resources/devin-acp-client.py"
+                      LogicalName="devin-acp-client.py"
+                      Link="Resources/devin-acp-client.py" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="CodeyBox.Tests" />
   </ItemGroup>
 

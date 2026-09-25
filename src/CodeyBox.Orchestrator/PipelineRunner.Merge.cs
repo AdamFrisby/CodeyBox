@@ -468,7 +468,11 @@ public sealed partial class PipelineRunner
             if (mergeSuggestionsJson is not null)
                 await PickUpSuggestionsAsync(item, project, mergeSuggestionsJson, ct);
 
-            return (mergeSha, agentResult.Stdout);
+            // The returned stdout tail is embedded in the PR description —
+            // project envelope-framed captures (devin's devin.acp NDJSON) back
+            // to the agent-visible text first so the fenced section shows the
+            // closing message, not escaped envelope lines.
+            return (mergeSha, agentResult.Stdout is { } mergeStdout ? AgentVisibleStdout(chosenMergeRunner, mergeStdout) : null);
         }
         finally
         {

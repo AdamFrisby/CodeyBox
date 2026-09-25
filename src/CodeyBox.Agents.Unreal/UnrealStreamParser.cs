@@ -38,7 +38,7 @@ public sealed class UnrealStreamParser : FlexibleAgentStreamParser
     protected override ParsedEvent ParseEvent(JsonElement root)
     {
         var type = FirstString(root, "type");
-        if (string.Equals(type, CliAgentRunnerBase.StderrEnvelopeType, StringComparison.OrdinalIgnoreCase))
+        if (CliAgentRunnerBase.TryReadStderrEnvelope(root, out _))
             return base.ParseEvent(root);
 
         // Terminal error event from unreal-agent-runner

@@ -1433,9 +1433,12 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new GeminiAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 // Devin: Cognition's agent CLI (binary `devin`, installed via
-// cli.devin.ai/install.sh). Driven non-interactively via `-p` with the prompt
-// on stdin through --prompt-file /dev/stdin (bare -p ignores piped stdin;
-// verified against devin 3000.11.1). Auth is the credentials.toml file
+// cli.devin.ai/install.sh). Dispatched over `devin acp` — the CLI's ACP
+// server over stdio — through the embedded Python shim that performs the
+// handshake and folds every session/update into devin.acp NDJSON envelopes,
+// so the agent-stream file keeps advancing during long turns (the print
+// mode's end-of-run text dump used to stall stream mtime and trip the
+// worker-progress watchdog). Auth is the credentials.toml file
 // contents shipped via CODEYBOX_DEVIN_AUTH_TOML and materialised at
 // ~/.local/share/devin/credentials.toml — the CLI has no DEVIN_API_KEY-style
 // env var. The binary must be installed in the sandbox image; see
@@ -3183,7 +3186,8 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CopilotInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
-builder.Services.AddSingleton<IInVmSmokeProbe, DevinInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe>(sp => new DevinInVmSmokeProbe(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CavemanCodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();

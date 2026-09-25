@@ -3604,8 +3604,11 @@ test "$work" = present && test "$exec_wrapper" = present
     /// The exec wrapper script content. Sources the env file (if present),
     /// cds to the target working directory, exec's the user command. Lives
     /// at /usr/local/bin/codeybox-exec inside the VM, owned by root with
-    /// mode 0755 so the agent (running as the unprivileged ubuntu user
-    /// without sudo) can run but cannot modify it.
+    /// mode 0755 so the agent's unprivileged ubuntu user can run it but an
+    /// accidental write cannot modify it. Note the ubuntu user holds
+    /// passwordless sudo inside the sandbox, so in-VM file ownership is not
+    /// a trust boundary against the agent — the wrapper's value is keeping
+    /// user commands out of a root context by default.
     ///
     /// <para>R8-core: when <c>CODEYBOX_AGENT_LOG_FILE</c> is set in the user
     /// environment, both stdout and stderr are tee'd to that path inside the
@@ -3616,6 +3619,13 @@ test "$work" = present && test "$exec_wrapper" = present
     /// are created relative to the directory of CODEYBOX_AGENT_LOG_FILE; the
     /// caller picks a path inside a writable mount (typically /work/.codeybox/).
     /// </para>
+    ///
+    /// <para>Envelope-framed invocations (<c>CODEYBOX_STDOUT_ENVELOPE_FRAMED</c>,
+    /// e.g. the devin ACP shim) are the exception to the tee merge: stderr
+    /// keeps its own channel end to end — a separate stream (and a
+    /// <c>.stderr</c> log sidecar) — because a bare stderr line folded into
+    /// the claimable envelope stream could forge stream events and falsify
+    /// cost/outcome records.</para>
     /// </summary>
     internal const string ExecWrapperScript = """
         #!/bin/bash
@@ -3690,14 +3700,26 @@ test "$work" = present && test "$exec_wrapper" = present
             rm -f "$codeybox_env_file_path" 2>/dev/null || true
         fi
         rm -f "$codeybox_err_file"
+        # When the invocation declares envelope-framed stdout
+        # (CODEYBOX_STDOUT_ENVELOPE_FRAMED=1 — e.g. the devin ACP shim, whose
+        # devin.acp lines are claimed by type tag), stderr must NEVER merge
+        # into the stdout stream: a bare stderr line would be
+        # indistinguishable from a genuine envelope, letting agent-controlled
+        # stderr forge stream events and falsify cost/outcome records. The
+        # tee'd log-file paths below keep stderr on its own channel (and its
+        # own .stderr sidecar) end to end for such invocations.
+        codeybox_stdout_is_framed="${CODEYBOX_STDOUT_ENVELOPE_FRAMED:-}"
         # Optional agent-output HTTP transport. The host injects these
         # variables only for agent CLI invocations that opted into the
         # transport. Copy them into shell locals and remove them from the
         # exported environment before launching the agent. The agent process
         # inherits neither the stream token, completion token, nor the run id.
-        # Detached runs authenticate completion through a separate HTTP token;
-        # VM-side sidecars are diagnostic only because the agent has sudo inside
-        # the sandbox.
+        # The stream token additionally never enters a pump process's
+        # environ or argv — it reaches python on stdin (first line), since
+        # /proc/<pid>/environ is readable by any same-uid process in the VM
+        # and the agent has sudo. Detached runs authenticate completion
+        # through a separate HTTP token; VM-side sidecars are diagnostic only
+        # because the agent has sudo inside the sandbox.
         codeybox_output_url="${CODEYBOX_AGENT_OUTPUT_URL:-}"
         codeybox_output_token="${CODEYBOX_AGENT_OUTPUT_TOKEN:-}"
         codeybox_output_exit_token="${CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN:-}"
@@ -3748,14 +3770,18 @@ test "$work" = present && test "$exec_wrapper" = present
         }
         codeybox_http_stream() {
             local codeybox_stream_name="$1"
-            CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
-            CODEYBOX_AGENT_OUTPUT_TOKEN="$codeybox_output_token" \
+            # The bearer token is fed to the pump on stdin's first line, not
+            # its environment: /proc/<pid>/environ is readable by any same-uid
+            # process (and the agent has sudo), so an environ-resident token
+            # would let the agent POST forged bytes straight into the stream
+            # endpoint for the pump's whole lifetime.
+            { printf '%s\n' "$codeybox_output_token"; cat; } | CODEYBOX_AGENT_OUTPUT_URL="$codeybox_output_url" \
             CODEYBOX_AGENT_OUTPUT_RUN_ID="$codeybox_output_run_id" \
             python3 -c '
         import os, sys, time, urllib.error, urllib.parse, urllib.request
         base = os.environ["CODEYBOX_AGENT_OUTPUT_URL"].rstrip("/")
         run_id = os.environ["CODEYBOX_AGENT_OUTPUT_RUN_ID"]
-        token = os.environ["CODEYBOX_AGENT_OUTPUT_TOKEN"]
+        token = sys.stdin.buffer.readline().decode("utf-8").rstrip("\n")
         stream = sys.argv[1]
         seq = 0
         max_chunk = 65536
@@ -3827,6 +3853,25 @@ test "$work" = present && test "$exec_wrapper" = present
             { umask 077; printf '%s\n' "$1" > "$codeybox_exit_tmp"; } 2>/dev/null
             mv -f "$codeybox_exit_tmp" "$codeybox_exit_file_path" 2>/dev/null || true
         }
+        # Prepare the invocation-log directory and a fresh .exit sidecar.
+        # Only meaningful when CODEYBOX_AGENT_LOG_FILE is set; callers gate
+        # on that. Dropping any stale marker first means a resume re-tail
+        # can never mistake a previous run's outcome for the current one.
+        codeybox_setup_log_sidecar() {
+            codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
+            mkdir -p "$codeybox_log_dir" 2>/dev/null || true
+            codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
+            rm -f "$codeybox_exit_file" 2>/dev/null || true
+        }
+        # The .exit sidecar next to the invocation log AND the env-named
+        # exit file both carry the outcome — write them together so a
+        # resume re-tail and a detached-exit poll always agree.
+        codeybox_report_exit() {
+            if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
+                printf '%s\n' "$1" > "$codeybox_exit_file" 2>/dev/null || true
+            fi
+            codeybox_write_exit_file "$1"
+        }
         codeybox_run_user_command() {
             if [ "$keep_stdin" = "1" ]; then
                 "$@"
@@ -3846,33 +3891,33 @@ test "$work" = present && test "$exec_wrapper" = present
                 exit 86
             fi
 
-            if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
-                codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
-                mkdir -p "$codeybox_log_dir" 2>/dev/null || true
-                codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
-                rm -f "$codeybox_exit_file" 2>/dev/null || true
+            if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ] && [ -z "$codeybox_stdout_is_framed" ]; then
+                codeybox_setup_log_sidecar
                 codeybox_run_user_command "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE" | codeybox_http_stream stdout
                 codeybox_status=("${PIPESTATUS[@]}")
                 codeybox_user_rc=${codeybox_status[0]}
                 codeybox_stream_rc=${codeybox_status[2]}
                 if [ "$codeybox_stream_rc" -ne 0 ]; then
                     echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
-                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
-                    codeybox_write_exit_file 87
+                    codeybox_report_exit 87
                     codeybox_http_exit 87 || true
                     exit 87
                 fi
-                printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
-                codeybox_write_exit_file "$codeybox_user_rc"
+                codeybox_report_exit "$codeybox_user_rc"
                 if ! codeybox_http_exit "$codeybox_user_rc"; then
                     echo "codeybox-exec: agent output HTTP completion failed during run" >&2
-                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
-                    codeybox_write_exit_file 87
+                    codeybox_report_exit 87
                     exit 87
                 fi
                 exit "$codeybox_user_rc"
             fi
 
+            # Envelope-framed + log-file (and every no-log run) take the
+            # two-fifo path: stdout and stderr keep separate streams end to
+            # end. With the log set, each stream also tees — stdout into the
+            # log itself, stderr into a .stderr sidecar — so the suspend/
+            # resume re-tail still has the full capture without a bare stderr
+            # byte ever entering the claimable stdout stream.
             codeybox_out_fifo=$(mktemp -u "${TMPDIR:-/tmp}/codeybox-stdout.XXXXXX")
             codeybox_err_fifo=$(mktemp -u "${TMPDIR:-/tmp}/codeybox-stderr.XXXXXX")
             if ! mkfifo "$codeybox_out_fifo" "$codeybox_err_fifo"; then
@@ -3881,24 +3926,32 @@ test "$work" = present && test "$exec_wrapper" = present
             fi
             codeybox_cleanup_fifos() { rm -f "$codeybox_out_fifo" "$codeybox_err_fifo"; }
             trap codeybox_cleanup_fifos EXIT
-            codeybox_http_stream stdout < "$codeybox_out_fifo" &
-            codeybox_out_stream_pid=$!
-            codeybox_http_stream stderr < "$codeybox_err_fifo" &
-            codeybox_err_stream_pid=$!
+            if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
+                codeybox_setup_log_sidecar
+                tee -a "$CODEYBOX_AGENT_LOG_FILE" < "$codeybox_out_fifo" | codeybox_http_stream stdout &
+                codeybox_out_stream_pid=$!
+                tee -a "${CODEYBOX_AGENT_LOG_FILE}.stderr" < "$codeybox_err_fifo" | codeybox_http_stream stderr &
+                codeybox_err_stream_pid=$!
+            else
+                codeybox_http_stream stdout < "$codeybox_out_fifo" &
+                codeybox_out_stream_pid=$!
+                codeybox_http_stream stderr < "$codeybox_err_fifo" &
+                codeybox_err_stream_pid=$!
+            fi
             codeybox_run_user_command "$@" > "$codeybox_out_fifo" 2> "$codeybox_err_fifo"
             codeybox_user_rc=$?
             wait "$codeybox_out_stream_pid"; codeybox_out_stream_rc=$?
             wait "$codeybox_err_stream_pid"; codeybox_err_stream_rc=$?
             if [ "$codeybox_out_stream_rc" -ne 0 ] || [ "$codeybox_err_stream_rc" -ne 0 ]; then
                 echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
-                codeybox_write_exit_file 87
+                codeybox_report_exit 87
                 codeybox_http_exit 87 || true
                 exit 87
             fi
-            codeybox_write_exit_file "$codeybox_user_rc"
+            codeybox_report_exit "$codeybox_user_rc"
             if ! codeybox_http_exit "$codeybox_user_rc"; then
                 echo "codeybox-exec: agent output HTTP completion failed during run" >&2
-                codeybox_write_exit_file 87
+                codeybox_report_exit 87
                 exit 87
             fi
             exit "$codeybox_user_rc"
@@ -3910,23 +3963,33 @@ test "$work" = present && test "$exec_wrapper" = present
         # with the command's exit code so the orchestrator can poll for
         # completion after a resume without having to read the agent's PID.
         if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
-            codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
-            mkdir -p "$codeybox_log_dir" 2>/dev/null || true
-            codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
-            # Drop any stale exit marker from a previous run so a resumed
-            # poller cannot mistake the previous outcome for the current one.
-            rm -f "$codeybox_exit_file" 2>/dev/null || true
-            # With `set -o pipefail` above, the pipeline's exit code is the
-            # rightmost non-zero status — i.e. the agent's exit code, not tee's.
-            # ${PIPESTATUS[0]} is the agent process specifically, which is what
-            # we want regardless of whether tee itself failed (it never does in
-            # practice but we still prefer the agent's true exit code).
-            codeybox_run_user_command "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
-            codeybox_user_rc=${PIPESTATUS[0]}
+            codeybox_setup_log_sidecar
+            if [ -n "$codeybox_stdout_is_framed" ]; then
+                # Envelope-framed stdout: never merge stderr into the
+                # claimable stream. stdout tees to the log and the host pipe;
+                # stderr keeps the real stderr channel and tees to a .stderr
+                # sidecar. A bare stderr line can therefore never be claimed
+                # as a genuine envelope host-side.
+                codeybox_run_user_command "$@" \
+                    > >(tee -a "$CODEYBOX_AGENT_LOG_FILE") \
+                    2> >(tee -a "${CODEYBOX_AGENT_LOG_FILE}.stderr" >&2)
+                codeybox_user_rc=$?
+                # The tee process substitutions are async jobs — drain them
+                # before writing the .exit marker or a resume re-tail can
+                # observe a truncated log.
+                wait
+            else
+                # With `set -o pipefail` above, the pipeline's exit code is the
+                # rightmost non-zero status — i.e. the agent's exit code, not tee's.
+                # ${PIPESTATUS[0]} is the agent process specifically, which is what
+                # we want regardless of whether tee itself failed (it never does in
+                # practice but we still prefer the agent's true exit code).
+                codeybox_run_user_command "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE"
+                codeybox_user_rc=${PIPESTATUS[0]}
+            fi
             # Best-effort sidecar; the orchestrator treats missing file as
             # "not yet finished" so we never silently swallow a write error.
-            printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
-            codeybox_write_exit_file "$codeybox_user_rc"
+            codeybox_report_exit "$codeybox_user_rc"
             exit "$codeybox_user_rc"
         fi
         if [ -n "$codeybox_exit_file_path" ]; then
@@ -6685,6 +6748,35 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         if (markerWaitSeconds <= 0)
             throw new ArgumentOutOfRangeException(nameof(markerWaitSeconds), "Marker wait seconds must be positive.");
 
+        // The ready check's bearer token travels on stdin, never in environ
+        // or argv: a process's environ/cmdline is visible via /proc to any
+        // same-uid process in the sandbox (and the agent has sudo), so a
+        // credential in `env TOKEN=... python3` would be recoverable for the
+        // check's whole lifetime.
+        const string detachedHttpReadyScript = """
+import os, sys, urllib.error, urllib.parse, urllib.request
+base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')
+run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')
+token = sys.stdin.buffer.readline().decode('utf-8').rstrip('\n')
+if not base or not run_id or not token:
+    sys.exit(1)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+url = base + '/' + urllib.parse.quote(run_id, safe='') + '/ready/0'
+req = urllib.request.Request(
+    url,
+    data=b'',
+    method='POST',
+    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})
+try:
+    with opener.open(req, timeout=2.5) as resp:
+        code = resp.getcode()
+        sys.exit(0 if 200 <= code < 300 else 1)
+except urllib.error.HTTPError:
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+""";
+
         const string detachedHttpExitPosterScript = """
 import os, sys, time, urllib.error, urllib.parse, urllib.request
 base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')
@@ -6843,33 +6935,12 @@ while True:
         // continuation delayed by thread-pool contention, false-failing the
         // preflight (exit 86). Both stay under the negative-path callers' 5s
         // readiness-latency assertion.
-        sb.AppendLine("timeout 4 env \\");
+        sb.AppendLine("{ printf '%s\\n' \"$codeybox_output_token\"; } | timeout 4 env \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
-        sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
-        sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, sys, urllib.error, urllib.parse, urllib.request");
-        sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
-        sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
-        sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
-        sb.AppendLine("if not base or not run_id or not token:");
-        sb.AppendLine("    sys.exit(1)");
-        sb.AppendLine("opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))");
-        sb.AppendLine("url = base + '/' + urllib.parse.quote(run_id, safe='') + '/ready/0'");
-        sb.AppendLine("req = urllib.request.Request(");
-        sb.AppendLine("    url,");
-        sb.AppendLine("    data=b'',");
-        sb.AppendLine("    method='POST',");
-        sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
-        sb.AppendLine("try:");
-        sb.AppendLine("    with opener.open(req, timeout=2.5) as resp:");
-        sb.AppendLine("        code = resp.getcode()");
-        sb.AppendLine("        sys.exit(0 if 200 <= code < 300 else 1)");
-        sb.AppendLine("except urllib.error.HTTPError:");
-        sb.AppendLine("    sys.exit(1)");
-        sb.AppendLine("except Exception:");
-        sb.AppendLine("    sys.exit(1)");
-        sb.AppendLine("PY");
+        sb.Append("python3 -c ")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(detachedHttpReadyScript))
+            .Append('\n');
         sb.AppendLine("}");
         sb.AppendLine("if [ -z \"$codeybox_output_url\" ] || [ -z \"$codeybox_output_token\" ] || [ -z \"$codeybox_output_run_id\" ]; then");
         sb.Append("    echo ")

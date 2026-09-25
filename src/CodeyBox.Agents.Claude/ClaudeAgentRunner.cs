@@ -25,7 +25,7 @@ namespace CodeyBox.Agents.Claude;
 /// failure leaves the requested id untouched (best-effort, so we never
 /// degrade a working call).</para>
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IPlanArtifactExtractor
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IAgentVisibleTextExtractor
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
     private static readonly EnvBackedCredentialFile OAuthCredentialFile = new(
@@ -400,7 +400,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// raw NDJSON. Returns <c>null</c> when no stream-json events were observed
     /// — the caller then feeds the raw stdout to the parser directly.
     /// </summary>
-    public string? ExtractPlanArtifactText(string rawStdout)
+    public string? ExtractAgentVisibleText(string rawStdout)
         => ClaudePlanArtifactExtractor.Extract(rawStdout);
 
     /// <summary>

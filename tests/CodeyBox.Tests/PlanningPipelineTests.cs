@@ -2327,7 +2327,7 @@ internal sealed class PlanningPipelineSetup(
 }
 
 
-internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentRunner, IPlanArtifactExtractor
+internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentRunner, IAgentVisibleTextExtractor
 {
     /// <summary>
     /// When true, the extractor unconditionally returns null regardless of
@@ -2341,7 +2341,7 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
     public int ExtractorInvocations { get; private set; }
     public int LastExtractorNullReturns { get; private set; }
 
-    public string? ExtractPlanArtifactText(string rawStdout)
+    public string? ExtractAgentVisibleText(string rawStdout)
     {
         ExtractorInvocations++;
         if (AlwaysReturnNullFromExtractor)
@@ -2687,14 +2687,14 @@ internal sealed class StructuredPlainPlanningAgent : IAgentRunner, IStructuredSt
     }
 }
 
-internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner, IPlanArtifactExtractor
+internal sealed class PlanningSessionRunner : IScopedSessionAgentRunner, IAgentVisibleTextExtractor
 {
     private ISandbox? _sandbox;
     private string? _workingDirectory;
 
     public AgentKind Kind => AgentKind.Claude;
 
-    public string? ExtractPlanArtifactText(string rawStdout)
+    public string? ExtractAgentVisibleText(string rawStdout)
         => ClaudePlanArtifactExtractor.Extract(rawStdout);
     public int OpenCalls { get; private set; }
     public int SendTurns { get; private set; }

@@ -92,6 +92,30 @@ public sealed class CliAgentLogFileEnvInjectionTests
     }
 
     [Fact]
+    public async Task RunAsync_EnvelopeFramed_PinsAttachedExecPipeAndSetsWrapperFlag()
+    {
+        // A claimable envelope stream must not ride the HTTP ingest
+        // transport (its bearer credential is recoverable inside the VM) nor
+        // a detached launch (its exit report is credential-authenticated):
+        // framed invocations are pinned to the attached exec pipe, and the
+        // wrapper is told to keep stderr off the merged stream.
+        var sandbox = new CapturingSandbox();
+        var runner = new TestRunner(envelopeFramed: true);
+
+        using (AgentInvocationLogContext.BeginScope("/work/.codeybox/agent-logs/wi-framed.log"))
+        {
+            await runner.RunAsync(sandbox, "/work", "echo ok", credential: null);
+        }
+
+        var env = sandbox.LastExec?.ExtraEnvironment;
+        Assert.NotNull(env);
+        Assert.Equal("1", env![SandboxConventions.EnvelopeFramedStdoutEnv]);
+        Assert.Equal(SandboxAgentOutputTransportPreference.ExecPipe, sandbox.LastExec?.AgentOutputTransport);
+        Assert.Equal(SandboxExecLaunchMode.Attached, sandbox.LastExec?.LaunchMode);
+        Assert.Equal("/work/.codeybox/agent-logs/wi-framed.log", env[SandboxConventions.AgentLogFileEnv]);
+    }
+
+    [Fact]
     public async Task RunResumedAsync_WithLogPathInScope_InjectsAgentLogFileEnv()
     {
         // Resume path goes through the same WithAgentRunId helper. Cover it
@@ -150,6 +174,13 @@ public sealed class CliAgentLogFileEnvInjectionTests
 
     private sealed class TestRunner : CliAgentRunnerBase
     {
+        private readonly bool _envelopeFramed;
+
+        public TestRunner(bool envelopeFramed = false)
+        {
+            _envelopeFramed = envelopeFramed;
+        }
+
         public override AgentKind Kind => new("test-log-env");
 
         protected override AgentInvocation BuildInvocation(
@@ -158,6 +189,6 @@ public sealed class CliAgentLogFileEnvInjectionTests
             string? modelId = null,
             string? reasoningMode = null,
             bool captureStructuredStream = false)
-            => new(["sh", "-c", prompt]);
+            => new(["sh", "-c", prompt], StdoutIsEnvelopeFramed: _envelopeFramed);
     }
 }

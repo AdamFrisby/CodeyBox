@@ -18,6 +18,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="CodeyBox.Tests" />
     <InternalsVisibleTo Include="CodeyBox.Agents.Claude" />
+    <InternalsVisibleTo Include="CodeyBox.Agents.Devin" />
     <InternalsVisibleTo Include="CodeyBox.Agents.Codex" />
     <InternalsVisibleTo Include="CodeyBox.Agents.Gemini" />
   </ItemGroup>

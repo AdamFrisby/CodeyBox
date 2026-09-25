@@ -59,6 +59,18 @@ public static class SandboxConventions
     public const string AgentLogFileEnv = "CODEYBOX_AGENT_LOG_FILE";
 
     /// <summary>
+    /// Environment variable name the exec wrapper checks to learn that the
+    /// invocation's stdout is a claimable NDJSON envelope stream. When set,
+    /// the wrapper must never merge the command's stderr into the stdout
+    /// channel — a bare stderr line folded into that stream is
+    /// indistinguishable from a genuine envelope and could forge stream
+    /// events or falsify cost/outcome records. Set by
+    /// <c>CliAgentRunnerBase</c> for invocations declaring
+    /// <c>AgentInvocation.StdoutIsEnvelopeFramed</c>.
+    /// </summary>
+    public const string EnvelopeFramedStdoutEnv = "CODEYBOX_STDOUT_ENVELOPE_FRAMED";
+
+    /// <summary>
     /// Environment variable used to mark sandbox-owned host processes with the
     /// work item that caused them. Providers derive it from
     /// <see cref="SandboxSpec.TimingWorkItemId"/> so watchdog process probes

@@ -22,7 +22,11 @@ public sealed partial class PipelineRunner
     /// branch is created from <paramref name="baseBranch"/>. On rework calls
     /// the branch is checked out as-is (with the work-phase commits already
     /// on it) and the agent stacks new commits on top.
-    /// Returns the agent's stdout for post-phase processing (e.g. question parsing).
+    /// Returns the agent-visible answer text for post-phase processing
+    /// (e.g. question parsing): the captured stdout projected through
+    /// <see cref="AgentVisibleStdout"/>, so envelope-framed runners (devin's
+    /// ACP shim emits the answer JSON-escaped inside <c>devin.acp</c>
+    /// envelopes) still surface their plain text to the block parsers.
     /// </summary>
     private async Task<string?> RunAgentPhaseAsync(
         WorkItem item,
@@ -1114,7 +1118,7 @@ public sealed partial class PipelineRunner
 
                     await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
                     phaseSucceeded = true;
-                    return agentResult.Stdout;
+                    return agentResult.Stdout is { } resumedStdout ? AgentVisibleStdout(runner, resumedStdout) : null;
                 }
 
                 var buildOutcome = RequiredBuildWorkPhaseOutcome.PassedOrSkipped;
@@ -1125,7 +1129,7 @@ public sealed partial class PipelineRunner
                 }
 
                 if (buildOutcome == RequiredBuildWorkPhaseOutcome.DeferredFailure)
-                    return agentResult.Stdout;
+                    return agentResult.Stdout is { } deferredStdout ? AgentVisibleStdout(runner, deferredStdout) : null;
 
                 // Feed the no-changes circuit breaker: a clean-exit-but-no-diff
                 // outcome is the silent-failure signature an agent exhibits when
@@ -1261,7 +1265,7 @@ public sealed partial class PipelineRunner
             await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
 
             phaseSucceeded = true;
-            return agentResult.Stdout;
+            return agentResult.Stdout is { } capturedStdout ? AgentVisibleStdout(runner, capturedStdout) : null;
         }
         catch (AgentResumePreparationUnavailableException ex)
         {

@@ -30,7 +30,8 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
         string seedRepoUrl,
         bool allowQuestions,
         IReadOnlyList<IAuditor>? auditors = null,
-        IAgentStreamStore? agentStreams = null)
+        IAgentStreamStore? agentStreams = null,
+        IAgentRunner? agentOverride = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -41,7 +42,7 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
-        var agent = new QuestionEmittingAgent();
+        var agent = agentOverride ?? new QuestionEmittingAgent();
         var registry = new AgentRegistry([agent]);
 
         var auditorList = auditors ?? (IReadOnlyList<IAuditor>)[];
@@ -53,7 +54,7 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
             DisplayName = "Test",
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
-            DefaultAgent = AgentKind.Claude,
+            DefaultAgent = agent.Kind,
             AllowAgentQuestions = allowQuestions,
             Audit = new ProjectAudit
             {
@@ -80,7 +81,8 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
 
-        return new TestPipelineWithQuestions(pipeline, store, questionStore, agent, gitHost, gitRoot, webhooks);
+        return new TestPipelineWithQuestions(pipeline, store, questionStore,
+            agent as QuestionEmittingAgent ?? new QuestionEmittingAgent(), gitHost, gitRoot, webhooks);
     }
 
     [Fact]
@@ -107,6 +109,38 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
         Assert.Single(questions);
         Assert.Equal("q-001", questions[0].QuestionId);
         Assert.Equal("open", questions[0].State);
+    }
+
+    [Fact]
+    public async Task AgentEmitsQuestion_InEnvelopeFramedStdout_ParksAtNeedsOperatorInput()
+    {
+        // Envelope-framed runners (devin's ACP dispatch) capture the agent's
+        // answer JSON-escaped inside devin.acp envelopes — the block regex
+        // never sees a literal id=" in the raw capture. The pipeline must
+        // project the stdout through the runner's IAgentVisibleTextExtractor
+        // before question parsing, or the operator question is silently
+        // dropped and the item merges unanswered.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var envelopeAgent = new EnvelopeFramedQuestionAgent { QuestionToEmit = "q-acp" };
+        using var tp = BuildWithQuestions(seed, allowQuestions: true, agentOverride: envelopeAgent);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Test",
+            Prompt = "do something",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+
+        var questions = await tp.QuestionStore.ListByWorkItemAsync(item.Id.ToString());
+        var question = Assert.Single(questions);
+        Assert.Equal("q-acp", question.QuestionId);
+        Assert.Equal("open", question.State);
     }
 
     [Fact]
@@ -408,6 +442,79 @@ internal sealed class QuestionEmittingAgent : IAgentRunner, IStructuredStreamAge
         if (captureStructuredStream)
             stdoutChunkCallback?.Invoke(stdout);
 
+        return new AgentResult(true, "ok", stdout, null);
+    }
+}
+
+/// <summary>
+/// A <see cref="QuestionEmittingAgent"/> variant whose stdout is a
+/// devin.acp envelope stream — the agent's answer text arrives JSON-escaped
+/// inside <c>agent_message_chunk</c>/<c>turn_complete.finalText</c> — and
+/// which projects it through the real <see cref="DevinAgentRunner"/>
+/// extractor, exactly as the production dispatch does.
+/// </summary>
+internal sealed class EnvelopeFramedQuestionAgent : IAgentRunner, IStructuredStreamAgentRunner, IAgentVisibleTextExtractor
+{
+    private static readonly CodeyBox.Agents.Devin.DevinAgentRunner ProjectionSource = new();
+
+    public AgentKind Kind { get; } = AgentKind.Devin;
+    public string? QuestionToEmit { get; set; }
+
+    public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default) =>
+        Task.FromResult(true);
+
+    public string? ExtractAgentVisibleText(string rawStdout)
+        => ProjectionSource.ExtractAgentVisibleText(rawStdout);
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox, string workingDirectory, string prompt,
+        AgentCredential? credential, string? modelId = null, string? reasoningMode = null,
+        CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
+    {
+        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(prompt,
+                @"merge branch `([^`]+)` into branch\s+`([^`]+)`",
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.Singleline);
+            if (!m.Success) return new AgentResult(false, "no parse", null, null);
+            var wb = m.Groups[1].Value;
+            var rc = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "merge", "--no-ff", "-m", $"codeybox: merge {wb}", $"origin/{wb}"],
+            }, ct);
+            return rc.Success ? new AgentResult(true, "merged", null, null) : new AgentResult(false, "merge failed", rc.Stdout, rc.Stderr);
+        }
+
+        var path = $"{workingDirectory}/question-test-{Guid.NewGuid():N}.txt";
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$0\"", path],
+            Stdin = "content\n",
+        }, ct);
+        if (!write.Success) return new AgentResult(false, "write failed", write.Stdout, write.Stderr);
+
+        var agentText = QuestionToEmit is null
+            ? "done"
+            : $"done\n<codeybox-question id=\"{QuestionToEmit}\">Should I use approach A or B? Default: A.</codeybox-question>";
+        var stdout = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            type = "devin.acp",
+            @event = "session_update",
+            sessionId = "s-1",
+            update = new
+            {
+                sessionUpdate = "agent_message_chunk",
+                content = new { type = "text", text = agentText },
+            },
+        }) + "\n" + System.Text.Json.JsonSerializer.Serialize(new
+        {
+            type = "devin.acp",
+            @event = "turn_complete",
+            stopReason = "end_turn",
+            finalText = agentText,
+        }) + "\n";
+
+        stdoutChunkCallback?.Invoke(stdout);
         return new AgentResult(true, "ok", stdout, null);
     }
 }

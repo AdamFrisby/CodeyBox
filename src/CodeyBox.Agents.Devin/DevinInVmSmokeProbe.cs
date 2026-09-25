@@ -13,9 +13,11 @@ namespace CodeyBox.Agents.Devin;
 ///   the credentials file landed where the CLI reads it AND the api_server_url
 ///   inside is reachable. <c>devin auth status</c> is deliberately NOT the
 ///   check: it prints "Not logged in." and still exits 0.</item>
-///   <item>a real print-mode turn using the exact dispatch argv
-///   (<see cref="DevinAgentRunner.FullAutonomyInvocationPrefix"/>) so the
-///   workspace-trust and permission-mode contract is exercised end to end.</item>
+///   <item>a real ACP turn using the exact dispatch wrapper
+///   (<see cref="DevinAgentRunner.BuildAcpDispatchScript"/> +
+///   <see cref="DevinAcpShim.BuildDispatchStdin"/>) so the shim delivery,
+///   prompt-file, session-mode, and <c>--model</c> contract is exercised
+///   end to end.</item>
 /// </list>
 ///
 /// <para>When the auth credential is absent — no credential bundle, or one
@@ -26,6 +28,21 @@ namespace CodeyBox.Agents.Devin;
 /// </summary>
 public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
 {
+    private readonly AgentDefaultsSnapshot? _defaults;
+
+    /// <param name="defaults">
+    /// Live snapshot of per-agent default model IDs (see
+    /// <see cref="AgentDefaultsSnapshot"/>). The probe's real ACP turn passes
+    /// the configured devin model when one is set, exercising the same
+    /// <c>--model</c> argv leg a dispatch does; when no default is
+    /// configured the flag is omitted and the account's server-side default
+    /// applies — matching dispatch behaviour exactly.
+    /// </param>
+    public DevinInVmSmokeProbe(AgentDefaultsSnapshot? defaults = null)
+    {
+        _defaults = defaults;
+    }
+
     public AgentKind Kind => AgentKind.Devin;
 
     public IReadOnlyList<InVmSmokeStep> BuildSteps(AgentCredential? credential)
@@ -47,13 +64,19 @@ public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
             steps.Add(new(
                 [DevinAgentRunner.DefaultBinary, "models", "list", "--format", "json"],
                 FailureHint: "devin models list failed (credentials path drift or invalid token)"));
-            // Runs through the runner's own prompt-file wrapper, so the probe
-            // fails whenever a real dispatch would fail to deliver its prompt.
+            // Runs through the runner's own ACP dispatch wrapper and framed
+            // stdin, so the probe fails whenever a real dispatch would fail:
+            // shim decode, prompt-file delivery, handshake, the
+            // full-autonomy session mode, and the configured --model pin all
+            // exercise the production path.
             steps.Add(new(
-                ["bash", "-c", DevinAgentRunner.BuildPromptFileScript(
-                    DevinAgentRunner.FullAutonomyInvocationPrefix(DevinAgentRunner.DefaultBinary))],
-                Stdin: "Reply with the single word: OK",
-                FailureHint: "devin print-mode turn failed (prompt delivery, workspace-trust or permission-mode contract drift)"));
+                ["bash", "-c", DevinAgentRunner.BuildAcpDispatchScript(
+                    DevinAgentRunner.AcpShimArgs(
+                        DevinAgentRunner.DefaultBinary,
+                        _defaults?.GetDefault(Kind.Value),
+                        DevinAgentRunner.FullAutonomyAcpMode))],
+                Stdin: DevinAcpShim.BuildDispatchStdin("Reply with the single word: OK"),
+                FailureHint: "devin acp turn failed (shim delivery, prompt-file, handshake or session-mode contract drift)"));
         }
 
         return steps;

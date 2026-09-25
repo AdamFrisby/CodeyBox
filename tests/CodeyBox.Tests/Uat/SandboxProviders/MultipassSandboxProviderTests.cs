@@ -1410,6 +1410,68 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void BuildDetachedLaunchScript_ReadyCheckTokenTravelsOnStdinNotEnvironment()
+    {
+        // The ready check's bearer credential must not sit in a process's
+        // environ/argv — /proc/<pid>/{environ,cmdline} is readable by any
+        // same-uid process in the sandbox (and the agent has sudo). The
+        // script feeds it to python on stdin's first line instead.
+        var script = MultipassSandbox.BuildDetachedLaunchScript(
+            "/home/ubuntu/.codeybox-exec-env/env",
+            "/home/ubuntu/.codeybox-exec/detached.pgid",
+            null,
+            ["/bin/sh", "-c", "printf should-run"]);
+
+        Assert.DoesNotContain(
+            "CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\",
+            script, StringComparison.Ordinal);
+        Assert.Contains(
+            "{ printf '%s\\n' \"$codeybox_output_token\"; } | timeout 4 env",
+            script, StringComparison.Ordinal);
+        Assert.Contains(
+            "token = sys.stdin.buffer.readline()",
+            script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_GeneratedScriptParsesAsBash()
+    {
+        // The launch script is stringly generated; `bash -n` catches quoting
+        // drift (e.g. a malformed ShellSingleQuote splice) that the pure
+        // string assertions cannot, without needing a VM.
+        if (OperatingSystem.IsWindows()) return;
+
+        var script = MultipassSandbox.BuildDetachedLaunchScript(
+            "/home/ubuntu/.codeybox-exec-env/env file",
+            "/home/ubuntu/.codeybox-exec/detached marker.pgid",
+            "/home/ubuntu/.codeybox-exec/stdin file",
+            ["/bin/sh", "/home/ubuntu/.codeybox-exec/command script.sh"],
+            exitTokenFile: "/home/ubuntu/.codeybox-exec/exit token");
+
+        var path = Path.Combine(Path.GetTempPath(), $"codeybox-detached-{Guid.NewGuid():N}.sh");
+        await File.WriteAllTextAsync(path, script);
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "/bin/bash",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add("-n");
+            psi.ArgumentList.Add(path);
+            using var proc = Process.Start(psi)!;
+            var stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0, $"bash -n rejected the generated launch script: {stderr}");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void BuildDetachedLaunchScript_DefaultMarkerWaitSecondsIsThirty()
     {
         var script = MultipassSandbox.BuildDetachedLaunchScript(
