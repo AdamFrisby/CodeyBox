@@ -30,8 +30,12 @@ public abstract record MajordomoMutateArgs : MajordomoToolArgs
 
     /// <summary>
     /// Number of work items a real (non-dry-run) execution of this call would
-    /// create or change. Used by the per-call and per-turn blast-radius
-    /// bounds; always &gt;= 1.
+    /// create or change, as far as the contract can express it. Used by the
+    /// per-call and per-turn blast-radius bounds; always &gt;= 1. Where the
+    /// true radius depends on live state (a cancel's queued-dependent
+    /// cascade), the runtime measures it and passes the projection to
+    /// <see cref="MajordomoAuthorization.Decide"/> — the declared count is a
+    /// floor, never the ceiling.
     /// </summary>
     public abstract int AffectedItemCount { get; }
 }

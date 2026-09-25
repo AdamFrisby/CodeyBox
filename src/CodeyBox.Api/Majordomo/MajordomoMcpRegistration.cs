@@ -25,6 +25,10 @@ internal static class MajordomoMcpRegistration
         services.AddSingleton<MajordomoExecutor>();
         services.AddHttpContextAccessor();
 
+        // Fail composition if any vocabulary descriptor lacks a handler —
+        // publication of an unwired tool must surface here, not per call.
+        MajordomoExecutor.VerifyVocabularyWiring();
+
         // Stateless streamable HTTP: no server-side session state, so the
         // per-identity turn ledger is the only mutation-budget accounting and
         // no session can outlive the credential that opened it.

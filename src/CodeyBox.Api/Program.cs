@@ -327,13 +327,13 @@ builder.Services.AddOptions<CodeyBoxOptions>()
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplySandboxClassesTo(opts, builder.Configuration));
 // Majordomo MCP surface: hot-reloadable policy (autonomy mode, per-turn
 // blast-radius cap, identity name, turn window) mirroring the vocabulary's
-// MajordomoOptions. Validation fails fast at load rather than silently
-// weakening the gate on a config typo.
+// MajordomoOptions. Validation fails fast at host start rather than silently
+// weakening the gate on a config typo, and reports the specific rule that
+// failed via the IValidateOptions implementation.
+builder.Services.AddSingleton<IValidateOptions<MajordomoServerOptions>, MajordomoServerOptionsValidator>();
 builder.Services.AddOptions<MajordomoServerOptions>()
     .Bind(builder.Configuration.GetSection(MajordomoServerOptions.SectionName))
-    .Validate(
-        static opts => MajordomoServerOptions.Validate(opts) is null,
-        "invalid CodeyBox:Majordomo configuration — see MajordomoServerOptions.Validate");
+    .ValidateOnStart();
 builder.Services.AddMajordomoMcp();
 
 builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(

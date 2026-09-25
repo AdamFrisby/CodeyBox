@@ -887,19 +887,50 @@ internal sealed class WorkItemCommandService
         Cancel,
     }
 
+    /// <param name="CascadeTargets">
+    /// The queued transitive dependents the commit will cascade-cancel,
+    /// enumerated at plan time via <see cref="FindCancelCascadeTargetsAsync"/>
+    /// so the reviewed change set and the executed write are the same set.
+    /// Empty for kinds that never cascade (close-out, already-cancelled).
+    /// </param>
     internal sealed record WorkItemCancelPlan(
         WorkItem Item,
         WorkItemCancelKind Kind,
         string? Reason,
-        string? ResolutionSha);
+        string? ResolutionSha,
+        IReadOnlyList<WorkItem> CascadeTargets);
+
+    /// <summary>
+    /// Enumerates every Queued item that transitively depends on
+    /// <paramref name="cancelledId"/> — the set a cancel commits alongside
+    /// the named item. Pure projection over a store listing; the per-target
+    /// write in <see cref="CommitCancelAsync"/> is still state-guarded, so a
+    /// target that raced out of Queued between plan and commit is skipped.
+    /// </summary>
+    public async Task<IReadOnlyList<WorkItem>> FindCancelCascadeTargetsAsync(
+        WorkItemId cancelledId, CancellationToken ct)
+    {
+        var allItems = new List<WorkItem>();
+        await foreach (var i in _store.ListAsync(ct)) allItems.Add(i);
+        return WorkItemDependencies.FindCascadeCancelTargets(cancelledId, allItems);
+    }
 
     /// <summary>
     /// Validates the close-out metadata and classifies the cancel by item
-    /// state. Pure — no writes; the worker-binding check happens inside the
-    /// commit because the cancel signal is itself the mutation.
+    /// state. No writes; the worker-binding check happens inside the commit
+    /// because the cancel signal is itself the mutation.
     /// </summary>
+    /// <param name="cascadeTargets">
+    /// The dependents enumerated by <see cref="FindCancelCascadeTargetsAsync"/>
+    /// at plan time. Carried on the plan so the commit cancels exactly the set
+    /// the caller reviewed — dependents created after the plan stay queued
+    /// behind the cancelled parent, same as dependents created after commit.
+    /// </param>
     public CommandPlan<WorkItemCancelPlan> PlanCancel(
-        WorkItem item, string? reason, string? resolutionSha)
+        WorkItem item,
+        string? reason,
+        string? resolutionSha,
+        IReadOnlyList<WorkItem> cascadeTargets)
     {
         // Validate optional close-out metadata. Same shape as /resume's reason
         // guard (no control chars, ≤500 chars); resolutionSha is a Git-shaped
@@ -921,13 +952,14 @@ internal sealed class WorkItemCommandService
         // there is a single terminal-closed shape regardless of how it got there.
         if (IsTerminalFailureCloseable(item.State))
             return CommandPlan<WorkItemCancelPlan>.Ready(
-                new WorkItemCancelPlan(item, WorkItemCancelKind.CloseTerminalFailure, reason, resolutionSha));
+                new WorkItemCancelPlan(
+                    item, WorkItemCancelKind.CloseTerminalFailure, reason, resolutionSha, []));
 
         // Idempotent close: an already-cancelled item is a no-op rather than 409.
         // Lets operator scripts and the audit UI retry DELETE safely.
         if (item.State == WorkItemState.Cancelled)
             return CommandPlan<WorkItemCancelPlan>.Ready(
-                new WorkItemCancelPlan(item, WorkItemCancelKind.AlreadyCancelled, reason, resolutionSha));
+                new WorkItemCancelPlan(item, WorkItemCancelKind.AlreadyCancelled, reason, resolutionSha, []));
 
         if (item.State == WorkItemState.Done)
             return CommandPlan<WorkItemCancelPlan>.Refused(
@@ -942,7 +974,7 @@ internal sealed class WorkItemCommandService
                 WorkItemCommandOutcome.Conflict($"cannot cancel item in state {item.State}"));
 
         return CommandPlan<WorkItemCancelPlan>.Ready(
-            new WorkItemCancelPlan(item, WorkItemCancelKind.Cancel, reason, resolutionSha));
+            new WorkItemCancelPlan(item, WorkItemCancelKind.Cancel, reason, resolutionSha, cascadeTargets));
     }
 
     public async Task<WorkItemCommandOutcome> CommitCancelAsync(WorkItemCancelPlan plan, CancellationToken ct)
@@ -1020,9 +1052,25 @@ internal sealed class WorkItemCommandService
                 await _timings.DeleteByWorkItemAsync(workItemId, ct);
         }
 
-        // Cascade: cancel all Queued items that (transitively) depend on this
-        // one. In-flight items (non-Queued) are left to run their course.
-        var cascaded = await CascadeCancelDependentsAsync(workItemId, _store, ct);
+        // Cascade: cancel the Queued transitive dependents enumerated at plan
+        // time. The committed set is exactly the reviewed set — dependents
+        // that raced out of Queued since the plan are skipped by the guard.
+        var cascaded = new List<WorkItemId>(plan.CascadeTargets.Count);
+        foreach (var target in plan.CascadeTargets)
+        {
+            // Atomic conditional update: only writes Cancelled when the item is still
+            // Queued in the DB. If a worker raced and transitioned it to Working between
+            // the plan's enumeration and now, the WHERE guard returns 0 rows and we skip
+            // the audit log — no spurious WorkItemDependentCancelled for in-flight items.
+            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled",
+                WorkItemCancellationReason.ParentCascaded);
+            var updated = await _store.TryUpdateIfStateAsync(cancelled, WorkItemState.Queued, ct);
+            if (updated)
+            {
+                cascaded.Add(target.Id);
+                AuditLog.WorkItemDependentCancelled(target.Id, workItemId);
+            }
+        }
 
         // Orphan any replays: clear their replay_of link so they keep running
         // but are no longer linked to the (now-cancelled) source.
@@ -1038,7 +1086,8 @@ internal sealed class WorkItemCommandService
     public async Task<WorkItemCommandOutcome> CancelAsync(
         WorkItem item, string? reason, string? resolutionSha, CancellationToken ct)
     {
-        var (plan, error) = PlanCancel(item, reason, resolutionSha);
+        var (plan, error) = PlanCancel(
+            item, reason, resolutionSha, await FindCancelCascadeTargetsAsync(item.Id, ct));
         return error ?? await CommitCancelAsync(plan!, ct);
     }
 
@@ -1054,39 +1103,6 @@ internal sealed class WorkItemCommandService
         var prefix = $"closed by operator from {priorState}";
         if (resolutionSha is not null) prefix += $" (resolution-sha={resolutionSha})";
         return reason is null ? prefix : $"{prefix}: {reason}";
-    }
-
-    /// <summary>
-    /// Cancels every Queued item that transitively depends on
-    /// <paramref name="cancelledId"/>; returns the ids actually transitioned.
-    /// </summary>
-    private async Task<IReadOnlyList<WorkItemId>> CascadeCancelDependentsAsync(
-        WorkItemId cancelledId,
-        IWorkItemStore store,
-        CancellationToken ct)
-    {
-        var allItems = new List<WorkItem>();
-        await foreach (var i in store.ListAsync(ct)) allItems.Add(i);
-
-        var targets = WorkItemDependencies.FindCascadeCancelTargets(cancelledId, allItems);
-        var cascaded = new List<WorkItemId>(targets.Count);
-        foreach (var target in targets)
-        {
-            // Atomic conditional update: only writes Cancelled when the item is still
-            // Queued in the DB. If a worker raced and transitioned it to Working between
-            // the ListAsync snapshot and now, the WHERE guard returns 0 rows and we skip
-            // the audit log — no spurious WorkItemDependentCancelled for in-flight items.
-            var cancelled = target.With(WorkItemState.Cancelled, "parent dependency cancelled",
-                WorkItemCancellationReason.ParentCascaded);
-            var updated = await store.TryUpdateIfStateAsync(cancelled, WorkItemState.Queued, ct);
-            if (updated)
-            {
-                cascaded.Add(target.Id);
-                AuditLog.WorkItemDependentCancelled(target.Id, cancelledId);
-            }
-        }
-
-        return cascaded;
     }
 
     // ── POST /workitems/{id}/retry ───────────────────────────────────────────

@@ -61,6 +61,15 @@ internal static class ApiKeyAuth
                         configuration,
                         environment,
                         RequiredConfigurationValidator.ApiClientsEntryMessage);
+                // The auth-disabled sentinel name is reserved: a configured
+                // client carrying it would be treated as the loopback
+                // operator by every host-scoped gate that asks
+                // IsAuthenticationDisabled.
+                if (string.Equals(client.Name, AuthenticationDisabledClientName, StringComparison.Ordinal))
+                    throw RequiredConfigurationValidator.CreateAggregateException(
+                        configuration,
+                        environment,
+                        $"CodeyBox:ApiClients entry name '{AuthenticationDisabledClientName}' is reserved.");
                 var token = Environment.GetEnvironmentVariable(client.TokenEnvVar);
                 if (string.IsNullOrWhiteSpace(token) || token.Length < 32)
                     throw RequiredConfigurationValidator.CreateAggregateException(

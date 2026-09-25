@@ -1519,6 +1519,9 @@ public sealed class SqliteWorkItemStore :
     }
 
     /// <inheritdoc />
+    public bool CreateAllIsAtomic => true;
+
+    /// <inheritdoc />
     /// <remarks>
     /// One write-lock acquisition and one transaction cover every item: a
     /// constraint violation or failure partway rolls the whole batch back, so

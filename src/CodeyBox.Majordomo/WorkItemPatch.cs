@@ -30,20 +30,25 @@ public sealed record WorkItemPatch
         IReadOnlyDictionary<string, string>? externalIds = null,
         IReadOnlyDictionary<string, string>? knobs = null)
     {
-        // Every field's assignment is an element of this array, so the
-        // no-change guard inspects the normalised values themselves rather
-        // than a parallel list of property names — a new field's assignment
-        // belongs in the same array, where it is counted automatically.
+        // Priority and ExternalIds have dedicated plan paths, so they are
+        // assigned outside the array — every OTHER field's assignment is an
+        // element of this array, which serves two guards at once: the
+        // no-change check below inspects the normalised values themselves
+        // rather than a parallel list of property names, and HasFieldEdits
+        // reads the same array. A new field's assignment belongs in the
+        // array, where both guards count it automatically.
         // The guard runs on the NORMALISED values: an input that normalises
         // away (a whitespace auditComplexity) is not a change, so a patch
         // carrying only that is still unrepresentable.
+        Priority = priority is { } p ? WorkItemFieldValidation.Priority(p) : null;
+        ExternalIds = externalIds is null ? null : WorkItemFieldValidation.ExternalIds(externalIds);
+
         object?[] normalised =
         [
             Title = title is null ? null : WorkItemFieldValidation.Title(title),
             Prompt = prompt is null ? null : WorkItemFieldValidation.Prompt(prompt),
             Agent = agent,
             AgentClassId = agentClassId is null ? null : WorkItemFieldValidation.AgentClassId(agentClassId),
-            Priority = priority is { } p ? WorkItemFieldValidation.Priority(p) : null,
             WorkTimeout = workTimeout is { } wt ? WorkItemFieldValidation.WorkTimeout(wt) : null,
             MergeTimeout = mergeTimeout is { } mt ? WorkItemFieldValidation.MergeTimeout(mt) : null,
             MinModelScore = minModelScore is { } mms ? WorkItemFieldValidation.MinModelScore(mms) : null,
@@ -53,12 +58,13 @@ public sealed record WorkItemPatch
                 ? null
                 : WorkItemFieldValidation.RequiredCapabilities(requiredCapabilities),
             DependsOn = dependsOn is null ? null : WorkItemFieldValidation.DependsOn(dependsOn),
-            ExternalIds = externalIds is null ? null : WorkItemFieldValidation.ExternalIds(externalIds),
             Knobs = knobs is null ? null : WorkItemFieldValidation.Knobs(knobs),
         ];
 
-        if (normalised.All(v => v is null))
+        if (normalised.All(v => v is null) && Priority is null && ExternalIds is null)
             throw new ArgumentException("patch must change at least one field");
+
+        HasFieldEdits = normalised.Any(v => v is not null);
     }
 
     /// <summary>New title; null = unchanged.</summary>
@@ -110,4 +116,13 @@ public sealed record WorkItemPatch
 
     /// <summary>Replace-set knob overrides; null = unchanged, empty = clear.</summary>
     public IReadOnlyDictionary<string, string>? Knobs { get; }
+
+    /// <summary>
+    /// True when the patch carries at least one edit the shared field-patch
+    /// plan applies — every field except <see cref="Priority"/> and
+    /// <see cref="ExternalIds"/>, which are committed through their own
+    /// dedicated plans. Derived from the constructor's normalised-value
+    /// array, so a field added there is counted automatically.
+    /// </summary>
+    public bool HasFieldEdits { get; }
 }

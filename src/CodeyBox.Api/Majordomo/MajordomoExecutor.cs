@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using CodeyBox.Core;
@@ -22,6 +24,9 @@ namespace CodeyBox.Api.Majordomo;
 ///   <item>bind arguments to the declared contract (failures still call
 ///   <c>Decide</c> with a null payload, which refuses as
 ///   <see cref="MajordomoRefusalReason.ArgumentContractMismatch"/>);</item>
+///   <item>measure the real blast radius where the contract under-declares
+///   it (a cancel's queued-dependent cascade) so <c>Decide</c> bounds what
+///   would actually run;</item>
 ///   <item><c>Decide</c> — the only policy check;</item>
 ///   <item>audit the call record (before any mutation);</item>
 ///   <item>run the backend: reads execute; mutations run the shared
@@ -29,17 +34,104 @@ namespace CodeyBox.Api.Majordomo;
 ///   for executed calls;</item>
 ///   <item>audit the outcome; spend turn budget only on real mutations.</item>
 /// </list>
+/// Mutations of one identity are serialized through the whole measure →
+/// decide → commit → record sequence by a keyed gate: the transport is
+/// stateless and parallel, and without serialization concurrent calls would
+/// observe the same pre-call usage and jointly overshoot the turn cap.
 /// </remarks>
 internal sealed class MajordomoExecutor
 {
     /// <summary>Arguments captured into the audit record are truncated to this many characters.</summary>
     internal const int MaxAuditArgumentChars = 8192;
 
+    private delegate Task<(MajordomoToolResult? Result, MajordomoRefusal? Refusal)> ReadHandler(
+        MajordomoReadBackend backend, MajordomoToolArgs args, CancellationToken ct);
+
+    /// <param name="cancelCascadeTargets">
+    /// For <c>cancel_work_item</c>, the dependents enumerated at decision
+    /// time — the plan must commit exactly the measured set, not a re-scan.
+    /// Null for every other tool.
+    /// </param>
+    private delegate Task<MajordomoMutationResult> MutateHandler(
+        MajordomoMutateBackend backend,
+        MajordomoMutateArgs args,
+        WorkInitiator initiator,
+        IReadOnlyList<WorkItem>? cancelCascadeTargets,
+        bool commit,
+        CancellationToken ct);
+
+    /// <summary>
+    /// Everything the executor needs to serve one vocabulary descriptor: an
+    /// optional argument-binding override (the parameterless tools), plus the
+    /// read or mutate handler. Bound once, beside the vocabulary, so an
+    /// unwired descriptor fails at registration rather than per call.
+    /// </summary>
+    private sealed record ToolWiring(
+        Func<MajordomoTool, JsonNode?, (MajordomoToolArgs? Args, MajordomoRefusal? Refusal)>? Bind,
+        ReadHandler? Read,
+        MutateHandler? Mutate);
+
+    private static readonly FrozenDictionary<MajordomoTool, ToolWiring> Wiring =
+        new Dictionary<MajordomoTool, ToolWiring>
+        {
+            [MajordomoTools.GetQueueStatus] = new(
+                static (tool, args) => EmptyOrRefuse(tool, args, GetQueueStatusArgs.Instance),
+                static async (b, _, ct) => ((MajordomoToolResult?)await b.GetQueueStatusAsync(ct).ConfigureAwait(false), null),
+                null),
+            [MajordomoTools.GetDispatchStatus] = new(
+                static (tool, args) => EmptyOrRefuse(tool, args, GetDispatchStatusArgs.Instance),
+                static async (b, _, ct) => ((MajordomoToolResult?)await b.GetDispatchStatusAsync(ct).ConfigureAwait(false), null),
+                null),
+            [MajordomoTools.GetAgentCapacity] = new(
+                null,
+                static async (b, a, ct) => await b.GetAgentCapacityAsync((GetAgentCapacityArgs)a, ct).ConfigureAwait(false),
+                null),
+            [MajordomoTools.ListWorkItems] = new(
+                null,
+                static async (b, a, ct) => ((MajordomoToolResult?)await b.ListWorkItemsAsync((ListWorkItemsArgs)a, ct).ConfigureAwait(false), null),
+                null),
+            [MajordomoTools.GetWorkItem] = new(
+                null,
+                static async (b, a, ct) => ((MajordomoToolResult?)await b.GetWorkItemAsync((GetWorkItemArgs)a, ct).ConfigureAwait(false), null),
+                null),
+            [MajordomoTools.GetWorkItemAudit] = new(
+                null,
+                static async (b, a, ct) => ((MajordomoToolResult?)await b.GetWorkItemAuditAsync((GetWorkItemAuditArgs)a, ct).ConfigureAwait(false), null),
+                null),
+            [MajordomoTools.CreateWorkItem] = new(
+                null,
+                null,
+                static (b, a, initiator, _, commit, ct) => b.CreateAsync((CreateWorkItemArgs)a, initiator, commit, ct)),
+            [MajordomoTools.CreateWorkItemChain] = new(
+                null,
+                null,
+                static (b, a, initiator, _, commit, ct) => b.CreateChainAsync((CreateWorkItemChainArgs)a, initiator, commit, ct)),
+            [MajordomoTools.UpdateWorkItem] = new(
+                null,
+                null,
+                static (b, a, _, _, commit, ct) => b.UpdateAsync((UpdateWorkItemArgs)a, commit, ct)),
+            [MajordomoTools.CancelWorkItem] = new(
+                null,
+                null,
+                static (b, a, _, cascade, commit, ct) => b.CancelAsync((CancelWorkItemArgs)a, cascade, commit, ct)),
+            [MajordomoTools.RetryWorkItem] = new(
+                null,
+                null,
+                static (b, a, _, _, commit, ct) => b.RetryAsync((RetryWorkItemArgs)a, commit, ct)),
+        }.ToFrozenDictionary();
+
     private readonly MajordomoReadBackend _reads;
     private readonly MajordomoMutateBackend _mutates;
     private readonly IOptionsMonitor<MajordomoServerOptions> _options;
     private readonly MajordomoTurnLedger _ledger;
     private readonly IHttpContextAccessor _httpContext;
+
+    /// <summary>
+    /// Per-identity serialization for mutate calls. Keys are configured API
+    /// client names (a bounded operator-defined set), so the map cannot grow
+    /// with caller input.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _mutationGates = new(StringComparer.Ordinal);
 
     public MajordomoExecutor(
         MajordomoReadBackend reads,
@@ -53,6 +145,24 @@ internal sealed class MajordomoExecutor
         _options = options;
         _ledger = ledger;
         _httpContext = httpContext;
+    }
+
+    /// <summary>
+    /// Startup-time wiring check called by registration: every vocabulary
+    /// descriptor must carry a handler of its own class. Without this a tool
+    /// added to <see cref="MajordomoTools.All"/> would publish cleanly and
+    /// only fail per call — the gap must surface when the server is composed.
+    /// </summary>
+    internal static void VerifyVocabularyWiring()
+    {
+        foreach (var tool in MajordomoTools.All)
+        {
+            var wired = Wiring.TryGetValue(tool, out var wiring)
+                && (tool.Class == MajordomoToolClass.Read ? wiring.Read is not null : wiring.Mutate is not null);
+            if (!wired)
+                throw new InvalidOperationException(
+                    $"majordomo tool '{tool.Name}' is in the vocabulary but has no {tool.Class} handler wired");
+        }
     }
 
     /// <summary>
@@ -71,37 +181,93 @@ internal sealed class MajordomoExecutor
         // mismatch.
         MajordomoToolArgs? args = null;
         MajordomoRefusal? bindRefusal = null;
-        if (MajordomoTools.TryGet(name, out var tool))
+        MajordomoTool? tool = null;
+        if (MajordomoTools.TryGet(name, out var resolved))
+        {
+            tool = resolved;
             (args, bindRefusal) = BindArguments(tool, argsNode);
+        }
 
-        var usage = _ledger.Snapshot(identity, TimeSpan.FromSeconds(options.TurnWindowSeconds));
-        var decision = MajordomoAuthorization.Decide(name, args, options.ToPolicy(), usage);
+        // Serialize one identity's mutations across measure → decide → commit
+        // → record. Stateless HTTP serves calls in parallel; without the gate
+        // N concurrent calls would snapshot the same pre-call usage, each
+        // pass the remaining-budget check, and jointly exceed the cap.
+        var gate = args is MajordomoMutateArgs
+            ? _mutationGates.GetOrAdd(identity, static _ => new SemaphoreSlim(1, 1))
+            : null;
+        if (gate is not null)
+            await gate.WaitAsync(ct).ConfigureAwait(false);
 
-        // The call record is written before any mutation is attempted —
-        // refused calls are audited too.
-        var callId = Guid.NewGuid().ToString("N");
-        var decisionLabel = decision switch
+        try
         {
-            MajordomoDecision.Execute => "execute",
-            MajordomoDecision.Propose => "propose",
-            MajordomoDecision.Refuse => "refuse",
-            _ => "unknown",
-        };
-        AuditLog.MajordomoToolCall(
-            callId, identity, name ?? "<missing>", decisionLabel, BoundArguments(argsNode));
+            // The blast radius Decide sees must be the real one: cancelling an
+            // item cascades to every queued transitive dependent, a count the
+            // argument contract cannot express. Enumerating here — inside the
+            // gate — also means the measured set is what the commit replays.
+            IReadOnlyList<WorkItem>? cancelCascade = null;
+            int? projectedAffected = null;
+            if (args is CancelWorkItemArgs cancel)
+            {
+                cancelCascade = await _mutates
+                    .FindCancelCascadeTargetsAsync(cancel.Id, ct).ConfigureAwait(false);
+                projectedAffected = 1 + cancelCascade.Count;
+            }
 
-        var (envelope, outcomeLabel, outcomeDetail, isError) = await DispatchAsync(
-            decision, name, identity, args, argsNode, bindRefusal, ct).ConfigureAwait(false);
-        AuditLog.MajordomoToolOutcome(callId, identity, name ?? "<missing>", outcomeLabel, outcomeDetail);
+            var usage = _ledger.Snapshot(identity, TimeSpan.FromSeconds(options.TurnWindowSeconds));
+            var decision = MajordomoAuthorization.Decide(
+                name, args, options.ToPolicy(), usage, projectedAffected);
 
-        var json = JsonSerializer.SerializeToElement(envelope, MajordomoJson.Options);
-        var text = JsonSerializer.Serialize(envelope, MajordomoJson.Options);
-        return new CallToolResult
+            // The call record is written before any mutation is attempted —
+            // refused calls are audited too. The wire name is untrusted input
+            // (nothing proven about it reaches this boundary); it is rendered
+            // through the echo guard so control characters cannot be smuggled
+            // into the audit trail.
+            var callId = Guid.NewGuid().ToString("N");
+            var auditTool = name is null ? "<missing>" : Validation.DescribeUntrustedValue(name);
+            var auditIdentity = Validation.DescribeUntrustedValue(identity);
+            AuditLog.MajordomoToolCall(
+                callId, auditIdentity, auditTool, DecisionLabel(decision), BoundArguments(argsNode));
+
+            try
+            {
+                var (envelope, outcome, detail, isError) = await DispatchAsync(
+                    decision, name, identity, args, argsNode, bindRefusal, cancelCascade, ct)
+                    .ConfigureAwait(false);
+                AuditLog.MajordomoToolOutcome(callId, auditIdentity, auditTool, outcome, detail);
+
+                var json = JsonSerializer.SerializeToElement(envelope, MajordomoJson.Options);
+                return new CallToolResult
+                {
+                    IsError = isError,
+                    StructuredContent = json,
+                    Content = [new TextContentBlock { Text = json.GetRawText() }],
+                };
+            }
+            catch (Exception ex)
+            {
+                // A mutation that threw mid-commit may have already written —
+                // post-commit steps (enqueue, webhooks, audit writes) fault
+                // after the row lands. Charge the projected blast radius so a
+                // faulted commit is not a free retry, and still emit the
+                // outcome record.
+                if (decision is MajordomoDecision.Execute
+                    && args is MajordomoMutateArgs { DryRun: false } failed)
+                {
+                    _ledger.Record(
+                        identity,
+                        Math.Max(failed.AffectedItemCount, projectedAffected ?? failed.AffectedItemCount));
+                }
+
+                AuditLog.MajordomoToolOutcome(
+                    callId, auditIdentity, auditTool, MajordomoOutcomes.Error,
+                    Validation.DescribeUntrustedValue($"{ex.GetType().Name}: {ex.Message}"));
+                throw;
+            }
+        }
+        finally
         {
-            IsError = isError,
-            StructuredContent = json,
-            Content = [new TextContentBlock { Text = text }],
-        };
+            gate?.Release();
+        }
     }
 
     private async Task<(JsonObject Envelope, string Outcome, string? Detail, bool IsError)> DispatchAsync(
@@ -111,6 +277,7 @@ internal sealed class MajordomoExecutor
         MajordomoToolArgs? args,
         JsonNode? argsNode,
         MajordomoRefusal? bindRefusal,
+        IReadOnlyList<WorkItem>? cancelCascade,
         CancellationToken ct)
     {
         switch (decision)
@@ -120,7 +287,8 @@ internal sealed class MajordomoExecutor
                 var refusal = bindRefusal is not null
                     ? bindRefusal with { Reason = ToReasonCode(refuse.Reason) }
                     : new MajordomoRefusal(ToReasonCode(refuse.Reason), refuse.Detail);
-                return (Envelope("refused", refusal: refusal), "refused", refusal.Detail, true);
+                return (Envelope(MajordomoOutcomes.Refused, refusal: refusal),
+                    MajordomoOutcomes.Refused, refusal.Detail, true);
             }
 
             case MajordomoDecision.Execute execute:
@@ -129,12 +297,15 @@ internal sealed class MajordomoExecutor
                 {
                     var (result, readRefusal) = await RunReadAsync(execute.Tool, args!, ct).ConfigureAwait(false);
                     if (readRefusal is not null)
-                        return (Envelope("refused", refusal: readRefusal), "refused", readRefusal.Detail, true);
-                    return (Envelope("executed", result: result), "executed", null, false);
+                        return (Envelope(MajordomoOutcomes.Refused, refusal: readRefusal),
+                            MajordomoOutcomes.Refused, readRefusal.Detail, true);
+                    return (Envelope(MajordomoOutcomes.Executed, result: result),
+                        MajordomoOutcomes.Executed, null, false);
                 }
 
                 var mutate = (MajordomoMutateArgs)args!;
-                var mutation = await RunMutateAsync(execute.Tool, mutate, commit: !mutate.DryRun, ct)
+                var mutation = await RunMutateAsync(
+                        execute.Tool, mutate, cancelCascade, commit: !mutate.DryRun, ct)
                     .ConfigureAwait(false);
 
                 // Budget is spent by real mutations only — dry-runs write
@@ -151,94 +322,88 @@ internal sealed class MajordomoExecutor
                             mutate.AffectedItemCount));
 
                 if (mutation.Refusal is not null)
-                    return (Envelope("refused", refusal: mutation.Refusal), "refused", mutation.Refusal.Detail, true);
+                    return (Envelope(MajordomoOutcomes.Refused, refusal: mutation.Refusal),
+                        MajordomoOutcomes.Refused, mutation.Refusal.Detail, true);
 
-                var label = mutate.DryRun ? "dry_run" : "executed";
+                var label = mutate.DryRun ? MajordomoOutcomes.DryRun : MajordomoOutcomes.Executed;
                 return (Envelope(label, result: mutation.ChangeSet), label, null, false);
             }
 
             case MajordomoDecision.Propose propose:
             {
-                var mutation = await RunMutateAsync(propose.Proposal.Tool, (MajordomoMutateArgs)args!, commit: false, ct)
+                var proposalArgs = (MajordomoMutateArgs)args!;
+                var mutation = await RunMutateAsync(
+                        propose.Proposal.Tool, proposalArgs, cancelCascade, commit: false, ct)
                     .ConfigureAwait(false);
                 if (mutation.Refusal is not null)
-                    return (Envelope("refused", refusal: mutation.Refusal), "refused", mutation.Refusal.Detail, true);
+                    return (Envelope(MajordomoOutcomes.Refused, refusal: mutation.Refusal),
+                        MajordomoOutcomes.Refused, mutation.Refusal.Detail, true);
                 // Echo the CANONICAL arguments (the bound contract
                 // re-serialized), not the raw payload — what the proposal
                 // shows is exactly what would execute.
                 var view = new MajordomoProposalView(
                     propose.Proposal.Tool.Name,
-                    args is null ? argsNode : JsonSerializer.SerializeToNode(args, args.GetType(), MajordomoJson.Options),
-                    propose.Proposal.AffectedItemCount,
-                    mutation.ChangeSet!);
-                return (Envelope("proposed", proposal: view), "proposed", null, false);
+                    JsonSerializer.SerializeToNode(proposalArgs, proposalArgs.GetType(), MajordomoJson.Options),
+                    mutation.ChangeSet!.PlannedItemCount,
+                    mutation.ChangeSet);
+                return (Envelope(MajordomoOutcomes.Proposed, proposal: view),
+                    MajordomoOutcomes.Proposed, null, false);
             }
 
             default:
-                return (Envelope("refused",
-                        refusal: new MajordomoRefusal("unknown_tool", $"unhandled decision for '{name}'")),
-                    "refused", "unhandled decision", true);
+                return (Envelope(MajordomoOutcomes.Refused,
+                        refusal: new MajordomoRefusal(
+                            MajordomoRefusalReasons.UnknownTool, $"unhandled decision for '{name}'")),
+                    MajordomoOutcomes.Refused, "unhandled decision", true);
         }
     }
 
-    private async Task<(MajordomoToolResult? Result, MajordomoRefusal? Refusal)> RunReadAsync(
-        MajordomoTool tool, MajordomoToolArgs args, CancellationToken ct)
-    {
-        if (tool == MajordomoTools.GetQueueStatus)
-            return (await _reads.GetQueueStatusAsync(ct).ConfigureAwait(false), null);
-        if (tool == MajordomoTools.GetDispatchStatus)
-            return (await _reads.GetDispatchStatusAsync(ct).ConfigureAwait(false), null);
-        if (tool == MajordomoTools.GetAgentCapacity)
-            return await _reads.GetAgentCapacityAsync((GetAgentCapacityArgs)args, ct).ConfigureAwait(false);
-        if (tool == MajordomoTools.ListWorkItems)
-            return (await _reads.ListWorkItemsAsync((ListWorkItemsArgs)args, ct).ConfigureAwait(false), null);
-        if (tool == MajordomoTools.GetWorkItem)
-            return (await _reads.GetWorkItemAsync((GetWorkItemArgs)args, ct).ConfigureAwait(false), null);
-        if (tool == MajordomoTools.GetWorkItemAudit)
-            return (await _reads.GetWorkItemAuditAsync((GetWorkItemAuditArgs)args, ct).ConfigureAwait(false), null);
-        return (null, new MajordomoRefusal("unknown_tool", $"no read backend for '{tool.Name}'"));
-    }
+    private Task<(MajordomoToolResult? Result, MajordomoRefusal? Refusal)> RunReadAsync(
+        MajordomoTool tool, MajordomoToolArgs args, CancellationToken ct) =>
+        Wiring.TryGetValue(tool, out var wiring) && wiring.Read is { } read
+            ? read(_reads, args, ct)
+            : Task.FromResult<(MajordomoToolResult?, MajordomoRefusal?)>(
+                (null, new MajordomoRefusal(
+                    MajordomoRefusalReasons.UnknownTool, $"no read backend for '{tool.Name}'")));
 
     private Task<MajordomoMutationResult> RunMutateAsync(
-        MajordomoTool tool, MajordomoMutateArgs args, bool commit, CancellationToken ct)
+        MajordomoTool tool,
+        MajordomoMutateArgs args,
+        IReadOnlyList<WorkItem>? cancelCascade,
+        bool commit,
+        CancellationToken ct) =>
+        Wiring.TryGetValue(tool, out var wiring) && wiring.Mutate is { } mutate
+            ? mutate(_mutates, args, ResolveInitiator(), cancelCascade, commit, ct)
+            : Task.FromResult(MajordomoMutationResult.Refused(
+                new MajordomoRefusal(
+                    MajordomoRefusalReasons.UnknownTool, $"no mutate backend for '{tool.Name}'")));
+
+    private ApiClientPrincipal? TryGetPrincipal()
     {
-        var initiator = ResolveInitiator();
-        if (tool == MajordomoTools.CreateWorkItem)
-            return _mutates.CreateAsync((CreateWorkItemArgs)args, initiator, commit, ct);
-        if (tool == MajordomoTools.CreateWorkItemChain)
-            return _mutates.CreateChainAsync((CreateWorkItemChainArgs)args, initiator, commit, ct);
-        if (tool == MajordomoTools.UpdateWorkItem)
-            return _mutates.UpdateAsync((UpdateWorkItemArgs)args, commit, ct);
-        if (tool == MajordomoTools.CancelWorkItem)
-            return _mutates.CancelAsync((CancelWorkItemArgs)args, commit, ct);
-        if (tool == MajordomoTools.RetryWorkItem)
-            return _mutates.RetryAsync((RetryWorkItemArgs)args, commit, ct);
-        return Task.FromResult(MajordomoMutationResult.Refused(
-            new MajordomoRefusal("unknown_tool", $"no mutate backend for '{tool.Name}'")));
+        var context = _httpContext.HttpContext;
+        return context is not null && ApiKeyAuth.TryGetPrincipal(context, out var principal)
+            ? principal
+            : null;
     }
 
     private string ResolveIdentity()
     {
-        var context = _httpContext.HttpContext;
-        if (context is not null && ApiKeyAuth.TryGetPrincipal(context, out var principal) && principal is not null)
-            return ApiKeyAuth.IsAuthenticationDisabled(principal)
-                ? "authentication-disabled"
-                : principal.Name;
-        return "unknown";
+        var principal = TryGetPrincipal();
+        if (principal is null)
+            return "unknown";
+        return ApiKeyAuth.IsAuthenticationDisabled(principal)
+            ? ApiKeyAuth.AuthenticationDisabledClientName
+            : principal.Name;
     }
 
-    private WorkInitiator ResolveInitiator()
-    {
-        var context = _httpContext.HttpContext;
-        if (context is not null && ApiKeyAuth.TryGetPrincipal(context, out var principal) && principal is not null)
-            return principal.FixedInitiator;
-        return new WorkInitiator
+    private WorkInitiator ResolveInitiator() =>
+        TryGetPrincipal()?.FixedInitiator
+        ?? new WorkInitiator
         {
             Issuer = "codeybox",
             Subject = "majordomo",
             DisplayName = "CodeyBox majordomo",
         };
-    }
 
     private static string BoundArguments(JsonNode? args)
     {
@@ -246,13 +411,21 @@ internal sealed class MajordomoExecutor
         return raw.Length <= MaxAuditArgumentChars ? raw : raw[..MaxAuditArgumentChars] + "…";
     }
 
+    private static string DecisionLabel(MajordomoDecision decision) => decision switch
+    {
+        MajordomoDecision.Execute => MajordomoDecisions.Execute,
+        MajordomoDecision.Propose => MajordomoDecisions.Propose,
+        MajordomoDecision.Refuse => MajordomoDecisions.Refuse,
+        _ => MajordomoDecisions.Unknown,
+    };
+
     private static string ToReasonCode(MajordomoRefusalReason reason) => reason switch
     {
-        MajordomoRefusalReason.UnknownTool => "unknown_tool",
-        MajordomoRefusalReason.ArgumentContractMismatch => "argument_contract_mismatch",
-        MajordomoRefusalReason.TooManyItemsInOneCall => "too_many_items_in_one_call",
-        MajordomoRefusalReason.TurnMutationBudgetExhausted => "turn_mutation_budget_exhausted",
-        _ => "refused",
+        MajordomoRefusalReason.UnknownTool => MajordomoRefusalReasons.UnknownTool,
+        MajordomoRefusalReason.ArgumentContractMismatch => MajordomoRefusalReasons.ArgumentContractMismatch,
+        MajordomoRefusalReason.TooManyItemsInOneCall => MajordomoRefusalReasons.TooManyItemsInOneCall,
+        MajordomoRefusalReason.TurnMutationBudgetExhausted => MajordomoRefusalReasons.TurnMutationBudgetExhausted,
+        _ => MajordomoRefusalReasons.Refused,
     };
 
     private static JsonObject Envelope(
@@ -275,17 +448,16 @@ internal sealed class MajordomoExecutor
 
     /// <summary>
     /// Deserializes the wire arguments into the tool's declared contract type.
-    /// The parameterless tools substitute their single instances; every other
-    /// contract goes through STJ with the shared majordomo serializer, so the
-    /// validating constructors run and an invalid call is unrepresentable.
+    /// Tools wired with a binding override (the parameterless vocabulary
+    /// members) substitute their single instances; every other contract goes
+    /// through STJ with the shared majordomo serializer, so the validating
+    /// constructors run and an invalid call is unrepresentable.
     /// </summary>
     internal static (MajordomoToolArgs? Args, MajordomoRefusal? Refusal) BindArguments(
         MajordomoTool tool, JsonNode? args)
     {
-        if (tool == MajordomoTools.GetQueueStatus)
-            return EmptyOrRefuse<GetQueueStatusArgs>(tool, args, GetQueueStatusArgs.Instance);
-        if (tool == MajordomoTools.GetDispatchStatus)
-            return EmptyOrRefuse<GetDispatchStatusArgs>(tool, args, GetDispatchStatusArgs.Instance);
+        if (Wiring.TryGetValue(tool, out var wiring) && wiring.Bind is { } bind)
+            return bind(tool, args);
 
         try
         {
@@ -295,28 +467,28 @@ internal sealed class MajordomoExecutor
             var value = bound.Deserialize(tool.ArgumentsType, MajordomoJson.Options);
             if (value is not MajordomoToolArgs typed)
                 return (null, new MajordomoRefusal(
-                    "argument_contract_mismatch",
+                    MajordomoRefusalReasons.ArgumentContractMismatch,
                     $"tool '{tool.Name}' arguments must be a JSON object"));
             return (typed, null);
         }
         catch (JsonException ex)
         {
             return (null, new MajordomoRefusal(
-                "argument_contract_mismatch",
+                MajordomoRefusalReasons.ArgumentContractMismatch,
                 ex.Message,
                 Field: ex.Path));
         }
         catch (ArgumentException ex)
         {
             return (null, new MajordomoRefusal(
-                "argument_contract_mismatch",
+                MajordomoRefusalReasons.ArgumentContractMismatch,
                 ex.Message,
                 Field: ex.ParamName));
         }
         catch (NotSupportedException ex)
         {
             return (null, new MajordomoRefusal(
-                "argument_contract_mismatch",
+                MajordomoRefusalReasons.ArgumentContractMismatch,
                 ex.Message));
         }
     }
@@ -327,7 +499,7 @@ internal sealed class MajordomoExecutor
     {
         if (args is JsonObject obj && obj.Count > 0)
             return (null, new MajordomoRefusal(
-                "argument_contract_mismatch",
+                MajordomoRefusalReasons.ArgumentContractMismatch,
                 $"tool '{tool.Name}' takes no arguments — got {string.Join(", ", obj.Select(kv => kv.Key))}"));
         return (instance, null);
     }

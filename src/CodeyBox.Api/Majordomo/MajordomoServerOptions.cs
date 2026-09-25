@@ -1,4 +1,5 @@
 using CodeyBox.Majordomo;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api.Majordomo;
 
@@ -77,5 +78,20 @@ public sealed class MajordomoServerOptions
         if (opts.TurnWindowSeconds is < 1 or > MaxTurnWindowSeconds)
             return $"{SectionName}:TurnWindowSeconds must be within [1, {MaxTurnWindowSeconds}]";
         return null;
+    }
+}
+
+/// <summary>
+/// Options validator preserving <see cref="MajordomoServerOptions.Validate"/>'s
+/// per-rule failure text — registered via <c>IValidateOptions</c> so the
+/// operator sees the actual fault, and honoured by <c>ValidateOnStart</c> so
+/// a bad mode/cap fails the host at startup, not at the first tool call.
+/// </summary>
+internal sealed class MajordomoServerOptionsValidator : IValidateOptions<MajordomoServerOptions>
+{
+    public ValidateOptionsResult Validate(string? name, MajordomoServerOptions options)
+    {
+        var failure = MajordomoServerOptions.Validate(options);
+        return failure is null ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failure);
     }
 }

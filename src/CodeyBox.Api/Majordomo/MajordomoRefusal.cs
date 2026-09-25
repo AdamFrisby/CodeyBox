@@ -22,7 +22,7 @@ internal sealed record MajordomoProposalView(
     string Tool,
     System.Text.Json.Nodes.JsonNode? Arguments,
     int AffectedItems,
-    object ChangeSet);
+    MajordomoChangeSet ChangeSet);
 
 /// <summary>
 /// What a mutation backend produced: either the change set (validated plan

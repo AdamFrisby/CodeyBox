@@ -85,7 +85,8 @@ public static class MajordomoTools
         MajordomoToolClass.Mutate,
         typeof(CancelWorkItemArgs),
         typeof(MajordomoChangeSet),
-        "Cancel one work item with a required operator-facing reason.");
+        "Cancel one work item with a required operator-facing reason.",
+        idempotent: true);
 
     public static readonly MajordomoTool RetryWorkItem = new(
         "retry_work_item",

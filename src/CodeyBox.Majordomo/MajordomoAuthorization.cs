@@ -38,11 +38,19 @@ public static class MajordomoAuthorization
     /// <param name="arguments">The typed argument payload for the call.</param>
     /// <param name="options">The current operator policy (mode + bounds).</param>
     /// <param name="turnUsage">Mutations already spent this turn.</param>
+    /// <param name="projectedAffectedItems">
+    /// The blast radius the runtime measured against live state when the
+    /// argument contract under-declares it (e.g. a cancel's queued-dependent
+    /// cascade). The declared <see cref="MajordomoMutateArgs.AffectedItemCount"/>
+    /// remains the floor — the projection can only raise the counted size,
+    /// never lower it.
+    /// </param>
     public static MajordomoDecision Decide(
         string? toolName,
         MajordomoToolArgs? arguments,
         MajordomoOptions options,
-        MajordomoTurnUsage turnUsage)
+        MajordomoTurnUsage turnUsage,
+        int? projectedAffectedItems = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(turnUsage);
@@ -77,17 +85,19 @@ public static class MajordomoAuthorization
             return new MajordomoDecision.Execute(tool);
 
         var cap = options.MaxMutatedItemsPerTurn;
-        var affected = mutate.AffectedItemCount;
+        var declared = mutate.AffectedItemCount;
 
         // A mutate contract reporting fewer than one affected item would slip
         // past both budget checks and execute without consuming turn budget —
         // fail closed rather than trust the count.
-        if (affected < 1)
+        if (declared < 1)
         {
             return new MajordomoDecision.Refuse(
                 MajordomoRefusalReason.ArgumentContractMismatch,
-                $"tool '{tool.Name}' reported {affected} affected items; a mutation must affect at least one");
+                $"tool '{tool.Name}' reported {declared} affected items; a mutation must affect at least one");
         }
+
+        var affected = Math.Max(declared, projectedAffectedItems ?? declared);
 
         if (affected > cap)
         {

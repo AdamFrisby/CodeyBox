@@ -465,6 +465,28 @@ internal sealed class WorkItemCreationService
             }
             return Error("an external id already exists in this project (concurrent duplicate)");
         }
+
+        return await CompleteCommitAsync(prepared, ct).ConfigureAwait(false);
+
+        CommittedWorkItemCreationResult Error(string message) =>
+            new(
+                item,
+                prepared.Project,
+                new Dictionary<WorkItemId, WorkItemState>(),
+                new Dictionary<WorkItemId, string?>(),
+                Results.BadRequest(new { error = message }));
+    }
+
+    /// <summary>
+    /// The post-write half of a creation commit, shared by
+    /// <see cref="CommitAsync"/> and <see cref="CommitAllAsync"/>: audit
+    /// entry, satisfied-dependency enqueue against fresh dependency states,
+    /// release webhook. Runs only after the row exists.
+    /// </summary>
+    private async Task<CommittedWorkItemCreationResult> CompleteCommitAsync(
+        PreparedWorkItemCreation prepared, CancellationToken ct)
+    {
+        var item = prepared.Item;
         AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title, item.Initiator);
 
         var freshDepStates = new Dictionary<WorkItemId, WorkItemState>();
@@ -496,14 +518,6 @@ internal sealed class WorkItemCreationService
             freshDepStates,
             freshDepExternalIds,
             null);
-
-        CommittedWorkItemCreationResult Error(string message) =>
-            new(
-                item,
-                prepared.Project,
-                new Dictionary<WorkItemId, WorkItemState>(),
-                new Dictionary<WorkItemId, string?>(),
-                Results.BadRequest(new { error = message }));
     }
 
     /// <summary>
@@ -517,6 +531,15 @@ internal sealed class WorkItemCreationService
         IReadOnlyList<PreparedWorkItemCreation> preparedItems,
         CancellationToken ct = default)
     {
+        // The all-or-nothing contract below is only real when the store
+        // commits the batch in one transaction — the sequential interface
+        // default would leave a partial chain behind on a mid-batch failure.
+        // Fail loudly rather than silently degrade.
+        if (!_store.CreateAllIsAtomic)
+            throw new InvalidOperationException(
+                "chain creation requires a store whose CreateAllAsync commits atomically " +
+                $"({nameof(IWorkItemStore.CreateAllIsAtomic)}), but {_store.GetType().Name} does not provide it");
+
         try { await _store.CreateAllAsync(preparedItems.Select(p => p.Item).ToList(), ct); }
         catch (WorkItemExternalIdConflictException)
         {
@@ -541,36 +564,7 @@ internal sealed class WorkItemCreationService
 
         var committed = new List<CommittedWorkItemCreationResult>(preparedItems.Count);
         foreach (var prepared in preparedItems)
-        {
-            var item = prepared.Item;
-            AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title, item.Initiator);
-
-            var freshDepStates = new Dictionary<WorkItemId, WorkItemState>();
-            var freshDepExternalIds = new Dictionary<WorkItemId, string?>();
-            foreach (var depId in item.DependsOn)
-            {
-                var dep = await _store.GetAsync(depId, ct);
-                if (dep is not null)
-                {
-                    freshDepStates[depId] = dep.State;
-                    freshDepExternalIds[depId] = dep.ExternalId;
-                }
-            }
-            if (WorkItemDependencies.AreSatisfied(item.DependsOn, freshDepStates))
-                await _queue.EnqueueAsync(item.Id, ct);
-
-            if (prepared.BoundRelease is not null)
-                await _webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = "release.work_item_added",
-                    WorkItem = item,
-                    Project = prepared.Project,
-                    Release = prepared.BoundRelease,
-                }, ct);
-
-            committed.Add(new CommittedWorkItemCreationResult(
-                item, prepared.Project, freshDepStates, freshDepExternalIds, null));
-        }
+            committed.Add(await CompleteCommitAsync(prepared, ct).ConfigureAwait(false));
 
         return new CommittedWorkItemChainResult(committed, null);
     }

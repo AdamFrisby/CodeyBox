@@ -336,7 +336,45 @@ public sealed class MajordomoMcpTests
             },
         });
 
+        var refusal = RefusalOf(result);
         AssertOutcome(result, "refused");
+        // The refusal names the offending field so the model can correct and
+        // retry from the message alone — a forward edge is rejected by the
+        // chain-shape contract before the store is ever consulted.
+        Assert.Equal("argument_contract_mismatch", refusal.GetProperty("reason").GetString());
+        Assert.Equal("items", refusal.GetProperty("field").GetString());
+        Assert.Equal(0, await StoreCountAsync(factory));
+    }
+
+    [Fact]
+    public async Task ChainWithRefactorNode_IsRefused_NamingItemAndField_NothingCreated()
+    {
+        // The chain-shape contract accepts this input, so the refusal comes
+        // from the whole-set composition review — the path that must name the
+        // offending item position and field for the model to correct.
+        using var factory = new WorkItemApiFactory();
+        using var autonomous = AutonomousFactory(factory);
+        using var http = autonomous.CreateClient();
+        await using var mcp = await ConnectAsync(autonomous, http);
+
+        var result = await mcp.CallToolAsync("create_work_item_chain", new Dictionary<string, object?>
+        {
+            ["items"] = new object[]
+            {
+                new Dictionary<string, object?> { ["item"] = Spec("a"), ["depends_on_indexes"] = Array.Empty<int>() },
+                new Dictionary<string, object?>
+                {
+                    ["item"] = Merge(Spec("b"), ("is_refactor", true)),
+                    ["depends_on_indexes"] = new[] { 0 },
+                },
+            },
+        });
+
+        var refusal = RefusalOf(result);
+        AssertOutcome(result, "refused");
+        Assert.Equal("invalid_chain", refusal.GetProperty("reason").GetString());
+        Assert.Equal("items[1]", refusal.GetProperty("item").GetString());
+        Assert.Equal("is_refactor", refusal.GetProperty("field").GetString());
         Assert.Equal(0, await StoreCountAsync(factory));
     }
 
@@ -556,6 +594,268 @@ public sealed class MajordomoMcpTests
         Assert.Equal(1, await StoreCountAsync(factory));
     }
 
+    // ── cancel cascade blast radius ────────────────────────────────────────
+
+    [Fact]
+    public async Task CancelCascade_WithinCap_CancelsQueuedDependentsTransitively()
+    {
+        using var factory = new WorkItemApiFactory();
+        var parent = Seed(WorkItemState.Queued, "parent");
+        var child = Seed(WorkItemState.Queued, "child", dependsOn: [parent.Id]);
+        var grandchild = Seed(WorkItemState.Queued, "grandchild", dependsOn: [child.Id]);
+        // An in-flight dependent is deliberately left to run its course.
+        var working = Seed(WorkItemState.Working, "in-flight dependent", dependsOn: [parent.Id]);
+        await factory.Store.CreateAsync(parent);
+        await factory.Store.CreateAsync(child);
+        await factory.Store.CreateAsync(grandchild);
+        await factory.Store.CreateAsync(working);
+
+        using var autonomous = AutonomousFactory(factory);
+        using var http = autonomous.CreateClient();
+        await using var mcp = await ConnectAsync(autonomous, http);
+
+        // The dry-run reviews the full cascade — the dependents are named in
+        // the change set, not discovered only in the commit.
+        var dry = await mcp.CallToolAsync("cancel_work_item", new Dictionary<string, object?>
+        {
+            ["id"] = parent.Id.ToString(),
+            ["reason"] = "chain superseded",
+            ["dry_run"] = true,
+        });
+        AssertOutcome(dry, "dry_run");
+        var dryChanges = Structured(dry).GetProperty("result").GetProperty("changes");
+        var kinds = dryChanges.EnumerateArray().Select(c => c.GetProperty("kind").GetString()).ToList();
+        Assert.Equal(["cancel_item", "cancel_dependents"], kinds);
+        var cascadeIds = dryChanges[1].GetProperty("ids").EnumerateArray()
+            .Select(e => e.GetString()).OrderBy(s => s, StringComparer.Ordinal).ToArray();
+        Assert.Equal(
+            new[] { child.Id.ToString(), grandchild.Id.ToString() }.OrderBy(s => s, StringComparer.Ordinal),
+            cascadeIds);
+
+        // Nothing was touched by the dry-run.
+        Assert.Equal(4, await StoreCountAsync(factory));
+        Assert.Equal(WorkItemState.Queued, (await factory.Store.GetAsync(child.Id))!.State);
+
+        var real = await mcp.CallToolAsync("cancel_work_item", new Dictionary<string, object?>
+        {
+            ["id"] = parent.Id.ToString(),
+            ["reason"] = "chain superseded",
+        });
+        AssertOutcome(real, "executed");
+        // The reviewed set is the executed set.
+        Assert.Equal(
+            dryChanges.GetRawText(),
+            Structured(real).GetProperty("result").GetProperty("changes").GetRawText());
+        var affected = Structured(real).GetProperty("result").GetProperty("affected_items");
+        Assert.Equal(3, affected.GetArrayLength());
+
+        Assert.Equal(WorkItemState.Cancelled, (await factory.Store.GetAsync(parent.Id))!.State);
+        Assert.Equal(WorkItemState.Cancelled, (await factory.Store.GetAsync(child.Id))!.State);
+        Assert.Equal(WorkItemState.Cancelled, (await factory.Store.GetAsync(grandchild.Id))!.State);
+        Assert.Equal(WorkItemState.Working, (await factory.Store.GetAsync(working.Id))!.State);
+    }
+
+    [Fact]
+    public async Task CancelCascade_ExceedingPerCallCap_IsRefused_NothingCancelled()
+    {
+        using var factory = new WorkItemApiFactory();
+        var parent = Seed(WorkItemState.Queued, "parent");
+        var child = Seed(WorkItemState.Queued, "child", dependsOn: [parent.Id]);
+        var grandchild = Seed(WorkItemState.Queued, "grandchild", dependsOn: [child.Id]);
+        await factory.Store.CreateAsync(parent);
+        await factory.Store.CreateAsync(child);
+        await factory.Store.CreateAsync(grandchild);
+
+        // The call's real blast radius is 3 (target + 2 cascade targets) — a
+        // cap of 2 must refuse it even though the contract declares 1 item.
+        using var autonomous = AutonomousFactory(factory, maxMutatedItemsPerTurn: 2);
+        using var http = autonomous.CreateClient();
+        await using var mcp = await ConnectAsync(autonomous, http);
+
+        var result = await mcp.CallToolAsync("cancel_work_item", new Dictionary<string, object?>
+        {
+            ["id"] = parent.Id.ToString(),
+            ["reason"] = "chain superseded",
+        });
+
+        AssertOutcome(result, "refused");
+        Assert.Equal("too_many_items_in_one_call",
+            RefusalOf(result).GetProperty("reason").GetString());
+        foreach (var seeded in new[] { parent, child, grandchild })
+            Assert.Equal(WorkItemState.Queued, (await factory.Store.GetAsync(seeded.Id))!.State);
+    }
+
+    [Fact]
+    public async Task CancelCascade_ExceedingRemainingTurnBudget_IsRefused()
+    {
+        using var factory = new WorkItemApiFactory();
+        var parent = Seed(WorkItemState.Queued, "parent");
+        var child = Seed(WorkItemState.Queued, "child", dependsOn: [parent.Id]);
+        var grandchild = Seed(WorkItemState.Queued, "grandchild", dependsOn: [child.Id]);
+        await factory.Store.CreateAsync(parent);
+        await factory.Store.CreateAsync(child);
+        await factory.Store.CreateAsync(grandchild);
+
+        using var autonomous = AutonomousFactory(factory, maxMutatedItemsPerTurn: 3);
+        using var http = autonomous.CreateClient();
+        await using var mcp = await ConnectAsync(autonomous, http);
+
+        // Spend one unit of turn budget first.
+        var first = await mcp.CallToolAsync("create_work_item", new Dictionary<string, object?>
+        {
+            ["item"] = Spec("first"),
+        });
+        AssertOutcome(first, "executed");
+
+        // The cancel projects 3 mutations (parent + child + grandchild) —
+        // fits the cap of 3 but not the remaining budget of 2.
+        var result = await mcp.CallToolAsync("cancel_work_item", new Dictionary<string, object?>
+        {
+            ["id"] = parent.Id.ToString(),
+            ["reason"] = "chain superseded",
+        });
+
+        AssertOutcome(result, "refused");
+        Assert.Equal("turn_mutation_budget_exhausted",
+            RefusalOf(result).GetProperty("reason").GetString());
+        Assert.Equal(WorkItemState.Queued, (await factory.Store.GetAsync(parent.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await factory.Store.GetAsync(child.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await factory.Store.GetAsync(grandchild.Id))!.State);
+    }
+
+    [Fact]
+    public async Task CancelProposal_ShowsTheCascadeInTheChangeSet()
+    {
+        using var factory = new WorkItemApiFactory();
+        var parent = Seed(WorkItemState.Queued, "parent");
+        var child = Seed(WorkItemState.Queued, "child", dependsOn: [parent.Id]);
+        var grandchild = Seed(WorkItemState.Queued, "grandchild", dependsOn: [child.Id]);
+        await factory.Store.CreateAsync(parent);
+        await factory.Store.CreateAsync(child);
+        await factory.Store.CreateAsync(grandchild);
+
+        // Default mode is Proposed — the operator's review must see the whole
+        // blast radius, not just the item the call named.
+        using var http = factory.CreateClient();
+        await using var mcp = await ConnectAsync(factory, http);
+
+        var result = await mcp.CallToolAsync("cancel_work_item", new Dictionary<string, object?>
+        {
+            ["id"] = parent.Id.ToString(),
+            ["reason"] = "chain superseded",
+        });
+
+        AssertOutcome(result, "proposed");
+        var view = Structured(result).GetProperty("proposal");
+        Assert.Equal(3, view.GetProperty("affected_items").GetInt32());
+        var changes = view.GetProperty("change_set").GetProperty("changes");
+        var kinds = changes.EnumerateArray().Select(c => c.GetProperty("kind").GetString()).ToList();
+        Assert.Equal(["cancel_item", "cancel_dependents"], kinds);
+        Assert.Equal(2, changes[1].GetProperty("ids").GetArrayLength());
+
+        // The proposal performs no mutation.
+        foreach (var seeded in new[] { parent, child, grandchild })
+            Assert.Equal(WorkItemState.Queued, (await factory.Store.GetAsync(seeded.Id))!.State);
+    }
+
+    // ── budget concurrency + fault accounting ───────────────────────────────
+
+    [Fact]
+    public async Task ConcurrentMutations_CannotOvershootTheTurnCap()
+    {
+        // Slow the store write so the calls genuinely overlap: without
+        // per-identity serialization every call snapshots usage=0 and each
+        // passes the remaining-budget check before the first commit lands.
+        using var factory = new WorkItemApiFactory();
+        factory.WorkItemStoreDecorator = inner => new SlowCreateStore(inner, TimeSpan.FromMilliseconds(150));
+        using var autonomous = AutonomousFactory(factory, maxMutatedItemsPerTurn: 1);
+        _ = autonomous.CreateClient(); // boot the host so Services resolves
+
+        var executor = autonomous.Services
+            .GetRequiredService<CodeyBox.Api.Majordomo.MajordomoExecutor>();
+        var accessor = autonomous.Services.GetRequiredService<IHttpContextAccessor>();
+        accessor.HttpContext = new DefaultHttpContext();
+        accessor.HttpContext.Items[ApiKeyAuth.PrincipalItemKey] = new ApiClientPrincipal(
+            "majordomo",
+            new WorkInitiator { Issuer = "codeybox", Subject = "majordomo-subject", DisplayName = "Test majordomo" },
+            CanDelegateInitiator: false);
+
+        var calls = Enumerable.Range(0, 5).Select(i =>
+            executor.ExecuteAsync(
+                "create_work_item",
+                new JsonObject
+                {
+                    ["item"] = new JsonObject
+                    {
+                        ["project_id"] = "test-project",
+                        ["title"] = $"concurrent {i}",
+                        ["prompt"] = "p",
+                    },
+                },
+                CancellationToken.None).AsTask()).ToList();
+        var results = await Task.WhenAll(calls);
+
+        Assert.Equal(1, results.Count(r => OutcomeOf(r) == "executed"));
+        Assert.Equal(4, results.Count(r =>
+            OutcomeOf(r) == "refused"
+            && RefusalOf(r).GetProperty("reason").GetString() == "turn_mutation_budget_exhausted"));
+        Assert.Equal(1, await StoreCountAsync(factory));
+    }
+
+    [Fact]
+    public async Task MutationThatThrowsAfterCommit_StillChargesTheBudgetAndAuditsAnOutcome()
+    {
+        var sink = new TestSink();
+        using var logger = new Serilog.LoggerConfiguration()
+            .MinimumLevel.Verbose()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        using var scope = AuditLog.PushScopedLogger(logger);
+
+        using var factory = new WorkItemApiFactory();
+        var item = Seed(WorkItemState.Queued, "cancel target");
+        await factory.Store.CreateAsync(item);
+        // OrphanReplaysAsync runs after the cancel's row write lands, so the
+        // call faults post-commit: the mutation is real but unreported by a
+        // normal return.
+        factory.WorkItemStoreDecorator = inner => new ThrowOnOrphanStore(inner);
+        using var autonomous = AutonomousFactory(factory, maxMutatedItemsPerTurn: 1);
+        _ = autonomous.CreateClient(); // boot the host so Services resolves
+
+        var executor = autonomous.Services
+            .GetRequiredService<CodeyBox.Api.Majordomo.MajordomoExecutor>();
+        var accessor = autonomous.Services.GetRequiredService<IHttpContextAccessor>();
+        accessor.HttpContext = new DefaultHttpContext();
+        accessor.HttpContext.Items[ApiKeyAuth.PrincipalItemKey] = new ApiClientPrincipal(
+            "majordomo",
+            new WorkInitiator { Issuer = "codeybox", Subject = "majordomo-subject", DisplayName = "Test majordomo" },
+            CanDelegateInitiator: false);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            executor.ExecuteAsync(
+                "cancel_work_item",
+                JsonNode.Parse($$"""{"id":"{{item.Id}}","reason":"post-commit fault"}"""),
+                CancellationToken.None).AsTask());
+
+        // The write landed even though the call threw.
+        Assert.Equal(WorkItemState.Cancelled, (await factory.Store.GetAsync(item.Id))!.State);
+
+        // ...and the committed mutation was charged: cap is 1, so the next
+        // mutation must be refused rather than getting a free retry.
+        var refused = await executor.ExecuteAsync(
+            "create_work_item",
+            JsonNode.Parse("""{"item":{"project_id":"test-project","title":"charged?","prompt":"p"}}"""),
+            CancellationToken.None);
+        AssertOutcome(refused, "refused");
+        Assert.Equal("turn_mutation_budget_exhausted",
+            RefusalOf(refused).GetProperty("reason").GetString());
+        Assert.Equal(1, await StoreCountAsync(factory));
+
+        // An outcome record exists for the faulted call too.
+        var outcomes = sink.Events.Where(e => EventNameOf(e) == "majordomo.tool_outcome").ToList();
+        Assert.Contains(outcomes, e => PropOf(e, "Outcome") == "error");
+    }
+
     // ── dry-run parity ─────────────────────────────────────────────────────
 
     [Fact]
@@ -713,9 +1013,11 @@ public sealed class MajordomoMcpTests
             .GetRequiredService<CodeyBox.Api.Majordomo.MajordomoExecutor>();
         var accessor = autonomous.Services.GetRequiredService<IHttpContextAccessor>();
         accessor.HttpContext = new DefaultHttpContext();
+        // The principal Name (audited identity) and the initiator Subject are
+        // deliberately distinct so the assertion proves which one is recorded.
         accessor.HttpContext.Items[ApiKeyAuth.PrincipalItemKey] = new ApiClientPrincipal(
             "majordomo",
-            new WorkInitiator { Issuer = "codeybox", Subject = "majordomo", DisplayName = "Test majordomo" },
+            new WorkInitiator { Issuer = "codeybox", Subject = "majordomo-subject", DisplayName = "Test majordomo" },
             CanDelegateInitiator: false);
 
         var executed = await executor.ExecuteAsync(
@@ -843,5 +1145,26 @@ public sealed class MajordomoMcpTests
         public IReadOnlyList<string> AllowedValues { get; } = allowed;
         public string DefaultValue => allowed[0];
         public string? GetWorkPromptFragment(string value) => null;
+    }
+
+    /// <summary>Delays each create so concurrent calls genuinely overlap mid-commit.</summary>
+    private sealed class SlowCreateStore(SqliteWorkItemStore inner, TimeSpan delay)
+        : ForwardingWorkItemStore(inner)
+    {
+        public override async Task CreateAsync(WorkItem item, CancellationToken ct = default)
+        {
+            await Task.Delay(delay, ct);
+            await base.CreateAsync(item, ct);
+        }
+    }
+
+    /// <summary>
+    /// Faults after the cancel row write has landed: OrphanReplaysAsync runs
+    /// late in the cancel commit, so the call fails post-commit.
+    /// </summary>
+    private sealed class ThrowOnOrphanStore(SqliteWorkItemStore inner) : ForwardingWorkItemStore(inner)
+    {
+        public override Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+            throw new InvalidOperationException("injected post-commit failure");
     }
 }

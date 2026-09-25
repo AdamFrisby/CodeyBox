@@ -17,7 +17,8 @@ public sealed record MajordomoTool
         MajordomoToolClass classification,
         Type argumentsType,
         Type resultType,
-        string description)
+        string description,
+        bool idempotent = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentException.ThrowIfNullOrWhiteSpace(description);
@@ -45,6 +46,7 @@ public sealed record MajordomoTool
         ArgumentsType = argumentsType;
         ResultType = resultType;
         Description = description;
+        Idempotent = idempotent;
     }
 
     /// <summary>Canonical wire name, matched ordinally (exact, case-sensitive).</summary>
@@ -61,4 +63,11 @@ public sealed record MajordomoTool
 
     /// <summary>One-line summary suitable for operator docs and prompt rendering.</summary>
     public string Description { get; }
+
+    /// <summary>
+    /// Whether replaying the call is a no-op (published as the MCP
+    /// <c>IdempotentHint</c> annotation). Cancel qualifies: repeating it on an
+    /// already-cancelled item succeeds without further mutation.
+    /// </summary>
+    public bool Idempotent { get; }
 }

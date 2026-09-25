@@ -101,13 +101,13 @@ internal sealed class MajordomoMutateBackend
             var dep = await _store.GetAsync(depId, ct).ConfigureAwait(false);
             if (dep is null)
                 return new MajordomoRefusal(
-                    "dependency_not_found",
+                    MajordomoRefusalReasons.DependencyNotFound,
                     $"{itemLabel}: dependency '{depId}' does not exist — pass the id of an existing work item",
                     Item: itemLabel,
                     Field: field);
             if (WorkItemDependencies.TerminalStates.Contains(dep.State))
                 return new MajordomoRefusal(
-                    "dependency_terminal",
+                    MajordomoRefusalReasons.DependencyTerminal,
                     $"{itemLabel}: dependency '{depId}' is already in terminal state {dep.State} — " +
                     "it can never satisfy the gate; drop the edge or retry the item first",
                     Item: itemLabel,
@@ -123,7 +123,7 @@ internal sealed class MajordomoMutateBackend
         // read the payload back so the refusal can carry the same detail text.
         var detail = await ResultText.ReadErrorTextAsync(error).ConfigureAwait(false);
         return MajordomoMutationResult.Refused(
-            new MajordomoRefusal("validation_failed", detail));
+            new MajordomoRefusal(MajordomoRefusalReasons.ValidationFailed, detail));
     }
 
     // ── create_work_item ────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ internal sealed class MajordomoMutateBackend
         catch (MajordomoRefusalException ex)
         {
             return MajordomoMutationResult.Refused(
-                new MajordomoRefusal("invalid_arguments", ex.Message, Item: spec.Title, Field: ex.Field));
+                new MajordomoRefusal(MajordomoRefusalReasons.InvalidArguments, ex.Message, Item: spec.Title, Field: ex.Field));
         }
 
         var prepared = await _creation.PrepareAsync(req, ct).ConfigureAwait(false);
@@ -181,7 +181,7 @@ internal sealed class MajordomoMutateBackend
         {
             var p = review[0];
             return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                "invalid_chain",
+                MajordomoRefusalReasons.InvalidChain,
                 p.Message,
                 Item: p.ItemIndex is { } ix ? $"items[{ix}]" : null,
                 Field: p.Field));
@@ -214,7 +214,7 @@ internal sealed class MajordomoMutateBackend
             catch (MajordomoRefusalException ex)
             {
                 return MajordomoMutationResult.Refused(
-                    new MajordomoRefusal("invalid_arguments", ex.Message, Item: $"items[{i}]", Field: ex.Field));
+                    new MajordomoRefusal(MajordomoRefusalReasons.InvalidArguments, ex.Message, Item: $"items[{i}]", Field: ex.Field));
             }
 
             var result = await _creation.PrepareAsync(
@@ -224,7 +224,7 @@ internal sealed class MajordomoMutateBackend
             {
                 var detail = await ResultText.ReadErrorTextAsync(result.Error).ConfigureAwait(false);
                 return MajordomoMutationResult.Refused(
-                    new MajordomoRefusal("validation_failed", $"items[{i}]: {detail}", Item: $"items[{i}]"));
+                    new MajordomoRefusal(MajordomoRefusalReasons.ValidationFailed, $"items[{i}]: {detail}", Item: $"items[{i}]"));
             }
 
             prepared.Add(result.Prepared!);
@@ -253,7 +253,7 @@ internal sealed class MajordomoMutateBackend
         var item = await _store.GetAsync(args.Id, ct).ConfigureAwait(false);
         if (item is null)
             return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                "not_found",
+                MajordomoRefusalReasons.NotFound,
                 $"work item '{args.Id}' does not exist",
                 Item: args.Id.ToString(),
                 Field: "id"));
@@ -287,22 +287,16 @@ internal sealed class MajordomoMutateBackend
         catch (MajordomoRefusalException ex)
         {
             return MajordomoMutationResult.Refused(
-                new MajordomoRefusal("invalid_arguments", ex.Message, Item: args.Id.ToString(), Field: ex.Field));
+                new MajordomoRefusal(MajordomoRefusalReasons.InvalidArguments, ex.Message, Item: args.Id.ToString(), Field: ex.Field));
         }
 
         WorkItemCommandService.CommandPlan<WorkItemCommandService.WorkItemPatchPlan>? patchPlan = null;
-        var hasFieldPatch =
-            patch.Title is not null || patch.Prompt is not null || patch.Agent is not null
-            || patch.WorkTimeout is not null || patch.MergeTimeout is not null
-            || patch.MinModelScore is not null || patch.AuditMaxIterations is not null
-            || patch.AuditComplexity is not null || patch.RequiredCapabilities is not null
-            || patch.DependsOn is not null || patch.Knobs is not null || patch.AgentClassId is not null;
-        if (hasFieldPatch)
+        if (patch.HasFieldEdits)
         {
             patchPlan = await _commands.PlanPatchAsync(item, fieldPatch, ct).ConfigureAwait(false);
             if (patchPlan.Error is { } patchError)
                 return MajordomoMutationResult.Refused(
-                    new MajordomoRefusal("validation_failed", patchError.Error ?? "patch rejected", Item: args.Id.ToString()));
+                    new MajordomoRefusal(MajordomoRefusalReasons.ValidationFailed, patchError.Error ?? "patch rejected", Item: args.Id.ToString()));
         }
 
         WorkItemCommandService.CommandPlan<WorkItemCommandService.WorkItemPriorityPlan>? priorityPlan = null;
@@ -311,7 +305,7 @@ internal sealed class MajordomoMutateBackend
             priorityPlan = await _commands.PlanPriorityAsync(item, priority, ct).ConfigureAwait(false);
             if (priorityPlan.Error is { } priorityError)
                 return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                    "validation_failed",
+                    MajordomoRefusalReasons.ValidationFailed,
                     priorityError.Error ?? "priority rejected",
                     Item: args.Id.ToString(),
                     Field: "patch.priority"));
@@ -328,7 +322,7 @@ internal sealed class MajordomoMutateBackend
                 ct).ConfigureAwait(false);
             if (extIdsPlan.Error is { } extIdsError)
                 return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                    "validation_failed",
+                    MajordomoRefusalReasons.ValidationFailed,
                     extIdsError.Error ?? "externalIds rejected",
                     Item: args.Id.ToString(),
                     Field: "patch.external_ids"));
@@ -348,7 +342,7 @@ internal sealed class MajordomoMutateBackend
             writesApplied = true;
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
-                    new MajordomoRefusal("conflict", outcome.Error ?? "patch failed", Item: args.Id.ToString()),
+                    new MajordomoRefusal(MajordomoRefusalReasons.Conflict, outcome.Error ?? "patch failed", Item: args.Id.ToString()),
                     writesApplied: outcome.StatusCode != 404);
         }
 
@@ -358,7 +352,7 @@ internal sealed class MajordomoMutateBackend
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
                     new MajordomoRefusal(
-                        "conflict",
+                        MajordomoRefusalReasons.Conflict,
                         (outcome.Error ?? "priority update failed") + (writesApplied ? " (earlier field edits were applied)" : string.Empty),
                         Item: args.Id.ToString(),
                         Field: "patch.priority"),
@@ -372,7 +366,7 @@ internal sealed class MajordomoMutateBackend
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
                     new MajordomoRefusal(
-                        "conflict",
+                        MajordomoRefusalReasons.Conflict,
                         (outcome.Error ?? "external ids update failed") + (writesApplied ? " (earlier edits were applied)" : string.Empty),
                         Item: args.Id.ToString(),
                         Field: "patch.external_ids"),
@@ -388,43 +382,68 @@ internal sealed class MajordomoMutateBackend
 
     // ── cancel_work_item ────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The queued transitive dependents a cancel of <paramref name="id"/>
+    /// would cascade to, enumerated against live state. The executor calls
+    /// this BEFORE the authorization decision so the blast-radius cap sees
+    /// the real projected count, then hands the same set back to
+    /// <see cref="CancelAsync"/> — the reviewed/executed set is the measured
+    /// set, never a re-scan that could drift wider.
+    /// </summary>
+    public Task<IReadOnlyList<WorkItem>> FindCancelCascadeTargetsAsync(WorkItemId id, CancellationToken ct) =>
+        _commands.FindCancelCascadeTargetsAsync(id, ct);
+
     public async Task<MajordomoMutationResult> CancelAsync(
-        CancelWorkItemArgs args, bool commit, CancellationToken ct)
+        CancelWorkItemArgs args,
+        IReadOnlyList<WorkItem>? cascadeTargets,
+        bool commit,
+        CancellationToken ct)
     {
         var item = await _store.GetAsync(args.Id, ct).ConfigureAwait(false);
         if (item is null)
             return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                "not_found",
+                MajordomoRefusalReasons.NotFound,
                 $"work item '{args.Id}' does not exist",
                 Item: args.Id.ToString(),
                 Field: "id"));
 
-        var (plan, planError) = _commands.PlanCancel(item, args.Reason, resolutionSha: null);
-        if (planError is not null)
+        // The caller (the executor's pre-decision measure) normally passes the
+        // enumerated set; a caller that skips it gets a fresh enumeration here
+        // so the plan always carries the true cascade.
+        var targets = cascadeTargets
+            ?? await _commands.FindCancelCascadeTargetsAsync(args.Id, ct).ConfigureAwait(false);
+
+        // PlanCancel produces only BadRequest/Conflict refusals; the reason is
+        // already validated at bind time and resolutionSha is always null here.
+        var (planned, planError) = _commands.PlanCancel(item, args.Reason, resolutionSha: null, targets);
+        if (planError is not null || planned is not { } plan)
             return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                planError.StatusCode == StatusCodes.Status404NotFound ? "not_found" : "conflict",
-                planError.Error ?? "cancel refused",
+                MajordomoRefusalReasons.Conflict,
+                planError?.Error ?? "cancel refused",
                 Item: args.Id.ToString()));
 
-        if (!commit)
-            return MajordomoMutationResult.Planned(
-                new MajordomoChangeSet(true, [new MajordomoPlannedChange.CancelItem(args.Id, args.Reason)], []));
+        var changes = new List<MajordomoPlannedChange>
+        {
+            new MajordomoPlannedChange.CancelItem(args.Id, args.Reason),
+        };
+        if (plan.CascadeTargets.Count > 0)
+            changes.Add(new MajordomoPlannedChange.CancelDependents(
+                args.Id, plan.CascadeTargets.Select(t => t.Id).ToList()));
 
-        var outcome = await _commands.CommitCancelAsync(plan!, ct).ConfigureAwait(false);
+        if (!commit)
+            return MajordomoMutationResult.Planned(new MajordomoChangeSet(true, changes, []));
+
+        var outcome = await _commands.CommitCancelAsync(plan, ct).ConfigureAwait(false);
         if (!outcome.Succeeded)
-            return MajordomoMutationResult.Refused(
-                new MajordomoRefusal("conflict", outcome.Error ?? "cancel failed", Item: args.Id.ToString()),
-                writesApplied: true);
+            throw new InvalidOperationException(
+                $"cancel commit returned {outcome.StatusCode} for work item {args.Id}: {outcome.Error}");
 
         var affected = new List<WorkItemId> { args.Id };
         if (outcome.AlsoAffected is { } cascaded)
             affected.AddRange(cascaded);
 
         return MajordomoMutationResult.Committed(
-            new MajordomoChangeSet(
-                false,
-                [new MajordomoPlannedChange.CancelItem(args.Id, args.Reason)],
-                affected));
+            new MajordomoChangeSet(false, changes, affected));
     }
 
     // ── retry_work_item ─────────────────────────────────────────────────────
@@ -435,7 +454,7 @@ internal sealed class MajordomoMutateBackend
         var item = await _store.GetAsync(args.Id, ct).ConfigureAwait(false);
         if (item is null)
             return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                "not_found",
+                MajordomoRefusalReasons.NotFound,
                 $"work item '{args.Id}' does not exist",
                 Item: args.Id.ToString(),
                 Field: "id"));
@@ -443,7 +462,7 @@ internal sealed class MajordomoMutateBackend
         var (plan, planError) = await _commands.PlanRetryAsync(item, args.From.ToPolicyValue(), ct).ConfigureAwait(false);
         if (planError is not null)
             return MajordomoMutationResult.Refused(new MajordomoRefusal(
-                "conflict",
+                MajordomoRefusalReasons.Conflict,
                 planError.Error ?? "retry refused",
                 Item: args.Id.ToString(),
                 Field: "id"));
@@ -461,7 +480,7 @@ internal sealed class MajordomoMutateBackend
             ct).ConfigureAwait(false);
         if (!outcome.Succeeded)
             return MajordomoMutationResult.Refused(
-                new MajordomoRefusal("conflict", outcome.Error ?? "retry failed", Item: args.Id.ToString()),
+                new MajordomoRefusal(MajordomoRefusalReasons.Conflict, outcome.Error ?? "retry failed", Item: args.Id.ToString()),
                 writesApplied: plan is { NeedsStaleFence: true });
 
         return MajordomoMutationResult.Committed(

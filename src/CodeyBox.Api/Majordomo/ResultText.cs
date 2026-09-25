@@ -6,9 +6,9 @@ using Microsoft.Extensions.Logging;
 namespace CodeyBox.Api.Majordomo;
 
 /// <summary>
-/// Reads the status code and error text out of an <see cref="IResult"/> the
-/// existing creation/commit contracts produce. The result is executed against
-/// a synthetic response buffer — it is never written to a wire — so the
+/// Reads the error text out of an <see cref="IResult"/> the existing
+/// creation/commit contracts produce. The result is executed against a
+/// synthetic response buffer — it is never written to a wire — so the
 /// majordomo refusal carries the exact text the REST caller would have seen.
 /// </summary>
 internal static class ResultText
@@ -19,7 +19,7 @@ internal static class ResultText
     private static readonly IServiceProvider EmptyServices =
         new ServiceCollection().AddOptions().AddLogging().BuildServiceProvider();
 
-    public static async Task<(int StatusCode, string? ErrorText)> ReadErrorAsync(IResult result)
+    public static async Task<string> ReadErrorTextAsync(IResult result)
     {
         var buffer = new MemoryStream();
         var context = new DefaultHttpContext { RequestServices = EmptyServices };
@@ -27,13 +27,7 @@ internal static class ResultText
         await result.ExecuteAsync(context).ConfigureAwait(false);
         buffer.Position = 0;
         var body = await new StreamReader(buffer).ReadToEndAsync().ConfigureAwait(false);
-        return (context.Response.StatusCode == 200 ? 500 : context.Response.StatusCode, ExtractError(body));
-    }
-
-    public static async Task<string> ReadErrorTextAsync(IResult result)
-    {
-        var (_, error) = await ReadErrorAsync(result).ConfigureAwait(false);
-        return error ?? "request rejected";
+        return ExtractError(body) ?? "request rejected";
     }
 
     private static string? ExtractError(string body)

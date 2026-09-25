@@ -27,9 +27,7 @@ internal sealed class MajordomoMcpTool : McpServerTool
             {
                 ReadOnlyHint = descriptor.Class == MajordomoToolClass.Read,
                 DestructiveHint = descriptor.Class == MajordomoToolClass.Mutate,
-                // Cancel is the one mutation whose replay is a no-op; create
-                // and update are not idempotent and retry is explicitly not.
-                IdempotentHint = descriptor == MajordomoTools.CancelWorkItem,
+                IdempotentHint = descriptor.Idempotent,
                 OpenWorldHint = false,
             },
         };

@@ -18,6 +18,12 @@ internal abstract class ForwardingWorkItemStore(SqliteWorkItemStore inner) : IWo
     protected SqliteWorkItemStore Inner { get; } = inner;
 
     public virtual Task CreateAsync(WorkItem item, CancellationToken ct = default) => Inner.CreateAsync(item, ct);
+    // Forward the batch commit AND its atomicity flag together — a decorator
+    // that reported the inner's atomicity while running the sequential
+    // interface default would silently break the chain-creation contract.
+    public virtual Task CreateAllAsync(IReadOnlyList<WorkItem> items, CancellationToken ct = default) =>
+        Inner.CreateAllAsync(items, ct);
+    public virtual bool CreateAllIsAtomic => Inner.CreateAllIsAtomic;
     public virtual Task UpdateAsync(WorkItem item, CancellationToken ct = default) => Inner.UpdateAsync(item, ct);
     public virtual Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) =>
         Inner.TryUpdateIfStateAsync(item, onlyIfState, ct);

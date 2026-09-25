@@ -102,7 +102,7 @@ internal sealed class MajordomoReadBackend
         {
             if (!_agents.TryGet(agent, out _))
                 return (null, new MajordomoRefusal(
-                    "unknown_agent",
+                    MajordomoRefusalReasons.UnknownAgent,
                     $"unknown agent '{Validation.DescribeUntrustedValue(agent.Value)}'; registered agents: {string.Join(", ", _agents.Available.Select(a => a.Value))}",
                     Field: "agent"));
             kinds = [agent];
