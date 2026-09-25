@@ -63,12 +63,9 @@ internal static class FramedStdin
         ValidateBashIdentifier(collectorVariable);
         ValidateBashIdentifier(foundVariable);
 
-        return string.Join('\n',
-            $"{foundVariable}=0",
-            "while IFS= read -r line; do",
-            $"  if [ \"$line\" = {ShellQuote(endMarker)} ]; then {foundVariable}=1; break; fi",
-            $"  printf '%s\\n' \"$line\" >> \"${collectorVariable}\"",
-            "done");
+        return $"{foundVariable}=0\n"
+            + ReaderLoopCore(endMarker, foundVariable,
+                $"printf '%s\\n' \"$line\" >> \"${collectorVariable}\"");
     }
 
     /// <summary>
@@ -86,14 +83,25 @@ internal static class FramedStdin
         ValidateBashIdentifier(collectorVariable);
         ValidateBashIdentifier(foundVariable);
 
-        return string.Join('\n',
-            $"{foundVariable}=0",
-            $"{collectorVariable}=''",
+        return $"{foundVariable}=0\n{collectorVariable}=''\n"
+            + ReaderLoopCore(endMarker, foundVariable,
+                $"{collectorVariable}=\"${{{collectorVariable}}}$line\"");
+    }
+
+    /// <summary>
+    /// The reader loop shared by both collector stanzas: read stdin lines
+    /// into the sink (<paramref name="collectLine"/>, emitted indented
+    /// inside the loop) until the end-marker line sets the found flag and
+    /// breaks. The caller emits its own init lines (found flag, collector)
+    /// first. Keeping the loop in one place is what makes the producer
+    /// (<see cref="Build"/>) and both consumers a single framing contract.
+    /// </summary>
+    private static string ReaderLoopCore(string endMarker, string foundVariable, string collectLine)
+        => string.Join('\n',
             "while IFS= read -r line; do",
             $"  if [ \"$line\" = {ShellQuote(endMarker)} ]; then {foundVariable}=1; break; fi",
-            $"  {collectorVariable}=\"${{{collectorVariable}}}$line\"",
+            $"  {collectLine}",
             "done");
-    }
 
     private static void ValidateBashIdentifier(string name)
     {

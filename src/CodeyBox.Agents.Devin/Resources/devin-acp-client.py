@@ -26,7 +26,7 @@ established at the emission point — the in-VM exec wrapper merges the
 command's stderr into its stdout whenever the invocation log tee is active
 (CODEYBOX_AGENT_LOG_FILE), so a tool subprocess printing a forged devin.acp
 line to stderr would otherwise arrive host-side as a bare, claimable
-envelope and falsify persisted usage/outcome records. Wrapped at the
+envelope and falsify the run's recorded outcome/diagnostics. Wrapped at the
 source, a merged or injected stream can never yield a bare devin.acp line
 sourced from stderr; `Error: ...` diagnostics still surface as envelope
 text for the host-side diagnoser.
@@ -385,8 +385,9 @@ def numeric_map(value):
     """Bound a peer-supplied usage/_meta bag to a flat string->number map
     before it is stamped into a claimable envelope field. The wire pipe is
     writable by anything that inherited the agent's stdout fd, so nested
-    objects are never re-emitted verbatim where the host folds values into
-    usage accounting."""
+    objects are never re-emitted verbatim. Host consumers treat these
+    counters as diagnostics-only telemetry — nothing folds them into usage
+    accounting."""
     if not isinstance(value, dict):
         return None
     return {
@@ -399,8 +400,10 @@ def numeric_map(value):
 
 def sanitise_update(update):
     """Re-emit a session/update payload with its claimable surface bounded:
-    _meta is the only field the host folds into usage accounting, so it is
-    reduced to a flat number map. Every other field is display metadata."""
+    _meta is reduced to a flat number map so a wire-pipe writer cannot
+    smuggle nested objects into a claimable envelope field. Every envelope
+    field is display metadata — the host never folds _meta counters into
+    usage accounting."""
     if not isinstance(update, dict):
         return update
     meta = update.get("_meta")
@@ -501,6 +504,13 @@ def read_prompt(path):
         # already-open descriptor 0 — re-opening the exec wrapper's stdin
         # pipe by name (/dev/stdin) fails EACCES because the pipe was
         # created before the sandbox-user drop.
+        #
+        # Provenance bound: fd 0 is an anonymous pipe a same-uid in-VM peer
+        # can append to via /proc/<pid>/fd/0 reopened O_WRONLY, so the
+        # prompt bytes read here are agent-influenceable — never treat the
+        # channel as operator-authentic. read() blocks until every write
+        # end closes, so a held write end can also stall this read (an
+        # already-bounded DoS: the dispatch carries the phase timeout).
         data = sys.stdin.buffer.read(MAX_PROMPT_BYTES + 1)
     else:
         if os.path.getsize(path) > MAX_PROMPT_BYTES:

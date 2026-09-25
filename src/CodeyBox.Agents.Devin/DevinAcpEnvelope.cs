@@ -6,13 +6,20 @@ namespace CodeyBox.Agents.Devin;
 /// <summary>
 /// The single reader for the shim's <c>devin.acp</c> NDJSON envelope
 /// contract (<c>Resources/devin-acp-client.py</c>): the line scan, the
-/// envelope validation, the event-name vocabulary, the nested
-/// <c>update</c>/<c>usage</c> shape navigation, and the usage-counter key
-/// policy. Every consumer — <see cref="DevinAcpOutcome"/>,
-/// <see cref="DevinCostExtractor"/>, <see cref="DevinStreamParser"/> —
-/// reads through this type so a wire change lands in one place instead of
-/// drifting across three scans (a snake_case usage object must feed the
-/// cost row exactly as it feeds the stream summary).
+/// envelope validation, the event-name vocabulary, and the nested
+/// <c>update</c> shape navigation. Every consumer —
+/// <see cref="DevinAcpOutcome"/>, <see cref="DevinStreamParser"/>,
+/// <see cref="DevinAgentRunner"/>'s visible-text projection — reads through
+/// this type so a wire change lands in one place instead of drifting
+/// across scans.
+///
+/// <para>Envelope usage counters (<c>turn_complete.usage</c>,
+/// <c>usage_update</c> <c>_meta</c>) are deliberately NOT read by any
+/// consumer: they are agent-influenceable telemetry (see
+/// <see cref="IsEnvelope"/>'s bounded claim) and promoting them into
+/// <c>has_extracted_token_usage</c> rows would let a forged envelope settle
+/// paid-quota escrow and skew burn estimates. They remain in the raw
+/// capture for diagnostics only.</para>
 /// </summary>
 internal static class DevinAcpEnvelope
 {
@@ -21,14 +28,12 @@ internal static class DevinAcpEnvelope
 
     // Property names centralised for the multi-consumer vocabulary —
     // anything read by more than one consumer (event names, the
-    // update/sessionUpdate/_meta/usage navigation, the turn-complete text)
+    // update/sessionUpdate navigation, the turn-complete text)
     // lives here; fields read by a single consumer stay literal at their
     // use site.
     internal const string EventPropertyName = "event";
     internal const string UpdatePropertyName = "update";
     internal const string SessionUpdatePropertyName = "sessionUpdate";
-    internal const string MetaPropertyName = "_meta";
-    internal const string UsagePropertyName = "usage";
     internal const string FinalTextPropertyName = "finalText";
 
     // Envelope `event` values the C# consumers dispatch on. The Python shim
@@ -49,14 +54,6 @@ internal static class DevinAcpEnvelope
     internal const string UpdateKindToolCall = "tool_call";
     internal const string UpdateKindToolCallUpdate = "tool_call_update";
     internal const string UpdateKindAgentMessageChunk = "agent_message_chunk";
-
-    // Devin-specific `usage_update` _meta counters (verified against devin
-    // 3000.11.1); the ACP session/prompt `usage` object spells the same
-    // counters without the vendor prefix.
-    internal const string MetaInputTokens = "cognition.ai/inputTokens";
-    internal const string MetaOutputTokens = "cognition.ai/outputTokens";
-    internal const string MetaCachedReadTokens = "cognition.ai/cachedReadTokens";
-    internal const string MetaCachedInputTokens = "cognition.ai/cached_input_tokens";
 
     /// <summary>
     /// One parsed envelope: the <c>event</c> name plus a detached clone of
@@ -119,8 +116,10 @@ internal static class DevinAcpEnvelope
     /// scalar-only usage bags, but the exec-pipe leg has no in-VM fix.
     /// Consumers must therefore treat envelope payloads — usage counters,
     /// the terminal event, finalText — as agent-influenceable telemetry:
-    /// good enough to keep the stream advancing and the cost row plausible,
-    /// never authoritative billing or authorization evidence.
+    /// good enough to keep the stream advancing and to surface the terminal
+    /// outcome, never authoritative accounting or authorization evidence
+    /// (the usage counters specifically are never promoted to extracted
+    /// usage — see this type's summary).
     /// </remarks>
     internal static bool IsEnvelope(JsonElement root) =>
         root.ValueKind == JsonValueKind.Object
@@ -138,24 +137,6 @@ internal static class DevinAcpEnvelope
         update = default;
         return root.TryGetProperty(UpdatePropertyName, out update)
             && update.ValueKind == JsonValueKind.Object;
-    }
-
-    /// <summary>
-    /// Reads the <c>_meta</c> counter bag of a
-    /// <see cref="EventSessionUpdate"/> envelope whose
-    /// <c>update.sessionUpdate</c> discriminator is
-    /// <see cref="UpdateKindUsageUpdate"/> — the nested-shape rule every
-    /// usage consumer must agree on.
-    /// </summary>
-    internal static bool TryGetUsageUpdateMeta(JsonElement root, out JsonElement meta)
-    {
-        meta = default;
-        return TryGetUpdate(root, out var update)
-            && update.TryGetProperty(SessionUpdatePropertyName, out var sessionUpdate)
-            && sessionUpdate.ValueKind == JsonValueKind.String
-            && sessionUpdate.GetString() == UpdateKindUsageUpdate
-            && update.TryGetProperty(MetaPropertyName, out meta)
-            && meta.ValueKind == JsonValueKind.Object;
     }
 
     /// <summary>
@@ -235,43 +216,4 @@ internal static class DevinAcpEnvelope
         return chunks.Length > 0 ? chunks.ToString() : terminalText ?? string.Empty;
     }
 
-    /// <summary>
-    /// Reads the <c>usage</c> totals object on a
-    /// <see cref="EventTurnComplete"/> envelope — the ACP
-    /// <c>session/prompt</c> result's usage bag.
-    /// </summary>
-    internal static bool TryGetTurnUsage(JsonElement root, out JsonElement usage)
-    {
-        usage = default;
-        return root.TryGetProperty(UsagePropertyName, out usage)
-            && usage.ValueKind == JsonValueKind.Object;
-    }
-
-    /// <summary>
-    /// Reads the per-turn token counters from a usage-shaped bag — either
-    /// the <c>session/prompt</c> result's <c>usage</c> object (ACP
-    /// camelCase) or a <c>usage_update</c> <c>_meta</c> bag (Devin's
-    /// <c>cognition.ai/*</c> keys). Snake_case spellings are accepted in
-    /// both so the cost row and the stream summary can never diverge on
-    /// key naming when the agent's wire format shifts.
-    /// </summary>
-    internal static (int? Input, int? Output, int? CachedInput) ReadUsage(JsonElement usage)
-        => (FirstInt(usage, "inputTokens", "input_tokens", MetaInputTokens),
-            FirstInt(usage, "outputTokens", "output_tokens", MetaOutputTokens),
-            FirstInt(usage, "cachedReadTokens", "cachedInputTokens", "cached_input_tokens",
-                MetaCachedReadTokens, MetaCachedInputTokens));
-
-    private static int? FirstInt(JsonElement el, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (el.ValueKind == JsonValueKind.Object
-                && el.TryGetProperty(name, out var value)
-                && value.TryGetInt32(out var parsed))
-            {
-                return parsed;
-            }
-        }
-        return null;
-    }
 }

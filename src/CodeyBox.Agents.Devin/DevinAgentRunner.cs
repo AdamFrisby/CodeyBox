@@ -93,9 +93,24 @@ namespace CodeyBox.Agents.Devin;
 /// inheriting the agent's fd 1 can write the shim's ACP wire pipe — the
 /// shim narrows that leg with unguessable request ids, session-id pinning,
 /// and scalar-only usage bags, but the exec-pipe leg has no in-VM fix.
-/// Envelope payloads are therefore agent-influenceable telemetry — usage,
-/// outcome, and final text are stream/cost signal, never authoritative
-/// accounting. See <see cref="DevinAcpEnvelope.IsEnvelope"/>.</para>
+/// Envelope payloads are therefore agent-influenceable telemetry —
+/// outcome and final text are stream signal only, and usage counters are
+/// never promoted to extracted usage, so they cannot settle quota escrow
+/// or feed burn estimates. See <see cref="DevinAcpEnvelope.IsEnvelope"/>.</para>
+///
+/// <para><b>Prompt-channel provenance.</b> The inbound leg has the same
+/// bound: descriptor 0 carries the base64 shim block and the prompt on one
+/// anonymous pipe, and opening <c>/proc/&lt;pid&gt;/fd/0</c> with
+/// <c>O_WRONLY</c> hands a same-uid in-VM peer a NEW write end on that
+/// pipe regardless of the descriptor's original access mode. A watcher
+/// (anything an earlier phase or the repo left running — the sandbox user
+/// is root-capable) that spots the dispatch's <c>bash -c</c> process can
+/// append bytes to the shim block or the prompt tail: fail-loud shim
+/// corruption at worst, or attacker-chosen text the agent reads as part of
+/// its prompt. No in-VM mechanism can make this channel operator-authentic
+/// — sudo defeats even a root-owned stdin sidecar — so prompt bytes must
+/// be treated as agent-influenceable too; every consumer of the run's
+/// output already treats that output as untrusted.</para>
 /// </summary>
 public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IStructuredStreamAgentRunner, IAgentVisibleTextExtractor
 {
@@ -293,6 +308,14 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// <c>exec</c>'d so bash exits with the shim's own status, and
     /// <see cref="PreemptProcessPattern"/> still matches the
     /// <c>devin acp</c> child process.</para>
+    ///
+    /// <para>Descriptor-0 bound: the stdin pipe is the same class of
+    /// anonymous pipe as the exec stdout leg — a same-uid peer can reopen
+    /// <c>/proc/&lt;pid&gt;/fd/0</c> with <c>O_WRONLY</c> and append bytes,
+    /// so shim-block and prompt bytes are agent-influenceable (see the
+    /// class-level <b>Prompt-channel provenance</b> note). Removing the
+    /// staged-file swap closed the name-based race; it does not make the
+    /// channel operator-authentic.</para>
     /// </summary>
     internal static string BuildAcpDispatchScript(IReadOnlyList<string> shimArgs)
     {

@@ -1,5 +1,4 @@
 using System.Text.Json;
-using CodeyBox.Agents;
 using CodeyBox.Agents.Devin;
 using CodeyBox.Core;
 
@@ -10,7 +9,10 @@ namespace CodeyBox.Tests;
 /// for the <c>devin.acp</c> NDJSON envelopes the dispatch shim emits:
 /// envelope lines are claimed (they are CodeyBox's own shape), foreign JSON
 /// is never claimed, and session_update / turn_complete envelopes map to
-/// tool calls, assistant chunks, token totals, and the final message.
+/// tool calls, assistant chunks, and the final message. Usage counters are
+/// recognised for liveness but never folded into the summary — they are
+/// agent-influenceable telemetry that must not reach
+/// <c>has_extracted_token_usage</c> cost rows.
 /// </summary>
 public sealed class DevinStreamParserTests
 {
@@ -62,8 +64,10 @@ public sealed class DevinStreamParserTests
         Assert.Equal("exec:0#abc", tool.ToolUseId);
         Assert.Equal("Ran dotnet test", tool.ToolName);
         Assert.True(tool.Succeeded);
-        Assert.Equal(11, summary.InputTokens);
-        Assert.Equal(7, summary.OutputTokens);
+        // The envelope's usage object is telemetry — never folded into the
+        // summary that feeds work_item_costs accounting.
+        Assert.Equal(0, summary.InputTokens);
+        Assert.Equal(0, summary.OutputTokens);
         Assert.Equal("DONE", summary.FinalAssistantMessage);
     }
 
@@ -82,17 +86,22 @@ public sealed class DevinStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_UsageUpdateMeta_FeedsTokenTotals()
+    public async Task ParseAsync_UsageUpdate_IsRecognized_CountersStayTelemetry()
     {
+        // A usage tick still counts as a recognised envelope (it keeps the
+        // stream alive), but its counters are agent-influenceable telemetry:
+        // folding them into the summary would promote forged values into
+        // has_extracted_token_usage cost rows that settle quota escrow.
         var stream = StreamOf(
             """{"type":"devin.acp","event":"session_update","sessionId":"s-1","update":{"sessionUpdate":"usage_update","used":100,"size":200,"_meta":{"cognition.ai/inputTokens":50,"cognition.ai/outputTokens":9,"cognition.ai/cachedReadTokens":4}}}""",
             """{"type":"devin.acp","event":"turn_complete","stopReason":"end_turn"}""");
 
         var summary = await new DevinStreamParser().ParseAsync(stream);
 
-        Assert.Equal(50, summary.InputTokens);
-        Assert.Equal(9, summary.OutputTokens);
-        Assert.Equal(4, summary.CachedInputTokens);
+        Assert.False(summary.IsUnsupported);
+        Assert.Equal(0, summary.InputTokens);
+        Assert.Equal(0, summary.OutputTokens);
+        Assert.Equal(0, summary.CachedInputTokens);
     }
 
     [Fact]

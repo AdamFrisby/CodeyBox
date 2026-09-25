@@ -14,6 +14,16 @@ namespace CodeyBox.Agents.Devin;
 /// ticks) and <c>turn_complete</c>/<c>turn_error</c>/<c>fatal</c> carry the
 /// terminal outcome.
 /// </summary>
+/// <remarks>
+/// Usage envelopes are recognised for stream liveness but their token
+/// counters are deliberately NOT folded into the summary: summary tokens are
+/// promoted into <c>work_item_costs</c> rows with
+/// <c>has_extracted_token_usage = 1</c>, which settle quota reservations and
+/// feed the burn estimator — and envelope payloads are agent-influenceable
+/// telemetry (<see cref="DevinAcpEnvelope.IsEnvelope"/>), so a forged
+/// zero-usage envelope would release a paid-quota escrow. The counters stay
+/// visible in the raw capture for diagnostics.
+/// </remarks>
 public sealed class DevinStreamParser : FlexibleAgentStreamParser
 {
     public DevinStreamParser(AgentStreamParserOptions? options = null)
@@ -67,7 +77,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
         var starts = new List<ToolBuilder>();
         var results = new List<ToolResultBuilder>();
         var isAssistant = false;
-        int? inputTokens = null, outputTokens = null, cachedInputTokens = null;
+        var sawUsageTick = false;
 
         if (DevinAcpEnvelope.TryGetUpdate(root, out var update))
         {
@@ -104,13 +114,12 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                     isAssistant = true;
                     break;
                 case DevinAcpEnvelope.UpdateKindUsageUpdate:
-                    // `used`/`size` are context-window occupancy, not
-                    // cumulative billing; the _meta counters carry the
-                    // per-turn token totals.
-                    if (DevinAcpEnvelope.TryGetUsageUpdateMeta(root, out var meta))
-                    {
-                        (inputTokens, outputTokens, cachedInputTokens) = DevinAcpEnvelope.ReadUsage(meta);
-                    }
+                    // Recognised for liveness, but the counters are
+                    // agent-influenceable telemetry and must never reach
+                    // the summary (see the class remarks) — they would be
+                    // promoted into work_item_costs rows that settle quota
+                    // escrow and feed the burn estimator.
+                    sawUsageTick = true;
                     break;
             }
         }
@@ -118,18 +127,16 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
         var recognized = starts.Count > 0
             || results.Count > 0
             || isAssistant
-            || inputTokens.HasValue
-            || outputTokens.HasValue
-            || cachedInputTokens.HasValue;
+            || sawUsageTick;
         return new ParsedEvent(
             EventType: isAssistant ? "assistant" : "devin.acp.session_update",
             Timestamp: timestamp,
             IsAssistant: isAssistant,
             ToolStarts: starts,
             ToolResults: results,
-            InputTokens: inputTokens,
-            OutputTokens: outputTokens,
-            CachedInputTokens: cachedInputTokens,
+            InputTokens: null,
+            OutputTokens: null,
+            CachedInputTokens: null,
             EstimatedUsd: null,
             TotalDuration: null,
             TimeToFirstToken: null,
@@ -139,21 +146,18 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
 
     private static ParsedEvent ParseTurnComplete(JsonElement root, DateTimeOffset? timestamp)
     {
-        int? inputTokens = null, outputTokens = null, cachedInputTokens = null;
-        if (DevinAcpEnvelope.TryGetTurnUsage(root, out var usage))
-        {
-            (inputTokens, outputTokens, cachedInputTokens) = DevinAcpEnvelope.ReadUsage(usage);
-        }
-
+        // The terminal envelope's `usage` object is agent-influenceable
+        // telemetry like every other envelope payload; it is deliberately
+        // not folded into the summary (see the class remarks).
         return new ParsedEvent(
             EventType: "result",
             Timestamp: timestamp,
             IsAssistant: false,
             ToolStarts: [],
             ToolResults: [],
-            InputTokens: inputTokens,
-            OutputTokens: outputTokens,
-            CachedInputTokens: cachedInputTokens,
+            InputTokens: null,
+            OutputTokens: null,
+            CachedInputTokens: null,
             EstimatedUsd: null,
             TotalDuration: null,
             TimeToFirstToken: null,

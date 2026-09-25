@@ -433,9 +433,10 @@ public sealed partial class PipelineRunner
     /// JSON-escaped inside <c>finalText</c> envelopes) implement
     /// <see cref="IAgentVisibleTextExtractor"/>; every other runner's
     /// captured stdout is already the plain text. Callers that feed a
-    /// plain-text parser (the check-and-act verdict sentinels) MUST pass
-    /// the capture through this — the sentinel JSON never parses out of raw
-    /// NDJSON.
+    /// plain-text parser (the check-and-act verdict sentinels, the
+    /// <c>&lt;codeybox-question&gt;</c> block parser, the PR-description
+    /// tail) MUST pass the capture through this — the sentinel JSON never
+    /// parses out of raw NDJSON.
     /// </summary>
     private static string AgentVisibleStdout(IAgentRunner runner, string capturedStdout)
         => (runner as IAgentVisibleTextExtractor)?.ExtractAgentVisibleText(capturedStdout)

@@ -77,8 +77,18 @@ internal static class DevinAcpShim
     /// while the prompt tail stays on the inherited descriptor 0
     /// (<c>--prompt-file -</c>), so neither artifact is ever staged at a
     /// re-openable path and the prompt never enters argv, the environment,
-    /// or <c>/proc/&lt;pid&gt;/environ</c> — the same delivery guarantee
-    /// the print-mode prompt file had.
+    /// or <c>/proc/&lt;pid&gt;/environ</c>.
+    ///
+    /// <para>That framing removes the staged-file swap, NOT the channel's
+    /// forgeability: descriptor 0 is an anonymous pipe a same-uid in-VM
+    /// peer can append to by re-opening <c>/proc/&lt;pid&gt;/fd/0</c> with
+    /// <c>O_WRONLY</c> (a fresh write end regardless of the descriptor's
+    /// mode). The delivered shim block and prompt are therefore
+    /// agent-influenceable — no in-VM mechanism can make the prompt channel
+    /// operator-authentic (sudo defeats even a root-owned sidecar), so
+    /// consumers must not treat delivered prompt bytes as authoritative
+    /// operator input. See the <b>Prompt-channel provenance</b> note on
+    /// <see cref="DevinAgentRunner"/>.</para>
     /// </summary>
     internal static string BuildDispatchStdin(string prompt)
     {

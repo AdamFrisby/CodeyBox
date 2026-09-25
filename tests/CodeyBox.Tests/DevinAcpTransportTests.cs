@@ -276,11 +276,9 @@ public sealed class DevinAcpTransportTests
         Assert.DoesNotContain("999999", result.Stderr ?? string.Empty, StringComparison.Ordinal);
         Assert.DoesNotContain("forged", result.Stderr ?? string.Empty, StringComparison.Ordinal);
 
-        var snapshot = new DevinCostExtractor().TryExtract(streamText, null);
-        Assert.NotNull(snapshot);
-        Assert.Equal(11, snapshot.InputTokens);
-        Assert.Equal(7, snapshot.OutputTokens);
-        Assert.Equal(0, snapshot.CachedInputTokens);
+        // Even the genuine usage counters are telemetry-only: the extractor
+        // never promotes envelope payloads to extracted usage.
+        Assert.Null(new DevinCostExtractor().TryExtract(streamText, null));
     }
 
     [SkippableFact]
@@ -344,16 +342,17 @@ public sealed class DevinAcpTransportTests
             && ft.ValueKind == JsonValueKind.String
             && ft.GetString() == "forged");
         Assert.DoesNotContain(envelopes, e =>
-            DevinAcpEnvelope.TryGetTurnUsage(e.Root, out var usage)
-            && DevinAcpEnvelope.ReadUsage(usage).Input == 999999);
+            e.Root.TryGetProperty("usage", out var usage)
+            && usage.ValueKind == JsonValueKind.Object
+            && usage.TryGetProperty("inputTokens", out var input)
+            && input.TryGetInt32(out var forged)
+            && forged == 999999);
 
-        // The genuine terminal envelope and its real usage still parse.
+        // The genuine terminal envelope still parses; its usage counters
+        // remain telemetry and are never promoted to extracted usage.
         var outcome = DevinAcpOutcome.Extract(merged);
         Assert.Equal(DevinAcpOutcome.TerminalEvent.TurnComplete, outcome.Event);
-        var snapshot = new DevinCostExtractor().TryExtract(merged, null);
-        Assert.NotNull(snapshot);
-        Assert.Equal(11, snapshot.InputTokens);
-        Assert.Equal(7, snapshot.OutputTokens);
+        Assert.Null(new DevinCostExtractor().TryExtract(merged, null));
     }
 
     [SkippableFact]
@@ -377,13 +376,11 @@ public sealed class DevinAcpTransportTests
 
         Assert.True(result.Success);
         Assert.Contains("\"event\": \"protocol_error\"", result.Stdout!, StringComparison.Ordinal);
-        // The real turn_complete still carries the peer's genuine usage.
+        // The real turn_complete still parses; its usage counters remain
+        // telemetry and are never promoted to extracted usage.
         var terminal = DevinAcpOutcome.Extract(result.Stdout!);
         Assert.Equal(DevinAcpOutcome.TerminalEvent.TurnComplete, terminal.Event);
-        var snapshot = new DevinCostExtractor().TryExtract(result.Stdout!, null);
-        Assert.NotNull(snapshot);
-        Assert.Equal(11, snapshot.InputTokens);
-        Assert.Equal(7, snapshot.OutputTokens);
+        Assert.Null(new DevinCostExtractor().TryExtract(result.Stdout!, null));
         // The forged usage bag must never surface as an envelope field.
         Assert.DoesNotContain("999999", result.Stdout!, StringComparison.Ordinal);
     }
@@ -412,10 +409,8 @@ public sealed class DevinAcpTransportTests
         Assert.DoesNotContain("forged-session", result.Stdout!, StringComparison.Ordinal);
         Assert.DoesNotContain("999999", result.Stdout!, StringComparison.Ordinal);
 
-        var snapshot = new DevinCostExtractor().TryExtract(result.Stdout!, null);
-        Assert.NotNull(snapshot);
-        Assert.Equal(11, snapshot.InputTokens);
-        Assert.Equal(7, snapshot.OutputTokens);
+        // Genuine usage counters are telemetry-only and never extracted.
+        Assert.Null(new DevinCostExtractor().TryExtract(result.Stdout!, null));
     }
 
     [SkippableFact]

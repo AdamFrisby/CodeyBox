@@ -461,7 +461,12 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   agent only as `session/prompt` JSON — never in argv, the environment,
   or a re-openable path. The shim reads it from the already-open fd 0 —
   re-opening the exec stdin pipe by name fails EACCES because the pipe
-  was created before the sandbox-user drop.
+  was created before the sandbox-user drop. That removes the staged-file
+  swap, not the channel's forgeability: fd 0 is an anonymous pipe a
+  same-uid in-VM peer can append to via `/proc/<pid>/fd/0` reopened
+  `O_WRONLY`, so delivered prompt bytes are agent-influenceable and must
+  not be treated as operator-authentic (sudo defeats even a root-owned
+  stdin sidecar — there is no in-VM fix).
 - Failure text surfaces either as shim `turn_error`/`fatal` envelopes
   (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
   `Error: …` lines — the CLI prints them to stderr (verified: `Error: Not
@@ -491,6 +496,10 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   session-scoped frames, and flat-number-only usage bags, but the exec-pipe
   leg has no in-VM fix. Envelope payloads are therefore agent-influenceable
   telemetry — usage, outcome, final text — never authoritative accounting.
+  Usage counters specifically are never promoted to extracted token usage:
+  `DevinCostExtractor` returns null and `DevinStreamParser` does not fold
+  them into the stream summary, so a forged zero-usage envelope cannot
+  settle the paid-quota escrow or skew the rate-gate burn samples.
 - The text-only path (`RunTextOnlyAsync`) still uses
   `devin -p --respect-workspace-trust false` with no permission flag —
   the read-only `auto` default is the conservative shape for answering

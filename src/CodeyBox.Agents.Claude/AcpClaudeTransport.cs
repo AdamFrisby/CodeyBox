@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Claude;
