@@ -109,7 +109,7 @@ public sealed class ExternalToolAuditorOptions
         if (maxFindings.HasValue && maxFindings.Value > 0)
             bound.MaxFindings = Math.Min(maxFindings.Value, 100_000);
 
-        var exitCodes = SplitList(section["FindingsExitCodes"])
+        var exitCodes = SplitCommaSeparatedList(section["FindingsExitCodes"])
             .Select(ReadInt)
             .Where(code => code.HasValue)
             .Select(code => code!.Value)
@@ -126,32 +126,37 @@ public sealed class ExternalToolAuditorOptions
                 _ => defaults.MinimumSeverity,
             };
 
-        var included = SplitList(section["IncludedRules"]).ToHashSet(StringComparer.Ordinal);
+        var included = SplitCommaSeparatedList(section["IncludedRules"]).ToHashSet(StringComparer.Ordinal);
         if (included.Count > 0)
             bound.IncludedRules = included;
 
-        var excluded = SplitList(section["ExcludedRules"]).ToHashSet(StringComparer.Ordinal);
+        var excluded = SplitCommaSeparatedList(section["ExcludedRules"]).ToHashSet(StringComparer.Ordinal);
         if (excluded.Count > 0)
             bound.ExcludedRules = excluded;
 
-        var excludePaths = SplitList(section["ExcludePaths"]);
+        var excludePaths = SplitCommaSeparatedList(section["ExcludePaths"]);
         if (excludePaths.Count > 0)
             bound.ExcludePaths = excludePaths;
 
-        var extraArguments = SplitList(section["ExtraArguments"]);
+        var extraArguments = SplitCommaSeparatedList(section["ExtraArguments"]);
         if (extraArguments.Count > 0)
             bound.ExtraArguments = extraArguments.Take(MaxExtraArguments + 1).ToList();
 
         return bound;
     }
 
-    private static int? ReadInt(string? value)
-        => int.TryParse(value?.Trim(), out var parsed) ? parsed : null;
-
-    private static List<string> SplitList(string? value)
+    /// <summary>
+    /// Splits a comma-separated scoped-config value into trimmed, non-empty
+    /// entries — the shared convention for list-valued auditor keys
+    /// (<c>ExcludePaths</c>, <c>ExtraArguments</c>, plugin-specific lists).
+    /// </summary>
+    public static List<string> SplitCommaSeparatedList(string? value)
         => string.IsNullOrWhiteSpace(value)
             ? []
             : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Where(item => item.Length > 0)
                 .ToList();
+
+    private static int? ReadInt(string? value)
+        => int.TryParse(value?.Trim(), out var parsed) ? parsed : null;
 }

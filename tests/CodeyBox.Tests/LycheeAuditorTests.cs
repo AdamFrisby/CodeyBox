@@ -274,6 +274,9 @@ public sealed class LycheeAuditorTests
         Assert.Contains("--include-fragments", scanExec.Argv);
         // Offline by default — no network in the audit sandbox.
         Assert.Contains("--offline", scanExec.Argv);
+        // Walker ignore files (.gitignore/.ignore) cannot hide committed
+        // documentation from the crawl.
+        Assert.Contains("--no-ignore", scanExec.Argv);
         // Repo-authored lychee config is pinned out; /dev/null parses empty.
         Assert.Contains("--config", scanExec.Argv);
         Assert.Contains("/dev/null", scanExec.Argv);
@@ -421,8 +424,9 @@ public sealed class LycheeAuditorTests
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsIgnoreProbe(exec))
-                // exit 0 = .lycheeignore exists at the repo root
-                return Task.FromResult(new SandboxExecResult(0, "", ""));
+                // The probe echoes each present path: stdout carries the
+                // verdict, exit 0 means the probe itself completed.
+                return Task.FromResult(new SandboxExecResult(0, ".lycheeignore\n", ""));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
@@ -432,6 +436,31 @@ public sealed class LycheeAuditorTests
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains(".lycheeignore", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task IgnoreProbeError_IsInfrastructureFailure_FailsClosed()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsIgnoreProbe(exec))
+                // A non-zero probe exit means the check itself failed —
+                // "could not confirm absence" is never treated as "absent".
+                return Task.FromResult(new SandboxExecResult(2, "", "sh: syntax error"));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new LycheeAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("lychee", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("could not confirm", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -467,6 +496,7 @@ public sealed class LycheeAuditorTests
         Assert.Equal(0, ignoreProbes);
         Assert.NotNull(scanExec);
         Assert.DoesNotContain("--config", scanExec!.Argv);
+        Assert.DoesNotContain("--no-ignore", scanExec.Argv);
     }
 
     [Fact]
@@ -497,6 +527,39 @@ public sealed class LycheeAuditorTests
         Assert.True(configIndex >= 0 && configIndex + 1 < argv.Count);
         Assert.Equal("/opt/codeybox/lychee.toml", argv[configIndex + 1]);
         Assert.DoesNotContain("/dev/null", argv);
+    }
+
+    [Theory]
+    [InlineData("--config=/opt/operator.toml")]
+    [InlineData("-c/opt/operator.toml")]
+    public async Task ExtraArguments_AttachedConfigForm_SuppressesPin(string extraArg)
+    {
+        // An operator --config in the attached/joined form must be detected
+        // just like the separated form — otherwise the auditor would emit a
+        // duplicate flag and the documented precedence would not hold.
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsIgnoreProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new LycheeAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = extraArg,
+            }),
+            CancellationToken.None);
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        Assert.Contains(extraArg, scanExec!.Argv);
+        Assert.DoesNotContain("--config", scanExec.Argv);
+        Assert.DoesNotContain("/dev/null", scanExec.Argv);
     }
 
     [Fact]
@@ -628,11 +691,6 @@ public sealed class LycheeAuditorTests
 
         var tools = loader.GetEnabledPluginTools();
         Assert.Empty(tools);
-
-        var contributions = PluginBaselineProvisioning.BuildContributions(tools);
-        var flattened = string.Join("\n", contributions.InstallCommands)
-            + "\n" + string.Join("\n", contributions.VerificationCommands.SelectMany(static v => v.Argv));
-        Assert.DoesNotContain("lychee", flattened, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -771,10 +829,8 @@ public sealed class LycheeAuditorTests
     private static SandboxExecResult Ok(SandboxExec exec)
         => IsVersionProbe(exec)
             ? new SandboxExecResult(0, "lychee " + LycheeAuditor.DefaultExpectedVersion + "\n", "")
-            : IsIgnoreProbe(exec)
-                // exit 1 = .lycheeignore absent
-                ? new SandboxExecResult(1, "", "")
-                : new SandboxExecResult(0, "", "");
+            // Presence probes: exit 0 with empty stdout = probed files absent.
+            : new SandboxExecResult(0, "", "");
 
     private static bool IsPresenceProbe(SandboxExec exec)
         => exec.Argv.Count >= 3
@@ -826,12 +882,18 @@ public sealed class LycheeAuditorTests
             };
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain both streams concurrently: a full stderr pipe would block
+            // the child on write while stdout stays open, deadlocking the
+            // synchronous read ahead of the timeout.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            Task.WhenAll(stdoutTask, stderrTask).Wait(TimeSpan.FromSeconds(5));
+            var stdout = stdoutTask.IsCompletedSuccessfully ? stdoutTask.Result : string.Empty;
             var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }

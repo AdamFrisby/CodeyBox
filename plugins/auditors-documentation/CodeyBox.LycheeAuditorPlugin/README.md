@@ -2,8 +2,8 @@
 
 Auditor plugin wrapping [lychee](https://lychee.cli.rs): it checks links in
 the audited repository's documentation files with `lychee --format json
---offline .` and reports each failed link check as an audit finding with the
-source file and `file:line` location lychee supplies.
+--offline --no-ignore .` and reports each failed link check as an audit
+finding with the source file and `file:line` location lychee supplies.
 
 ## What it reports
 
@@ -42,9 +42,12 @@ source file and `file:line` location lychee supplies.
   lychee's documentation extensions (`md`/`mkd`/`mdx`/`mdown`/`mdwn`/`mkdn`/
   `mkdown`/`markdown`, `html`/`htm`, `css`, `txt`, `xml`). Links inside
   `*.py`, `*.cs`, `*.yml`, etc. are not extracted.
-- **Gitignored and excluded inputs.** lychee skips files covered by
-  `.gitignore`/`.ignore`, and paths listed in `ExcludePaths` are excluded at
-  crawl time via `--exclude-path` — links inside them are never checked.
+- **Excluded inputs.** Paths listed in `ExcludePaths` are excluded at crawl
+  time via `--exclude-path` — links inside them are never checked. Walker
+  ignore files (`./.gitignore`, `.ignore`, the global ignore file) are *not*
+  honored by default: the scan passes `--no-ignore` so the audit subject
+  cannot hide a committed file from the crawl. Only
+  `TrustRepositorySuppression: true` restores ignore-file handling.
 - **Site-root-absolute links resolve only with `RootDirectory`.** A link like
   `/docs/guide.md` is only checkable if the deploy root is known; without
   `RootDirectory` lychee reports it — which is the honest result.
@@ -123,27 +126,29 @@ Scoped under `CodeyBox:Plugins:codeybox.lychee`, resolved per run
 | `RootDirectory` | `null` | Absolute in-sandbox path passed to `--root-dir`; resolves site-root-absolute links (`/docs/x.md`) in local files. Ignored when `ExtraArguments` supplies `--root-dir`. |
 | `Inputs` | `.` | Comma-separated lychee inputs (files, globs, directories) replacing the whole-tree `.` default — e.g. `docs,README.md` to scope to one tree. |
 | `ConfigPath` | `null` | Path passed to `--config` — an operator-pinned lychee config. Takes precedence over the `/dev/null` pin and the repo's own config files. Ignored when `ExtraArguments` already supplies `--config`/`-c`. |
-| `TrustRepositorySuppression` | `false` | When `false` (default) a repo-root `.lycheeignore` fails closed and `--config /dev/null` disables all default config-file lookup. When `true`, lychee honors `.lycheeignore` and repo-authored `lychee.toml`/`[lychee]` sections. |
+| `TrustRepositorySuppression` | `false` | When `false` (default) a repo-root `.lycheeignore` fails closed, `--config /dev/null` disables all default config-file lookup, and `--no-ignore` stops `.gitignore`/`.ignore` from hiding input files. When `true`, lychee honors all of those repo-authored surfaces. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
 | `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop; the only ids are `lychee/broken-link` and `lychee/timeout`. |
-| `ExcludePaths` | `.git/`, `vendor/`, `third_party/`, `node_modules/`, `dist/`, `build/`, `out/`, `coverage/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Each entry is also translated to an anchored `--exclude-path` regex so excluded trees are never crawled. Setting it replaces the default list. |
+| `ExcludePaths` | `.git/`, `vendor/`, `third_party/`, `node_modules/`, `.venv/`, `venv/`, `dist/`, `build/`, `out/`, `coverage/`, `bin/`, `obj/`, `target/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Each entry is also translated to an anchored `--exclude-path` regex so excluded trees are never crawled; under `--no-ignore` this list is the only boundary keeping gitignored build output out of the walk. Setting it replaces the default list. |
 | `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--exclude <url-regex>`, `--accept <codes>`, `--scheme https`, or an operator `--config`/`--exclude-path`. A repeated flag wins over the built-in default — take care: `--format` would replace the JSON report the parser expects and break the run into infrastructure failure. |
 | `TimeoutSeconds` | `300` | Per-run bound. Exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 
 **Repository-controlled suppression is off by default.** The audit subject
-writes the repository, and lychee honors two repo-authored surfaces:
+writes the repository, and lychee honors three repo-authored surfaces: walker
+ignore files (`.gitignore`, `.ignore`, the global ignore file — they would
+let the subject exclude a committed file from the crawl entirely),
 `.lycheeignore` in the working directory (loaded unconditionally — no flag
-disables it — each line a URL-exclusion regex) and the default config files
+disables it — each line a URL-exclusion regex), and the default config files
 (`lychee.toml`, or `[lychee]`-equivalent sections in `Cargo.toml`,
 `pyproject.toml`, `package.json`), which can widen `exclude`/`accept` and
-silence findings. By default the auditor fails closed when a repo-root
-`.lycheeignore` exists, and passes `--config /dev/null` — an empty config
-that turns off every default lookup — so the checked ruleset cannot be
-steered by the audited tree. `TrustRepositorySuppression: true` restores the
-tool's default behavior for repos whose own lychee config is the intended
-contract; a deliberate `ConfigPath` overrides the pin without trusting the
-repo.
+silence findings. By default the auditor passes `--no-ignore` so ignore
+rules cannot hide inputs, fails closed when a repo-root `.lycheeignore`
+exists, and passes `--config /dev/null` — an empty config that turns off
+every default lookup — so the checked ruleset cannot be steered by the
+audited tree. `TrustRepositorySuppression: true` restores the tool's default
+behavior for repos whose own lychee config is the intended contract; a
+deliberate `ConfigPath` overrides the pin without trusting the repo.
 
 If your repository legitimately ships `lychee.toml` or `.lycheeignore` for its
 own CI, either point `ConfigPath` at that file (it is then the explicit,
@@ -153,10 +158,16 @@ operator-chosen config) or set `TrustRepositorySuppression: true`.
 
 `lychee .` — the whole worktree, walked recursively and filtered to
 documentation extensions, with hidden files included (docs live under
-`.github/`) and `.git/` excluded. Findings under vendored
-(`vendor/`, `third_party/`, `node_modules/`) and generated (`dist/`,
-`build/`, `out/`, `coverage/`) prefixes are excluded both at crawl time
-(`--exclude-path`) and at finding level (`ExcludePaths`): broken links in
-third-party docs or build output belong to upstream packages, not the change
-under audit — reporting them trains operators to ignore the auditor.
+`.github/`). The walk does **not** honor `.gitignore`/`.ignore` by default
+(`--no-ignore`): a link-checker the audited repository can hide files from
+is not a gate. The cost is that gitignored trees are now walked too, so the
+`ExcludePaths` defaults — `.git/` plus vendored (`vendor/`, `third_party/`,
+`node_modules/`, `.venv/`, `venv/`) and generated (`dist/`, `build/`, `out/`,
+`coverage/`, `bin/`, `obj/`, `target/`) prefixes — double as the crawl
+boundary: findings under them are excluded both at crawl time
+(`--exclude-path`) and at finding level. Exclusions are anchored at the repo
+root — a nested `src/X/bin/` is not covered; widen `ExcludePaths` in scoped
+config if a layout keeps generated docs elsewhere. Broken links in
+third-party docs or build output belong to upstream packages, not the
+change under audit — reporting them trains operators to ignore the auditor.
 `Inputs` narrows the crawl itself when whole-tree coverage is too broad.

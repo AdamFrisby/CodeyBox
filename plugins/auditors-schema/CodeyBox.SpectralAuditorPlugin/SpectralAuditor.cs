@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using CodeyBox.PluginSdk.Tools;
@@ -11,8 +10,8 @@ namespace CodeyBox.SpectralAuditorPlugin;
 /// <see cref="ExternalToolAuditorBase"/>: the base supplies sandboxed invocation
 /// with a bounded timeout, per-stream output caps, SARIF parsing, severity mapping,
 /// exit-code classification, and per-auditor configuration. This class adds Spectral-specific
-/// argument assembly and pinned tool version validation through
-/// <see cref="ExternalToolAuditorBase.VerifyToolAsync"/>.
+/// argument assembly and declares the pinned tool version through
+/// <see cref="ExternalToolAuditorBase.VersionPin"/>.
 ///
 /// <para><b>Gate behaviour: hybrid / severity-driven.</b> Spectral classifies rule
 /// violations into error, warning, info, and hint. By default, schema violations and
@@ -73,12 +72,6 @@ public sealed class SpectralAuditor : ExternalToolAuditorBase, IPluginInitialize
     public const string TargetPatternsKey = "TargetPatterns";
 
     private const string DefaultGlob = "**/*.{json,yml,yaml}";
-    private const int ProbeMaxOutputBytes = 16 * 1024;
-    private const int MessageValueMaxChars = 64;
-    private static readonly TimeSpan ProbeTimeoutCap = TimeSpan.FromSeconds(30);
-    private static readonly Regex VersionPattern = new(
-        @"\d+\.\d+\.\d+[\w.\-]*",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
@@ -124,6 +117,10 @@ public sealed class SpectralAuditor : ExternalToolAuditorBase, IPluginInitialize
     protected override Func<ExternalToolAuditorOptions> OptionsAccessor => _optionsAccessor;
 
     /// <inheritdoc />
+    protected override ToolVersionPin? VersionPin =>
+        new(PluginId, _expectedVersion, DefaultExpectedVersion, ["--version"]);
+
+    /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
         var args = new List<string>
@@ -136,8 +133,7 @@ public sealed class SpectralAuditor : ExternalToolAuditorBase, IPluginInitialize
 
         var ruleset = _rulesetPath();
         if (!string.IsNullOrWhiteSpace(ruleset)
-            && !options.ExtraArguments.Contains("--ruleset", StringComparer.Ordinal)
-            && !options.ExtraArguments.Contains("-r", StringComparer.Ordinal))
+            && !ExtraArgumentsSupplyFlag(options, "--ruleset", "-r"))
         {
             args.Add("--ruleset");
             args.Add(ruleset.Trim());
@@ -162,114 +158,12 @@ public sealed class SpectralAuditor : ExternalToolAuditorBase, IPluginInitialize
         ArgumentNullException.ThrowIfNull(context);
         var scoped = context.ScopedConfig;
         _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
-        _expectedVersion = () => scoped["ExpectedVersion"];
+        _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _rulesetPath = () => scoped[RulesetPathKey] ?? scoped["Ruleset"];
-        _targetPatterns = () => SplitList(scoped[TargetPatternsKey] ?? scoped["Documents"]);
+        _targetPatterns = () =>
+            ExternalToolAuditorOptions.SplitCommaSeparatedList(scoped[TargetPatternsKey] ?? scoped["Documents"]);
         context.Logger.LogInformation(
             "SpectralAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
     }
-
-    /// <summary>
-    /// Spectral-specific preconditions on the live path: validates that the installed
-    /// spectral binary matches the pinned release (<c>ExpectedVersion</c>).
-    /// </summary>
-    protected override async Task VerifyToolAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        await ThrowIfToolVersionMismatchAsync(sandbox, workingDirectory, tool, options, ct)
-            .ConfigureAwait(false);
-    }
-
-    private async Task ThrowIfToolVersionMismatchAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var configured = _expectedVersion();
-        var expected = NormalizeVersion(configured);
-        if (expected is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' has an unparseable ExpectedVersion "
-                + $"('{TruncateForMessage(configured)}'); set CodeyBox:Plugins:{PluginId}:ExpectedVersion "
-                + $"to a {tool} release such as '{DefaultExpectedVersion}'.")
-            { IsDeterministic = true };
-
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            "version check",
-            new SandboxExec
-            {
-                Argv = [tool, "--version"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        var reported = ExtractVersion(result.Stdout);
-        if (result.ExecutionUnavailable
-            || result.ExitCode != 0
-            || reported is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' version could not be determined "
-                + $"(exit {result.ExitCode}). The pinned release is required before the scan can run — "
-                + $"a missing or foreign '{tool}' is infrastructure, not a verdict on the diff.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        if (!string.Equals(reported, expected, StringComparison.Ordinal))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is version {reported}, but this auditor is "
-                + $"pinned to {expected}. A different scanner version changes the rule set and the "
-                + "findings; provision the pinned release or set ExpectedVersion to the version you provisioned.")
-            { IsDeterministic = true };
-    }
-
-    private static TimeSpan ProbeTimeout(ExternalToolAuditorOptions options)
-    {
-        var timeout = EffectiveTimeout(options);
-        return timeout > ProbeTimeoutCap ? ProbeTimeoutCap : timeout;
-    }
-
-    private static string? ExtractVersion(string stdout)
-    {
-        var match = VersionPattern.Match(stdout);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string? NormalizeVersion(string? configured)
-    {
-        var value = string.IsNullOrWhiteSpace(configured)
-            ? DefaultExpectedVersion
-            : configured.Trim();
-        var match = VersionPattern.Match(value);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
-    }
-
-    private static List<string> SplitList(string? value)
-        => string.IsNullOrWhiteSpace(value)
-            ? []
-            : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Where(static item => item.Length > 0)
-                .ToList();
 }

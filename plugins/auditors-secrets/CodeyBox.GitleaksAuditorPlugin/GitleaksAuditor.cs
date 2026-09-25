@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using CodeyBox.PluginSdk.Tools;
@@ -12,9 +11,10 @@ namespace CodeyBox.GitleaksAuditorPlugin;
 /// <see cref="ExternalToolAuditorBase"/>: the base supplies sandboxed
 /// invocation with a bounded timeout, per-stream output caps, SARIF parsing,
 /// severity mapping, exit-code classification, and per-auditor configuration.
-/// This class adds two gitleaks-specific preconditions through the base's
-/// <see cref="ExternalToolAuditorBase.VerifyToolAsync"/> seam — the pinned
-/// tool version and the repository-suppression gate below.
+/// This class declares the pinned tool version through the base's
+/// <see cref="ExternalToolAuditorBase.VersionPin"/> and adds the
+/// repository-suppression gate below through
+/// <see cref="ExternalToolAuditorBase.VerifyToolAsync"/>.
 ///
 /// <para><b>Gate behaviour: blocking by default.</b> gitleaks has no severity
 /// vocabulary — every SARIF result is a detected credential — so every finding
@@ -120,15 +120,6 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
     private const string ConfigEnvVar = "GITLEAKS_CONFIG_TOML";
     private const string PinnedDefaultConfigToml = "[extend]\nuseDefault = true\n";
 
-    private const int ProbeMaxOutputBytes = 16 * 1024;
-    private const int MessageValueMaxChars = 64;
-    // The precondition probes are liveness checks, not the scan: they never
-    // need more than this and share the operator-configured timeout below it.
-    private static readonly TimeSpan ProbeTimeoutCap = TimeSpan.FromSeconds(30);
-    private static readonly Regex VersionPattern = new(
-        @"\d+\.\d+\.\d+[\w.\-]*",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
-
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
         FindingsExitCodes = new HashSet<int> { 0, LeaksFoundExitCode },
@@ -164,6 +155,10 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
 
     /// <inheritdoc />
     protected override Func<ExternalToolAuditorOptions> OptionsAccessor => _optionsAccessor;
+
+    /// <inheritdoc />
+    protected override ToolVersionPin? VersionPin =>
+        new(PluginId, _expectedVersion, DefaultExpectedVersion, ["version"]);
 
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
@@ -214,7 +209,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
         ArgumentNullException.ThrowIfNull(context);
         var scoped = context.ScopedConfig;
         _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
-        _expectedVersion = () => scoped["ExpectedVersion"];
+        _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _trustRepositorySuppression = () =>
             bool.TryParse(scoped[TrustRepositorySuppressionKey], out var trust) && trust;
         context.Logger.LogInformation(
@@ -223,11 +218,14 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
     }
 
     /// <summary>
-    /// gitleaks-specific preconditions on the live path: the pinned scanner
-    /// version, and — unless the operator opted in — absence of the
+    /// gitleaks-specific preconditions on the live path beyond the base's
+    /// pinned version check: unless the operator opted in, absence of the
     /// repository-controlled files gitleaks would honor or exempt from the
-    /// scan (<c>.gitleaksignore</c>, <c>.gitleaks.toml</c>). Both fail closed
-    /// as infrastructure before the scan runs.
+    /// scan (<c>.gitleaksignore</c>, <c>.gitleaks.toml</c>) is confirmed
+    /// through the shared fail-closed presence probe — and
+    /// <c>.gitleaks.toml</c> is checked in git history too, since the
+    /// config-path exemption covers every commit. Both fail closed as
+    /// infrastructure before the scan runs.
     /// </summary>
     protected override async Task VerifyToolAsync(
         ISandbox sandbox,
@@ -236,61 +234,9 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        await ThrowIfToolVersionMismatchAsync(sandbox, workingDirectory, tool, options, ct)
-            .ConfigureAwait(false);
         if (!_trustRepositorySuppression())
             await ThrowIfRepoSuppressionFilePresentAsync(sandbox, workingDirectory, tool, options, ct)
                 .ConfigureAwait(false);
-    }
-
-    private async Task ThrowIfToolVersionMismatchAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var configured = _expectedVersion();
-        var expected = NormalizeVersion(configured);
-        if (expected is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' has an unparseable ExpectedVersion "
-                + $"('{TruncateForMessage(configured)}'); set CodeyBox:Plugins:{PluginId}:ExpectedVersion "
-                + $"to a {tool} release such as '{DefaultExpectedVersion}'.")
-            { IsDeterministic = true };
-
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            "version check",
-            new SandboxExec
-            {
-                Argv = [tool, "version"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        var reported = ExtractVersion(result.Stdout);
-        if (result.ExecutionUnavailable
-            || result.ExitCode != 0
-            || reported is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' version could not be determined "
-                + $"(exit {result.ExitCode}). The pinned release is required before the scan can run — "
-                + $"a missing or foreign '{tool}' is infrastructure, not a verdict on the diff.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        if (!string.Equals(reported, expected, StringComparison.Ordinal))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is version {reported}, but this auditor is "
-                + $"pinned to {expected}. A different scanner version changes the rule set and the "
-                + "findings; provision the pinned release or set ExpectedVersion to the version you provisioned.")
-            { IsDeterministic = true };
     }
 
     private async Task ThrowIfRepoSuppressionFilePresentAsync(
@@ -307,47 +253,23 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
         // would let the subject hide a leak. A repo-root .gitleaks.toml is
         // gated alongside it: gitleaks exempts its own config path from the
         // scan, so the file's contents are never checked for secrets at all.
-        var presence = await ExecToolBoundedAsync(
+        var present = await ProbeRepositoryFilesPresentAsync(
             sandbox,
+            workingDirectory,
             tool,
-            "suppression check",
-            new SandboxExec
-            {
-                Argv =
-                [
-                    "sh", "-c",
-                    "rc=0; for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then echo \"$f\"; rc=1; fi; done; exit $rc",
-                    "sh", RepositoryIgnoreFile, RepositoryConfigFile,
-                ],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            [RepositoryIgnoreFile, RepositoryConfigFile],
+            options,
             ct).ConfigureAwait(false);
-
-        if (presence.ExecutionUnavailable)
+        if (present.Count > 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
-                + "transport was unavailable.");
-        if (presence.ExitCode != 0)
-        {
-            var found = SingleLine(presence.Stdout);
-            var detail = found.Length > 0
-                ? $"found repository-controlled file(s) '{found}'"
-                : "could not confirm file absence";
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check {detail} in the audited "
-                + $"repository (exit {presence.ExitCode}) — gitleaks honors '{RepositoryIgnoreFile}' "
-                + $"unconditionally and never scans its own '{RepositoryConfigFile}' config path, so "
-                + "either file lets the audit subject hide a leak. Remove the file(s), or set "
+                $"could-not-verify: audit tool '{tool}' found repository-controlled file(s) "
+                + $"'{string.Join("', '", present)}' in the audited repository — gitleaks honors "
+                + $"'{RepositoryIgnoreFile}' unconditionally and never scans its own "
+                + $"'{RepositoryConfigFile}' config path, so either file lets the audit subject hide "
+                + "a leak. Remove the file(s), or set "
                 + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to trust "
-                + "repository-controlled suppression surfaces.",
-                presence.ExitCode,
-                presence.Stdout + "\n" + presence.Stderr)
+                + "repository-controlled suppression surfaces.")
             { IsDeterministic = true };
-        }
 
         // The config-path exemption covers every commit, not just the
         // worktree: a subject could commit a secret inside .gitleaks.toml and
@@ -394,36 +316,5 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
                 history.ExitCode,
                 history.Stdout + "\n" + history.Stderr)
             { IsDeterministic = true };
-    }
-
-    private static TimeSpan ProbeTimeout(ExternalToolAuditorOptions options)
-    {
-        var timeout = EffectiveTimeout(options);
-        return timeout > ProbeTimeoutCap ? ProbeTimeoutCap : timeout;
-    }
-
-    private static string? ExtractVersion(string stdout)
-    {
-        var match = VersionPattern.Match(stdout);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string? NormalizeVersion(string? configured)
-    {
-        var value = string.IsNullOrWhiteSpace(configured)
-            ? DefaultExpectedVersion
-            : configured.Trim();
-        var match = VersionPattern.Match(value);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
     }
 }

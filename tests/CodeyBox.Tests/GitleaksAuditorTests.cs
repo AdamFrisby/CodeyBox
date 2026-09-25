@@ -150,7 +150,7 @@ public sealed class GitleaksAuditorTests
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsWorktreeSuppressionProbe(exec))
-                return Task.FromResult(new SandboxExecResult(1, ".gitleaksignore\n", "")); // file present
+                return Task.FromResult(new SandboxExecResult(0, ".gitleaksignore\n", "")); // file present
             if (IsHistorySuppressionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             scanExecs++;
@@ -178,7 +178,7 @@ public sealed class GitleaksAuditorTests
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsWorktreeSuppressionProbe(exec))
-                return Task.FromResult(new SandboxExecResult(1, ".gitleaks.toml\n", "")); // file present
+                return Task.FromResult(new SandboxExecResult(0, ".gitleaks.toml\n", "")); // file present
             if (IsHistorySuppressionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             scanExecs++;
@@ -241,7 +241,7 @@ public sealed class GitleaksAuditorTests
             if (IsSuppressionProbe(exec))
             {
                 suppressionProbes++;
-                return Task.FromResult(new SandboxExecResult(1, "", "")); // file present
+                return Task.FromResult(new SandboxExecResult(0, ".gitleaksignore\n", "")); // file present
             }
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
