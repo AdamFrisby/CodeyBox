@@ -271,7 +271,7 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
     public async Task RevokeAsync(string leaseId, CancellationToken ct = default)
     {
         var parsed = ParseOurs(leaseId);
-        var options = RequireUsableOptions();
+        var options = RequireConfiguredOptions();
         EnsureClients();
         if (_broker is not null && _broker.Unregister(leaseId))
             _logger.LogInformation("Infisical broker dropped endpoint for lease '{LeaseId}'.", leaseId);
@@ -497,6 +497,15 @@ public sealed class InfisicalSecretProvider : ILeaseCapableSecretProvider, IPlug
 
     private InfisicalOptions RequireUsableOptions()
         => CredentialOptions.RequireUsable(
+            CurrentOptions(), InfisicalException.BackendName, InfisicalException.Create);
+
+    /// <summary>
+    /// The revocation gate: options must be valid but need not be enabled —
+    /// disabling the plugin is a natural response to a suspect backend and
+    /// must not strand already-issued leases until their server-side expiry.
+    /// </summary>
+    private InfisicalOptions RequireConfiguredOptions()
+        => CredentialOptions.RequireValid(
             CurrentOptions(), InfisicalException.BackendName, InfisicalException.Create);
 
     private static InfisicalSecretMapping? FindMapping(InfisicalOptions options, ProjectSandboxSecret secret)

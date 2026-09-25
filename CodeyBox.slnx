@@ -75,6 +75,7 @@
     <Project Path="plugins/credentials/CodeyBox.DopplerPlugin/CodeyBox.DopplerPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.OnePasswordPlugin/CodeyBox.OnePasswordPlugin.csproj" />
     <Project Path="plugins/credentials/CodeyBox.BitwardenPlugin/CodeyBox.BitwardenPlugin.csproj" />
+    <Project Path="plugins/credentials/CodeyBox.OpenBaoPlugin/CodeyBox.OpenBaoPlugin.csproj" />
     <Project Path="plugins/upstream/CodeyBox.AzureDevOpsUpstreamPlugin/CodeyBox.AzureDevOpsUpstreamPlugin.csproj" />
     <Project Path="plugins/upstream/CodeyBox.GiteaUpstreamPlugin/CodeyBox.GiteaUpstreamPlugin.csproj" />
     <Project Path="plugins/upstream/CodeyBox.ForgejoUpstreamPlugin/CodeyBox.ForgejoUpstreamPlugin.csproj" />

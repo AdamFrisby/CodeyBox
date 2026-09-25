@@ -179,7 +179,7 @@ public sealed class InfisicalRestClient
                 throw new InfisicalException(
                     CredentialFailureKind.InvalidResponse,
                     $"Infisical create of dynamic lease '{dynamicSecretName}' returned no expireAt.");
-            var data = ReadDataFields(root, $"dynamic lease '{dynamicSecretName}'");
+            var data = ReadDataFields(root);
             _log.LogInformation(
                 "Infisical created dynamic lease '{LeaseId}' for '{Name}' expiring {ExpiresAt}.",
                 leaseId, dynamicSecretName, expiresAt);
@@ -270,31 +270,8 @@ public sealed class InfisicalRestClient
         }
     }
 
-    private static IReadOnlyDictionary<string, string> ReadDataFields(JsonElement root, string where)
-    {
-        var fields = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
-            return fields.AsReadOnlyDictionary();
-        foreach (var property in data.EnumerateObject())
-        {
-            fields[property.Name] = property.Value.ValueKind switch
-            {
-                JsonValueKind.String => property.Value.GetString() ?? string.Empty,
-                JsonValueKind.Number => property.Value.GetRawText(),
-                JsonValueKind.True => "true",
-                JsonValueKind.False => "false",
-                JsonValueKind.Null => string.Empty,
-                _ => property.Value.GetRawText(),
-            };
-        }
-        return fields.AsReadOnlyDictionary();
-    }
-
-}
-
-internal static class DictionaryExtensions
-{
-    internal static IReadOnlyDictionary<TKey, TValue> AsReadOnlyDictionary<TKey, TValue>(
-        this Dictionary<TKey, TValue> source) where TKey : notnull
-        => new System.Collections.ObjectModel.ReadOnlyDictionary<TKey, TValue>(source);
+    private static IReadOnlyDictionary<string, string> ReadDataFields(JsonElement root)
+        => root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object
+            ? CredentialJson.ReadStringFields(data)
+            : new Dictionary<string, string>(StringComparer.Ordinal);
 }

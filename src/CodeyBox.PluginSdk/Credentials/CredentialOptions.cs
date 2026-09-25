@@ -243,10 +243,12 @@ public static class CredentialOptions
 
     /// <summary>
     /// The enabled-and-valid gate every credential provider applies before
-    /// issuing, renewing, or revoking: a disabled plugin or an invalid
-    /// configuration is a typed <see cref="CredentialFailureKind.Misconfigured"/>
+    /// issuing or renewing: a disabled plugin or an invalid configuration
+    /// is a typed <see cref="CredentialFailureKind.Misconfigured"/>
     /// failure carrying the backend's own exception type, identical across
     /// backends. Returns the options for the caller to keep using.
+    /// Revocation uses <see cref="RequireValid{TOptions}"/> instead —
+    /// teardown must not be gated on the plugin still being enabled.
     /// </summary>
     public static TOptions RequireUsable<TOptions>(
         TOptions options, string backend, CredentialExceptionFactory exceptionFactory)
@@ -262,6 +264,24 @@ public static class CredentialOptions
                 $"{backend} provider is disabled (Enabled=false); enable it to issue.",
                 null, null, null);
         }
+        return RequireValid(options, backend, exceptionFactory);
+    }
+
+    /// <summary>
+    /// The teardown-side counterpart to <see cref="RequireUsable{TOptions}"/>:
+    /// configuration must still be valid (a revocation cannot run against an
+    /// unusable address either), but <see cref="ICredentialOptions.Enabled"/>
+    /// does not apply — disabling a plugin is a natural operator response to
+    /// a suspect backend and must not strand already-issued leases until
+    /// their server-side expiry.
+    /// </summary>
+    public static TOptions RequireValid<TOptions>(
+        TOptions options, string backend, CredentialExceptionFactory exceptionFactory)
+        where TOptions : ICredentialOptions
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(backend);
+        ArgumentNullException.ThrowIfNull(exceptionFactory);
         var errors = options.Validate();
         if (errors.Count > 0)
         {

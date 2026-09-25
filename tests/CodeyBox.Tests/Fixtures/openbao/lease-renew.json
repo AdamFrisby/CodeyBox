@@ -1,0 +1,10 @@
+{
+  "request_id": "6e8c0d2f-4a6b-4c8d-0e2f-7a8b9c0d1e2f",
+  "lease_id": "database/creds/readonly/9f8e7d6c-1234-4a5b-8c7d-0123456789ab",
+  "lease_duration": 1200,
+  "renewable": true,
+  "data": null,
+  "warnings": null,
+  "wrap_info": null,
+  "auth": null
+}
