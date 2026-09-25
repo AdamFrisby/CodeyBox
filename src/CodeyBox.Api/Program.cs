@@ -6314,32 +6314,7 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes, DeployConsistencyService con
     });
 });
 
-try
-{
-    app.Run();
-
-    // StopHost maps a BackgroundService fault to a graceful host shutdown,
-    // which would otherwise exit 0 exactly like an intentional stop. A
-    // recorded fault means the orchestrator died (e.g. sustained SQLite
-    // write-gate outage); exit non-zero so supervisors detect and restart.
-    var failureTracker = app.Services.GetService<BackgroundServiceFailureTracker>();
-    if (failureTracker?.Fault is not null)
-    {
-        Log.Error(
-            failureTracker.Fault,
-            "Host stopped after a background service fault; exiting non-zero");
-        Environment.ExitCode = BackgroundServiceFailureTracker.ResolveExitCode(backgroundServiceFaulted: true);
-    }
-}
-catch (Exception ex)
-{
-    Log.Fatal(ex, "Host terminated unexpectedly");
-    throw;
-}
-finally
-{
-    Log.CloseAndFlush();
-}
+Program.RunHost(app);
 
 namespace CodeyBox.Api
 {
@@ -9391,5 +9366,49 @@ public partial class Program
         var monitor = sp.GetRequiredService<IOptionsMonitor<InteractionsOptions>>();
         return () => monitor.CurrentValue.Providers.FirstOrDefault(p =>
             string.Equals(p.Provider, providerName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Runs the application host, resolving and capturing the
+    /// <see cref="BackgroundServiceFailureTracker"/> singleton before the host
+    /// executes. When <see cref="IHost.Run"/> returns, the service provider
+    /// is already disposed; inspecting the pre-resolved tracker avoids an
+    /// <see cref="ObjectDisposedException"/> on shutdown and maps a recorded
+    /// background-service fault to a non-zero process exit code.
+    /// </summary>
+    /// <param name="host">The host to run.</param>
+    internal static void RunHost(IHost host)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+
+        // Pre-resolve tracker while host.Services is alive. host.Run()
+        // disposes the host (and its container) before returning.
+        var failureTracker = host.Services.GetService<BackgroundServiceFailureTracker>();
+
+        try
+        {
+            host.Run();
+
+            // StopHost maps a BackgroundService fault to a graceful host shutdown,
+            // which would otherwise exit 0 exactly like an intentional stop. A
+            // recorded fault means the orchestrator died (e.g. sustained SQLite
+            // write-gate outage); exit non-zero so supervisors detect and restart.
+            if (failureTracker?.Fault is not null)
+            {
+                Log.Error(
+                    failureTracker.Fault,
+                    "Host stopped after a background service fault; exiting non-zero");
+                Environment.ExitCode = BackgroundServiceFailureTracker.ResolveExitCode(backgroundServiceFaulted: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Host terminated unexpectedly");
+            throw;
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
     }
 }
