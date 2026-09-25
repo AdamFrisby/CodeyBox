@@ -50,9 +50,6 @@ public sealed class PlaneWorkSyncPlugin
     private readonly object _clientLock = new();
     private bool _disposed;
 
-    /// <summary>Maximum comment body posted upstream (Plane markdown limit guard).</summary>
-    internal const int MaxCommentChars = 32 * 1024;
-
     private readonly Dictionary<string, string> _uuidCache =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _projectIdentifierCache =
@@ -200,7 +197,7 @@ public sealed class PlaneWorkSyncPlugin
                 ProjectId = new ProjectId(
                     parsed.CodeyBoxProjectId ?? FirstConfiguredProject(options)),
                 Title = string.IsNullOrWhiteSpace(parsed.Key) ? "plane-comment" : parsed.Key,
-                Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+                Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
                 PresentSignals = [],
                 LastActorLogin = parsed.ActorLogin,
                 HasSignal = false,
@@ -218,7 +215,7 @@ public sealed class PlaneWorkSyncPlugin
             ExternalId = parsed.Key,
             ProjectId = new ProjectId(parsed.CodeyBoxProjectId),
             Title = parsed.Title,
-            Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = parsed.ActorLogin,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -233,13 +230,13 @@ public sealed class PlaneWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "plane work sync is disabled");
-        var check = CheckTracked(update.Namespace, update.ExternalId);
+        var check = this.CheckTracked(update.Namespace, update.ExternalId);
         if (check is not null)
             return check;
 
-        var mapping = CurrentMapping(options);
+        var mapping = WorkStateMapping.ParseOrEmpty(options.StateMapping, _logger, "Plane");
         if (!mapping.TryMap(update.State, out var status) || string.IsNullOrEmpty(status))
-            return Unmapped(update.State);
+            return TrackerPostResult.UnmappedFor(update.State);
 
         var target = await ResolveTargetAsync(options, update.ExternalId, ct).ConfigureAwait(false);
         if (target.FailureDetail is not null || string.IsNullOrEmpty(target.IssueUuid))
@@ -263,7 +260,7 @@ public sealed class PlaneWorkSyncPlugin
         try
         {
             var commentId = await api.CreateCommentAsync(
-                options, projectId, issueUuid, ClipComment(update.Body), ct).ConfigureAwait(false);
+                options, projectId, issueUuid, WorkSyncText.ClipComment(update.Body, update.WorkItemId), ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
         catch (PlaneApiException ex) when (ex.IsCapabilityGap)
@@ -283,7 +280,7 @@ public sealed class PlaneWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "plane work sync is disabled");
-        var check = CheckTracked(post.Namespace, post.ExternalId);
+        var check = this.CheckTracked(post.Namespace, post.ExternalId);
         if (check is not null)
             return check;
 
@@ -294,7 +291,7 @@ public sealed class PlaneWorkSyncPlugin
 
         try
         {
-            var body = ClipComment($"{post.Body}\n\n{PlaneWebhook.QuestionTag(post.QuestionId)}");
+            var body = WorkSyncText.ClipComment($"{post.Body}\n\n{PlaneWebhook.QuestionTag(post.QuestionId)}", post.WorkItemId);
             var commentId = await api.CreateCommentAsync(options, projectId, issueUuid, body, ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
@@ -313,7 +310,7 @@ public sealed class PlaneWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "plane work sync is disabled");
-        var check = CheckTracked(report.Namespace, report.ExternalId);
+        var check = this.CheckTracked(report.Namespace, report.ExternalId);
         if (check is not null)
             return check;
 
@@ -353,7 +350,7 @@ public sealed class PlaneWorkSyncPlugin
         try
         {
             var commentId = await api.CreateCommentAsync(
-                options, projectId, issueUuid, ClipComment(report.Body), ct).ConfigureAwait(false);
+                options, projectId, issueUuid, WorkSyncText.ClipComment(report.Body, report.WorkItemId), ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
         catch (PlaneApiException ex)
@@ -459,19 +456,6 @@ public sealed class PlaneWorkSyncPlugin
             : PlaneWorkSyncOptions.FromConfiguration(section);
     }
 
-    internal WorkStateMapping CurrentMapping(PlaneWorkSyncOptions options)
-    {
-        try
-        {
-            return WorkStateMapping.Parse(options.StateMapping);
-        }
-        catch (ArgumentException ex)
-        {
-            _logger.LogError(ex, "Plane state mapping is invalid; reporting every state as unmapped");
-            return WorkStateMapping.Empty;
-        }
-    }
-
     private PlaneRestClient EnsureClients()
     {
         if (_api is not null)
@@ -515,7 +499,7 @@ public sealed class PlaneWorkSyncPlugin
             ExternalId = issue.Key,
             ProjectId = new ProjectId(codeyBoxProject),
             Title = issue.Title,
-            Body = Truncate(issue.Description, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(issue.Description, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = issue.LastActorLogin,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -533,23 +517,6 @@ public sealed class PlaneWorkSyncPlugin
                 signals.Add(new WorkSignal(kind, datum.Value));
         }
         return signals;
-    }
-
-    private TrackerPostResult? CheckTracked(string @namespace, string externalId)
-    {
-        if (!string.Equals(@namespace, Namespace, StringComparison.OrdinalIgnoreCase))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
-        if (string.IsNullOrWhiteSpace(externalId))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
-        return null;
-    }
-
-    private static TrackerPostResult Unmapped(WorkItemState state)
-    {
-        var unmapped = new UnmappedWorkItemState(state);
-        return new TrackerPostResult(TrackerPostOutcome.UnmappedState, Detail: unmapped.Describe());
     }
 
     /// <summary>
@@ -649,15 +616,6 @@ public sealed class PlaneWorkSyncPlugin
     private static string FirstConfiguredProject(PlaneWorkSyncOptions options) =>
         options.ProjectMap.Values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "plane";
 
-    private static string Truncate(string value, int maxChars) =>
-        value.Length <= maxChars ? value : value[..maxChars];
-
-    private static string ClipComment(string body)
-    {
-        if (string.IsNullOrEmpty(body))
-            throw new ArgumentException("tracker body must not be empty", nameof(body));
-        return body.Length <= MaxCommentChars ? body : body[..MaxCommentChars];
-    }
 
     private static string NormalizeUrl(string url) => url.Trim().TrimEnd('/');
 

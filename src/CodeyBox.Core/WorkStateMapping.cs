@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -47,6 +49,25 @@ public sealed class WorkStateMapping
         }
 
         return new WorkStateMapping(map);
+    }
+
+    /// <summary>
+    /// Parses the operator declaration, logging and degrading to <see
+    /// cref="Empty"/> when invalid, so a bad hot-reload reports every state
+    /// unmapped rather than crashing a poll or post.
+    /// </summary>
+    public static WorkStateMapping ParseOrEmpty(
+        IReadOnlyDictionary<string, string> declaration, ILogger logger, string providerName)
+    {
+        try
+        {
+            return Parse(declaration);
+        }
+        catch (ArgumentException ex)
+        {
+            logger.LogError(ex, "{Provider} state mapping is invalid; reporting every state as unmapped", providerName);
+            return Empty;
+        }
     }
 
     /// <summary>

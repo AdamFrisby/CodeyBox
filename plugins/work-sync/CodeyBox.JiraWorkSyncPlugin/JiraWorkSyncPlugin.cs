@@ -49,9 +49,6 @@ public sealed class JiraWorkSyncPlugin
     private readonly object _clientLock = new();
     private bool _disposed;
 
-    /// <summary>Maximum comment body posted upstream (Jira text limit guard).</summary>
-    internal const int MaxCommentChars = 32 * 1024;
-
     private readonly Dictionary<string, string> _keyCache =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly object _cacheLock = new();
@@ -187,7 +184,7 @@ public sealed class JiraWorkSyncPlugin
                 ProjectId = new ProjectId(
                     parsed.ProjectId ?? FirstConfiguredProject(options)),
                 Title = parsed.IssueKey,
-                Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+                Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
                 PresentSignals = [],
                 LastActorLogin = parsed.ActorLogin,
                 HasSignal = false,
@@ -204,7 +201,7 @@ public sealed class JiraWorkSyncPlugin
             ExternalId = parsed.IssueKey,
             ProjectId = new ProjectId(parsed.ProjectId),
             Title = parsed.Title,
-            Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = parsed.ActorLogin,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -219,13 +216,13 @@ public sealed class JiraWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "jira work sync is disabled");
-        var check = CheckTracked(update.Namespace, update.ExternalId);
+        var check = this.CheckTracked(update.Namespace, update.ExternalId);
         if (check is not null)
             return check;
 
-        var mapping = CurrentMapping(options);
+        var mapping = WorkStateMapping.ParseOrEmpty(options.StateMapping, _logger, "Jira");
         if (!mapping.TryMap(update.State, out var status) || string.IsNullOrEmpty(status))
-            return Unmapped(update.State);
+            return TrackerPostResult.UnmappedFor(update.State);
 
         var api = EnsureClients();
         var transition = await ResolveTransitionAsync(api, options, update.ExternalId, status, ct).ConfigureAwait(false);
@@ -245,7 +242,7 @@ public sealed class JiraWorkSyncPlugin
         try
         {
             var commentId = await api.CreateCommentAsync(
-                options, update.ExternalId, ClipComment(update.Body), ct).ConfigureAwait(false);
+                options, update.ExternalId, WorkSyncText.ClipComment(update.Body, update.WorkItemId), ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
         catch (JiraApiException ex)
@@ -265,14 +262,14 @@ public sealed class JiraWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "jira work sync is disabled");
-        var check = CheckTracked(post.Namespace, post.ExternalId);
+        var check = this.CheckTracked(post.Namespace, post.ExternalId);
         if (check is not null)
             return check;
 
         var api = EnsureClients();
         try
         {
-            var body = ClipComment($"{post.Body}\n\n{JiraWebhook.QuestionTag(post.QuestionId)}");
+            var body = WorkSyncText.ClipComment($"{post.Body}\n\n{JiraWebhook.QuestionTag(post.QuestionId)}", post.WorkItemId);
             var commentId = await api.CreateCommentAsync(options, post.ExternalId, body, ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
@@ -291,7 +288,7 @@ public sealed class JiraWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "jira work sync is disabled");
-        var check = CheckTracked(report.Namespace, report.ExternalId);
+        var check = this.CheckTracked(report.Namespace, report.ExternalId);
         if (check is not null)
             return check;
 
@@ -326,7 +323,7 @@ public sealed class JiraWorkSyncPlugin
         try
         {
             var commentId = await api.CreateCommentAsync(
-                options, report.ExternalId, ClipComment(report.Body), ct).ConfigureAwait(false);
+                options, report.ExternalId, WorkSyncText.ClipComment(report.Body, report.WorkItemId), ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
         catch (JiraApiException ex)
@@ -428,19 +425,6 @@ public sealed class JiraWorkSyncPlugin
             : JiraWorkSyncOptions.FromConfiguration(section);
     }
 
-    internal WorkStateMapping CurrentMapping(JiraWorkSyncOptions options)
-    {
-        try
-        {
-            return WorkStateMapping.Parse(options.StateMapping);
-        }
-        catch (ArgumentException ex)
-        {
-            _logger.LogError(ex, "Jira state mapping is invalid; reporting every state as unmapped");
-            return WorkStateMapping.Empty;
-        }
-    }
-
     private JiraRestClient EnsureClients()
     {
         if (_api is not null)
@@ -483,7 +467,7 @@ public sealed class JiraWorkSyncPlugin
             ExternalId = issue.Key,
             ProjectId = new ProjectId(codeyBoxProject),
             Title = issue.Title,
-            Body = Truncate(issue.Description, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(issue.Description, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = issue.LastActorLogin,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -511,23 +495,6 @@ public sealed class JiraWorkSyncPlugin
                 signals.Add(new WorkSignal(kind, datum.Value));
         }
         return signals;
-    }
-
-    private TrackerPostResult? CheckTracked(string @namespace, string externalId)
-    {
-        if (!string.Equals(@namespace, Namespace, StringComparison.OrdinalIgnoreCase))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
-        if (string.IsNullOrWhiteSpace(externalId))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
-        return null;
-    }
-
-    private static TrackerPostResult Unmapped(WorkItemState state)
-    {
-        var unmapped = new UnmappedWorkItemState(state);
-        return new TrackerPostResult(TrackerPostOutcome.UnmappedState, Detail: unmapped.Describe());
     }
 
     private sealed record TransitionResolution(string? TransitionId, string? FailureDetail);
@@ -569,15 +536,6 @@ public sealed class JiraWorkSyncPlugin
     private static string FirstConfiguredProject(JiraWorkSyncOptions options) =>
         options.ProjectMap.Values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "jira";
 
-    private static string Truncate(string value, int maxChars) =>
-        value.Length <= maxChars ? value : value[..maxChars];
-
-    private static string ClipComment(string body)
-    {
-        if (string.IsNullOrEmpty(body))
-            throw new ArgumentException("tracker body must not be empty", nameof(body));
-        return body.Length <= MaxCommentChars ? body : body[..MaxCommentChars];
-    }
 
     private static string NormalizeUrl(string url) => url.Trim().TrimEnd('/');
 

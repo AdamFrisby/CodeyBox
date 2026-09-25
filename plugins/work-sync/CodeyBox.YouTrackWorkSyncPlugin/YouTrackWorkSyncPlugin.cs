@@ -26,10 +26,12 @@ namespace CodeyBox.YouTrackWorkSyncPlugin;
 /// <para>YouTrack's distinctive surface is its command syntax: state changes
 /// are commands (<c>{State} {In Progress}</c>) applied through
 /// <c>POST /api/commands</c>, not field writes. Project and field names are
-/// per-instance configurable, so the field names and the state values are
-/// explicit operator declarations — an unmapped state is reported, never
-/// guessed, and a command the instance rejects is a reported <c>Failed</c>
-/// outcome.</para>
+/// per-instance configurable, so the field names are operator declarations,
+/// and the state value applied is the caller-resolved <see
+/// cref="TrackerProgressUpdate.ExternalStatus"/>/<see
+/// cref="TrackerOutcomeReport.ExternalStatus"/> — an unmapped state is
+/// reported, never guessed, and a command the instance rejects is a reported
+/// <c>Failed</c> outcome.</para>
 /// <para>Webhooks: YouTrack delivers them through the Webhook Triggers app,
 /// which is configured in the YouTrack UI (there is no webhook-registration
 /// REST API on any YouTrack version, so registration cannot be managed from
@@ -57,9 +59,6 @@ public sealed class YouTrackWorkSyncPlugin
     private readonly bool _ownsHttpClient;
     private readonly object _clientLock = new();
     private bool _disposed;
-
-    /// <summary>Maximum comment body posted upstream (YouTrack text limit guard).</summary>
-    internal const int MaxCommentChars = 32 * 1024;
 
     /// <summary>Production constructor (DI provides the HTTP factory).</summary>
     public YouTrackWorkSyncPlugin(IHttpClientFactory httpFactory, TimeProvider? clock = null)
@@ -261,7 +260,7 @@ public sealed class YouTrackWorkSyncPlugin
                 ExternalId = parsed.IssueId,
                 ProjectId = new ProjectId(commentProject),
                 Title = parsed.IssueId,
-                Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+                Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
                 PresentSignals = [],
                 LastActorLogin = parsed.ActorLogin,
                 HasSignal = false,
@@ -280,7 +279,7 @@ public sealed class YouTrackWorkSyncPlugin
             ExternalId = parsed.IssueId,
             ProjectId = new ProjectId(codeyBoxProject),
             Title = string.IsNullOrWhiteSpace(parsed.Title) ? parsed.IssueId : parsed.Title,
-            Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = parsed.ActorLogin,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -295,13 +294,17 @@ public sealed class YouTrackWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "youtrack work sync is disabled");
-        var check = CheckTracked(update.Namespace, update.ExternalId);
+        var check = this.CheckTracked(update.Namespace, update.ExternalId);
         if (check is not null)
             return check;
 
-        var mapping = CurrentMapping(options);
-        if (!mapping.TryMap(update.State, out var status) || string.IsNullOrEmpty(status))
-            return Unmapped(update.State);
+        // The caller (WorkTrackerService) resolves the declared external
+        // status from the operator's state mapping and hands it in via
+        // ExternalStatus; an empty status means unmapped — report it, never
+        // guess (and never re-map through a second, driftable mapping).
+        var status = update.ExternalStatus;
+        if (string.IsNullOrEmpty(status))
+            return TrackerPostResult.UnmappedFor(update.State);
 
         var api = EnsureClients();
         var applied = await ApplyStateAsync(api, options, update.ExternalId, status, ct).ConfigureAwait(false);
@@ -311,7 +314,8 @@ public sealed class YouTrackWorkSyncPlugin
         try
         {
             var commentId = await api.CreateCommentAsync(
-                options, update.ExternalId, ClipComment(update.Body), ct).ConfigureAwait(false);
+                options, update.ExternalId,
+                WorkSyncText.ClipComment(update.Body, update.WorkItemId), ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
         catch (YouTrackApiException ex)
@@ -331,14 +335,15 @@ public sealed class YouTrackWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "youtrack work sync is disabled");
-        var check = CheckTracked(post.Namespace, post.ExternalId);
+        var check = this.CheckTracked(post.Namespace, post.ExternalId);
         if (check is not null)
             return check;
 
         var api = EnsureClients();
         try
         {
-            var body = ClipComment($"{post.Body}\n\n{YouTrackWebhook.QuestionTag(post.QuestionId)}");
+            var body = WorkSyncText.ClipComment(
+                $"{post.Body}\n\n{YouTrackWebhook.QuestionTag(post.QuestionId)}", post.WorkItemId);
             var commentId = await api.CreateCommentAsync(options, post.ExternalId, body, ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
@@ -357,7 +362,7 @@ public sealed class YouTrackWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "youtrack work sync is disabled");
-        var check = CheckTracked(report.Namespace, report.ExternalId);
+        var check = this.CheckTracked(report.Namespace, report.ExternalId);
         if (check is not null)
             return check;
 
@@ -383,7 +388,8 @@ public sealed class YouTrackWorkSyncPlugin
         try
         {
             var commentId = await api.CreateCommentAsync(
-                options, report.ExternalId, ClipComment(report.Body), ct).ConfigureAwait(false);
+                options, report.ExternalId,
+                WorkSyncText.ClipComment(report.Body, report.WorkItemId), ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
         }
         catch (YouTrackApiException ex)
@@ -421,22 +427,13 @@ public sealed class YouTrackWorkSyncPlugin
     internal YouTrackWorkSyncOptions CurrentOptions()
     {
         var section = _host?.ScopedConfig ?? _testConfig;
-        return section is null
-            ? new YouTrackWorkSyncOptions()
-            : YouTrackWorkSyncOptions.FromConfiguration(section);
-    }
-
-    internal WorkStateMapping CurrentMapping(YouTrackWorkSyncOptions options)
-    {
-        try
-        {
-            return WorkStateMapping.Parse(options.StateMapping);
-        }
-        catch (ArgumentException ex)
-        {
-            _logger.LogError(ex, "YouTrack state mapping is invalid; reporting every state as unmapped");
-            return WorkStateMapping.Empty;
-        }
+        if (section is null)
+            return new YouTrackWorkSyncOptions();
+        var warnings = new List<string>();
+        var options = YouTrackWorkSyncOptions.FromConfiguration(section, warnings);
+        foreach (var warning in warnings)
+            _logger.LogWarning("YouTrack work-sync config: {Warning}", warning);
+        return options;
     }
 
     private YouTrackRestClient EnsureClients()
@@ -525,7 +522,7 @@ public sealed class YouTrackWorkSyncPlugin
             ExternalId = issue.IdReadable,
             ProjectId = new ProjectId(codeyBoxProject),
             Title = string.IsNullOrWhiteSpace(issue.Title) ? issue.IdReadable : issue.Title,
-            Body = Truncate(issue.Description, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(issue.Description, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = issue.LastActorLogin,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -544,23 +541,6 @@ public sealed class YouTrackWorkSyncPlugin
         return signals;
     }
 
-    private TrackerPostResult? CheckTracked(string @namespace, string externalId)
-    {
-        if (!string.Equals(@namespace, Namespace, StringComparison.OrdinalIgnoreCase))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"namespace '{@namespace}' is not tracked by source '{Namespace}'");
-        if (string.IsNullOrWhiteSpace(externalId))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: "no external id to track");
-        return null;
-    }
-
-    private static TrackerPostResult Unmapped(WorkItemState state)
-    {
-        var unmapped = new UnmappedWorkItemState(state);
-        return new TrackerPostResult(TrackerPostOutcome.UnmappedState, Detail: unmapped.Describe());
-    }
-
     /// <summary>
     /// Maps a webhook project key to its operator-declared CodeyBox project.
     /// Null when unmapped — the same "skipped, never guessed" rule as issues.
@@ -569,14 +549,4 @@ public sealed class YouTrackWorkSyncPlugin
         options.ProjectMap.TryGetValue(projectKey, out var mapped) && !string.IsNullOrWhiteSpace(mapped)
             ? mapped
             : null;
-
-    private static string Truncate(string value, int maxChars) =>
-        value.Length <= maxChars ? value : value[..maxChars];
-
-    private static string ClipComment(string body)
-    {
-        if (string.IsNullOrEmpty(body))
-            throw new ArgumentException("tracker body must not be empty", nameof(body));
-        return body.Length <= MaxCommentChars ? body : body[..MaxCommentChars];
-    }
 }

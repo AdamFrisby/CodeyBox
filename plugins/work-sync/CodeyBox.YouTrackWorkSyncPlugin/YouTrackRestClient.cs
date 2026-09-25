@@ -44,9 +44,9 @@ public sealed class YouTrackRestClient
 
     /// <summary>Issue fields requested on poll reads — bounded to what ingestion uses.</summary>
     internal const string IssueFields =
-        "id,idReadable,summary,description,updated,project(id,shortName)," +
-        "tags(name),customFields(name,value(name,login,fullName,$type),$type)," +
-        "updater(login,fullName)";
+        "idReadable,summary,description,updated,project(shortName)," +
+        "tags(name),customFields(name,value(name,login,$type),$type)," +
+        "updater(login)";
 
     /// <summary>Maximum upstream error text surfaced in exception detail.</summary>
     internal const int MaxErrorChars = 300;
@@ -75,8 +75,12 @@ public sealed class YouTrackRestClient
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var query = $"project: {QuoteQueryValue(projectKey)} sort by: updated desc";
+        var maxPages = Math.Max(1, options.MaxPagesPerPoll);
         var skip = 0;
-        while (true)
+        // The page count is bounded independently of MaxItemsPerPoll: a
+        // misbehaving upstream returning perpetually full pages of items
+        // that fail to parse must not keep the poll issuing requests.
+        for (var pageIndex = 0; pageIndex < maxPages; pageIndex++)
         {
             var url = $"{Base(options)}/api/issues"
                 + $"?query={Uri.EscapeDataString(query)}"
@@ -166,7 +170,7 @@ public sealed class YouTrackRestClient
             if (root.ValueKind != JsonValueKind.Object)
                 return null;
             return new YouTrackInstanceInfo(
-                Str(root, "version"), Str(root, "build"));
+                YouTrackIssue.Str(root, "version"), YouTrackIssue.Str(root, "build"));
         }
         catch (YouTrackApiException ex) when (ex.IsCapabilityGap
             || ex.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.Unauthorized)
@@ -202,40 +206,39 @@ public sealed class YouTrackRestClient
     {
         var url = $"{Base(options)}/api/users/me?fields=login";
         using var doc = await GetAsync(options, url, ct).ConfigureAwait(false);
-        var login = Str(doc.RootElement, "login");
+        var login = YouTrackIssue.Str(doc.RootElement, "login");
         return string.IsNullOrWhiteSpace(login) ? null : login;
     }
 
     /// <summary>
-    /// The configured API origin. An unset or non-http(s) value is an
-    /// operator misconfiguration and throws before a request is built —
-    /// the bearer credential must never be aimed at a placeholder or
-    /// non-HTTP target.
+    /// The configured API origin. An unset, non-http(s), or plaintext-http
+    /// value is an operator misconfiguration and throws before a request is
+    /// built — the bearer credential must never be aimed at a placeholder,
+    /// a non-HTTP target, or a cleartext channel. <c>http://</c> requires the
+    /// explicit dev-only <see cref="YouTrackWorkSyncOptions.AllowUnsafeHttp"/>
+    /// opt-in.
     /// </summary>
     private static string Base(YouTrackWorkSyncOptions options)
     {
         var raw = options.ApiBaseUrl.TrimEnd('/');
         if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri)
-            || (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+            || (uri.Scheme != Uri.UriSchemeHttps
+                && !(uri.Scheme == Uri.UriSchemeHttp && options.AllowUnsafeHttp)))
             throw new InvalidOperationException(
-                "YouTrack ApiBaseUrl is not configured or is not an absolute http(s) URL; " +
-                "set it in the plugin configuration before enabling work sync.");
+                "YouTrack ApiBaseUrl is not configured or is not an absolute https URL; " +
+                "set it in the plugin configuration before enabling work sync " +
+                "(plaintext http:// would send credentials unencrypted and requires " +
+                "the dev-only AllowUnsafeHttp=true opt-in).");
         return raw;
     }
 
     private static string Esc(string value) => Uri.EscapeDataString(value);
 
-    private static string Str(JsonElement el, string name) =>
-        el.ValueKind == JsonValueKind.Object
-        && el.TryGetProperty(name, out var v)
-        && v.ValueKind == JsonValueKind.String
-            ? v.GetString() ?? string.Empty : string.Empty;
-
     private static string? FirstNonEmpty(JsonElement el, params string[] names)
     {
         foreach (var name in names)
         {
-            var s = Str(el, name);
+            var s = YouTrackIssue.Str(el, name);
             if (!string.IsNullOrWhiteSpace(s))
                 return s;
         }

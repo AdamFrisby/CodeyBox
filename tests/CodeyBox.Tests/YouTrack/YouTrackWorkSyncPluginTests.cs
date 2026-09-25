@@ -72,9 +72,6 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
         ["SignalKind"] = "Assignee",
         ["SignalValue"] = SignalLogin,
         ["ProjectMap:PROJ"] = "test-project",
-        ["StateMapping:Working"] = "In Progress",
-        ["StateMapping:Done"] = "Fixed",
-        ["StateMapping:Failed"] = "Won't fix",
         ["TokenEnvVar"] = "YOUTRACK_TOKEN",
     };
 
@@ -318,12 +315,10 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
     [Fact]
     public async Task UnquotableStatus_IsRefused_NotMangledIntoACommand()
     {
-        // A mapped status containing a '}' would break out of the brace quoting
-        // and inject arbitrary command text — the sink must refuse, not mangle.
-        var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["StateMapping:Working"] = "In Progress} tag injected",
-        });
+        // A declared status containing a '}' would break out of the brace
+        // quoting and inject arbitrary command text — the sink must refuse,
+        // not mangle.
+        var plugin = CreatePlugin();
         UseRest();
         var candidate = Assert.Single(await PollAllAsync(plugin), c => c.ExternalId == "PROJ-1");
         var item = (await _ingestion.IngestAsync(candidate, plugin)).Item!;
@@ -341,6 +336,60 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
         Assert.Equal(TrackerPostOutcome.Failed, result.Outcome);
         Assert.DoesNotContain(_handler.Requests,
             r => r.Request.RequestUri!.AbsolutePath.EndsWith("/commands", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ProgressPost_WithNoDeclaredStatus_IsReportedUnmapped()
+    {
+        // The plugin applies the caller-resolved ExternalStatus verbatim; an
+        // empty one means the host found no declared mapping — reported, never
+        // re-mapped or guessed.
+        var plugin = CreatePlugin();
+        UseRest();
+
+        var result = await plugin.PostProgressAsync(new TrackerProgressUpdate
+        {
+            WorkItemId = WorkItemId.New(),
+            Namespace = "youtrack",
+            ExternalId = "PROJ-1",
+            State = WorkItemState.Working,
+            ExternalStatus = "",
+            Body = "update",
+        });
+
+        Assert.Equal(TrackerPostOutcome.UnmappedState, result.Outcome);
+        Assert.Empty(_handler.Requests);
+    }
+
+    [Fact]
+    public async Task AssigneeSignal_MatchesOnlyTheImmutableLogin_NeverDisplayName()
+    {
+        // A user who can self-assign but cannot assign the service account can
+        // rename their own display name to the signal value — that must not
+        // forge ingestion. The signal matches login only.
+        var plugin = CreatePlugin();
+        var spoofed = Fixture("issues-page.json")
+            .Replace("\"login\": \"codeybox-bot\"", "\"login\": \"mallory\"", StringComparison.Ordinal)
+            .Replace("\"fullName\": \"CodeyBox Bot\"", "\"fullName\": \"codeybox-bot\"", StringComparison.Ordinal);
+        UseRest(issuesJson: spoofed);
+
+        var candidates = await PollAllAsync(plugin);
+        var forged = Assert.Single(candidates, c => c.ExternalId == "PROJ-1");
+
+        Assert.False(forged.HasSignal);
+        Assert.DoesNotContain(forged.PresentSignals,
+            s => s.Kind == WorkSignalKind.Assignee && s.Value == SignalLogin);
+
+        // Same forgery on the webhook path: changedFields carrying a user
+        // object whose fullName equals the signal value but whose login is
+        // someone else.
+        var webhook = Fixture("issue-webhook.json")
+            .Replace("\"login\": \"codeybox-bot\"", "\"login\": \"mallory\"", StringComparison.Ordinal)
+            .Replace("\"fullName\": \"CodeyBox Bot\"", "\"fullName\": \"codeybox-bot\"", StringComparison.Ordinal);
+        var webhookCandidate = plugin.ParseVerifiedWebhookBody(webhook);
+
+        Assert.NotNull(webhookCandidate);
+        Assert.False(webhookCandidate.HasSignal);
     }
 
     [Fact]
@@ -596,6 +645,144 @@ public sealed class YouTrackWorkSyncPluginTests : IDisposable
 
         Assert.Equal("Bearer", credential.Scheme);
         Assert.Equal("perm:test-token", credential.Value);
+    }
+
+    [Fact]
+    public async Task PlaintextHttp_IsRejectedWithoutUnsafeOptIn()
+    {
+        // Bearer tokens and the OAuth client secret must never ride a
+        // cleartext channel: http:// endpoints fail fast unless the dev-only
+        // AllowUnsafeHttp opt-in is set.
+        var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ApiBaseUrl"] = "http://youtrack.example.test",
+        });
+        UseRest();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => plugin.PostProgressAsync(
+            new TrackerProgressUpdate
+            {
+                WorkItemId = WorkItemId.New(),
+                Namespace = "youtrack",
+                ExternalId = "PROJ-1",
+                State = WorkItemState.Working,
+                ExternalStatus = "In Progress",
+                Body = "update",
+            }));
+        Assert.Empty(await PollAllAsync(plugin));
+        Assert.Empty(_handler.Requests);
+
+        // The OAuth token endpoint is guarded independently.
+        _env["YOUTRACK_OAUTH_CLIENT_ID"] = "cid";
+        _env["YOUTRACK_OAUTH_CLIENT_SECRET"] = "csecret";
+        var http = new HttpClient(_handler);
+        using var tokens = new YouTrackTokenProvider(
+            http, name => _env.TryGetValue(name, out var v) ? v : null);
+        var oauthOptions = plugin.CurrentOptions() with
+        {
+            OAuthClientIdEnvVar = "YOUTRACK_OAUTH_CLIENT_ID",
+            OAuthClientSecretEnvVar = "YOUTRACK_OAUTH_CLIENT_SECRET",
+            OAuthTokenUrl = "http://hub.example.test/oauth2/token",
+        };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => tokens.GetCredentialAsync(oauthOptions));
+    }
+
+    [Fact]
+    public async Task PlaintextHttp_WithExplicitOptIn_Polls()
+    {
+        var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ApiBaseUrl"] = "http://youtrack.example.test",
+            ["AllowUnsafeHttp"] = "true",
+        });
+        UseRest();
+
+        var found = await PollAllAsync(plugin);
+
+        Assert.Contains(found, c => c.ExternalId == "PROJ-1");
+        Assert.Contains(_handler.Requests,
+            r => r.Request.RequestUri!.Scheme == Uri.UriSchemeHttp);
+    }
+
+    [Fact]
+    public async Task Poll_PageCap_StopsEndlessUnparseablePages()
+    {
+        // An upstream that keeps returning full pages of items that fail to
+        // parse would otherwise poll forever: MaxItemsPerPoll counts parsed
+        // candidates only, so the page count is bounded separately.
+        var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["PageSize"] = "1",
+            ["MaxPagesPerPoll"] = "2",
+        });
+        UseRest(issuesJson: """[{"$type":"Issue"}]""");
+
+        var found = await PollAllAsync(plugin);
+
+        Assert.Empty(found);
+        Assert.Equal(2, _handler.Requests.Count(
+            r => r.Request.RequestUri!.AbsolutePath.EndsWith("/api/issues", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task OAuthToken_CacheIsKeyedToEndpoint()
+    {
+        var clock = new YouTrackClock(new DateTimeOffset(2026, 9, 20, 17, 0, 0, TimeSpan.Zero));
+        var plugin = CreatePlugin(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["OAuthClientIdEnvVar"] = "YOUTRACK_OAUTH_CLIENT_ID",
+                ["OAuthClientSecretEnvVar"] = "YOUTRACK_OAUTH_CLIENT_SECRET",
+            },
+            clock);
+        _env["YOUTRACK_OAUTH_CLIENT_ID"] = "cid";
+        _env["YOUTRACK_OAUTH_CLIENT_SECRET"] = "csecret";
+        _handler.Responder = (req, _) =>
+            req.RequestUri!.AbsoluteUri.Contains("oauth2/token", StringComparison.Ordinal)
+                ? JsonResponse("""{"access_token":"tok-1","expires_in":3600}""")
+                : JsonResponse("{}");
+
+        var http = new HttpClient(_handler);
+        using var tokens = new YouTrackTokenProvider(
+            http, name => _env.TryGetValue(name, out var v) ? v : null, clock);
+        var options = plugin.CurrentOptions();
+
+        await tokens.GetCredentialAsync(options);
+        await tokens.GetCredentialAsync(options);
+        // A retargeted endpoint must never be sent a token minted for another host.
+        var retargeted = options with { OAuthTokenUrl = "https://other.example.test/oauth2/token" };
+        await tokens.GetCredentialAsync(retargeted);
+
+        Assert.Equal(2, _handler.Requests.Count(
+            r => r.Request.RequestUri!.AbsoluteUri.Contains("oauth2/token", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task ClippedComment_PreservesLoopGuardMarker()
+    {
+        // The caller appends the marker at the end of the body; a naive
+        // head-clip would drop it and the echoed comment would not be
+        // recognised as CodeyBox-authored.
+        var plugin = CreatePlugin();
+        UseRest();
+        var candidate = Assert.Single(await PollAllAsync(plugin), c => c.ExternalId == "PROJ-1");
+        var item = (await _ingestion.IngestAsync(candidate, plugin)).Item!;
+        var marked = WorkSyncLoopGuard.Mark(new string('x', WorkSyncText.MaxCommentChars + 100), item.Id);
+
+        var result = await plugin.PostProgressAsync(new TrackerProgressUpdate
+        {
+            WorkItemId = item.Id,
+            Namespace = "youtrack",
+            ExternalId = "PROJ-1",
+            State = WorkItemState.Working,
+            ExternalStatus = "In Progress",
+            Body = marked,
+        });
+
+        Assert.Equal(TrackerPostOutcome.Posted, result.Outcome);
+        var comment = Assert.Single(_handler.Requests,
+            r => r.Request.RequestUri!.AbsolutePath.EndsWith("/comments", StringComparison.Ordinal));
+        Assert.Contains("codeybox-work-item:", comment.Body, StringComparison.Ordinal);
     }
 
     [SkippableFact]

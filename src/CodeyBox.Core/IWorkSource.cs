@@ -38,10 +38,11 @@ public interface IWorkSource
 
     /// <summary>
     /// Parses an inbound webhook body into a candidate item. The caller MUST
-    /// verify the body's authenticity (HMAC signature over the raw bytes)
-    /// BEFORE invoking this method — mirroring the
-    /// <c>InteractionEndpoints</c> ordering rule — because parsing assigns
-    /// meaning to untrusted bytes. Returns null when the payload carries no
+    /// verify the body's authenticity BEFORE invoking this method — mirroring
+    /// the <c>InteractionEndpoints</c> ordering rule — because parsing assigns
+    /// meaning to untrusted bytes. The mechanism is provider-specific (HMAC
+    /// signature over the raw bytes, or a shared-token comparison). Returns
+    /// null when the payload carries no
     /// candidate work (e.g. an event type this source does not ingest).
     /// Sources without webhook support (<see
     /// cref="WorkSourceCapabilities.SupportsWebhooks"/> false) throw

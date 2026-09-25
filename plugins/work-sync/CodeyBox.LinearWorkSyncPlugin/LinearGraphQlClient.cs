@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Text.Json;
+using CodeyBox.Core;
 
 namespace CodeyBox.LinearWorkSyncPlugin;
 
@@ -283,11 +284,9 @@ public sealed class LinearGraphQlClient
                 && first.TryGetProperty("message", out var msg)
                 && msg.ValueKind == JsonValueKind.String
                 ? msg.GetString() : "unknown GraphQL error";
-            throw new LinearApiException($"Linear API error: {Truncate(message ?? "unknown GraphQL error", 500)}.");
+            throw new LinearApiException($"Linear API error: {WorkSyncText.Truncate(message ?? "unknown GraphQL error", 500)}.");
         }
         return root;
     }
 
-    private static string Truncate(string value, int maxChars) =>
-        value.Length <= maxChars ? value : value[..maxChars];
 }

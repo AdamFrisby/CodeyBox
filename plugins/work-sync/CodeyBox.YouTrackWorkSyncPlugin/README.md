@@ -29,12 +29,15 @@ operator declarations.
    applies the declared state as a command, surfaces open questions as
    comments, reports commit SHAs / PR links, and reports terminal completion
    or failure the same way.
-3. **State mapping** is an explicit operator declaration (`StateMapping`).
-   An unmapped state returns `UnmappedState` and writes nothing — never
-   guessed. A mapped value is expressed as `{field} {value}` with both
-   operands brace-quoted; a value the command language cannot express (or
-   that the instance's state-machine rules reject) is a reported `Failed`
-   outcome, not a silent skip.
+3. **State mapping** is an explicit operator declaration, configured once at
+   the host level (`CodeyBox:WorkSync:StateMapping`) and handed to the plugin
+   already resolved (`ExternalStatus`) — the plugin applies exactly that
+   value and never re-maps through a second, driftable declaration. An
+   unmapped state returns `UnmappedState` and writes nothing — never guessed.
+   A mapped value is expressed as `{field} {value}` with both operands
+   brace-quoted; a value the command language cannot express (or that the
+   instance's state-machine rules reject) is a reported `Failed` outcome, not
+   a silent skip.
 4. **Loop safety** — every outbound body carries
    `<!-- codeybox-work-item:{id} -->` (applied by `WorkTrackerService`); our
    own comments and command-driven updates are recognised by that marker or
@@ -66,7 +69,10 @@ operator declarations.
    Alternatively create a Hub *service* with a client id/secret for the
    OAuth2 client-credentials grant.
 2. Decide the signal: assign issues to the service account (recommended),
-   or apply a tag (e.g. `codeybox`), or move issues to a triage state.
+   or apply a tag (e.g. `codeybox`), or move issues to a triage state. For
+   `SignalKind=Assignee`, `SignalValue` must be the service account's
+   **login** — the immutable identifier. Display names are user-editable and
+   are never matched, so renaming a user cannot forge the signal.
 3. Export the token where the host reads the chain, e.g. `YOUTRACK_TOKEN`.
    For OAuth2 export the client id and secret instead, and set
    `OAuthScope` to the Hub service id of the YouTrack service if the
@@ -88,13 +94,15 @@ operator declarations.
       "Enabled": ["codeybox.youtrack-worksync"],
       "AssemblyPaths": ["/etc/codeybox/plugins/CodeyBox.YouTrackWorkSyncPlugin.dll"]
     },
+    "WorkSync": {
+      "StateMapping": { "Working": "In Progress", "Done": "Fixed", "Failed": "Won't fix" }
+    },
     "Plugins:codeybox.youtrack-worksync": {
       "Enabled": true,
       "ApiBaseUrl": "https://acme.youtrack.cloud",
       "SignalKind": "Assignee",
       "SignalValue": "codeybox-bot",
       "ProjectMap": { "PROJ": "my-app" },
-      "StateMapping": { "Working": "In Progress", "Done": "Fixed", "Failed": "Won't fix" },
       "StateFieldName": "State",
       "AssigneeFieldName": "Assignee",
       "TokenEnvVar": "YOUTRACK_TOKEN",
@@ -109,7 +117,7 @@ All values are hot-reloadable (re-read per poll/post). Full reference: every
 property on `YouTrackWorkSyncOptions` is a config key (`TimeoutSeconds`,
 `PageSize`, `MaxItemsPerPoll`, `MaxIngestedBodyChars`, `MaxResponseBytes`,
 `OAuthTokenUrl`, `OAuthClientIdEnvVar` / `OAuthClientSecretEnvVar`,
-`OAuthScope`). Login-based loop-guard attribution (recognising CodeyBox-authored
+`OAuthScope`, `MaxPagesPerPoll`, `AllowUnsafeHttp`). Login-based loop-guard attribution (recognising CodeyBox-authored
 updates by the acting account) is configured once at the host level via
 `CodeyBox:WorkSync:CodeyBoxServiceLogins` — not per plugin.
 
@@ -135,6 +143,10 @@ and optionally `OAuthScope` (the YouTrack service's Hub id — often
   or status value containing characters the command language cannot express
   is refused, never interpolated raw (an unguarded `}` would break out of
   the quoting into command syntax).
+- `ApiBaseUrl` and `OAuthTokenUrl` must be `https://` — the bearer token and
+  OAuth client secret would otherwise travel in cleartext. Plaintext
+  `http://` is refused unless `AllowUnsafeHttp=true` is set explicitly
+  (dev-only opt-in, e.g. a local test instance).
 - No secrets in logs or error text — only ids, status codes, and env-var names.
 
 ## Question replies

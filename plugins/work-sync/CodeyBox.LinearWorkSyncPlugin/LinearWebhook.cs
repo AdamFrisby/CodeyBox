@@ -19,9 +19,6 @@ public static class LinearWebhook
     /// <summary>Maximum webhook body accepted (64 KB, enforced before buffering).</summary>
     public const int MaxBodyBytes = 64 * 1024;
 
-    /// <summary>Tag embedded in surfaced question comments so replies can be attributed.</summary>
-    public const string QuestionTagPrefix = WorkSyncQuestions.TagPrefix;
-
     /// <summary>
     /// Verifies a Linear webhook signature with a constant-time comparison.
     /// Returns false for missing/empty signatures and malformed hex — never throws.

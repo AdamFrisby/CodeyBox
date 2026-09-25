@@ -42,9 +42,6 @@ public sealed class LinearWorkSyncPlugin
     private readonly object _clientLock = new();
     private bool _disposed;
 
-    /// <summary>Maximum comment body posted upstream (Linear markdown limit guard).</summary>
-    internal const int MaxCommentChars = 32 * 1024;
-
     private readonly Dictionary<string, string> _issueIdCache =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly object _cacheLock = new();
@@ -152,7 +149,7 @@ public sealed class LinearWorkSyncPlugin
                 ExternalId = parsed.Identifier,
                 ProjectId = new ProjectId(parsed.ProjectId ?? FirstConfiguredProject(options)),
                 Title = string.IsNullOrWhiteSpace(parsed.Title) ? parsed.Identifier : parsed.Title,
-                Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+                Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
                 PresentSignals = [],
                 LastActorLogin = parsed.ActorLogin,
                 HasSignal = false,
@@ -168,7 +165,7 @@ public sealed class LinearWorkSyncPlugin
             ExternalId = parsed.Identifier,
             ProjectId = new ProjectId(parsed.ProjectId),
             Title = parsed.Title,
-            Body = Truncate(parsed.Body, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(parsed.Body, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = parsed.ActorLogin,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -183,13 +180,13 @@ public sealed class LinearWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "linear work sync is disabled");
-        var check = CheckTracked(update.Namespace, update.ExternalId);
+        var check = this.CheckTracked(update.Namespace, update.ExternalId);
         if (check is not null)
             return check;
 
-        var mapping = CurrentMapping(options);
+        var mapping = WorkStateMapping.ParseOrEmpty(options.StateMapping, _logger, "Linear");
         if (!mapping.TryMap(update.State, out var status) || string.IsNullOrEmpty(status))
-            return Unmapped(update.State);
+            return TrackerPostResult.UnmappedFor(update.State);
 
         var api = EnsureClients();
         var issueId = await ResolveIssueIdAsync(api, options, update.ExternalId, ct).ConfigureAwait(false);
@@ -204,7 +201,7 @@ public sealed class LinearWorkSyncPlugin
 
         await api.UpdateIssueStateAsync(options, issueId, stateId, ct).ConfigureAwait(false);
         var commentId = await api.CreateCommentAsync(
-            options, issueId, ClipComment(update.Body), ct).ConfigureAwait(false);
+            options, issueId, WorkSyncText.ClipComment(update.Body, update.WorkItemId), ct).ConfigureAwait(false);
         return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
     }
 
@@ -216,7 +213,7 @@ public sealed class LinearWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "linear work sync is disabled");
-        var check = CheckTracked(post.Namespace, post.ExternalId);
+        var check = this.CheckTracked(post.Namespace, post.ExternalId);
         if (check is not null)
             return check;
 
@@ -226,7 +223,7 @@ public sealed class LinearWorkSyncPlugin
             return new TrackerPostResult(TrackerPostOutcome.Failed,
                 Detail: $"Linear issue '{post.ExternalId}' not found");
 
-        var body = ClipComment($"{post.Body}\n\n{LinearWebhook.QuestionTag(post.QuestionId)}");
+        var body = WorkSyncText.ClipComment($"{post.Body}\n\n{LinearWebhook.QuestionTag(post.QuestionId)}", post.WorkItemId);
         var commentId = await api.CreateCommentAsync(options, issueId, body, ct).ConfigureAwait(false);
         return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
     }
@@ -239,7 +236,7 @@ public sealed class LinearWorkSyncPlugin
         var options = CurrentOptions();
         if (!options.Enabled)
             return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "linear work sync is disabled");
-        var check = CheckTracked(report.Namespace, report.ExternalId);
+        var check = this.CheckTracked(report.Namespace, report.ExternalId);
         if (check is not null)
             return check;
 
@@ -270,7 +267,7 @@ public sealed class LinearWorkSyncPlugin
         }
 
         var commentId = await api.CreateCommentAsync(
-            options, issueId, ClipComment(report.Body), ct).ConfigureAwait(false);
+            options, issueId, WorkSyncText.ClipComment(report.Body, report.WorkItemId), ct).ConfigureAwait(false);
         return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: commentId);
     }
 
@@ -359,19 +356,6 @@ public sealed class LinearWorkSyncPlugin
             : LinearWorkSyncOptions.FromConfiguration(section);
     }
 
-    internal WorkStateMapping CurrentMapping(LinearWorkSyncOptions options)
-    {
-        try
-        {
-            return WorkStateMapping.Parse(options.StateMapping);
-        }
-        catch (ArgumentException ex)
-        {
-            _logger.LogError(ex, "Linear state mapping is invalid; reporting every state as unmapped");
-            return WorkStateMapping.Empty;
-        }
-    }
-
     private LinearGraphQlClient EnsureClients()
     {
         if (_api is not null)
@@ -416,7 +400,7 @@ public sealed class LinearWorkSyncPlugin
             ExternalId = issue.Identifier,
             ProjectId = new ProjectId(projectId),
             Title = issue.Title,
-            Body = Truncate(issue.Description, options.MaxIngestedBodyChars),
+            Body = WorkSyncText.Truncate(issue.Description, options.MaxIngestedBodyChars),
             PresentSignals = present,
             LastActorLogin = null,
             HasSignal = options.RequiredSignal.IsPresentIn(present),
@@ -434,23 +418,6 @@ public sealed class LinearWorkSyncPlugin
                 signals.Add(new WorkSignal(kind, datum.Value));
         }
         return signals;
-    }
-
-    private TrackerPostResult? CheckTracked(string @namespace, string externalId)
-    {
-        if (!string.Equals(@namespace, Namespace, StringComparison.OrdinalIgnoreCase))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
-        if (string.IsNullOrWhiteSpace(externalId))
-            return new TrackerPostResult(TrackerPostOutcome.NotTracked,
-                Detail: $"no external id under '{Namespace}'");
-        return null;
-    }
-
-    private static TrackerPostResult Unmapped(WorkItemState state)
-    {
-        var unmapped = new UnmappedWorkItemState(state);
-        return new TrackerPostResult(TrackerPostOutcome.UnmappedState, Detail: unmapped.Describe());
     }
 
     private async Task<string?> ResolveIssueIdAsync(
@@ -488,15 +455,6 @@ public sealed class LinearWorkSyncPlugin
     private static string FirstConfiguredProject(LinearWorkSyncOptions options) =>
         options.TeamProjectMap.Values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "linear";
 
-    private static string Truncate(string value, int maxChars) =>
-        value.Length <= maxChars ? value : value[..maxChars];
-
-    private static string ClipComment(string body)
-    {
-        if (string.IsNullOrEmpty(body))
-            throw new ArgumentException("tracker body must not be empty", nameof(body));
-        return body.Length <= MaxCommentChars ? body : body[..MaxCommentChars];
-    }
 
     private static string NormalizeUrl(string url) => url.Trim().TrimEnd('/');
 

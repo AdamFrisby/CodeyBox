@@ -76,7 +76,20 @@ public sealed record TrackerPostResult(
     /// <summary>Upstream comment/status id when posted; null otherwise.</summary>
     string? RemoteId = null,
     /// <summary>Human-readable detail for failures and skips.</summary>
-    string? Detail = null);
+    string? Detail = null)
+{
+    /// <summary>
+    /// The shared "declared, never guessed" answer for a state with no
+    /// operator-declared external mapping: <see
+    /// cref="TrackerPostOutcome.UnmappedState"/> with the sentinel's
+    /// description.
+    /// </summary>
+    public static TrackerPostResult UnmappedFor(WorkItemState state)
+    {
+        var unmapped = new UnmappedWorkItemState(state);
+        return new TrackerPostResult(TrackerPostOutcome.UnmappedState, Detail: unmapped.Describe());
+    }
+}
 
 /// <summary>Progress update for a meaningful work-item state transition.</summary>
 public sealed record TrackerProgressUpdate

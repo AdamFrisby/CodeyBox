@@ -17,9 +17,6 @@ namespace CodeyBox.YouTrackWorkSyncPlugin;
 /// </summary>
 public sealed record YouTrackIssue
 {
-    /// <summary>Database entity id (e.g. <c>2-123</c>).</summary>
-    public required string Id { get; init; }
-
     /// <summary>Human-readable issue id (e.g. <c>PROJ-123</c>). The ingestion key.</summary>
     public required string IdReadable { get; init; }
 
@@ -33,7 +30,11 @@ public sealed record YouTrackIssue
     /// <summary>Tag names applied to the issue (the label signal).</summary>
     public IReadOnlyList<string> TagNames { get; init; } = [];
 
-    /// <summary>Logins/full names of users in the configured assignee field.</summary>
+    /// <summary>
+    /// Logins of users in the configured assignee field. Only the immutable
+    /// <c>login</c> counts — <c>fullName</c>/<c>name</c> are user-editable
+    /// display text and are never matched against the signal.
+    /// </summary>
     public IReadOnlyList<string> AssigneeLogins { get; init; } = [];
 
     /// <summary>Current value name of the configured state field.</summary>
@@ -65,7 +66,6 @@ public sealed record YouTrackIssue
 
         return new YouTrackIssue
         {
-            Id = Str(node, "id"),
             IdReadable = idReadable,
             Title = Str(node, "summary"),
             Description = Str(node, "description"),
@@ -77,7 +77,7 @@ public sealed record YouTrackIssue
         };
     }
 
-    private static string ProjectKeyOf(JsonElement node)
+    internal static string ProjectKeyOf(JsonElement node)
     {
         var project = Get(node, "project");
         return project.ValueKind == JsonValueKind.Object ? Str(project, "shortName") : string.Empty;
@@ -116,17 +116,18 @@ public sealed record YouTrackIssue
         return null;
     }
 
+    /// <summary>
+    /// The user's immutable <c>login</c>, or null when absent. Display fields
+    /// (<c>fullName</c>, <c>name</c>) are user-editable and are never used as
+    /// an identity — a spoofed display name must not pass loop-guard actor
+    /// attribution or the assignee signal.
+    /// </summary>
     internal static string? UserLogin(JsonElement user)
     {
         if (user.ValueKind != JsonValueKind.Object)
             return null;
-        foreach (var key in new[] { "login", "fullName", "name" })
-        {
-            var value = Str(user, key);
-            if (!string.IsNullOrWhiteSpace(value))
-                return value;
-        }
-        return null;
+        var login = Str(user, "login");
+        return string.IsNullOrWhiteSpace(login) ? null : login;
     }
 
     internal static JsonElement Get(JsonElement el, string name) =>
@@ -138,22 +139,27 @@ public sealed record YouTrackIssue
         && v.ValueKind == JsonValueKind.String
             ? v.GetString() ?? string.Empty : string.Empty;
 
-    private static string Str(JsonElement el) =>
+    internal static string Str(JsonElement el) =>
         el.ValueKind == JsonValueKind.String ? el.GetString() ?? string.Empty : string.Empty;
 }
 
 /// <summary>
 /// Shared extraction of ingestion-signal values from YouTrack's tag list and
 /// custom-field values. A field value may be a scalar, a bundle element
-/// (<c>{"name": …}</c>), a user (<c>{"login": …, "fullName": …}</c>), or an
+/// (<c>{"name": …}</c>), a user (<c>{"login": …}</c>), or an
 /// array of any of those (multi-value fields) — all shapes are read.
+/// <para>Only immutable identifiers are ever emitted: a tag/bundle element's
+/// <c>name</c> or a user's <c>login</c>. User-editable display text
+/// (<c>fullName</c>, bare strings standing in for a user) is never matched
+/// against the operator's signal — a user who can edit their own display
+/// name must not be able to forge the signal.</para>
 /// </summary>
 public static class YouTrackSignals
 {
     /// <summary>
     /// All string values a custom-field value element carries: scalar text,
-    /// bundle-element names, or user identifiers (login plus full name, so
-    /// operators may declare either). Arrays yield every element's values.
+    /// bundle-element names, or the immutable user <c>login</c>. Arrays yield
+    /// every element's values.
     /// </summary>
     public static IReadOnlyList<string> Values(JsonElement? value)
     {
@@ -164,7 +170,12 @@ public static class YouTrackSignals
         return found;
     }
 
-    /// <summary>User-identifying values (login, full name) only — for the assignee signal.</summary>
+    /// <summary>
+    /// Immutable user <c>login</c>s only — for the assignee signal. User
+    /// objects without a <c>login</c> and bare display strings yield nothing:
+    /// display names are free-text and user-editable, so matching them would
+    /// let any assignable user forge the signal.
+    /// </summary>
     public static IReadOnlyList<string> UserValues(JsonElement? value)
     {
         var found = new List<string>();
@@ -187,7 +198,7 @@ public static class YouTrackSignals
                     Collect(item, found);
                 return;
             case JsonValueKind.Object:
-                foreach (var key in new[] { "name", "login", "fullName" })
+                foreach (var key in new[] { "name", "login" })
                 {
                     var s = YouTrackIssue.Str(el, key);
                     if (!string.IsNullOrWhiteSpace(s))
@@ -215,29 +226,13 @@ public static class YouTrackSignals
                 CollectUsers(item, found);
             return;
         }
-        // A bare string in an assignee-field context is a user reference
-        // (login or display name) — the webhook app may send it either way.
-        if (el.ValueKind == JsonValueKind.String)
-        {
-            var text = el.GetString();
-            if (!string.IsNullOrWhiteSpace(text))
-                found.Add(text);
-            return;
-        }
         if (el.ValueKind != JsonValueKind.Object)
             return;
-        // Only treat objects that look like users ($type or login present) as
-        // users; a bundle element with just a name is not an assignee.
-        var looksLikeUser = el.TryGetProperty("$type", out var t)
-            && t.ValueKind == JsonValueKind.String
-            && t.GetString()?.Contains("User", StringComparison.Ordinal) == true;
+        // Only the immutable login identifies a user. A bare string or a
+        // display name in an assignee-field context is ambiguous free text —
+        // never matched.
         var login = YouTrackIssue.Str(el, "login");
-        if (!looksLikeUser && string.IsNullOrWhiteSpace(login))
-            return;
         if (!string.IsNullOrWhiteSpace(login))
             found.Add(login);
-        var fullName = YouTrackIssue.Str(el, "fullName");
-        if (!string.IsNullOrWhiteSpace(fullName))
-            found.Add(fullName);
     }
 }

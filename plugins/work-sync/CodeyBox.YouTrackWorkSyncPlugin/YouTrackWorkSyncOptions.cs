@@ -1,4 +1,3 @@
-using System.Globalization;
 using CodeyBox.Core;
 using Microsoft.Extensions.Configuration;
 
@@ -32,13 +31,23 @@ public sealed record YouTrackWorkSyncOptions
 
     /// <summary>
     /// YouTrack base URL (scheme + host, e.g. <c>https://acme.youtrack.cloud</c>
-    /// or a self-hosted origin). Must be http(s). The REST API is reached at
-    /// <c>{ApiBaseUrl}/api</c>. Required when <see cref="Enabled"/> is set —
-    /// there is deliberately no placeholder default, so enabling the plugin
-    /// without an URL fails loudly instead of sending the bearer credential
-    /// to an operator-unintended host.
+    /// or a self-hosted origin). Must be https — the bearer token and OAuth
+    /// client secret ride on these requests, so <c>http://</c> is rejected
+    /// unless <see cref="AllowUnsafeHttp"/> is explicitly set. The REST API is
+    /// reached at <c>{ApiBaseUrl}/api</c>. Required when <see cref="Enabled"/>
+    /// is set — there is deliberately no placeholder default, so enabling the
+    /// plugin without an URL fails loudly instead of sending the bearer
+    /// credential to an operator-unintended host.
     /// </summary>
     public string ApiBaseUrl { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Dev-only opt-in allowing plaintext <c>http://</c> endpoints (<see
+    /// cref="ApiBaseUrl"/>, <see cref="OAuthTokenUrl"/>). Off by default:
+    /// without it a cleartext URL fails fast because it would send the
+    /// permanent token and OAuth client secret unencrypted.
+    /// </summary>
+    public bool AllowUnsafeHttp { get; init; }
 
     /// <summary>Per-request timeout, in seconds (1–300, default 30). Applied per request, so edits hot-reload.</summary>
     public int TimeoutSeconds { get; init; } = 30;
@@ -56,8 +65,9 @@ public sealed record YouTrackWorkSyncOptions
     /// <summary>
     /// Exact value that must be present for ingestion (ordinal-ignore-case exact
     /// match, never substring). For <c>Assignee</c> this is the service-account
-    /// login or full name; for <c>Label</c> the tag name; for <c>Status</c> the
-    /// state value (e.g. <c>To Review</c>).
+    /// <c>login</c> — the only immutable user identifier; display names are
+    /// user-editable and never matched. For <c>Label</c> the tag name; for
+    /// <c>Status</c> the state value (e.g. <c>To Review</c>).
     /// </summary>
     public string SignalValue { get; init; } = string.Empty;
 
@@ -68,19 +78,6 @@ public sealed record YouTrackWorkSyncOptions
     /// </summary>
     public IReadOnlyDictionary<string, string> ProjectMap { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Explicit CodeyBox-state-name to YouTrack state-value declaration (e.g.
-    /// <c>{ "Working": "In Progress", "Done": "Fixed" }</c>), parsed by
-    /// <see cref="WorkStateMapping.Parse"/>. A state with no entry is reported
-    /// as unmapped, never guessed. The value is applied through YouTrack's
-    /// command interface (<c>{State} {value}</c> against <see
-    /// cref="StateFieldName"/>), so the value must name a real bundle element
-    /// reachable by the project's state-machine rules — a rejected command is
-    /// a reported <c>Failed</c> outcome, not a silent skip.
-    /// </summary>
-    public IReadOnlyDictionary<string, string> StateMapping { get; init; } =
-        new Dictionary<string, string>(StringComparer.Ordinal);
 
     /// <summary>
     /// Name of the YouTrack custom field carrying the state (default
@@ -109,7 +106,8 @@ public sealed record YouTrackWorkSyncOptions
     /// Hub OAuth token endpoint for the client-credentials flow. Empty derives
     /// <c>{ApiBaseUrl}/hub/api/rest/oauth2/token</c>, which covers both
     /// self-hosted and cloud instances (YouTrack Cloud embeds Hub). Only used
-    /// when the OAuth env vars are set. Must be http(s).
+    /// when the OAuth env vars are set. Must be https — the client secret is
+    /// posted to it — unless <see cref="AllowUnsafeHttp"/> is explicitly set.
     /// </summary>
     public string OAuthTokenUrl { get; init; } = string.Empty;
 
@@ -147,6 +145,14 @@ public sealed record YouTrackWorkSyncOptions
 
     /// <summary>REST page size per request ($top, 1–500, default 50).</summary>
     public int PageSize { get; init; } = 50;
+
+    /// <summary>
+    /// Maximum pages fetched per project per poll (1–1000, default 100).
+    /// Bounds the request stream even when upstream keeps returning full
+    /// pages of items that fail to parse — <see cref="MaxItemsPerPoll"/> alone
+    /// counts only successfully parsed candidates.
+    /// </summary>
+    public int MaxPagesPerPoll { get; init; } = 100;
 
     /// <summary>Upper bound on ingested title/body length (chars) before use.</summary>
     public int MaxIngestedBodyChars { get; init; } = 64 * 1024;
@@ -189,58 +195,27 @@ public sealed record YouTrackWorkSyncOptions
 
         return new YouTrackWorkSyncOptions
         {
-            Enabled = ReadBool(section, "Enabled", defaults.Enabled),
-            ApiBaseUrl = ReadNonEmpty(section, "ApiBaseUrl", defaults.ApiBaseUrl).TrimEnd('/'),
-            TimeoutSeconds = Math.Clamp(ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds), 1, 300),
+            Enabled = PluginConfigReaders.ReadBool(section, "Enabled", defaults.Enabled),
+            ApiBaseUrl = PluginConfigReaders.ReadNonEmpty(section, "ApiBaseUrl", defaults.ApiBaseUrl).TrimEnd('/'),
+            AllowUnsafeHttp = PluginConfigReaders.ReadBool(section, "AllowUnsafeHttp", defaults.AllowUnsafeHttp),
+            TimeoutSeconds = Math.Clamp(PluginConfigReaders.ReadInt(section, "TimeoutSeconds", defaults.TimeoutSeconds), 1, 300),
             SignalKind = signalKind,
             SignalValue = (section["SignalValue"] ?? defaults.SignalValue).Trim(),
-            ProjectMap = ReadMap(section.GetSection("ProjectMap")),
-            StateMapping = ReadMap(section.GetSection("StateMapping"), StringComparer.Ordinal),
-            StateFieldName = ReadNonEmpty(section, "StateFieldName", defaults.StateFieldName),
-            AssigneeFieldName = ReadNonEmpty(section, "AssigneeFieldName", defaults.AssigneeFieldName),
-            TokenEnvVar = ReadNonEmpty(section, "TokenEnvVar", defaults.TokenEnvVar),
+            ProjectMap = PluginConfigReaders.ReadMap(section.GetSection("ProjectMap")),
+            StateFieldName = PluginConfigReaders.ReadNonEmpty(section, "StateFieldName", defaults.StateFieldName),
+            AssigneeFieldName = PluginConfigReaders.ReadNonEmpty(section, "AssigneeFieldName", defaults.AssigneeFieldName),
+            TokenEnvVar = PluginConfigReaders.ReadNonEmpty(section, "TokenEnvVar", defaults.TokenEnvVar),
             OAuthTokenUrl = (section["OAuthTokenUrl"] ?? defaults.OAuthTokenUrl).Trim(),
             OAuthClientIdEnvVar = (section["OAuthClientIdEnvVar"] ?? string.Empty).Trim(),
             OAuthClientSecretEnvVar = (section["OAuthClientSecretEnvVar"] ?? string.Empty).Trim(),
             OAuthScope = (section["OAuthScope"] ?? string.Empty).Trim(),
-            WebhookTokenHeader = ReadNonEmpty(section, "WebhookTokenHeader", defaults.WebhookTokenHeader),
-            WebhookSecretEnvVar = ReadNonEmpty(section, "WebhookSecretEnvVar", defaults.WebhookSecretEnvVar),
-            MaxResponseBytes = Math.Clamp(ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes), 1024 * 1024, 256 * 1024 * 1024),
-            MaxItemsPerPoll = Math.Clamp(ReadInt(section, "MaxItemsPerPoll", defaults.MaxItemsPerPoll), 1, 1000),
-            PageSize = Math.Clamp(ReadInt(section, "PageSize", defaults.PageSize), 1, 500),
-            MaxIngestedBodyChars = Math.Clamp(ReadInt(section, "MaxIngestedBodyChars", defaults.MaxIngestedBodyChars), 1024, 256 * 1024),
+            WebhookTokenHeader = PluginConfigReaders.ReadNonEmpty(section, "WebhookTokenHeader", defaults.WebhookTokenHeader),
+            WebhookSecretEnvVar = PluginConfigReaders.ReadNonEmpty(section, "WebhookSecretEnvVar", defaults.WebhookSecretEnvVar),
+            MaxResponseBytes = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes), 1024 * 1024, 256 * 1024 * 1024),
+            MaxItemsPerPoll = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxItemsPerPoll", defaults.MaxItemsPerPoll), 1, 1000),
+            PageSize = Math.Clamp(PluginConfigReaders.ReadInt(section, "PageSize", defaults.PageSize), 1, 500),
+            MaxPagesPerPoll = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxPagesPerPoll", defaults.MaxPagesPerPoll), 1, 1000),
+            MaxIngestedBodyChars = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxIngestedBodyChars", defaults.MaxIngestedBodyChars), 1024, 256 * 1024),
         };
-    }
-
-    private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw) || !bool.TryParse(raw.Trim(), out var parsed) ? fallback : parsed;
-    }
-
-    private static int ReadInt(IConfigurationSection section, string key, int fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw)
-            || !int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
-            ? fallback : parsed;
-    }
-
-    private static string ReadNonEmpty(IConfigurationSection section, string key, string fallback)
-    {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw) ? fallback : raw.Trim();
-    }
-
-    private static IReadOnlyDictionary<string, string> ReadMap(
-        IConfigurationSection section, IEqualityComparer<string>? comparer = null)
-    {
-        var map = new Dictionary<string, string>(comparer ?? StringComparer.OrdinalIgnoreCase);
-        foreach (var child in section.GetChildren())
-        {
-            if (!string.IsNullOrWhiteSpace(child.Key) && child.Value is not null)
-                map[child.Key.Trim()] = child.Value.Trim();
-        }
-        return map;
     }
 }

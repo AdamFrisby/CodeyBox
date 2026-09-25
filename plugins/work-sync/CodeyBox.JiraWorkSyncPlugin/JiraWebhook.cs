@@ -22,9 +22,6 @@ public static class JiraWebhook
     /// <summary>Query parameter carrying the shared-secret delivery token.</summary>
     public const string TokenQueryParameter = "token";
 
-    /// <summary>Tag embedded in surfaced question comments so replies can be attributed.</summary>
-    public const string QuestionTagPrefix = WorkSyncQuestions.TagPrefix;
-
     /// <summary>
     /// Verifies a Jira webhook delivery by comparing the token presented in
     /// the request query string against the configured secret with a

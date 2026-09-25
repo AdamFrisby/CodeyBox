@@ -39,6 +39,7 @@ public sealed class YouTrackTokenProvider : IDisposable
     private readonly TimeProvider _clock;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
     private string? _cachedAccessToken;
+    private string? _cacheKey;
     private DateTimeOffset _refreshAt = DateTimeOffset.MinValue;
     private bool _disposed;
 
@@ -95,29 +96,40 @@ public sealed class YouTrackTokenProvider : IDisposable
 
     private async Task<string> GetOAuthTokenAsync(YouTrackWorkSyncOptions options, CancellationToken ct)
     {
+        var clientId = Read(options.OAuthClientIdEnvVar);
+        var clientSecret = Read(options.OAuthClientSecretEnvVar);
+        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+            throw new InvalidOperationException(
+                "YouTrack OAuth is partially configured: client id and secret env vars must both be set.");
+
+        var tokenUrl = options.ResolvedOAuthTokenUrl;
+        if (!Uri.TryCreate(tokenUrl, UriKind.Absolute, out var parsed)
+            || (parsed.Scheme != Uri.UriSchemeHttps
+                && !(parsed.Scheme == Uri.UriSchemeHttp && options.AllowUnsafeHttp)))
+            throw new InvalidOperationException(
+                "YouTrack OAuth token endpoint is not an absolute https URL; " +
+                "set OAuthTokenUrl or ApiBaseUrl in the plugin configuration " +
+                "(plaintext http:// would post the client secret unencrypted and " +
+                "requires the dev-only AllowUnsafeHttp=true opt-in).");
+
+        // The cache is keyed to the endpoint and client the token was minted
+        // for: a hot-reload retargeting the integration must never replay a
+        // token minted for a different host or credential.
+        var cacheKey = parsed.AbsoluteUri + "\n" + clientId;
         var now = _clock.GetUtcNow();
-        if (_cachedAccessToken is not null && now < _refreshAt)
+        if (_cachedAccessToken is not null
+            && string.Equals(_cacheKey, cacheKey, StringComparison.Ordinal)
+            && now < _refreshAt)
             return _cachedAccessToken;
 
         await _refreshLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             now = _clock.GetUtcNow();
-            if (_cachedAccessToken is not null && now < _refreshAt)
+            if (_cachedAccessToken is not null
+                && string.Equals(_cacheKey, cacheKey, StringComparison.Ordinal)
+                && now < _refreshAt)
                 return _cachedAccessToken;
-
-            var clientId = Read(options.OAuthClientIdEnvVar);
-            var clientSecret = Read(options.OAuthClientSecretEnvVar);
-            if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
-                throw new InvalidOperationException(
-                    "YouTrack OAuth is partially configured: client id and secret env vars must both be set.");
-
-            var tokenUrl = options.ResolvedOAuthTokenUrl;
-            if (!Uri.TryCreate(tokenUrl, UriKind.Absolute, out var parsed)
-                || (parsed.Scheme != Uri.UriSchemeHttps && parsed.Scheme != Uri.UriSchemeHttp))
-                throw new InvalidOperationException(
-                    "YouTrack OAuth token endpoint is not an absolute http(s) URL; " +
-                    "set OAuthTokenUrl or ApiBaseUrl in the plugin configuration.");
 
             var form = new Dictionary<string, string>
             {
@@ -145,6 +157,7 @@ public sealed class YouTrackTokenProvider : IDisposable
                 throw new InvalidOperationException("YouTrack OAuth refresh returned an unusable expiry.");
 
             _cachedAccessToken = payload.AccessToken;
+            _cacheKey = cacheKey;
             _refreshAt = now.AddSeconds(payload.ExpiresInSeconds - RefreshSkewSeconds);
             return payload.AccessToken;
         }

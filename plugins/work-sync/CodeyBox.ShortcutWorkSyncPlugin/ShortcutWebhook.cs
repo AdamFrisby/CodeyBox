@@ -23,9 +23,6 @@ public static class ShortcutWebhook
     /// <summary>Maximum webhook body accepted (64 KB, enforced before buffering).</summary>
     public const int MaxBodyBytes = 64 * 1024;
 
-    /// <summary>Tag embedded in surfaced question comments so replies can be attributed.</summary>
-    public const string QuestionTagPrefix = WorkSyncQuestions.TagPrefix;
-
     /// <summary>
     /// Verifies a webhook signature with a constant-time comparison: hex
     /// HMAC-SHA256 over the raw body keyed by the shared secret. Returns false

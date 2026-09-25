@@ -23,9 +23,6 @@ public static class YouTrackWebhook
     /// <summary>Maximum webhook body accepted (64 KB, enforced before buffering).</summary>
     public const int MaxBodyBytes = 64 * 1024;
 
-    /// <summary>Tag embedded in surfaced question comments so replies can be attributed.</summary>
-    public const string QuestionTagPrefix = WorkSyncQuestions.TagPrefix;
-
     /// <summary>changedFields names treated as the tag list (label signal).</summary>
     private static readonly HashSet<string> TagFieldNames =
         new(StringComparer.OrdinalIgnoreCase) { "tag", "tags" };
@@ -78,7 +75,7 @@ public static class YouTrackWebhook
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
                 return null;
-            var evt = Str(root, "event");
+            var evt = YouTrackIssue.Str(root, "event");
             if (string.IsNullOrWhiteSpace(evt))
                 return null;
 
@@ -87,12 +84,11 @@ public static class YouTrackWebhook
                 return new YouTrackWebhookEvent(
                     Kind: YouTrackWebhookEventKind.SignalRemovedHint,
                     IssueId: IssueIdReadable(root),
-                    ProjectKey: ProjectKeyOf(root),
-                    Title: Str(root, "summary"),
+                    ProjectKey: YouTrackIssue.ProjectKeyOf(root),
+                    Title: YouTrackIssue.Str(root, "summary"),
                     Body: string.Empty,
                     PresentSignals: [],
-                    ActorLogin: UserLoginOf(root, "updatedBy"),
-                    CommentId: null);
+                    ActorLogin: UserLoginOf(root, "updatedBy"));
             }
 
             if (evt.StartsWith("comment", StringComparison.OrdinalIgnoreCase))
@@ -131,7 +127,7 @@ public static class YouTrackWebhook
         var issueId = IssueIdReadable(root);
         if (string.IsNullOrWhiteSpace(issueId))
             return null;
-        var projectKey = ProjectKeyOf(root);
+        var projectKey = YouTrackIssue.ProjectKeyOf(root);
         if (string.IsNullOrWhiteSpace(projectKey))
             return null;
 
@@ -141,7 +137,7 @@ public static class YouTrackWebhook
         {
             foreach (var t in tags.EnumerateArray())
             {
-                var name = t.ValueKind == JsonValueKind.Object ? Str(t, "name") : StringOf(t);
+                var name = t.ValueKind == JsonValueKind.Object ? YouTrackIssue.Str(t, "name") : YouTrackIssue.Str(t);
                 if (!string.IsNullOrWhiteSpace(name))
                     signals.Add(new YouTrackSignalDatum(WorkSignalKind.Label, name));
             }
@@ -163,7 +159,7 @@ public static class YouTrackWebhook
             {
                 if (entry.ValueKind != JsonValueKind.Object)
                     continue;
-                var name = Str(entry, "name");
+                var name = YouTrackIssue.Str(entry, "name");
                 if (!entry.TryGetProperty("value", out var value))
                     continue;
                 if (string.Equals(name, options.StateFieldName, StringComparison.OrdinalIgnoreCase))
@@ -188,11 +184,10 @@ public static class YouTrackWebhook
             Kind: YouTrackWebhookEventKind.Issue,
             IssueId: issueId,
             ProjectKey: projectKey,
-            Title: Str(root, "summary"),
-            Body: Str(root, "description"),
+            Title: YouTrackIssue.Str(root, "summary"),
+            Body: YouTrackIssue.Str(root, "description"),
             PresentSignals: signals,
-            ActorLogin: UserLoginOf(root, "updatedBy") ?? UserLoginOf(root, "reporter"),
-            CommentId: null);
+            ActorLogin: UserLoginOf(root, "updatedBy") ?? UserLoginOf(root, "reporter"));
     }
 
     private static YouTrackWebhookEvent? CommentEvent(JsonElement root)
@@ -204,17 +199,16 @@ public static class YouTrackWebhook
             || comments.ValueKind != JsonValueKind.Array)
             return null;
 
-        string? text = null, commentId = null;
+        string? text = null;
         string? author = null;
         foreach (var c in comments.EnumerateArray())
         {
             if (c.ValueKind != JsonValueKind.Object)
                 continue;
-            var t = Str(c, "text");
+            var t = YouTrackIssue.Str(c, "text");
             if (string.IsNullOrWhiteSpace(t))
                 continue;
             text = t;
-            commentId = Str(c, "id");
             if (c.TryGetProperty("author", out var a))
                 author = YouTrackIssue.UserLogin(a);
         }
@@ -226,12 +220,11 @@ public static class YouTrackWebhook
         return new YouTrackWebhookEvent(
             Kind: YouTrackWebhookEventKind.Comment,
             IssueId: issueId,
-            ProjectKey: ProjectKeyOf(root),
+            ProjectKey: YouTrackIssue.ProjectKeyOf(root),
             Title: string.Empty,
             Body: text,
             PresentSignals: [],
-            ActorLogin: author,
-            CommentId: commentId);
+            ActorLogin: author);
     }
 
     /// <summary>
@@ -242,10 +235,10 @@ public static class YouTrackWebhook
     /// </summary>
     private static string IssueIdReadable(JsonElement root)
     {
-        var readable = Str(root, "idReadable");
+        var readable = YouTrackIssue.Str(root, "idReadable");
         if (!string.IsNullOrWhiteSpace(readable))
             return readable;
-        var project = ProjectKeyOf(root);
+        var project = YouTrackIssue.ProjectKeyOf(root);
         if (string.IsNullOrWhiteSpace(project))
             return string.Empty;
         if (root.TryGetProperty("numberInProject", out var n))
@@ -259,22 +252,9 @@ public static class YouTrackWebhook
         return string.Empty;
     }
 
-    private static string ProjectKeyOf(JsonElement root) =>
-        root.TryGetProperty("project", out var project) && project.ValueKind == JsonValueKind.Object
-            ? Str(project, "shortName") : string.Empty;
-
     private static string? UserLoginOf(JsonElement root, string name) =>
         root.TryGetProperty(name, out var user) && user.ValueKind == JsonValueKind.Object
             ? YouTrackIssue.UserLogin(user) : null;
-
-    private static string Str(JsonElement el, string name) =>
-        el.ValueKind == JsonValueKind.Object
-        && el.TryGetProperty(name, out var v)
-        && v.ValueKind == JsonValueKind.String
-            ? v.GetString() ?? string.Empty : string.Empty;
-
-    private static string StringOf(JsonElement el) =>
-        el.ValueKind == JsonValueKind.String ? el.GetString() ?? string.Empty : string.Empty;
 }
 
 /// <summary>Kinds of YouTrack webhook deliveries the plugin acts on.</summary>
@@ -304,5 +284,4 @@ public sealed record YouTrackWebhookEvent(
     string Title,
     string Body,
     IReadOnlyList<YouTrackSignalDatum> PresentSignals,
-    string? ActorLogin,
-    string? CommentId);
+    string? ActorLogin);
