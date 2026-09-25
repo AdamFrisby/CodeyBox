@@ -272,7 +272,7 @@ public sealed partial class PipelineRunner
     {
         using var planningScope = BeginPhaseScope(current, "planning");
         string planArtifact;
-        IPlanArtifactExtractor? producingExtractor = null;
+        IAgentVisibleTextExtractor? producingExtractor = null;
         using (var planningPhase = new PhaseCancellation("planning", ct, _opts.TimeProvider))
         {
             var (planningTimeout, _) = ResolveEffectiveWorkTimeout(current, project);
@@ -295,7 +295,7 @@ public sealed partial class PipelineRunner
                             ct,
                             phaseCt =>
                             {
-                                producingExtractor = runner as IPlanArtifactExtractor;
+                                producingExtractor = runner as IAgentVisibleTextExtractor;
                                 return RunPlanningAgentTurnAsync(
                                     trialItem,
                                     runner,
@@ -393,7 +393,7 @@ public sealed partial class PipelineRunner
     private async Task<WorkItem?> PersistPlanArtifactAsync(
         WorkItemId itemId,
         int promptRevisionAtPlanningDispatch,
-        IPlanArtifactExtractor? producingExtractor,
+        IAgentVisibleTextExtractor? producingExtractor,
         string artifact,
         CancellationToken ct)
     {
@@ -1013,7 +1013,7 @@ public sealed partial class PipelineRunner
                 log: _log,
                 activitySource: CodeyBoxActivities.Pipeline))
             {
-                var canCaptureStructuredStream = runner is IPlanArtifactExtractor
+                var canCaptureStructuredStream = runner is IAgentVisibleTextExtractor
                     && await CanCaptureStructuredStreamAsync(runner, sandbox, "planning", ct);
                 streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
                     ? await BeginAgentStreamCaptureAsync(item.Id, "planning", 1, ct)
@@ -1279,15 +1279,15 @@ public sealed partial class PipelineRunner
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
     };
 
-    private string NormalizePlanArtifact(IPlanArtifactExtractor? producingExtractor, string artifact)
+    private string NormalizePlanArtifact(IAgentVisibleTextExtractor? producingExtractor, string artifact)
     {
         // Runners whose planning-phase stdout is wrapped in a provider-specific
         // envelope (e.g. Claude's stream-json NDJSON) implement
-        // IPlanArtifactExtractor to surface the agent-visible plan text. Runners
+        // IAgentVisibleTextExtractor to surface the agent-visible plan text. Runners
         // that emit plain stdout (no extractor) feed PlanArtifactDocument
         // directly. Keeping the unwrap behind a runner-side hook matches the
         // orchestrator's agent-agnostic contract — no AgentKind switch here.
-        var extracted = producingExtractor?.ExtractPlanArtifactText(artifact);
+        var extracted = producingExtractor?.ExtractAgentVisibleText(artifact);
         if (extracted is null)
         {
             // Either the producing runner has no envelope (every non-Claude

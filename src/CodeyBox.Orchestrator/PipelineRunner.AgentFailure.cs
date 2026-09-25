@@ -480,8 +480,9 @@ public sealed partial class PipelineRunner
     /// agent's committed remediation is visible). Mirrors
     /// <see cref="RunCheckAndActAgentAsync"/> — single invocation, no commit,
     /// no merge, no push — but evaluates the modified repo instead of the
-    /// pristine base. Returns the aggregated stdout (streamed chunks +
-    /// terminal payload) so the verdict parser sees the full tail.
+    /// pristine base. Returns the agent-visible text (streamed chunks +
+    /// terminal payload, projected through <see cref="AgentVisibleStdout"/>
+    /// for envelope-framed runners) so the verdict parser sees the full tail.
     /// </summary>
     private async Task<string> RunPostActReCheckAgentAsync(
         WorkItem item, Project project, IAgentRunner agentRunner,
@@ -591,7 +592,7 @@ public sealed partial class PipelineRunner
             throw new InvalidOperationException(detail);
         }
 
-        return aggregatedStdout;
+        return AgentVisibleStdout(agentRunner, aggregatedStdout);
     }
 
     /// <summary>

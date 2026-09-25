@@ -55,11 +55,11 @@ namespace CodeyBox.Agents.Devin;
 /// drift off the configured model.</para>
 ///
 /// <para><b>Prompt delivery.</b> The prompt travels on stdin after the
-/// base64 shim block and is piped into a <c>mktemp</c> file the shim reads;
-/// it never enters argv or the environment (<c>MAX_ARG_STRLEN</c> is 128 KiB
-/// per element and rework prompts exceed it — same constraint as
-/// opencode/aider, and the reason positional <c>-- &lt;prompt&gt;</c> argv
-/// is not used).</para>
+/// base64 shim block and reaches the shim through the still-open descriptor
+/// 0 (<c>--prompt-file -</c>); it never enters argv, the environment, or a
+/// re-openable path (<c>MAX_ARG_STRLEN</c> is 128 KiB per element and
+/// rework prompts exceed it — same constraint as opencode/aider, and the
+/// reason positional <c>-- &lt;prompt&gt;</c> argv is not used).</para>
 ///
 /// <para><b>Auth.</b> The CLI reads <c>~/.local/share/devin/credentials.toml</c>
 /// (XDG data dir) written by <c>devin auth login</c>/<c>auth import</c>; there
@@ -80,19 +80,24 @@ namespace CodeyBox.Agents.Devin;
 /// parks quota/auth failures instead of dead-lettering them.</para>
 ///
 /// <para><b>Envelope provenance.</b> <c>devin.acp</c> lines are claimed by
-/// type tag, so nothing agent-controlled may ever land as a bare line on the
-/// claimable stdout stream. Two mechanisms enforce that: the shim retargets
-/// its whole stderr surface (inherited by the CLI and every tool subprocess)
-/// through a relay that re-emits each line as a <c>codeybox.stderr</c>
-/// envelope — provenance at the emission point, safe even where the exec
-/// wrapper's log-file tee merges streams — and
+/// type tag. Emission-side hygiene closes the named injection vectors: the
+/// shim retargets its whole stderr surface (inherited by the CLI and every
+/// tool subprocess) through a relay that re-emits each line as a
+/// <c>codeybox.stderr</c> envelope — safe even where the exec wrapper's
+/// log-file tee merges streams — and
 /// <c>AgentInvocation.StdoutIsEnvelopeFramed</c> pins the dispatch to the
 /// attached exec-pipe transport so no bearer credential exists in-VM that
-/// could POST forged bytes into the stream. See
-/// <see cref="DevinAcpEnvelope.IsEnvelope"/> for the residual trust boundary.
-/// </para>
+/// could POST forged bytes into the stream. What these mechanisms do NOT
+/// cover: a same-uid (root-capable) in-VM process can still write the exec
+/// stdout pipe through <c>/proc/&lt;pid&gt;/fd</c>, and a tool subprocess
+/// inheriting the agent's fd 1 can write the shim's ACP wire pipe — the
+/// shim narrows that leg with unguessable request ids, session-id pinning,
+/// and scalar-only usage bags, but the exec-pipe leg has no in-VM fix.
+/// Envelope payloads are therefore agent-influenceable telemetry — usage,
+/// outcome, and final text are stream/cost signal, never authoritative
+/// accounting. See <see cref="DevinAcpEnvelope.IsEnvelope"/>.</para>
 /// </summary>
-public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IStructuredStreamAgentRunner
+public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IStructuredStreamAgentRunner, IAgentVisibleTextExtractor
 {
     /// <summary>
     /// Sandbox environment variable carrying the Devin credentials.toml
@@ -220,18 +225,24 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
             StdoutIsEnvelopeFramed: true);
     }
 
+    /// <summary>
+    /// Unwraps the shim's <c>devin.acp</c> envelope stream into the
+    /// agent-visible answer text — the concatenated
+    /// <c>agent_message_chunk</c> payloads the shim also joins into
+    /// <c>turn_complete.finalText</c>. Returns null when the capture carries
+    /// no envelopes so the caller feeds raw stdout to its consumer (e.g. a
+    /// print-mode text-only exec). The check-and-act verdict parser and the
+    /// plan-artifact parser both consume this plain text — the verdict
+    /// sentinels arrive JSON-escaped inside envelopes otherwise.
+    /// </summary>
+    public string? ExtractAgentVisibleText(string rawStdout)
+        => DevinAcpEnvelope.ExtractAgentVisibleText(rawStdout);
+
     private string? EffectiveModelId(string? modelId)
         => !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
 
     /// <summary>
-    /// Sandbox path template for the per-run ACP working directory. A per-run
-    /// <c>mktemp</c> dir under <c>$TMPDIR</c>, so two phases in one sandbox
-    /// never collide.
-    /// </summary>
-    private const string AcpDirTemplate = "${TMPDIR:-/tmp}/codeybox-devin-acp.XXXXXX";
-
-    /// <summary>
-    /// The shim argv (after the script path) for one ACP turn.
+    /// The shim argv (after the script body) for one ACP turn.
     /// <paramref name="modelId"/> is passed verbatim to
     /// <c>devin acp --model</c> — the configured swe-2 id, never a fallback;
     /// omit when null so the account server-side default applies.
@@ -255,20 +266,31 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     }
 
     /// <summary>
-    /// The <c>bash -c</c> script that materialises the embedded shim and the
-    /// piped prompt into a private <c>mktemp</c> dir, then runs the shim.
-    /// Internal so <c>DevinInVmSmokeProbe</c> (same assembly) exercises the
-    /// exact dispatch path — a probe that passed while dispatch failed is
-    /// what let the <c>/dev/stdin</c> fault reach production.
+    /// The <c>bash -c</c> script that collects the embedded shim from the
+    /// framed stdin block and runs it with the prompt tail still on
+    /// descriptor 0. Internal so <c>DevinInVmSmokeProbe</c> (same assembly)
+    /// exercises the exact dispatch path — a probe that passed while
+    /// dispatch failed is what let the <c>/dev/stdin</c> fault reach
+    /// production.
+    ///
+    /// <para>Neither the shim nor the prompt is ever staged at a path: a
+    /// same-uid watcher inside the sandbox could observe the earlier
+    /// <c>mktemp</c> dir and swap <c>acp_client.py</c> (or the prompt)
+    /// between staging and use. Instead the decoded script rides into the
+    /// interpreter through argv (<c>python3 -I -c "$cb_shim"</c>) and the
+    /// prompt stays on the inherited fd 0 (<c>--prompt-file -</c> reads
+    /// <c>sys.stdin</c> — re-opening <c>/dev/stdin</c> by name fails EACCES
+    /// because the exec wrapper's stdin pipe is created before the
+    /// sandbox-user drop). <c>-I</c> keeps a repo-controlled module
+    /// (a worktree <c>json.py</c>) and ambient <c>PYTHONPATH</c> out of the
+    /// shim's import path; the script's argv footprint stays far under the
+    /// 128 KiB per-element cap, guarded by
+    /// <see cref="DevinAcpShim.MaxShimBytes"/>.</para>
     ///
     /// <para>Stdin is framed as
     /// <see cref="DevinAcpShim.BuildDispatchStdin"/> produces: base64 shim
-    /// lines, the end-marker line, then the verbatim prompt which
-    /// <c>cat</c> pipes to the prompt file. <c>umask 077</c> + the EXIT trap
-    /// keep the materialised files 0600 and remove them however the turn
-    /// ends, so a later phase sharing the sandbox cannot read a previous
-    /// prompt. Python is NOT <c>exec</c>'d, so the trap still runs; bash then
-    /// exits with the shim's own status, and
+    /// lines, the end-marker line, then the verbatim prompt. Python is NOT
+    /// <c>exec</c>'d so bash exits with the shim's own status, and
     /// <see cref="PreemptProcessPattern"/> still matches the
     /// <c>devin acp</c> child process.</para>
     /// </summary>
@@ -280,17 +302,11 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
 
         return string.Join('\n',
             "set -eu",
-            "umask 077",
-            $"cb_dir=$(mktemp -d \"{AcpDirTemplate}\")",
-            "trap 'rm -rf \"$cb_dir\"' EXIT INT TERM",
-            "cb_shim=\"$cb_dir/acp_client.py\"",
-            "cb_shim_b64=\"$cb_dir/acp_client.b64\"",
-            "cb_prompt=\"$cb_dir/prompt.txt\"",
-            FramedStdin.BashReaderBlock(DevinAcpShim.StdinEndMarker, "cb_shim_b64", "cb_found"),
+            FramedStdin.BashReaderBlockToVariable(DevinAcpShim.StdinEndMarker, "cb_shim_b64", "cb_found"),
             "[ \"$cb_found\" = 1 ] || { echo 'missing devin acp shim terminator' >&2; exit 1; }",
-            "base64 -d \"$cb_shim_b64\" > \"$cb_shim\"",
-            "cat > \"$cb_prompt\"",
-            "python3 \"$cb_shim\" --prompt-file \"$cb_prompt\" "
+            "[ -n \"$cb_shim_b64\" ] || { echo 'missing devin acp shim payload' >&2; exit 1; }",
+            "cb_shim=$(printf '%s\\n' \"$cb_shim_b64\" | base64 -d)",
+            "python3 -I -c \"$cb_shim\" --prompt-file - "
                 + string.Join(' ', shimArgs.Select(ShellQuote)));
     }
 

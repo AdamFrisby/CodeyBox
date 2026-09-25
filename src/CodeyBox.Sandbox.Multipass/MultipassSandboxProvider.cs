@@ -3850,6 +3850,25 @@ test "$work" = present && test "$exec_wrapper" = present
             { umask 077; printf '%s\n' "$1" > "$codeybox_exit_tmp"; } 2>/dev/null
             mv -f "$codeybox_exit_tmp" "$codeybox_exit_file_path" 2>/dev/null || true
         }
+        # Prepare the invocation-log directory and a fresh .exit sidecar.
+        # Only meaningful when CODEYBOX_AGENT_LOG_FILE is set; callers gate
+        # on that. Dropping any stale marker first means a resume re-tail
+        # can never mistake a previous run's outcome for the current one.
+        codeybox_setup_log_sidecar() {
+            codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
+            mkdir -p "$codeybox_log_dir" 2>/dev/null || true
+            codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
+            rm -f "$codeybox_exit_file" 2>/dev/null || true
+        }
+        # The .exit sidecar next to the invocation log AND the env-named
+        # exit file both carry the outcome — write them together so a
+        # resume re-tail and a detached-exit poll always agree.
+        codeybox_report_exit() {
+            if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
+                printf '%s\n' "$1" > "$codeybox_exit_file" 2>/dev/null || true
+            fi
+            codeybox_write_exit_file "$1"
+        }
         codeybox_run_user_command() {
             if [ "$keep_stdin" = "1" ]; then
                 "$@"
@@ -3870,27 +3889,21 @@ test "$work" = present && test "$exec_wrapper" = present
             fi
 
             if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ] && [ -z "$codeybox_stdout_is_framed" ]; then
-                codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
-                mkdir -p "$codeybox_log_dir" 2>/dev/null || true
-                codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
-                rm -f "$codeybox_exit_file" 2>/dev/null || true
+                codeybox_setup_log_sidecar
                 codeybox_run_user_command "$@" 2>&1 | tee -a "$CODEYBOX_AGENT_LOG_FILE" | codeybox_http_stream stdout
                 codeybox_status=("${PIPESTATUS[@]}")
                 codeybox_user_rc=${codeybox_status[0]}
                 codeybox_stream_rc=${codeybox_status[2]}
                 if [ "$codeybox_stream_rc" -ne 0 ]; then
                     echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
-                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
-                    codeybox_write_exit_file 87
+                    codeybox_report_exit 87
                     codeybox_http_exit 87 || true
                     exit 87
                 fi
-                printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
-                codeybox_write_exit_file "$codeybox_user_rc"
+                codeybox_report_exit "$codeybox_user_rc"
                 if ! codeybox_http_exit "$codeybox_user_rc"; then
                     echo "codeybox-exec: agent output HTTP completion failed during run" >&2
-                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
-                    codeybox_write_exit_file 87
+                    codeybox_report_exit 87
                     exit 87
                 fi
                 exit "$codeybox_user_rc"
@@ -3911,10 +3924,7 @@ test "$work" = present && test "$exec_wrapper" = present
             codeybox_cleanup_fifos() { rm -f "$codeybox_out_fifo" "$codeybox_err_fifo"; }
             trap codeybox_cleanup_fifos EXIT
             if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
-                codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
-                mkdir -p "$codeybox_log_dir" 2>/dev/null || true
-                codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
-                rm -f "$codeybox_exit_file" 2>/dev/null || true
+                codeybox_setup_log_sidecar
                 tee -a "$CODEYBOX_AGENT_LOG_FILE" < "$codeybox_out_fifo" | codeybox_http_stream stdout &
                 codeybox_out_stream_pid=$!
                 tee -a "${CODEYBOX_AGENT_LOG_FILE}.stderr" < "$codeybox_err_fifo" | codeybox_http_stream stderr &
@@ -3931,23 +3941,14 @@ test "$work" = present && test "$exec_wrapper" = present
             wait "$codeybox_err_stream_pid"; codeybox_err_stream_rc=$?
             if [ "$codeybox_out_stream_rc" -ne 0 ] || [ "$codeybox_err_stream_rc" -ne 0 ]; then
                 echo "codeybox-exec: agent output HTTP ingest failed during run" >&2
-                if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
-                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
-                fi
-                codeybox_write_exit_file 87
+                codeybox_report_exit 87
                 codeybox_http_exit 87 || true
                 exit 87
             fi
-            if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
-                printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
-            fi
-            codeybox_write_exit_file "$codeybox_user_rc"
+            codeybox_report_exit "$codeybox_user_rc"
             if ! codeybox_http_exit "$codeybox_user_rc"; then
                 echo "codeybox-exec: agent output HTTP completion failed during run" >&2
-                if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
-                    printf '%s\n' 87 > "$codeybox_exit_file" 2>/dev/null || true
-                fi
-                codeybox_write_exit_file 87
+                codeybox_report_exit 87
                 exit 87
             fi
             exit "$codeybox_user_rc"
@@ -3959,12 +3960,7 @@ test "$work" = present && test "$exec_wrapper" = present
         # with the command's exit code so the orchestrator can poll for
         # completion after a resume without having to read the agent's PID.
         if [ -n "${CODEYBOX_AGENT_LOG_FILE:-}" ]; then
-            codeybox_log_dir=$(dirname "$CODEYBOX_AGENT_LOG_FILE")
-            mkdir -p "$codeybox_log_dir" 2>/dev/null || true
-            codeybox_exit_file="${CODEYBOX_AGENT_LOG_FILE}.exit"
-            # Drop any stale exit marker from a previous run so a resumed
-            # poller cannot mistake the previous outcome for the current one.
-            rm -f "$codeybox_exit_file" 2>/dev/null || true
+            codeybox_setup_log_sidecar
             if [ -n "$codeybox_stdout_is_framed" ]; then
                 # Envelope-framed stdout: never merge stderr into the
                 # claimable stream. stdout tees to the log and the host pipe;
@@ -3990,8 +3986,7 @@ test "$work" = present && test "$exec_wrapper" = present
             fi
             # Best-effort sidecar; the orchestrator treats missing file as
             # "not yet finished" so we never silently swallow a write error.
-            printf '%s\n' "$codeybox_user_rc" > "$codeybox_exit_file" 2>/dev/null || true
-            codeybox_write_exit_file "$codeybox_user_rc"
+            codeybox_report_exit "$codeybox_user_rc"
             exit "$codeybox_user_rc"
         fi
         if [ -n "$codeybox_exit_file_path" ]; then

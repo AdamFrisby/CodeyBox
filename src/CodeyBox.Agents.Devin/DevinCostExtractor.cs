@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 
@@ -16,7 +17,11 @@ namespace CodeyBox.Agents.Devin;
 /// LAST tick's counters win — supplying buckets the terminal usage object
 /// lacks (e.g. cached input). A stream with neither yields <c>null</c> so
 /// the pipeline still records a zero-token row whose timestamps feed
-/// <c>usageTotal.elapsedMs</c>.</para>
+/// <c>usageTotal.elapsedMs</c>. The recorded counters are shim-reported
+/// telemetry — <see cref="DevinAcpEnvelope.IsEnvelope"/> bounds the claim:
+/// a same-uid in-VM writer can still inject envelope lines, so the numbers
+/// are usage signal reconcilable against Devin's server-side accounting,
+/// not authoritative billing.</para>
 ///
 /// <para><see cref="DefaultPricing"/> is null because cost is unknown —
 /// consumption is billed as ACUs on the operator's Devin subscription, so a
@@ -40,16 +45,13 @@ public sealed class DevinCostExtractor : IAgentCostExtractor
         foreach (var envelope in DevinAcpEnvelope.Enumerate(agentStdout))
         {
             var root = envelope.Root;
+            JsonElement usageBag;
             if (envelope.Event == DevinAcpEnvelope.EventTurnComplete
                 && DevinAcpEnvelope.TryGetTurnUsage(root, out var usage))
             {
                 // The terminal envelope's totals win over every
-                // intermediate usage_update tick.
-                var turn = DevinAcpEnvelope.ReadUsage(usage);
-                inputTokens = turn.Input ?? inputTokens;
-                outputTokens = turn.Output ?? outputTokens;
-                cachedInputTokens = turn.CachedInput ?? cachedInputTokens;
-                sawUsage = true;
+                // intermediate usage_update tick (it arrives last).
+                usageBag = usage;
             }
             else if (envelope.Event == DevinAcpEnvelope.EventSessionUpdate
                      && DevinAcpEnvelope.TryGetUsageUpdateMeta(root, out var meta))
@@ -57,12 +59,18 @@ public sealed class DevinCostExtractor : IAgentCostExtractor
                 // The _meta counters are cumulative over the turn, so the
                 // last tick carries the totals — same last-wins policy as
                 // the terminal envelope for every bucket.
-                var tick = DevinAcpEnvelope.ReadUsage(meta);
-                inputTokens = tick.Input ?? inputTokens;
-                outputTokens = tick.Output ?? outputTokens;
-                cachedInputTokens = tick.CachedInput ?? cachedInputTokens;
-                sawUsage = true;
+                usageBag = meta;
             }
+            else
+            {
+                continue;
+            }
+
+            var reading = DevinAcpEnvelope.ReadUsage(usageBag);
+            inputTokens = reading.Input ?? inputTokens;
+            outputTokens = reading.Output ?? outputTokens;
+            cachedInputTokens = reading.CachedInput ?? cachedInputTokens;
+            sawUsage = true;
         }
 
         return sawUsage

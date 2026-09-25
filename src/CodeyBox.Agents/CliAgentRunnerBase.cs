@@ -43,6 +43,33 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         => JsonSerializer.Serialize(new { type = StderrEnvelopeType, text }) + "\n";
 
     /// <summary>
+    /// The read side of <see cref="SerializeStderrEnvelopeLine"/>: true when
+    /// <paramref name="root"/> is a <c>codeybox.stderr</c> envelope, with its
+    /// <c>text</c> payload in <paramref name="text"/> (null when the envelope
+    /// carries no string text). Single source of truth for the wire shape —
+    /// consumers call this rather than re-navigating the type/text fields so
+    /// a contract change lands in one place.
+    /// </summary>
+    public static bool TryReadStderrEnvelope(JsonElement root, out string? text)
+    {
+        text = null;
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty("type", out var typeEl)
+            || typeEl.ValueKind != JsonValueKind.String
+            || typeEl.GetString() != StderrEnvelopeType)
+        {
+            return false;
+        }
+
+        if (root.TryGetProperty("text", out var textEl)
+            && textEl.ValueKind == JsonValueKind.String)
+        {
+            text = textEl.GetString();
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Sandbox CLI invocation built by concrete agent runners. This stays
     /// protected so argv/environment/stdin details do not leak into Core's
     /// domain/plugin-facing API.
@@ -63,6 +90,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// in-VM exec wrapper is told via
     /// <see cref="CodeyBox.Sandbox.SandboxConventions.EnvelopeFramedStdoutEnv"/>
     /// to keep stderr off the stdout stream even under the log-file tee.
+    /// Note the bound: the exec pipe is NOT integrity-protected against a
+    /// same-uid process inside the sandbox (it can write the pipe through
+    /// <c>/proc/&lt;pid&gt;/fd</c>), so consumers of envelope payloads must
+    /// treat them as agent-influenceable telemetry, not authoritative fact.
     /// </param>
     protected sealed record AgentInvocation(
         IReadOnlyList<string> Argv,
@@ -611,7 +642,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // so a transient crash is recoverable on the production work/
             // audit/merge paths regardless of AgentStreams. Plain-stdout call
             // sites (verdict-parser shortcuts) intentionally forgo resume to
-            // keep their stdout contract intact.
+            // keep their stdout contract intact. Runners whose stdout is an
+            // envelope stream keep that contract honest through
+            // IAgentVisibleTextExtractor — the caller projects the capture
+            // back to agent-visible text before parsing.
             if (sessionResumeContext is not null
                 && (!sessionResumeContext.Capability.RequiresStructuredStreamForSessionId
                     || sessionResumeContext.CaptureStructuredStream)
@@ -965,8 +999,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // recoverable inside the sandbox (the agent has sudo), which
             // would let agent content POST forged envelopes — and a forged
             // exit code — straight into the claimable channel. Attached exec
-            // anchors both the bytes and the outcome to the real process's
-            // fd chain and exit status instead.
+            // anchors the bytes to the dispatch's own fd chain and exit
+            // status instead. That pin is not integrity-proof — a same-uid
+            // in-VM process can still reach the pipe via /proc/<pid>/fd —
+            // so envelope payloads remain agent-influenceable telemetry,
+            // not authoritative fact.
             AgentOutputTransport = invocation.StdoutIsEnvelopeFramed
                 ? SandboxAgentOutputTransportPreference.ExecPipe
                 : SelectBatchAgentOutputTransport(sandbox),

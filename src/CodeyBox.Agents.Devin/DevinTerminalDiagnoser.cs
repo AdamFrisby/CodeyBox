@@ -76,7 +76,9 @@ internal static class DevinTerminalDiagnoser
     /// <summary>
     /// If <paramref name="line"/> is a <c>codeybox.stderr</c> envelope,
     /// returns its <c>text</c> payload; otherwise null. Malformed JSON is
-    /// treated as a plain line, never an error.
+    /// treated as a plain line, never an error. The envelope shape is read
+    /// through <see cref="CliAgentRunnerBase.TryReadStderrEnvelope"/>, the
+    /// shared reader for the contract's write side.
     /// </summary>
     private static string? TryUnwrapStderrEnvelope(string line)
     {
@@ -86,19 +88,9 @@ internal static class DevinTerminalDiagnoser
         try
         {
             using var doc = JsonDocument.Parse(line);
-            var root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object
-                || !root.TryGetProperty("type", out var typeEl)
-                || typeEl.ValueKind != JsonValueKind.String
-                || typeEl.GetString() != CliAgentRunnerBase.StderrEnvelopeType)
-            {
-                return null;
-            }
-
-            return root.TryGetProperty("text", out var textEl)
-                && textEl.ValueKind == JsonValueKind.String
-                    ? textEl.GetString()
-                    : null;
+            return CliAgentRunnerBase.TryReadStderrEnvelope(doc.RootElement, out var text)
+                ? text
+                : null;
         }
         catch (JsonException)
         {

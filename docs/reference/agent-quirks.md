@@ -430,9 +430,13 @@ non-login PATH the dispatcher uses (or symlink `devin` onto PATH).
 
 **Non-interactive invocation:** `devin acp` — an Agent Client Protocol
 server over stdio — driven by the embedded Python shim
-(`Resources/devin-acp-client.py`) through a `bash -c` wrapper that
-materialises the shim and a prompt file from a framed stdin payload
-(base64 shim, end-marker line, verbatim prompt).
+(`Resources/devin-acp-client.py`) through a `bash -c` wrapper over a
+framed stdin payload (base64 shim, end-marker line, verbatim prompt).
+Neither artifact is staged at a path — a same-uid watcher inside the
+sandbox could swap a staged file between write and exec — so the decoded
+shim rides argv (`python3 -I -c`, which also keeps the worktree off
+`sys.path`) and the prompt stays on the inherited descriptor 0
+(`--prompt-file -`).
 
 - ACP was chosen over `devin -p` because print mode only emits plain text
   when the run ends — a long turn never touched the agent-stream file and
@@ -454,7 +458,10 @@ materialises the shim and a prompt file from a framed stdin payload
   passed; neither may act on a dispatch.
 - The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
   128 KiB per argv element and rework prompts exceed it) and reaches the
-  agent only as `session/prompt` JSON — never in argv or the environment.
+  agent only as `session/prompt` JSON — never in argv, the environment,
+  or a re-openable path. The shim reads it from the already-open fd 0 —
+  re-opening the exec stdin pipe by name fails EACCES because the pipe
+  was created before the sandbox-user drop.
 - Failure text surfaces either as shim `turn_error`/`fatal` envelopes
   (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
   `Error: …` lines — the CLI prints them to stderr (verified: `Error: Not
@@ -476,7 +483,14 @@ materialises the shim and a prompt file from a framed stdin payload
   recoverable inside the VM (the agent has sudo) and would let agent content
   POST forged envelopes straight into the claimable stream. A line the model
   prints to stderr can never impersonate a shim envelope and falsify
-  usage/cost records.
+  usage/cost records. These mechanisms do NOT integrity-protect the channel:
+  a same-uid (root-capable) process in the VM can still write the exec
+  stdout pipe via `/proc/<pid>/fd`, and a tool subprocess inheriting the
+  agent's fd 1 writes onto the shim's ACP wire pipe — the shim narrows the
+  wire pipe with unguessable JSON-RPC request ids, session-id pinning on
+  session-scoped frames, and flat-number-only usage bags, but the exec-pipe
+  leg has no in-VM fix. Envelope payloads are therefore agent-influenceable
+  telemetry — usage, outcome, final text — never authoritative accounting.
 - The text-only path (`RunTextOnlyAsync`) still uses
   `devin -p --respect-workspace-trust false` with no permission flag —
   the read-only `auto` default is the conservative shape for answering

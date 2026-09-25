@@ -32,10 +32,11 @@ public sealed class DevinInVmSmokeProbe : IInVmSmokeProbe
 
     /// <param name="defaults">
     /// Live snapshot of per-agent default model IDs (see
-    /// <see cref="AgentDefaultsSnapshot"/>). The probe's real ACP turn pins
-    /// the configured devin model so it exercises the same
-    /// <c>--model</c> argv leg a dispatch does — and never silently bills
-    /// the account's server-side default model.
+    /// <see cref="AgentDefaultsSnapshot"/>). The probe's real ACP turn passes
+    /// the configured devin model when one is set, exercising the same
+    /// <c>--model</c> argv leg a dispatch does; when no default is
+    /// configured the flag is omitted and the account's server-side default
+    /// applies — matching dispatch behaviour exactly.
     /// </param>
     public DevinInVmSmokeProbe(AgentDefaultsSnapshot? defaults = null)
     {

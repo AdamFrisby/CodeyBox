@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Devin;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
@@ -36,14 +37,15 @@ public sealed class DevinAgentRunnerTests
 
     /// <summary>
     /// The devin dispatch exec. The CLI is wrapped in a bash script that
-    /// materialises the framed stdin into a per-run <c>mktemp</c> dir (see
-    /// <c>DevinAgentRunner.BuildAcpDispatchScript</c>), so the exec to find is
-    /// the one whose script declares that dir — not the sibling bash exec
-    /// that materialises credentials.
+    /// collects the framed-stdin shim into a variable and execs it via
+    /// <c>python3 -I -c</c> (see
+    /// <c>DevinAgentRunner.BuildAcpDispatchScript</c>), so the exec to find
+    /// is the one whose script declares that collector — not the sibling
+    /// bash exec that materialises credentials.
     /// </summary>
     private static SandboxExec DevinExec(RecordingSandbox sandbox) =>
         Assert.Single(sandbox.Execs, e => e.Argv.Count == 3 && e.Argv[0] == "bash"
-            && e.Argv[2].Contains("cb_dir=", StringComparison.Ordinal));
+            && e.Argv[2].Contains("cb_shim_b64", StringComparison.Ordinal));
 
     /// <summary>The shim command line the wrapper script ends with.</summary>
     private static string DevinCommandLine(RecordingSandbox sandbox) =>
@@ -70,7 +72,7 @@ public sealed class DevinAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "do the thing", Cred());
 
         Assert.Equal(
-            $"python3 \"$cb_shim\" --prompt-file \"$cb_prompt\" '--binary' 'devin' "
+            $"python3 -I -c \"$cb_shim\" --prompt-file - '--binary' 'devin' "
             + $"'--model' '{ConfiguredModel}' '--mode' 'bypass'",
             DevinCommandLine(sandbox));
     }
@@ -80,8 +82,8 @@ public sealed class DevinAgentRunnerTests
     {
         // Linux MAX_ARG_STRLEN is 128 KiB per element and applies to argv AND
         // the environment, so neither can carry a rework prompt. The prompt
-        // is piped verbatim after the base64 shim + end-marker frame and
-        // `cat` writes it to the file the shim opens.
+        // is piped verbatim after the base64 shim + end-marker frame and the
+        // shim reads it from the still-open descriptor 0 (--prompt-file -).
         var sandbox = new RecordingSandbox();
         var runner = RunnerWithDefault();
         const string prompt = "implement the widget with extra care";
@@ -98,22 +100,28 @@ public sealed class DevinAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_NeverPassesDevStdin_AsThePromptFile()
+    public async Task RunAsync_StagesNoReOpenableArtifacts()
     {
-        // /dev/stdin must be RE-OPENED by the CLI, and the in-VM exec wrapper
-        // pipes stdin in before dropping to the sandbox user, so opening it
-        // fails EACCES and every dispatch died in under a second. Regression
-        // guard: the prompt file must be a real file the sandbox user owns.
+        // The shim and the prompt must never sit at a path the dispatch
+        // re-opens: a same-uid watcher in the sandbox could swap a staged
+        // file between the write and the exec (and an earlier design that
+        // re-opened /dev/stdin died EACCES — the exec wrapper's stdin pipe
+        // is created before the sandbox-user drop). The shim rides argv via
+        // `python3 -I -c`, the prompt stays on the inherited fd 0.
         var sandbox = new RecordingSandbox();
         var runner = RunnerWithDefault();
 
         await runner.RunAsync(sandbox, "/work", "do the thing", Cred());
 
         var script = DevinExec(sandbox).Argv[2];
+        Assert.DoesNotContain("mktemp", script, StringComparison.Ordinal);
         Assert.DoesNotContain("/dev/stdin", script, StringComparison.Ordinal);
-        Assert.Contains("cat > \"$cb_prompt\"", script, StringComparison.Ordinal);
-        Assert.Contains("umask 077", script, StringComparison.Ordinal);
-        Assert.Contains("trap 'rm -rf \"$cb_dir\"' EXIT INT TERM", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("/dev/fd/", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("cb_prompt", script, StringComparison.Ordinal);
+        Assert.Contains("python3 -I -c \"$cb_shim\" --prompt-file -", script, StringComparison.Ordinal);
+        // The framed-stdin block still feeds the shim through a variable
+        // collected line-by-line — never a staged file.
+        Assert.Contains("cb_shim_b64=\"${cb_shim_b64}$line\"", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -362,7 +370,7 @@ public sealed class DevinAgentRunnerTests
         Assert.True(result.Success);
         var textOnly = Assert.Single(sandbox.Execs, e => e.Argv.Count == 3 && e.Argv[0] == "bash"
             && e.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal)
-            && !e.Argv[2].Contains("cb_dir=", StringComparison.Ordinal));
+            && !e.Argv[2].Contains("cb_shim_b64", StringComparison.Ordinal));
         var command = textOnly.Argv[2].Split('\n')[^1];
         Assert.Equal(
             $"'devin' '-p' '--respect-workspace-trust' 'false' "
@@ -395,6 +403,72 @@ public sealed class DevinAgentRunnerTests
 
         Assert.NotNull(reason);
         Assert.Contains(DevinAgentRunner.AuthTomlEnvironmentVariable, reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ExtractAgentVisibleText_JoinsMessageChunks_AndYieldsVerdictSentinels()
+    {
+        // Check-and-act feeds the aggregated stdout blob to the verdict
+        // parser — for devin that blob is envelope NDJSON where the verdict
+        // (including its <<<CODEYBOX_VERDICT>>> sentinels) arrives
+        // JSON-escaped inside agent_message_chunk / finalText. The extractor
+        // must project the stream back to the plain answer text the parser
+        // was written against.
+        var verdictJson = "{\"answer\": true, \"evidence\": \"src/Foo.cs L42\", \"confidence\": \"high\"}";
+        var agentText =
+            "analysis\n" + CheckAndActPipeline.StartSentinel + "\n" + verdictJson + "\n"
+            + CheckAndActPipeline.EndSentinel + "\n";
+        var stdout = string.Concat(
+            "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}\n",
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                type = "devin.acp",
+                @event = "session_update",
+                sessionId = "s-1",
+                update = new
+                {
+                    sessionUpdate = "agent_message_chunk",
+                    content = new { type = "text", text = agentText },
+                },
+            }) + "\n",
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                type = "devin.acp",
+                @event = "turn_complete",
+                stopReason = "end_turn",
+                usage = new { inputTokens = 11, outputTokens = 7 },
+                finalText = agentText,
+            }) + "\n");
+
+        var extracted = new DevinAgentRunner().ExtractAgentVisibleText(stdout);
+        Assert.Equal(agentText, extracted);
+
+        var ok = CheckAndActPipeline.TryParseVerdict(extracted, out var verdict, out var error);
+        Assert.True(ok, error);
+        Assert.NotNull(verdict);
+        Assert.True(verdict!.Answer);
+        Assert.Equal("src/Foo.cs L42", verdict.Evidence);
+        Assert.Equal("high", verdict.Confidence);
+    }
+
+    [Fact]
+    public void ExtractAgentVisibleText_NoChunks_FallsBackToTerminalFinalText()
+    {
+        // A truncated capture that dropped the session_update envelopes but
+        // kept the terminal line still yields the joined text the shim
+        // stamped at turn end.
+        var stdout =
+            "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\",\"finalText\":\"the final answer\"}\n";
+
+        Assert.Equal("the final answer", new DevinAgentRunner().ExtractAgentVisibleText(stdout));
+    }
+
+    [Fact]
+    public void ExtractAgentVisibleText_NoEnvelopes_ReturnsNull()
+    {
+        // Non-devin output (or an exec that never ran the shim) must fall
+        // back to the caller's raw stdout unchanged.
+        Assert.Null(new DevinAgentRunner().ExtractAgentVisibleText("plain text stdout\n"));
     }
 
     [Fact]
@@ -437,9 +511,10 @@ public sealed class DevinAgentRunnerTests
                 return Task.FromResult(new SandboxExecResult(AcpHelpExitCode, "acp help", ""));
             }
             // The dispatch exec is the framed-stdin wrapper (bash -c <script>),
-            // not a bare `devin` argv — the script declares cb_dir.
+            // not a bare `devin` argv — the script collects the shim into
+            // $cb_shim_b64.
             if (exec.Argv.Count == 3 && exec.Argv[0] == "bash"
-                && exec.Argv[2].Contains("cb_dir=", StringComparison.Ordinal))
+                && exec.Argv[2].Contains("cb_shim_b64", StringComparison.Ordinal))
             {
                 return Task.FromResult(new SandboxExecResult(DevinExitCode, DevinStdout, DevinStderr));
             }

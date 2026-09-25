@@ -23,9 +23,9 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
 
     /// <summary>
     /// Claims by the devin.acp type tag; see
-    /// <see cref="DevinAcpEnvelope.IsEnvelope"/> for why the tag is
-    /// unambiguous (provenance is enforced at the emission point and the
-    /// claimable channel is pinned to the attached exec pipe).
+    /// <see cref="DevinAcpEnvelope.IsEnvelope"/> for which injection vectors
+    /// the claim closes (stderr folding, transport pinning) and the
+    /// same-uid /proc-fd residual it cannot.
     /// </summary>
     public override bool TryClaim(JsonElement line) =>
         DevinAcpEnvelope.IsEnvelope(line);
@@ -107,7 +107,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                     // `used`/`size` are context-window occupancy, not
                     // cumulative billing; the _meta counters carry the
                     // per-turn token totals.
-                    if (TryGet(update, out var meta, DevinAcpEnvelope.MetaPropertyName))
+                    if (DevinAcpEnvelope.TryGetUsageUpdateMeta(root, out var meta))
                     {
                         (inputTokens, outputTokens, cachedInputTokens) = DevinAcpEnvelope.ReadUsage(meta);
                     }
@@ -157,7 +157,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
             EstimatedUsd: null,
             TotalDuration: null,
             TimeToFirstToken: null,
-            FinalText: FirstString(root, "finalText"),
+            FinalText: FirstString(root, DevinAcpEnvelope.FinalTextPropertyName),
             IsRecognized: true);
     }
 }

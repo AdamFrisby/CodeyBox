@@ -8,9 +8,11 @@ namespace CodeyBox.Agents;
 /// shim dispatch): a base64-encoded payload block wrapped at
 /// <see cref="Base64LineWidth"/>, an end-marker line, then the verbatim
 /// trailing payload (prompt / session stdin). Producer and consuming bash
-/// stanza are ONE framing contract — marker, wrap width, and reader
-/// variables must agree — so both halves live here and a framing change
-/// propagates to every transport instead of silently diverging.
+/// stanzas (<see cref="BashReaderBlock"/> for a file collector,
+/// <see cref="BashReaderBlockToVariable"/> for a variable collector) are ONE
+/// framing contract — marker, wrap width, and reader variables must agree —
+/// so both halves live here and a framing change propagates to every
+/// transport instead of silently diverging.
 /// </summary>
 internal static class FramedStdin
 {
@@ -66,6 +68,30 @@ internal static class FramedStdin
             "while IFS= read -r line; do",
             $"  if [ \"$line\" = {ShellQuote(endMarker)} ]; then {foundVariable}=1; break; fi",
             $"  printf '%s\\n' \"$line\" >> \"${collectorVariable}\"",
+            "done");
+    }
+
+    /// <summary>
+    /// Variant of <see cref="BashReaderBlock"/> that accumulates the payload
+    /// block into a shell VARIABLE instead of a file, for consumers that must
+    /// never stage the payload at a re-openable path inside the sandbox (a
+    /// same-uid watcher could swap a staged file between write and exec).
+    /// The caller emits the marker-not-found check and then consumes the
+    /// trailing stdin payload however it needs — typically by passing the
+    /// still-open descriptor 0 on to the payload's consumer.
+    /// </summary>
+    internal static string BashReaderBlockToVariable(string endMarker, string collectorVariable, string foundVariable)
+    {
+        ArgumentNullException.ThrowIfNull(endMarker);
+        ValidateBashIdentifier(collectorVariable);
+        ValidateBashIdentifier(foundVariable);
+
+        return string.Join('\n',
+            $"{foundVariable}=0",
+            $"{collectorVariable}=''",
+            "while IFS= read -r line; do",
+            $"  if [ \"$line\" = {ShellQuote(endMarker)} ]; then {foundVariable}=1; break; fi",
+            $"  {collectorVariable}=\"${{{collectorVariable}}}$line\"",
             "done");
     }
 

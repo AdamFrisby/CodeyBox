@@ -428,13 +428,28 @@ public sealed partial class PipelineRunner
     }
 
     /// <summary>
+    /// Projects a captured stdout blob to the agent-visible answer text.
+    /// Envelope-framed runners (the devin.acp shim emits the agent's text
+    /// JSON-escaped inside <c>finalText</c> envelopes) implement
+    /// <see cref="IAgentVisibleTextExtractor"/>; every other runner's
+    /// captured stdout is already the plain text. Callers that feed a
+    /// plain-text parser (the check-and-act verdict sentinels) MUST pass
+    /// the capture through this — the sentinel JSON never parses out of raw
+    /// NDJSON.
+    /// </summary>
+    private static string AgentVisibleStdout(IAgentRunner runner, string capturedStdout)
+        => (runner as IAgentVisibleTextExtractor)?.ExtractAgentVisibleText(capturedStdout)
+            ?? capturedStdout;
+
+    /// <summary>
     /// Runs the agent inside a project sandbox for the check phase. Mirrors
     /// the work-phase sandbox / clone scaffolding but never commits, never
     /// pushes, never opens a PR — the agent's only deliverable is the
-    /// structured verdict on stdout. Returns the aggregated stdout chunks
-    /// (via callback) and final <see cref="AgentResult.Stdout"/> concatenated
-    /// so the verdict parser sees both streamed deltas and any one-shot final
-    /// payload. Throws on agent failure so the outer catch in
+    /// structured verdict on stdout. Returns the agent-visible text: the
+    /// aggregated stdout chunks (via callback) plus the final
+    /// <see cref="AgentResult.Stdout"/>, projected through
+    /// <see cref="AgentVisibleStdout"/> for envelope-framed runners. Throws
+    /// on agent failure so the outer catch in
     /// <see cref="RunCheckAndActAsync"/> records it as Failed.
     /// </summary>
     private async Task<string> RunCheckAndActAgentAsync(
@@ -573,7 +588,7 @@ public sealed partial class PipelineRunner
             }
 
             await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
-            return aggregatedStdout;
+            return AgentVisibleStdout(agentRunner, aggregatedStdout);
         }
         catch (Exception ex)
         {

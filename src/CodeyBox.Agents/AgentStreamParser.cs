@@ -646,9 +646,9 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             || string.Equals(FirstString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase);
         string? finalText = null;
 
-        if (string.Equals(type, StderrEnvelopeType, StringComparison.OrdinalIgnoreCase))
+        if (CliAgentRunnerBase.TryReadStderrEnvelope(root, out var stderrTextValue))
         {
-            var stderrText = FirstString(root, "text") ?? string.Empty;
+            var stderrText = stderrTextValue ?? string.Empty;
             return new ParsedEvent(
                 EventType: StderrEnvelopeType,
                 Timestamp: timestamp,

@@ -1,3 +1,4 @@
+using CodeyBox.Agents.Devin;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -136,6 +137,52 @@ public sealed class CheckAndActPipelineTests : IDisposable
         var followups = allItems.Where(i => i.OriginCheckWorkItemId == check.Id).ToList();
         var followup = Assert.Single(followups);
         Assert.Equal(existingFollowup.Id, followup.Id);
+    }
+
+    [Fact]
+    public async Task EnvelopeFramedAgentStdout_StillYieldsParsableVerdict()
+    {
+        // Devin's ACP dispatch returns stdout as a devin.acp envelope
+        // stream — the agent's text (verdict sentinels included) arrives
+        // JSON-escaped inside agent_message_chunk/finalText. The pipeline
+        // must project the capture through the runner's
+        // IAgentVisibleTextExtractor before TryParseVerdict: on raw
+        // envelopes the sentinel JSON is escaped and always fails to parse.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DevinEnvelopeScriptedAgent { Kind = AgentKind.Devin };
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, agentOverride: agent);
+        agent.CheckPlan.Enqueue(
+            BuildDevinEnvelopeStdout(BuildVerdictStdout(true, "still vulnerable", "high")));
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check for SQL injection",
+            Prompt = "evaluate the repo",
+            Agent = AgentKind.Devin,
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-envelope",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is any user-facing SQL built via string concatenation?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix it", Prompt = "remediate" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(final.Verdict);
+        Assert.True(final.Verdict!.Answer);
+        Assert.Contains("still vulnerable", final.Verdict.Evidence);
+        Assert.True(agent.ExtractCalls > 0,
+            "the envelope stream must pass through the runner's text projection");
     }
 
     [Fact]
@@ -1705,6 +1752,64 @@ public sealed class CheckAndActPipelineTests : IDisposable
         var ans = answer ? "true" : "false";
         var confSegment = confidence is null ? "" : $", \"confidence\": \"{confidence}\"";
         return $"some preamble\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\"{confSegment}}}\n{CheckAndActPipeline.EndSentinel}\n";
+    }
+
+    /// <summary>
+    /// Wraps <paramref name="agentText"/> in the devin.acp envelope stream
+    /// shape <see cref="DevinAgentRunner.RunAsync"/> returns: one
+    /// agent_message_chunk carrying the text plus the terminal envelope the
+    /// shim stamps with the joined <c>finalText</c>.
+    /// </summary>
+    private static string BuildDevinEnvelopeStdout(string agentText)
+    {
+        return string.Concat(
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                type = "devin.acp",
+                @event = "session_started",
+                sessionId = "s-1",
+            }) + "\n",
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                type = "devin.acp",
+                @event = "session_update",
+                sessionId = "s-1",
+                update = new
+                {
+                    sessionUpdate = "agent_message_chunk",
+                    content = new { type = "text", text = agentText },
+                },
+            }) + "\n",
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                type = "devin.acp",
+                @event = "turn_complete",
+                stopReason = "end_turn",
+                usage = new { inputTokens = 11, outputTokens = 7 },
+                finalText = agentText,
+            }) + "\n");
+    }
+
+    /// <summary>
+    /// A <see cref="ScriptedAgent"/> registered as the devin runner whose
+    /// scripted stdout is a devin.acp envelope stream — the exact shape
+    /// <see cref="DevinAgentRunner.RunAsync"/> produces. Implements
+    /// <see cref="IAgentVisibleTextExtractor"/> by delegating to the real
+    /// runner so the test exercises the production projection, not a copy.
+    /// </summary>
+    private sealed class DevinEnvelopeScriptedAgent : ScriptedAgent, IAgentVisibleTextExtractor
+    {
+        public DevinEnvelopeScriptedAgent() : base([])
+        {
+        }
+
+        public int ExtractCalls { get; private set; }
+
+        public string? ExtractAgentVisibleText(string rawStdout)
+        {
+            ExtractCalls++;
+            return new DevinAgentRunner().ExtractAgentVisibleText(rawStdout);
+        }
     }
 
     private static CheckAndActCompletionResult BuildCompletionResult(

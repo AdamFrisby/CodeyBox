@@ -32,6 +32,15 @@ internal static class DevinAcpShim
     internal const string StdinEndMarker = "__CODEYBOX_DEVIN_ACP_SHIM_END__";
 
     /// <summary>
+    /// Upper bound for the decoded shim: the dispatch passes it as a single
+    /// <c>python3 -c</c> argv element, so it must stay under the kernel's
+    /// per-element cap (<c>MAX_ARG_STRLEN</c> = 128 KiB) with headroom.
+    /// Exceeding it fails the dispatch build here rather than as E2BIG
+    /// inside the sandbox.
+    /// </summary>
+    internal const int MaxShimBytes = 96 * 1024;
+
+    /// <summary>
     /// The embedded shim bytes, loaded once. Returned to callers only as
     /// <see cref="ReadOnlyMemory{T}"/> so no caller can mutate the shared
     /// copy that every later dispatch ships to the sandbox.
@@ -49,18 +58,27 @@ internal static class DevinAcpShim
                 $"Devin ACP shim resource '{EmbeddedResourceName}' is missing from {asm.GetName().Name}.");
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
-        return ms.ToArray();
+        var bytes = ms.ToArray();
+        if (bytes.Length > MaxShimBytes)
+        {
+            throw new InvalidOperationException(
+                $"Devin ACP shim resource '{EmbeddedResourceName}' is {bytes.Length} bytes, "
+                + $"exceeding the {MaxShimBytes}-byte cap for single-argv-element delivery.");
+        }
+        return bytes;
     }
 
     /// <summary>
     /// The dispatch exec stdin frame, built by
     /// <see cref="FramedStdin.Build"/>: the base64-encoded shim (wrapped at
     /// <see cref="FramedStdin.Base64LineWidth"/>), the end marker on its own
-    /// line, then the prompt verbatim. The wrapper script decodes the shim
-    /// to a temp file and pipes the rest to the prompt file, so the prompt
-    /// never enters argv, the environment, or
-    /// <c>/proc/&lt;pid&gt;/environ</c> — the same delivery guarantee the
-    /// print-mode prompt file had.
+    /// line, then the prompt verbatim. The wrapper script collects the
+    /// shim block into a variable and execs it via <c>python3 -I -c</c>
+    /// while the prompt tail stays on the inherited descriptor 0
+    /// (<c>--prompt-file -</c>), so neither artifact is ever staged at a
+    /// re-openable path and the prompt never enters argv, the environment,
+    /// or <c>/proc/&lt;pid&gt;/environ</c> — the same delivery guarantee
+    /// the print-mode prompt file had.
     /// </summary>
     internal static string BuildDispatchStdin(string prompt)
     {

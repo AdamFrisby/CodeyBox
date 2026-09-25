@@ -30,6 +30,17 @@ envelope and falsify persisted usage/outcome records. Wrapped at the
 source, a merged or injected stream can never yield a bare devin.acp line
 sourced from stderr; `Error: ...` diagnostics still surface as envelope
 text for the host-side diagnoser.
+
+What the envelopes do NOT prove: a same-uid (root-capable) process inside
+the sandbox can still write the exec stdout pipe through /proc/<pid>/fd,
+and a tool subprocess that inherits the agent's fd 1 writes onto this
+client's wire pipe. The wire pipe is narrowed — JSON-RPC request ids are
+unguessable (a forged response can never name a pending one),
+session-scoped frames must carry the negotiated sessionId, and usage bags
+are re-emitted as flat number maps, not verbatim objects — but the
+exec-pipe leg has no in-VM fix. Consumers must treat envelope payloads
+(usage counters, terminal event, finalText) as agent-influenceable
+telemetry, never authoritative accounting.
 """
 
 from __future__ import annotations
@@ -37,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -186,12 +198,19 @@ class AcpClient:
 
     def __init__(self, proc):
         self.proc = proc
-        self.next_id = 0
         self.pending = {}
+        # Negotiated session id, set when session/new answers. Session-scoped
+        # frames for any other id are dropped — the agent's sessionId is a
+        # server-chosen opaque string a wire-pipe writer cannot guess.
+        self.session_id = None
 
     def request(self, stage, method, params):
-        self.next_id += 1
-        request_id = self.next_id
+        # Unguessable ids: a process that inherited the agent's stdout fd (a
+        # tool subprocess of `devin acp`) writes onto the pipe this client
+        # reads, and could otherwise answer a predictable sequential id with
+        # a forged turn result that the shim would stamp into a genuine
+        # terminal envelope.
+        request_id = "cb-" + secrets.token_hex(16)
         self.pending[request_id] = stage
         self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
 
@@ -274,7 +293,7 @@ def run_turn(client, prompt, cwd, mode):
             continue
 
         if "method" in frame:
-            final_text_chars = handle_notification(frame, final_text_parts, final_text_chars)
+            final_text_chars = handle_notification(client, frame, final_text_parts, final_text_chars)
             continue
 
         if "id" not in frame:
@@ -322,6 +341,7 @@ def run_turn(client, prompt, cwd, mode):
                 emit("fatal", stage="session/new",
                      message="session/new response did not carry a sessionId")
                 return EXIT_TURN_FAILED
+            client.session_id = session_id
             emit("session_started", sessionId=session_id)
             if mode:
                 client.request("session/set_mode", "session/set_mode",
@@ -342,7 +362,7 @@ def run_turn(client, prompt, cwd, mode):
                 return EXIT_TURN_FAILED
             emit("turn_complete",
                  stopReason=stop_reason,
-                 usage=result.get("usage"),
+                 usage=numeric_map(result.get("usage")),
                  finalText="".join(final_text_parts) or None)
             return 0
         else:
@@ -361,11 +381,48 @@ def send_prompt(client, session_id, prompt):
     emit("prompt_sent", promptBytes=len(prompt.encode("utf-8")))
 
 
-def handle_notification(frame, final_text_parts, final_text_chars):
+def numeric_map(value):
+    """Bound a peer-supplied usage/_meta bag to a flat string->number map
+    before it is stamped into a claimable envelope field. The wire pipe is
+    writable by anything that inherited the agent's stdout fd, so nested
+    objects are never re-emitted verbatim where the host folds values into
+    usage accounting."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: entry
+        for key, entry in value.items()
+        if isinstance(key, str) and isinstance(entry, (int, float))
+        and not isinstance(entry, bool)
+    }
+
+
+def sanitise_update(update):
+    """Re-emit a session/update payload with its claimable surface bounded:
+    _meta is the only field the host folds into usage accounting, so it is
+    reduced to a flat number map. Every other field is display metadata."""
+    if not isinstance(update, dict):
+        return update
+    meta = update.get("_meta")
+    if not isinstance(meta, dict):
+        return update
+    bounded = dict(update)
+    bounded["_meta"] = numeric_map(meta)
+    return bounded
+
+
+def handle_notification(client, frame, final_text_parts, final_text_chars):
     method = frame.get("method")
     params = frame.get("params")
     if method == "session/update" and isinstance(params, dict):
-        update = params.get("update")
+        if params.get("sessionId") != client.session_id:
+            # The wire pipe is writable by anything that inherited the
+            # agent's stdout fd; session frames must name the negotiated
+            # session id or they are not the peer's to emit.
+            emit("protocol_error",
+                 message="session/update for a session id this client did not open")
+            return final_text_chars
+        update = sanitise_update(params.get("update"))
         emit("session_update", sessionId=params.get("sessionId"), update=update)
         if isinstance(update, dict) and update.get("sessionUpdate") == "agent_message_chunk":
             content = update.get("content")
@@ -382,6 +439,15 @@ def handle_agent_request(client, frame):
     params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
 
     if method == "session/request_permission":
+        if params.get("sessionId") != client.session_id:
+            # Answer (so a genuinely-misshaped peer is not left waiting on
+            # a response it needs) but never honour the request: a frame
+            # for a session this client did not open is not the peer's.
+            client.respond_error(request_id, -32602,
+                                 "sessionId does not match the negotiated session")
+            emit("protocol_error",
+                 message="session/request_permission for a session id this client did not open")
+            return
         options = params.get("options")
         options = options if isinstance(options, list) else []
         tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
@@ -419,7 +485,9 @@ def parse_args(argv):
     parser.add_argument("--binary", required=True)
     parser.add_argument("--cwd", default=None,
                         help="Session cwd; defaults to the shim's working directory")
-    parser.add_argument("--prompt-file", required=True)
+    parser.add_argument("--prompt-file", required=True,
+                        help="'-' reads the prompt tail from descriptor 0 "
+                             "(the dispatch's framed stdin)")
     parser.add_argument("--model", default=None,
                         help="Passed verbatim to `devin acp --model`; never a fallback")
     parser.add_argument("--mode", default=None,
@@ -428,10 +496,20 @@ def parse_args(argv):
 
 
 def read_prompt(path):
-    if os.path.getsize(path) > MAX_PROMPT_BYTES:
-        raise ValueError("prompt file exceeds %d bytes" % MAX_PROMPT_BYTES)
-    with open(path, "r", encoding="utf-8") as handle:
-        return handle.read()
+    if path == "-":
+        # The prompt tail of the dispatch's stdin frame. Read the
+        # already-open descriptor 0 — re-opening the exec wrapper's stdin
+        # pipe by name (/dev/stdin) fails EACCES because the pipe was
+        # created before the sandbox-user drop.
+        data = sys.stdin.buffer.read(MAX_PROMPT_BYTES + 1)
+    else:
+        if os.path.getsize(path) > MAX_PROMPT_BYTES:
+            raise ValueError("prompt file exceeds %d bytes" % MAX_PROMPT_BYTES)
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_PROMPT_BYTES + 1)
+    if len(data) > MAX_PROMPT_BYTES:
+        raise ValueError("prompt exceeds %d bytes" % MAX_PROMPT_BYTES)
+    return data.decode("utf-8")
 
 
 def main(argv=None):
