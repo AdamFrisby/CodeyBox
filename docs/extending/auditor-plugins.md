@@ -308,14 +308,23 @@ Behaviour the base guarantees identically for every tool:
   the plugin's scoped config section; resolve it per invocation so edits apply
   without a restart.
 
+A pinned tool version is declared, not implemented: set `VersionPin` to a
+`ToolVersionPin` (plugin id, a per-invocation `ExpectedVersion` accessor, the
+default release, and the version-probe arguments — `["--version"]` for most
+tools, `["version"]` for subcommand-style CLIs) and `RunAsync` probes the
+tool before every scan, failing closed on a missing binary, an unrecognised
+version, or a mismatch.
+
 Two extension points cover tool requirements the base cannot express
 declaratively:
 
 - `VerifyToolAsync` — a pre-scan precondition hook invoked inside `RunAsync`
-  after the tool's presence is confirmed. Override it for checks like a pinned
-  tool version or repository-state gates, throwing `AuditUnavailableException`
-  to fail closed. Run probes through `ExecToolBoundedAsync` so they inherit
-  the same timeout bounding and failure classification as the scan.
+  after the tool's presence and declared `VersionPin` are confirmed. Override
+  it for repository-state gates (e.g. refusing repo-authored suppression
+  files — `ProbeRepositoryFilesPresentAsync` is the shared fail-closed probe
+  for that), throwing `AuditUnavailableException` to fail closed. Run probes
+  through `ExecToolBoundedAsync` so they inherit the same timeout bounding
+  and failure classification as the scan.
 - `BuildToolEnvironment` — extra environment variables for the tool process,
   for tools whose behavior is env-controlled (e.g. pinning configuration that
   must not come from the audited repository).
