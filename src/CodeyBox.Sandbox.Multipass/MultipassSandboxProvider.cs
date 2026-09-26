@@ -1036,7 +1036,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         if (run.ExitCode != 0)
             throw new InvalidOperationException($"multipass delete --purge {name} failed (exit {run.ExitCode}): {run.Stderr}");
         if (_activeSandboxNames.ContainsKey(name))
-            throw new InvalidOperationException("Refusing to delete staging for a Multipass sandbox that became active.");
+            throw new InvalidOperationException($"Multipass sandbox '{name}' became active after delete --purge; refusing to remove its staging directory.");
         // Clean up staging dir if it still exists.
         var stagingDir = Path.Combine(_stagingRoot, name);
         try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, recursive: true); }

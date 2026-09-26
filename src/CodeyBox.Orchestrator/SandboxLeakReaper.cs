@@ -204,9 +204,13 @@ public sealed class SandboxLeakReaper : BackgroundService
 
     internal async Task RunSweepAsync(CancellationToken ct)
     {
-        WarnIfLeakThresholdBelowPhaseCeiling();
         try
         {
+            // Inside the sweep's containment: the warning helper dereferences
+            // hot-reloadable options, and an invalid reload (or a degenerate
+            // multiplier) must fault the sweep — logged and retried next pass —
+            // not escape RunSweepAsync and kill the BackgroundService.
+            WarnIfLeakThresholdBelowPhaseCeiling();
             var allManaged = await _provider.ListAllManagedAsync(ct);
             var now = _clock();
             var observedSuspendOrphans = new HashSet<LeakIdentity>();
@@ -552,9 +556,20 @@ public sealed class SandboxLeakOptions
     /// values are coupled: raising the work-timeout ceiling or the phase
     /// multiplier requires re-checking the threshold.
     /// </summary>
-    public static TimeSpan MinimumLeakAgeThreshold(double phaseAbsoluteTimeoutMultiplier) =>
-        TimeSpan.FromMinutes(WorkTimeoutPolicy.MaxMinutes * phaseAbsoluteTimeoutMultiplier)
-        + LeakAgeThresholdProvisioningMargin;
+    public static TimeSpan MinimumLeakAgeThreshold(double phaseAbsoluteTimeoutMultiplier)
+    {
+        // Bound before FromMinutes: a finite-but-huge configured multiplier
+        // (the config validator only checks finite && >= 1) would overflow
+        // TimeSpan's range and throw. Any unusable or overflowing value maps
+        // to the maximum bound so the caller's comparison still warns.
+        var requiredMinutes = WorkTimeoutPolicy.MaxMinutes * phaseAbsoluteTimeoutMultiplier
+            + LeakAgeThresholdProvisioningMargin.TotalMinutes;
+        return !double.IsFinite(requiredMinutes)
+            || requiredMinutes >= TimeSpan.MaxValue.TotalMinutes
+            || requiredMinutes <= TimeSpan.MinValue.TotalMinutes
+            ? TimeSpan.MaxValue
+            : TimeSpan.FromMinutes(requiredMinutes);
+    }
 
     /// <summary>
     /// Shipped default for <see cref="LeakAgeThreshold"/>:

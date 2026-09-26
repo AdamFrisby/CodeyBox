@@ -694,6 +694,42 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task DisposeLeakedAsync_through_composite_reclaims_zombie()
+    {
+        // Regression: the composite's live-ownership veto must pass a zombie
+        // through to the provider's reclaim path — a handle whose DisposeAsync
+        // already ran is not owned by a live phase. Before the snapshots and
+        // inventory stopped reporting zombies as active, the composite vetoed
+        // this disposal and the remote VM leaked until process restart.
+        var mountSource = Directory.CreateTempSubdirectory("codeybox-remote-leak-").FullName;
+        try
+        {
+            var opts = Options(Host("a", cap: 1));
+            var transports = new HostTransportSet();
+            var provider = Provider(() => opts, transports);
+
+            var sandbox = await provider.CreateAsync(Spec() with
+            {
+                Mounts = [new SandboxMount { HostPath = mountSource, SandboxPath = "/data", ReadOnly = false }],
+            });
+
+            transports["a"].ThrowTransportOnStageOut = true;
+            await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => sandbox.DisposeAsync().AsTask());
+            transports["a"].ThrowTransportOnStageOut = false;
+            Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+
+            var composite = new CompositeManagedSandboxProvider([provider]);
+            await composite.DisposeLeakedAsync(sandbox.Id, CancellationToken.None);
+
+            Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+        }
+        finally
+        {
+            try { Directory.Delete(mountSource, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task CreateAsync_filters_hosts_by_allowed_network_profile()
     {
         var opts = Options(

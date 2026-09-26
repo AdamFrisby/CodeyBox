@@ -17,23 +17,41 @@ namespace CodeyBox.Orchestrator;
 public sealed partial class PipelineRunner
 {
     /// <summary>
-    /// True when the exception proves the sandbox's execution transport was
-    /// lost underneath running work — the VM was destroyed (e.g. by the leak
-    /// reaper), the host crashed, or the exec channel died. Widens
-    /// <see cref="SandboxDeferralGuard.IsExecutionTransportLoss"/> with the
-    /// flagged failure types this assembly owns
-    /// (<see cref="AgentInfrastructureFailureException"/> and
-    /// <see cref="CodeyBox.Sandbox.SandboxCredentialFileWriteException"/>
-    /// carrying <c>ExecutionUnavailable</c>). Catch boundaries that map
-    /// failures to terminal item outcomes must let these propagate to the
-    /// transient-retry park instead — a terminal transition marks the item
-    /// failed and hands its working tree to the clone reaper even though a
-    /// fresh sandbox reproduces a working environment.
+    /// Parks an item whose sandbox execution transport was lost underneath
+    /// running work — the VM was destroyed (e.g. by the leak reaper), the host
+    /// crashed, or the exec channel died — for bounded transient retry under
+    /// an infrastructure classification. The work is not at fault and a fresh
+    /// sandbox reproduces a working environment; a terminal transition would
+    /// also hand the clone to the repo reaper immediately (grace applies only
+    /// to terminal rows), destroying the agent's working tree — the follow-on
+    /// damage observed when live VMs were deleted. Single decision+action
+    /// used by every catch boundary that recognizes the loss.
     /// </summary>
-    private static bool IsExecutionTransportLoss(Exception ex) =>
-        SandboxDeferralGuard.IsExecutionTransportLoss(ex)
-        || ex is AgentInfrastructureFailureException { ExecutionUnavailable: true }
-            or SandboxCredentialFileWriteException { ExecutionUnavailable: true };
+    /// <param name="operation">Dispatch-loop context label for the warning
+    /// log (e.g. "run", "check-and-act").</param>
+    private Task ParkForExecutionTransportLossAsync(
+        WorkItem item,
+        string error,
+        Project? project,
+        string? phase,
+        AgentKind? agent,
+        string operation)
+    {
+        _log.LogWarning(
+            "Work item {Id} {Operation} parking for retry because its sandbox execution transport was lost (agent {Agent}, phase {Phase}): {Reason}",
+            item.Id,
+            operation,
+            agent?.Value ?? "unknown",
+            phase ?? "unknown",
+            error);
+        return TransitionWaitingForTransientRetryAsync(
+            item,
+            error,
+            project,
+            phase,
+            agent,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+    }
 
     private void ThrowIfTransientAgentFailure(
         IAgentRunner runner,

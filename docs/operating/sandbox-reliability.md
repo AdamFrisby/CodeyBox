@@ -27,7 +27,7 @@ A provider-owned sandbox is classified as leaked when these conditions hold:
    suspended-sandbox mappings are also exempt while startup recovery owns them.
 3. Its creation timestamp — derived from provider metadata or provider-owned
    staging metadata where available — is **older than
-   `LeakAgeThreshold`** (default 12:30:00), or its creation timestamp cannot be
+   `LeakAgeThreshold`** (default 1.00:30:00), or its creation timestamp cannot be
    determined.
 
 The default is derived — not picked: it equals the longest legitimate phase
@@ -67,7 +67,7 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
     "SandboxLeak": {
       "Enabled": true,
       "CheckInterval": "00:15:00",
-      "LeakAgeThreshold": "12:30:00",
+      "LeakAgeThreshold": "1.00:30:00",
       "AutoDispose": true
     }
   }
@@ -78,7 +78,7 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
 |---|---|---|---|
 | `Enabled` | `true` | startup only | Enable or disable the sweep entirely. |
 | `CheckInterval` | `00:15:00` | startup only | How often the scan runs; sampled when the timer is constructed. |
-| `LeakAgeThreshold` | `12:30:00` | hot | Minimum age before an untracked sandbox is declared leaked. Sized above the maximum legitimate phase duration; keep it that way. |
+| `LeakAgeThreshold` | `1.00:30:00` | hot | Minimum age before an untracked sandbox is declared leaked. Sized above the maximum legitimate phase duration; keep it that way. |
 | `AutoDispose` | `true` | hot | Purge each detected leak automatically. |
 | `MaxConcurrentAutoDispose` | `4` | hot | Parallel disposals, capped to limit pressure on the provider during restart cleanup. |
 

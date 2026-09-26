@@ -234,8 +234,7 @@ public sealed partial class PipelineRunner
                 agentPhase,
                 "Retained-sandbox adoption could not be completed safely; the exact recovery lease remains preserved.",
                 ex,
-                executionUnavailable: ex is SandboxExecutionUnavailableException
-                    or AgentResumePreparationUnavailableException);
+                executionUnavailable: SandboxDeferralGuard.IsExecutionTransportLoss(ex));
         }
         catch
         {

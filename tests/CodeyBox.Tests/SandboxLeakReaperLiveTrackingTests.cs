@@ -132,10 +132,14 @@ public sealed class SandboxLeakReaperLiveTrackingTests
         var (configuredMultiplier, configuredThreshold) = LoadShippedSandboxLeakConfig();
         var multiplier = configuredMultiplier ?? new CodeyBoxOptions().PhaseAbsoluteTimeoutMultiplier;
         var threshold = configuredThreshold ?? new SandboxLeakOptions().LeakAgeThreshold;
-        var bound = SandboxLeakOptions.MinimumLeakAgeThreshold(multiplier);
+        // Independent oracle — NOT SandboxLeakOptions.MinimumLeakAgeThreshold:
+        // computing the bound through the function under test would make both
+        // sides shrink together and the assertion could never catch a shipped
+        // default that fell below the maximum legitimate phase duration.
+        var bound = TimeSpan.FromMinutes(WorkTimeoutPolicy.MaxMinutes * multiplier);
         Assert.True(
-            threshold >= bound,
-            $"shipped LeakAgeThreshold {threshold} is below {bound}, the minimum for the shipped PhaseAbsoluteTimeoutMultiplier {multiplier}");
+            threshold > bound,
+            $"shipped LeakAgeThreshold {threshold} does not exceed {bound}, the maximum legitimate phase duration for the shipped PhaseAbsoluteTimeoutMultiplier {multiplier} (WorkTimeoutPolicy.MaxMinutes × multiplier)");
 
         // And the property-default pair must stay coupled so a build with no
         // config at all is safe by construction.

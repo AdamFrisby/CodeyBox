@@ -683,6 +683,12 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         var snap = new List<(WorkItemId, IShutdownTeardownSandbox)>(_active.Count);
         foreach (var (_, sb) in _active)
         {
+            // A handle whose DisposeAsync already claimed it is a zombie no
+            // live phase owns — reporting it as live would veto the provider's
+            // own zombie-reclaim path in DisposeLeakedAsync. The reclaim is
+            // serialized with the in-flight dispose via the handle's lock.
+            if (sb.DisposalStarted)
+                continue;
             if (sb.OwningWorkItemId is { } id)
                 snap.Add((id, sb));
         }
@@ -694,6 +700,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         var snap = new List<ActiveSandboxProgress>(_active.Count);
         foreach (var (_, sb) in _active)
         {
+            if (sb.DisposalStarted)
+                continue;
             if (sb.OwningWorkItemId is { } id)
                 snap.Add(new ActiveSandboxProgress(id, sb.Id, Status: $"running host={sb.HostId}"));
         }
@@ -1711,7 +1719,13 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             if (string.IsNullOrEmpty(name)) continue;
             if (!RemoteMultipassVmNames.IsManagedVmNameForPrefix(name, opts.VmNamePrefix)) continue;
 
-            var isTrackedActive = _active.TryGetValue(new RemoteSandboxIdentity(opts.HostId, name), out var active) && active.IsTrackedActive;
+            // A tracked entry whose DisposeAsync already claimed the handle is
+            // a zombie (e.g. deferred at sync-back, tracking left held), not
+            // live work — report it untracked so the sweep can route it to the
+            // provider's zombie-reclaim path instead of vetoing it forever.
+            var isTrackedActive = _active.TryGetValue(new RemoteSandboxIdentity(opts.HostId, name), out var active)
+                && active.IsTrackedActive
+                && !active.DisposalStarted;
             var state = entry.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null;
             var isSuspendOrFreezing = state is "Suspended" or "Suspending" or "Freezing";
             createdAtByName.TryGetValue(name, out var createdAt);

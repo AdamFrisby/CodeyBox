@@ -218,7 +218,12 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
             {
                 if (!string.Equals(info.Name, name, StringComparison.Ordinal))
                     continue;
-                reporters.Add(provider);
+                // One provider can legitimately list the same name more than
+                // once (e.g. the remote multipass provider keys active entries
+                // by (host, name)); dedupe so a single reporter cannot later
+                // read as "multiple providers" to the routing ambiguity check.
+                if (!reporters.Contains(provider))
+                    reporters.Add(provider);
                 if (info.IsTrackedActive
                     && (hostId is null || string.Equals(info.HostId, hostId, StringComparison.Ordinal)))
                 {

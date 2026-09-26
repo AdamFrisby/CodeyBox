@@ -1154,16 +1154,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // the exact follow-on damage observed when live VMs were deleted.
             if (ex.ExecutionUnavailable)
             {
-                _log.LogWarning(
-                    "Work item {Id} parking for retry because agent {Agent} lost its sandbox execution transport in phase {Phase}: {Reason}",
-                    item.Id, ex.Agent.Value, ex.Phase, ex.Message);
-                await TransitionWaitingForTransientRetryAsync(
-                    item,
-                    ex.Message,
-                    project,
-                    ex.Phase,
-                    ex.Agent,
-                    failureKind: WorkItemFailureKinds.Infrastructure);
+                await ParkForExecutionTransportLossAsync(
+                    item, ex.Message, project, ex.Phase, ex.Agent, "run");
                 return;
             }
 
@@ -1437,7 +1429,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item.Id, ex.Agent.Value, SanitizedAgentDetail.FromRaw(ex.Reason).Value);
             await TransitionNoActionRequiredAsync(item, project, ex, CancellationToken.None);
         }
-        catch (Exception ex) when (IsExecutionTransportLoss(ex))
+        catch (Exception ex) when (SandboxDeferralGuard.IsExecutionTransportLoss(ex))
         {
             // Transport-loss shapes that escaped a phase's own conversion —
             // a raw SandboxExecutionUnavailableException from an audit/verification
@@ -1447,16 +1439,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // failure and handing the clone to the repo reaper. The
             // AgentInfrastructureFailureException catch above owns the wrapped
             // variant; this clause is the backstop for unwrapped shapes.
-            _log.LogWarning(
-                "Work item {Id} parking for retry because its sandbox execution transport was lost: {Reason}",
-                item.Id, ex.Message);
-            await TransitionWaitingForTransientRetryAsync(
-                item,
-                ex.Message,
-                project,
-                phase: null,
-                item.Agent,
-                failureKind: WorkItemFailureKinds.Infrastructure);
+            await ParkForExecutionTransportLossAsync(
+                item, ex.Message, project, phase: null, item.Agent, "run");
         }
         catch (Exception ex)
         {

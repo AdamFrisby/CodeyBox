@@ -7127,7 +7127,16 @@ namespace CodeyBox.Api
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
-        public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
+
+        /// <summary>
+        /// Multiplier applied to each phase's per-attempt timeout to get its
+        /// absolute wall-clock cap. Bound to
+        /// <see cref="Orchestrator.PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier"/>:
+        /// <c>SandboxLeakOptions.DefaultLeakAgeThreshold</c> derives from that
+        /// constant, so this default MUST track it or the shipped leak
+        /// threshold silently stops covering the multiplier actually in force.
+        /// </summary>
+        public double PhaseAbsoluteTimeoutMultiplier { get; set; } = Orchestrator.PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier;
 
         /// <summary>
         /// Global default work-phase wall-clock budget in minutes, applied to

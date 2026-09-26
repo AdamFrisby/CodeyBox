@@ -152,16 +152,8 @@ public sealed partial class PipelineRunner
             // the agent's working tree.
             if (infraEx.ExecutionUnavailable)
             {
-                _log.LogWarning(
-                    "Work item {Id} check-and-act parking for retry because agent {Agent} lost its sandbox execution transport in phase {Phase}: {Reason}",
-                    item.Id, infraEx.Agent.Value, infraEx.Phase, infraEx.Message);
-                await TransitionWaitingForTransientRetryAsync(
-                    item,
-                    infraEx.Message,
-                    project,
-                    infraEx.Phase,
-                    infraEx.Agent,
-                    failureKind: WorkItemFailureKinds.Infrastructure);
+                await ParkForExecutionTransportLossAsync(
+                    item, infraEx.Message, project, infraEx.Phase, infraEx.Agent, "check-and-act");
                 return;
             }
 
@@ -192,22 +184,14 @@ public sealed partial class PipelineRunner
                 project,
                 failureKind: WorkItemFailureKinds.Infrastructure);
         }
-        catch (Exception ex) when (IsExecutionTransportLoss(ex))
+        catch (Exception ex) when (SandboxDeferralGuard.IsExecutionTransportLoss(ex))
         {
             // Raw transport-loss shapes that never got wrapped into an
             // AgentInfrastructureFailureException — e.g. a
             // SandboxExecutionUnavailableException from the git-clone exec —
             // carry the same recoverable meaning: park, do not fail terminal.
-            _log.LogWarning(
-                "Work item {Id} check-and-act parking for retry because its sandbox execution transport was lost: {Reason}",
-                item.Id, ex.Message);
-            await TransitionWaitingForTransientRetryAsync(
-                item,
-                ex.Message,
-                project,
-                "check",
-                agentRunner.Kind,
-                failureKind: WorkItemFailureKinds.Infrastructure);
+            await ParkForExecutionTransportLossAsync(
+                item, ex.Message, project, "check", agentRunner.Kind, "check-and-act");
         }
         catch (Exception ex)
         {

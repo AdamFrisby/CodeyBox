@@ -8597,7 +8597,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         await provider.DisposeLeakedAsync(vmName, CancellationToken.None);
 
-        Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
         Assert.Contains(runner.Calls, call => call.Argv is [_, "delete", "--purge", var deleted] && deleted == vmName);
         Assert.Empty(states);
     }

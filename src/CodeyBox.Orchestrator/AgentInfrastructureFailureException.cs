@@ -2,7 +2,7 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-internal sealed class AgentInfrastructureFailureException : Exception
+internal sealed class AgentInfrastructureFailureException : Exception, IExecutionTransportLoss
 {
     public AgentInfrastructureFailureException(
         AgentKind agent,

@@ -30,12 +30,16 @@ public static class SandboxDeferralGuard
     /// Like a deferral, this must propagate to the layer that owns recoverable
     /// infrastructure classification: wrapping it into a terminal outcome
     /// marks the item failed and hands its working tree to the clone reaper
-    /// even though a fresh sandbox reproduces a working environment.
+    /// even though a fresh sandbox reproduces a working environment. The
+    /// complete set is recognized through <see cref="IExecutionTransportLoss"/>,
+    /// so flagged exception types declared in other assemblies (e.g.
+    /// AgentInfrastructureFailureException, SandboxCredentialFileWriteException)
+    /// are covered here too — do NOT widen this predicate in a downstream
+    /// assembly or the terminal-mapping boundaries split again.
     /// Pure: no I/O, no ambient state.
     /// </summary>
     public static bool IsExecutionTransportLoss(Exception ex) =>
-        ex is SandboxExecutionUnavailableException
-            or AgentResumePreparationUnavailableException;
+        ex is IExecutionTransportLoss { ExecutionUnavailable: true };
 
     /// <summary>
     /// Returns true when <paramref name="ex"/> is safe to wrap into a
