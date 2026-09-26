@@ -70,6 +70,7 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
 
         var findings = new List<ExternalToolFinding>();
         var sawSummary = false;
+        var lastIsSummary = false;
 
         foreach (var rawLine in input.Stderr.Split('\n'))
         {
@@ -86,7 +87,9 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
             {
                 // Not a JSON record — a panic dump, a truncated final line, or
                 // foreign output. Tolerated here; the summary gate below is
-                // what decides whether the run completed.
+                // what decides whether the run completed. Any such trailing
+                // line means the summary was not the final record.
+                lastIsSummary = false;
                 continue;
             }
 
@@ -94,7 +97,10 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
             {
                 var root = document.RootElement;
                 if (root.ValueKind != JsonValueKind.Object)
+                {
+                    lastIsSummary = false;
                     continue;
+                }
                 var type = GetString(root, "type"u8);
                 if (string.Equals(type, "diagnostic", StringComparison.Ordinal)
                     && root.TryGetProperty("fields"u8, out var fields)
@@ -102,16 +108,22 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
                 {
                     if (findings.Count < MaxResults)
                         findings.Add(ParseDiagnostic(fields));
+                    lastIsSummary = false;
                 }
                 else if (string.Equals(type, "summary", StringComparison.Ordinal))
                 {
                     sawSummary = true;
+                    lastIsSummary = true;
                 }
-                // "log" records and unknown types carry no findings.
+                else
+                {
+                    // "log" records and unknown types carry no findings.
+                    lastIsSummary = false;
+                }
             }
         }
 
-        if (!sawSummary)
+        if (!sawSummary || !lastIsSummary)
             throw new ExternalToolParseException(
                 $"Tool '{input.ToolName}' produced no 'summary' record — cargo-deny writes the "
                 + "summary only when the check run completes, so its absence means a run failure "
@@ -143,47 +155,30 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
         if (fields.TryGetProperty("labels"u8, out var labels)
             && labels.ValueKind == JsonValueKind.Array)
         {
-            var appended = 0;
-            var omitted = 0;
-            foreach (var label in labels.EnumerateArray())
-            {
-                if (label.ValueKind != JsonValueKind.Object)
-                    continue;
-                var detail = BuildLabelDetail(label);
-                if (detail is null)
-                    continue;
-                if (appended >= MaxLabelsInMessage)
-                {
-                    omitted++;
-                    continue;
-                }
-                builder.Append("; ").Append(detail);
-                appended++;
-            }
-            if (omitted > 0)
-                builder.Append("; +").Append(omitted).Append(" more label(s)");
+            AppendBoundedArray(
+                builder,
+                labels,
+                MaxLabelsInMessage,
+                static element => element.ValueKind == JsonValueKind.Object
+                    ? BuildLabelDetail(element)
+                    : null,
+                static detail => "; " + detail,
+                static omitted => "; +" + omitted + " more label(s)");
         }
 
         if (fields.TryGetProperty("notes"u8, out var notes)
             && notes.ValueKind == JsonValueKind.Array)
         {
-            var appended = 0;
-            var omitted = 0;
-            foreach (var note in notes.EnumerateArray())
-            {
-                if (note.ValueKind != JsonValueKind.String
-                    || NullIfWhiteSpace(note.GetString()) is not { } text)
-                    continue;
-                if (appended >= MaxNotesInMessage)
-                {
-                    omitted++;
-                    continue;
-                }
-                builder.Append("; note: ").Append(text);
-                appended++;
-            }
-            if (omitted > 0)
-                builder.Append("; +").Append(omitted).Append(" more note(s)");
+            AppendBoundedArray(
+                builder,
+                notes,
+                MaxNotesInMessage,
+                static element => element.ValueKind == JsonValueKind.String
+                    && NullIfWhiteSpace(element.GetString()) is { } text
+                    ? "note: " + text
+                    : null,
+                static detail => "; " + detail,
+                static omitted => "; +" + omitted + " more note(s)");
         }
 
         return new ExternalToolFinding(
@@ -192,6 +187,33 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
             Message: builder.ToString(),
             Path: null,
             Line: null);
+    }
+
+    private static void AppendBoundedArray(
+        StringBuilder builder,
+        JsonElement array,
+        int cap,
+        Func<JsonElement, string?> render,
+        Func<string, string> prefix,
+        Func<int, string> remainder)
+    {
+        var appended = 0;
+        var omitted = 0;
+        foreach (var element in array.EnumerateArray())
+        {
+            var detail = render(element);
+            if (detail is null)
+                continue;
+            if (appended >= cap)
+            {
+                omitted++;
+                continue;
+            }
+            builder.Append(prefix(detail));
+            appended++;
+        }
+        if (omitted > 0)
+            builder.Append(remainder(omitted));
     }
 
     private static string? BuildLabelDetail(JsonElement label)

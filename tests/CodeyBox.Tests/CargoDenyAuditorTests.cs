@@ -321,8 +321,10 @@ public sealed class CargoDenyAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "deny.exceptions.toml\n", ""));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, "", NdjsonClean));
         });
@@ -339,6 +341,93 @@ public sealed class CargoDenyAuditorTests
 
         Assert.True(result.Passed);
         Assert.NotNull(scanExec);
+    }
+
+    [Fact]
+    public async Task AdvisoryDataSourceOverride_FailsClosed_AsDeterministicInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+            {
+                if (IsAdvisoryContentProbe(exec))
+                    return Task.FromResult(new SandboxExecResult(0, "deny.toml\n", ""));
+                var requested = exec.Argv.Skip(4).ToList();
+                if (requested.Contains("deny.toml", StringComparer.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(0, "deny.toml\n", ""));
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, "", NdjsonClean));
+        });
+
+        IAuditor auditor = new CargoDenyAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("deny.toml", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task AdvisoryDataSourceOverride_SkippedWhenConfigPathPinned()
+    {
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, "", NdjsonClean));
+        });
+
+        var auditor = new CargoDenyAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigPath"] = "/baseline/deny.toml",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        Assert.Contains("--config", scanExec!.Argv, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task RepositoryCargoConfig_FailsClosed_AsDeterministicInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+            {
+                if (IsAdvisoryContentProbe(exec))
+                    return Task.FromResult(new SandboxExecResult(0, "", ""));
+                var requested = exec.Argv.Skip(4).ToList();
+                if (requested.Contains(".cargo/config.toml", StringComparer.Ordinal))
+                    return Task.FromResult(new SandboxExecResult(0, ".cargo/config.toml\n", ""));
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, "", NdjsonClean));
+        });
+
+        IAuditor auditor = new CargoDenyAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains(".cargo/config.toml", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
     }
 
     [Fact]
@@ -673,12 +762,15 @@ public sealed class CargoDenyAuditorTests
             && exec.Argv[2].Contains("-e", StringComparison.Ordinal)
             && !exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
+    private static bool IsAdvisoryContentProbe(SandboxExec exec)
+        => IsRepoFileProbe(exec) && exec.Argv[2].Contains("grep", StringComparison.Ordinal);
+
     private static async Task<string> SeedCargoDenyFixtureRepoAsync(bool bannedDep)
     {
         var dir = Path.Combine(
             Path.GetTempPath(), "codeybox-cargo-deny-fixture-" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(Path.Combine(dir, "denyme"));
-        Directory.CreateDirectory(Path.Combine(dir, "app"));
+        Directory.CreateDirectory(Path.Combine(dir, "denyme", "src"));
+        Directory.CreateDirectory(Path.Combine(dir, "app", "src"));
 
         // A path dependency keeps `cargo metadata` fully offline — no
         // registry index, no lockfile resolution against crates.io.
@@ -688,7 +780,7 @@ public sealed class CargoDenyAuditorTests
             version = "0.1.0"
             edition = "2021"
             """);
-        await File.WriteAllTextAsync(Path.Combine(dir, "denyme", "lib.rs"), "pub fn f() {}\n");
+        await File.WriteAllTextAsync(Path.Combine(dir, "denyme", "src", "lib.rs"), "pub fn f() {}\n");
 
         var depBlock = bannedDep
             ? "[dependencies]\ndenyme = { path = \"../denyme\" }\n"
@@ -701,7 +793,7 @@ public sealed class CargoDenyAuditorTests
 
             {{depBlock}}
             """);
-        await File.WriteAllTextAsync(Path.Combine(dir, "app", "lib.rs"), "pub fn g() {}\n");
+        await File.WriteAllTextAsync(Path.Combine(dir, "app", "src", "lib.rs"), "pub fn g() {}\n");
 
         var denyToml = bannedDep
             ? """
@@ -734,12 +826,18 @@ public sealed class CargoDenyAuditorTests
             };
             psi.ArgumentList.Add(argument);
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain both streams concurrently: a full stderr pipe would block
+            // the child on write while stdout stays open, deadlocking the
+            // synchronous read ahead of the timeout.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            Task.WhenAll(stdoutTask, stderrTask).Wait(TimeSpan.FromSeconds(5));
+            var stdout = stdoutTask.IsCompletedSuccessfully ? stdoutTask.Result : string.Empty;
             var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }

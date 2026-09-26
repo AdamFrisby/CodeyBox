@@ -54,7 +54,7 @@ namespace CodeyBox.CargoDenyAuditorPlugin;
 /// never a pass, never a finding.</para>
 ///
 /// <para><b>Repository-controlled suppression.</b> The audited repository's
-/// <c>deny.toml</c> (or <c>.deny.toml</c>/<c>.cargo/deny.toml</c>/<c>.config/deny.toml</c>)
+/// <c>deny.toml</c> (or <c>.deny.toml</c>/<c>.cargo/deny.toml</c>)
 /// is the policy contract under audit and is honored by default — weaken it
 /// and the audit reports against the weakened policy, which is visible in
 /// the diff; an operator who needs an org-fixed policy sets
@@ -81,8 +81,9 @@ namespace CodeyBox.CargoDenyAuditorPlugin;
 /// <para><b>Network.</b> The advisories check fetches the configured
 /// advisory databases (the RustSec advisory-db by default) and
 /// <c>cargo metadata</c> may reach the registry index, so the auditor
-/// declares <see cref="AuditCapabilities.Network"/> — the hosts must be in
-/// the deployment's <c>AuditToolAllowedHosts</c> egress list. Fully offline
+/// declares <see cref="AuditCapabilities.Network"/> unless <c>Offline</c> is
+/// set — the hosts must be in the deployment's
+/// <c>AuditToolAllowedHosts</c> egress list. Fully offline
 /// deployments pre-seed the advisory database (and cargo cache) into the
 /// baseline and set <c>Offline</c>; the declared capability permits egress,
 /// it does not force it.</para>
@@ -186,6 +187,19 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
         ".cargo/deny.exceptions.toml",
     ];
 
+    private static readonly string[] RepositoryPolicyFiles =
+    [
+        "deny.toml",
+        ".deny.toml",
+        ".cargo/deny.toml",
+    ];
+
+    private static readonly string[] RepositoryCargoConfigFiles =
+    [
+        ".cargo/config.toml",
+        ".cargo/config",
+    ];
+
     private static readonly IReadOnlySet<string> AllowedChecks =
         new HashSet<string>(StringComparer.Ordinal)
         {
@@ -219,7 +233,7 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
     public override string Name => "codeybox:cargo-deny";
 
     /// <inheritdoc />
-    public override AuditCapabilities Required => AuditCapabilities.Network;
+    public override AuditCapabilities Required => _offline() ? AuditCapabilities.None : AuditCapabilities.Network;
 
     /// <inheritdoc />
     protected override string ToolName => "cargo-deny";
@@ -266,7 +280,7 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
         if (invalid.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' has invalid Checks entries "
-                + $"('{string.Join("', '", invalid)}'); set CodeyBox:Plugins:{PluginId}:{ChecksKey} "
+                + $"('{TruncateForMessage(string.Join("', '", invalid))}'); set CodeyBox:Plugins:{PluginId}:{ChecksKey} "
                 + "to a comma-separated subset of advisories, bans, licenses, sources, all.")
             { IsDeterministic = true };
 
@@ -336,10 +350,23 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
     /// exceptions files (<c>deny.exceptions.toml</c> and dot variants) found
     /// beside the manifest on top of the configured policy — a
     /// repo-authored file that silently weakens the policy under audit.
-    /// Unless the operator opted in via
+    /// The same trust gate covers two further repo-controlled surfaces: a
+    /// repository <c>deny.toml</c> that overrides the advisory-database
+    /// source (<c>db-urls</c>/<c>db-path</c>/<c>git-fetch-with-cli</c>) can
+    /// point the scan at an attacker-chosen (e.g. empty) advisory database
+    /// and suppress every vulnerability finding, and a repository
+    /// <c>.cargo/config.toml</c> is loaded by the <c>cargo metadata</c>
+    /// invocation cargo-deny performs for graph resolution (source
+    /// replacement, custom registries, credential providers). Unless the
+    /// operator opted in via
     /// <see cref="TrustRepositorySuppressionKey"/>, their presence at the
     /// worktree root — or beside a configured <see cref="ManifestPathKey"/>
-    /// — fails closed as infrastructure before the scan runs.
+    /// — fails closed as infrastructure before the scan runs. Pinning an
+    /// operator-owned policy via <see cref="ConfigPathKey"/> removes the
+    /// repository <c>deny.toml</c> from the resolution chain, so the
+    /// advisory-source check is skipped then; the exceptions and cargo-config
+    /// gates still apply because those files layer on top of (or feed into)
+    /// even a pinned policy run.
     /// </summary>
     protected override async Task VerifyToolAsync(
         ISandbox sandbox,
@@ -351,20 +378,11 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
         if (_trustRepositorySuppression())
             return;
 
-        // cargo-deny resolves exceptions files walking UP from the manifest
-        // directory to the filesystem root, so every ancestor directory of a
-        // configured ManifestPath inside the worktree is a load site — probe
-        // them all (paths above the worktree are operator territory).
-        var candidates = new List<string>(RepositoryExceptionsFiles);
-        foreach (var dir in ManifestAncestors(_manifestPath()))
-        {
-            var prefix = dir + "/";
-            foreach (var file in RepositoryExceptionsFiles)
-                candidates.Add(prefix + file);
-        }
+        var manifestDirs = ManifestAncestors(_manifestPath()).Take(MaxManifestAncestors).ToList();
 
+        var exceptionCandidates = BuildCandidates(RepositoryExceptionsFiles, manifestDirs);
         var present = await ProbeRepositoryFilesPresentAsync(
-            sandbox, workingDirectory, tool, candidates, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, tool, exceptionCandidates, options, ct).ConfigureAwait(false);
         if (present.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled exceptions "
@@ -373,6 +391,46 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
                 + "could weaken the dependency policy it is audited against. Remove the file(s), "
                 + $"or set CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to "
                 + "trust repository-authored exceptions.")
+            { IsDeterministic = true };
+
+        var cargoConfigCandidates = BuildCandidates(RepositoryCargoConfigFiles, manifestDirs);
+        var cargoConfigs = await ProbeRepositoryFilesPresentAsync(
+            sandbox, workingDirectory, tool, cargoConfigCandidates, options, ct).ConfigureAwait(false);
+        if (cargoConfigs.Count > 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' found repository-controlled cargo config "
+                + $"file(s) '{string.Join("', '", cargoConfigs)}' in the audited repository — "
+                + "cargo-deny resolves the crate graph via `cargo metadata`, which loads that "
+                + "config (source replacement, registries, credential providers), so the audit "
+                + "subject could redirect dependency resolution. Remove the file(s), use "
+                + $"CodeyBox:Plugins:{PluginId}:{MetadataPathKey} to supply pre-generated "
+                + "metadata, or set "
+                + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to "
+                + "trust repository cargo config.")
+            { IsDeterministic = true };
+
+        if (!string.IsNullOrWhiteSpace(_configPath()))
+            return;
+
+        var policyCandidates = BuildCandidates(RepositoryPolicyFiles, manifestDirs);
+        var policies = await ProbeRepositoryFilesPresentAsync(
+            sandbox, workingDirectory, tool, policyCandidates, options, ct).ConfigureAwait(false);
+        if (policies.Count == 0)
+            return;
+
+        var overrides = await ProbeAdvisoryDataSourceOverridesAsync(
+            sandbox, workingDirectory, tool, policies, options, ct).ConfigureAwait(false);
+        if (overrides.Count > 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' found repository-controlled advisory "
+                + $"database source override(s) in '{string.Join("', '", overrides)}' — "
+                + "the [advisories] db-urls/db-path/git-fetch-with-cli keys redirect the "
+                + "vulnerability database, so the audit subject could suppress every advisory "
+                + "finding with an empty database. Remove the override(s), pin an "
+                + "operator-owned policy via "
+                + $"CodeyBox:Plugins:{PluginId}:{ConfigPathKey}, or set "
+                + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to "
+                + "trust repository policy data sources.")
             { IsDeterministic = true };
     }
 
@@ -388,8 +446,9 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
     {
         if (string.IsNullOrWhiteSpace(manifestPath))
             yield break;
-        var normalized = manifestPath.Trim().Replace('\\', '/').Trim('/');
-        if (manifestPath.Trim().StartsWith('/')
+        var trimmed = manifestPath.Trim();
+        var normalized = trimmed.Replace('\\', '/').Trim('/');
+        if (trimmed.StartsWith('/')
             || normalized.Length == 0
             || normalized.Split('/').Contains("..", StringComparer.Ordinal))
             yield break;
@@ -403,6 +462,84 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
             lastSlash = directory.LastIndexOf('/');
             normalized = directory;
         }
+    }
+
+    private const int MaxManifestAncestors = 32;
+    private const int MessageValueMaxChars = 64;
+
+    private const string AdvisoryDataSourceProbeScript =
+        "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then "
+        + "if grep -q -i -E 'db-urls|db_urls|db-path|db_path|git-fetch-with-cli|git_fetch_with_cli' \"./$f\" 2>/dev/null; then "
+        + "printf '%s\\n' \"$f\"; fi; fi; done; exit 0";
+
+    private static List<string> BuildCandidates(string[] baseFiles, List<string> manifestDirs)
+    {
+        var candidates = new List<string>(baseFiles.Length * (manifestDirs.Count + 1));
+        candidates.AddRange(baseFiles);
+        foreach (var dir in manifestDirs)
+        {
+            var prefix = dir + "/";
+            foreach (var file in baseFiles)
+                candidates.Add(prefix + file);
+        }
+        return candidates.Distinct(StringComparer.Ordinal).ToList();
+    }
+
+    private static async Task<IReadOnlyList<string>> ProbeAdvisoryDataSourceOverridesAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> policyFiles,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var argv = new List<string>(policyFiles.Count + 4) { "sh", "-c", AdvisoryDataSourceProbeScript, "sh" };
+        argv.AddRange(policyFiles);
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "suppression check",
+            new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
+                + "transport was unavailable.");
+        if (result.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-file "
+                + $"absence (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
+                + "that the files are absent.",
+                result.ExitCode,
+                result.Stdout + "\n" + result.Stderr);
+
+        var expected = new HashSet<string>(policyFiles, StringComparer.Ordinal);
+        var matched = new List<string>();
+        foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (expected.Contains(line))
+                matched.Add(line);
+        }
+        return matched;
+    }
+
+    private static string TruncateForMessage(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "(empty)";
+        var single = SingleLine(value);
+        return single.Length > MessageValueMaxChars
+            ? single[..MessageValueMaxChars] + "…"
+            : single;
     }
 
     private static void AddPathFlag(List<string> args, string flag, string? value)

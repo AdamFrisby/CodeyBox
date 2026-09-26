@@ -90,13 +90,19 @@ Both reach baseline provisioning only while the plugin is enabled.
 ## Policy configuration and repository-controlled files
 
 cargo-deny resolves policy from `deny.toml` (or `.deny.toml`,
-`.cargo/deny.toml`, `.config/deny.toml`), discovered beside the manifest and
+`.cargo/deny.toml`), discovered beside the manifest and
 walking upward. By default the audited repository's own policy is the
 contract being verified — weakening it is visible in the diff. An operator
 who needs a fixed organizational policy sets `ConfigPath` to a config
 provisioned outside the repository (note the upward walk can also pick up a
 `deny.toml` above the worktree when none exists inside it — pin `ConfigPath`
-to eliminate that).
+to eliminate that). A repository policy that overrides the advisory-database
+source (`db-urls`/`db-path`/`git-fetch-with-cli` under `[advisories]`) fails
+closed as infrastructure unless `TrustRepositorySuppression: true` is set or
+`ConfigPath` pins an operator-owned policy, because it could point the scan
+at an empty database and suppress every advisory finding. Likewise a
+repository `.cargo/config.toml` (or `.cargo/config`) fails closed: it feeds
+the `cargo metadata` graph resolution cargo-deny performs.
 
 `deny.exceptions.toml` (and `.deny.exceptions.toml`,
 `.cargo/deny.exceptions.toml`) are cargo-deny's local-override files: they add
