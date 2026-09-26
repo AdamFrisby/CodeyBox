@@ -957,6 +957,7 @@ public sealed class DaytonaSandboxProviderTests
         // Loopback TCP server speaking just enough HTTP-upgrade to capture the
         // handshake headers the real socket sends — no live network.
         var listener = new TcpListener(IPAddress.Loopback, 0);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         string? authorization = null;
         string? organization = null;
         Task serves = Task.CompletedTask;
@@ -966,16 +967,19 @@ public sealed class DaytonaSandboxProviderTests
             var port = ((IPEndPoint)listener.LocalEndpoint).Port;
             serves = Task.Run(async () =>
             {
-                using var client = await listener.AcceptTcpClientAsync();
+                using var client = await listener.AcceptTcpClientAsync(cts.Token);
                 using var stream = client.GetStream();
                 var request = new StringBuilder();
                 var buffer = new byte[4096];
                 string key = string.Empty;
                 int read;
-                while ((read = await stream.ReadAsync(buffer)) > 0
-                    && !request.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                while ((read = await stream.ReadAsync(buffer, cts.Token)) > 0)
                 {
                     request.Append(Encoding.ASCII.GetString(buffer, 0, read));
+                    if (request.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                        break;
+                    if (request.Length > 65536)
+                        throw new InvalidOperationException("Handshake headers exceeded 64 KiB.");
                 }
                 foreach (var line in request.ToString().Split("\r\n", StringSplitOptions.None))
                 {
@@ -993,14 +997,25 @@ public sealed class DaytonaSandboxProviderTests
                     "Upgrade: websocket\r\n" +
                     "Connection: Upgrade\r\n" +
                     "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
-                await stream.WriteAsync(Encoding.ASCII.GetBytes(response));
-                while (await stream.ReadAsync(buffer) > 0) { }
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(response), cts.Token);
+                try
+                {
+                    while (await stream.ReadAsync(buffer, cts.Token) > 0) { }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Test teardown: the client socket is gone with the timeout.
+                }
+                catch (IOException)
+                {
+                    // Client abort (RST) surfaces as a reset, not a clean FIN.
+                }
             });
 
             {
                 await using var socket = new ClientWebSocketDaytonaWebSocket();
                 await socket.ConnectAsync(
-                    new Uri($"ws://127.0.0.1:{port}/logs?follow=true"), "ws-test-token", "org-1", CancellationToken.None);
+                    new Uri($"ws://127.0.0.1:{port}/logs?follow=true"), "ws-test-token", "org-1", cts.Token);
                 Assert.Equal(WebSocketState.Open, socket.State);
                 Assert.Equal("Bearer ws-test-token", authorization);
                 Assert.Equal("org-1", organization);
@@ -1011,6 +1026,30 @@ public sealed class DaytonaSandboxProviderTests
         finally
         {
             listener.Stop();
+            if (!serves.IsCompleted)
+            {
+                await cts.CancelAsync();
+                try
+                {
+                    await serves;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Server task was still parked in accept/read at teardown.
+                }
+                catch (IOException)
+                {
+                    // Listener stop tore down a connection mid-handshake.
+                }
+                catch (SocketException)
+                {
+                    // Listener stop aborted a pending accept.
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Listener stop raced a pending accept.
+                }
+            }
         }
     }
 
