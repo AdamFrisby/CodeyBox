@@ -71,9 +71,8 @@ internal sealed class CargoSemverChecksReportParser : IExternalToolOutputParser
         var failureSections = 0;
         ParseState? state = null;
 
-        foreach (var rawLine in SplitLines(input.Stdout))
+        foreach (var line in SplitLines(input.Stdout))
         {
-            var line = rawLine.TrimEnd('\r');
             var header = SectionHeader.Match(line);
             if (header.Success)
             {

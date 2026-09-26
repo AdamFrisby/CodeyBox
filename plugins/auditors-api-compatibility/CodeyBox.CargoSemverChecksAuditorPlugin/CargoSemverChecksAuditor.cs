@@ -91,7 +91,12 @@ namespace CodeyBox.CargoSemverChecksAuditorPlugin;
 /// whitespace-padded dots, a dotted key under a parent header,
 /// unicode escapes, inline tables) all collapse to the same JSON key, and
 /// <c>--no-deps</c> scopes the probe to the workspace manifests the tool
-/// actually consults — vendored or fixture manifests carry no weight.
+/// actually consults — vendored or fixture manifests carry no weight. The
+/// probe runs <c>cargo metadata</c> against the same manifest the scan will
+/// consult — the scoped <c>ManifestPath</c> key or a
+/// <c>--manifest-path</c> in <c>ExtraArguments</c>, resolved once and
+/// shared by every gate — so a lint table in whichever manifest the tool
+/// actually reads cannot evade it.
 /// Operators who deliberately trust repo-authored lint config set
 /// <c>TrustRepositorySuppression</c>. Note the table only controls lint
 /// levels — it cannot add findings, so trusting it trades suppression for
@@ -108,7 +113,11 @@ namespace CodeyBox.CargoSemverChecksAuditorPlugin;
 /// generated trees. A repository without a root <c>Cargo.toml</c> fails
 /// closed with a deterministic infrastructure error pointing at
 /// <c>ManifestPath</c> — enabling this auditor on a non-Rust project is a
-/// misconfiguration, and a loud one, not a silent skip.</para>
+/// misconfiguration, and a loud one, not a silent skip. The crate under
+/// audit can be pointed elsewhere by the scoped <c>ManifestPath</c> key or
+/// a <c>--manifest-path</c> flag in <c>ExtraArguments</c>; both gates above
+/// follow whichever channel supplies it, and setting both is a
+/// deterministic configuration failure.</para>
 ///
 /// <para><b>Runtime and network.</b> The check builds rustdoc JSON for the
 /// baseline and current crates — a full dependency compile of repo-authored
@@ -196,6 +205,7 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
     private const string BaselineVersionFlag = "--baseline-version";
     private const string BaselineRootFlag = "--baseline-root";
     private const string BaselineRustdocFlag = "--baseline-rustdoc";
+    private const string ManifestPathFlag = "--manifest-path";
 
     // Exit contract of the suppression probe: cargo metadata parses the
     // workspace manifests with cargo's own TOML parser and echoes every
@@ -206,12 +216,23 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
     // inline tables) all collapse to the same JSON key, and --no-deps
     // scopes the probe to the workspace manifests the tool actually
     // consults (vendored, fixture, and excluded manifests carry no weight).
-    // 0 = the token was found (suppression present), 1 = confirmed clean,
+    // The token is searched across the whole normalized document, so ANY
+    // occurrence trips the gate — including false positives like a member
+    // or dependency named 'cargo-semver-checks', the substring in a
+    // package's description/keywords/categories, or a checkout path that
+    // contains it. Over-match is the sanctioned fail-closed posture;
+    // operators on such a repo set TrustRepositorySuppression. 0 = the
+    // token was found (suppression present), 1 = confirmed clean,
     // 3 = cargo could not parse the workspace — anything but 0/1 is "could
     // not confirm", never evidence of absence. The JSON never reaches this
     // process's stdout: grep -q folds it into the exit code, so no
-    // repo-controlled bytes are echoed into the verdict. "$@" forwards the
-    // optional --manifest-path pair as argv entries, never through string
+    // repo-controlled bytes are echoed into the verdict. Note the stream
+    // cap bounds only what returns to the host — the command substitution
+    // buffers cargo's full metadata document in the probe shell's memory
+    // inside the sandbox, so a pathological manifest can kill the probe
+    // (still fail-closed: a dead probe is "could not confirm", never a
+    // pass). "$@" forwards the effective --manifest-path pair — whichever
+    // channel supplied it — as argv entries, never through string
     // interpolation.
     private const string SuppressionProbeScript =
         "metadata=$(cargo metadata --no-deps --format-version 1 \"$@\") || exit 3; "
@@ -304,14 +325,13 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
         if (set.Count > 1 || (set.Count == 1 && operatorBaseline))
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' has more than one baseline configured "
-                + $"({string.Join(", ", set.Select(e => e.Flag))}"
+                + $"({string.Join(", ", set.Select(e => e.Key))}"
                 + (operatorBaseline ? " plus an ExtraArguments --baseline-* flag" : string.Empty)
-                + $") — set exactly one of CodeyBox:Plugins:{PluginId}:{BaselineRevKey} / "
-                + $"{BaselineVersionKey} / {BaselineRootKey} / {BaselineRustdocKey}, or pass one "
+                + $") — set exactly one of {BaselineKeysList}, or pass one "
                 + "--baseline-* flag via ExtraArguments.")
             { IsDeterministic = true };
         if (set.Count == 1)
-            return [set[0].Flag, ValidatedScopedValue(set[0].Value!, set[0].Flag)];
+            return [set[0].Flag, ValidatedArgumentValue(set[0].Value!, set[0].Key)];
         if (operatorBaseline)
             return [];
 
@@ -324,20 +344,13 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
         var args = new List<string> { "check-release", "--color", "never" };
-        var manifestPath = ValidatedScopedPath(_manifestPath(), ManifestPathKey);
-        if (manifestPath is not null)
-        {
-            // A second --manifest-path from ExtraArguments would silently
-            // override the scoped key at the clap layer — surface the
-            // duplicated knob deterministically instead.
-            if (ExtraArgumentsSupplyFlag(options, "--manifest-path"))
-                throw new AuditUnavailableException(
-                    $"could-not-verify: auditor '{Name}' has --manifest-path configured in both "
-                    + $"CodeyBox:Plugins:{PluginId}:{ManifestPathKey} and ExtraArguments — set it "
-                    + "in exactly one place.")
-                { IsDeterministic = true };
-            args.AddRange(["--manifest-path", manifestPath]);
-        }
+        // The scan must consult the same manifest the suppression probe and
+        // root-presence gate resolved: an ExtraArguments --manifest-path is
+        // appended verbatim by the base, so only the scoped key's value is
+        // emitted here.
+        if (EffectiveManifestPath(options, out var fromScopedKey) is { } manifestPath
+            && fromScopedKey)
+            args.AddRange([ManifestPathFlag, manifestPath]);
         return args;
     }
 
@@ -362,11 +375,13 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
 
     /// <summary>
     /// cargo-semver-checks-specific preconditions on the live path: a root
-    /// <c>Cargo.toml</c> must exist (unless <c>ManifestPath</c> points the
-    /// tool elsewhere), and — unless the operator opted in — no manifest the
-    /// workspace consults may carry a <c>cargo-semver-checks</c> lint table
-    /// the audit subject could use to downgrade or silence lints. Both fail
-    /// closed as deterministic infrastructure before the scan runs.
+    /// <c>Cargo.toml</c> must exist (unless the effective manifest path —
+    /// <c>ManifestPath</c> or an ExtraArguments <c>--manifest-path</c> —
+    /// points the tool elsewhere), and — unless the operator opted in — no
+    /// manifest the workspace consults may carry a
+    /// <c>cargo-semver-checks</c> lint table the audit subject could use to
+    /// downgrade or silence lints. Both fail closed as deterministic
+    /// infrastructure before the scan runs.
     /// </summary>
     protected override async Task VerifyToolAsync(
         ISandbox sandbox,
@@ -375,7 +390,7 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(_manifestPath()))
+        if (EffectiveManifestPath(options, out _) is null)
         {
             var present = await ProbeRepositoryFilesPresentAsync(
                 sandbox,
@@ -412,7 +427,7 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
 
         try
         {
-            Validation.ValidateBranchName(baseBranch!, nameof(context.BaseBranch));
+            Validation.ValidateBranchName(baseBranch, nameof(context.BaseBranch));
         }
         catch (ArgumentException ex)
         {
@@ -422,14 +437,14 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
             { IsDeterministic = true };
         }
 
-        var baseBranchDisplay = SingleLine(baseBranch!);
+        var baseBranchDisplay = SingleLine(baseBranch);
 
         // The work item's base branch is the previous public API state.
         // origin/<base> is the sandbox clone's canonical ref (the pipeline's
         // own diff auditors use origin/<base>...HEAD); the bare name covers
         // layouts that only carry a local branch.
         string? baseSha = null;
-        foreach (var candidate in new[] { $"origin/{baseBranch}", baseBranch! })
+        foreach (var candidate in new[] { $"origin/{baseBranch}", baseBranch })
         {
             var probe = await GitProbeAsync(
                 sandbox,
@@ -512,9 +527,12 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
         CancellationToken ct)
     {
         var argv = new List<string> { "sh", "-c", SuppressionProbeScript, "sh" };
-        var manifestPath = ValidatedScopedPath(_manifestPath(), ManifestPathKey);
-        if (manifestPath is not null)
-            argv.AddRange(["--manifest-path", manifestPath]);
+        // Probe the same manifest the scan will consult — the gate must
+        // cover whichever channel (scoped key or ExtraArguments) supplies
+        // --manifest-path, or a lint table in the pointed-to manifest would
+        // be honored by the tool but never inspected.
+        if (EffectiveManifestPath(options, out _) is { } manifestPath)
+            argv.AddRange([ManifestPathFlag, manifestPath]);
 
         var result = await ExecToolBoundedAsync(
             sandbox,
@@ -554,17 +572,94 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
                 result.Stdout + "\n" + result.Stderr);
     }
 
-    private List<(string Flag, string? Value)> ConfiguredBaselines() =>
+    /// <summary>
+    /// The manifest path the scan will actually consult: the scoped
+    /// <see cref="ManifestPathKey"/> value, or an operator-supplied
+    /// <c>--manifest-path</c> in <c>ExtraArguments</c>. Both channels at once
+    /// are a deterministic configuration failure (a second flag would
+    /// silently override at the clap layer); an ExtraArguments flag with no
+    /// usable value fails the same way. The root presence check, the
+    /// suppression probe, and the scan argv all resolve through this so
+    /// they can never disagree about which manifest the tool reads.
+    /// </summary>
+    /// <param name="fromScopedKey">
+    /// True when the returned value came from the scoped key — callers
+    /// emitting the flag themselves must not re-emit an
+    /// ExtraArguments-supplied one (the base appends those verbatim).
+    /// </param>
+    private string? EffectiveManifestPath(ExternalToolAuditorOptions options, out bool fromScopedKey)
+    {
+        var scoped = ValidatedScopedPath(_manifestPath(), ManifestPathKey);
+        var extraSupplied = TryGetExtraArgumentsFlagValue(options, ManifestPathFlag, out var extra);
+        fromScopedKey = scoped is not null;
+        if (scoped is not null && extraSupplied)
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' has --manifest-path configured in both "
+                + $"CodeyBox:Plugins:{PluginId}:{ManifestPathKey} and ExtraArguments — set it "
+                + "in exactly one place.")
+            { IsDeterministic = true };
+        if (scoped is not null || !extraSupplied)
+            return scoped;
+        if (extra is null)
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' ExtraArguments supplies '{ManifestPathFlag}' "
+                + "with no following value — pass it as '--manifest-path <path>' or "
+                + "'--manifest-path=<path>'.")
+            { IsDeterministic = true };
+        return ValidatedArgumentValue(extra, $"ExtraArguments '{ManifestPathFlag}'");
+    }
+
+    /// <summary>
+    /// Extracts the value an operator's <c>ExtraArguments</c> supplies for a
+    /// long-form flag — the entry following a bare <c>--flag</c>, or the
+    /// text after <c>--flag=</c>, the same spellings
+    /// <see cref="ExtraArgumentsSupplyFlag"/> recognizes. The last
+    /// occurrence wins; a bare trailing flag yields a null value (the tool
+    /// would reject it — callers validate). Returns false when the flag is
+    /// absent.
+    /// </summary>
+    private static bool TryGetExtraArgumentsFlagValue(
+        ExternalToolAuditorOptions options,
+        string flag,
+        out string? value)
+    {
+        value = null;
+        var supplied = false;
+        var attachedPrefix = flag + "=";
+        var extraArguments = options.ExtraArguments;
+        for (var i = 0; i < extraArguments.Count; i++)
+        {
+            var arg = extraArguments[i];
+            if (string.Equals(arg, flag, StringComparison.Ordinal))
+            {
+                supplied = true;
+                value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
+            }
+            else if (arg.StartsWith(attachedPrefix, StringComparison.Ordinal))
+            {
+                supplied = true;
+                value = arg[attachedPrefix.Length..];
+            }
+        }
+        return supplied;
+    }
+
+    private List<(string Key, string Flag, string? Value)> ConfiguredBaselines() =>
     [
-        (BaselineRevFlag, _baselineRev()),
-        (BaselineVersionFlag, _baselineVersion()),
-        (BaselineRootFlag, _baselineRoot()),
-        (BaselineRustdocFlag, _baselineRustdoc()),
+        (BaselineRevKey, BaselineRevFlag, _baselineRev()),
+        (BaselineVersionKey, BaselineVersionFlag, _baselineVersion()),
+        (BaselineRootKey, BaselineRootFlag, _baselineRoot()),
+        (BaselineRustdocKey, BaselineRustdocFlag, _baselineRustdoc()),
     ];
 
-    private string BaselineConfigHint
-        => $"Set one of CodeyBox:Plugins:{PluginId}:{BaselineRevKey} / {BaselineVersionKey} / "
-            + $"{BaselineRootKey} / {BaselineRustdocKey}, or pass one --baseline-* flag via "
+    // The shared enumeration of the four baseline keys — one source of
+    // truth so error messages cannot drift apart when a knob is added.
+    private static string BaselineKeysList
+        => $"CodeyBox:Plugins:{PluginId}:{BaselineRevKey} / {BaselineVersionKey} / "
+            + $"{BaselineRootKey} / {BaselineRustdocKey}";
+
+    private static string BaselineConfigHint
+        => $"Set one of {BaselineKeysList}, or pass one --baseline-* flag via "
             + "ExtraArguments, to pin the baseline explicitly.";
 
     private AuditUnavailableException NoBaselineConfigured()
@@ -578,16 +673,18 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
     {
         if (string.IsNullOrWhiteSpace(value))
             return null;
-        return ValidatedScopedValue(value, key);
+        return ValidatedArgumentValue(value, key);
     }
 
     /// <summary>
-    /// Validates a scoped-config value that travels to the tool as an argv
+    /// Validates a configured value that travels to the tool as an argv
     /// entry: bounded length, no leading dash (it would be read as another
-    /// flag), no control characters. Values are never concatenated into a
-    /// shell string — this only guards the argv contract.
+    /// flag), no control characters. <paramref name="source"/> names the
+    /// knob that supplied the value for the failure message. Values are
+    /// never concatenated into a shell string — this only guards the argv
+    /// contract.
     /// </summary>
-    private static string ValidatedScopedValue(string value, string key)
+    private static string ValidatedArgumentValue(string value, string source)
     {
         var trimmed = value.Trim();
         const int maxChars = 1024;
@@ -595,7 +692,7 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
             || trimmed[0] == '-'
             || trimmed.Any(char.IsControl))
             throw new AuditUnavailableException(
-                $"could-not-verify: scoped config '{key}' is not a usable argument value "
+                $"could-not-verify: configured '{source}' is not a usable argument value "
                 + "(empty, overlong, leading '-', or contains control characters).")
             { IsDeterministic = true };
         return trimmed;

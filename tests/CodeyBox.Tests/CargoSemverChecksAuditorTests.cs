@@ -559,6 +559,88 @@ public sealed class CargoSemverChecksAuditorTests
         Assert.True(index >= 0 && probe.Argv[index + 1] == "rust/member/Cargo.toml");
     }
 
+    [Theory]
+    [InlineData("--manifest-path=rust/member/Cargo.toml")]
+    [InlineData("--manifest-path,rust/member/Cargo.toml")]
+    public async Task ExtraArgumentsManifestPath_ProbesSameManifest_AsScan(string extraArguments)
+    {
+        var manifestProbes = 0;
+        SandboxExec? suppressionProbe = null;
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsManifestProbe(exec))
+                manifestProbes++;
+            if (IsSuppressionProbe(exec))
+                suppressionProbe = exec;
+            if (IsScanExec(exec))
+            {
+                scanExec = exec;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            return Task.FromResult(Ok(exec));
+        });
+
+        var auditor = new CargoSemverChecksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = extraArguments,
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        // An operator-supplied --manifest-path skips the root Cargo.toml
+        // presence check exactly like the scoped ManifestPath key.
+        Assert.Equal(0, manifestProbes);
+        Assert.NotNull(suppressionProbe);
+        Assert.NotNull(scanExec);
+        // Probe and scan must agree on the manifest: the suppression gate
+        // covers the same manifest cargo-semver-checks reads lint config
+        // from, whichever argv spelling carried it.
+        var probeIndex = suppressionProbe!.Argv.ToList().IndexOf("--manifest-path");
+        Assert.True(probeIndex >= 0);
+        Assert.Equal("rust/member/Cargo.toml", suppressionProbe.Argv[probeIndex + 1]);
+        var scanIndex = scanExec!.Argv.ToList().IndexOf("--manifest-path");
+        if (scanIndex >= 0)
+        {
+            Assert.Equal("rust/member/Cargo.toml", scanExec.Argv[scanIndex + 1]);
+        }
+        else
+        {
+            Assert.Contains("--manifest-path=rust/member/Cargo.toml", scanExec.Argv);
+        }
+    }
+
+    [Fact]
+    public async Task ExtraArgumentsManifestPath_WithoutValue_IsDeterministicInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(Ok(exec));
+        });
+
+        var auditor = new CargoSemverChecksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--manifest-path",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("manifest-path", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
     [Fact]
     public async Task ExtraArgumentsBaseline_DefersToOperator_AndSkipsGitProbes()
     {
@@ -920,7 +1002,11 @@ public sealed class CargoSemverChecksAuditorTests
         // The change under audit lives on a feature branch so the merge-base
         // with main is the v1 commit — the baseline public API.
         await RunGitAsync(dir, "checkout", "-b", "feature");
-        await WriteCrateAsync("0.2.0", withGone: !breaking);
+        // The version stays at 0.1.0: under cargo semver rules a 0.x minor
+        // bump (0.1.0 -> 0.2.0) is the major-equivalent, so bumping it would
+        // satisfy the lints' required update and mask the unresolved
+        // breakage this fixture exists to produce.
+        await WriteCrateAsync("0.1.0", withGone: !breaking);
         await RunGitAsync(dir, "add", "-A");
         await RunGitAsync(dir, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "v2");
         return dir;
