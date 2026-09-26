@@ -131,6 +131,97 @@ public sealed class ShellCommandAuditorTransportTests
     }
 
     [Fact]
+    public async Task ExecutionUnavailable_NonZeroExit_IsRetried_NotAFinding()
+    {
+        // The observed production shape: the exec channel dropped mid-command,
+        // the transport exited 1 (not 255) carrying the abnormal-closure
+        // diagnostic, and the sandbox flagged the exec ExecutionUnavailable —
+        // no verdict existed to attribute to the diff.
+        var commandExecs = 0;
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+            TreatExit127AsMissingTool = false,
+            TransportRetryBaseDelay = TimeSpan.Zero,
+        });
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+            commandExecs++;
+            return commandExecs == 1
+                ? new SandboxExecResult(1, "", TransportDiagnostic, ExecutionUnavailable: true)
+                : new SandboxExecResult(0, "Passed!\n", "");
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+        Assert.Equal(2, commandExecs);
+    }
+
+    [Fact]
+    public async Task ExecutionUnavailable_WithoutTransportDiagnostic_IsRetriedToInfrastructure()
+    {
+        // The provider's flag is authoritative on its own: the command's exit
+        // was never observed, whatever the captured streams look like.
+        const int maxAttempts = 3;
+        var commandExecs = 0;
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+            TreatExit127AsMissingTool = false,
+            TransportRetryMaxAttempts = maxAttempts,
+            TransportRetryBaseDelay = TimeSpan.Zero,
+        });
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+            commandExecs++;
+            return new SandboxExecResult(1, "", "exec channel lost before exit report", ExecutionUnavailable: true);
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Equal(maxAttempts, commandExecs);
+        Assert.False(ex.IsDeterministic);
+        Assert.Equal(1, ex.ExitCode);
+        Assert.Contains("could not run", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ToolPresenceProbe_ExecutionUnavailable_IsInfrastructure_NotMissingTool()
+    {
+        // A dropped channel on the presence probe never checked the tool:
+        // reporting "tool not installed" would misattribute a transport
+        // failure to provisioning.
+        var commandExecs = 0;
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:test-pass",
+            Argv = ["dotnet", "test", "--no-build"],
+            TransportRetryBaseDelay = TimeSpan.Zero,
+        });
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(255, "", TransportDiagnostic, ExecutionUnavailable: true);
+            commandExecs++;
+            return new SandboxExecResult(0, "Passed!\n", "");
+        });
+
+        await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Equal(0, commandExecs);
+    }
+
+    [Fact]
     public async Task TransportFailureExhaustion_ThrowsInfrastructureFailure_WithNoFinding()
     {
         const int maxAttempts = 3;

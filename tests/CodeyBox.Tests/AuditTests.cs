@@ -370,29 +370,37 @@ public sealed class AuditTests
     }
 
     [Fact]
-    public async Task ShellCommandAuditor_FailsWhenExecutionUnavailableEvenWithZeroExit()
+    public async Task ShellCommandAuditor_ExecutionUnavailableEvenWithZeroExit_IsInfrastructureNotAPassOrFinding()
     {
+        // ExecutionUnavailable means the command's verdict was never observed
+        // — an exit 0 here is the transport's, not the command's. It must not
+        // pass, and it must not record a code finding: bounded retries exhaust
+        // into AuditUnavailableException.
+        var commandExecs = 0;
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
         {
             Name = "lint",
             Argv = ["lint"],
+            TransportRetryBaseDelay = TimeSpan.Zero,
         });
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
-                ? new SandboxExecResult(0, "/usr/bin/lint\n", "")
-                : new SandboxExecResult(
-                    0,
-                    "",
-                    "sandbox process launcher unavailable",
-                    ExecutionUnavailable: true));
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/lint\n", "");
+            commandExecs++;
+            return new SandboxExecResult(
+                0,
+                "",
+                "sandbox process launcher unavailable",
+                ExecutionUnavailable: true);
+        });
 
-        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
-        Assert.False(result.Passed);
-        var finding = Assert.Single(result.Findings);
-        Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Equal("command exited 0", finding.Title);
-        Assert.Contains("sandbox process launcher unavailable", finding.Description, StringComparison.Ordinal);
+        Assert.False(ex.IsDeterministic);
+        Assert.Equal(3, commandExecs);
+        Assert.Contains("could not run", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
