@@ -368,7 +368,7 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
     /// gates still apply because those files layer on top of (or feed into)
     /// even a pinned policy run.
     /// </summary>
-    protected override async Task VerifyToolAsync(
+    protected override async Task<IReadOnlyList<ExternalToolFinding>> VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
@@ -376,13 +376,14 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
         CancellationToken ct)
     {
         if (_trustRepositorySuppression())
-            return;
+            return [];
 
         var manifestDirs = ManifestAncestors(_manifestPath()).Take(MaxManifestAncestors).ToList();
 
         var exceptionCandidates = BuildCandidates(RepositoryExceptionsFiles, manifestDirs);
         var present = await ProbeRepositoryFilesPresentAsync(
-            sandbox, workingDirectory, tool, "suppression check", exceptionCandidates, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, tool, "suppression check", exceptionCandidates,
+            RepositoryFileProbe.Present, options, ct).ConfigureAwait(false);
         if (present.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled exceptions "
@@ -395,7 +396,8 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
 
         var cargoConfigCandidates = BuildCandidates(RepositoryCargoConfigFiles, manifestDirs);
         var cargoConfigs = await ProbeRepositoryFilesPresentAsync(
-            sandbox, workingDirectory, tool, "suppression check", cargoConfigCandidates, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, tool, "suppression check", cargoConfigCandidates,
+            RepositoryFileProbe.Present, options, ct).ConfigureAwait(false);
         if (cargoConfigs.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled cargo config "
@@ -410,13 +412,14 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
             { IsDeterministic = true };
 
         if (!string.IsNullOrWhiteSpace(_configPath()))
-            return;
+            return [];
 
         var policyCandidates = BuildCandidates(RepositoryPolicyFiles, manifestDirs);
         var policies = await ProbeRepositoryFilesPresentAsync(
-            sandbox, workingDirectory, tool, "suppression check", policyCandidates, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, tool, "suppression check", policyCandidates,
+            RepositoryFileProbe.Present, options, ct).ConfigureAwait(false);
         if (policies.Count == 0)
-            return;
+            return [];
 
         var overrides = await ProbeAdvisoryDataSourceOverridesAsync(
             sandbox, workingDirectory, tool, policies, options, ct).ConfigureAwait(false);
@@ -432,6 +435,8 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
                 + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to "
                 + "trust repository policy data sources.")
             { IsDeterministic = true };
+
+        return [];
     }
 
     /// <summary>

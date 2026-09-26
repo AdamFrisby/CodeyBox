@@ -208,6 +208,85 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
+    public async Task ErrorFindingBeyondMaxFindings_StillFailsTheAudit()
+    {
+        // The findings cap is a display bound, not a severity eraser: an
+        // error-severity finding pushed past MaxFindings must still fail the
+        // audit, or a flood of advisory findings could forge a pass.
+        const string warningThenError = """
+            {
+              "version": "2.1.0",
+              "runs": [{
+                "results": [
+                  {
+                    "ruleId": "warn-rule",
+                    "level": "warning",
+                    "message": { "text": "Advisory." },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "a.js" }, "region": { "startLine": 1 } } }]
+                  },
+                  {
+                    "ruleId": "error-rule",
+                    "level": "error",
+                    "message": { "text": "Dropped by the cap." },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "b.js" }, "region": { "startLine": 2 } } }]
+                  }
+                ]
+              }]
+            }
+            """;
+        var options = new ExternalToolAuditorOptions
+        {
+            FindingsExitCodes = new HashSet<int> { 0 },
+            MaxFindings = 1,
+        };
+
+        var result = await new TestToolAuditor(options).RunAsync(
+            ToolReturning(0, warningThenError, ""), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
+        Assert.Contains("error-severity", result.RawOutput, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AdvisoryFindingsBeyondMaxFindings_StillPass()
+    {
+        const string twoWarnings = """
+            {
+              "version": "2.1.0",
+              "runs": [{
+                "results": [
+                  {
+                    "ruleId": "warn-a",
+                    "level": "warning",
+                    "message": { "text": "First." },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "a.js" }, "region": { "startLine": 1 } } }]
+                  },
+                  {
+                    "ruleId": "warn-b",
+                    "level": "warning",
+                    "message": { "text": "Second." },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "b.js" }, "region": { "startLine": 2 } } }]
+                  }
+                ]
+              }]
+            }
+            """;
+        var options = new ExternalToolAuditorOptions
+        {
+            FindingsExitCodes = new HashSet<int> { 0 },
+            MaxFindings = 1,
+        };
+
+        var result = await new TestToolAuditor(options).RunAsync(
+            ToolReturning(0, twoWarnings, ""), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Single(result.Findings);
+    }
+
+    [Fact]
     public async Task CleanRun_Passes_WithNoFindings()
     {
         var sandbox = ToolReturning(0, """{ "version": "2.1.0", "runs": [] }""", "");
@@ -391,7 +470,8 @@ public sealed class ExternalToolAuditorTests
         public Task<IReadOnlyList<string>> ProbeAsync(
             ISandbox sandbox, IReadOnlyList<string> paths, CancellationToken ct)
             => ProbeRepositoryFilesPresentAsync(
-                sandbox, "/work", ToolName, "suppression check", paths, new ExternalToolAuditorOptions(), ct);
+                sandbox, "/work", ToolName, "suppression check", paths,
+                RepositoryFileProbe.Present, new ExternalToolAuditorOptions(), ct);
 
         public static bool SuppliesFlag(ExternalToolAuditorOptions options, params string[] flags)
             => ExtraArgumentsSupplyFlag(options, flags);

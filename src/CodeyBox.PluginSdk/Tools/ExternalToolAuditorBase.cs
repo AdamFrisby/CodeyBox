@@ -36,13 +36,18 @@ public abstract class ExternalToolAuditorBase : IAuditor
         @"\d+\.\d+\.\d+[\w.\-]*",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
-    // Each candidate is probed with -e (exists) and -L (symlink — catches a
-    // dangling symlink that -e would miss) and echoed when present; the
-    // script always exits 0 once it completes, so the exit code carries only
-    // probe health while stdout carries the verdict. The "./" prefix keeps a
-    // leading-dash name from being read as a test operator.
+    // Each candidate is probed with the mode's test and echoed when it
+    // matches; the script always exits 0 once it completes, so the exit code
+    // carries only probe health while stdout carries the verdict. The "./"
+    // prefix keeps a leading-dash name from being read as a test operator.
     private const string RepositoryFilePresenceScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then printf '%s\\n' \"$f\"; fi; done; exit 0";
+
+    // -L only: echoes names that are themselves symlinks (a present path's
+    // ancestors are NOT tested — callers must probe each component they care
+    // about).
+    private const string RepositoryFileSymlinkScript =
+        "for f in \"$@\"; do if [ -L \"./$f\" ]; then printf '%s\\n' \"$f\"; fi; done; exit 0";
 
     /// <summary>Stable name for logs and findings.</summary>
     public abstract string Name { get; }
@@ -94,6 +99,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// fail closed on a missing binary, an unrecognised version string, or a
     /// version other than the configured or default expectation. Default
     /// null: no version precondition.
+    /// <para>Caution for tools that auto-load repository-rooted
+    /// configuration on EVERY invocation (config discovered from the process
+    /// cwd before argument dispatch): a plain <c>--version</c> already loads
+    /// it, running repository-controlled code before
+    /// <see cref="VerifyToolAsync"/> gates can inspect it. Such tools must
+    /// isolate the probe — e.g. pin a benign config via
+    /// <see cref="ToolVersionPin.VersionProbeArguments"/>.</para>
     /// </summary>
     protected virtual ToolVersionPin? VersionPin => null;
 
@@ -107,16 +119,21 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// Use <see cref="ExecToolBoundedAsync"/> for precondition probes so they
     /// get the same timeout bounding and failure classification as the scan;
     /// <see cref="ProbeRepositoryFilesPresentAsync"/> covers the common
-    /// "does a repository-controlled file exist" gate. The default imposes no
-    /// extra preconditions.
+    /// "does a repository-controlled file exist" gate.
+    /// <para>The returned findings are supplemental: they are merged ahead of
+    /// the tool's parsed report findings before severity mapping and
+    /// selection — for problems the tool would never print (e.g. files the
+    /// audited repository suppressed silently). Return an empty list when
+    /// there is nothing to add; the default imposes no extra preconditions
+    /// and contributes none.</para>
     /// </summary>
-    protected virtual Task VerifyToolAsync(
+    protected virtual Task<IReadOnlyList<ExternalToolFinding>> VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
-        => Task.CompletedTask;
+        => Task.FromResult<IReadOnlyList<ExternalToolFinding>>([]);
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
@@ -134,7 +151,8 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
         await ThrowIfToolMissingAsync(sandbox, workingDirectory, tool, ct).ConfigureAwait(false);
         await VerifyToolVersionPinAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
-        await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
+        var supplemental = await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false)
+            ?? [];
         var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
 
         if (result.ExecutionUnavailable)
@@ -148,8 +166,12 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 result);
 
         var parsed = ParseOutput(tool, result);
-        var selection = SelectFindings(tool, parsed, options);
-        var passed = selection.Findings.All(f => f.Severity < AuditSeverity.Error);
+        var selection = SelectFindings(tool, supplemental, parsed, options);
+        // The verdict is computed over every finding that survived filtering —
+        // including ones MaxFindings dropped — so a flood of advisory findings
+        // can never push an error past the cap into a forged pass.
+        var passed = selection.CappedErrorCount == 0
+            && selection.Findings.All(f => f.Severity < AuditSeverity.Error);
         return new AuditResult(passed, selection.Findings, RawOutput: BuildRawOutput(result, options, selection));
     }
 
@@ -343,16 +365,26 @@ public abstract class ExternalToolAuditorBase : IAuditor
             { IsDeterministic = true };
     }
 
+    /// <summary>What a repository-file probe tests each candidate path for.</summary>
+    protected enum RepositoryFileProbe
+    {
+        /// <summary>Present at all — regular file or symlink (the symlink arm also catches dangling links).</summary>
+        Present,
+        /// <summary>Is itself a symlink — the final component only; ancestors need their own probe entries.</summary>
+        Symlinked,
+    }
+
     /// <summary>
-    /// Bounded presence probe for repository-controlled files at the audited
-    /// worktree root — e.g. suppression files the audit subject could use to
-    /// hide findings from the tool. Returns the subset of
-    /// <paramref name="relativePaths"/> that exist (regular files and
-    /// symlinks). Fails closed: an exec-transport failure or any non-zero
-    /// probe exit throws <see cref="AuditUnavailableException"/> — "could not
-    /// confirm absence" is never treated as "absent". Path entries must be
-    /// relative; absolute paths, <c>..</c> segments, and embedded newlines are
-    /// rejected so the probe can never escape the worktree or corrupt its
+    /// Bounded probe for repository-controlled paths at the audited worktree
+    /// root — e.g. suppression files the audit subject could use to hide
+    /// findings from the tool, or symlinked paths that would redirect a scan
+    /// outside the worktree. Returns the subset of
+    /// <paramref name="relativePaths"/> matching <paramref name="mode"/>.
+    /// Fails closed: an exec-transport failure or any non-zero probe exit
+    /// throws <see cref="AuditUnavailableException"/> — "could not confirm
+    /// absence" is never treated as "absent". Path entries must be relative;
+    /// absolute paths, <c>..</c> segments, and embedded newlines are rejected
+    /// so the probe can never escape the worktree or corrupt its
     /// one-name-per-line protocol. <paramref name="operation"/> names the
     /// probe in failure messages (e.g. "suppression check", "target check").
     /// </summary>
@@ -362,6 +394,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         string tool,
         string operation,
         IReadOnlyList<string> relativePaths,
+        RepositoryFileProbe mode,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
@@ -371,7 +404,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var requested = new HashSet<string>(StringComparer.Ordinal);
         var argv = new List<string>(relativePaths.Count + 4)
         {
-            "sh", "-c", RepositoryFilePresenceScript, "sh",
+            "sh", "-c", mode == RepositoryFileProbe.Symlinked
+                ? RepositoryFileSymlinkScript
+                : RepositoryFilePresenceScript, "sh",
         };
         foreach (var path in relativePaths)
         {
@@ -403,13 +438,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 + "transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' {operation} could not confirm repository-file "
-                + $"absence (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
-                + "that the files are absent.",
+                $"could-not-verify: audit tool '{tool}' {operation} could not inspect repository "
+                + $"paths (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
+                + "about the repository's state.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
 
-        // The probe echoes each present path, one per line; intersect with
+        // The probe echoes each matching path, one per line; intersect with
         // the requested set — output beyond it is not trusted.
         var present = new List<string>();
         foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -533,24 +568,29 @@ public abstract class ExternalToolAuditorBase : IAuditor
         }
     }
 
-    /// <summary>Kept findings plus the two distinct drop reasons, for honest raw-output attribution.</summary>
+    /// <summary>Kept findings plus the drop reasons — including how many capped findings were error-severity, since the verdict still depends on them.</summary>
     private sealed record FindingSelection(
         List<AuditFinding> Findings,
         int FilteredCount,
-        int CappedCount);
+        int CappedCount,
+        int CappedErrorCount);
 
     private FindingSelection SelectFindings(
         string tool,
+        IReadOnlyList<ExternalToolFinding> supplemental,
         IReadOnlyList<ExternalToolFinding> parsed,
         ExternalToolAuditorOptions options)
     {
         var mapping = SeverityMapping ?? ExternalToolSeverityMapping.Default;
         var maxFindings = Math.Max(1, options.MaxFindings);
-        var findings = new List<AuditFinding>(Math.Min(parsed.Count, maxFindings));
+        var findings = new List<AuditFinding>(Math.Min(supplemental.Count + parsed.Count, maxFindings));
         var filtered = 0;
         var capped = 0;
+        var cappedErrors = 0;
 
-        foreach (var item in parsed)
+        // Supplemental findings (e.g. suppression-site markers) go first —
+        // they exist precisely because the tool's report cannot show them.
+        foreach (var item in supplemental.Concat(parsed))
         {
             if (item is null)
                 continue;
@@ -565,6 +605,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
             if (findings.Count >= maxFindings)
             {
                 capped++;
+                // A capped error finding must still fail the audit — the
+                // report cap is a display bound, never a severity eraser.
+                if (severity >= AuditSeverity.Error)
+                    cappedErrors++;
                 continue;
             }
 
@@ -576,7 +620,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 Location: BuildLocation(item)));
         }
 
-        return new FindingSelection(findings, filtered, capped);
+        return new FindingSelection(findings, filtered, capped, cappedErrors);
     }
 
     private static bool IsRuleFiltered(ExternalToolFinding item, ExternalToolAuditorOptions options)
@@ -677,7 +721,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
             if (selection.FilteredCount > 0)
                 reasons.Add($"{selection.FilteredCount} excluded by IncludedRules/ExcludedRules/ExcludePaths/MinimumSeverity");
             if (selection.CappedCount > 0)
-                reasons.Add($"{selection.CappedCount} beyond MaxFindings {Math.Max(1, options.MaxFindings)}");
+                reasons.Add(
+                    $"{selection.CappedCount} beyond MaxFindings {Math.Max(1, options.MaxFindings)}"
+                    + (selection.CappedErrorCount > 0
+                        ? $" — {selection.CappedErrorCount} error-severity, still failing the audit"
+                        : ""));
             combined += $"\n[findings dropped: {string.Join("; ", reasons)}]";
         }
         return combined;

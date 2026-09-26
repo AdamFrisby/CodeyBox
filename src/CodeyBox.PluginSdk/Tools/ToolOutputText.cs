@@ -35,7 +35,10 @@ public static class ToolOutputText
     /// <summary>
     /// Renders an untrusted configuration or output value for embedding in a
     /// failure message: single-line and capped at
-    /// <see cref="MessageValueMaxChars"/>.
+    /// <see cref="MessageValueMaxChars"/>. Truncation is marked with a
+    /// single-character ellipsis; <see cref="Truncate"/> (finding titles,
+    /// wrapped by the auditor base) uses the three-dot form — a cosmetic
+    /// difference between the two surfaces, kept stable rather than churned.
     /// </summary>
     public static string TruncateForMessage(string? value)
     {

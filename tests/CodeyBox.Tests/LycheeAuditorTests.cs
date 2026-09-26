@@ -460,7 +460,7 @@ public sealed class LycheeAuditorTests
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains("lychee", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("could not confirm", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("could not inspect", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 

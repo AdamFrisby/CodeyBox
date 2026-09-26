@@ -301,7 +301,7 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
     /// binary must match the pinned release (<c>ExpectedVersion</c>). A
     /// mismatch fails closed as infrastructure before the scan runs.
     /// </summary>
-    protected override async Task VerifyToolAsync(
+    protected override async Task<IReadOnlyList<ExternalToolFinding>> VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
@@ -310,6 +310,7 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
     {
         await ThrowIfToolVersionMismatchAsync(sandbox, workingDirectory, tool, options, ct)
             .ConfigureAwait(false);
+        return [];
     }
 
     private async Task ThrowIfToolVersionMismatchAsync(

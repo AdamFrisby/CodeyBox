@@ -361,7 +361,7 @@ public sealed class LycheeAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <c>.lycheeignore</c> — which lychee would load unconditionally — fails
     /// closed as infrastructure before the scan runs.
     /// </summary>
-    protected override async Task VerifyToolAsync(
+    protected override async Task<IReadOnlyList<ExternalToolFinding>> VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
@@ -371,6 +371,7 @@ public sealed class LycheeAuditor : ExternalToolAuditorBase, IPluginInitializer
         if (!_trustRepositorySuppression())
             await ThrowIfRepositoryIgnoreFilePresentAsync(sandbox, workingDirectory, tool, options, ct)
                 .ConfigureAwait(false);
+        return [];
     }
 
     private async Task ThrowIfRepositoryIgnoreFilePresentAsync(
@@ -391,6 +392,7 @@ public sealed class LycheeAuditor : ExternalToolAuditorBase, IPluginInitializer
             tool,
             "suppression check",
             [RepositoryIgnoreFile],
+            RepositoryFileProbe.Present,
             options,
             ct).ConfigureAwait(false);
         if (present.Count > 0)

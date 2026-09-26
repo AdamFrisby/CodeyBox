@@ -227,7 +227,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
     /// config-path exemption covers every commit. Both fail closed as
     /// infrastructure before the scan runs.
     /// </summary>
-    protected override async Task VerifyToolAsync(
+    protected override async Task<IReadOnlyList<ExternalToolFinding>> VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
@@ -237,6 +237,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
         if (!_trustRepositorySuppression())
             await ThrowIfRepoSuppressionFilePresentAsync(sandbox, workingDirectory, tool, options, ct)
                 .ConfigureAwait(false);
+        return [];
     }
 
     private async Task ThrowIfRepoSuppressionFilePresentAsync(
@@ -259,6 +260,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
             tool,
             "suppression check",
             [RepositoryIgnoreFile, RepositoryConfigFile],
+            RepositoryFileProbe.Present,
             options,
             ct).ConfigureAwait(false);
         if (present.Count > 0)

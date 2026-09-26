@@ -37,7 +37,7 @@ public sealed class ExternalToolAuditorOptions
     /// <summary>Per-stream output capture cap. Excess is discarded and reported as truncated.</summary>
     public int MaxOutputBytesPerStream { get; set; } = DefaultMaxOutputBytesPerStream;
 
-    /// <summary>Upper bound on findings returned from one run. Excess findings are dropped and the truncation is reported.</summary>
+    /// <summary>Upper bound on findings returned from one run. Excess findings are dropped from the report and the truncation is reported — but a dropped error-severity finding still fails the audit; the cap is a display bound, never a severity eraser.</summary>
     public int MaxFindings { get; set; } = DefaultMaxFindings;
 
     /// <summary>

@@ -33,16 +33,6 @@ internal sealed class AstGrepJsonOutputParser : IExternalToolOutputParser
     // Same per-document result bound the shared SARIF parser applies.
     private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
 
-    /// <summary>
-    /// Findings the auditor collected outside the JSON report — e.g. files
-    /// carrying <c>ast-grep-ignore</c> suppression directives, which ast-grep
-    /// honors silently — set by
-    /// <see cref="AstGrepAuditor.VerifyToolAsync"/> before the scan's output
-    /// is parsed. Emitted ahead of report findings so the result cap can
-    /// never hide a suppression site behind bulk diagnostics.
-    /// </summary>
-    internal IReadOnlyList<ExternalToolFinding> SupplementalFindings { get; set; } = [];
-
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -69,13 +59,6 @@ internal sealed class AstGrepJsonOutputParser : IExternalToolOutputParser
                     $"Tool '{input.ToolName}' produced JSON that is not the ast-grep match array.");
 
             var findings = new List<ExternalToolFinding>();
-            foreach (var extra in SupplementalFindings)
-            {
-                if (findings.Count >= MaxResults)
-                    break;
-                if (extra is not null)
-                    findings.Add(extra);
-            }
             foreach (var element in document.RootElement.EnumerateArray())
             {
                 if (findings.Count >= MaxResults)

@@ -46,33 +46,59 @@ makes every suppression surface visible instead:
   but no longer invisible — a bounded pre-scan `grep` sweep over the scan
   targets emits a `Warning` finding (rule id `ast-grep/suppression-site`)
   per file containing the marker, so a clean report cannot silently mean
-  "suppressed".
+  "suppressed". The sweep runs `grep -rla` (binary-looking files are still
+  swept, matching ast-grep's tolerant parser) and **fails closed** when its
+  output is truncated or more than 200 marker-bearing files are found —
+  partial coverage is never reported as "no suppressions".
 
 Setting `TrustRepositorySuppression` to true opts back in to
 repository-authored suppression wholesale: it drops the `--no-ignore`
 flags, the `no-suppress-all` escalation, and the marker sweep.
 
+The precondition probes (`sh` + `grep`) are assumed present in the sandbox
+baseline — they are ubiquitous on any POSIX image, but are invoked by
+argv, never through a constructed shell string.
+
 ## Repository config and dynamic languages
 
 `scan` needs a ruleset, and by default it comes from the audited
-repository: ast-grep auto-loads `sgconfig.yml` at the worktree root. That
-file is more than rules — a `customLanguages`/`libraryPath` entry makes
-ast-grep **dlopen a repository-pathed native library into the scanner
-process**: code execution the audit subject controls, which could also
-write a clean report and forge a pass.
+repository: ast-grep auto-loads `sgconfig.yml` (preferred) or
+`sgconfig.yaml` at the worktree root. That file is more than rules — a
+`customLanguages`/`libraryPath` entry makes ast-grep **dlopen a
+repository-pathed native library into the scanner process**: code
+execution the audit subject controls, which could also write a clean
+report and forge a pass.
 
 By default the auditor fails closed as deterministic infrastructure when
-the repo-root `sgconfig.yml` declares those keys. The opt-ins, in order of
-preference:
+the repo-root sgconfig declares those keys (either extension; the
+dynamic-load keys are matched wherever they appear, including flow-style
+YAML). The opt-ins, in order of preference:
 
 - pin an operator-owned `sgconfig.yml` via `ConfigFile` (`-c` replaces the
-  repository's config entirely — the gate then does not run);
+  repository's config entirely — the gate then does not run). In
+  `ExtraArguments`, only the spellings ast-grep's own pre-dispatch scan
+  honors count as pinning: `-c FILE`, `-c=FILE`, `--config FILE`,
+  `--config=FILE`. The joined short form `-cFILE` is parsed by clap but
+  *not* by that scan — repository discovery still fires, so the gate still
+  runs;
 - set `TrustRepositoryCustomLanguages` to true when the repository's
   sgconfig is already trusted to execute code inside the audit sandbox.
 
-A repo `sgconfig.yml` without dynamic loading is used as-is — its rules,
+A repo sgconfig without dynamic loading is used as-is — its rules,
 severities, and `util` definitions are the project's own structural-lint
 contract.
+
+Two boundaries worth knowing:
+
+- ast-grep resolves and loads the project config **for every invocation,
+  before argument dispatch** — even `--version`. The auditor's version
+  probe therefore pins an empty config (`--config /dev/null`) so a
+  worktree sgconfig can never execute code inside the probe.
+- Config discovery also walks the worktree's **ancestor directories**: a
+  repository without its own sgconfig silently uses one from a parent
+  directory. That file is baseline-owned (the operator controls the
+  sandbox filesystem), so it is trusted — pin `ConfigFile` if even that is
+  too much latitude.
 
 ## Walker coverage
 
@@ -132,15 +158,20 @@ output are likewise infrastructure failures naming the tool — never a
 passing audit. Note the deliberate asymmetry: a **nonexistent scan target**
 is ast-grep's silent-pass trap (`ERROR: …` on stderr, empty report, exit
 `0`), so configured `Targets` are probed for existence first and a missing
-one fails deterministically; a **symlinked** target fails the same way,
-because ast-grep follows a symlinked scan root even without `--follow`.
+one fails deterministically; a target resolving through a **symlink**
+fails the same way — ast-grep follows a symlinked scan root even without
+`--follow`, and the check covers every ancestor component, not just the
+final name.
 
 ## Version pinning
 
 The auditor is pinned to **ast-grep `0.45.3`** (`ExpectedVersion` in scoped
 config): rule evaluation, severity semantics, and the JSON report shape
 change between releases, so an unpinned binary would change findings under
-you. `ast-grep --version` is probed before every run.
+you. `ast-grep --version` is probed before every run — with
+`--config /dev/null` appended, because ast-grep loads the project config
+(and its `customLanguages` libraries) before even dispatching `--version`;
+the pinned empty config keeps repository code out of the probe.
 
 The tool requirement is declared **verify-only** — no `AptPackage`: no
 distro package carries ast-grep. Provision the pinned release into the
@@ -200,15 +231,15 @@ Scoped under `CodeyBox:Plugins:codeybox.ast-grep`, resolved per run
 | `ExpectedVersion` | `0.45.3` | Pinned ast-grep release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
 | `ConfigFile` | — (repo `sgconfig.yml`) | `-c/--config` project config path. Pin an operator-owned sgconfig provisioned into the baseline instead of trusting the audited repository's — also replaces the repo config entirely, so the `customLanguages` gate does not run. Conflicts with `RuleFile`. |
 | `RuleFile` | — | `-r/--rule` single rule file. Conflicts with `ConfigFile`. Note it does not exempt the `customLanguages` gate: ast-grep still discovers a repo-root `sgconfig.yml` to register languages. |
-| `Targets` | `.` | Comma-separated repository-relative files/folders scanned positionally. Must exist in the worktree — a missing target is a deterministic infrastructure failure (ast-grep would otherwise report it as an empty pass) — and must not be symlinks, which would redirect the scan root outside the worktree. |
+| `Targets` | `.` | Comma-separated repository-relative files/folders scanned positionally. Must exist in the worktree — a missing target is a deterministic infrastructure failure (ast-grep would otherwise report it as an empty pass) — and must not resolve through a symlink at any ancestor component, which would redirect the scan root outside the worktree. |
 | `TrustRepositorySuppression` | `false` | Trust repository-authored suppression surfaces: drops the `--no-ignore` flags, the `no-suppress-all` escalation, and the suppression-marker sweep. |
 | `TrustRepositoryCustomLanguages` | `false` | Consent to a repo-root `sgconfig.yml` declaring `customLanguages`/`libraryPath` — repository-controlled native code executed inside the scanner, which can also forge the report. Prefer `ConfigFile` instead. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. |
 | `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop — repo rule ids plus `no-suppress-all` / `unused-suppression` / `ast-grep/suppression-site`. |
 | `ExcludePaths` | `.git/`, `vendor/`, `third_party/`, `node_modules/`, `dist/`, `build/`, `out/`, `coverage/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/` — and kept out of the crawl via `--globs` exclusions (prefix entries only; exact-path and glob-metacharacter entries stay findings-level). Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell): severity overrides (`--error`, `--error=<id>` — note `=` is required), `--min-severity`, `--filter`, extra paths, etc. An operator-supplied `--config`/`-c` outranks `ConfigFile` and marks the project config operator-pinned; `--rule`/`-r` outranks `RuleFile`. `--no-ignore` arguments are additive to the built-in set — honor repository ignore files via `TrustRepositorySuppression` instead. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell): severity overrides (`--error`, `--error=<id>` — note `=` is required), `--min-severity`, `--filter`, extra paths, etc. An operator-supplied `--config`/`-c` (or the `=`/`VALUE` forms ast-grep's own argv scan honors) outranks `ConfigFile` and marks the project config operator-pinned — note the joined short form `-cFILE` does **not** count, since ast-grep's pre-dispatch config scan misses it; `--rule`/`-r` outranks `RuleFile`. `--no-ignore` arguments are additive to the built-in set — honor repository ignore files via `TrustRepositorySuppression` instead. |
 | `TimeoutSeconds` | `300` | Per-run bound; exceeding it is infrastructure, not a pass. |
-| `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
+| `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation — and an error-severity finding dropped past `MaxFindings` still fails the audit, so bulk output can never hide a blocking diagnostic. |
 
 The audited repository supplies its own ruleset through `sgconfig.yml` +
 rule directories — that file is the config ast-grep expects in the

@@ -322,9 +322,12 @@ declaratively:
   after the tool's presence and declared `VersionPin` are confirmed. Override
   it for repository-state gates (e.g. refusing repo-authored suppression
   files — `ProbeRepositoryFilesPresentAsync` is the shared fail-closed probe
-  for that), throwing `AuditUnavailableException` to fail closed. Run probes
-  through `ExecToolBoundedAsync` so they inherit the same timeout bounding
-  and failure classification as the scan.
+  for that), throwing `AuditUnavailableException` to fail closed. It returns
+  supplemental findings — problems the tool's own report would never print —
+  which are merged ahead of the parsed report findings before severity
+  mapping and selection; return an empty list when there is nothing to add.
+  Run probes through `ExecToolBoundedAsync` so they inherit the same timeout
+  bounding and failure classification as the scan.
 - `BuildToolEnvironment` — extra environment variables for the tool process,
   for tools whose behavior is env-controlled (e.g. pinning configuration that
   must not come from the audited repository).
