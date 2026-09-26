@@ -106,7 +106,7 @@ between releases, so an unpinned binary changes findings under you.
 `cargo-semver-checks --version` is probed before every run; any other
 version is an infrastructure failure.
 
-Both requirements are declared **verify-only** — no `AptPackage`:
+All requirements are declared **verify-only** — no `AptPackage`:
 
 - `cargo-semver-checks` — no distro package carries it. Install the pinned
   release into the baseline via `CodeyBox:MultipassExtraRuncmd` /
@@ -123,6 +123,9 @@ Both requirements are declared **verify-only** — no `AptPackage`:
   baking a rustup toolchain. A `rust-toolchain.toml` in the audited
   repository also steers the toolchain cargo-semver-checks invokes — an
   incompatible pin fails the run loudly, it cannot silently skip lints.
+- `git` — ships in the stock sandbox baseline; declared because the default
+  baseline resolution runs `git rev-parse`/`git merge-base` inside the
+  audited clone.
 
 ## Network egress
 
@@ -157,9 +160,9 @@ and per project under `Audit.Custom`:
 { "Kind": "plugin", "PluginId": "codeybox.cargo-semver-checks" }
 ```
 
-Only then do the declared `cargo-semver-checks`/`cargo` tool requirements
-reach baseline provisioning (presence-verified at bake time; nothing is
-apt-installed because no `AptPackage` is declared).
+Only then do the declared `cargo-semver-checks`/`cargo`/`git` tool
+requirements reach baseline provisioning (presence-verified at bake time;
+nothing is apt-installed because no `AptPackage` is declared).
 
 ## Configuration
 
@@ -171,11 +174,11 @@ run (hot-reloadable):
 | `ExpectedVersion` | `0.50.0` | Pinned cargo-semver-checks release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
 | `BaselineRev` / `BaselineVersion` / `BaselineRoot` / `BaselineRustdoc` | merge-base of `origin/<BaseBranch>` | Exactly one baseline source (see above). With none set, the merge-base of the work item's base branch is used. |
 | `ManifestPath` | — | `--manifest-path` when the crate under audit is not at the repository root. When set, the root `Cargo.toml` presence check is skipped. |
-| `TrustRepositorySuppression` | `false` | When `true`, `[package|workspace.metadata.cargo-semver-checks]` lint tables in the audited repository are honored. When `false`, any `Cargo.toml` carrying `metadata.cargo-semver-checks` fails the run closed as deterministic infrastructure. |
+| `TrustRepositorySuppression` | `false` | When `true`, `[package|workspace.metadata.cargo-semver-checks]` lint tables in the audited repository are honored. When `false`, the run fails closed as deterministic infrastructure whenever `cargo metadata` reports a `cargo-semver-checks` table under any workspace member's `package.metadata` or the `workspace.metadata` — a semantic check over cargo's own normalized manifest output, so quoted, whitespace-dotted, `\u`-escaped, or inline-table TOML spellings cannot evade it, and vendored/fixture manifests the tool never consults cannot trip it. A workspace member literally named `cargo-semver-checks` false-positives the same way — set this key to trust it. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity — e.g. `error` keeps only deny-level findings. |
 | `IncludedRules` / `ExcludedRules` | — | Exact lint ids to keep/drop (e.g. `function_missing`). |
 | `ExcludePaths` | — | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Findings are relative to the checked package root, so prefix exclusions should match accordingly. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--package`, `--exclude`, `--all-features`, `--release-type`, `--offline`. Take care: `--release-type` overrides the detected version bump and can satisfy deny-level lints outright; a second baseline flag conflicts with the configured one and fails the run; verbosity flags (`-q`) suppress the report and fail closed as infrastructure. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--package`, `--exclude`, `--all-features`, `--release-type`, `--offline`. Take care: `--release-type` overrides the detected version bump and can satisfy deny-level lints outright; a `--baseline-*` flag here replaces the merge-base default, but combined with a configured `Baseline*` key (or a second `--manifest-path` with `ManifestPath`) it is a deterministic configuration failure; verbosity flags (`-q`) suppress the report and fail closed as infrastructure. |
 | `TimeoutSeconds` | `900` | Per-run bound (the check compiles dependencies twice — baseline and current); exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 

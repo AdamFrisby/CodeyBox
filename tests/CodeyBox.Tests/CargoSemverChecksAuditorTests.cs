@@ -17,8 +17,10 @@ namespace CodeyBox.Tests;
 /// - Report sections map to findings with lint rule ids and file:line locations; warn-level sections are advisory.
 /// - Tool section levels are mapped through the declared severity mapping (never passed through).
 /// - Default baseline resolves the merge-base of origin/&lt;base&gt;/&lt;base&gt; and HEAD via git probes;
-///   a configured Baseline* key skips resolution; conflicting keys fail deterministically.
-/// - Repo lint config (metadata.cargo-semver-checks) fails closed unless TrustRepositorySuppression.
+///   a configured Baseline* key or an ExtraArguments --baseline-* flag skips resolution;
+///   conflicting sources fail deterministically.
+/// - Repo lint config (a cargo-semver-checks table reported by cargo metadata) fails closed
+///   unless TrustRepositorySuppression; a failed probe is infrastructure, not a pass.
 /// - A missing root Cargo.toml fails deterministically; ManifestPath points the tool elsewhere.
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_cargo_semver_checks", "true")] use a fixture
@@ -507,6 +509,150 @@ public sealed class CargoSemverChecksAuditorTests
     }
 
     [Fact]
+    public async Task SuppressionProbeFailure_IsInfrastructure_NotAPass()
+    {
+        // A cargo metadata failure (e.g. an unparseable manifest, exit 3 from
+        // the probe script) means "could not confirm clean" — it must surface
+        // as infrastructure, never as evidence that lint config is absent.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSuppressionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(3, "", "error: failed to parse manifest"));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(Ok(exec));
+        });
+
+        IAuditor auditor = new CargoSemverChecksAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("cargo-semver-checks", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task ManifestPath_IsForwardedToSuppressionProbe()
+    {
+        SandboxExec? probe = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSuppressionProbe(exec))
+                probe = exec;
+            return Task.FromResult(IsScanExec(exec) ? new SandboxExecResult(0, "", "") : Ok(exec));
+        });
+
+        var auditor = new CargoSemverChecksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ManifestPath"] = "rust/member/Cargo.toml",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(probe);
+        var index = probe!.Argv.ToList().IndexOf("--manifest-path");
+        Assert.True(index >= 0 && probe.Argv[index + 1] == "rust/member/Cargo.toml");
+    }
+
+    [Fact]
+    public async Task ExtraArgumentsBaseline_DefersToOperator_AndSkipsGitProbes()
+    {
+        var gitProbes = 0;
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (exec.Argv[0] == "git")
+                gitProbes++;
+            if (IsScanExec(exec))
+            {
+                scanExec = exec;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            return Task.FromResult(Ok(exec));
+        });
+
+        var auditor = new CargoSemverChecksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--baseline-rev=v2.0.0",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(0, gitProbes);
+        Assert.NotNull(scanExec);
+        // The operator's flag arrives once, via ExtraArguments — the auditor
+        // neither resolves nor emits a competing --baseline-* flag.
+        var baselineFlags = scanExec!.Argv
+            .Count(static a => a.StartsWith("--baseline-", StringComparison.Ordinal));
+        Assert.Equal(1, baselineFlags);
+    }
+
+    [Fact]
+    public async Task ScopedBaselinePlusExtraArgumentsFlag_IsDeterministicInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(Ok(exec));
+        });
+
+        var auditor = new CargoSemverChecksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:BaselineRev"] = "v1.4.0",
+                ["Scoped:ExtraArguments"] = "--baseline-version=1.0.0",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("baseline", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task ScopedManifestPathPlusExtraArgumentsFlag_IsDeterministicInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(Ok(exec));
+        });
+
+        var auditor = new CargoSemverChecksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ManifestPath"] = "rust/member/Cargo.toml",
+                ["Scoped:ExtraArguments"] = "--manifest-path=other/Cargo.toml",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("manifest-path", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
     public async Task TrustRepositorySuppression_SkipsLintConfigProbe()
     {
         var suppressionProbes = 0;
@@ -578,20 +724,23 @@ public sealed class CargoSemverChecksAuditorTests
         Assert.Contains(plugins, p => p.PluginId == CargoSemverChecksAuditor.PluginId);
 
         var tools = loader.GetEnabledPluginTools();
-        Assert.Equal(2, tools.Count);
+        Assert.Equal(3, tools.Count);
         Assert.Contains(tools, t => t.Binary == "cargo-semver-checks");
         Assert.Contains(tools, t => t.Binary == "cargo");
+        Assert.Contains(tools, t => t.Binary == "git");
         // Verify-only by design: no distro package carries a pinned
         // cargo-semver-checks, and the toolchain's rustdoc JSON format must
-        // match the pinned release — both are operator-provisioned.
+        // match the pinned release — both are operator-provisioned. git
+        // ships in the stock baseline.
         Assert.All(tools, t => Assert.Null(t.AptPackage));
 
         var contributions = PluginBaselineProvisioning.BuildContributions(loader.GetEnabledPluginTools());
-        Assert.Equal(2, contributions.VerificationCommands.Count);
+        Assert.Equal(3, contributions.VerificationCommands.Count);
         var verificationArgv = string.Join(
             "\n", contributions.VerificationCommands.SelectMany(static v => v.Argv));
         Assert.Contains("cargo-semver-checks", verificationArgv, StringComparison.Ordinal);
         Assert.Contains("cargo", verificationArgv, StringComparison.Ordinal);
+        Assert.Contains("git", verificationArgv, StringComparison.Ordinal);
         Assert.Empty(contributions.InstallCommands);
     }
 
@@ -745,7 +894,7 @@ public sealed class CargoSemverChecksAuditorTests
         => exec.Argv.Count >= 3
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"
-            && exec.Argv[2].Contains("metadata.cargo-semver-checks", StringComparison.Ordinal);
+            && exec.Argv[2].Contains("cargo metadata", StringComparison.Ordinal);
 
     private static async Task<string> SeedFixtureRepoAsync(bool breaking)
     {

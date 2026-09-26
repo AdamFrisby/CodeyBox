@@ -119,6 +119,28 @@ public abstract class ExternalToolAuditorBase : IAuditor
         CancellationToken ct)
         => Task.CompletedTask;
 
+    /// <summary>
+    /// Optional per-run argument hook invoked inside <see cref="RunAsync"/>
+    /// after options resolve and before argv is built — for arguments that
+    /// need the <see cref="AuditContext"/> or bounded sandbox probes to
+    /// compute (e.g. a baseline revision resolved from the work item's base
+    /// branch, which <see cref="BuildToolArguments"/> cannot see). The
+    /// returned arguments are appended between the author's
+    /// <see cref="BuildToolArguments"/> output and the operator's
+    /// <c>ExtraArguments</c>, and count toward the built-argument bound.
+    /// The hook runs before the tool-presence, version, and
+    /// <see cref="VerifyToolAsync"/> checks; use
+    /// <see cref="ExecToolBoundedAsync"/> for probes so they share the
+    /// timeout bounding and failure classification. Default: no arguments.
+    /// </summary>
+    protected virtual Task<IReadOnlyList<string>> ResolveContextArgumentsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+        => Task.FromResult<IReadOnlyList<string>>([]);
+
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -131,7 +153,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
         var tool = ExternalToolNames.Validate(ToolName, nameof(ToolName));
         var options = OptionsAccessor() ?? new ExternalToolAuditorOptions();
-        var argv = BuildArgv(tool, options);
+        var contextArguments = await ResolveContextArgumentsAsync(
+            sandbox, workingDirectory, context, options, ct).ConfigureAwait(false) ?? [];
+        var argv = BuildArgv(tool, options, contextArguments);
 
         await ThrowIfToolMissingAsync(sandbox, workingDirectory, tool, ct).ConfigureAwait(false);
         await VerifyToolVersionPinAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
@@ -155,18 +179,22 @@ public abstract class ExternalToolAuditorBase : IAuditor
         return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, parsed.Count - findings.Count, truncated));
     }
 
-    private IReadOnlyList<string> BuildArgv(string tool, ExternalToolAuditorOptions options)
+    private IReadOnlyList<string> BuildArgv(
+        string tool,
+        ExternalToolAuditorOptions options,
+        IReadOnlyList<string> contextArguments)
     {
         var built = BuildToolArguments(options) ?? [];
-        if (built.Count > MaxBuiltArguments)
+        if (built.Count + contextArguments.Count > MaxBuiltArguments)
             throw new InvalidOperationException(
-                $"Auditor '{Name}' built {built.Count} tool arguments, exceeding the bound of {MaxBuiltArguments}.");
+                $"Auditor '{Name}' built {built.Count + contextArguments.Count} tool arguments, exceeding the bound of {MaxBuiltArguments}.");
         if (options.ExtraArguments.Count > ExternalToolAuditorOptions.MaxExtraArguments)
             throw new InvalidOperationException(
                 $"Auditor '{Name}' was configured with {options.ExtraArguments.Count} extra arguments, exceeding the bound of {ExternalToolAuditorOptions.MaxExtraArguments}.");
 
-        var argv = new List<string>(1 + built.Count + options.ExtraArguments.Count) { tool };
+        var argv = new List<string>(1 + built.Count + contextArguments.Count + options.ExtraArguments.Count) { tool };
         argv.AddRange(built);
+        argv.AddRange(contextArguments);
         argv.AddRange(options.ExtraArguments);
         return argv;
     }
