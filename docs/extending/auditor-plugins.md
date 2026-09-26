@@ -333,6 +333,8 @@ declaratively:
 scanner version and keep repo-authored suppression files from silencing the
 audit. A worked example lives at
 `plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/`.
+The knip unused-JS/TS auditor is at
+`plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/`.
 
 ## Sample plugin
 
