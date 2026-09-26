@@ -65,6 +65,7 @@
     <Project Path="plugins/auditors-infrastructure/CodeyBox.KubeconformAuditorPlugin/CodeyBox.KubeconformAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.EslintAuditorPlugin/CodeyBox.EslintAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/CodeyBox.KnipAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/CodeyBox.GitleaksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-schema/CodeyBox.SpectralAuditorPlugin/CodeyBox.SpectralAuditorPlugin.csproj" />
     <Project Path="plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/CodeyBox.DotnetTestRunnerPlugin.csproj" />
