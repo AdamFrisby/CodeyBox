@@ -391,7 +391,7 @@ public sealed class ExternalToolAuditorTests
         public Task<IReadOnlyList<string>> ProbeAsync(
             ISandbox sandbox, IReadOnlyList<string> paths, CancellationToken ct)
             => ProbeRepositoryFilesPresentAsync(
-                sandbox, "/work", ToolName, paths, new ExternalToolAuditorOptions(), ct);
+                sandbox, "/work", ToolName, "suppression check", paths, new ExternalToolAuditorOptions(), ct);
 
         public static bool SuppliesFlag(ExternalToolAuditorOptions options, params string[] flags)
             => ExtraArgumentsSupplyFlag(options, flags);

@@ -173,5 +173,5 @@ internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
         => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        => ToolOutputText.SingleLine(message);
 }

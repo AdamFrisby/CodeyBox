@@ -257,6 +257,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
             sandbox,
             workingDirectory,
             tool,
+            "suppression check",
             [RepositoryIgnoreFile, RepositoryConfigFile],
             options,
             ct).ConfigureAwait(false);

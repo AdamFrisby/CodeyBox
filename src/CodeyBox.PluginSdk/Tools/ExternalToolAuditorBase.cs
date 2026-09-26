@@ -24,7 +24,6 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private const int UnavailableOutputTailMaxChars = 4096;
     private const int TitleMaxChars = 200;
     private const int MaxBuiltArguments = 256;
-    private const int MessageValueMaxChars = 64;
 
     /// <summary>Per-stream capture cap for precondition probes (version checks, repository-suppression gates).</summary>
     protected const int ProbeMaxOutputBytes = 16 * 1024;
@@ -149,10 +148,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 result);
 
         var parsed = ParseOutput(tool, result);
-        var findings = ToFindings(tool, parsed, options);
-        var truncated = findings.Count < parsed.Count;
-        var passed = findings.All(f => f.Severity < AuditSeverity.Error);
-        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, parsed.Count - findings.Count, truncated));
+        var selection = SelectFindings(tool, parsed, options);
+        var passed = selection.Findings.All(f => f.Severity < AuditSeverity.Error);
+        return new AuditResult(passed, selection.Findings, RawOutput: BuildRawOutput(result, options, selection));
     }
 
     private IReadOnlyList<string> BuildArgv(string tool, ExternalToolAuditorOptions options)
@@ -355,12 +353,14 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// confirm absence" is never treated as "absent". Path entries must be
     /// relative; absolute paths, <c>..</c> segments, and embedded newlines are
     /// rejected so the probe can never escape the worktree or corrupt its
-    /// one-name-per-line protocol.
+    /// one-name-per-line protocol. <paramref name="operation"/> names the
+    /// probe in failure messages (e.g. "suppression check", "target check").
     /// </summary>
     protected static async Task<IReadOnlyList<string>> ProbeRepositoryFilesPresentAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
+        string operation,
         IReadOnlyList<string> relativePaths,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
@@ -385,7 +385,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var result = await ExecToolBoundedAsync(
             sandbox,
             tool,
-            "suppression check",
+            operation,
             new SandboxExec
             {
                 Argv = argv,
@@ -399,11 +399,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
         if (result.ExecutionUnavailable)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
+                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
                 + "transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-file "
+                $"could-not-verify: audit tool '{tool}' {operation} could not confirm repository-file "
                 + $"absence (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
                 + "that the files are absent.",
                 result.ExitCode,
@@ -505,15 +505,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
         return normalized;
     }
 
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
-    }
+    /// <summary>
+    /// Renders an untrusted configuration or output value for embedding in a
+    /// failure message — single-line and length-capped. Shared implementation:
+    /// <see cref="ToolOutputText.TruncateForMessage"/>.
+    /// </summary>
+    protected static string TruncateForMessage(string? value)
+        => ToolOutputText.TruncateForMessage(value);
 
     private IReadOnlyList<ExternalToolFinding> ParseOutput(string tool, SandboxExecResult result)
     {
@@ -535,7 +533,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
         }
     }
 
-    private List<AuditFinding> ToFindings(
+    /// <summary>Kept findings plus the two distinct drop reasons, for honest raw-output attribution.</summary>
+    private sealed record FindingSelection(
+        List<AuditFinding> Findings,
+        int FilteredCount,
+        int CappedCount);
+
+    private FindingSelection SelectFindings(
         string tool,
         IReadOnlyList<ExternalToolFinding> parsed,
         ExternalToolAuditorOptions options)
@@ -543,19 +547,26 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var mapping = SeverityMapping ?? ExternalToolSeverityMapping.Default;
         var maxFindings = Math.Max(1, options.MaxFindings);
         var findings = new List<AuditFinding>(Math.Min(parsed.Count, maxFindings));
+        var filtered = 0;
+        var capped = 0;
 
         foreach (var item in parsed)
         {
-            if (findings.Count >= maxFindings)
-                break;
             if (item is null)
                 continue;
-            if (IsRuleFiltered(item, options) || IsPathExcluded(item, options))
-                continue;
-
             var severity = mapping.Map(item.SeverityLevel);
-            if (severity < options.MinimumSeverity)
+            if (IsRuleFiltered(item, options)
+                || IsPathExcluded(item, options)
+                || severity < options.MinimumSeverity)
+            {
+                filtered++;
                 continue;
+            }
+            if (findings.Count >= maxFindings)
+            {
+                capped++;
+                continue;
+            }
 
             findings.Add(new AuditFinding(
                 AuditorName: Name,
@@ -565,7 +576,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 Location: BuildLocation(item)));
         }
 
-        return findings;
+        return new FindingSelection(findings, filtered, capped);
     }
 
     private static bool IsRuleFiltered(ExternalToolFinding item, ExternalToolAuditorOptions options)
@@ -639,8 +650,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private static string BuildRawOutput(
         SandboxExecResult result,
         ExternalToolAuditorOptions options,
-        int droppedFindings,
-        bool findingsTruncated)
+        FindingSelection selection)
     {
         var maxBytes = Math.Clamp(
             options.MaxOutputBytesPerStream,
@@ -661,8 +671,15 @@ public abstract class ExternalToolAuditorBase : IAuditor
         else
             combined = stdout + "\n" + stderr;
 
-        if (findingsTruncated)
-            combined += $"\n[findings truncated: {droppedFindings} finding(s) beyond MaxFindings {Math.Max(1, options.MaxFindings)} were dropped]";
+        if (selection.FilteredCount + selection.CappedCount > 0)
+        {
+            var reasons = new List<string>(2);
+            if (selection.FilteredCount > 0)
+                reasons.Add($"{selection.FilteredCount} excluded by IncludedRules/ExcludedRules/ExcludePaths/MinimumSeverity");
+            if (selection.CappedCount > 0)
+                reasons.Add($"{selection.CappedCount} beyond MaxFindings {Math.Max(1, options.MaxFindings)}");
+            combined += $"\n[findings dropped: {string.Join("; ", reasons)}]";
+        }
         return combined;
     }
 
@@ -703,7 +720,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         => value.Replace("\x1b", string.Empty, StringComparison.Ordinal);
 
     private static string Truncate(string value, int maxChars)
-        => value.Length <= maxChars ? value : value[..maxChars] + "...";
+        => ToolOutputText.Truncate(value, maxChars);
 
     private static string Tail(string text, int maxChars)
         => text.Length <= maxChars ? text : text[^maxChars..];
@@ -712,15 +729,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// Flattens tool output to a single line for failure messages. Every
     /// control character — newlines, tabs, ESC and other terminal escape
     /// bytes — becomes a space so untrusted tool output cannot inject
-    /// sequences into logged messages or persisted failure reasons.
+    /// sequences into logged messages or persisted failure reasons. Shared
+    /// implementation: <see cref="ToolOutputText.SingleLine"/>.
     /// </summary>
     protected static string SingleLine(string message)
-    {
-        var builder = new StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
-    }
+        => ToolOutputText.SingleLine(message);
 
     private static string FormatTimeout(TimeSpan timeout)
         => timeout.TotalMinutes >= 1

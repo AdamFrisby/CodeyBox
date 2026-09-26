@@ -1,5 +1,4 @@
 using System.Collections.Frozen;
-using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
 
@@ -258,13 +257,8 @@ internal sealed class KnipJsonOutputParser : IExternalToolOutputParser
         => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static string Truncate(string value, int maxChars)
-        => value.Length <= maxChars ? value : value[..maxChars] + "...";
+        => ToolOutputText.Truncate(value, maxChars);
 
     private static string SingleLine(string message)
-    {
-        var builder = new StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
-    }
+        => ToolOutputText.SingleLine(message);
 }

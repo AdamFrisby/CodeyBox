@@ -382,7 +382,7 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
 
         var exceptionCandidates = BuildCandidates(RepositoryExceptionsFiles, manifestDirs);
         var present = await ProbeRepositoryFilesPresentAsync(
-            sandbox, workingDirectory, tool, exceptionCandidates, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, tool, "suppression check", exceptionCandidates, options, ct).ConfigureAwait(false);
         if (present.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled exceptions "
@@ -395,7 +395,7 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
 
         var cargoConfigCandidates = BuildCandidates(RepositoryCargoConfigFiles, manifestDirs);
         var cargoConfigs = await ProbeRepositoryFilesPresentAsync(
-            sandbox, workingDirectory, tool, cargoConfigCandidates, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, tool, "suppression check", cargoConfigCandidates, options, ct).ConfigureAwait(false);
         if (cargoConfigs.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled cargo config "
@@ -414,7 +414,7 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
 
         var policyCandidates = BuildCandidates(RepositoryPolicyFiles, manifestDirs);
         var policies = await ProbeRepositoryFilesPresentAsync(
-            sandbox, workingDirectory, tool, policyCandidates, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, tool, "suppression check", policyCandidates, options, ct).ConfigureAwait(false);
         if (policies.Count == 0)
             return;
 
@@ -465,7 +465,6 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
     }
 
     private const int MaxManifestAncestors = 32;
-    private const int MessageValueMaxChars = 64;
 
     private const string AdvisoryDataSourceProbeScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then "
@@ -530,16 +529,6 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
                 matched.Add(line);
         }
         return matched;
-    }
-
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
     }
 
     private static void AddPathFlag(List<string> args, string flag, string? value)

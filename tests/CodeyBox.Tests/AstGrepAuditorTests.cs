@@ -21,8 +21,17 @@ namespace CodeyBox.Tests;
 /// - Tool severities map through the declared mapping (error→Error, warning→Warning,
 ///   info/hint→Info); raw tokens never reach the severity field.
 /// - Exit 0 with warning-only diagnostics still yields advisory findings and a pass.
-/// - Configured Targets must exist in the worktree: ast-grep reports a missing target as
-///   exit 0 with an empty report, so the auditor probes for existence and fails closed.
+/// - Configured Targets must exist in the worktree and not be symlinks: ast-grep reports a
+///   missing target as exit 0 with an empty report, so the auditor probes for existence and
+///   fails closed; a symlinked scan root would escape the worktree.
+/// - The walker cannot hide code: all six --no-ignore classes are passed by default so repo
+///   .gitignore/.ignore files and hidden paths stay in the crawl, and ExcludePaths doubles
+///   as the crawl boundary via --globs.
+/// - A repo-root sgconfig.yml declaring customLanguages/libraryPath fails closed (ast-grep
+///   would dlopen repo-supplied native code into the scanner); an operator-pinned ConfigFile
+///   or TrustRepositoryCustomLanguages bypasses the gate.
+/// - ast-grep-ignore markers become visible Warning findings via a pre-scan grep sweep —
+///   rule-scoped suppressions are silent in the report otherwise.
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_astgrep", "true")] need only the
 ///   pinned binary — fixtures carry their own sgconfig.yml and rules, no network.
@@ -191,8 +200,8 @@ public sealed class AstGrepAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(1, JsonWithErrorAndWarning, "Error: 1 error(s) found in code."));
         });
@@ -233,8 +242,8 @@ public sealed class AstGrepAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -253,8 +262,8 @@ public sealed class AstGrepAuditorTests
         // gate is severity-driven, not "any finding fails".
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             return Task.FromResult(new SandboxExecResult(0, JsonWarningOnly, ""));
         });
 
@@ -275,8 +284,8 @@ public sealed class AstGrepAuditorTests
         // be mistaken for "found problems".
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             return Task.FromResult(new SandboxExecResult(1, "", "Error: task join failure"));
         });
 
@@ -296,8 +305,8 @@ public sealed class AstGrepAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             return Task.FromResult(new SandboxExecResult(exitCode, "", "Error: could not run"));
         });
 
@@ -314,8 +323,8 @@ public sealed class AstGrepAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             return Task.FromResult(new SandboxExecResult(1, JsonWithAllSeverityLevels, ""));
         });
 
@@ -345,8 +354,8 @@ public sealed class AstGrepAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             return Task.FromResult(new SandboxExecResult(1, JsonWithVendoredFindings, ""));
         });
 
@@ -363,8 +372,8 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
@@ -392,8 +401,8 @@ public sealed class AstGrepAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
@@ -421,8 +430,8 @@ public sealed class AstGrepAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
@@ -448,13 +457,17 @@ public sealed class AstGrepAuditorTests
     public async Task ScopedConfiguration_Targets_OverrideDefaultScope_AndAreProbed()
     {
         SandboxExec? scanExec = null;
+        var targetProbes = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
-            if (IsTargetProbe(exec))
+            if (IsRepositoryFileProbe(exec) && !exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            {
+                targetProbes++;
                 // The presence script echoes each existing path, one per line.
                 return Task.FromResult(new SandboxExecResult(0, "src\nrules\n", ""));
+            }
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
@@ -474,6 +487,7 @@ public sealed class AstGrepAuditorTests
         Assert.DoesNotContain(".", argv.Skip(1));
         Assert.Equal("src", argv[^2]);
         Assert.Equal("rules", argv[^1]);
+        Assert.Equal(1, targetProbes);
     }
 
     [Fact]
@@ -484,10 +498,10 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
-            if (IsTargetProbe(exec))
+            if (IsRepositoryFileProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "src\n", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
@@ -517,8 +531,8 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
@@ -543,8 +557,8 @@ public sealed class AstGrepAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
             return Task.FromResult(new SandboxExecResult(1, JsonWithErrorAndWarning, ""));
         });
 
@@ -560,6 +574,274 @@ public sealed class AstGrepAuditorTests
 
         var finding = Assert.Single(result.Findings);
         Assert.Contains("no-eval", finding.Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ScanArgv_NeutralizesRepositoryIgnoreFiles_ByDefault()
+    {
+        // The audit subject owns .gitignore/.ignore and dot-directories —
+        // without --no-ignore the walker would silently skip hidden or
+        // ignored code and report an empty pass.
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        var argv = scanExec!.Argv;
+        foreach (var ignoreClass in new[] { "hidden", "dot", "exclude", "global", "parent", "vcs" })
+            Assert.Contains("--no-ignore=" + ignoreClass, argv);
+        Assert.Contains("--error=" + AstGrepAuditor.NoSuppressAllRuleId, argv);
+        // ExcludePaths double as the crawl boundary under --no-ignore.
+        Assert.Contains("!.git/**", argv);
+        Assert.Contains("!vendor/**", argv);
+        Assert.Contains("!node_modules/**", argv);
+    }
+
+    [Fact]
+    public async Task TrustRepositorySuppression_DropsNoIgnoreFlagsAndMarkerSweep()
+    {
+        var grepExecs = 0;
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsGrepProbe(exec))
+            {
+                grepExecs++;
+                return Task.FromResult(new SandboxExecResult(0, "src/ignored.js\n", ""));
+            }
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new AstGrepAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:TrustRepositorySuppression"] = "true",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+        Assert.NotNull(scanExec);
+        Assert.DoesNotContain(scanExec!.Argv, a => a.StartsWith("--no-ignore", StringComparison.Ordinal));
+        Assert.DoesNotContain("--error=" + AstGrepAuditor.NoSuppressAllRuleId, scanExec.Argv);
+        // The suppression-marker sweep is part of the trusted surface —
+        // under the opt-in it does not run at all.
+        Assert.Equal(0, grepExecs);
+    }
+
+    [Fact]
+    public async Task RepoSgconfig_WithCustomLanguages_IsDeterministicInfrastructure_NeverAPass()
+    {
+        // A repo-root sgconfig.yml declaring customLanguages makes ast-grep
+        // dlopen a repository-pathed native library — code the audit subject
+        // controls, which could also emit a clean report. Fail closed.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsRepositoryFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
+            if (IsConfigContentProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("customLanguages", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task RepoSgconfig_WithoutDynamicLoadKeys_Scans()
+    {
+        var configProbes = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsRepositoryFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
+            if (IsConfigContentProbe(exec))
+            {
+                configProbes++;
+                return Task.FromResult(new SandboxExecResult(1, "", ""));
+            }
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(1, configProbes);
+    }
+
+    [Fact]
+    public async Task RepoSgconfig_DynamicLoadKeys_TrustedViaOptIn_ScansWithoutConfigProbe()
+    {
+        var configProbes = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsConfigContentProbe(exec))
+            {
+                configProbes++;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new AstGrepAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:TrustRepositoryCustomLanguages"] = "true",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(0, configProbes);
+    }
+
+    [Fact]
+    public async Task OperatorPinnedConfigFile_SkipsRepositoryConfigGate()
+    {
+        // -c/--config replaces sgconfig discovery entirely, so a repo-root
+        // sgconfig.yml is never loaded — the gate does not run.
+        var configProbes = 0;
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsRepositoryFileProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            {
+                configProbes++;
+                return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
+            }
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new AstGrepAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigFile"] = "/opt/sg/sgconfig.yml",
+            }),
+            CancellationToken.None);
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.Equal(0, configProbes);
+        Assert.NotNull(scanExec);
+    }
+
+    [Fact]
+    public async Task SuppressionMarkers_BecomeVisibleWarningFindings()
+    {
+        // Rule-scoped ast-grep-ignore suppressions leave no trace in the JSON
+        // report — the pre-scan sweep surfaces each file carrying the marker
+        // so a clean report cannot silently mean "suppressed".
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsMarkerProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "src/hidden.js\n./lib/x.js\n", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(2, result.Findings.Count);
+        var hidden = result.Findings.Single(f => f.Location == "src/hidden.js");
+        Assert.Equal(AuditSeverity.Warning, hidden.Severity);
+        Assert.Contains(AstGrepAuditor.SuppressionSiteRuleId, hidden.Title, StringComparison.Ordinal);
+        Assert.Equal("lib/x.js", result.Findings.Single(f => f.Location != "src/hidden.js").Location);
+    }
+
+    [Fact]
+    public async Task SuppressionMarkerSweep_Failure_IsInfrastructureFailure()
+    {
+        // grep exits 2 on unreadable input — "could not confirm" is never
+        // evidence that no suppression directives exist.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsMarkerProbe(exec))
+                return Task.FromResult(new SandboxExecResult(2, "", "grep: read error"));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("suppression-marker", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task SymlinkedTarget_IsDeterministicInfrastructure()
+    {
+        // ast-grep follows a symlinked scan root even without --follow —
+        // a repo-committed link would point the crawl outside the worktree.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsRepositoryFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "src\n", ""));
+            if (IsSymlinkProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "src\n", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new AstGrepAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:Targets"] = "src",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("symlink", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
     }
 
     [Fact]
@@ -818,6 +1100,23 @@ public sealed class AstGrepAuditorTests
             Host: new TestPluginHost(config.GetSection("Scoped")));
     }
 
+    /// <summary>
+    /// Benign answers for every pre-scan probe the auditor issues — presence,
+    /// version, repository-file presence (nothing present), symlink check (no
+    /// links), and the grep probes (no matches). Returns null for the scan
+    /// itself, so a test only scripts the execs it cares about.
+    /// </summary>
+    private static SandboxExecResult? ProbeAnswer(SandboxExec exec)
+    {
+        if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            return Ok(exec);
+        if (IsRepositoryFileProbe(exec) || IsSymlinkProbe(exec))
+            return new SandboxExecResult(0, "", "");
+        if (IsGrepProbe(exec))
+            return new SandboxExecResult(1, "", "");
+        return null;
+    }
+
     private static SandboxExecResult Ok(SandboxExec exec)
         => IsVersionProbe(exec)
             ? new SandboxExecResult(0, "ast-grep " + AstGrepAuditor.DefaultExpectedVersion + "\n", "")
@@ -833,11 +1132,35 @@ public sealed class AstGrepAuditorTests
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "ast-grep" && exec.Argv[1] == "--version";
 
-    private static bool IsTargetProbe(SandboxExec exec)
-        => exec.Argv.Count >= 3
+    // The shared presence script echoes existing (-e or -L) repo-relative
+    // paths, one per line.
+    private static bool IsRepositoryFileProbe(SandboxExec exec)
+        => exec.Argv.Count >= 4
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"
-            && !exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
+            && exec.Argv[2].Contains("for f in \"$@\"", StringComparison.Ordinal)
+            && exec.Argv[2].Contains("[ -e", StringComparison.Ordinal);
+
+    // The auditor's sibling probe echoes only symlinked (-L) paths; it shares
+    // the "for f in $@" shape but never tests -e.
+    private static bool IsSymlinkProbe(SandboxExec exec)
+        => exec.Argv.Count >= 4
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2].Contains("for f in \"$@\"", StringComparison.Ordinal)
+            && exec.Argv[2].Contains("[ -L", StringComparison.Ordinal)
+            && !exec.Argv[2].Contains("[ -e", StringComparison.Ordinal);
+
+    private static bool IsGrepProbe(SandboxExec exec)
+        => exec.Argv.Count >= 3 && exec.Argv[0] == "grep";
+
+    // Content check for dynamic-load keys in the repo's sgconfig.yml.
+    private static bool IsConfigContentProbe(SandboxExec exec)
+        => IsGrepProbe(exec) && exec.Argv.Contains("-qEe", StringComparer.Ordinal);
+
+    // Suppression-marker sweep over the scan targets.
+    private static bool IsMarkerProbe(SandboxExec exec)
+        => IsGrepProbe(exec) && exec.Argv.Contains("ast-grep-ignore", StringComparer.Ordinal);
 
     private static async Task<string> SeedAstGrepFixtureRepoAsync(bool violation)
     {
@@ -874,12 +1197,18 @@ public sealed class AstGrepAuditorTests
             };
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain both streams concurrently: a full stderr pipe would block
+            // the child on write while stdout stays open, deadlocking the
+            // synchronous read ahead of the timeout.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            Task.WhenAll(stdoutTask, stderrTask).Wait(TimeSpan.FromSeconds(5));
+            var stdout = stdoutTask.IsCompletedSuccessfully ? stdoutTask.Result : string.Empty;
             var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }

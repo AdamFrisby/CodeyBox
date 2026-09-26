@@ -140,7 +140,6 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
     /// </summary>
     public const string IgnoreMissingSchemasKey = "IgnoreMissingSchemas";
 
-    private const int MessageValueMaxChars = 64;
     private static readonly Regex VersionPattern = new(
         @"\d+\.\d+\.\d+[\w.\-]*",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
@@ -378,16 +377,6 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
             : configured.Trim();
         var match = VersionPattern.Match(value);
         return match.Success ? match.Value : null;
-    }
-
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
     }
 
     private static List<string> SplitList(string? value)

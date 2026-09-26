@@ -389,6 +389,7 @@ public sealed class LycheeAuditor : ExternalToolAuditorBase, IPluginInitializer
             sandbox,
             workingDirectory,
             tool,
+            "suppression check",
             [RepositoryIgnoreFile],
             options,
             ct).ConfigureAwait(false);
