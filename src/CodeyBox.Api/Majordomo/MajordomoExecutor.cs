@@ -124,6 +124,7 @@ internal sealed class MajordomoExecutor
     private readonly MajordomoMutateBackend _mutates;
     private readonly IOptionsMonitor<MajordomoServerOptions> _options;
     private readonly MajordomoTurnLedger _ledger;
+    private readonly MajordomoProposalService _proposals;
     private readonly IHttpContextAccessor _httpContext;
 
     /// <summary>
@@ -138,12 +139,14 @@ internal sealed class MajordomoExecutor
         MajordomoMutateBackend mutates,
         IOptionsMonitor<MajordomoServerOptions> options,
         MajordomoTurnLedger ledger,
+        MajordomoProposalService proposals,
         IHttpContextAccessor httpContext)
     {
         _reads = reads;
         _mutates = mutates;
         _options = options;
         _ledger = ledger;
+        _proposals = proposals;
         _httpContext = httpContext;
     }
 
@@ -338,10 +341,17 @@ internal sealed class MajordomoExecutor
                 if (mutation.Refusal is not null)
                     return (Envelope(MajordomoOutcomes.Refused, refusal: mutation.Refusal),
                         MajordomoOutcomes.Refused, mutation.Refusal.Detail, true);
+                // The proposal is persisted before it is shown: the operator
+                // approves the stored record, and approval replays the stored
+                // arguments through the mutate backend.
+                var stored = await _proposals.ProposeAsync(
+                        propose.Proposal.Tool, proposalArgs, identity, ct)
+                    .ConfigureAwait(false);
                 // Echo the CANONICAL arguments (the bound contract
                 // re-serialized), not the raw payload — what the proposal
                 // shows is exactly what would execute.
                 var view = new MajordomoProposalView(
+                    stored.Id,
                     propose.Proposal.Tool.Name,
                     JsonSerializer.SerializeToNode(proposalArgs, proposalArgs.GetType(), MajordomoJson.Options),
                     mutation.ChangeSet!.PlannedItemCount,

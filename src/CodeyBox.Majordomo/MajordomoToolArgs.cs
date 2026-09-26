@@ -12,9 +12,10 @@ public abstract record MajordomoToolArgs
 }
 
 /// <summary>
-/// Base of every MUTATE tool's argument contract. Carries the two fields the
-/// authorization layer needs uniformly: <see cref="DryRun"/> and the blast
-/// radius of the call (<see cref="AffectedItemCount"/>).
+/// Base of every MUTATE tool's argument contract. Carries the fields the
+/// authorization layer needs uniformly: <see cref="DryRun"/>, the blast
+/// radius of the call (<see cref="AffectedItemCount"/>), and the reasoning
+/// the assistant gave (<see cref="Reasoning"/>, persisted with the proposal).
 /// </summary>
 public abstract record MajordomoMutateArgs : MajordomoToolArgs
 {
@@ -27,6 +28,23 @@ public abstract record MajordomoMutateArgs : MajordomoToolArgs
     /// it executes in every mode and consumes no per-turn budget.
     /// </summary>
     public bool DryRun { get; init; }
+
+    /// <summary>
+    /// Why the assistant wants this mutation, in its own words. Persisted on
+    /// the proposal so the operator reviews the reasoning alongside the
+    /// validated change set; ignored by execution, so it can never change
+    /// what approval commits. Null when the caller gave none; whitespace
+    /// normalises to null; longer than
+    /// <see cref="MajordomoProposalRecord.MaxReasoningLength"/> characters is
+    /// refused at bind time rather than truncated.
+    /// </summary>
+    public string? Reasoning
+    {
+        get => _reasoning;
+        init => _reasoning = value is null ? null : MajordomoProposalRecord.NormalizeReasoning(value, nameof(Reasoning));
+    }
+
+    private readonly string? _reasoning;
 
     /// <summary>
     /// Number of work items a real (non-dry-run) execution of this call would

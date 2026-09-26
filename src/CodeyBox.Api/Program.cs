@@ -5835,6 +5835,7 @@ TestSelectionSoundnessEndpoints.Map(app);
 ConfigReloadEndpoints.Map(app);
 DeployConsistencyEndpoints.Map(app);
 app.MapMajordomoMcp();
+app.MapMajordomoProposals();
 
 // Prometheus scrape endpoint — registered only when the exporter is enabled
 // so the surface is invisible (route not on the table) by default. Mapped

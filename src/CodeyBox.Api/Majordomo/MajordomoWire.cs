@@ -21,6 +21,11 @@ internal static class MajordomoRefusalReasons
     public const string DependencyNotFound = "dependency_not_found";
     public const string DependencyTerminal = "dependency_terminal";
     public const string UnknownAgent = "unknown_agent";
+    public const string ProposalNotFound = "proposal_not_found";
+    public const string ProposalNotPending = "proposal_not_pending";
+    public const string ProposalExpired = "proposal_expired";
+    public const string ProposalToolRetired = "proposal_tool_retired";
+    public const string ProposalCorrupt = "proposal_corrupt";
 }
 
 /// <summary>

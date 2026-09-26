@@ -22,6 +22,17 @@ internal static class MajordomoMcpRegistration
         services.AddSingleton<MajordomoTurnLedger>();
         services.AddSingleton<MajordomoReadBackend>();
         services.AddSingleton<MajordomoMutateBackend>();
+        services.AddSingleton<IMajordomoProposalStore>(sp =>
+        {
+            var path = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.StateDatabasePath;
+            return new SqliteMajordomoProposalStore(path);
+        });
+        services.AddSingleton<MajordomoProposalService>(sp =>
+            new MajordomoProposalService(
+                sp.GetRequiredService<IMajordomoProposalStore>(),
+                sp.GetRequiredService<MajordomoMutateBackend>(),
+                sp.GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>(),
+                sp.GetService<TimeProvider>() ?? TimeProvider.System));
         services.AddSingleton<MajordomoExecutor>();
         services.AddHttpContextAccessor();
 

@@ -33,6 +33,15 @@ public sealed class MajordomoServerOptions
     /// <summary>Largest accepted <see cref="TurnWindowSeconds"/>.</summary>
     public const int MaxTurnWindowSeconds = 3600;
 
+    /// <summary>Default proposal time-to-live in seconds (24 hours).</summary>
+    public const int DefaultProposalTimeToLiveSeconds = 24 * 3600;
+
+    /// <summary>Shortest accepted proposal time-to-live in seconds (1 minute).</summary>
+    public const int MinProposalTimeToLiveSeconds = 60;
+
+    /// <summary>Longest accepted proposal time-to-live in seconds (30 days).</summary>
+    public const int MaxProposalTimeToLiveSeconds = 30 * 24 * 3600;
+
     /// <summary>
     /// Whether MUTATE tools execute immediately or produce operator
     /// proposals. Mirrors <see cref="MajordomoOptions.Mode"/>; defaults to
@@ -59,11 +68,22 @@ public sealed class MajordomoServerOptions
     /// </summary>
     public int TurnWindowSeconds { get; set; } = DefaultTurnWindowSeconds;
 
+    /// <summary>
+    /// How long a queued proposal stays approvable, in seconds. Approving
+    /// past the deadline is refused and the proposal is marked expired, so a
+    /// stale queue cannot be approved long after the reasoning behind it
+    /// stopped being true. Between <see cref="MinProposalTimeToLiveSeconds"/>
+    /// and <see cref="MaxProposalTimeToLiveSeconds"/> seconds. Mirrors
+    /// <see cref="MajordomoOptions.ProposalTimeToLive"/>.
+    /// </summary>
+    public int ProposalTimeToLiveSeconds { get; set; } = DefaultProposalTimeToLiveSeconds;
+
     /// <summary>Builds the policy record the authorization gate consumes.</summary>
     public MajordomoOptions ToPolicy() => new()
     {
         Mode = Mode,
         MaxMutatedItemsPerTurn = MaxMutatedItemsPerTurn,
+        ProposalTimeToLive = TimeSpan.FromSeconds(ProposalTimeToLiveSeconds),
     };
 
     /// <summary>Hot-reload validator: returns the failure message or null.</summary>
@@ -77,6 +97,8 @@ public sealed class MajordomoServerOptions
             return $"{SectionName}:ClientName must be a non-empty ApiClients entry name";
         if (opts.TurnWindowSeconds is < 1 or > MaxTurnWindowSeconds)
             return $"{SectionName}:TurnWindowSeconds must be within [1, {MaxTurnWindowSeconds}]";
+        if (opts.ProposalTimeToLiveSeconds is < MinProposalTimeToLiveSeconds or > MaxProposalTimeToLiveSeconds)
+            return $"{SectionName}:ProposalTimeToLiveSeconds must be within [{MinProposalTimeToLiveSeconds}, {MaxProposalTimeToLiveSeconds}]";
         return null;
     }
 }

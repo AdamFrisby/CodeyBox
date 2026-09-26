@@ -14,6 +14,15 @@ public sealed record MajordomoOptions
     /// <summary>Default per-turn cap on mutated items.</summary>
     public const int DefaultMaxMutatedItemsPerTurn = 8;
 
+    /// <summary>Default proposal time-to-live: a day-old suggestion is stale reasoning.</summary>
+    public static readonly TimeSpan DefaultProposalTimeToLive = TimeSpan.FromHours(24);
+
+    /// <summary>Shortest accepted proposal time-to-live.</summary>
+    public static readonly TimeSpan MinProposalTimeToLive = TimeSpan.FromMinutes(1);
+
+    /// <summary>Longest accepted proposal time-to-live.</summary>
+    public static readonly TimeSpan MaxProposalTimeToLive = TimeSpan.FromDays(30);
+
     /// <summary>
     /// Hard ceiling on <see cref="MaxMutatedItemsPerTurn"/> — configuration
     /// cannot raise the blast radius past this no matter what the operator
@@ -61,6 +70,27 @@ public sealed record MajordomoOptions
                     nameof(MaxMutatedItemsPerTurn), value,
                     $"MaxMutatedItemsPerTurn must be within [1, {MaxAllowedMutatedItemsPerTurn}]");
             _maxMutatedItemsPerTurn = value;
+        }
+    }
+
+    private TimeSpan _proposalTimeToLive = DefaultProposalTimeToLive;
+
+    /// <summary>
+    /// How long a proposal stays approvable after it is queued. Approving
+    /// past the deadline is refused and the proposal is marked expired, so a
+    /// stale queue of suggestions cannot be approved long after the reasoning
+    /// behind them stopped being true.
+    /// </summary>
+    public TimeSpan ProposalTimeToLive
+    {
+        get => _proposalTimeToLive;
+        init
+        {
+            if (value < MinProposalTimeToLive || value > MaxProposalTimeToLive)
+                throw new ArgumentOutOfRangeException(
+                    nameof(ProposalTimeToLive), value,
+                    $"ProposalTimeToLive must be within [{MinProposalTimeToLive}, {MaxProposalTimeToLive}]");
+            _proposalTimeToLive = value;
         }
     }
 }

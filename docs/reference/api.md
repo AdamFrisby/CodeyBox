@@ -69,6 +69,11 @@ the operator key included — is refused, so the majordomo's calls are
 attributable to its own principal and the token can be revoked without
 rotating the operator key.
 
+In `proposed` mode, mutations are persisted as operator-reviewable proposals
+under `/majordomo/proposals` (list, inspect, approve, reject, supersede —
+see the `Majordomo` configuration reference). Approval commits through the
+same path as Autonomous mode, revalidated against live queue state.
+
 ### GitHub App delivery credentials
 
 For team installations, configure the GitHub upstream with a GitHub App

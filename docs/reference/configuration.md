@@ -1237,7 +1237,8 @@ hot-reloadable; the executor reads the current options on every call.
   "Mode": "proposed",
   "MaxMutatedItemsPerTurn": 8,
   "ClientName": "majordomo",
-  "TurnWindowSeconds": 120
+  "TurnWindowSeconds": 120,
+  "ProposalTimeToLiveSeconds": 86400
 }
 ```
 
@@ -1247,6 +1248,19 @@ hot-reloadable; the executor reads the current options on every call.
 | `MaxMutatedItemsPerTurn` | `8` | Per-call and cumulative per-turn cap on mutated work items (hard ceiling 100). |
 | `ClientName` | `majordomo` | The `CodeyBox:ApiClients` entry whose token is the majordomo credential. Only that client may reach the endpoint — the operator key and other named clients are refused — so majordomo calls are attributable and the credential is revocable independently. |
 | `TurnWindowSeconds` | `120` | Rolling window over which mutations from one identity accumulate toward the per-turn cap. 1–3600. |
+| `ProposalTimeToLiveSeconds` | `86400` | How long a queued proposal stays approvable (24 hours). Approving past the deadline is refused and the proposal is marked expired. 60–2592000. |
+
+Proposed-mode mutations are persisted as proposals (tool, arguments, the
+majordomo's reasoning, proposer, timestamp, state) in the state database, so
+they survive restarts. The operator reviews them under
+`/majordomo/proposals` (`GET /` to list, `GET /{id}` for one proposal,
+`POST /{id}/approve` to commit, `POST /{id}/reject` or
+`POST /{id}/supersede` with a `{"reason": ...}` body to close without
+mutating). Approval replays the stored call through the same mutate path an
+Autonomous-mode call takes, revalidated against live queue state — a proposal
+whose precondition moved (a cancel whose target has since completed, a chain
+depending on a since-finished item) is refused with a reason instead of
+applied blindly.
 
 ## `Projects`
 
