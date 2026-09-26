@@ -11,8 +11,23 @@ public interface IMajordomoProposalStore
     /// <summary>Largest accepted page size for <see cref="ListAsync"/>.</summary>
     public const int MaxListLimit = 500;
 
-    /// <summary>Persists a new pending proposal. Ids are unique; a duplicate id throws.</summary>
-    Task EnqueueAsync(MajordomoProposalRecord proposal, CancellationToken ct = default);
+    /// <summary>
+    /// Persists a new pending proposal, bounding the queue atomically with
+    /// the insert: pending rows past
+    /// <see cref="MajordomoOptions.ProposalTimeToLive"/> and decided rows
+    /// older than <see cref="MajordomoOptions.DecidedProposalRetention"/> are
+    /// reaped first, then the insert is refused with
+    /// <see cref="MajordomoProposalQueueFullException"/> when
+    /// <see cref="MajordomoOptions.MaxPendingProposals"/> undecided proposals
+    /// (pending or applying) already exist. <paramref name="now"/> is the
+    /// clock both the sweep and the cap read. Ids are unique; a duplicate id
+    /// throws.
+    /// </summary>
+    Task EnqueueAsync(
+        MajordomoProposalRecord proposal,
+        MajordomoOptions policy,
+        DateTimeOffset now,
+        CancellationToken ct = default);
 
     /// <summary>Loads one proposal by id; null when unknown.</summary>
     Task<MajordomoProposalRecord?> GetAsync(string id, CancellationToken ct = default);

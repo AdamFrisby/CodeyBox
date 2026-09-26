@@ -1238,7 +1238,9 @@ hot-reloadable; the executor reads the current options on every call.
   "MaxMutatedItemsPerTurn": 8,
   "ClientName": "majordomo",
   "TurnWindowSeconds": 120,
-  "ProposalTimeToLiveSeconds": 86400
+  "ProposalTimeToLiveSeconds": 86400,
+  "MaxPendingProposals": 256,
+  "DecidedProposalRetentionSeconds": 604800
 }
 ```
 
@@ -1249,6 +1251,8 @@ hot-reloadable; the executor reads the current options on every call.
 | `ClientName` | `majordomo` | The `CodeyBox:ApiClients` entry whose token is the majordomo credential. Only that client may reach the endpoint — the operator key and other named clients are refused — so majordomo calls are attributable and the credential is revocable independently. |
 | `TurnWindowSeconds` | `120` | Rolling window over which mutations from one identity accumulate toward the per-turn cap. 1–3600. |
 | `ProposalTimeToLiveSeconds` | `86400` | How long a queued proposal stays approvable (24 hours). Approving past the deadline is refused and the proposal is marked expired. 60–2592000. |
+| `MaxPendingProposals` | `256` | Cap on proposals awaiting an operator decision (pending plus in-flight `applying` commits). Past the cap, new proposals are refused as `proposal_queue_full` until decisions drain the backlog. 1–4096. |
+| `DecidedProposalRetentionSeconds` | `604800` | How long a decided (approved/rejected/expired/superseded) proposal row is kept for review before an enqueue sweep removes it (7 days). Pending rows past their TTL are reaped by the same sweep; `applying` rows are never reaped. 60–7776000. |
 
 Proposed-mode mutations are persisted as proposals (tool, arguments, the
 majordomo's reasoning, proposer, timestamp, state) in the state database, so

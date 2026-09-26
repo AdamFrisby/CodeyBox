@@ -12,11 +12,39 @@ public sealed class InMemoryMajordomoProposalStore : IMajordomoProposalStore
     private readonly ConcurrentDictionary<string, MajordomoProposalRecord> _records =
         new(StringComparer.Ordinal);
 
-    public Task EnqueueAsync(MajordomoProposalRecord proposal, CancellationToken ct = default)
+    /// <summary>Serializes the reap → count → insert sequence inside <see cref="EnqueueAsync"/>.</summary>
+    private readonly object _enqueueLock = new();
+
+    public Task EnqueueAsync(
+        MajordomoProposalRecord proposal,
+        MajordomoOptions policy,
+        DateTimeOffset now,
+        CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(proposal);
-        if (!_records.TryAdd(proposal.Id, proposal))
-            throw new InvalidOperationException($"proposal '{proposal.Id}' is already queued");
+        ArgumentNullException.ThrowIfNull(policy);
+
+        lock (_enqueueLock)
+        {
+            var retentionCutoff = now - policy.DecidedProposalRetention;
+            foreach (var (id, record) in _records)
+            {
+                var reap = record.IsDecided
+                    ? (record.DecidedAt ?? record.ProposedAt) < retentionCutoff
+                    : record.State == MajordomoProposalState.Pending
+                        && record.IsExpiredAt(now, policy.ProposalTimeToLive);
+                if (reap)
+                    _records.TryRemove(id, out _);
+            }
+
+            var undecided = _records.Values.Count(static r =>
+                r.State is MajordomoProposalState.Pending or MajordomoProposalState.Applying);
+            if (undecided >= policy.MaxPendingProposals)
+                throw new MajordomoProposalQueueFullException(policy.MaxPendingProposals);
+            if (!_records.TryAdd(proposal.Id, proposal))
+                throw new InvalidOperationException($"proposal '{proposal.Id}' is already queued");
+        }
+
         return Task.CompletedTask;
     }
 

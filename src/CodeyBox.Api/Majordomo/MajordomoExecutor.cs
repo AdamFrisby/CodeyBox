@@ -316,15 +316,19 @@ internal sealed class MajordomoExecutor
                         MajordomoOutcomes.Refused, mutation.Refusal.Detail, true);
                 // The proposal is persisted before it is shown: the operator
                 // approves the stored record, and approval replays the stored
-                // arguments through the mutate backend.
+                // arguments through the mutate backend. A full proposal
+                // queue is a refusal the model can act on, not an error.
                 var stored = await _proposals.ProposeAsync(
                         propose.Proposal.Tool, proposalArgs, mutation.ChangeSet!, identity, ct)
                     .ConfigureAwait(false);
+                if (stored.Refusal is { } enqueueRefusal)
+                    return (Envelope(MajordomoOutcomes.Refused, refusal: enqueueRefusal),
+                        MajordomoOutcomes.Refused, enqueueRefusal.Detail, true);
                 // Echo the CANONICAL arguments (the bound contract
                 // re-serialized), not the raw payload — what the proposal
                 // shows is exactly what would execute.
                 var view = new MajordomoProposalView(
-                    stored.Id,
+                    stored.Record!.Id,
                     propose.Proposal.Tool.Name,
                     JsonSerializer.SerializeToNode(proposalArgs, proposalArgs.GetType(), MajordomoJson.Options),
                     mutation.ChangeSet!.PlannedItemCount,

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Majordomo;
 
@@ -26,9 +27,6 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
     // SQLITE_CONSTRAINT_PRIMARYKEY: a duplicate Enqueue id.
     private const int SqliteConstraintPrimaryKey = 1555;
 
-    /// <summary>How long a blocked statement retries before SQLite reports busy.</summary>
-    private const int BusyTimeoutMilliseconds = 30000;
-
     /// <summary>
     /// The columns every read projects, in the ordinal order
     /// <see cref="Read"/> consumes. Listed explicitly rather than
@@ -42,17 +40,20 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly SqliteDatabaseWriteGate _writeLock;
+    private readonly ILogger<SqliteMajordomoProposalStore>? _log;
     private int _disposed;
 
     public SqliteMajordomoProposalStore(
         string path,
-        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null,
+        ILogger<SqliteMajordomoProposalStore>? log = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
         _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
+        _log = log;
         _writeLock.Wait();
         try
         {
@@ -66,7 +67,7 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
                 // be gone by approval time, and that drift is revalidated at
                 // apply rather than refused by the schema.
                 pragmaCmd.CommandText =
-                    $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={BusyTimeoutMilliseconds}; PRAGMA foreign_keys = OFF;";
+                    $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={SqliteDefaults.BusyTimeoutMilliseconds}; PRAGMA foreign_keys = OFF;";
                 pragmaCmd.ExecuteNonQuery();
             }
 
@@ -102,25 +103,63 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
         }
     }
 
-    public async Task EnqueueAsync(MajordomoProposalRecord proposal, CancellationToken ct = default)
+    public async Task EnqueueAsync(
+        MajordomoProposalRecord proposal,
+        MajordomoOptions policy,
+        DateTimeOffset now,
+        CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(proposal);
+        ArgumentNullException.ThrowIfNull(policy);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             await _writeLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                // The sweep and the cap ride the same write critical section
+                // as the insert. Expired pending rows are reaped BEFORE the
+                // cap counts, so a stale backlog drains as new proposals
+                // arrive instead of deadlocking the queue; applying rows are
+                // never reaped — a claimed commit stays for inspection.
+                using (var sweep = _conn.CreateCommand())
+                {
+                    sweep.CommandText = $"""
+                        DELETE FROM majordomo_proposals
+                        WHERE state IN ('{MajordomoProposalState.Approved}', '{MajordomoProposalState.Rejected}',
+                                        '{MajordomoProposalState.Expired}', '{MajordomoProposalState.Superseded}')
+                          AND julianday(COALESCE(decided_at, proposed_at)) < julianday($retentionCutoff);
+                        DELETE FROM majordomo_proposals
+                        WHERE state = '{MajordomoProposalState.Pending}'
+                          AND julianday(proposed_at) <= julianday($expiryCutoff);
+                        """;
+                    sweep.Parameters.AddWithValue(
+                        "$retentionCutoff", (now - policy.DecidedProposalRetention).ToString("O"));
+                    sweep.Parameters.AddWithValue(
+                        "$expiryCutoff", (now - policy.ProposalTimeToLive).ToString("O"));
+                    await sweep.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
                 using var cmd = _conn.CreateCommand();
-                cmd.CommandText = """
+                // The cap is a guard INSIDE the insert statement: the count
+                // is evaluated under the statement's own write lock, so even
+                // a writer in another process cannot slip a row between the
+                // count and the insert. Zero rows written means the queue
+                // was already at the bound — a refusal, not a silent drop.
+                cmd.CommandText = $"""
                     INSERT INTO majordomo_proposals (id, tool, args_json, reasoning, plan_json, proposed_by,
                         proposed_at, state, decided_at, decided_by, decision_reason, result_ids_json)
-                    VALUES ($id, $tool, $args, $reasoning, $plan, $by, $at, $state, $decidedAt, $decidedBy, $decisionReason, $resultIds);
+                    SELECT $id, $tool, $args, $reasoning, $plan, $by, $at, $state, $decidedAt, $decidedBy, $decisionReason, $resultIds
+                    WHERE (SELECT COUNT(*) FROM majordomo_proposals
+                           WHERE state IN ('{MajordomoProposalState.Pending}', '{MajordomoProposalState.Applying}'))
+                          < $maxPending;
                     """;
                 Bind(cmd, proposal);
+                cmd.Parameters.AddWithValue("$maxPending", policy.MaxPendingProposals);
                 try
                 {
-                    await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                    if (await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 0)
+                        throw new MajordomoProposalQueueFullException(policy.MaxPendingProposals);
                 }
                 catch (SqliteException ex) when (ex.SqliteExtendedErrorCode == SqliteConstraintPrimaryKey)
                 {
@@ -187,9 +226,15 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
                 {
                     rows.Add(Read(reader));
                 }
-                catch (MajordomoProposalCorruptException)
+                catch (MajordomoProposalCorruptException ex)
                 {
                     // Skipped per above; GetAsync still surfaces the detail.
+                    // Logged so the unreadable row is visible somewhere — the
+                    // operator list is the queue's only discovery surface.
+                    _log?.LogWarning(
+                        "Skipping corrupt majordomo proposal row {ProposalId}: {Detail}",
+                        Validation.DescribeUntrustedValue(ex.ProposalId),
+                        Validation.DescribeUntrustedValue(ex.Message));
                 }
             }
 

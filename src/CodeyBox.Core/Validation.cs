@@ -328,4 +328,37 @@ public static partial class Validation
             or UnicodeCategory.OtherNotAssigned
             or UnicodeCategory.LineSeparator
             or UnicodeCategory.ParagraphSeparator);
+
+    /// <summary>
+    /// True when every character of <paramref name="value"/> is in the
+    /// display-echoable class <see cref="DescribeUntrustedValue"/> keeps —
+    /// so storing it cannot smuggle bidi overrides, zero-width or
+    /// private-use characters, lone surrogates, or terminal escapes into a
+    /// rendered surface. <paramref name="allowProseWhitespace"/> additionally
+    /// permits CR/LF/TAB for multi-line stored text (majordomo reasoning);
+    /// single-line values echoed into audit records must leave it off so a
+    /// line break cannot forge a log entry. Null is echoable.
+    /// </summary>
+    public static bool IsEchoableText(string? value, bool allowProseWhitespace = false)
+    {
+        if (value is null)
+            return true;
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (allowProseWhitespace && value[i] is '\r' or '\n' or '\t')
+                continue;
+            var width = char.IsHighSurrogate(value[i])
+                && i + 1 < value.Length
+                && char.IsLowSurrogate(value[i + 1])
+                ? 2
+                : 1;
+            var category = width == 2
+                ? char.GetUnicodeCategory(value, i)
+                : char.GetUnicodeCategory(value[i]);
+            if (!IsEchoableCategory(category))
+                return false;
+            i += width - 1;
+        }
+        return true;
+    }
 }

@@ -32,6 +32,9 @@ internal static class MajordomoRefusalReasons
 
     /// <summary>A claimed commit is in flight or was interrupted before its outcome was recorded.</summary>
     public const string ProposalCommitIncomplete = "proposal_commit_incomplete";
+
+    /// <summary>The proposal queue is at its configured bound on undecided proposals.</summary>
+    public const string ProposalQueueFull = "proposal_queue_full";
 }
 
 /// <summary>

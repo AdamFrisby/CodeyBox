@@ -26,6 +26,22 @@ internal sealed record MajordomoProposalApprovalOutcome(
 }
 
 /// <summary>
+/// Outcome of filing a proposal: either the stored record or a refusal —
+/// today only a full queue (the configured bound on undecided proposals
+/// reached), which the caller can retry after decisions drain the backlog.
+/// </summary>
+internal sealed record MajordomoProposalEnqueueOutcome(
+    MajordomoProposalRecord? Record,
+    MajordomoRefusal? Refusal)
+{
+    public static MajordomoProposalEnqueueOutcome Enqueued(MajordomoProposalRecord record) =>
+        new(record, null);
+
+    public static MajordomoProposalEnqueueOutcome Refused(MajordomoRefusal refusal) =>
+        new(null, refusal);
+}
+
+/// <summary>
 /// Outcome of rejecting or superseding a proposal: either the updated record
 /// or a refusal naming the actual state.
 /// </summary>
@@ -134,25 +150,41 @@ internal sealed class MajordomoProposalService
     /// <summary>
     /// Persists a planned mutation as a pending proposal, carrying the dry-run
     /// change set the operator reviews — approval re-plans against live state
-    /// and refuses when the live plan no longer matches what was shown.
+    /// and refuses when the live plan no longer matches what was shown. The
+    /// store enforces the configured backlog bound atomically with the
+    /// insert (reaping expired pending rows and decided rows past retention
+    /// first), so a queue at capacity refuses instead of growing the state
+    /// database at request rate.
     /// </summary>
-    public async Task<MajordomoProposalRecord> ProposeAsync(
+    public async Task<MajordomoProposalEnqueueOutcome> ProposeAsync(
         MajordomoTool tool,
         MajordomoMutateArgs args,
         MajordomoChangeSet reviewedChangeSet,
         string proposedBy,
         CancellationToken ct = default)
     {
+        var policy = _options.CurrentValue.ToPolicy();
         var record = MajordomoProposalRecord.Create(
             tool.Name, args, proposedBy, _time.GetUtcNow(), args.Reasoning, reviewedChangeSet);
-        await _store.EnqueueAsync(record, ct).ConfigureAwait(false);
+        try
+        {
+            await _store.EnqueueAsync(record, policy, _time.GetUtcNow(), ct).ConfigureAwait(false);
+        }
+        catch (MajordomoProposalQueueFullException)
+        {
+            return MajordomoProposalEnqueueOutcome.Refused(new MajordomoRefusal(
+                MajordomoRefusalReasons.ProposalQueueFull,
+                $"the proposal queue is full — {policy.MaxPendingProposals} proposals are " +
+                "awaiting a decision; review the queue before proposing more"));
+        }
+
         AuditLog.MajordomoToolCall(
             record.Id,
             Validation.DescribeUntrustedValue(proposedBy),
             Validation.DescribeUntrustedValue(tool.Name),
             MajordomoDecisions.Propose,
             $"proposal {record.Id}");
-        return record;
+        return MajordomoProposalEnqueueOutcome.Enqueued(record);
     }
 
     /// <summary>
@@ -223,10 +255,22 @@ internal sealed class MajordomoProposalService
                 // backend re-plans every target against live state (the
                 // refusal leaves the proposal pending so the operator can
                 // inspect, reject, or retry), and the re-planned change set
-                // must still match the one the operator reviewed.
+                // must still match the one the operator reviewed. A cancel's
+                // cascade is measured once here — inside the per-id gate —
+                // and the SAME enumerated set is handed to the commit below,
+                // so an approval can never cancel a wider set than the
+                // revalidation measured (the delegate contract the executor
+                // already honours).
+                IReadOnlyList<WorkItem>? cancelCascade = null;
+                if (record.Arguments is CancelWorkItemArgs cancel)
+                {
+                    cancelCascade = await _mutates
+                        .FindCancelCascadeTargetsAsync(cancel.Id, ct).ConfigureAwait(false);
+                }
+
                 var plan = await _mutates.MutateAsync(
                         tool!, record.Arguments, initiator,
-                        cancelCascadeTargets: null, commit: false, ct)
+                        cancelCascade, commit: false, ct)
                     .ConfigureAwait(false);
                 if (plan.Refusal is not null)
                 {
@@ -260,7 +304,8 @@ internal sealed class MajordomoProposalService
                         id, MajordomoProposalState.Pending, claim, ct).ConfigureAwait(false))
                 {
                     return await CommitClaimedAsync(
-                        record, id, safeId, tool!, decidedBy, initiator, now, ct).ConfigureAwait(false);
+                        record, id, safeId, tool!, decidedBy, initiator, cancelCascade, now, ct)
+                        .ConfigureAwait(false);
                 }
                 // Lost the claim — loop re-reads and reports the winning state.
             }
@@ -284,6 +329,12 @@ internal sealed class MajordomoProposalService
     /// record, because returning it to pending would invite a blind retry of
     /// a partially applied mutation.
     /// </summary>
+    /// <param name="cancelCascade">
+    /// For a cancel proposal, the dependent set enumerated during
+    /// revalidation — the commit must apply exactly that measured set, never
+    /// a re-scan that could widen the blast radius past what the drift check
+    /// compared.
+    /// </param>
     private async Task<MajordomoProposalApprovalOutcome> CommitClaimedAsync(
         MajordomoProposalRecord record,
         string id,
@@ -291,13 +342,28 @@ internal sealed class MajordomoProposalService
         MajordomoTool tool,
         string decidedBy,
         WorkInitiator initiator,
+        IReadOnlyList<WorkItem>? cancelCascade,
         DateTimeOffset now,
         CancellationToken ct)
     {
-        var mutation = await _mutates.MutateAsync(
-                tool, record.Arguments, initiator,
-                cancelCascadeTargets: null, commit: true, ct)
-            .ConfigureAwait(false);
+        MajordomoMutationResult mutation;
+        try
+        {
+            mutation = await _mutates.MutateAsync(
+                    tool, record.Arguments, initiator,
+                    cancelCascade, commit: true, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // A mid-commit failure may have already written — mirror the
+            // executor's faulted-mutation audit so the trail is never silent
+            // about a partially applied proposal commit.
+            AuditOutcome(id, decidedBy, record.ToolName, MajordomoOutcomes.Error,
+                $"commit threw — partial writes may have landed: " +
+                Validation.DescribeUntrustedValue($"{ex.GetType().Name}: {ex.Message}"));
+            throw;
+        }
 
         if (mutation.Refusal is { } refusal)
         {
@@ -421,7 +487,6 @@ internal sealed class MajordomoProposalService
             if (!await _store.TryTransitionAsync(id, record.State, decided, ct).ConfigureAwait(false))
             {
                 var current = await _store.GetAsync(id, ct).ConfigureAwait(false);
-                var actual = current?.State.ToString().ToLowerInvariant() ?? "missing";
                 return MajordomoProposalDecisionOutcome.Refused(NotPending(safeId, current?.State));
             }
 
@@ -533,8 +598,12 @@ internal sealed class MajordomoProposalService
         if (trimmed.Length > MaxDecisionReasonLength)
             throw new ArgumentException(
                 $"reason must be <= {MaxDecisionReasonLength} chars", nameof(reason));
-        if (trimmed.Any(char.IsControl))
-            throw new ArgumentException("reason must not contain control characters", nameof(reason));
+        // The reason lands in audit records and the proposal DTO verbatim:
+        // single-line, echoable characters only — a newline could forge a
+        // log line, a bidi override could spoof the displayed decision.
+        if (!Validation.IsEchoableText(trimmed))
+            throw new ArgumentException(
+                "reason must not contain control or display-spoofing characters", nameof(reason));
         return trimmed;
     }
 }

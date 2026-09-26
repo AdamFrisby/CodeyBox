@@ -121,6 +121,28 @@ public sealed class MajordomoProposalQueueTests
     private static IOptionsMonitor<MajordomoServerOptions> MonitorOf(MajordomoServerOptions options)
         => new StubOptionsMonitor(options);
 
+    /// <summary>Files a proposal through the service, asserting it was not refused.</summary>
+    private static async Task<MajordomoProposalRecord> ProposeOrThrowAsync(
+        MajordomoProposalService service,
+        MajordomoTool tool,
+        MajordomoMutateArgs args,
+        MajordomoChangeSet reviewedChangeSet,
+        string proposedBy,
+        CancellationToken ct = default)
+    {
+        var outcome = await service.ProposeAsync(tool, args, reviewedChangeSet, proposedBy, ct);
+        Assert.Null(outcome.Refusal);
+        return outcome.Record!;
+    }
+
+    /// <summary>A pending proposal record for <paramref name="title"/>.</summary>
+    private static MajordomoProposalRecord Proposal(string title, DateTimeOffset? at = null) =>
+        MajordomoProposalRecord.Create(
+            "create_work_item",
+            new CreateWorkItemArgs(ItemSpec(title)),
+            "majordomo",
+            at ?? DateTimeOffset.UtcNow);
+
     private sealed class StubOptionsMonitor(MajordomoServerOptions value) : IOptionsMonitor<MajordomoServerOptions>
     {
         public MajordomoServerOptions CurrentValue => value;
@@ -288,7 +310,7 @@ public sealed class MajordomoProposalQueueTests
         var time = new ControllableTime(DateTimeOffset.UtcNow);
         var service = ManualService(factory, store, time, ttlSeconds: 3600);
 
-        var record = await service.ProposeAsync(
+        var record = await ProposeOrThrowAsync(service,
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("doomed item")),
             ReviewedPlan(ItemSpec("doomed item")),
@@ -370,7 +392,7 @@ public sealed class MajordomoProposalQueueTests
         var time = new ControllableTime(DateTimeOffset.UtcNow);
         var service = ManualService(factory, store, time);
 
-        var record = await service.ProposeAsync(
+        var record = await ProposeOrThrowAsync(service,
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("unwanted item")),
             ReviewedPlan(ItemSpec("unwanted item")),
@@ -400,7 +422,7 @@ public sealed class MajordomoProposalQueueTests
         var time = new ControllableTime(DateTimeOffset.UtcNow);
         var service = ManualService(factory, store, time);
 
-        var record = await service.ProposeAsync(
+        var record = await ProposeOrThrowAsync(service,
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("once only")),
             ReviewedPlan(ItemSpec("once only")),
@@ -438,7 +460,7 @@ public sealed class MajordomoProposalQueueTests
                 now,
                 reviewedChangeSet: plan);
             id = record.Id;
-            await store.EnqueueAsync(record);
+            await store.EnqueueAsync(record, new MajordomoOptions(), DateTimeOffset.UtcNow);
         }
 
         try
@@ -514,7 +536,7 @@ public sealed class MajordomoProposalQueueTests
         var time = new ControllableTime(DateTimeOffset.UtcNow);
         var service = ManualService(factory, store, time);
 
-        var record = await service.ProposeAsync(
+        var record = await ProposeOrThrowAsync(service,
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("raced approval")),
             ReviewedPlan(ItemSpec("raced approval")),
@@ -545,7 +567,7 @@ public sealed class MajordomoProposalQueueTests
         var time = new ControllableTime(DateTimeOffset.UtcNow);
         var service = ManualService(factory, store, time);
 
-        var record = await service.ProposeAsync(
+        var record = await ProposeOrThrowAsync(service,
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("raced decision")),
             ReviewedPlan(ItemSpec("raced decision")),
@@ -595,7 +617,7 @@ public sealed class MajordomoProposalQueueTests
 
         var args = new CancelWorkItemArgs(target.Id, "consolidating work");
         var reviewed = await PlanWithBackendAsync(factory, MajordomoTools.CancelWorkItem, args);
-        var record = await service.ProposeAsync(
+        var record = await ProposeOrThrowAsync(service,
             MajordomoTools.CancelWorkItem, args, reviewed, "majordomo", CancellationToken.None);
 
         // The blast radius grows between proposal and approval: another item
@@ -622,7 +644,7 @@ public sealed class MajordomoProposalQueueTests
         var time = new ControllableTime(DateTimeOffset.UtcNow);
         var service = ManualService(factory, store, time);
 
-        var record = await service.ProposeAsync(
+        var record = await ProposeOrThrowAsync(service,
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("interrupted")),
             ReviewedPlan(ItemSpec("interrupted")),
@@ -675,7 +697,7 @@ public sealed class MajordomoProposalQueueTests
             ProposedBy = "majordomo",
             ProposedAt = DateTimeOffset.UtcNow,
         };
-        await store.EnqueueAsync(record);
+        await store.EnqueueAsync(record, new MajordomoOptions(), DateTimeOffset.UtcNow);
 
         var approval = await service.ApproveAsync(record.Id, "test-operator", TestInitiator);
         Assert.NotNull(approval.Refusal);
@@ -761,9 +783,9 @@ public sealed class MajordomoProposalQueueTests
     [Fact]
     public async Task ProposalEndpoints_RefuseMajordomoAndExecutorTokens_AcceptOperator()
     {
-        const string operatorKey = "0123456789abcdef0123456789abcdef";
-        const string majordomoKey = "fedcba9876543210fedcba9876543210";
-        const string executorKey = "00112233445566770011223344556677";
+        const string operatorKey = "test-token-operator-proposal-gate-00";
+        const string majordomoKey = "test-token-majordomo-proposal-gate-0";
+        const string executorKey = "test-token-executor-proposal-gate-00";
         using var envOperator = new EnvironmentVariableScope("CODEYBOX_API_KEY", operatorKey);
         using var envMajordomo = new EnvironmentVariableScope("CODEYBOX_TEST_MAJORDOMO_TOKEN", majordomoKey);
         using var envExecutor = new EnvironmentVariableScope("CODEYBOX_TEST_EXECUTOR_TOKEN", executorKey);
@@ -795,7 +817,7 @@ public sealed class MajordomoProposalQueueTests
             DateTimeOffset.UtcNow,
             reviewedChangeSet: ReviewedPlan(spec));
         await host.Services.GetRequiredService<IMajordomoProposalStore>()
-            .EnqueueAsync(proposal);
+            .EnqueueAsync(proposal, new MajordomoOptions(), DateTimeOffset.UtcNow);
 
         using var http = host.CreateClient();
 
@@ -831,6 +853,205 @@ public sealed class MajordomoProposalQueueTests
             .GetAsync(proposal.Id);
         Assert.Equal(MajordomoProposalState.Rejected, record!.State);
         Assert.Empty(await ListAllAsync(inner));
+    }
+
+    // ── queue bounds: the enqueue path is capped and self-sweeping ─────────
+
+    [Fact]
+    public async Task Enqueue_WhenQueueIsFull_RefusesAtomically()
+    {
+        var store = new InMemoryMajordomoProposalStore();
+        var policy = new MajordomoOptions { MaxPendingProposals = 2 };
+        var now = DateTimeOffset.UtcNow;
+
+        await store.EnqueueAsync(Proposal("one"), policy, now);
+        await store.EnqueueAsync(Proposal("two"), policy, now);
+
+        var ex = await Assert.ThrowsAsync<MajordomoProposalQueueFullException>(
+            () => store.EnqueueAsync(Proposal("three"), policy, now));
+        Assert.Equal(2, ex.MaxPending);
+        Assert.Equal(2, (await store.ListAsync()).Count);
+    }
+
+    [Fact]
+    public async Task Enqueue_ReapsExpiredPendingRows_FreeingCapacity()
+    {
+        var store = new InMemoryMajordomoProposalStore();
+        var policy = new MajordomoOptions
+        {
+            MaxPendingProposals = 1,
+            ProposalTimeToLive = TimeSpan.FromMinutes(5),
+        };
+        var t0 = DateTimeOffset.UtcNow;
+
+        await store.EnqueueAsync(Proposal("stale", t0), policy, t0);
+        // While the stale row is undecided the cap refuses new proposals …
+        await Assert.ThrowsAsync<MajordomoProposalQueueFullException>(
+            () => store.EnqueueAsync(Proposal("blocked", t0), policy, t0));
+
+        // … but once it is past its TTL the next enqueue reaps it and lands.
+        var later = t0.AddMinutes(10);
+        await store.EnqueueAsync(Proposal("fresh", later), policy, later);
+        var remaining = Assert.Single(await store.ListAsync());
+        Assert.Equal("fresh", Assert.IsType<CreateWorkItemArgs>(remaining.Arguments).Item.Title);
+    }
+
+    [Fact]
+    public async Task Enqueue_ReapsOnlyDecidedRowsPastRetention()
+    {
+        var store = new InMemoryMajordomoProposalStore();
+        var policy = new MajordomoOptions
+        {
+            ProposalTimeToLive = TimeSpan.FromDays(30),
+            DecidedProposalRetention = TimeSpan.FromDays(7),
+        };
+        var t0 = DateTimeOffset.UtcNow;
+
+        var decided = Proposal("old rejection", t0);
+        var pending = Proposal("still pending", t0);
+        var stuck = Proposal("stuck commit", t0);
+        await store.EnqueueAsync(decided, policy, t0);
+        await store.EnqueueAsync(pending, policy, t0);
+        await store.EnqueueAsync(stuck, policy, t0);
+        Assert.True(await store.TryTransitionAsync(
+            decided.Id, MajordomoProposalState.Pending,
+            decided with
+            {
+                State = MajordomoProposalState.Rejected,
+                DecidedAt = t0.AddDays(1),
+                DecidedBy = "test-operator",
+                DecisionReason = "not needed",
+            }));
+        Assert.True(await store.TryTransitionAsync(
+            stuck.Id, MajordomoProposalState.Pending,
+            stuck with
+            {
+                State = MajordomoProposalState.Applying,
+                DecidedAt = t0,
+                DecidedBy = "test-operator",
+                DecisionReason = MajordomoProposalService.CommitInFlightReason,
+            }));
+
+        // Past the retention window an enqueue reaps the decided row — but a
+        // live pending row and a claimed commit are never reaped.
+        var later = t0.AddDays(9);
+        await store.EnqueueAsync(Proposal("trigger", later), policy, later);
+
+        var rows = await store.ListAsync();
+        Assert.Equal(3, rows.Count);
+        Assert.DoesNotContain(rows, r => r.Id == decided.Id);
+        Assert.Contains(rows, r => r.Id == pending.Id);
+        Assert.Contains(rows, r => r.Id == stuck.Id);
+    }
+
+    [Fact]
+    public async Task SqliteStore_Enqueue_EnforcesCap_AndSweepsExpiredPending()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mjd-prop-{Guid.NewGuid():N}.db");
+        var policy = new MajordomoOptions
+        {
+            MaxPendingProposals = 1,
+            ProposalTimeToLive = TimeSpan.FromMinutes(5),
+        };
+        var t0 = DateTimeOffset.UtcNow;
+        try
+        {
+            using (var store = new SqliteMajordomoProposalStore(path))
+            {
+                await store.EnqueueAsync(Proposal("stale", t0), policy, t0);
+                await Assert.ThrowsAsync<MajordomoProposalQueueFullException>(
+                    () => store.EnqueueAsync(Proposal("blocked", t0), policy, t0));
+
+                var later = t0.AddMinutes(10);
+                await store.EnqueueAsync(Proposal("fresh", later), policy, later);
+            }
+
+            using (var reopened = new SqliteMajordomoProposalStore(path))
+            {
+                var rows = await reopened.ListAsync();
+                var remaining = Assert.Single(rows);
+                Assert.Equal("fresh", Assert.IsType<CreateWorkItemArgs>(remaining.Arguments).Item.Title);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch (IOException) { }
+            TestScratchDirectory.DeleteSqliteCompanions(path);
+        }
+    }
+
+    [Fact]
+    public async Task FullProposalQueue_RefusesProposals_UntilDecisionsDrainIt()
+    {
+        using var factory = new WorkItemApiFactory();
+        var store = new InMemoryMajordomoProposalStore();
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        var service = new MajordomoProposalService(
+            store,
+            factory.Services.GetRequiredService<MajordomoMutateBackend>(),
+            MonitorOf(new MajordomoServerOptions { MaxPendingProposals = 1 }),
+            time);
+
+        var first = await service.ProposeAsync(
+            MajordomoTools.CreateWorkItem,
+            new CreateWorkItemArgs(ItemSpec("queued")),
+            ReviewedPlan(ItemSpec("queued")),
+            "majordomo",
+            CancellationToken.None);
+        Assert.Null(first.Refusal);
+        Assert.NotNull(first.Record);
+
+        var overflow = await service.ProposeAsync(
+            MajordomoTools.CreateWorkItem,
+            new CreateWorkItemArgs(ItemSpec("overflow")),
+            ReviewedPlan(ItemSpec("overflow")),
+            "majordomo",
+            CancellationToken.None);
+        Assert.NotNull(overflow.Refusal);
+        Assert.Equal("proposal_queue_full", overflow.Refusal!.Reason);
+        Assert.Null(overflow.Record);
+
+        // Deciding drains the backlog, and the refusal was never a write.
+        var rejection = await service.RejectAsync(first.Record!.Id, "test-operator", "no");
+        Assert.Null(rejection.Refusal);
+        var after = await service.ProposeAsync(
+            MajordomoTools.CreateWorkItem,
+            new CreateWorkItemArgs(ItemSpec("after drain")),
+            ReviewedPlan(ItemSpec("after drain")),
+            "majordomo",
+            CancellationToken.None);
+        Assert.Null(after.Refusal);
+        Assert.NotNull(after.Record);
+        Assert.Empty(await ListAllAsync(factory));
+    }
+
+    // ── approval commits exactly the cascade revalidation measured ──────────
+
+    [Fact]
+    public async Task Approval_CommitsExactlyTheMeasuredCancelCascade()
+    {
+        using var factory = new WorkItemApiFactory();
+        var target = Seed(WorkItemState.Queued, "cancel target");
+        var dependent = Seed(WorkItemState.Queued, "dependent") with { DependsOn = [target.Id] };
+        await factory.Store.CreateAsync(target);
+        await factory.Store.CreateAsync(dependent);
+
+        var store = new InMemoryMajordomoProposalStore();
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        var service = ManualService(factory, store, time);
+
+        var args = new CancelWorkItemArgs(target.Id, "consolidating work");
+        var reviewed = await PlanWithBackendAsync(factory, MajordomoTools.CancelWorkItem, args);
+        var record = await ProposeOrThrowAsync(
+            service, MajordomoTools.CancelWorkItem, args, reviewed, "majordomo");
+
+        var approval = await service.ApproveAsync(record.Id, "test-operator", TestInitiator);
+        Assert.Null(approval.Refusal);
+        Assert.Equal(2, approval.ChangeSet!.AffectedItems.Count);
+        Assert.Equal(WorkItemState.Cancelled, (await factory.Store.GetAsync(target.Id))!.State);
+        Assert.Equal(WorkItemState.Cancelled, (await factory.Store.GetAsync(dependent.Id))!.State);
+        Assert.Equal(
+            MajordomoProposalState.Approved, (await store.GetAsync(record.Id))!.State);
     }
 
     private sealed class EnvironmentVariableScope : IDisposable

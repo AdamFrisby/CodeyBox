@@ -17,8 +17,10 @@ internal static class MajordomoProposalEndpoints
 {
     /// <summary>
     /// The initiator stamped on a committed mutation when the deciding
-    /// request carries no API principal (an auth-disabled test host driving
-    /// the service directly still commits as an operator decision).
+    /// request carries no API principal at all — a host driving the service
+    /// without an authenticated request still commits as an operator
+    /// decision. (An auth-disabled host does carry a principal: the
+    /// loopback-operator sentinel.)
     /// </summary>
     private static readonly WorkInitiator ProposalDecisionInitiator = new()
     {

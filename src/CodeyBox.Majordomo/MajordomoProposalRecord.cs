@@ -120,11 +120,14 @@ public sealed record MajordomoProposalRecord
         if (trimmed.Length > MaxReasoningLength)
             throw new ArgumentException(
                 $"reasoning must be <= {MaxReasoningLength} chars", paramName);
-        // Reasoning is rendered to operators, so terminal escapes must not
-        // ride it into a log or dashboard. Newlines and tabs are legitimate
-        // prose; every other control character is refused.
-        if (trimmed.Any(c => char.IsControl(c) && c is not '\r' and not '\n' and not '\t'))
-            throw new ArgumentException("reasoning must not contain control characters", paramName);
+        // Reasoning is rendered to operators, so terminal escapes and
+        // display-spoofing characters (bidi overrides/isolates, zero-width
+        // and other Unicode format characters, unassigned code points) must
+        // not ride it into a log or dashboard. Newlines and tabs are
+        // legitimate prose; every other non-echoable character is refused.
+        if (!Validation.IsEchoableText(trimmed, allowProseWhitespace: true))
+            throw new ArgumentException(
+                "reasoning must not contain control or display-spoofing characters", paramName);
         return trimmed;
     }
 }

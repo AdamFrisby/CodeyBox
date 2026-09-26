@@ -30,6 +30,28 @@ public sealed record MajordomoOptions
     /// </summary>
     public const int MaxAllowedMutatedItemsPerTurn = 100;
 
+    /// <summary>Default cap on proposals awaiting an operator decision.</summary>
+    public const int DefaultMaxPendingProposals = 256;
+
+    /// <summary>
+    /// Hard ceiling on <see cref="MaxPendingProposals"/> — configuration
+    /// cannot raise the backlog bound past this no matter what the operator
+    /// sets.
+    /// </summary>
+    public const int MaxAllowedPendingProposals = 4096;
+
+    /// <summary>
+    /// Default retention for decided proposal rows: a week of review history
+    /// before the enqueue sweep reaps them.
+    /// </summary>
+    public static readonly TimeSpan DefaultDecidedProposalRetention = TimeSpan.FromDays(7);
+
+    /// <summary>Shortest accepted decided-row retention.</summary>
+    public static readonly TimeSpan MinDecidedProposalRetention = TimeSpan.FromMinutes(1);
+
+    /// <summary>Longest accepted decided-row retention.</summary>
+    public static readonly TimeSpan MaxDecidedProposalRetention = TimeSpan.FromDays(90);
+
     private MajordomoAutonomyMode _mode = MajordomoAutonomyMode.Proposed;
 
     /// <summary>
@@ -91,6 +113,49 @@ public sealed record MajordomoOptions
                     nameof(ProposalTimeToLive), value,
                     $"ProposalTimeToLive must be within [{MinProposalTimeToLive}, {MaxProposalTimeToLive}]");
             _proposalTimeToLive = value;
+        }
+    }
+
+    private int _maxPendingProposals = DefaultMaxPendingProposals;
+
+    /// <summary>
+    /// Maximum proposals awaiting an operator decision at once — pending rows
+    /// plus claimed commits still in <c>applying</c>. The store enforces the
+    /// cap atomically with each enqueue, so a proposer cannot grow the shared
+    /// state database at request rate; a refused enqueue stays a refusal the
+    /// caller can see, never a silent drop.
+    /// </summary>
+    public int MaxPendingProposals
+    {
+        get => _maxPendingProposals;
+        init
+        {
+            if (value < 1 || value > MaxAllowedPendingProposals)
+                throw new ArgumentOutOfRangeException(
+                    nameof(MaxPendingProposals), value,
+                    $"MaxPendingProposals must be within [1, {MaxAllowedPendingProposals}]");
+            _maxPendingProposals = value;
+        }
+    }
+
+    private TimeSpan _decidedProposalRetention = DefaultDecidedProposalRetention;
+
+    /// <summary>
+    /// How long a decided (approved, rejected, expired, superseded) proposal
+    /// row is retained for operator review before the enqueue sweep removes
+    /// it. Undecided rows are never reaped by retention — a claimed commit
+    /// stuck in <c>applying</c> stays for operator inspection.
+    /// </summary>
+    public TimeSpan DecidedProposalRetention
+    {
+        get => _decidedProposalRetention;
+        init
+        {
+            if (value < MinDecidedProposalRetention || value > MaxDecidedProposalRetention)
+                throw new ArgumentOutOfRangeException(
+                    nameof(DecidedProposalRetention), value,
+                    $"DecidedProposalRetention must be within [{MinDecidedProposalRetention}, {MaxDecidedProposalRetention}]");
+            _decidedProposalRetention = value;
         }
     }
 }
