@@ -233,7 +233,9 @@ public sealed partial class PipelineRunner
                 runner.Kind,
                 agentPhase,
                 "Retained-sandbox adoption could not be completed safely; the exact recovery lease remains preserved.",
-                ex);
+                ex,
+                executionUnavailable: ex is SandboxExecutionUnavailableException
+                    or AgentResumePreparationUnavailableException);
         }
         catch
         {
@@ -1275,7 +1277,8 @@ public sealed partial class PipelineRunner
                 agentPhase,
                 ex.ExitCode is { } exitCode
                     ? $"Sandbox execution became unavailable while preparing the checkpointed {agentPhase} turn (exit {exitCode})."
-                    : $"Sandbox execution became unavailable while preparing the checkpointed {agentPhase} turn.");
+                    : $"Sandbox execution became unavailable while preparing the checkpointed {agentPhase} turn.",
+                executionUnavailable: true);
         }
         catch (SandboxExecutionUnavailableException ex)
         {
@@ -1302,14 +1305,16 @@ public sealed partial class PipelineRunner
                 agentPhase,
                 successfulAgentResult is null
                     ? $"Sandbox execution became unavailable before the {agentPhase} agent could run (exit {ex.ExitCode})."
-                    : $"Sandbox execution became unavailable after agent exit while preserving the {agentPhase} work tree (exit {ex.ExitCode}).");
+                    : $"Sandbox execution became unavailable after agent exit while preserving the {agentPhase} work tree (exit {ex.ExitCode}).",
+                executionUnavailable: true);
         }
         catch (SandboxCredentialFileWriteException ex) when (ex.ExecutionUnavailable)
         {
             throw new AgentInfrastructureFailureException(
                 runner.Kind,
                 agentPhase,
-                $"Sandbox execution became unavailable while materialising credentials for {agentPhase} (exit {ex.ExitCode}).");
+                $"Sandbox execution became unavailable while materialising credentials for {agentPhase} (exit {ex.ExitCode}).",
+                executionUnavailable: true);
         }
         catch (Exception ex) when (
             resumingRetainedSandbox
@@ -1323,7 +1328,9 @@ public sealed partial class PipelineRunner
                 runner.Kind,
                 agentPhase,
                 "Retained-sandbox checkpoint conversion could not be completed safely; the exact recovery lease remains preserved.",
-                ex);
+                ex,
+                executionUnavailable: ex is SandboxExecutionUnavailableException
+                    or AgentResumePreparationUnavailableException);
         }
         finally
         {

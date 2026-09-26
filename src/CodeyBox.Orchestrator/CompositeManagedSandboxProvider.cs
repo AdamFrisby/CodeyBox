@@ -107,6 +107,8 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
+        await RequireNotOwnedByLiveWorkAsync(name, hostId: null, ct).ConfigureAwait(false);
+
         ProviderEntry[] candidates;
         lock (_lastListLock)
         {
@@ -139,6 +141,8 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
             return;
         }
 
+        await RequireNotOwnedByLiveWorkAsync(sandbox.Name, sandbox.HostId, ct).ConfigureAwait(false);
+
         var outerProviderId = sandbox.LifecycleProviderId;
         string? innerProviderId = null;
         if (TryDecodeNestedProviderId(
@@ -160,6 +164,55 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
         await provider.Lifecycle.DisposeLeakedAsync(
             sandbox with { LifecycleProviderId = innerProviderId },
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Destructive-disposal guard. The leak sweep's <c>IsTrackedActive</c> flag
+    /// is a snapshot of a per-provider in-memory registry that can silently
+    /// lose (or never gain) an entry, so it must not be the only thing
+    /// standing between a running agent and VM deletion. Before routing any
+    /// disposal this re-verifies the name against live phase/worker state:
+    /// every constituent lifecycle's active-work snapshot, plus a fresh
+    /// managed inventory where ANY provider reporting the name as
+    /// tracked-active vetoes the delete. Verification failures fail closed —
+    /// the sweep retries on its next pass rather than deleting an unverifiable
+    /// VM.
+    /// </summary>
+    private async Task RequireNotOwnedByLiveWorkAsync(string name, string? hostId, CancellationToken ct)
+    {
+        foreach (var provider in _providers)
+        {
+            if (provider.Lifecycle is IActiveSandboxProvider active
+                && active.SnapshotActiveSandboxes().Any(e =>
+                    string.Equals(e.Sandbox.Id, name, StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException(
+                    $"Refusing to dispose managed sandbox '{name}': a live work phase still owns it.");
+            }
+
+            if (provider.Lifecycle is IActiveSandboxProgressProvider progress
+                && progress.SnapshotActiveSandboxProgress().Any(e =>
+                    string.Equals(e.SandboxId, name, StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException(
+                    $"Refusing to dispose managed sandbox '{name}': a live work phase still owns it.");
+            }
+        }
+
+        foreach (var provider in _providers)
+        {
+            var managed = await provider.Lifecycle.ListAllManagedAsync(ct).ConfigureAwait(false);
+            foreach (var info in managed)
+            {
+                if (info.IsTrackedActive
+                    && string.Equals(info.Name, name, StringComparison.Ordinal)
+                    && (hostId is null || string.Equals(info.HostId, hostId, StringComparison.Ordinal)))
+                {
+                    throw new InvalidOperationException(
+                        $"Refusing to dispose managed sandbox '{name}': provider '{provider.Id}' reports it tracked-active.");
+                }
+            }
+        }
     }
 
     private static string EncodeNestedProviderId(string outerProviderId, string innerProviderId) =>

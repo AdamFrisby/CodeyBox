@@ -1144,6 +1144,29 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (AgentInfrastructureFailureException ex)
         {
+            // A severed execution transport means the sandbox itself is gone
+            // (leak reaper, host crash, dead exec channel): the work is not
+            // at fault and a fresh sandbox reproduces a working environment,
+            // so park for bounded transient retry under an infrastructure
+            // classification. Deterministically failing terminal would also
+            // hand the clone to the repo reaper immediately (grace applies
+            // only to terminal rows), destroying the agent's working tree —
+            // the exact follow-on damage observed when live VMs were deleted.
+            if (ex.ExecutionUnavailable)
+            {
+                _log.LogWarning(
+                    "Work item {Id} parking for retry because agent {Agent} lost its sandbox execution transport in phase {Phase}: {Reason}",
+                    item.Id, ex.Agent.Value, ex.Phase, ex.Message);
+                await TransitionWaitingForTransientRetryAsync(
+                    item,
+                    ex.Message,
+                    project,
+                    ex.Phase,
+                    ex.Agent,
+                    failureKind: WorkItemFailureKinds.Infrastructure);
+                return;
+            }
+
             _log.LogWarning(
                 "Work item {Id} failed because agent {Agent} hit infrastructure failure in phase {Phase}: {Reason}",
                 item.Id, ex.Agent.Value, ex.Phase, ex.Message);

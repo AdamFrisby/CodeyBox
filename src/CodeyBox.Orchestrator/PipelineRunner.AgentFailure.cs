@@ -37,7 +37,11 @@ public sealed partial class PipelineRunner
             return;
 
         var detail = BuildAgentFailureDetail(messagePrefix, result, _opts.MaxFailureDetailBytes);
-        throw new AgentInfrastructureFailureException(runner.Kind, phase, detail);
+        throw new AgentInfrastructureFailureException(
+            runner.Kind,
+            phase,
+            detail,
+            executionUnavailable: result.ExecutionUnavailable);
     }
 
     private async Task ThrowIfAuthErrorAgentFailureAsync(

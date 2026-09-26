@@ -368,7 +368,12 @@ public sealed class PipelineIntegrationTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var retained = (await tp.Store.GetAsync(item.Id))!;
-        Assert.Equal(WorkItemState.Failed, retained.State);
+        // A severed sandbox transport parks recoverably rather than failing
+        // terminally: the item keeps its infrastructure classification, its
+        // retained-sandbox lease, and — critically — does not enter a terminal
+        // state that would let the clone reaper delete the working tree.
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, retained.State);
+        Assert.DoesNotContain(retained.State, WorkItemDependencies.TerminalStates);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, retained.FailureKind);
         Assert.NotNull(retained.AgentTurnRecoveryLease);
         Assert.Null(retained.PreemptCheckpoint);
@@ -477,7 +482,7 @@ public sealed class PipelineIntegrationTests : IDisposable
         await tp.Pipeline.RunAsync((await tp.Store.GetAsync(item.Id))!, CancellationToken.None);
 
         var failedConversion = (await tp.Store.GetAsync(item.Id))!;
-        Assert.Equal(WorkItemState.Failed, failedConversion.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, failedConversion.State);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, failedConversion.FailureKind);
         Assert.Equal(originalLease, failedConversion.AgentTurnRecoveryLease);
         Assert.Null(failedConversion.PreemptCheckpoint);
@@ -536,7 +541,7 @@ public sealed class PipelineIntegrationTests : IDisposable
         await tp.Pipeline.RunAsync((await tp.Store.GetAsync(item.Id))!, CancellationToken.None);
 
         var failedAdoption = (await tp.Store.GetAsync(item.Id))!;
-        Assert.Equal(WorkItemState.Failed, failedAdoption.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, failedAdoption.State);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, failedAdoption.FailureKind);
         Assert.Equal(originalLease, failedAdoption.AgentTurnRecoveryLease);
         Assert.Null(failedAdoption.PreemptCheckpoint);
@@ -616,13 +621,13 @@ public sealed class PipelineIntegrationTests : IDisposable
             "TransitionWaitingForTransientRetryAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance,
             binder: null,
-            types: [typeof(WorkItem), typeof(string), typeof(Project), typeof(string), typeof(AgentKind?)],
+            types: [typeof(WorkItem), typeof(string), typeof(Project), typeof(string), typeof(AgentKind?), typeof(string)],
             modifiers: null);
         Assert.NotNull(method);
 
         await (Task)method!.Invoke(
             tp.Pipeline,
-            [stale, "Transport channel closed", null, "work", AgentKind.Claude])!;
+            [stale, "Transport channel closed", null, "work", AgentKind.Claude, "transient"])!;
 
         var final = await tp.Store.GetAsync(stale.Id);
         Assert.NotNull(final);

@@ -614,7 +614,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         return sp.GetRequiredService<ISandboxProviderRegistry>().EnsureKind(kind);
     }
 
-    ISandboxProvider inner = BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog);
+    ISandboxProvider inner = BuildReloadableSandboxProvider(sp, loggerFactory);
     var hostPlatform = hostPlatformEarly;
     LogSandboxEgressClassification(kind, hostPlatform, startupLog);
     SandboxProviderSelection.ValidateWorkloadTrust(
@@ -752,42 +752,6 @@ static void LogSandboxProviderCapabilities(ISandboxProvider provider, ILogger st
         matrix);
 }
 
-static ReloadableSandboxProvider BuildReloadableSandboxProvider(
-    IServiceProvider sp,
-    CodeyBoxOptions startupOptions,
-    ILoggerFactory loggerFactory,
-    ILogger startupLog)
-{
-    var options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
-    var multipassBaselineNamespace = new MultipassSandboxOptions();
-    return new ReloadableSandboxProvider(
-        () => options.CurrentValue.SandboxProvider ?? string.Empty,
-        () => options.CurrentValue.SandboxProviderCutover?.RetainedInventoryProviders ?? [],
-        [
-            new ReloadableSandboxProvider.ProviderRegistration(
-                SandboxProviderKinds.Multipass,
-                () => BuildMultipass(
-                    startupOptions,
-                    sp,
-                    loggerFactory,
-                    startupLog,
-                    sp.GetService<ITimingStore>(),
-                    sp.GetService<ISandboxResourceUsageStore>()),
-                baselineRef => MultipassSandboxProvider.IsOwnedBaselineRef(
-                    multipassBaselineNamespace,
-                    baselineRef)),
-            new ReloadableSandboxProvider.ProviderRegistration(
-                SandboxProviderKinds.Incus,
-                () => BuildIncus(
-                    sp,
-                    loggerFactory,
-                    sp.GetService<ITimingStore>(),
-                    sp.GetService<ISandboxResourceUsageStore>()),
-                IncusSandboxProvider.IsRoutableBaselineRef),
-        ],
-        loggerFactory.CreateLogger<ReloadableSandboxProvider>());
-}
-
 static ISandboxProvider BuildSandboxProviderInner(
     IServiceProvider sp,
     CodeyBoxOptions opts,
@@ -895,33 +859,6 @@ static IE2eExecutionPool BuildRemoteE2eExecutionPool(
         e2eOptions,
         loggerFactory.CreateLogger<MultiHostE2eExecutionPool>(),
         fallbackImageReference: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxImageReference);
-}
-
-static CompositeManagedSandboxProvider BuildManagedSandboxLifecycleProvider(IServiceProvider sp)
-{
-    var providers = new List<IManagedSandboxLifecycle> { sp.GetRequiredService<ISandboxProvider>() };
-    // Touch the catalog first: snapshot construction warms every configured
-    // provider kind into the registry, so the registry snapshot below covers
-    // the members placement can actually select. Registry-built providers
-    // would otherwise be invisible to the leak reaper and operator dispose
-    // endpoints whenever the pipeline — rather than the legacy singleton —
-    // created the sandbox. Entries whose backend is already covered (same
-    // provider name as an earlier entry — e.g. the registry's plain
-    // multipass behind the singleton's reloadable multipass router) are
-    // skipped: same backend means identical inventory, and listing it twice
-    // would make name-based disposal ambiguous.
-    _ = sp.GetRequiredService<SandboxClassesSnapshot>();
-    var seenNames = new HashSet<string>(providers.Select(static p => p.Name), StringComparer.Ordinal);
-    foreach (var registration in sp.GetRequiredService<ISandboxProviderRegistry>().ListRegistered())
-    {
-        if (seenNames.Add(registration.Provider.Name))
-            providers.Add(registration.Provider);
-    }
-    if (sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
-    {
-        providers.AddRange(source.ManagedSandboxProviders);
-    }
-    return new CompositeManagedSandboxProvider(providers);
 }
 
 static bool IsValidE2eExecutionOptions(E2eExecutionOptions opts)
@@ -9248,6 +9185,66 @@ namespace CodeyBox.Api
 // Exposed for WebApplicationFactory<Program> in integration tests.
 public partial class Program
 {
+    internal static ReloadableSandboxProvider BuildReloadableSandboxProvider(
+        IServiceProvider sp,
+        ILoggerFactory loggerFactory)
+    {
+        var options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+        var multipassBaselineNamespace = new MultipassSandboxOptions();
+        // Active-sandbox tracking (_activeNames / _activeOwners) lives inside
+        // each provider instance, so every construction path must share ONE
+        // instance per backend kind. A second IncusSandboxProvider built here
+        // lists placement-created sandboxes as untracked while they are still
+        // mid-phase (same backend Name, so the lifecycle composite dedupes the
+        // instance the placement path actually owns) — the leak reaper then
+        // destroys live VMs. The registry is the single construction
+        // authority; the router borrows its per-kind instances rather than
+        // building twins.
+        return new ReloadableSandboxProvider(
+            () => options.CurrentValue.SandboxProvider ?? string.Empty,
+            () => options.CurrentValue.SandboxProviderCutover?.RetainedInventoryProviders ?? [],
+            [
+                new ReloadableSandboxProvider.ProviderRegistration(
+                    SandboxProviderKinds.Multipass,
+                    () => sp.GetRequiredService<ISandboxProviderRegistry>().EnsureKind(SandboxProviderKinds.Multipass),
+                    baselineRef => MultipassSandboxProvider.IsOwnedBaselineRef(
+                        multipassBaselineNamespace,
+                        baselineRef)),
+                new ReloadableSandboxProvider.ProviderRegistration(
+                    SandboxProviderKinds.Incus,
+                    () => sp.GetRequiredService<ISandboxProviderRegistry>().EnsureKind(SandboxProviderKinds.Incus),
+                    IncusSandboxProvider.IsRoutableBaselineRef),
+            ],
+            loggerFactory.CreateLogger<ReloadableSandboxProvider>());
+    }
+
+    internal static CompositeManagedSandboxProvider BuildManagedSandboxLifecycleProvider(IServiceProvider sp)
+    {
+        var providers = new List<IManagedSandboxLifecycle> { sp.GetRequiredService<ISandboxProvider>() };
+        // Touch the catalog first: snapshot construction warms every configured
+        // provider kind into the registry, so the registry snapshot below covers
+        // the members placement can actually select. Registry-built providers
+        // would otherwise be invisible to the leak reaper and operator dispose
+        // endpoints whenever the pipeline — rather than the legacy singleton —
+        // created the sandbox. Entries whose backend is already covered (same
+        // provider name as an earlier entry — e.g. the registry's plain
+        // multipass behind the singleton's reloadable multipass router) are
+        // skipped: same backend means identical inventory, and listing it twice
+        // would make name-based disposal ambiguous.
+        _ = sp.GetRequiredService<SandboxClassesSnapshot>();
+        var seenNames = new HashSet<string>(providers.Select(static p => p.Name), StringComparer.Ordinal);
+        foreach (var registration in sp.GetRequiredService<ISandboxProviderRegistry>().ListRegistered())
+        {
+            if (seenNames.Add(registration.Provider.Name))
+                providers.Add(registration.Provider);
+        }
+        if (sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
+        {
+            providers.AddRange(source.ManagedSandboxProviders);
+        }
+        return new CompositeManagedSandboxProvider(providers);
+    }
+
     /// <summary>
     /// Enforces the changelog webhook secret requirement at startup.
     /// Changelog automation is opt-in: when disabled, no secret is required.

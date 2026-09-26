@@ -481,6 +481,33 @@ public sealed class SandboxLeakReaper : BackgroundService
 public sealed class SandboxLeakOptions
 {
     /// <summary>
+    /// Headroom added on top of the maximum legitimate phase duration when
+    /// deriving <see cref="DefaultLeakAgeThreshold"/>: VM provisioning and
+    /// phase setup precede the per-attempt clock, so the creation-age of a
+    /// legitimately running sandbox exceeds the phase budget by roughly this
+    /// margin.
+    /// </summary>
+    private static readonly TimeSpan LeakAgeThresholdProvisioningMargin = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Shipped default for <see cref="LeakAgeThreshold"/>: the longest
+    /// legitimate phase duration plus provisioning headroom. A phase's
+    /// absolute cap is its per-attempt work budget — clamped by
+    /// <see cref="WorkTimeoutPolicy.MaxMinutes"/> — multiplied by
+    /// <see cref="PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier"/>.
+    /// The threshold must stay above that bound: below it a mid-phase
+    /// sandbox can be declared abandoned while its worker is still
+    /// legitimately running — exactly the failure mode that destroyed live
+    /// work when the registry-of-active-sandboxes drifted. The three values
+    /// are coupled: raising the work-timeout ceiling or the phase multiplier
+    /// requires re-checking this default.
+    /// </summary>
+    public static readonly TimeSpan DefaultLeakAgeThreshold =
+        TimeSpan.FromMinutes(
+            WorkTimeoutPolicy.MaxMinutes * PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier)
+        + LeakAgeThresholdProvisioningMargin;
+
+    /// <summary>
     /// Enable or disable the leak reaper. Default true.
     /// <para><b>Startup-only:</b> sampled at PeriodicTimer construction.
     /// Toggling at runtime requires a CodeyBox restart.</para>
@@ -496,11 +523,13 @@ public sealed class SandboxLeakOptions
 
     /// <summary>
     /// Minimum age before a non-active sandbox is declared leaked.
-    /// Default 30 minutes — conservative enough to not mistake a sandbox
-    /// that is mid-way through work-phase clone.
+    /// Default <see cref="DefaultLeakAgeThreshold"/> — sized above the maximum
+    /// legitimate phase duration (see that member's documentation); operators
+    /// lowering it must keep it above the phase durations their deployment
+    /// allows or mid-phase sandboxes risk being declared abandoned.
     /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
-    public TimeSpan LeakAgeThreshold { get; set; } = TimeSpan.FromMinutes(30);
+    public TimeSpan LeakAgeThreshold { get; set; } = DefaultLeakAgeThreshold;
 
     /// <summary>
     /// Maximum time to exempt gracefully preempted sandboxes from leak reporting
