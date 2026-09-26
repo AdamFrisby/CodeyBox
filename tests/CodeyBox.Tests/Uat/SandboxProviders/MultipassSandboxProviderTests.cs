@@ -8570,7 +8570,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task DisposeLeakedAsync_ForTrackedActiveVm_ClearsOwnerSnapshot()
+    public async Task DisposeLeakedAsync_AfterLeaseRelease_ClearsOwnerSnapshot()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         var runner = BuildSuccessfulCreateRunner(states);
@@ -8580,7 +8580,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             daemonRetryPolicy: InstantDaemonRetryPolicy());
 
         var workItemId = WorkItemId.New();
-        await provider.CreateAsync(new SandboxSpec
+        var sandbox = await provider.CreateAsync(new SandboxSpec
         {
             ImageReference = "ignored",
             TimingWorkItemId = workItemId,
@@ -8588,9 +8588,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var vmName = Assert.Single(states.Keys);
         Assert.Single(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
 
+        // DisposeLeakedAsync refuses names still tracked-active — a live phase
+        // in this process owns them (see MultipassLeakDisposeGuardTests). The
+        // reclaimable shape is an orphan whose active lease was released while
+        // the VM survived, e.g. a failed delete inside DisposeAsync or
+        // deployment cleanup.
+        ((IActiveSandboxLease)sandbox).ReleaseActiveTracking();
+
         await provider.DisposeLeakedAsync(vmName, CancellationToken.None);
 
         Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
+        Assert.Contains(runner.Calls, call => call.Argv is [_, "delete", "--purge", var deleted] && deleted == vmName);
         Assert.Empty(states);
     }
 

@@ -656,19 +656,41 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
-    public async Task DisposeLeakedAsync_active_sandbox_releases_host_reservation()
+    public async Task DisposeLeakedAsync_zombie_sandbox_releases_host_reservation()
     {
-        var opts = Options(Host("a", cap: 1));
-        var transports = new HostTransportSet();
-        var provider = Provider(() => opts, transports);
+        var mountSource = Directory.CreateTempSubdirectory("codeybox-remote-leak-").FullName;
+        try
+        {
+            var opts = Options(Host("a", cap: 1));
+            var transports = new HostTransportSet();
+            var provider = Provider(() => opts, transports);
 
-        var sandbox = await provider.CreateAsync(Spec());
+            var sandbox = await provider.CreateAsync(Spec() with
+            {
+                Mounts = [new SandboxMount { HostPath = mountSource, SandboxPath = "/data", ReadOnly = false }],
+            });
 
-        Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
+            Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
 
-        await provider.DisposeLeakedAsync(sandbox.Id, CancellationToken.None);
+            // Stranded-tracking zombie: DisposeAsync claimed the handle but its
+            // sync-back deferred before tracking was released — tracked-active
+            // yet owned by no live phase, the shape ForceDisposeLeakedAsync
+            // exists to reclaim. (A sandbox whose dispose never started is
+            // refused instead — see the tracked-active guard tests in
+            // MultipassRemoteSandboxProviderTests.)
+            transports["a"].ThrowTransportOnStageOut = true;
+            await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => sandbox.DisposeAsync().AsTask());
+            transports["a"].ThrowTransportOnStageOut = false;
+            Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
 
-        Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+            await provider.DisposeLeakedAsync(sandbox.Id, CancellationToken.None);
+
+            Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+        }
+        finally
+        {
+            try { Directory.Delete(mountSource, recursive: true); } catch { }
+        }
     }
 
     [Fact]
