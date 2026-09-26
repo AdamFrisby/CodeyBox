@@ -329,7 +329,10 @@ public sealed class DaytonaSandboxProvider :
         if (!string.Equals(sandbox.State, "stopped", StringComparison.OrdinalIgnoreCase))
         {
             try { await Api.StopSandboxAsync(endpoint, name, force: true, ct).ConfigureAwait(false); }
-            catch (DaytonaApiException ex) when (ex.Kind is DaytonaFailureKind.Conflict or DaytonaFailureKind.NotFound) { }
+            catch (DaytonaApiException ex) when (ex.Kind is DaytonaFailureKind.Conflict or DaytonaFailureKind.NotFound)
+            {
+                // Already stopping or already gone — the delete below observes the final state.
+            }
         }
         await Api.DeleteSandboxAsync(endpoint, name, ct).ConfigureAwait(false);
         MarkNoLongerActive(name);
@@ -538,7 +541,10 @@ public sealed class DaytonaSandboxProvider :
                 if (state is "paused" or "pausing" or "stopping")
                 {
                     try { await Api.StopSandboxAsync(endpoint, name, force: true, ct).ConfigureAwait(false); }
-                    catch (DaytonaApiException ex) when (ex.Kind is DaytonaFailureKind.Conflict or DaytonaFailureKind.NotFound) { }
+                    catch (DaytonaApiException ex) when (ex.Kind is DaytonaFailureKind.Conflict or DaytonaFailureKind.NotFound)
+                    {
+                        // Already stopping or already gone — the delete below observes the final state.
+                    }
                 }
                 await Api.DeleteSandboxAsync(endpoint, name, ct).ConfigureAwait(false);
                 _log.LogInformation("Reconciled orphaned daytona sandbox {Name} (state={State})", name, state);
@@ -728,12 +734,14 @@ public sealed class DaytonaSandboxProvider :
     /// <summary>
     /// Toolbox base URI for one sandbox: the service-returned
     /// <c>toolboxProxyUrl</c> when present (untrusted — must be absolute
-    /// http(s)), else the configured proxy base; either way the sandbox id is
-    /// appended as one escaped path segment.
+    /// https, or http only under the <c>AllowUnsafeHttp</c> opt-in carried on
+    /// the endpoint), else the configured proxy base; either way the sandbox
+    /// id is appended as one escaped path segment.
     /// </summary>
     private static Uri ToolboxBaseFromDto(DaytonaSandboxDto dto, DaytonaEndpoint endpoint, string sandboxId)
     {
-        var proxy = DaytonaApiClient.TryParseAbsoluteUrl(dto.ToolboxProxyUrl, "sandbox toolboxProxyUrl")
+        var proxy = DaytonaApiClient.TryParseAbsoluteUrl(
+                dto.ToolboxProxyUrl, "sandbox toolboxProxyUrl", endpoint.AllowUnsafeHttp)
             ?? endpoint.ToolboxProxyBaseUri;
         return new Uri(proxy, Uri.EscapeDataString(sandboxId) + "/");
     }
@@ -981,7 +989,8 @@ public sealed class DaytonaSandboxProvider :
         var apiUri = new Uri(opts.ApiUrl.TrimEnd('/') + "/", UriKind.Absolute);
         var toolboxUri = new Uri(opts.ToolboxProxyUrl.TrimEnd('/') + "/", UriKind.Absolute);
         return new DaytonaEndpoint(apiUri, toolboxUri, apiKey.Trim(),
-            string.IsNullOrWhiteSpace(opts.OrganizationId) ? null : opts.OrganizationId);
+            string.IsNullOrWhiteSpace(opts.OrganizationId) ? null : opts.OrganizationId,
+            opts.AllowUnsafeHttp);
     }
 
     /// <summary>

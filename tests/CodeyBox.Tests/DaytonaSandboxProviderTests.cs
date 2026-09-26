@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Api;
@@ -830,6 +832,186 @@ public sealed class DaytonaSandboxProviderTests
             .Select(p => p.Name)
             .ToList();
         Assert.Equal(["ApiKeyEnvVar"], secretLike);
+    }
+
+    // ------------------------------------------------------------------
+    // Trust-boundary guards (audit regression)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void ServiceUrl_HttpRejected_WithoutUnsafeHttpOptIn()
+    {
+        Assert.Null(DaytonaApiClient.TryParseAbsoluteUrl(null, "sandbox toolboxProxyUrl"));
+        Assert.Null(DaytonaApiClient.TryParseAbsoluteUrl("  ", "sandbox toolboxProxyUrl"));
+
+        var https = DaytonaApiClient.TryParseAbsoluteUrl("https://proxy.example/toolbox", "sandbox toolboxProxyUrl");
+        Assert.Equal("https://proxy.example/toolbox", https!.ToString());
+
+        // A service-returned cleartext URL must never carry the API key unless
+        // the operator opted into local-test http.
+        var refused = Assert.Throws<DaytonaApiException>(() =>
+            DaytonaApiClient.TryParseAbsoluteUrl("http://proxy.example/toolbox", "sandbox toolboxProxyUrl"));
+        Assert.Equal(DaytonaFailureKind.Unexpected, refused.Kind);
+        Assert.Contains("AllowUnsafeHttp", refused.Message);
+
+        var allowed = DaytonaApiClient.TryParseAbsoluteUrl(
+            "http://localhost/toolbox", "sandbox toolboxProxyUrl", allowUnsafeHttp: true);
+        Assert.Equal("http://localhost/toolbox", allowed!.ToString());
+
+        Assert.Throws<DaytonaApiException>(() =>
+            DaytonaApiClient.TryParseAbsoluteUrl("ftp://proxy.example/toolbox", "sandbox toolboxProxyUrl"));
+        Assert.Throws<DaytonaApiException>(() =>
+            DaytonaApiClient.TryParseAbsoluteUrl("/relative/path", "sandbox toolboxProxyUrl"));
+    }
+
+    [Fact]
+    public void ToolboxClient_RejectsCleartextBase_WithoutUnsafeHttpOptIn()
+    {
+        // Guard at the credential sink: even a caller that bypassed the
+        // service-URL parse cannot send the API key over cleartext http.
+        var server = new FakeDaytonaServer();
+        var http = new HttpClient(server);
+        var apiBase = new Uri("http://localhost/api/");
+        var ex = Assert.Throws<ArgumentException>(() => new DaytonaToolboxClient(
+            http,
+            new DaytonaEndpoint(apiBase, new Uri("http://localhost/toolbox/"), TestApiKey, null),
+            new Uri("http://attacker.example/toolbox/sandbox-1/")));
+        Assert.Contains("AllowUnsafeHttp", ex.Message);
+
+        var optedIn = new DaytonaToolboxClient(
+            http,
+            new DaytonaEndpoint(apiBase, new Uri("http://localhost/toolbox/"), TestApiKey, null, AllowUnsafeHttp: true),
+            new Uri("http://localhost/toolbox/sandbox-1/"));
+        Assert.Equal("http://localhost/toolbox/sandbox-1/", optedIn.SandboxBaseUri.ToString());
+    }
+
+    private static DaytonaSandbox StagingSandbox(
+        FakeDaytonaServer server, DaytonaSandboxOptions opts, string sandboxPath, string hostPath)
+    {
+        var http = new HttpClient(server);
+        return new DaytonaSandbox(
+            "codeybox-staging-test",
+            WorkSpec(),
+            () => opts,
+            new DaytonaApiClient(http),
+            () => new DaytonaEndpoint(
+                new Uri("http://localhost/api/"), new Uri("http://localhost/toolbox/"), TestApiKey, null, true),
+            () => new Uri("http://localhost/toolbox/codeybox-staging-test/"),
+            new QueueDaytonaWebSocketFactory(),
+            http,
+            [new DaytonaMountPlan(sandboxPath, hostPath, ReadOnly: false, IsPersistentTmpfsDirectory: false)],
+            _ => { },
+            TimeProvider.System,
+            NullLogger.Instance);
+    }
+
+    [Fact]
+    public async Task StageFile_RefusesOversizedHostFile_BeforeAnyTraffic()
+    {
+        using var dir = new TempDirectory();
+        var path = Path.Combine(dir.Path, "big.bin");
+        await File.WriteAllBytesAsync(path, new byte[4096]);
+        var server = new FakeDaytonaServer();
+        var sandbox = StagingSandbox(server, TestOptions() with { MaxFileSyncBytes = 100 }, "/data/big.bin", path);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sandbox.PrepareFilesystemAsync(CancellationToken.None));
+        Assert.Contains("100-byte", ex.Message);
+        Assert.Empty(server.Requests);
+    }
+
+    [Fact]
+    public async Task StageDirectory_RefusesOversizedHostTree_BeforeAnyTraffic()
+    {
+        using var dir = new TempDirectory();
+        await File.WriteAllBytesAsync(Path.Combine(dir.Path, "big.bin"), new byte[4096]);
+        var server = new FakeDaytonaServer();
+        var sandbox = StagingSandbox(
+            server, TestOptions() with { MaxSyncArchiveExpandedBytes = 100 }, "/data", dir.Path);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sandbox.PrepareFilesystemAsync(CancellationToken.None));
+        Assert.Contains("100-byte", ex.Message);
+        Assert.Empty(server.Requests);
+    }
+
+    [Fact]
+    public async Task StageDirectory_RefusesTooManyEntries_BeforeAnyTraffic()
+    {
+        using var dir = new TempDirectory();
+        await File.WriteAllTextAsync(Path.Combine(dir.Path, "a.txt"), "a");
+        await File.WriteAllTextAsync(Path.Combine(dir.Path, "b.txt"), "b");
+        var server = new FakeDaytonaServer();
+        var sandbox = StagingSandbox(
+            server, TestOptions() with { MaxSyncArchiveEntries = 1 }, "/data", dir.Path);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sandbox.PrepareFilesystemAsync(CancellationToken.None));
+        Assert.Contains("1-entry", ex.Message);
+        Assert.Empty(server.Requests);
+    }
+
+    [Fact]
+    public async Task RealWebSocket_SendsBearerTokenInHandshake()
+    {
+        // Loopback TCP server speaking just enough HTTP-upgrade to capture the
+        // handshake headers the real socket sends — no live network.
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        string? authorization = null;
+        string? organization = null;
+        Task serves = Task.CompletedTask;
+        try
+        {
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            serves = Task.Run(async () =>
+            {
+                using var client = await listener.AcceptTcpClientAsync();
+                using var stream = client.GetStream();
+                var request = new StringBuilder();
+                var buffer = new byte[4096];
+                string key = string.Empty;
+                int read;
+                while ((read = await stream.ReadAsync(buffer)) > 0
+                    && !request.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    request.Append(Encoding.ASCII.GetString(buffer, 0, read));
+                }
+                foreach (var line in request.ToString().Split("\r\n", StringSplitOptions.None))
+                {
+                    if (line.StartsWith("Authorization:", StringComparison.OrdinalIgnoreCase))
+                        authorization = line.Substring("Authorization:".Length).Trim();
+                    else if (line.StartsWith("X-Daytona-Organization-ID:", StringComparison.OrdinalIgnoreCase))
+                        organization = line.Substring("X-Daytona-Organization-ID:".Length).Trim();
+                    else if (line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
+                        key = line.Substring("Sec-WebSocket-Key:".Length).Trim();
+                }
+                var accept = Convert.ToBase64String(
+                    SHA1.HashData(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+                var response =
+                    "HTTP/1.1 101 Switching Protocols\r\n" +
+                    "Upgrade: websocket\r\n" +
+                    "Connection: Upgrade\r\n" +
+                    "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(response));
+                while (await stream.ReadAsync(buffer) > 0) { }
+            });
+
+            {
+                await using var socket = new ClientWebSocketDaytonaWebSocket();
+                await socket.ConnectAsync(
+                    new Uri($"ws://127.0.0.1:{port}/logs?follow=true"), "ws-test-token", "org-1", CancellationToken.None);
+                Assert.Equal(WebSocketState.Open, socket.State);
+                Assert.Equal("Bearer ws-test-token", authorization);
+                Assert.Equal("org-1", organization);
+            }
+
+            await serves.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            listener.Stop();
+        }
     }
 
     // ------------------------------------------------------------------

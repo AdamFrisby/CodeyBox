@@ -675,7 +675,13 @@ internal sealed class DaytonaSandbox :
 
     private async Task UploadDirectoryAsync(string hostPath, string sandboxPath, CancellationToken ct)
     {
-        var archive = CreateDirectoryArchiveBase64(hostPath);
+        // Host repo content staged through spec mounts is less-trusted input
+        // to a heap-allocation sink: the entry/expanded caps are enforced by a
+        // streaming stat walk BEFORE the whole tree is buffered into a tar, and
+        // the compressed/base64 caps are enforced before the payload is sent.
+        var opts = _readOptions();
+        ValidateHostDirectoryBounds(hostPath, opts);
+        var archive = CreateDirectoryArchiveBase64(hostPath, opts);
         var result = await ExecInternalAsync(new SandboxExec
         {
             Argv =
@@ -696,7 +702,32 @@ internal sealed class DaytonaSandbox :
 
     private async Task UploadFileAsync(string hostPath, string sandboxPath, CancellationToken ct)
     {
-        var payload = Convert.ToBase64String(await File.ReadAllBytesAsync(hostPath, ct).ConfigureAwait(false));
+        // Stat BEFORE buffering: an inflated repo file must fail on its
+        // on-disk size, not after the whole content lands on the heap. The
+        // length is re-checked after the read so a concurrent grow cannot slip
+        // past the stat (fail-closed on TOCTOU).
+        var opts = _readOptions();
+        var stagedBytes = new FileInfo(hostPath).Length;
+        if (stagedBytes > opts.MaxFileSyncBytes)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to stage host file {hostPath}: on-disk size {stagedBytes} exceeds " +
+                $"the {opts.MaxFileSyncBytes}-byte decoded-size bound.");
+        }
+        var content = await File.ReadAllBytesAsync(hostPath, ct).ConfigureAwait(false);
+        if (content.LongLength > opts.MaxFileSyncBytes)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to stage host file {hostPath}: read size {content.LongLength} exceeds " +
+                $"the {opts.MaxFileSyncBytes}-byte decoded-size bound.");
+        }
+        var payload = Convert.ToBase64String(content);
+        if (payload.Length > opts.MaxFileSyncBase64Bytes)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to stage host file {hostPath}: base64 size {payload.Length} exceeds " +
+                $"the {opts.MaxFileSyncBase64Bytes}-byte bound.");
+        }
         var result = await ExecInternalAsync(new SandboxExec
         {
             Argv =
@@ -800,12 +831,58 @@ internal sealed class DaytonaSandbox :
         File.WriteAllBytes(hostPath, bytes);
     }
 
-    private static string CreateDirectoryArchiveBase64(string hostPath)
+    /// <summary>
+    /// Streams a stat walk over the host tree BEFORE archiving: entry count
+    /// and total file bytes are bounded while enumeration is still lazy, so an
+    /// inflated directory fails before its content is buffered. The walk
+    /// itself is bounded by construction — it throws out of the lazy
+    /// enumeration as soon as either cap trips.
+    /// </summary>
+    private static void ValidateHostDirectoryBounds(string hostPath, DaytonaSandboxOptions opts)
+    {
+        long entries = 0;
+        long totalBytes = 0;
+        foreach (var entry in Directory.EnumerateFileSystemEntries(hostPath, "*", SearchOption.AllDirectories))
+        {
+            entries++;
+            if (entries > opts.MaxSyncArchiveEntries)
+            {
+                throw new InvalidOperationException(
+                    $"Refusing to stage host directory {hostPath}: entry count exceeds " +
+                    $"the {opts.MaxSyncArchiveEntries}-entry bound.");
+            }
+            if (File.Exists(entry))
+            {
+                totalBytes += new FileInfo(entry).Length;
+                if (totalBytes > opts.MaxSyncArchiveExpandedBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Refusing to stage host directory {hostPath}: content size exceeds " +
+                        $"the {opts.MaxSyncArchiveExpandedBytes}-byte expanded-size bound.");
+                }
+            }
+        }
+    }
+
+    private static string CreateDirectoryArchiveBase64(string hostPath, DaytonaSandboxOptions opts)
     {
         using var output = new MemoryStream();
         using (var gzip = new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true))
             TarFile.CreateFromDirectory(hostPath, gzip, includeBaseDirectory: false);
-        return Convert.ToBase64String(output.ToArray());
+        if (output.Length > opts.MaxSyncArchiveBytes)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to stage host directory {hostPath}: compressed size {output.Length} exceeds " +
+                $"the {opts.MaxSyncArchiveBytes}-byte bound.");
+        }
+        var archive = Convert.ToBase64String(output.ToArray());
+        if (archive.Length > opts.MaxSyncArchiveBase64Bytes)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to stage host directory {hostPath}: base64 size {archive.Length} exceeds " +
+                $"the {opts.MaxSyncArchiveBase64Bytes}-byte bound.");
+        }
+        return archive;
     }
 
     /// <summary>

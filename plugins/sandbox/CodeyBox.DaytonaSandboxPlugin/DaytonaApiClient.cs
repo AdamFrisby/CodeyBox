@@ -18,7 +18,8 @@ internal sealed record DaytonaEndpoint(
     Uri ApiBaseUri,
     Uri ToolboxProxyBaseUri,
     string ApiKey,
-    string? OrganizationId);
+    string? OrganizationId,
+    bool AllowUnsafeHttp = false);
 
 /// <summary>
 /// Thin REST client for the Daytona control plane (<c>{ApiUrl}/sandbox</c>,
@@ -234,14 +235,16 @@ internal sealed class DaytonaApiClient
         if (response.StatusCode == HttpStatusCode.NotFound)
             return null;
         var dto = await ReadJsonAsync<DaytonaToolboxProxyUrl>(response, "get toolbox proxy url", ct).ConfigureAwait(false);
-        return TryParseAbsoluteUrl(dto?.Url, "toolbox proxy url");
+        return TryParseAbsoluteUrl(dto?.Url, "toolbox proxy url", endpoint.AllowUnsafeHttp);
     }
 
     /// <summary>
     /// Remote URLs are untrusted input to an outbound-request sink: an absolute
-    /// http/https URI or nothing — never a relative path, never another scheme.
+    /// https URI (http only under the dev-only <c>AllowUnsafeHttp</c> opt-in,
+    /// since the API key rides every toolbox request) or nothing — never a
+    /// relative path, never another scheme.
     /// </summary>
-    internal static Uri? TryParseAbsoluteUrl(string? raw, string what)
+    internal static Uri? TryParseAbsoluteUrl(string? raw, string what, bool allowUnsafeHttp = false)
     {
         if (string.IsNullOrWhiteSpace(raw))
             return null;
@@ -252,6 +255,14 @@ internal sealed class DaytonaApiClient
                 DaytonaFailureKind.Unexpected,
                 $"parse {what}",
                 $"service returned a non-absolute or non-http(s) URL: '{raw.Trim()}'");
+        }
+        if (uri.Scheme == Uri.UriSchemeHttp && !allowUnsafeHttp)
+        {
+            throw new DaytonaApiException(
+                DaytonaFailureKind.Unexpected,
+                $"parse {what}",
+                "service returned a cleartext http toolbox URL but AllowUnsafeHttp is not set; " +
+                $"refusing to send the API key over cleartext: '{raw.Trim()}'");
         }
         return uri;
     }

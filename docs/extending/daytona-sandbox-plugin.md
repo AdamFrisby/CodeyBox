@@ -103,6 +103,11 @@ falling back to another provider.
 `OrganizationId` is optional and non-secret; it is sent as the
 `X-Daytona-Organization-ID` header on every API call.
 
+Every endpoint that carries the API key — the configured `ApiUrl` /
+`ToolboxProxyUrl` and any per-sandbox `toolboxProxyUrl` the service returns —
+must be `https`. A cleartext `http` URL is refused unless the dev-only
+`AllowUnsafeHttp` option is set, which exists only for loopback tests.
+
 ## Capacity and placement
 
 `SandboxMember.Capacity` is honored by the member admission gate — a Daytona

@@ -37,6 +37,11 @@ internal sealed class DaytonaToolboxClient
         _sandboxBase = toolboxBaseUri ?? throw new ArgumentNullException(nameof(toolboxBaseUri));
         if (_sandboxBase.Scheme != Uri.UriSchemeHttp && _sandboxBase.Scheme != Uri.UriSchemeHttps)
             throw new ArgumentException("Toolbox base URI must be http(s).", nameof(toolboxBaseUri));
+        if (_sandboxBase.Scheme == Uri.UriSchemeHttp && !endpoint.AllowUnsafeHttp)
+            throw new ArgumentException(
+                "Toolbox base URI uses cleartext http but AllowUnsafeHttp is not set; " +
+                "the API key rides every toolbox request, so https is required outside local tests.",
+                nameof(toolboxBaseUri));
     }
 
     public Uri SandboxBaseUri => _sandboxBase;
@@ -130,31 +135,11 @@ internal sealed class DaytonaToolboxClient
         if (!response.IsSuccessStatusCode)
             await DaytonaApiClient.EnsureSuccessAsync(response, "get session command logs", ct).ConfigureAwait(false);
 
-        if (response.Content.Headers.ContentLength is { } known && known > maxBytes)
-        {
-            throw new DaytonaApiException(
-                DaytonaFailureKind.Unexpected, "get session command logs",
-                $"logs content length {known} exceeds the {maxBytes}-byte bound");
-        }
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var buffer = new MemoryStream();
-        var chunk = new byte[DownloadChunkBytes];
-        long total = 0;
-        int read;
-        while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
-        {
-            total += read;
-            if (total > maxBytes)
-            {
-                throw new DaytonaApiException(
-                    DaytonaFailureKind.Unexpected, "get session command logs",
-                    $"logs content exceeded the {maxBytes}-byte bound");
-            }
-            buffer.Write(chunk, 0, read);
-        }
+        var bodyBytes = await ReadBoundedAsync(response.Content, maxBytes, "get session command logs", "logs content", ct)
+            .ConfigureAwait(false);
+        var body = Encoding.UTF8.GetString(bodyBytes);
 
         var mediaType = response.Content.Headers.ContentType?.MediaType;
-        var body = Encoding.UTF8.GetString(buffer.ToArray());
         if (mediaType is not null && mediaType.Contains("json", StringComparison.OrdinalIgnoreCase))
         {
             try
@@ -195,13 +180,26 @@ internal sealed class DaytonaToolboxClient
         if (response.StatusCode == HttpStatusCode.NotFound)
             return null;
         await DaytonaApiClient.EnsureSuccessAsync(response, "download file", ct).ConfigureAwait(false);
-        if (response.Content.Headers.ContentLength is { } known && known > maxBytes)
+        return await ReadBoundedAsync(response.Content, maxBytes, "download file", "file content", ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Streams an untrusted response body through a byte ceiling before
+    /// materialising it: the declared <c>Content-Length</c> is checked first
+    /// (fail fast on a lying-large header), then every chunk is counted so a
+    /// missing or lying header cannot blow the bound either.
+    /// </summary>
+    private static async Task<byte[]> ReadBoundedAsync(
+        HttpContent content, long maxBytes, string operation, string what, CancellationToken ct)
+    {
+        if (content.Headers.ContentLength is { } known && known > maxBytes)
         {
             throw new DaytonaApiException(
-                DaytonaFailureKind.Unexpected, "download file",
-                $"file content length {known} exceeds the {maxBytes}-byte bound");
+                DaytonaFailureKind.Unexpected, operation,
+                $"{what} content length {known} exceeds the {maxBytes}-byte bound");
         }
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        await using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var buffer = new MemoryStream();
         var chunk = new byte[DownloadChunkBytes];
         long total = 0;
@@ -212,8 +210,8 @@ internal sealed class DaytonaToolboxClient
             if (total > maxBytes)
             {
                 throw new DaytonaApiException(
-                    DaytonaFailureKind.Unexpected, "download file",
-                    $"file content exceeded the {maxBytes}-byte bound");
+                    DaytonaFailureKind.Unexpected, operation,
+                    $"{what} content exceeded the {maxBytes}-byte bound");
             }
             buffer.Write(chunk, 0, read);
         }
