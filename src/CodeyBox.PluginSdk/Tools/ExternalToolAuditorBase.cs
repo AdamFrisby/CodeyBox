@@ -481,12 +481,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
     /// <summary>
     /// Extracts the first <c>major.minor.patch</c> version token from tool
-    /// version output; null when the output carries none.
+    /// version output; null when the output carries none. A trailing sentence
+    /// period (as in <c>CodeQL command-line toolchain release 2.27.1.</c>) is
+    /// not part of the version and is stripped — a version never ends with a
+    /// dot, while the suffix character class would otherwise absorb it and
+    /// make an installed release compare unequal to its pin.
     /// </summary>
     protected static string? ExtractToolVersion(string output)
     {
         var match = ToolVersionPattern.Match(output);
-        return match.Success ? match.Value : null;
+        if (!match.Success)
+            return null;
+        var version = match.Value.TrimEnd('.');
+        return version.Length == 0 ? null : version;
     }
 
     private static string NormalizeProbePath(string? path)

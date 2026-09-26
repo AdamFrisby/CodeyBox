@@ -28,6 +28,7 @@ public sealed class PluginLayoutConventionTests
         "credentials",
         "notifications",
         "quota",
+        "sast",
         "telemetry",
         "test-runners",
         "upstream",
