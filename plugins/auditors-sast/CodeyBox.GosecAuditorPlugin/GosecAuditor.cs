@@ -219,7 +219,7 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
-        ValidateExtraArguments(options);
+        NormalizeExtraArguments(options);
 
         var args = new List<string>
         {
@@ -298,19 +298,30 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <summary>
-    /// ExtraArguments land after the positional <c>./...</c> scan target, and
-    /// Go's flag package stops flag parsing at the first positional — a
-    /// flag-shaped extra would be silently swallowed as a (nonexistent)
-    /// package path instead of reaching gosec's flag parser. Reject them
-    /// deterministically rather than letting configured behavior evaporate,
-    /// and reject tree-escaping patterns so extras stay inside the audited
-    /// worktree. Package-pattern entries (e.g. <c>./pkg/...</c>) pass through.
+    /// Rewrites <see cref="ExternalToolAuditorOptions.ExtraArguments"/> to
+    /// its validated, normalized form. Entries land after the positional
+    /// <c>./...</c> scan target, and Go's flag package stops flag parsing
+    /// at the first positional — a flag-shaped extra would be silently
+    /// swallowed as a (nonexistent) package path instead of reaching
+    /// gosec's flag parser. Flag-shaped and tree-escaping entries are
+    /// rejected deterministically rather than letting configured behavior
+    /// evaporate, and the forwarded argv carries the trimmed
+    /// <c>/</c>-separated pattern that was validated — not a raw entry
+    /// whose padding gosec would read as a different, nonexistent path.
+    /// Package-pattern entries (e.g. <c>./pkg/...</c>) pass through.
     /// </summary>
-    private static void ValidateExtraArguments(ExternalToolAuditorOptions options)
+    private static void NormalizeExtraArguments(ExternalToolAuditorOptions options)
     {
+        var normalized = new List<string>(options.ExtraArguments.Count);
         foreach (var arg in options.ExtraArguments)
         {
-            if (arg.StartsWith("-", StringComparison.Ordinal))
+            var pattern = TryNormalizeWorktreeRelativePath(arg)
+                ?? throw new AuditUnavailableException(
+                    "could-not-verify: gosec auditor ExtraArguments entry "
+                    + $"'{SingleLine(arg)}' is not a repository-relative package pattern; absolute "
+                    + "paths and '..' segments would scan outside the audited worktree.")
+                { IsDeterministic = true };
+            if (pattern.StartsWith('-'))
                 throw new AuditUnavailableException(
                     "could-not-verify: gosec auditor ExtraArguments entry "
                     + $"'{SingleLine(arg)}' looks like a flag, but tool arguments are appended after "
@@ -320,16 +331,8 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
                     + "severity/rule/path options under "
                     + $"CodeyBox:Plugins:{PluginId} instead.")
                 { IsDeterministic = true };
-            var normalized = arg.Replace('\\', '/').Trim();
-            if (normalized.Length == 0
-                || normalized[0] == '/'
-                || normalized.IndexOf('\n') >= 0
-                || normalized.Split('/').Contains("..", StringComparer.Ordinal))
-                throw new AuditUnavailableException(
-                    "could-not-verify: gosec auditor ExtraArguments entry "
-                    + $"'{SingleLine(arg)}' is not a repository-relative package pattern; absolute "
-                    + "paths and '..' segments would scan outside the audited worktree.")
-                { IsDeterministic = true };
+            normalized.Add(pattern);
         }
+        options.ExtraArguments = normalized;
     }
 }

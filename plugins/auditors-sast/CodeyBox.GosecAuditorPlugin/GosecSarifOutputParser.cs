@@ -81,7 +81,8 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
     /// <c>runs[].tool.driver.rules[].properties.tags</c>. Returns an empty
     /// map when no descriptor severities are readable — findings then keep
     /// their SARIF <c>level</c>. Never throws on descriptor oddities: a
-    /// missing severity annotation is a downgrade, not a parse failure.
+    /// missing severity annotation loses the native-level precision and the
+    /// finding keeps its stricter SARIF <c>level</c> — not a parse failure.
     /// </summary>
     private static IReadOnlyDictionary<string, string> ExtractRuleSeverities(string sarif)
     {

@@ -470,6 +470,27 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// Normalizes a repository-relative path — backslashes to <c>/</c>,
+    /// trimmed — and returns it, or <see langword="null"/> when it is empty,
+    /// rooted at <c>/</c>, carries a newline, or escapes the worktree
+    /// through a <c>..</c> segment. The single source of truth for
+    /// "confined to the audited worktree": repository probes bake the
+    /// result into a script's <c>$@</c> list, and auditors gate operator
+    /// path entries (e.g. <c>ExtraArguments</c> package patterns) on it.
+    /// Callers translate the null into their own error type.
+    /// </summary>
+    protected static string? TryNormalizeWorktreeRelativePath(string? path)
+    {
+        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim();
+        if (normalized.Length == 0
+            || normalized[0] == '/'
+            || normalized.IndexOf('\n') >= 0
+            || normalized.Split('/').Contains("..", StringComparer.Ordinal))
+            return null;
+        return normalized;
+    }
+
+    /// <summary>
     /// Bounded timeout for precondition probes: shares the configured scan
     /// timeout below a fixed cap — a probe is a liveness check, not the scan.
     /// </summary>
@@ -490,20 +511,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     private static string NormalizeProbePath(string? path)
-    {
         // Probe paths are baked into the sh script's "$@" list: refuse
         // anything that could escape the worktree or break the
         // one-name-per-line protocol.
-        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim();
-        if (normalized.Length == 0
-            || normalized[0] == '/'
-            || normalized.IndexOf('\n') >= 0
-            || normalized.Split('/').Contains("..", StringComparer.Ordinal))
-            throw new ArgumentException(
+        => TryNormalizeWorktreeRelativePath(path)
+            ?? throw new ArgumentException(
                 "Repository probe paths must be relative paths inside the worktree.",
                 nameof(path));
-        return normalized;
-    }
 
     private static string TruncateForMessage(string? value)
     {

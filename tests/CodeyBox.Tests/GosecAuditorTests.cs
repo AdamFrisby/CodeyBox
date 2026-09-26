@@ -348,6 +348,58 @@ public sealed class GosecAuditorTests
     }
 
     [Fact]
+    public async Task TreeEscapingExtraArguments_AreRejectedDeterministically_ScanNeverRuns()
+    {
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "../outside/...",
+            }),
+            CancellationToken.None);
+
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+        Assert.Contains("../outside/...", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task ExtraArguments_AreForwardedNormalized_NotVerbatim()
+    {
+        // The argv reaching gosec must carry the validated normalized form:
+        // a backslash-separated pattern forwarded verbatim would be a
+        // different, nonexistent package path to the tool.
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = @".\subpkg\...",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.Equal("./subpkg/...", scanExec!.Argv[^1]);
+    }
+
+    [Fact]
     public async Task WrongOrMissingVersion_IsInfrastructure_ScanNeverRuns()
     {
         // A different release changes gosec's rules and findings — fail
@@ -632,6 +684,30 @@ public sealed class GosecAuditorTests
         => exec.Argv.Count == 2 && exec.Argv[0] == "gosec" && exec.Argv[1] == "-version";
 
     private static bool BinaryOnPath(string binary)
+        => TryRunProbe(binary, "version")?.ExitCode == 0;
+
+    private static string? ProbeInstalledGosecVersion()
+    {
+        var probe = TryRunProbe("gosec", "-version");
+        if (probe is null || probe.Value.ExitCode != 0)
+            return null;
+        // "Version: 2.28.0\nGit tag: v2.28.0\n..." — `go install` builds
+        // report "dev" and can never satisfy the pin, so they yield no
+        // gated run.
+        var versionLine = probe.Value.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault(static l => l.StartsWith("Version:", StringComparison.Ordinal));
+        var version = versionLine?["Version:".Length..].Trim();
+        return string.IsNullOrWhiteSpace(version) || version == "dev" ? null : version;
+    }
+
+    // Runs a one-shot version-style probe with a hard bound: both streams
+    // are drained before WaitForExit so a chatty tool cannot block, and a
+    // process outliving the timeout is killed. Null means "could not run"
+    // — a missing binary, a start failure, or a timeout — which the gated
+    // tests treat as absence and return early rather than fail on a host
+    // without the tool.
+    private static (int ExitCode, string Stdout)? TryRunProbe(string binary, string argument)
     {
         try
         {
@@ -642,55 +718,24 @@ public sealed class GosecAuditorTests
                 RedirectStandardError = true,
                 UseShellExecute = false,
             };
-            psi.ArgumentList.Add("version");
-            using var process = Process.Start(psi)!;
-            process.StandardOutput.ReadToEnd();
-            process.StandardError.ReadToEnd();
-            return process.WaitForExit(milliseconds: 10_000) && process.ExitCode == 0;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static string? ProbeInstalledGosecVersion()
-    {
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "gosec",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
-            psi.ArgumentList.Add("-version");
+            psi.ArgumentList.Add(argument);
             using var process = Process.Start(psi)!;
             var stdout = process.StandardOutput.ReadToEnd();
             process.StandardError.ReadToEnd();
-            if (!process.WaitForExit(milliseconds: 10_000))
+            if (!process.WaitForExit(milliseconds: ProbeTimeoutMilliseconds))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
-            // "Version: 2.28.0\nGit tag: v2.28.0\n..." — `go install` builds
-            // report "dev" and can never satisfy the pin, so they yield no
-            // gated run.
-            if (process.ExitCode != 0)
-                return null;
-            var versionLine = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .FirstOrDefault(static l => l.StartsWith("Version:", StringComparison.Ordinal));
-            var version = versionLine?["Version:".Length..].Trim();
-            return string.IsNullOrWhiteSpace(version) || version == "dev" ? null : version;
+            return (process.ExitCode, stdout);
         }
         catch
         {
-            // Any failure means no usable gosec on PATH — the gated tests
-            // return early rather than fail on a host without the tool.
             return null;
         }
     }
+
+    private const int ProbeTimeoutMilliseconds = 10_000;
 
     private static async Task<string> SeedFixtureRepoAsync(bool vulnerable)
     {

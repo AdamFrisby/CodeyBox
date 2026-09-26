@@ -19,8 +19,10 @@ repositories fail loudly (see below).
   MEDIUM and HIGH both into `error`, so the auditor recovers the native
   severity from each result's rule descriptor (`properties.tags`) and falls
   back to the SARIF level only when the descriptor is unreadable. To drop
-  advisory noise, raise `MinimumSeverity`; the tool-side `-severity` filter
-  is also available via `ExtraArguments`.
+  advisory noise, raise `MinimumSeverity` — the tool-side `-severity` flag
+  cannot be passed: `ExtraArguments` accepts package patterns only and
+  rejects flag-shaped entries deterministically (see the config table
+  below), so `MinimumSeverity` is the supported knob.
 
 ## What it cannot see
 
