@@ -128,6 +128,12 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                 Stdin = context.PlanArtifact,
             }, ct);
 
+            if (IsUnavailableExec(write))
+            {
+                throw new AuditUnavailableException(
+                    $"could-not-verify: auditor '{Name}' could not materialise the plan artifact: " +
+                    "the sandbox exec transport was unavailable. No verdict was produced.");
+            }
             if (!write.Success)
             {
                 return new AuditResult(false, [new AuditFinding(
@@ -148,6 +154,14 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                 Argv = ["rm", "-f", "--", planArtifactPath],
                 WorkingDirectory = workingDirectory,
             }, ct);
+            if (IsUnavailableExec(cleanup))
+            {
+                // mustRemove stays set: the rm's outcome is unknown, so the
+                // finally still makes its best-effort removal attempt.
+                throw new AuditUnavailableException(
+                    $"could-not-verify: auditor '{Name}' could not verify plan-artifact cleanup: " +
+                    "the sandbox exec transport was unavailable. No verdict was produced.");
+            }
             mustRemove = false;
             if (!cleanup.Success)
             {
@@ -204,13 +218,18 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 
             // A dropped exec channel produced no verdict: the command did not
             // run to completion, so there is nothing attributable to the code
-            // under review. Retry with backoff rather than recording a finding
-            // against the diff — a transport-shaped finding would burn a rework
-            // iteration on an unfixable outcome and park the item as though the
-            // diff were at fault. Only when the bounded retries are exhausted
-            // does this surface, as infrastructure (AuditUnavailableException),
-            // with no finding recorded from any attempt.
-            if (ExecTransportFailure.IsTransportFailure(result))
+            // under review. Two signals detect that — the provider's
+            // ExecutionUnavailable flag (the guest-side exit was never
+            // observed, so result.ExitCode describes the transport, not the
+            // command — a websocket drop can surface as exit 1, not just 255)
+            // and the transport's abnormal-closure diagnostic. Retry with
+            // backoff rather than recording a finding against the diff — a
+            // transport-shaped finding would burn a rework iteration on an
+            // unfixable outcome and park the item as though the diff were at
+            // fault. Only when the bounded retries are exhausted does this
+            // surface, as infrastructure (AuditUnavailableException), with no
+            // finding recorded from any attempt.
+            if (IsUnavailableExec(result))
             {
                 if (attempt < maxAttempts)
                 {
@@ -292,6 +311,16 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     }
 
     /// <summary>
+    /// True when the exec produced no verdict attributable to the command:
+    /// either the sandbox flagged the run <see cref="SandboxExecResult.ExecutionUnavailable"/>
+    /// (its completion was never observed, so <see cref="SandboxExecResult.ExitCode"/>
+    /// is the transport's own — not the command's) or the channel emitted the
+    /// abnormal-closure signature <see cref="ExecTransportFailure"/> recognises.
+    /// </summary>
+    private static bool IsUnavailableExec(SandboxExecResult result)
+        => result.ExecutionUnavailable || ExecTransportFailure.IsTransportFailure(result);
+
+    /// <summary>
     /// Builds the infrastructure failure for exhausted exec-transport retries.
     /// Deliberately non-deterministic (a plain retry may succeed), so the
     /// pipeline routes it to the infrastructure failure path instead of
@@ -306,11 +335,11 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     {
         var diagnostic = ExecTransportFailure.FirstDiagnosticLine(combinedOutput);
         var evidence = diagnostic.Length == 0
-            ? "exec-transport diagnostic"
-            : $"'{diagnostic}'";
+            ? "the exec was flagged execution-unavailable"
+            : $"diagnostic '{diagnostic}'";
         return new AuditUnavailableException(
-            $"could-not-verify: auditor '{Name}' could not run: the sandbox exec transport dropped " +
-            $"(exit {ExecTransportFailure.TransportFailureExitCode} with {evidence}) on all {maxAttempts} attempt(s). " +
+            $"could-not-verify: auditor '{Name}' could not run: the sandbox exec transport was unavailable " +
+            $"(exit {result.ExitCode} with {evidence}) on all {maxAttempts} attempt(s). " +
             "No verdict was produced, so no finding was recorded.",
             result.ExitCode,
             combinedOutput);
@@ -446,6 +475,16 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             WorkingDirectory = workingDirectory,
         }, ct);
 
+        // A dropped exec channel means presence was never verified. Reporting
+        // the tool as missing would misattribute a transport failure to
+        // provisioning — surface infrastructure instead.
+        if (IsUnavailableExec(probe))
+        {
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' could not check whether '{toolName}' is installed: " +
+                "the sandbox exec transport was unavailable. No verdict was produced.");
+        }
+
         return probe.ExitCode != 0;
     }
 
@@ -516,11 +555,12 @@ public sealed record ShellCommandAuditorOptions
 
     /// <summary>
     /// Total exec attempts (initial try plus retries) when the sandbox exec
-    /// transport drops mid-command (exit 255 with an abnormal-closure
-    /// diagnostic). A dropped channel produced no verdict, so a plain retry
-    /// usually recovers; only when every attempt drops does the run surface as
-    /// infrastructure with no finding recorded. Must be at least 1; smaller
-    /// values behave as 1.
+    /// transport drops mid-command — signalled by
+    /// <see cref="SandboxExecResult.ExecutionUnavailable"/> or by the exit-255
+    /// abnormal-closure diagnostic. A dropped channel produced no verdict, so a
+    /// plain retry usually recovers; only when every attempt drops does the run
+    /// surface as infrastructure with no finding recorded. Must be at least 1;
+    /// smaller values behave as 1.
     /// </summary>
     public int TransportRetryMaxAttempts { get; init; } = 3;
 
