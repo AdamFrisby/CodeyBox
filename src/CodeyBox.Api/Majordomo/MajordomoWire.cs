@@ -26,6 +26,12 @@ internal static class MajordomoRefusalReasons
     public const string ProposalExpired = "proposal_expired";
     public const string ProposalToolRetired = "proposal_tool_retired";
     public const string ProposalCorrupt = "proposal_corrupt";
+
+    /// <summary>The live re-plan no longer matches the change set the operator reviewed.</summary>
+    public const string ProposalDrifted = "proposal_drifted";
+
+    /// <summary>A claimed commit is in flight or was interrupted before its outcome was recorded.</summary>
+    public const string ProposalCommitIncomplete = "proposal_commit_incomplete";
 }
 
 /// <summary>
@@ -38,6 +44,9 @@ internal static class MajordomoOutcomes
     public const string DryRun = "dry_run";
     public const string Proposed = "proposed";
     public const string Refused = "refused";
+
+    /// <summary>An operator decision (reject/supersede) was recorded — distinct from a refused call.</summary>
+    public const string Decided = "decided";
 
     /// <summary>The call threw before it could settle — writes may have landed.</summary>
     public const string Error = "error";

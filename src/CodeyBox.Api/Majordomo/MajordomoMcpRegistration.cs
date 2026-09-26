@@ -1,4 +1,5 @@
 using CodeyBox.Majordomo;
+using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -25,7 +26,8 @@ internal static class MajordomoMcpRegistration
         services.AddSingleton<IMajordomoProposalStore>(sp =>
         {
             var path = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.StateDatabasePath;
-            return new SqliteMajordomoProposalStore(path);
+            return new SqliteMajordomoProposalStore(
+                path, sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
         });
         services.AddSingleton<MajordomoProposalService>(sp =>
             new MajordomoProposalService(

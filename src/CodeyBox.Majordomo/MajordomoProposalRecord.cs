@@ -4,11 +4,13 @@ namespace CodeyBox.Majordomo;
 
 /// <summary>
 /// One persisted majordomo proposal: the exact tool call the assistant made
-/// (tool plus typed arguments), the reasoning it gave, who proposed it and
-/// when, and the current lifecycle state. The record is immutable — state
-/// changes produce a new record via <c>with</c> and persist through
-/// <see cref="IMajordomoProposalStore.TryTransitionAsync"/>, which moves a
-/// proposal out of <see cref="MajordomoProposalState.Pending"/> exactly once.
+/// (tool plus typed arguments), the change set the operator reviewed, the
+/// reasoning the majordomo gave, who proposed it and when, and the current
+/// lifecycle state. The record is immutable — state changes produce a new
+/// record via <c>with</c> and persist through
+/// <see cref="IMajordomoProposalStore.TryTransitionAsync"/>, which applies
+/// the update only while the stored row is still in the expected state, so a
+/// claim, revert, or settle can never overwrite a decision that raced it.
 /// </summary>
 public sealed record MajordomoProposalRecord
 {
@@ -26,6 +28,15 @@ public sealed record MajordomoProposalRecord
 
     /// <summary>The reasoning the majordomo gave for the call; null when it gave none.</summary>
     public string? Reasoning { get; init; }
+
+    /// <summary>
+    /// The dry-run change set shown to the operator at proposal time.
+    /// Approval re-plans against live queue state and refuses when the live
+    /// plan no longer matches this one — the committed mutation can never
+    /// exceed what was reviewed. Null only on rows persisted before the plan
+    /// was recorded; those approve without the drift check.
+    /// </summary>
+    public MajordomoChangeSet? ReviewedChangeSet { get; init; }
 
     /// <summary>Identity that proposed (the majordomo API-client name).</summary>
     public required string ProposedBy { get; init; }
@@ -65,7 +76,8 @@ public sealed record MajordomoProposalRecord
         MajordomoMutateArgs arguments,
         string proposedBy,
         DateTimeOffset proposedAt,
-        string? reasoning = null)
+        string? reasoning = null,
+        MajordomoChangeSet? reviewedChangeSet = null)
     {
         ArgumentNullException.ThrowIfNull(arguments);
         if (!MajordomoTools.TryGet(toolName, out var tool) || tool.Class != MajordomoToolClass.Mutate)
@@ -82,14 +94,20 @@ public sealed record MajordomoProposalRecord
             ToolName = tool.Name,
             Arguments = arguments,
             Reasoning = NormalizeReasoning(reasoning ?? arguments.Reasoning, nameof(reasoning)),
+            ReviewedChangeSet = reviewedChangeSet,
             ProposedBy = proposedBy,
             ProposedAt = proposedAt,
             State = MajordomoProposalState.Pending,
         };
     }
 
-    /// <summary>True once the proposal has left <see cref="MajordomoProposalState.Pending"/>.</summary>
-    public bool IsDecided => State != MajordomoProposalState.Pending;
+    /// <summary>
+    /// True once the proposal is in a terminal state (approved, rejected,
+    /// expired, superseded). <see cref="MajordomoProposalState.Applying"/> is
+    /// not decided: the commit was claimed but no outcome is recorded yet.
+    /// </summary>
+    public bool IsDecided => State is not MajordomoProposalState.Pending
+        and not MajordomoProposalState.Applying;
 
     /// <summary>True when <paramref name="now"/> is past the expiry deadline for this proposal.</summary>
     public bool IsExpiredAt(DateTimeOffset now, TimeSpan timeToLive) => ProposedAt + timeToLive <= now;

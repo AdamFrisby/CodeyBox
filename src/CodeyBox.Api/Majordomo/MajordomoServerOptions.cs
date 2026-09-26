@@ -34,13 +34,16 @@ public sealed class MajordomoServerOptions
     public const int MaxTurnWindowSeconds = 3600;
 
     /// <summary>Default proposal time-to-live in seconds (24 hours).</summary>
-    public const int DefaultProposalTimeToLiveSeconds = 24 * 3600;
+    public static readonly int DefaultProposalTimeToLiveSeconds =
+        (int)MajordomoOptions.DefaultProposalTimeToLive.TotalSeconds;
 
     /// <summary>Shortest accepted proposal time-to-live in seconds (1 minute).</summary>
-    public const int MinProposalTimeToLiveSeconds = 60;
+    public static readonly int MinProposalTimeToLiveSeconds =
+        (int)MajordomoOptions.MinProposalTimeToLive.TotalSeconds;
 
     /// <summary>Longest accepted proposal time-to-live in seconds (30 days).</summary>
-    public const int MaxProposalTimeToLiveSeconds = 30 * 24 * 3600;
+    public static readonly int MaxProposalTimeToLiveSeconds =
+        (int)MajordomoOptions.MaxProposalTimeToLive.TotalSeconds;
 
     /// <summary>
     /// Whether MUTATE tools execute immediately or produce operator
@@ -97,7 +100,8 @@ public sealed class MajordomoServerOptions
             return $"{SectionName}:ClientName must be a non-empty ApiClients entry name";
         if (opts.TurnWindowSeconds is < 1 or > MaxTurnWindowSeconds)
             return $"{SectionName}:TurnWindowSeconds must be within [1, {MaxTurnWindowSeconds}]";
-        if (opts.ProposalTimeToLiveSeconds is < MinProposalTimeToLiveSeconds or > MaxProposalTimeToLiveSeconds)
+        if (opts.ProposalTimeToLiveSeconds < MinProposalTimeToLiveSeconds
+            || opts.ProposalTimeToLiveSeconds > MaxProposalTimeToLiveSeconds)
             return $"{SectionName}:ProposalTimeToLiveSeconds must be within [{MinProposalTimeToLiveSeconds}, {MaxProposalTimeToLiveSeconds}]";
         return null;
     }

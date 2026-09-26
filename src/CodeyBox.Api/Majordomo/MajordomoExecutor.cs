@@ -47,77 +47,38 @@ internal sealed class MajordomoExecutor
     private delegate Task<(MajordomoToolResult? Result, MajordomoRefusal? Refusal)> ReadHandler(
         MajordomoReadBackend backend, MajordomoToolArgs args, CancellationToken ct);
 
-    /// <param name="cancelCascadeTargets">
-    /// For <c>cancel_work_item</c>, the dependents enumerated at decision
-    /// time — the plan must commit exactly the measured set, not a re-scan.
-    /// Null for every other tool.
-    /// </param>
-    private delegate Task<MajordomoMutationResult> MutateHandler(
-        MajordomoMutateBackend backend,
-        MajordomoMutateArgs args,
-        WorkInitiator initiator,
-        IReadOnlyList<WorkItem>? cancelCascadeTargets,
-        bool commit,
-        CancellationToken ct);
-
     /// <summary>
-    /// Everything the executor needs to serve one vocabulary descriptor: an
+    /// Everything the executor needs to serve one READ descriptor: an
     /// optional argument-binding override (the parameterless tools), plus the
-    /// read or mutate handler. Bound once, beside the vocabulary, so an
-    /// unwired descriptor fails at registration rather than per call.
+    /// read handler. MUTATE descriptors dispatch through
+    /// <see cref="MajordomoMutateBackend.Mutations"/> — the one table shared
+    /// with proposal approval — so there is no second mapping to drift.
     /// </summary>
     private sealed record ToolWiring(
         Func<MajordomoTool, JsonNode?, (MajordomoToolArgs? Args, MajordomoRefusal? Refusal)>? Bind,
-        ReadHandler? Read,
-        MutateHandler? Mutate);
+        ReadHandler? Read);
 
     private static readonly FrozenDictionary<MajordomoTool, ToolWiring> Wiring =
         new Dictionary<MajordomoTool, ToolWiring>
         {
             [MajordomoTools.GetQueueStatus] = new(
                 static (tool, args) => EmptyOrRefuse(tool, args, GetQueueStatusArgs.Instance),
-                static async (b, _, ct) => ((MajordomoToolResult?)await b.GetQueueStatusAsync(ct).ConfigureAwait(false), null),
-                null),
+                static async (b, _, ct) => ((MajordomoToolResult?)await b.GetQueueStatusAsync(ct).ConfigureAwait(false), null)),
             [MajordomoTools.GetDispatchStatus] = new(
                 static (tool, args) => EmptyOrRefuse(tool, args, GetDispatchStatusArgs.Instance),
-                static async (b, _, ct) => ((MajordomoToolResult?)await b.GetDispatchStatusAsync(ct).ConfigureAwait(false), null),
-                null),
+                static async (b, _, ct) => ((MajordomoToolResult?)await b.GetDispatchStatusAsync(ct).ConfigureAwait(false), null)),
             [MajordomoTools.GetAgentCapacity] = new(
                 null,
-                static async (b, a, ct) => await b.GetAgentCapacityAsync((GetAgentCapacityArgs)a, ct).ConfigureAwait(false),
-                null),
+                static async (b, a, ct) => await b.GetAgentCapacityAsync((GetAgentCapacityArgs)a, ct).ConfigureAwait(false)),
             [MajordomoTools.ListWorkItems] = new(
                 null,
-                static async (b, a, ct) => ((MajordomoToolResult?)await b.ListWorkItemsAsync((ListWorkItemsArgs)a, ct).ConfigureAwait(false), null),
-                null),
+                static async (b, a, ct) => ((MajordomoToolResult?)await b.ListWorkItemsAsync((ListWorkItemsArgs)a, ct).ConfigureAwait(false), null)),
             [MajordomoTools.GetWorkItem] = new(
                 null,
-                static async (b, a, ct) => ((MajordomoToolResult?)await b.GetWorkItemAsync((GetWorkItemArgs)a, ct).ConfigureAwait(false), null),
-                null),
+                static async (b, a, ct) => ((MajordomoToolResult?)await b.GetWorkItemAsync((GetWorkItemArgs)a, ct).ConfigureAwait(false), null)),
             [MajordomoTools.GetWorkItemAudit] = new(
                 null,
-                static async (b, a, ct) => ((MajordomoToolResult?)await b.GetWorkItemAuditAsync((GetWorkItemAuditArgs)a, ct).ConfigureAwait(false), null),
-                null),
-            [MajordomoTools.CreateWorkItem] = new(
-                null,
-                null,
-                static (b, a, initiator, _, commit, ct) => b.CreateAsync((CreateWorkItemArgs)a, initiator, commit, ct)),
-            [MajordomoTools.CreateWorkItemChain] = new(
-                null,
-                null,
-                static (b, a, initiator, _, commit, ct) => b.CreateChainAsync((CreateWorkItemChainArgs)a, initiator, commit, ct)),
-            [MajordomoTools.UpdateWorkItem] = new(
-                null,
-                null,
-                static (b, a, _, _, commit, ct) => b.UpdateAsync((UpdateWorkItemArgs)a, commit, ct)),
-            [MajordomoTools.CancelWorkItem] = new(
-                null,
-                null,
-                static (b, a, _, cascade, commit, ct) => b.CancelAsync((CancelWorkItemArgs)a, cascade, commit, ct)),
-            [MajordomoTools.RetryWorkItem] = new(
-                null,
-                null,
-                static (b, a, _, _, commit, ct) => b.RetryAsync((RetryWorkItemArgs)a, commit, ct)),
+                static async (b, a, ct) => ((MajordomoToolResult?)await b.GetWorkItemAuditAsync((GetWorkItemAuditArgs)a, ct).ConfigureAwait(false), null)),
         }.ToFrozenDictionary();
 
     private readonly MajordomoReadBackend _reads;
@@ -133,6 +94,17 @@ internal sealed class MajordomoExecutor
     /// with caller input.
     /// </summary>
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _mutationGates = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The initiator stamped on committed mutations when the request carries
+    /// no API principal (non-HTTP test hosts drive the executor directly).
+    /// </summary>
+    private static readonly WorkInitiator MajordomoInitiator = new()
+    {
+        Issuer = "codeybox",
+        Subject = "majordomo",
+        DisplayName = "CodeyBox majordomo",
+    };
 
     public MajordomoExecutor(
         MajordomoReadBackend reads,
@@ -160,8 +132,9 @@ internal sealed class MajordomoExecutor
     {
         foreach (var tool in MajordomoTools.All)
         {
-            var wired = Wiring.TryGetValue(tool, out var wiring)
-                && (tool.Class == MajordomoToolClass.Read ? wiring.Read is not null : wiring.Mutate is not null);
+            var wired = tool.Class == MajordomoToolClass.Mutate
+                ? MajordomoMutateBackend.CanMutate(tool)
+                : Wiring.TryGetValue(tool, out var wiring) && wiring.Read is not null;
             if (!wired)
                 throw new InvalidOperationException(
                     $"majordomo tool '{tool.Name}' is in the vocabulary but has no {tool.Class} handler wired");
@@ -345,7 +318,7 @@ internal sealed class MajordomoExecutor
                 // approves the stored record, and approval replays the stored
                 // arguments through the mutate backend.
                 var stored = await _proposals.ProposeAsync(
-                        propose.Proposal.Tool, proposalArgs, identity, ct)
+                        propose.Proposal.Tool, proposalArgs, mutation.ChangeSet!, identity, ct)
                     .ConfigureAwait(false);
                 // Echo the CANONICAL arguments (the bound contract
                 // re-serialized), not the raw payload — what the proposal
@@ -385,38 +358,12 @@ internal sealed class MajordomoExecutor
         IReadOnlyList<WorkItem>? cancelCascade,
         bool commit,
         CancellationToken ct) =>
-        Wiring.TryGetValue(tool, out var wiring) && wiring.Mutate is { } mutate
-            ? mutate(_mutates, args, ResolveInitiator(), cancelCascade, commit, ct)
-            : Task.FromResult(MajordomoMutationResult.Refused(
-                new MajordomoRefusal(
-                    MajordomoRefusalReasons.UnknownTool, $"no mutate backend for '{tool.Name}'")));
+        _mutates.MutateAsync(tool, args, ResolveInitiator(), cancelCascade, commit, ct);
 
-    private ApiClientPrincipal? TryGetPrincipal()
-    {
-        var context = _httpContext.HttpContext;
-        return context is not null && ApiKeyAuth.TryGetPrincipal(context, out var principal)
-            ? principal
-            : null;
-    }
-
-    private string ResolveIdentity()
-    {
-        var principal = TryGetPrincipal();
-        if (principal is null)
-            return "unknown";
-        return ApiKeyAuth.IsAuthenticationDisabled(principal)
-            ? ApiKeyAuth.AuthenticationDisabledClientName
-            : principal.Name;
-    }
+    private string ResolveIdentity() => MajordomoCallerContext.Identity(_httpContext.HttpContext);
 
     private WorkInitiator ResolveInitiator() =>
-        TryGetPrincipal()?.FixedInitiator
-        ?? new WorkInitiator
-        {
-            Issuer = "codeybox",
-            Subject = "majordomo",
-            DisplayName = "CodeyBox majordomo",
-        };
+        MajordomoCallerContext.Initiator(_httpContext.HttpContext, MajordomoInitiator);
 
     private static string BoundArguments(JsonNode? args)
     {

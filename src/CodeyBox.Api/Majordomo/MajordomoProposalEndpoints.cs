@@ -1,6 +1,7 @@
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Majordomo;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api.Majordomo;
 
@@ -8,18 +9,83 @@ namespace CodeyBox.Api.Majordomo;
 /// Operator surface for the majordomo proposal queue: list and inspect
 /// queued proposals, approve them (committing through the mutate backend),
 /// or reject/supersede them (recording the outcome without mutating).
-/// Served under the API-key middleware like every other operator endpoint.
+/// Served under the API-key middleware like every other operator endpoint —
+/// and additionally gated by <see cref="CheckProposalOperator"/> so the
+/// majordomo's own credential can never approve the calls it queued.
 /// </summary>
 internal static class MajordomoProposalEndpoints
 {
+    /// <summary>
+    /// The initiator stamped on a committed mutation when the deciding
+    /// request carries no API principal (an auth-disabled test host driving
+    /// the service directly still commits as an operator decision).
+    /// </summary>
+    private static readonly WorkInitiator ProposalDecisionInitiator = new()
+    {
+        Issuer = "codeybox",
+        Subject = "majordomo-proposal",
+        DisplayName = "CodeyBox majordomo proposal approval",
+    };
+
     public static void MapMajordomoProposals(this WebApplication app)
     {
         var group = app.MapGroup("/majordomo/proposals");
+        // The bearer middleware authenticates; this filter authorizes — the
+        // whole proposal surface is operator-only. Proposed mode exists to
+        // put the model's mutations behind human review, so the majordomo
+        // client (the prompt-injectable identity being gated) must never
+        // reach the decision routes.
+        group.AddEndpointFilter(async (context, next) =>
+        {
+            var options = context.HttpContext.RequestServices
+                .GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>()
+                .CurrentValue;
+            return CheckProposalOperator(context.HttpContext, options) is { } error
+                ? error
+                : await next(context);
+        });
         group.MapGet("/", ListAsync);
         group.MapGet("/{id}", GetAsync);
         group.MapPost("/{id}/approve", ApproveAsync);
         group.MapPost("/{id}/reject", RejectAsync);
         group.MapPost("/{id}/supersede", SupersedeAsync);
+    }
+
+    /// <summary>
+    /// The operator gate for the proposal surface: any authenticated
+    /// principal may proceed EXCEPT the configured majordomo client — the
+    /// less-trusted identity whose calls proposed mode exists to review —
+    /// and executor-bound tokens, which prove a host identity, not an
+    /// operator's. Returns null when the caller may proceed, else the
+    /// failure result to write.
+    /// </summary>
+    internal static IResult? CheckProposalOperator(HttpContext context, MajordomoServerOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(options);
+
+        if (!ApiKeyAuth.TryGetPrincipal(context, out var principal) || principal is null)
+        {
+            return Results.Problem(
+                statusCode: StatusCodes.Status401Unauthorized,
+                title: "unauthenticated");
+        }
+
+        // The auth-disabled sentinel is the loopback operator.
+        if (ApiKeyAuth.IsAuthenticationDisabled(principal))
+            return null;
+
+        if (string.Equals(principal.Name, options.ClientName, StringComparison.Ordinal)
+            || principal.ExecutorHostId is not null)
+        {
+            return Results.Problem(
+                statusCode: StatusCodes.Status403Forbidden,
+                title: "forbidden",
+                detail: "proposal decisions are operator-only — the majordomo client and " +
+                    "executor-bound tokens cannot decide proposals");
+        }
+
+        return null;
     }
 
     private static async Task<IResult> ListAsync(
@@ -64,7 +130,12 @@ internal static class MajordomoProposalEndpoints
         }
         catch (MajordomoProposalCorruptException ex)
         {
-            return Results.Ok(new { id, corrupt = true, detail = ex.Message });
+            return Results.Ok(new
+            {
+                id = Validation.DescribeUntrustedValue(id),
+                corrupt = true,
+                detail = ex.Message,
+            });
         }
 
         return record is null
@@ -78,7 +149,9 @@ internal static class MajordomoProposalEndpoints
         MajordomoProposalService proposals,
         CancellationToken ct)
     {
-        var outcome = await proposals.ApproveAsync(id, DecideIdentity(context), ResolveInitiator(context), ct)
+        var outcome = await proposals.ApproveAsync(
+                id, MajordomoCallerContext.Identity(context),
+                MajordomoCallerContext.Initiator(context, ProposalDecisionInitiator), ct)
             .ConfigureAwait(false);
         if (outcome.Refusal is not null)
             return ProposalRefusalResult(outcome.Refusal);
@@ -104,7 +177,8 @@ internal static class MajordomoProposalEndpoints
         MajordomoProposalService proposals,
         CancellationToken ct)
     {
-        var outcome = await proposals.RejectAsync(id, DecideIdentity(context), body?.Reason ?? string.Empty, ct)
+        var outcome = await proposals.RejectAsync(
+                id, MajordomoCallerContext.Identity(context), body?.Reason ?? string.Empty, ct)
             .ConfigureAwait(false);
         return outcome.Refusal is not null
             ? ProposalRefusalResult(outcome.Refusal)
@@ -118,7 +192,8 @@ internal static class MajordomoProposalEndpoints
         MajordomoProposalService proposals,
         CancellationToken ct)
     {
-        var outcome = await proposals.SupersedeAsync(id, DecideIdentity(context), body?.Reason ?? string.Empty, ct)
+        var outcome = await proposals.SupersedeAsync(
+                id, MajordomoCallerContext.Identity(context), body?.Reason ?? string.Empty, ct)
             .ConfigureAwait(false);
         return outcome.Refusal is not null
             ? ProposalRefusalResult(outcome.Refusal)
@@ -135,7 +210,9 @@ internal static class MajordomoProposalEndpoints
         MajordomoRefusalReasons.ProposalNotPending
             or MajordomoRefusalReasons.ProposalExpired
             or MajordomoRefusalReasons.ProposalCorrupt
-            or MajordomoRefusalReasons.ProposalToolRetired => Results.Conflict(new
+            or MajordomoRefusalReasons.ProposalToolRetired
+            or MajordomoRefusalReasons.ProposalDrifted
+            or MajordomoRefusalReasons.ProposalCommitIncomplete => Results.Conflict(new
             {
                 error = refusal.Detail,
                 reason = refusal.Reason,
@@ -149,6 +226,9 @@ internal static class MajordomoProposalEndpoints
         tool = record.ToolName,
         arguments = JsonSerializer.SerializeToNode(record.Arguments, record.Arguments.GetType(), MajordomoJson.Options),
         reasoning = record.Reasoning,
+        reviewedChangeSet = record.ReviewedChangeSet is { } plan
+            ? JsonSerializer.SerializeToNode(plan, MajordomoJson.Options)
+            : null,
         proposedBy = record.ProposedBy,
         proposedAt = record.ProposedAt,
         state = record.State.ToString().ToLowerInvariant(),
@@ -157,23 +237,6 @@ internal static class MajordomoProposalEndpoints
         decisionReason = record.DecisionReason,
         resultAffectedItems = record.ResultAffectedItems?.Select(i => i.ToString()).ToList(),
     };
-
-    private static string DecideIdentity(HttpContext context) =>
-        ApiKeyAuth.TryGetPrincipal(context, out var principal) && principal is not null
-            ? ApiKeyAuth.IsAuthenticationDisabled(principal)
-                ? ApiKeyAuth.AuthenticationDisabledClientName
-                : principal.Name
-            : "unknown";
-
-    private static WorkInitiator ResolveInitiator(HttpContext context) =>
-        ApiKeyAuth.TryGetPrincipal(context, out var principal) && principal?.FixedInitiator is { } initiator
-            ? initiator
-            : new WorkInitiator
-            {
-                Issuer = "codeybox",
-                Subject = "majordomo-proposal",
-                DisplayName = "CodeyBox majordomo proposal approval",
-            };
 }
 
 /// <summary>Operator-supplied justification for rejecting or superseding a proposal.</summary>

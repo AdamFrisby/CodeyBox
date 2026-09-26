@@ -1,4 +1,7 @@
+using System.Net;
+using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -7,6 +10,7 @@ using CodeyBox.Api;
 using CodeyBox.Api.Majordomo;
 using CodeyBox.Core;
 using CodeyBox.Majordomo;
+using CodeyBox.Orchestrator;
 using ModelContextProtocol;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
@@ -132,6 +136,26 @@ public sealed class MajordomoProposalQueueTests
 
     private static NewWorkItemSpec ItemSpec(string title) =>
         new(new ProjectId("test-project"), title, "do " + title);
+
+    /// <summary>The dry-run change set a proposal for <paramref name="spec"/> would carry.</summary>
+    private static MajordomoChangeSet ReviewedPlan(NewWorkItemSpec spec) =>
+        new(DryRun: true, [new MajordomoPlannedChange.CreateItem(spec)], []);
+
+    /// <summary>
+    /// Runs the real mutate backend's plan-only arm so the stored proposal
+    /// carries exactly the change set proposal-time review would have shown.
+    /// </summary>
+    private static async Task<MajordomoChangeSet> PlanWithBackendAsync(
+        WorkItemApiFactory factory,
+        MajordomoTool tool,
+        MajordomoMutateArgs args)
+    {
+        var backend = factory.Services.GetRequiredService<MajordomoMutateBackend>();
+        var planned = await backend.MutateAsync(
+            tool, args, TestInitiator, cancelCascadeTargets: null, commit: false, CancellationToken.None);
+        Assert.Null(planned.Refusal);
+        return planned.ChangeSet!;
+    }
 
     // ── 1. approval == autonomous ────────────────────────────────────────────
 
@@ -267,6 +291,7 @@ public sealed class MajordomoProposalQueueTests
         var record = await service.ProposeAsync(
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("doomed item")),
+            ReviewedPlan(ItemSpec("doomed item")),
             "majordomo",
             CancellationToken.None);
         Assert.Equal(MajordomoProposalState.Pending, (await store.GetAsync(record.Id))!.State);
@@ -320,8 +345,9 @@ public sealed class MajordomoProposalQueueTests
         }
 
         // The anchor completes before approval, so the tail's dependency can
-        // never satisfy — the failure surfaces while the head is already
-        // prepared, which is exactly the partway point that must file nothing.
+        // never satisfy — the refusal fires during the all-nodes dependency
+        // check, before any node is prepared: the partway point that must
+        // file nothing.
         await factory.Store.UpdateAsync(anchor with { State = WorkItemState.Done });
 
         var service = factory.Services.GetRequiredService<MajordomoProposalService>();
@@ -347,6 +373,7 @@ public sealed class MajordomoProposalQueueTests
         var record = await service.ProposeAsync(
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("unwanted item")),
+            ReviewedPlan(ItemSpec("unwanted item")),
             "majordomo",
             CancellationToken.None);
 
@@ -376,6 +403,7 @@ public sealed class MajordomoProposalQueueTests
         var record = await service.ProposeAsync(
             MajordomoTools.CreateWorkItem,
             new CreateWorkItemArgs(ItemSpec("once only")),
+            ReviewedPlan(ItemSpec("once only")),
             "majordomo",
             CancellationToken.None);
 
@@ -400,13 +428,15 @@ public sealed class MajordomoProposalQueueTests
         var path = Path.Combine(Path.GetTempPath(), $"mjd-prop-{Guid.NewGuid():N}.db");
         var now = DateTimeOffset.UtcNow;
         string id;
+        var plan = ReviewedPlan(ItemSpec("durable item"));
         using (var store = new SqliteMajordomoProposalStore(path))
         {
             var record = MajordomoProposalRecord.Create(
                 "create_work_item",
                 new CreateWorkItemArgs(ItemSpec("durable item")) { Reasoning = "because tests" },
                 "majordomo",
-                now);
+                now,
+                reviewedChangeSet: plan);
             id = record.Id;
             await store.EnqueueAsync(record);
         }
@@ -425,6 +455,12 @@ public sealed class MajordomoProposalQueueTests
                 Assert.Equal(now, loaded.ProposedAt);
                 var create = Assert.IsType<CreateWorkItemArgs>(loaded.Arguments);
                 Assert.Equal("durable item", create.Item.Title);
+                // The reviewed change set round-trips — the approval-time
+                // drift check compares this against a live re-plan.
+                Assert.NotNull(loaded.ReviewedChangeSet);
+                Assert.Equal(
+                    JsonSerializer.Serialize(plan.Changes, MajordomoJson.Options),
+                    JsonSerializer.Serialize(loaded.ReviewedChangeSet!.Changes, MajordomoJson.Options));
             }
         }
         finally
@@ -466,5 +502,349 @@ public sealed class MajordomoProposalQueueTests
         var update = Assert.IsType<UpdateWorkItemArgs>(record.Arguments);
         Assert.Equal(queued.Id, update.Id);
         Assert.Equal("new title", update.Patch.Title);
+    }
+
+    // ── concurrency: one proposal, one commit ────────────────────────────────
+
+    [Fact]
+    public async Task ConcurrentApprovals_CommitExactlyOnce()
+    {
+        using var factory = new WorkItemApiFactory();
+        var store = new InMemoryMajordomoProposalStore();
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        var service = ManualService(factory, store, time);
+
+        var record = await service.ProposeAsync(
+            MajordomoTools.CreateWorkItem,
+            new CreateWorkItemArgs(ItemSpec("raced approval")),
+            ReviewedPlan(ItemSpec("raced approval")),
+            "majordomo",
+            CancellationToken.None);
+
+        var outcomes = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ =>
+            service.ApproveAsync(record.Id, "test-operator", TestInitiator)));
+
+        // Exactly one approval committed; the rest replay the recorded ids.
+        var committed = outcomes.Where(o => o.ChangeSet is not null).ToList();
+        Assert.Single(committed);
+        Assert.All(outcomes.Where(o => o.ChangeSet is null), o =>
+        {
+            Assert.Null(o.Refusal);
+            Assert.NotNull(o.AlreadyApprovedIds);
+        });
+        Assert.Single(await ListAllAsync(factory));
+        Assert.Equal(
+            MajordomoProposalState.Approved, (await store.GetAsync(record.Id))!.State);
+    }
+
+    [Fact]
+    public async Task ApproveAndReject_Concurrently_NeverDiverge()
+    {
+        using var factory = new WorkItemApiFactory();
+        var store = new InMemoryMajordomoProposalStore();
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        var service = ManualService(factory, store, time);
+
+        var record = await service.ProposeAsync(
+            MajordomoTools.CreateWorkItem,
+            new CreateWorkItemArgs(ItemSpec("raced decision")),
+            ReviewedPlan(ItemSpec("raced decision")),
+            "majordomo",
+            CancellationToken.None);
+
+        var approveTask = service.ApproveAsync(record.Id, "test-operator", TestInitiator);
+        var rejectTask = service.RejectAsync(record.Id, "test-operator", "changed my mind");
+        await Task.WhenAll(approveTask, rejectTask);
+        var approval = await approveTask;
+        var rejection = await rejectTask;
+
+        var final = (await store.GetAsync(record.Id))!;
+        var items = await ListAllAsync(factory);
+        if (approval.ChangeSet is not null)
+        {
+            // Approval claimed first: the commit landed and the record says so.
+            Assert.Equal(MajordomoProposalState.Approved, final.State);
+            Assert.Single(items);
+            Assert.Equal(
+                "proposal_not_pending", rejection.Refusal?.Reason);
+        }
+        else
+        {
+            // The rejection won: the record is rejected and the queue was
+            // never touched — never "rejected but mutated".
+            Assert.Equal(MajordomoProposalState.Rejected, final.State);
+            Assert.Empty(items);
+            Assert.Equal("proposal_not_pending", approval.Refusal?.Reason);
+        }
+    }
+
+    // ── drift: the committed plan must be the reviewed plan ──────────────────
+
+    [Fact]
+    public async Task Approval_WhenReviewedCascadeGrew_IsRefusedAsDrifted()
+    {
+        using var factory = new WorkItemApiFactory();
+        var target = Seed(WorkItemState.Queued, "cancel target");
+        var dependent = Seed(WorkItemState.Queued, "dependent one") with { DependsOn = [target.Id] };
+        await factory.Store.CreateAsync(target);
+        await factory.Store.CreateAsync(dependent);
+
+        var store = new InMemoryMajordomoProposalStore();
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        var service = ManualService(factory, store, time);
+
+        var args = new CancelWorkItemArgs(target.Id, "consolidating work");
+        var reviewed = await PlanWithBackendAsync(factory, MajordomoTools.CancelWorkItem, args);
+        var record = await service.ProposeAsync(
+            MajordomoTools.CancelWorkItem, args, reviewed, "majordomo", CancellationToken.None);
+
+        // The blast radius grows between proposal and approval: another item
+        // now depends on the cancel target.
+        await factory.Store.CreateAsync(
+            Seed(WorkItemState.Queued, "dependent two") with { DependsOn = [target.Id] });
+
+        var approval = await service.ApproveAsync(record.Id, "test-operator", TestInitiator);
+        Assert.NotNull(approval.Refusal);
+        Assert.Equal("proposal_drifted", approval.Refusal!.Reason);
+
+        // Nothing was cancelled; the proposal stays pending for a re-proposal.
+        Assert.All(await ListAllAsync(factory), i => Assert.Equal(WorkItemState.Queued, i.State));
+        Assert.Equal(MajordomoProposalState.Pending, (await store.GetAsync(record.Id))!.State);
+    }
+
+    // ── interrupted commit: refused re-approval, closable ────────────────────
+
+    [Fact]
+    public async Task InterruptedCommit_CannotBeReapproved_ButCanBeClosed()
+    {
+        using var factory = new WorkItemApiFactory();
+        var store = new InMemoryMajordomoProposalStore();
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        var service = ManualService(factory, store, time);
+
+        var record = await service.ProposeAsync(
+            MajordomoTools.CreateWorkItem,
+            new CreateWorkItemArgs(ItemSpec("interrupted")),
+            ReviewedPlan(ItemSpec("interrupted")),
+            "majordomo",
+            CancellationToken.None);
+
+        // Simulate a crashed commit: claimed, but the outcome never landed.
+        Assert.True(await store.TryTransitionAsync(
+            record.Id,
+            MajordomoProposalState.Pending,
+            record with
+            {
+                State = MajordomoProposalState.Applying,
+                DecisionReason = MajordomoProposalService.CommitInFlightReason,
+            }));
+
+        // Re-approval is refused rather than risking a double commit.
+        var approval = await service.ApproveAsync(record.Id, "test-operator", TestInitiator);
+        Assert.NotNull(approval.Refusal);
+        Assert.Equal("proposal_commit_incomplete", approval.Refusal!.Reason);
+        Assert.Empty(await ListAllAsync(factory));
+
+        // The operator closes the row out; the record keeps the caveat that
+        // the mutation may already have applied.
+        var close = await service.RejectAsync(record.Id, "test-operator", "verified nothing landed");
+        Assert.Null(close.Refusal);
+        Assert.Equal(MajordomoProposalState.Rejected, close.Record!.State);
+        Assert.Contains("claimed commit", close.Record.DecisionReason);
+        Assert.Empty(await ListAllAsync(factory));
+    }
+
+    // ── retired tool: refusal, never a commit path ───────────────────────────
+
+    [Fact]
+    public async Task Proposal_WhoseToolLeftTheVocabulary_IsRefusedAsRetired()
+    {
+        using var factory = new WorkItemApiFactory();
+        var store = new InMemoryMajordomoProposalStore();
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        var service = ManualService(factory, store, time);
+
+        // A hand-built row as if the tool had been removed between proposal
+        // and approval — the durable-store read path reports this as corrupt,
+        // the service path reports the precise reason.
+        var record = new MajordomoProposalRecord
+        {
+            Id = MajordomoProposalRecord.NewId(),
+            ToolName = "drain_the_queue",
+            Arguments = new CreateWorkItemArgs(ItemSpec("stale")),
+            ProposedBy = "majordomo",
+            ProposedAt = DateTimeOffset.UtcNow,
+        };
+        await store.EnqueueAsync(record);
+
+        var approval = await service.ApproveAsync(record.Id, "test-operator", TestInitiator);
+        Assert.NotNull(approval.Refusal);
+        Assert.Equal("proposal_tool_retired", approval.Refusal!.Reason);
+        Assert.Empty(await ListAllAsync(factory));
+    }
+
+    // ── operator gate: proposal decisions are not the majordomo's ────────────
+
+    private static DefaultHttpContext ContextWith(ApiClientPrincipal principal)
+    {
+        var ctx = new DefaultHttpContext();
+        ctx.Items[ApiKeyAuth.PrincipalItemKey] = principal;
+        return ctx;
+    }
+
+    private static int? StatusCodeOf(IResult? result) =>
+        result is null ? null : Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode;
+
+    private static WorkInitiator ClientInitiator(string subject) => new()
+    {
+        Issuer = "test",
+        Subject = subject,
+        DisplayName = subject,
+    };
+
+    [Fact]
+    public void ProposalGate_MissingPrincipal_IsUnauthorized()
+    {
+        var result = MajordomoProposalEndpoints.CheckProposalOperator(
+            new DefaultHttpContext(), new MajordomoServerOptions());
+        Assert.Equal(StatusCodes.Status401Unauthorized, StatusCodeOf(result));
+    }
+
+    [Fact]
+    public void ProposalGate_AuthenticationDisabled_IsAllowed()
+    {
+        var ctx = ContextWith(new ApiClientPrincipal(
+            ApiKeyAuth.AuthenticationDisabledClientName,
+            ClientInitiator("operator"),
+            CanDelegateInitiator: false));
+        Assert.Null(MajordomoProposalEndpoints.CheckProposalOperator(ctx, new MajordomoServerOptions()));
+    }
+
+    [Fact]
+    public void ProposalGate_MajordomoClient_IsForbidden()
+    {
+        // The credential whose calls proposed mode exists to review must
+        // never reach the decision routes.
+        var ctx = ContextWith(new ApiClientPrincipal(
+            "majordomo", ClientInitiator("majordomo"), CanDelegateInitiator: false));
+        var result = MajordomoProposalEndpoints.CheckProposalOperator(ctx, new MajordomoServerOptions());
+        Assert.Equal(StatusCodes.Status403Forbidden, StatusCodeOf(result));
+    }
+
+    [Fact]
+    public void ProposalGate_ExecutorBoundClient_IsForbidden()
+    {
+        // A host-bound token proves which executor is calling, not that an
+        // operator is deciding.
+        var ctx = ContextWith(new ApiClientPrincipal(
+            "executor-1", ClientInitiator("executor-1"), CanDelegateInitiator: false,
+            ExecutorHostId: "exec-1"));
+        var result = MajordomoProposalEndpoints.CheckProposalOperator(ctx, new MajordomoServerOptions());
+        Assert.Equal(StatusCodes.Status403Forbidden, StatusCodeOf(result));
+    }
+
+    [Fact]
+    public void ProposalGate_OperatorAndOtherClients_AreAllowed()
+    {
+        var options = new MajordomoServerOptions();
+        var legacy = ContextWith(new ApiClientPrincipal(
+            "legacy-operator", ClientInitiator("operator"), CanDelegateInitiator: false));
+        Assert.Null(MajordomoProposalEndpoints.CheckProposalOperator(legacy, options));
+
+        var other = ContextWith(new ApiClientPrincipal(
+            "audit-runner", ClientInitiator("audit-runner"), CanDelegateInitiator: false));
+        Assert.Null(MajordomoProposalEndpoints.CheckProposalOperator(other, options));
+    }
+
+    // ── operator gate over real HTTP wiring ──────────────────────────────────
+
+    [Fact]
+    public async Task ProposalEndpoints_RefuseMajordomoAndExecutorTokens_AcceptOperator()
+    {
+        const string operatorKey = "0123456789abcdef0123456789abcdef";
+        const string majordomoKey = "fedcba9876543210fedcba9876543210";
+        const string executorKey = "00112233445566770011223344556677";
+        using var envOperator = new EnvironmentVariableScope("CODEYBOX_API_KEY", operatorKey);
+        using var envMajordomo = new EnvironmentVariableScope("CODEYBOX_TEST_MAJORDOMO_TOKEN", majordomoKey);
+        using var envExecutor = new EnvironmentVariableScope("CODEYBOX_TEST_EXECUTOR_TOKEN", executorKey);
+
+        using var inner = new WorkItemApiFactory();
+        using var host = inner.WithWebHostBuilder(builder =>
+            builder.ConfigureAppConfiguration((_, cfg) => cfg.AddInMemoryCollection(
+                new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "false",
+                    ["CodeyBox:ApiClients:0:Name"] = "majordomo",
+                    ["CodeyBox:ApiClients:0:TokenEnvVar"] = "CODEYBOX_TEST_MAJORDOMO_TOKEN",
+                    ["CodeyBox:ApiClients:0:Principal:Issuer"] = "test",
+                    ["CodeyBox:ApiClients:0:Principal:Subject"] = "majordomo",
+                    ["CodeyBox:ApiClients:0:Principal:DisplayName"] = "Test majordomo",
+                    ["CodeyBox:ApiClients:1:Name"] = "executor-1",
+                    ["CodeyBox:ApiClients:1:TokenEnvVar"] = "CODEYBOX_TEST_EXECUTOR_TOKEN",
+                    ["CodeyBox:ApiClients:1:Principal:Issuer"] = "test",
+                    ["CodeyBox:ApiClients:1:Principal:Subject"] = "executor-1",
+                    ["CodeyBox:ApiClients:1:Principal:DisplayName"] = "Test executor",
+                    ["CodeyBox:ApiClients:1:ExecutorHostId"] = "exec-1",
+                })));
+
+        var spec = ItemSpec("gated proposal");
+        var proposal = MajordomoProposalRecord.Create(
+            "create_work_item",
+            new CreateWorkItemArgs(spec),
+            "majordomo",
+            DateTimeOffset.UtcNow,
+            reviewedChangeSet: ReviewedPlan(spec));
+        await host.Services.GetRequiredService<IMajordomoProposalStore>()
+            .EnqueueAsync(proposal);
+
+        using var http = host.CreateClient();
+
+        // The majordomo credential is refused on every proposal route.
+        http.DefaultRequestHeaders.Authorization = new("Bearer", majordomoKey);
+        var response = await http.PostAsync(
+            $"/majordomo/proposals/{proposal.Id}/approve", content: null);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        response = await http.PostAsJsonAsync(
+            $"/majordomo/proposals/{proposal.Id}/reject", new { reason = "self-approval" });
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        response = await http.GetAsync($"/majordomo/proposals/{proposal.Id}");
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+
+        // An executor-bound token is refused too.
+        http.DefaultRequestHeaders.Authorization = new("Bearer", executorKey);
+        response = await http.PostAsync(
+            $"/majordomo/proposals/{proposal.Id}/approve", content: null);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+
+        // None of the refused calls touched the proposal or the queue.
+        var record = await host.Services.GetRequiredService<IMajordomoProposalStore>()
+            .GetAsync(proposal.Id);
+        Assert.Equal(MajordomoProposalState.Pending, record!.State);
+        Assert.Empty(await ListAllAsync(inner));
+
+        // The operator key decides.
+        http.DefaultRequestHeaders.Authorization = new("Bearer", operatorKey);
+        response = await http.PostAsJsonAsync(
+            $"/majordomo/proposals/{proposal.Id}/reject", new { reason = "not needed" });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        record = await host.Services.GetRequiredService<IMajordomoProposalStore>()
+            .GetAsync(proposal.Id);
+        Assert.Equal(MajordomoProposalState.Rejected, record!.State);
+        Assert.Empty(await ListAllAsync(inner));
+    }
+
+    private sealed class EnvironmentVariableScope : IDisposable
+    {
+        private readonly string _name;
+        private readonly string? _previous;
+
+        public EnvironmentVariableScope(string name, string? value)
+        {
+            _name = name;
+            _previous = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose() => Environment.SetEnvironmentVariable(_name, _previous);
     }
 }

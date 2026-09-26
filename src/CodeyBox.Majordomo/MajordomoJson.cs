@@ -1,22 +1,22 @@
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Schema;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
 using CodeyBox.Core;
-using CodeyBox.Majordomo;
 
-namespace CodeyBox.Api.Majordomo;
+namespace CodeyBox.Majordomo;
 
 /// <summary>
-/// The serializer contract for the majordomo MCP surface: snake_case
+/// The serializer contract for the majordomo surface: snake_case
 /// property names (matching the tool names), string forms for the typed
 /// identifier wrappers, snake_case enum names, and strict input handling —
 /// the wire is a model, so unknown fields are ignored but malformed values
-/// are never silently reinterpreted.
+/// are never silently reinterpreted. The same options drive wire binding,
+/// the proposal store's persisted payload, and the executor's echo-back, so
+/// what the operator reviews is byte-for-byte what a commit replays.
 /// </summary>
-internal static class MajordomoJson
+public static class MajordomoJson
 {
     public static readonly JsonSerializerOptions Options = Create();
 
@@ -56,88 +56,8 @@ internal static class MajordomoJson
     /// through here so a contract rename cannot silently drift the wire
     /// shape, the advertised schema, or refusal field names apart.
     /// </summary>
-    internal static string WirePropertyName(string clrName) =>
+    public static string WirePropertyName(string clrName) =>
         Options.PropertyNamingPolicy?.ConvertName(clrName) ?? clrName;
-
-    /// <summary>
-    /// The JSON schema a tool advertises for its argument contract. Generated
-    /// from the typed contract so the schema cannot drift from the
-    /// deserializer; the custom-converter types (ids, durations) are
-    /// rewritten to their wire shape (string) so the advertised schema
-    /// matches what the server actually accepts.
-    /// </summary>
-    public static JsonElement InputSchemaFor(Type argumentsType)
-    {
-        var exporterOptions = new JsonSchemaExporterOptions
-        {
-            TransformSchemaNode = static (context, schema) =>
-                StringWireTypes.Contains(context.TypeInfo.Type)
-                    ? new JsonObject { ["type"] = "string" }
-                    : schema,
-        };
-        var node = JsonSchemaExporter.GetJsonSchemaAsNode(Options, argumentsType, exporterOptions);
-        if (node is not JsonObject root)
-            return JsonSerializer.SerializeToElement(node, Options);
-
-        // The exporter marks the root nullable (type: ["object","null"]) since
-        // the reference type can be null in C# terms; MCP requires a plain
-        // object root — arguments are never null on the wire.
-        if (root["type"] is JsonArray { Count: 2 })
-            root["type"] = "object";
-
-        if (root["properties"] is JsonObject properties)
-        {
-            // AffectedItemCount is a computed read-back on the mutate contract
-            // base — an output, never an input. The exporter cannot know that;
-            // strip it so the advertised schema matches what binds. Absent on
-            // a mutate contract means the exporter shape drifted — fail loudly
-            // at registration rather than advertise a computed property as
-            // input.
-            if (typeof(MajordomoMutateArgs).IsAssignableFrom(argumentsType)
-                && !properties.Remove(WirePropertyName(nameof(MajordomoMutateArgs.AffectedItemCount))))
-                throw new InvalidOperationException(
-                    $"the generated schema for {argumentsType.Name} lacks the '{WirePropertyName(nameof(MajordomoMutateArgs.AffectedItemCount))}' " +
-                    $"read-back property — {nameof(InputSchemaFor)} must be updated alongside the contract");
-
-            // The chain node's custom converter makes the exporter treat
-            // items[] as opaque. Pin the real wire shape, embedding the full
-            // NewWorkItemSpec schema so the advertised contract is complete.
-            if (argumentsType == typeof(CreateWorkItemChainArgs))
-            {
-                var itemsName = WirePropertyName(nameof(CreateWorkItemChainArgs.Items));
-                if (properties[itemsName] is not JsonObject itemsSchema)
-                    throw new InvalidOperationException(
-                        $"the generated schema for {argumentsType.Name} lacks the '{itemsName}' array — " +
-                        $"{nameof(InputSchemaFor)} must be updated alongside the contract");
-                var specSchema = JsonSchemaExporter.GetJsonSchemaAsNode(
-                    Options, typeof(NewWorkItemSpec), exporterOptions);
-                if (specSchema is JsonObject specObj && specObj["type"] is JsonArray)
-                    specObj["type"] = "object";
-                itemsSchema["items"] = new JsonObject
-                {
-                    ["type"] = "object",
-                    ["required"] = new JsonArray(WorkItemChainNodeConverter.ItemField),
-                    ["properties"] = new JsonObject
-                    {
-                        [WorkItemChainNodeConverter.ItemField] = specSchema,
-                        [WorkItemChainNodeConverter.DependsOnIndexesField] = new JsonObject
-                        {
-                            ["type"] = "array",
-                            ["items"] = new JsonObject { ["type"] = "integer" },
-                        },
-                    },
-                };
-            }
-        }
-
-        return JsonSerializer.SerializeToElement(node, Options);
-    }
-
-    private static readonly HashSet<Type> StringWireTypes =
-    [
-        typeof(WorkItemId), typeof(ProjectId), typeof(ReleaseId),
-        typeof(AgentKind), typeof(AuditTarget), typeof(TimeSpan),
-    ];
 
     private sealed class WorkItemIdConverter : JsonConverter<WorkItemId>
     {
@@ -237,22 +157,16 @@ internal static class MajordomoJson
     /// </summary>
     private sealed class WorkItemChainNodeConverter : JsonConverter<WorkItemChainNode>
     {
-        // The wire field names, derived through the contract's naming policy
-        // and shared with the schema patch in InputSchemaFor — one source of
-        // truth so a contract rename cannot drift reader/writer/schema apart.
-        // Properties, not fields: this type is constructed inside Create()
-        // while Options is still being assigned.
-        internal static string ItemField => WirePropertyName(nameof(WorkItemChainNode.Item));
-        internal static string DependsOnIndexesField => WirePropertyName(nameof(WorkItemChainNode.DependsOnIndexes));
-
         public override WorkItemChainNode Read(
             ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
         {
             var node = JsonNode.Parse(ref reader) as JsonObject
                 ?? throw new JsonException("chain node must be a JSON object");
-            var item = node[ItemField]?.Deserialize<NewWorkItemSpec>(options)
-                ?? throw new JsonException($"chain node requires an '{ItemField}' object");
-            var edges = node[DependsOnIndexesField]?.Deserialize<int[]>(options) ?? [];
+            var itemName = WirePropertyName(nameof(WorkItemChainNode.Item));
+            var edgesName = WirePropertyName(nameof(WorkItemChainNode.DependsOnIndexes));
+            var item = node[itemName]?.Deserialize<NewWorkItemSpec>(options)
+                ?? throw new JsonException($"chain node requires an '{itemName}' object");
+            var edges = node[edgesName]?.Deserialize<int[]>(options) ?? [];
             return new WorkItemChainNode(item, edges);
         }
 
@@ -260,9 +174,9 @@ internal static class MajordomoJson
             Utf8JsonWriter writer, WorkItemChainNode value, JsonSerializerOptions options)
         {
             writer.WriteStartObject();
-            writer.WritePropertyName(ItemField);
+            writer.WritePropertyName(WirePropertyName(nameof(WorkItemChainNode.Item)));
             JsonSerializer.Serialize(writer, value.Item, options);
-            writer.WritePropertyName(DependsOnIndexesField);
+            writer.WritePropertyName(WirePropertyName(nameof(WorkItemChainNode.DependsOnIndexes)));
             JsonSerializer.Serialize(writer, value.DependsOnIndexes, options);
             writer.WriteEndObject();
         }

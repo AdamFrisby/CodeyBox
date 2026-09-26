@@ -71,8 +71,11 @@ rotating the operator key.
 
 In `proposed` mode, mutations are persisted as operator-reviewable proposals
 under `/majordomo/proposals` (list, inspect, approve, reject, supersede —
-see the `Majordomo` configuration reference). Approval commits through the
-same path as Autonomous mode, revalidated against live queue state.
+see the `Majordomo` configuration reference). That surface is operator-only:
+the majordomo client itself and executor-bound tokens are refused, so the
+credential whose calls are being reviewed can never approve them. Approval
+commits through the same path as Autonomous mode, revalidated against live
+queue state.
 
 ### GitHub App delivery credentials
 
