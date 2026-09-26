@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Majordomo;
@@ -170,7 +171,7 @@ internal sealed class MajordomoProposalService
         var policy = _options.CurrentValue.ToPolicy();
         var now = _time.GetUtcNow();
         var record = MajordomoProposalRecord.Create(
-            tool.Name, args, proposedBy, now, args.Reasoning, reviewedChangeSet);
+            tool.Name, args, proposedBy, now, reviewedChangeSet, args.Reasoning);
         try
         {
             await _store.EnqueueAsync(record, policy, now, ct).ConfigureAwait(false);
@@ -183,12 +184,16 @@ internal sealed class MajordomoProposalService
                 "awaiting a decision; review the queue before proposing more"));
         }
 
+        // The audit record carries the canonical serialized argument
+        // payload — what an approval would replay — under the same bound the
+        // executor applies to raw call arguments.
         AuditLog.MajordomoToolCall(
             record.Id,
             Validation.DescribeUntrustedValue(proposedBy),
             Validation.DescribeUntrustedValue(tool.Name),
             MajordomoDecisions.Propose,
-            $"proposal {record.Id}");
+            MajordomoExecutor.BoundArguments(
+                JsonSerializer.SerializeToNode(record.Arguments, record.Arguments.GetType(), MajordomoJson.Options)));
         return MajordomoProposalEnqueueOutcome.Enqueued(record);
     }
 
@@ -252,8 +257,7 @@ internal sealed class MajordomoProposalService
                 if (record.IsDecided)
                     return Refused(NotPending(safeId, record.State));
 
-                var (tool, commitRefusal) = ResolveCommitTool(record);
-                if (commitRefusal is not null)
+                if (!TryResolveCommitTool(record, out var tool, out var commitRefusal))
                     return Refused(commitRefusal);
 
                 // Revalidation and review fidelity run before the claim: the
@@ -274,7 +278,7 @@ internal sealed class MajordomoProposalService
                 }
 
                 var plan = await _mutates.MutateAsync(
-                        tool!, record.Arguments, initiator,
+                        tool, record.Arguments, initiator,
                         cancelCascade, commit: false, ct)
                     .ConfigureAwait(false);
                 if (plan.Refusal is not null)
@@ -309,7 +313,7 @@ internal sealed class MajordomoProposalService
                         id, MajordomoProposalState.Pending, claim, ct).ConfigureAwait(false))
                 {
                     return await CommitClaimedAsync(
-                        record, tool!, decidedBy, initiator, cancelCascade, now, ct)
+                        record, tool, decidedBy, initiator, cancelCascade, now, ct)
                         .ConfigureAwait(false);
                 }
                 // Lost the claim — loop re-reads and reports the winning state.
@@ -381,20 +385,38 @@ internal sealed class MajordomoProposalService
                     DecidedBy = decidedBy,
                     DecisionReason = $"commit partially applied then refused: {refusal.Detail}",
                 };
-                await _store.TryTransitionAsync(
-                    id, MajordomoProposalState.Applying, stuck, ct).ConfigureAwait(false);
+                // Reject/supersede may settle an applying row from another
+                // process, so the re-stamp can legitimately lose — report the
+                // state that actually won rather than claim the row is still
+                // applying.
+                var disposition = await _store.TryTransitionAsync(
+                        id, MajordomoProposalState.Applying, stuck, ct).ConfigureAwait(false)
+                    ? "the proposal stays in 'applying' until an operator inspects the queue and closes it"
+                    : $"a concurrent decision has since marked the proposal " +
+                        $"'{await DescribeStoredStateAsync(id, ct).ConfigureAwait(false)}'";
                 refusal = refusal with
                 {
                     Detail = refusal.Detail + " — part of the mutation was applied before this refusal; " +
-                    "the proposal stays in 'applying' until an operator inspects the queue and closes it",
+                        disposition,
                 };
             }
             else
             {
                 // The commit planned everything before writing, so a refusal
-                // with no writes frees the proposal back to pending.
-                await _store.TryTransitionAsync(
-                    id, MajordomoProposalState.Applying, record, ct).ConfigureAwait(false);
+                // with no writes frees the proposal back to pending. A lost
+                // CAS means a decision in another process settled the
+                // claimed row first — report the winning state rather than
+                // claim a revert that did not happen.
+                if (!await _store.TryTransitionAsync(
+                        id, MajordomoProposalState.Applying, record, ct).ConfigureAwait(false))
+                {
+                    refusal = refusal with
+                    {
+                        Detail = refusal.Detail + " — the proposal could not be returned to pending; " +
+                            $"a concurrent decision marked it " +
+                            $"'{await DescribeStoredStateAsync(id, ct).ConfigureAwait(false)}'",
+                    };
+                }
             }
 
             AuditOutcome(id, decidedBy, record.ToolName, MajordomoOutcomes.Refused, refusal.Detail);
@@ -508,34 +530,70 @@ internal sealed class MajordomoProposalService
     }
 
     /// <summary>
+    /// Reads the proposal's current stored state for a "what actually won"
+    /// note when a transition loses its compare-and-set — the same re-read
+    /// <see cref="DecideAsync"/> performs — tolerating a corrupt or vanished
+    /// row so the report itself cannot throw.
+    /// </summary>
+    private async Task<string> DescribeStoredStateAsync(string id, CancellationToken ct)
+    {
+        try
+        {
+            var current = await _store.GetAsync(id, ct).ConfigureAwait(false);
+            return current?.State.ToString().ToLowerInvariant() ?? "missing";
+        }
+        catch (MajordomoProposalCorruptException)
+        {
+            return "corrupt";
+        }
+    }
+
+    /// <summary>
     /// Checks that a stored proposal still maps to a committable MUTATE tool.
     /// A tool that left the vocabulary is a retirement (a terminal refusal
     /// the operator resolves by rejecting); an argument payload that no
     /// longer matches its contract, a dry-run flag, or a vocabulary member
     /// with no backend arm is record corruption.
     /// </summary>
-    private static (MajordomoTool? Tool, MajordomoRefusal? Refusal) ResolveCommitTool(
-        MajordomoProposalRecord record)
+    private static bool TryResolveCommitTool(
+        MajordomoProposalRecord record,
+        [NotNullWhen(true)] out MajordomoTool? tool,
+        [NotNullWhen(false)] out MajordomoRefusal? refusal)
     {
-        if (!MajordomoTools.TryGet(record.ToolName, out var tool) || tool.Class != MajordomoToolClass.Mutate)
-            return (null, new MajordomoRefusal(
+        if (!MajordomoTools.TryGetMutate(record.ToolName, out var resolved))
+        {
+            tool = null;
+            refusal = new MajordomoRefusal(
                 MajordomoRefusalReasons.ProposalToolRetired,
                 $"tool '{Validation.DescribeUntrustedValue(record.ToolName)}' is no longer a known MUTATE tool — " +
-                "reject or supersede the proposal to close it out"));
+                "reject or supersede the proposal to close it out");
+            return false;
+        }
 
-        if (record.Arguments.GetType() != tool.ArgumentsType || record.Arguments.DryRun)
-            return (null, new MajordomoRefusal(
+        if (!resolved.AcceptsArguments(record.Arguments) || record.Arguments.DryRun)
+        {
+            tool = null;
+            refusal = new MajordomoRefusal(
                 MajordomoRefusalReasons.ProposalCorrupt,
-                $"stored arguments for '{tool.Name}' do not match {tool.ArgumentsType.Name} or carry a dry-run flag"));
+                $"stored arguments for '{resolved.Name}' do not match {resolved.ArgumentsType.Name} " +
+                "or carry a dry-run flag");
+            return false;
+        }
 
         // VerifyVocabularyWiring makes this unreachable for the real
         // vocabulary; a hand-seeded record could still reach it.
-        if (!MajordomoMutateBackend.CanMutate(tool))
-            return (null, new MajordomoRefusal(
+        if (!MajordomoMutateBackend.CanMutate(resolved))
+        {
+            tool = null;
+            refusal = new MajordomoRefusal(
                 MajordomoRefusalReasons.ProposalCorrupt,
-                $"tool '{tool.Name}' has no commit path"));
+                $"tool '{resolved.Name}' has no commit path");
+            return false;
+        }
 
-        return (tool, null);
+        tool = resolved;
+        refusal = null;
+        return true;
     }
 
     /// <summary>

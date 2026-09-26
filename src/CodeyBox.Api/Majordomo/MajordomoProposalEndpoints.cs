@@ -99,11 +99,16 @@ internal static class MajordomoProposalEndpoints
         MajordomoProposalState? filter = null;
         if (state is not null)
         {
-            if (!Enum.TryParse<MajordomoProposalState>(state, ignoreCase: true, out var parsed))
+            // TryParse alone would accept a numeric like "7" as an undefined
+            // member; IsDefined keeps unknown inputs on the same 400 path.
+            if (!Enum.TryParse<MajordomoProposalState>(state, ignoreCase: true, out var parsed)
+                || !Enum.IsDefined(parsed))
+            {
                 return Results.BadRequest(new
                 {
                     error = $"unknown proposal state '{Validation.DescribeUntrustedValue(state)}'",
                 });
+            }
             filter = parsed;
         }
 

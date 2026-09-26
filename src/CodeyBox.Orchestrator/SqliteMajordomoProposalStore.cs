@@ -321,7 +321,7 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
         var argsJson = reader.GetString(2);
         try
         {
-            if (!MajordomoTools.TryGet(toolName, out var tool) || tool.Class != MajordomoToolClass.Mutate)
+            if (!MajordomoTools.TryGetMutate(toolName, out var tool))
             {
                 throw new MajordomoProposalCorruptException(
                     id, $"tool '{Validation.DescribeUntrustedValue(toolName)}' is not a known MUTATE tool");
@@ -332,12 +332,13 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
             {
                 var bound = JsonSerializer.Deserialize(argsJson, tool.ArgumentsType, MajordomoJson.Options);
                 if (bound is not MajordomoMutateArgs typed)
-                    throw new MajordomoProposalCorruptException(id, $"arguments for '{toolName}' did not bind to {tool.ArgumentsType.Name}");
+                    throw new MajordomoProposalCorruptException(id, $"arguments for '{Validation.DescribeUntrustedValue(toolName)}' did not bind to {tool.ArgumentsType.Name}");
                 arguments = typed;
             }
             catch (Exception ex) when (ex is JsonException or ArgumentException or NotSupportedException)
             {
-                throw new MajordomoProposalCorruptException(id, $"arguments for '{toolName}' are unreadable: {ex.Message}");
+                throw new MajordomoProposalCorruptException(
+                    id, $"arguments for '{Validation.DescribeUntrustedValue(toolName)}' are unreadable: {Validation.DescribeUntrustedValue(ex.Message)}");
             }
 
             return new MajordomoProposalRecord
@@ -349,9 +350,13 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
                 ReviewedChangeSet = ReadPlan(id, reader, 4),
                 ProposedBy = reader.GetString(5),
                 ProposedAt = DateTimeOffset.Parse(reader.GetString(6), null),
+                // TryParse alone would accept a stored numeric like '7' as
+                // an undefined member — IsDefined keeps only named states.
                 State = Enum.TryParse<MajordomoProposalState>(reader.GetString(7), out var state)
+                        && Enum.IsDefined(state)
                     ? state
-                    : throw new MajordomoProposalCorruptException(id, $"unknown state '{reader.GetString(7)}'"),
+                    : throw new MajordomoProposalCorruptException(
+                        id, $"unknown state '{Validation.DescribeUntrustedValue(reader.GetString(7))}'"),
                 DecidedAt = reader.IsDBNull(8) ? null : DateTimeOffset.Parse(reader.GetString(8), null),
                 DecidedBy = reader.IsDBNull(9) ? null : reader.GetString(9),
                 DecisionReason = reader.IsDBNull(10) ? null : reader.GetString(10),
@@ -364,7 +369,11 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
         }
         catch (Exception ex) when (ex is FormatException or InvalidCastException or IndexOutOfRangeException)
         {
-            throw new MajordomoProposalCorruptException(id, $"row is unreadable: {ex.Message}");
+            // ex.Message can echo the raw stored value; the detail surfaces
+            // in HTTP responses and audit records, so it goes through the
+            // echo guard like the column reads above.
+            throw new MajordomoProposalCorruptException(
+                id, $"row is unreadable: {Validation.DescribeUntrustedValue(ex.Message)}");
         }
     }
 
@@ -378,7 +387,8 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
         }
         catch (Exception ex) when (ex is JsonException or ArgumentException or NotSupportedException)
         {
-            throw new MajordomoProposalCorruptException(id, $"reviewed plan is unreadable: {ex.Message}");
+            throw new MajordomoProposalCorruptException(
+                id, $"reviewed plan is unreadable: {Validation.DescribeUntrustedValue(ex.Message)}");
         }
     }
 
@@ -410,7 +420,8 @@ public sealed class SqliteMajordomoProposalStore : IMajordomoProposalStore, IDis
         }
         catch (Exception ex) when (ex is JsonException or FormatException or ArgumentException)
         {
-            throw new MajordomoProposalCorruptException(id, $"result ids are unreadable: {ex.Message}");
+            throw new MajordomoProposalCorruptException(
+                id, $"result ids are unreadable: {Validation.DescribeUntrustedValue(ex.Message)}");
         }
     }
 

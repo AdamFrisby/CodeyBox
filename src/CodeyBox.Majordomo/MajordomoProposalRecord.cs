@@ -83,19 +83,23 @@ public sealed record MajordomoProposalRecord
     /// Creates a pending proposal, validating the tool/argument pairing the
     /// same way <see cref="MajordomoAuthorization"/> does: the tool must be a
     /// known MUTATE tool and the arguments must be exactly its contract type.
+    /// <paramref name="reviewedChangeSet"/> is required — the drift check at
+    /// approval time is only as strong as the plan the operator reviewed, so
+    /// a proposal without one cannot be created.
     /// </summary>
     public static MajordomoProposalRecord Create(
         string toolName,
         MajordomoMutateArgs arguments,
         string proposedBy,
         DateTimeOffset proposedAt,
-        string? reasoning = null,
-        MajordomoChangeSet? reviewedChangeSet = null)
+        MajordomoChangeSet reviewedChangeSet,
+        string? reasoning = null)
     {
         ArgumentNullException.ThrowIfNull(arguments);
-        if (!MajordomoTools.TryGet(toolName, out var tool) || tool.Class != MajordomoToolClass.Mutate)
+        ArgumentNullException.ThrowIfNull(reviewedChangeSet);
+        if (!MajordomoTools.TryGetMutate(toolName, out var tool))
             throw new ArgumentException($"'{toolName}' is not a known MUTATE tool", nameof(toolName));
-        if (arguments.GetType() != tool.ArgumentsType)
+        if (!tool.AcceptsArguments(arguments))
             throw new ArgumentException(
                 $"tool '{tool.Name}' requires arguments of type {tool.ArgumentsType.Name}", nameof(arguments));
         if (string.IsNullOrWhiteSpace(proposedBy))

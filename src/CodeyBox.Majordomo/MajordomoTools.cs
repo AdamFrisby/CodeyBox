@@ -132,4 +132,20 @@ public static class MajordomoTools
         tool = null;
         return false;
     }
+
+    /// <summary>
+    /// Resolves <paramref name="name"/> to a known MUTATE descriptor — a
+    /// name that exists AND carries the mutation classification. Persisted
+    /// proposals can only ever commit through a mutate descriptor, so a name
+    /// resolving to a READ tool (or to nothing) is not committable; callers
+    /// layer their own failure mode (refusal reason, exception) on a false
+    /// return.
+    /// </summary>
+    public static bool TryGetMutate(string? name, [MaybeNullWhen(false)] out MajordomoTool tool)
+    {
+        if (TryGet(name, out tool) && tool.Class == MajordomoToolClass.Mutate)
+            return true;
+        tool = null;
+        return false;
+    }
 }

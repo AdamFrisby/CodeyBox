@@ -131,6 +131,10 @@ public sealed class MajordomoServerOptions
             return $"{SectionName}:MaxMutatedItemsPerTurn must be within [1, {MajordomoOptions.MaxAllowedMutatedItemsPerTurn}]";
         if (string.IsNullOrWhiteSpace(opts.ClientName) || opts.ClientName.Any(char.IsControl))
             return $"{SectionName}:ClientName must be a non-empty ApiClients entry name";
+        // The auth-disabled sentinel is reserved: pointing ClientName at it
+        // would confine the loopback operator itself to the MCP route.
+        if (string.Equals(opts.ClientName, ApiKeyAuth.AuthenticationDisabledClientName, StringComparison.Ordinal))
+            return $"{SectionName}:ClientName '{ApiKeyAuth.AuthenticationDisabledClientName}' is reserved";
         if (opts.TurnWindowSeconds is < 1 or > MaxTurnWindowSeconds)
             return $"{SectionName}:TurnWindowSeconds must be within [1, {MaxTurnWindowSeconds}]";
         if (opts.ProposalTimeToLiveSeconds < MinProposalTimeToLiveSeconds

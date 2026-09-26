@@ -136,12 +136,16 @@ public sealed class MajordomoProposalQueueTests
     }
 
     /// <summary>A pending proposal record for <paramref name="title"/>.</summary>
-    private static MajordomoProposalRecord Proposal(string title, DateTimeOffset? at = null) =>
-        MajordomoProposalRecord.Create(
+    private static MajordomoProposalRecord Proposal(string title, DateTimeOffset? at = null)
+    {
+        var spec = ItemSpec(title);
+        return MajordomoProposalRecord.Create(
             "create_work_item",
-            new CreateWorkItemArgs(ItemSpec(title)),
+            new CreateWorkItemArgs(spec),
             "majordomo",
-            at ?? DateTimeOffset.UtcNow);
+            at ?? DateTimeOffset.UtcNow,
+            ReviewedPlan(spec));
+    }
 
     private sealed class StubOptionsMonitor(MajordomoServerOptions value) : IOptionsMonitor<MajordomoServerOptions>
     {
@@ -676,6 +680,47 @@ public sealed class MajordomoProposalQueueTests
         Assert.Empty(await ListAllAsync(factory));
     }
 
+    [Fact]
+    public async Task Approval_WhenCommitRefuses_AndRevertLosesARace_ReportsWinningState()
+    {
+        using var factory = new WorkItemApiFactory();
+        var target = Seed(WorkItemState.Queued, "raced revert");
+        await factory.Store.CreateAsync(target);
+
+        var time = new ControllableTime(DateTimeOffset.UtcNow);
+        // The store interposes the two races this exercises: the mutation
+        // target goes terminal between the revalidation plan and the commit
+        // (duringClaim), and a decision in another process settles the
+        // claimed row before the failed commit can revert it to pending.
+        var store = new SettleOnRevertStore(
+            new InMemoryMajordomoProposalStore(),
+            duringClaim: () => factory.Store.UpdateAsync(target with { State = WorkItemState.Done }),
+            settle: row => row with
+            {
+                State = MajordomoProposalState.Rejected,
+                DecidedBy = "other-operator",
+                DecisionReason = "closed elsewhere",
+            });
+        var service = ManualService(factory, store, time);
+
+        var args = new CancelWorkItemArgs(target.Id, "tidying");
+        var reviewed = await PlanWithBackendAsync(factory, MajordomoTools.CancelWorkItem, args);
+        var record = await ProposeOrThrowAsync(
+            service, MajordomoTools.CancelWorkItem, args, reviewed, "majordomo");
+
+        var approval = await service.ApproveAsync(record.Id, "test-operator", TestInitiator);
+
+        // The commit refused having written nothing — but the reply names
+        // the state that actually won instead of claiming a return to
+        // pending that never happened.
+        Assert.NotNull(approval.Refusal);
+        Assert.Contains("'rejected'", approval.Refusal!.Detail);
+        var stored = await store.GetAsync(record.Id);
+        Assert.Equal(MajordomoProposalState.Rejected, stored!.State);
+        Assert.Equal("other-operator", stored.DecidedBy);
+        Assert.Equal(WorkItemState.Done, (await factory.Store.GetAsync(target.Id))!.State);
+    }
+
     // ── retired tool: refusal, never a commit path ───────────────────────────
 
     [Fact]
@@ -832,6 +877,21 @@ public sealed class MajordomoProposalQueueTests
         response = await http.GetAsync($"/majordomo/proposals/{proposal.Id}");
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
 
+        // The same credential is confined to the MCP surface: it cannot
+        // reach the direct REST mutations — or any other route — the
+        // proposal queue exists to gate behind review.
+        response = await http.GetAsync("/workitems/");
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        response = await http.PostAsJsonAsync("/workitems/", new { projectId = "test-project" });
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        response = await http.PostAsync("/queue/drain", content: null);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+
+        // … but it still reaches its MCP surface and runs tools.
+        await using var mcp = await ConnectAsync(http);
+        var queueCall = await mcp.CallToolAsync("get_queue_status", new Dictionary<string, object?>());
+        Assert.Equal("executed", OutcomeOf(queueCall));
+
         // An executor-bound token is refused too.
         http.DefaultRequestHeaders.Authorization = new("Bearer", executorKey);
         response = await http.PostAsync(
@@ -844,8 +904,13 @@ public sealed class MajordomoProposalQueueTests
         Assert.Equal(MajordomoProposalState.Pending, record!.State);
         Assert.Empty(await ListAllAsync(inner));
 
-        // The operator key decides.
+        // The operator key decides — and the state filter refuses an
+        // undefined numeric member the same way it refuses a bogus name.
         http.DefaultRequestHeaders.Authorization = new("Bearer", operatorKey);
+        response = await http.GetAsync("/majordomo/proposals/?state=7");
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        response = await http.GetAsync("/majordomo/proposals/?state=pending");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         response = await http.PostAsJsonAsync(
             $"/majordomo/proposals/{proposal.Id}/reject", new { reason = "not needed" });
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -981,6 +1046,64 @@ public sealed class MajordomoProposalQueueTests
     }
 
     [Fact]
+    public async Task SqliteStore_Read_RefusesUndefinedState_AndSanitizesCorruptDetail()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mjd-prop-{Guid.NewGuid():N}.db");
+        try
+        {
+            using var store = new SqliteMajordomoProposalStore(path);
+            var specA = ItemSpec("numeric state");
+            var numeric = MajordomoProposalRecord.Create(
+                "create_work_item",
+                new CreateWorkItemArgs(specA),
+                "majordomo",
+                DateTimeOffset.UtcNow,
+                ReviewedPlan(specA));
+            var specB = ItemSpec("escape state");
+            var escaped = MajordomoProposalRecord.Create(
+                "create_work_item",
+                new CreateWorkItemArgs(specB),
+                "majordomo",
+                DateTimeOffset.UtcNow,
+                ReviewedPlan(specB));
+            var policy = new MajordomoOptions();
+            await store.EnqueueAsync(numeric, policy, DateTimeOffset.UtcNow);
+            await store.EnqueueAsync(escaped, policy, DateTimeOffset.UtcNow);
+
+            // Tamper with the persisted rows out-of-band: a numeric state
+            // must not parse as an undefined enum member, and raw stored
+            // bytes must not carry control characters into the corrupt
+            // detail that surfaces in responses and audit records.
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={path}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE majordomo_proposals SET state = $state WHERE id = $id;";
+                cmd.Parameters.AddWithValue("$state", "7");
+                cmd.Parameters.AddWithValue("$id", numeric.Id);
+                Assert.Equal(1, cmd.ExecuteNonQuery());
+                cmd.Parameters["$state"].Value = "Pending\u001b[31m";
+                cmd.Parameters["$id"].Value = escaped.Id;
+                Assert.Equal(1, cmd.ExecuteNonQuery());
+            }
+
+            var ex = await Assert.ThrowsAsync<MajordomoProposalCorruptException>(
+                () => store.GetAsync(numeric.Id));
+            Assert.Contains("unknown state '7'", ex.Message);
+
+            ex = await Assert.ThrowsAsync<MajordomoProposalCorruptException>(
+                () => store.GetAsync(escaped.Id));
+            Assert.Contains("unknown state", ex.Message);
+            Assert.DoesNotContain('\u001b', ex.Message);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch (IOException) { }
+            TestScratchDirectory.DeleteSqliteCompanions(path);
+        }
+    }
+
+    [Fact]
     public async Task FullProposalQueue_RefusesProposals_UntilDecisionsDrainIt()
     {
         using var factory = new WorkItemApiFactory();
@@ -1052,6 +1175,62 @@ public sealed class MajordomoProposalQueueTests
         Assert.Equal(WorkItemState.Cancelled, (await factory.Store.GetAsync(dependent.Id))!.State);
         Assert.Equal(
             MajordomoProposalState.Approved, (await store.GetAsync(record.Id))!.State);
+    }
+
+    /// <summary>
+    /// Store decorator simulating cross-process interference with a claimed
+    /// commit: <paramref name="duringClaim"/> runs once the Pending→Applying
+    /// claim lands (e.g. moving the mutation target), and an Applying→Pending
+    /// revert loses to a concurrent decision that settles the row via
+    /// <paramref name="settle"/> first.
+    /// </summary>
+    private sealed class SettleOnRevertStore(
+        IMajordomoProposalStore inner,
+        Func<Task> duringClaim,
+        Func<MajordomoProposalRecord, MajordomoProposalRecord> settle)
+        : IMajordomoProposalStore
+    {
+        public Task EnqueueAsync(
+            MajordomoProposalRecord proposal,
+            MajordomoOptions policy,
+            DateTimeOffset now,
+            CancellationToken ct = default) =>
+            inner.EnqueueAsync(proposal, policy, now, ct);
+
+        public Task<MajordomoProposalRecord?> GetAsync(string id, CancellationToken ct = default) =>
+            inner.GetAsync(id, ct);
+
+        public Task<IReadOnlyList<MajordomoProposalRecord>> ListAsync(
+            MajordomoProposalState? state = null,
+            int limit = IMajordomoProposalStore.MaxListLimit,
+            CancellationToken ct = default) =>
+            inner.ListAsync(state, limit, ct);
+
+        public async Task<bool> TryTransitionAsync(
+            string id,
+            MajordomoProposalState expectedCurrent,
+            MajordomoProposalRecord decided,
+            CancellationToken ct = default)
+        {
+            if (expectedCurrent == MajordomoProposalState.Pending
+                && decided.State == MajordomoProposalState.Applying)
+            {
+                var claimed = await inner.TryTransitionAsync(id, expectedCurrent, decided, ct);
+                if (claimed)
+                    await duringClaim();
+                return claimed;
+            }
+
+            if (expectedCurrent == MajordomoProposalState.Applying
+                && decided.State == MajordomoProposalState.Pending)
+            {
+                // The competing decision wins the claimed row first.
+                await inner.TryTransitionAsync(id, expectedCurrent, settle(decided), ct);
+                return false;
+            }
+
+            return await inner.TryTransitionAsync(id, expectedCurrent, decided, ct);
+        }
     }
 
     private sealed class EnvironmentVariableScope : IDisposable

@@ -409,6 +409,8 @@ internal sealed class MajordomoMutateBackend
         if (priorityPlan is not null)
         {
             var outcome = await _commands.CommitPriorityAsync(priorityPlan.Plan!, ct).ConfigureAwait(false);
+            // A no-op priority commit (item already at the target priority)
+            // reports WritesApplied false — nothing landed to charge for.
             writesApplied |= outcome.WritesApplied;
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
@@ -418,7 +420,6 @@ internal sealed class MajordomoMutateBackend
                         Item: args.Id.ToString(),
                         Field: "patch.priority"),
                     writesApplied: writesApplied);
-            writesApplied = true;
         }
 
         if (extIdsPlan is not null)

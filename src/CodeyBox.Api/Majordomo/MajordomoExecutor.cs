@@ -369,7 +369,11 @@ internal sealed class MajordomoExecutor
     private WorkInitiator ResolveInitiator() =>
         MajordomoCallerContext.Initiator(_httpContext.HttpContext, MajordomoInitiator);
 
-    private static string BoundArguments(JsonNode? args)
+    /// <summary>
+    /// Bounds an argument payload for the audit record — internal so the
+    /// proposal queue audits the same canonical form under the same cap.
+    /// </summary>
+    internal static string BoundArguments(JsonNode? args)
     {
         var raw = args?.ToJsonString() ?? "{}";
         return raw.Length <= MaxAuditArgumentChars ? raw : raw[..MaxAuditArgumentChars] + "…";

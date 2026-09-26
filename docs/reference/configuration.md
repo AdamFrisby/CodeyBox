@@ -1248,7 +1248,7 @@ hot-reloadable; the executor reads the current options on every call.
 |-----|---------|-------------|
 | `Mode` | `proposed` | `autonomous` executes mutations immediately; `proposed` returns an operator-reviewable proposal with the validated change set instead of mutating. |
 | `MaxMutatedItemsPerTurn` | `8` | Per-call and cumulative per-turn cap on mutated work items (hard ceiling 100). |
-| `ClientName` | `majordomo` | The `CodeyBox:ApiClients` entry whose token is the majordomo credential. Only that client may reach the endpoint — the operator key and other named clients are refused — so majordomo calls are attributable and the credential is revocable independently. |
+| `ClientName` | `majordomo` | The `CodeyBox:ApiClients` entry whose token is the majordomo credential. Only that client may reach the endpoint — the operator key and other named clients are refused — and the majordomo credential is confined to `/mcp/majordomo`, refused on every other route so it can only exercise the reviewed tool vocabulary. Majordomo calls are attributable and the credential is revocable independently. |
 | `TurnWindowSeconds` | `120` | Rolling window over which mutations from one identity accumulate toward the per-turn cap. 1–3600. |
 | `ProposalTimeToLiveSeconds` | `86400` | How long a queued proposal stays approvable (24 hours). Approving past the deadline is refused and the proposal is marked expired. 60–2592000. |
 | `MaxPendingProposals` | `256` | Cap on proposals awaiting an operator decision (pending plus in-flight `applying` commits). Past the cap, new proposals are refused as `proposal_queue_full` until decisions drain the backlog. 1–4096. |

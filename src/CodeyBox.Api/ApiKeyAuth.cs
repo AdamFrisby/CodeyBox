@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
+using CodeyBox.Api.Majordomo;
 using CodeyBox.Core;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
 
@@ -140,6 +142,26 @@ internal static class ApiKeyAuth
             }
 
             ctx.Items[PrincipalItemKey] = principal;
+
+            // The majordomo credential is confined to its MCP surface: its
+            // token lives wherever the prompt-injectable MCP client runs, so
+            // it may only exercise the reviewed tool vocabulary — every other
+            // route, including the direct REST mutations Proposed mode exists
+            // to gate behind operator review, refuses it.
+            var majordomo = ctx.RequestServices
+                .GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>().CurrentValue;
+            if (!IsAuthenticationDisabled(principal)
+                && string.Equals(principal.Name, majordomo.ClientName, StringComparison.Ordinal)
+                && !ctx.Request.Path.StartsWithSegments(
+                    MajordomoMcpRegistration.RoutePattern, StringComparison.Ordinal))
+            {
+                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await ctx.Response.WriteAsync(
+                    $"the '{majordomo.ClientName}' API client may only call " +
+                    MajordomoMcpRegistration.RoutePattern);
+                return;
+            }
+
             await next();
         });
     }
