@@ -466,6 +466,30 @@ public sealed class DaytonaSandboxProviderTests
         await sandbox.DisposeAsync();
     }
 
+    [Fact]
+    public async Task Exec_WebsocketFallback_OversizedLogsSnapshot_IsExecutionUnavailable()
+    {
+        // The non-follow logs snapshot is guest-influenced output: a body
+        // larger than the snapshot ceiling must classify as infrastructure
+        // (ExecutionUnavailable), never buffer unbounded into the host.
+        var server = new FakeDaytonaServer
+        {
+            CommandLogsBody = "{\"output\":\"" + new string('x', 2 * 1024 * 1024) + "\"}",
+        };
+        var provider = NewProvider(server, new QueueDaytonaWebSocketFactory(
+            new ConnectFailingDaytonaWebSocket()));
+        var sandbox = await provider.CreateAsync(WorkSpec(), CancellationToken.None);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["true"],
+            MaxStdoutBytes = 64,
+            MaxStderrBytes = 64,
+        }, CancellationToken.None);
+        Assert.True(result.ExecutionUnavailable);
+        await sandbox.DisposeAsync();
+    }
+
     // ------------------------------------------------------------------
     // Capacity / live load
     // ------------------------------------------------------------------
@@ -485,11 +509,22 @@ public sealed class DaytonaSandboxProviderTests
             CancellationToken.None);
 
         // Both member gates are at cap: a third acquisition must wait, and the
-        // wait is visible to placement as live load.
+        // wait is visible to placement as live load. Poll for a violation
+        // (a third create request, or a completed third acquire) with a
+        // timeout instead of a fixed sleep, so the test cannot pass vacuously
+        // when the machine is slow: a correct implementation never issues the
+        // third create while both members are at cap.
         var third = Task.Run(() => acquirer.AcquireAsync(
             new SandboxPlacementAcquisition(WorkItemId.New(), "work", [], null, null, WorkSpec()),
             CancellationToken.None));
-        await Task.Delay(150);
+        var settleUntil = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        int ExactCreates() => server.Requests.Count(r => r.Method == "POST" && r.Path == "/api/sandbox");
+        while (!third.IsCompleted
+            && ExactCreates() == 2
+            && DateTime.UtcNow < settleUntil)
+        {
+            await Task.Delay(5);
+        }
         Assert.False(third.IsCompleted, "a third acquire must wait when both members are at capacity");
         Assert.Equal(2, acquirer.InFlight);
         Assert.Equal(2, server.Requests.Count(r => r.Method == "POST" && r.Path == "/api/sandbox"));

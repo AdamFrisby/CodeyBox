@@ -38,6 +38,9 @@ internal sealed class DaytonaApiClient
     // into exception messages and logs.
     private const int MaxErrorBodyChars = 2048;
 
+    // Control-plane list page size for managed-sandbox inventory scans.
+    private const int ListPageSize = 200;
+
     private readonly HttpClient _http;
 
     public DaytonaApiClient(HttpClient http)
@@ -80,7 +83,7 @@ internal sealed class DaytonaApiClient
         string? cursor = null;
         for (var page = 0; page < maxPages; page++)
         {
-            var query = $"name={Uri.EscapeDataString(namePrefix)}&labels={labelsFilter}&limit=200";
+            var query = $"name={Uri.EscapeDataString(namePrefix)}&labels={labelsFilter}&limit={ListPageSize.ToString(CultureInfo.InvariantCulture)}";
             if (!string.IsNullOrEmpty(cursor))
                 query += $"&cursor={Uri.EscapeDataString(cursor)}";
 
@@ -191,7 +194,7 @@ internal sealed class DaytonaApiClient
         var result = new List<DaytonaSnapshotDto>();
         for (var page = 1; page <= maxPages; page++)
         {
-            var query = $"name={Uri.EscapeDataString(namePrefix)}&limit=200&page={page.ToString(CultureInfo.InvariantCulture)}";
+            var query = $"name={Uri.EscapeDataString(namePrefix)}&limit={ListPageSize.ToString(CultureInfo.InvariantCulture)}&page={page.ToString(CultureInfo.InvariantCulture)}";
             using var response = await SendAsync(
                 endpoint, HttpMethod.Get, $"snapshots?{query}", null, ct).ConfigureAwait(false);
             var pageResult = await ReadJsonAsync<DaytonaListSnapshotsResponse>(response, "list snapshots", ct)
@@ -264,10 +267,6 @@ internal sealed class DaytonaApiClient
         var dto = await ReadJsonAsync<DaytonaSandboxDto>(response, operation, ct).ConfigureAwait(false);
         return dto ?? throw new DaytonaApiException(DaytonaFailureKind.Unexpected, operation, "empty response body");
     }
-
-    private Task<DaytonaSandboxDto> PostStateChangeAsync(
-        DaytonaEndpoint endpoint, string idOrName, string action, CancellationToken ct) =>
-        PostPathCoreAsync(endpoint, $"sandbox/{Uri.EscapeDataString(idOrName)}/{action}", $"{action} sandbox", ct);
 
     private Task<HttpResponseMessage> SendJsonAsync(
         DaytonaEndpoint endpoint, HttpMethod method, string path, object body, CancellationToken ct)

@@ -18,6 +18,7 @@ internal sealed class DaytonaToolboxClient
 {
     private static readonly JsonSerializerOptions Json = DaytonaApiClient.Json;
     private const int MaxErrorBodyChars = 2048;
+    private const int DownloadChunkBytes = 64 * 1024;
 
     private readonly HttpClient _http;
     private readonly DaytonaEndpoint _endpoint;
@@ -113,8 +114,14 @@ internal sealed class DaytonaToolboxClient
     /// the command's output. Newer daemons return JSON ({stdout, stderr,
     /// output}); older ones return plain combined text — callers handle both.
     /// </summary>
+    /// <param name="maxBytes">
+    /// Upper bound on the raw response body. Guest output is untrusted and
+    /// unbounded, so the body is streamed through a byte ceiling (mirroring
+    /// <see cref="DownloadFileAsync"/>) before UTF-8 decoding — it is never
+    /// buffered with an unbounded <c>ReadAsStringAsync</c>.
+    /// </param>
     public async Task<DaytonaCommandLogs> GetSessionCommandLogsAsync(
-        string sessionId, string commandId, CancellationToken ct)
+        string sessionId, string commandId, long maxBytes, CancellationToken ct)
     {
         using var response = await SendAsync(
             HttpMethod.Get,
@@ -123,8 +130,31 @@ internal sealed class DaytonaToolboxClient
         if (!response.IsSuccessStatusCode)
             await DaytonaApiClient.EnsureSuccessAsync(response, "get session command logs", ct).ConfigureAwait(false);
 
+        if (response.Content.Headers.ContentLength is { } known && known > maxBytes)
+        {
+            throw new DaytonaApiException(
+                DaytonaFailureKind.Unexpected, "get session command logs",
+                $"logs content length {known} exceeds the {maxBytes}-byte bound");
+        }
+        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[DownloadChunkBytes];
+        long total = 0;
+        int read;
+        while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
+        {
+            total += read;
+            if (total > maxBytes)
+            {
+                throw new DaytonaApiException(
+                    DaytonaFailureKind.Unexpected, "get session command logs",
+                    $"logs content exceeded the {maxBytes}-byte bound");
+            }
+            buffer.Write(chunk, 0, read);
+        }
+
         var mediaType = response.Content.Headers.ContentType?.MediaType;
-        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        var body = Encoding.UTF8.GetString(buffer.ToArray());
         if (mediaType is not null && mediaType.Contains("json", StringComparison.OrdinalIgnoreCase))
         {
             try
@@ -173,7 +203,7 @@ internal sealed class DaytonaToolboxClient
         }
         await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var buffer = new MemoryStream();
-        var chunk = new byte[64 * 1024];
+        var chunk = new byte[DownloadChunkBytes];
         long total = 0;
         int read;
         while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)

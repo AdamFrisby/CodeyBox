@@ -67,6 +67,18 @@ internal sealed class DaytonaSandbox :
     // message, covering the 3-byte channel prefix and framing overhead.
     private const long MessageSizeSlackBytes = 1024 * 1024;
 
+    // Size of the rented WS receive buffer; messages larger than the
+    // per-message ceiling are accumulated across frames in ReceiveMessageAsync.
+    private const int WsReceiveBufferBytes = 64 * 1024;
+
+    // Stderr preview cap for the file-sync helper execs (base64/tar): enough
+    // to diagnose a failed helper without letting a noisy daemon blow the cap.
+    private const int SyncHelperStderrCapBytes = 64 * 1024;
+
+    // Exit code reported when the spec's wall-clock limit fires; matches the
+    // conventional timeout(1) 124 so orchestrator tooling reads it as timeout.
+    private const int WallClockTimeoutExitCode = 124;
+
     private readonly string _name;
     private readonly SandboxSpec _spec;
     private readonly Func<DaytonaSandboxOptions> _readOptions;
@@ -262,7 +274,7 @@ internal sealed class DaytonaSandbox :
             // not a cancellation and not an infra outage.
             await TryDeleteSessionAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
             return new SandboxExecResult(
-                124,
+                WallClockTimeoutExitCode,
                 string.Empty,
                 $"daytona exec exceeded the sandbox wall-clock limit ({_spec.Limits.WallClock})",
                 ExecutionUnavailable: false);
@@ -301,8 +313,14 @@ internal sealed class DaytonaSandbox :
         }
         catch (DaytonaApiException)
         {
+            // The snapshot body carries both streams in one payload, so its
+            // pre-decode ceiling is the sum of the per-stream caps (the
+            // collectors still enforce each stream's share on append).
+            long snapshotCapBytes = (long)(exec.MaxStdoutBytes ?? opts.MaxExecOutputBytes)
+                + (exec.MaxStderrBytes ?? opts.MaxExecOutputBytes)
+                + MessageSizeSlackBytes;
             return await PollExecToCompletionAsync(
-                toolbox, sessionId, commandId, stdout, stderr, opts, ct).ConfigureAwait(false);
+                toolbox, sessionId, commandId, stdout, stderr, opts, snapshotCapBytes, ct).ConfigureAwait(false);
         }
 
         long maxMessageBytes = Math.Max(exec.MaxStdoutBytes ?? 0, exec.MaxStderrBytes ?? 0);
@@ -315,7 +333,7 @@ internal sealed class DaytonaSandbox :
             chunk => { stderr.Append(chunk); return Task.CompletedTask; });
 
 
-        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        var buffer = ArrayPool<byte>.Shared.Rent(WsReceiveBufferBytes);
         var killRequested = false;
         try
         {
@@ -387,6 +405,7 @@ internal sealed class DaytonaSandbox :
         DaytonaOutputCollector stdout,
         DaytonaOutputCollector stderr,
         DaytonaSandboxOptions opts,
+        long snapshotCapBytes,
         CancellationToken ct)
     {
         var exitCode = await PollExitCodeAsync(
@@ -395,7 +414,7 @@ internal sealed class DaytonaSandbox :
         if (exitCode is null)
             return (null, StreamFailed: true);
 
-        var logs = await toolbox.GetSessionCommandLogsAsync(sessionId, commandId, ct).ConfigureAwait(false);
+        var logs = await toolbox.GetSessionCommandLogsAsync(sessionId, commandId, snapshotCapBytes, ct).ConfigureAwait(false);
         if (logs.Stdout is { } stdoutText)
             stdout.Append(stdoutText);
         if (logs.Stderr is { } stderrText)
@@ -621,12 +640,12 @@ internal sealed class DaytonaSandbox :
             {
                 throw new DaytonaApiException(
                     DaytonaFailureKind.Unreachable, "setup exec",
-                    $"exec transport unavailable during setup in {Id}: {Tail(result.Stderr)}");
+                    $"exec transport unavailable during setup in {Id}: {DaytonaTextUtil.Tail(result.Stderr)}");
             }
             if (!result.Success)
             {
                 throw new InvalidOperationException(
-                    $"Daytona setup command failed in {Id} with exit {result.ExitCode}: {Tail(result.Stderr)}");
+                    $"Daytona setup command failed in {Id} with exit {result.ExitCode}: {DaytonaTextUtil.Tail(result.Stderr)}");
             }
         }
     }
@@ -672,7 +691,7 @@ internal sealed class DaytonaSandbox :
             Stdin = archive,
         }, includeSpecEnvironment: false, ct).ConfigureAwait(false);
         if (!result.Success)
-            throw new InvalidOperationException($"Failed to stage host directory {hostPath} into daytona sandbox {Id}:{sandboxPath}: {Tail(result.Stderr)}");
+            throw new InvalidOperationException($"Failed to stage host directory {hostPath} into daytona sandbox {Id}:{sandboxPath}: {DaytonaTextUtil.Tail(result.Stderr)}");
     }
 
     private async Task UploadFileAsync(string hostPath, string sandboxPath, CancellationToken ct)
@@ -690,7 +709,7 @@ internal sealed class DaytonaSandbox :
             Stdin = payload,
         }, includeSpecEnvironment: false, ct).ConfigureAwait(false);
         if (!result.Success)
-            throw new InvalidOperationException($"Failed to stage host file {hostPath} into daytona sandbox {Id}:{sandboxPath}: {Tail(result.Stderr)}");
+            throw new InvalidOperationException($"Failed to stage host file {hostPath} into daytona sandbox {Id}:{sandboxPath}: {DaytonaTextUtil.Tail(result.Stderr)}");
     }
 
     // ------------------------------------------------------------------
@@ -746,11 +765,11 @@ internal sealed class DaytonaSandbox :
             ],
             WorkingDirectory = "/",
             MaxStdoutBytes = opts.MaxSyncArchiveBase64Bytes,
-            MaxStderrBytes = 64 * 1024,
+            MaxStderrBytes = SyncHelperStderrCapBytes,
             KillOnOutputLimit = true,
         }, includeSpecEnvironment: false, ct).ConfigureAwait(false);
         if (!result.Success)
-            throw new InvalidOperationException($"Failed to archive daytona directory {Id}:{sandboxPath}: {Tail(result.Stderr)}");
+            throw new InvalidOperationException($"Failed to archive daytona directory {Id}:{sandboxPath}: {DaytonaTextUtil.Tail(result.Stderr)}");
 
         ReplaceHostDirectoryFromArchive(hostPath, result.Stdout.Trim(), opts);
     }
@@ -763,11 +782,11 @@ internal sealed class DaytonaSandbox :
             Argv = ["base64", "-w0", sandboxPath],
             WorkingDirectory = "/",
             MaxStdoutBytes = opts.MaxFileSyncBase64Bytes,
-            MaxStderrBytes = 64 * 1024,
+            MaxStderrBytes = SyncHelperStderrCapBytes,
             KillOnOutputLimit = true,
         }, includeSpecEnvironment: false, ct).ConfigureAwait(false);
         if (!result.Success)
-            throw new InvalidOperationException($"Failed to read daytona file {Id}:{sandboxPath}: {Tail(result.Stderr)}");
+            throw new InvalidOperationException($"Failed to read daytona file {Id}:{sandboxPath}: {DaytonaTextUtil.Tail(result.Stderr)}");
 
         var payload = result.Stdout.Trim();
         if (payload.Length > opts.MaxFileSyncBase64Bytes)
@@ -1059,12 +1078,6 @@ internal sealed class DaytonaSandbox :
             Volatile.Write(ref _disposed, 1);
             Volatile.Write(ref _disposing, 0);
         }
-    }
-
-    private static string Tail(string text)
-    {
-        const int max = 500;
-        return text.Length <= max ? text : text[^max..];
     }
 }
 

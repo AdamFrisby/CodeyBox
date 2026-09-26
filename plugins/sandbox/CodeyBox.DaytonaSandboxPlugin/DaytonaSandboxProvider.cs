@@ -38,6 +38,10 @@ public sealed class DaytonaSandboxProvider :
 
     private static readonly TimeSpan MinimumOperatorFixRecheck = TimeSpan.FromMinutes(5);
 
+    // Ceiling on the exit-marker file (a small ASCII exit code); the marker
+    // path is provider-constructed but its bytes are guest-influenced output.
+    private const long ExitMarkerMaxBytes = 256;
+
     private readonly Func<DaytonaSandboxOptions> _readOptions;
     private readonly Func<string, string?> _environment;
     private readonly IDaytonaWebSocketFactory _webSocketFactory;
@@ -153,7 +157,6 @@ public sealed class DaytonaSandboxProvider :
         var name = GenerateSandboxName(opts.NamePrefix);
         var mounts = ValidateAndPlanMounts(spec);
         var workItemId = spec.TimingWorkItemId.GetValueOrDefault();
-        var timingItem = spec.TimingWorkItemId.GetValueOrDefault();
         var timingPhase = spec.TimingPhase ?? "work";
         var created = false;
 
@@ -161,7 +164,7 @@ public sealed class DaytonaSandboxProvider :
         {
             var request = BuildCreateRequest(spec, opts, name, workItemId);
             await using var provisionTiming = await TimingScope.BeginAsync(
-                _timings, timingItem, timingPhase, "daytona.create", log: _log).ConfigureAwait(false);
+                _timings, workItemId, timingPhase, "daytona.create", log: _log).ConfigureAwait(false);
             var createdDto = await Api.CreateSandboxAsync(endpoint, request, ct).ConfigureAwait(false);
             created = true;
             var sandboxId = createdDto.Id ?? name;
@@ -424,7 +427,7 @@ public sealed class DaytonaSandboxProvider :
             var exitInfo = await toolbox.GetFileInfoAsync(exitMarker, ct).ConfigureAwait(false);
             if (exitInfo is not null)
             {
-                var markerBytes = await toolbox.DownloadFileAsync(exitMarker, 256, ct).ConfigureAwait(false);
+                var markerBytes = await toolbox.DownloadFileAsync(exitMarker, ExitMarkerMaxBytes, ct).ConfigureAwait(false);
                 if (markerBytes is not null &&
                     int.TryParse(Encoding.UTF8.GetString(markerBytes).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var exitCode))
                 {
@@ -436,7 +439,7 @@ public sealed class DaytonaSandboxProvider :
         }
     }
 
-    private static async Task<long> TryTailLogAsync(
+    private async Task<long> TryTailLogAsync(
         DaytonaToolboxClient toolbox, string agentLogPath, Action<string> logSink, long offset,
         DaytonaSandboxOptions opts, CancellationToken ct)
     {
@@ -448,8 +451,9 @@ public sealed class DaytonaSandboxProvider :
             logSink(Encoding.UTF8.GetString(bytes, (int)offset, (int)(bytes.LongLength - offset)));
             return bytes.LongLength;
         }
-        catch (DaytonaApiException)
+        catch (DaytonaApiException ex)
         {
+            _log.LogDebug(ex, "Skipped daytona agent-log tail read at offset {Offset}", offset);
             return offset; // log may not exist yet — the exit marker drives completion
         }
     }
@@ -497,7 +501,7 @@ public sealed class DaytonaSandboxProvider :
             {
                 _log.LogWarning(
                     "PushSuspendedVmCheckpointRefAsync({VmName}, {RefName}): in-sandbox git push failed (exit {ExitCode}): {Stderr}",
-                    vmName, refName, result.ExitCode, Tail(result.Stderr));
+                    vmName, refName, result.ExitCode, DaytonaTextUtil.Tail(result.Stderr));
                 return false;
             }
             _log.LogInformation("Pushed adopted daytona sandbox {Name} HEAD to checkpoint {RefName}", vmName, refName);
@@ -955,6 +959,8 @@ public sealed class DaytonaSandboxProvider :
             opts.MaxSyncArchiveExpandedBytes <= 0 || opts.MaxSyncArchiveEntries <= 0 ||
             opts.MaxFileSyncBase64Bytes <= 0 || opts.MaxFileSyncBytes <= 0 || opts.MaxExecInputBytes <= 0)
             throw new InvalidOperationException("Daytona sync/exec size limits must all be greater than zero.");
+        if (opts.AllowUnsafeHttp)
+            _log.LogWarning("The daytona sandbox provider allows cleartext http: the API key rides every request, so enable AllowUnsafeHttp only for local tests.");
         return opts;
     }
 
@@ -1117,12 +1123,6 @@ public sealed class DaytonaSandboxProvider :
 
     private static int? ToWholeGiB(long? bytes) =>
         bytes is { } b && b > 0 ? (int)Math.Ceiling(b / (double)(1024L * 1024 * 1024)) : null;
-
-    private static string Tail(string text)
-    {
-        const int max = 500;
-        return text.Length <= max ? text : text[^max..];
-    }
 
     public void Dispose() => _clients.Dispose();
 
