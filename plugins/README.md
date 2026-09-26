@@ -35,6 +35,7 @@ sit alongside them rather than buried among them.
 | `auditors-infrastructure` | Auditors checking infrastructure-as-code and deployment descriptors |
 | `auditors-licensing` | Auditors checking license headers and dependency licenses |
 | `auditors-linting` | Auditors enforcing code style and formatting |
+| `auditors-sast` | Auditors running SAST tools (structural AST/pattern scanning, e.g. `CodeyBox.AstGrepAuditorPlugin`) |
 | `auditors-schema` | Auditors validating schemas, migrations, and contracts |
 | `auditors-scripting` | Auditors checking shell and scripting hygiene |
 | `auditors-secrets` | Auditors scanning for leaked secrets and credentials |

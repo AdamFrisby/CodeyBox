@@ -335,6 +335,8 @@ audit. A worked example lives at
 `plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/`.
 The knip unused-JS/TS auditor is at
 `plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/`.
+The ast-grep structural-pattern SAST auditor is at
+`plugins/auditors-sast/CodeyBox.AstGrepAuditorPlugin/`.
 
 ## Sample plugin
 

@@ -21,6 +21,7 @@ public sealed class PluginLayoutConventionTests
         "auditors-infrastructure",
         "auditors-licensing",
         "auditors-linting",
+        "auditors-sast",
         "auditors-schema",
         "auditors-scripting",
         "auditors-secrets",
