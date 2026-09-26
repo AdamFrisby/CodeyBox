@@ -34,10 +34,17 @@ public sealed class SandboxLeakReaper : BackgroundService
     private readonly IManagedSandboxLifecycle _provider;
     private readonly IWebhookDispatcher _webhooks;
     private readonly Func<SandboxLeakOptions> _optsAccessor;
+    private readonly Func<double>? _phaseAbsoluteTimeoutMultiplierAccessor;
     private readonly ILogger<SandboxLeakReaper> _log;
     private readonly IWorkItemStore? _store;
     private readonly Func<DateTimeOffset> _clock;
     private readonly LeakDetectionSink? _leakSink;
+
+    // Latch for the threshold/multiplier shortfall warning: warns once per
+    // distinct misconfigured (threshold, multiplier) pair and re-arms when the
+    // pair changes, so a hot config edit that creates the hazard is caught on
+    // the next sweep without spamming every interval.
+    private (TimeSpan Threshold, double Multiplier)? _thresholdShortfallWarnedFor;
 
     // First time THIS reaper observed each sandbox in a suspend-lifecycle state with no
     // live mapping. The suspend-orphan grace is measured from this timestamp, NOT
@@ -83,11 +90,13 @@ public sealed class SandboxLeakReaper : BackgroundService
         ILogger<SandboxLeakReaper> log,
         IWorkItemStore? store,
         Func<DateTimeOffset>? clock = null,
-        LeakDetectionSink? leakSink = null)
+        LeakDetectionSink? leakSink = null,
+        Func<double>? phaseAbsoluteTimeoutMultiplierAccessor = null)
     {
         _provider = provider;
         _webhooks = webhooks;
         _optsAccessor = optionsAccessor;
+        _phaseAbsoluteTimeoutMultiplierAccessor = phaseAbsoluteTimeoutMultiplierAccessor;
         _log = log;
         _store = store;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
@@ -152,8 +161,50 @@ public sealed class SandboxLeakReaper : BackgroundService
         while (await timer.WaitForNextTickAsync(stoppingToken));
     }
 
+    /// <summary>
+    /// Enforces the threshold/multiplier coupling the shipped default derives
+    /// from: an operator who raises CodeyBox:PhaseAbsoluteTimeoutMultiplier or
+    /// lowers CodeyBox:SandboxLeak:LeakAgeThreshold can silently recreate the
+    /// incident — a mid-phase sandbox out-aging the threshold while its worker
+    /// still runs. Warns once per distinct misconfigured pair (the latch
+    /// re-arms when either value changes) so a hot config edit that creates
+    /// the hazard is caught on the next sweep without log spam. A warning,
+    /// not a hard failure: a below-bound threshold is a degraded invariant,
+    /// and the live phase/worker veto in the disposal path is the hard stop.
+    /// </summary>
+    private void WarnIfLeakThresholdBelowPhaseCeiling()
+    {
+        var multiplier = _phaseAbsoluteTimeoutMultiplierAccessor?.Invoke();
+        if (multiplier is not { } multiplierValue
+            || double.IsNaN(multiplierValue)
+            || double.IsInfinity(multiplierValue)
+            || multiplierValue < 1.0)
+        {
+            return;
+        }
+
+        var threshold = _opts.LeakAgeThreshold;
+        var minimum = SandboxLeakOptions.MinimumLeakAgeThreshold(multiplierValue);
+        if (threshold >= minimum)
+        {
+            _thresholdShortfallWarnedFor = null;
+            return;
+        }
+
+        var key = (threshold, multiplierValue);
+        if (_thresholdShortfallWarnedFor == key)
+            return;
+        _thresholdShortfallWarnedFor = key;
+        _log.LogWarning(
+            "SandboxLeakReaper: LeakAgeThreshold {Configured} is below the minimum {Minimum} required for the configured CodeyBox:PhaseAbsoluteTimeoutMultiplier={Multiplier} — a mid-phase sandbox can out-age the threshold while its worker is still legitimately running; raise CodeyBox:SandboxLeak:LeakAgeThreshold accordingly",
+            threshold,
+            minimum,
+            multiplierValue);
+    }
+
     internal async Task RunSweepAsync(CancellationToken ct)
     {
+        WarnIfLeakThresholdBelowPhaseCeiling();
         try
         {
             var allManaged = await _provider.ListAllManagedAsync(ct);
@@ -490,22 +541,28 @@ public sealed class SandboxLeakOptions
     private static readonly TimeSpan LeakAgeThresholdProvisioningMargin = TimeSpan.FromMinutes(30);
 
     /// <summary>
-    /// Shipped default for <see cref="LeakAgeThreshold"/>: the longest
-    /// legitimate phase duration plus provisioning headroom. A phase's
-    /// absolute cap is its per-attempt work budget — clamped by
-    /// <see cref="WorkTimeoutPolicy.MaxMinutes"/> — multiplied by
+    /// Smallest safe <see cref="LeakAgeThreshold"/> for a given configured
+    /// <c>CodeyBox:PhaseAbsoluteTimeoutMultiplier</c>: the longest legitimate
+    /// phase duration — a per-attempt work budget clamped by
+    /// <see cref="WorkTimeoutPolicy.MaxMinutes"/> times the multiplier — plus
+    /// provisioning headroom. The threshold must stay above that bound: below
+    /// it a mid-phase sandbox can be declared abandoned while its worker is
+    /// still legitimately running — exactly the failure mode that destroyed
+    /// live work when the registry-of-active-sandboxes drifted. The three
+    /// values are coupled: raising the work-timeout ceiling or the phase
+    /// multiplier requires re-checking the threshold.
+    /// </summary>
+    public static TimeSpan MinimumLeakAgeThreshold(double phaseAbsoluteTimeoutMultiplier) =>
+        TimeSpan.FromMinutes(WorkTimeoutPolicy.MaxMinutes * phaseAbsoluteTimeoutMultiplier)
+        + LeakAgeThresholdProvisioningMargin;
+
+    /// <summary>
+    /// Shipped default for <see cref="LeakAgeThreshold"/>:
+    /// <see cref="MinimumLeakAgeThreshold"/> at the shipped
     /// <see cref="PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier"/>.
-    /// The threshold must stay above that bound: below it a mid-phase
-    /// sandbox can be declared abandoned while its worker is still
-    /// legitimately running — exactly the failure mode that destroyed live
-    /// work when the registry-of-active-sandboxes drifted. The three values
-    /// are coupled: raising the work-timeout ceiling or the phase multiplier
-    /// requires re-checking this default.
     /// </summary>
     public static readonly TimeSpan DefaultLeakAgeThreshold =
-        TimeSpan.FromMinutes(
-            WorkTimeoutPolicy.MaxMinutes * PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier)
-        + LeakAgeThresholdProvisioningMargin;
+        MinimumLeakAgeThreshold(PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier);
 
     /// <summary>
     /// Enable or disable the leak reaper. Default true.
@@ -525,8 +582,10 @@ public sealed class SandboxLeakOptions
     /// Minimum age before a non-active sandbox is declared leaked.
     /// Default <see cref="DefaultLeakAgeThreshold"/> — sized above the maximum
     /// legitimate phase duration (see that member's documentation); operators
-    /// lowering it must keep it above the phase durations their deployment
-    /// allows or mid-phase sandboxes risk being declared abandoned.
+    /// lowering it must keep it at or above
+    /// <see cref="MinimumLeakAgeThreshold"/> for their configured
+    /// <c>CodeyBox:PhaseAbsoluteTimeoutMultiplier</c> or mid-phase sandboxes
+    /// risk being declared abandoned.
     /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public TimeSpan LeakAgeThreshold { get; set; } = DefaultLeakAgeThreshold;

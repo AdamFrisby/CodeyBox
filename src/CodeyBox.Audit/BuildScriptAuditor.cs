@@ -59,7 +59,12 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
 
         if (presence.ExitCode != 0)
         {
-            if (presence.ExitCode != 1 || IsCouldNotExecute(presence) || presence.ExecutionUnavailable)
+            // Transport loss is infrastructure, not audit unavailability:
+            // propagate so the pipeline parks the item for retry instead of
+            // terminal-failing it and handing the clone to the reaper.
+            if (presence.ExecutionUnavailable)
+                throw new SandboxExecutionUnavailableException(presence.ExitCode);
+            if (presence.ExitCode != 1 || IsCouldNotExecute(presence))
                 throw UnavailableFromResult("could-not-verify: build.sh presence check could not run", presence);
 
             if (context.BuildScriptRequired)
@@ -93,7 +98,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         {
             throw;
         }
-        catch (Exception ex) when (!SandboxDeferralGuard.IsDeferral(ex))
+        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
             throw new AuditUnavailableException(
                 $"could-not-verify: build.sh could not execute: {SingleLineSummary(ex.Message)}",
@@ -102,7 +107,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
 
         var output = CombinedOutput(result);
         if (result.ExecutionUnavailable)
-            throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
         if (IsCouldNotExecute(result))
             throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
         if (result.ExitCode == 0)
@@ -156,7 +161,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         {
             throw;
         }
-        catch (Exception ex) when (!SandboxDeferralGuard.IsDeferral(ex))
+        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
             throw new AuditUnavailableException(
                 $"could-not-verify: {operation} failed: {SingleLineSummary(ex.Message)}",

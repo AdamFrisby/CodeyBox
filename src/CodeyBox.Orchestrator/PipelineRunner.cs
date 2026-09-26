@@ -1437,6 +1437,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item.Id, ex.Agent.Value, SanitizedAgentDetail.FromRaw(ex.Reason).Value);
             await TransitionNoActionRequiredAsync(item, project, ex, CancellationToken.None);
         }
+        catch (Exception ex) when (IsExecutionTransportLoss(ex))
+        {
+            // Transport-loss shapes that escaped a phase's own conversion —
+            // a raw SandboxExecutionUnavailableException from an audit/verification
+            // exec path, a flagged credential-file write, etc. The sandbox itself
+            // is gone, not the work: park for bounded transient retry under an
+            // infrastructure classification instead of writing a terminal
+            // failure and handing the clone to the repo reaper. The
+            // AgentInfrastructureFailureException catch above owns the wrapped
+            // variant; this clause is the backstop for unwrapped shapes.
+            _log.LogWarning(
+                "Work item {Id} parking for retry because its sandbox execution transport was lost: {Reason}",
+                item.Id, ex.Message);
+            await TransitionWaitingForTransientRetryAsync(
+                item,
+                ex.Message,
+                project,
+                phase: null,
+                item.Agent,
+                failureKind: WorkItemFailureKinds.Infrastructure);
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);

@@ -1328,9 +1328,7 @@ public sealed partial class PipelineRunner
                 runner.Kind,
                 agentPhase,
                 "Retained-sandbox checkpoint conversion could not be completed safely; the exact recovery lease remains preserved.",
-                ex,
-                executionUnavailable: ex is SandboxExecutionUnavailableException
-                    or AgentResumePreparationUnavailableException);
+                ex);
         }
         finally
         {

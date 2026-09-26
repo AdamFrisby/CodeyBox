@@ -143,6 +143,28 @@ public sealed partial class PipelineRunner
         }
         catch (AgentInfrastructureFailureException infraEx)
         {
+            // A severed execution transport means the sandbox itself is gone
+            // (leak reaper, host crash, dead exec channel): the work is not
+            // at fault and a fresh sandbox reproduces a working environment,
+            // so park for bounded transient retry under an infrastructure
+            // classification — same as RunAsync's catch. Failing terminal
+            // would hand the clone to the repo reaper immediately, destroying
+            // the agent's working tree.
+            if (infraEx.ExecutionUnavailable)
+            {
+                _log.LogWarning(
+                    "Work item {Id} check-and-act parking for retry because agent {Agent} lost its sandbox execution transport in phase {Phase}: {Reason}",
+                    item.Id, infraEx.Agent.Value, infraEx.Phase, infraEx.Message);
+                await TransitionWaitingForTransientRetryAsync(
+                    item,
+                    infraEx.Message,
+                    project,
+                    infraEx.Phase,
+                    infraEx.Agent,
+                    failureKind: WorkItemFailureKinds.Infrastructure);
+                return;
+            }
+
             _log.LogWarning(
                 "Work item {Id} check-and-act failed because agent {Agent} hit infrastructure failure in phase {Phase}: {Reason}",
                 item.Id, infraEx.Agent.Value, infraEx.Phase, infraEx.Message);
@@ -168,6 +190,23 @@ public sealed partial class PipelineRunner
                 seedEx.Message,
                 CancellationToken.None,
                 project,
+                failureKind: WorkItemFailureKinds.Infrastructure);
+        }
+        catch (Exception ex) when (IsExecutionTransportLoss(ex))
+        {
+            // Raw transport-loss shapes that never got wrapped into an
+            // AgentInfrastructureFailureException — e.g. a
+            // SandboxExecutionUnavailableException from the git-clone exec —
+            // carry the same recoverable meaning: park, do not fail terminal.
+            _log.LogWarning(
+                "Work item {Id} check-and-act parking for retry because its sandbox execution transport was lost: {Reason}",
+                item.Id, ex.Message);
+            await TransitionWaitingForTransientRetryAsync(
+                item,
+                ex.Message,
+                project,
+                "check",
+                agentRunner.Kind,
                 failureKind: WorkItemFailureKinds.Infrastructure);
         }
         catch (Exception ex)

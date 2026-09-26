@@ -96,6 +96,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         SandboxStartupResumePolicy.MaximumAdoptionDeadline;
 
     private readonly ISandboxProvider? _provider;
+    private readonly IManagedSandboxLifecycle? _leakDisposal;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
@@ -128,7 +129,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         SandboxStartupResumeMode? mode = null,
         IInfrastructureDeferralScheduler? infrastructureDeferrals = null,
         IHostApplicationLifetime? applicationLifetime = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IManagedSandboxLifecycle? leakDisposal = null)
         : this(
             provider,
             store,
@@ -147,10 +149,18 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             recoveryInput,
             infrastructureDeferrals,
             applicationLifetime,
-            timeProvider)
+            timeProvider,
+            leakDisposal)
     {
     }
 
+    /// <param name="leakDisposal">
+    /// Lifecycle used for the resumed-VM purge. Production passes the
+    /// composite <see cref="IManagedSandboxLifecycle"/> so the destructive
+    /// delete re-verifies live phase/worker ownership instead of trusting
+    /// one provider's in-memory tracked-active registry alone; when null the
+    /// raw <paramref name="provider"/> is used.
+    /// </param>
     public SandboxResumeOnStartupService(
         ISandboxProvider? provider,
         IWorkItemStore store,
@@ -159,10 +169,12 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         IStartupRecoveryInputSink recoveryInput,
         IInfrastructureDeferralScheduler? infrastructureDeferrals = null,
         IHostApplicationLifetime? applicationLifetime = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IManagedSandboxLifecycle? leakDisposal = null)
     {
         ArgumentNullException.ThrowIfNull(recoveryInput);
         _provider = provider;
+        _leakDisposal = leakDisposal ?? provider;
         _store = store;
         _log = log;
         _optionsAccessor = optionsAccessor;
@@ -504,12 +516,17 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
     private async Task TryDisposeStartupResumedVmAsync(string vmName)
     {
-        if (_provider is null)
+        if (_leakDisposal is null)
             return;
 
         try
         {
-            await _provider.DisposeLeakedAsync(vmName, CancellationToken.None);
+            // Routed through the managed lifecycle (the composite in
+            // production) so the destructive purge re-verifies live
+            // phase/worker ownership rather than trusting a single provider's
+            // in-memory tracked-active registry — the registry the
+            // live-VM-reap incident proved can silently lose an entry.
+            await _leakDisposal.DisposeLeakedAsync(vmName, CancellationToken.None);
         }
         catch (Exception ex)
         {

@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -116,22 +118,30 @@ public sealed class SandboxLeakReaperLiveTrackingTests
     }
 
     [Fact]
-    public void DefaultLeakAgeThreshold_ExceedsWorkTimeoutCeiling()
+    public void ShippedLeakAgeThreshold_CoversTheShippedMaximumLegitimatePhaseDuration()
     {
-        // A work phase may legitimately run DefaultWorkTimeoutMinutes
-        // (240 shipped; up to MaxMinutes configured) times the phase
-        // absolute-timeout multiplier before the phase cap fires. The leak
-        // threshold default must sit above that bound or mid-phase sandboxes
-        // get declared abandoned.
-        var shipped = new SandboxLeakOptions().LeakAgeThreshold;
+        // The incident's hard bound evaluated against what actually ships:
+        // the effective configured threshold (appsettings override, or the
+        // SandboxLeakOptions default when unset) must cover the longest phase
+        // the configured PhaseAbsoluteTimeoutMultiplier can allow — a
+        // per-attempt work budget clamped by WorkTimeoutPolicy.MaxMinutes,
+        // times the multiplier — or a mid-phase sandbox can out-age the
+        // threshold while its worker is still legitimately running. The
+        // reaper's runtime warning catches operator drift; this test keeps
+        // the shipped values themselves from drifting.
+        var (configuredMultiplier, configuredThreshold) = LoadShippedSandboxLeakConfig();
+        var multiplier = configuredMultiplier ?? new CodeyBoxOptions().PhaseAbsoluteTimeoutMultiplier;
+        var threshold = configuredThreshold ?? new SandboxLeakOptions().LeakAgeThreshold;
+        var bound = SandboxLeakOptions.MinimumLeakAgeThreshold(multiplier);
         Assert.True(
-            shipped > TimeSpan.FromMinutes(WorkTimeoutPolicy.DefaultMinutes),
-            $"LeakAgeThreshold {shipped} must exceed DefaultWorkTimeoutMinutes {WorkTimeoutPolicy.DefaultMinutes}m");
-        var maxPhase = TimeSpan.FromMinutes(
-            WorkTimeoutPolicy.MaxMinutes * PipelineOptions.DefaultPhaseAbsoluteTimeoutMultiplier);
-        Assert.True(
-            shipped > maxPhase,
-            $"LeakAgeThreshold {shipped} must exceed the maximum legitimate phase duration {maxPhase}");
+            threshold >= bound,
+            $"shipped LeakAgeThreshold {threshold} is below {bound}, the minimum for the shipped PhaseAbsoluteTimeoutMultiplier {multiplier}");
+
+        // And the property-default pair must stay coupled so a build with no
+        // config at all is safe by construction.
+        Assert.Equal(
+            SandboxLeakOptions.DefaultLeakAgeThreshold,
+            new SandboxLeakOptions().LeakAgeThreshold);
     }
 
     [Fact]
@@ -141,7 +151,7 @@ public sealed class SandboxLeakReaperLiveTrackingTests
         // that is the bug. Before deleting, the composite must re-verify
         // against live phase/worker state, and a live binding vetoes the
         // delete even when the in-memory listing says untracked.
-        var provider = new TrackingSandboxProvider("incus");
+        var provider = new TrackingSandboxProvider(SandboxProviderKinds.Incus);
         provider.SeedUntracked("codeybox-live-vm", DateTimeOffset.UtcNow - TimeSpan.FromHours(2));
         provider.SeedLivePhaseBinding("codeybox-live-vm", WorkItemId.New());
         var composite = new CompositeManagedSandboxProvider([provider]);
@@ -153,7 +163,7 @@ public sealed class SandboxLeakReaperLiveTrackingTests
                     DateTimeOffset.UtcNow - TimeSpan.FromHours(2),
                     null,
                     IsTrackedActive: false,
-                    LifecycleProviderId: "incus"),
+                    LifecycleProviderId: SandboxProviderKinds.Incus),
                 CancellationToken.None));
 
         Assert.Contains("live work phase", ex.Message);
@@ -166,7 +176,7 @@ public sealed class SandboxLeakReaperLiveTrackingTests
         // Positive control: the live-state veto must not block reclamation of
         // a sandbox nothing owns — no tracked-active report, no live phase
         // binding anywhere.
-        var provider = new TrackingSandboxProvider("incus");
+        var provider = new TrackingSandboxProvider(SandboxProviderKinds.Incus);
         provider.SeedUntracked("codeybox-orphan", DateTimeOffset.UtcNow - TimeSpan.FromHours(2));
         var composite = new CompositeManagedSandboxProvider([provider]);
 
@@ -177,13 +187,118 @@ public sealed class SandboxLeakReaperLiveTrackingTests
                 DateTimeOffset.UtcNow - TimeSpan.FromHours(2),
                 null,
                 IsTrackedActive: false,
-                LifecycleProviderId: "incus"),
+                LifecycleProviderId: SandboxProviderKinds.Incus),
             CancellationToken.None);
 
         Assert.Contains("codeybox-orphan", provider.DisposedNames);
         Assert.DoesNotContain(
             "codeybox-orphan",
             (await composite.ListAllManagedAsync(CancellationToken.None)).Select(info => info.Name));
+    }
+
+    [Fact]
+    public async Task DisposeLeaked_RefusesWhenFreshInventoryReportsTrackedActive()
+    {
+        // Third veto arm: a provider whose FRESH inventory still reports the
+        // name tracked-active vetoes the delete even though the caller's
+        // stale sweep snapshot claimed untracked — the registry-cleared-mid-
+        // phase recovery case.
+        var provider = new TrackingSandboxProvider(SandboxProviderKinds.Incus);
+        provider.SeedTrackedActive("codeybox-active-vm", DateTimeOffset.UtcNow - TimeSpan.FromHours(2));
+        var composite = new CompositeManagedSandboxProvider([provider]);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => composite.DisposeLeakedAsync("codeybox-active-vm", CancellationToken.None));
+
+        Assert.Contains("tracked-active", ex.Message);
+        Assert.Empty(provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task DisposeLeaked_RefusesWhenAProviderInventoryIsIncomplete()
+    {
+        // Fail-closed on partial evidence: a provider that could not fully
+        // enumerate (e.g. an unreachable executor host) can hide the
+        // tracked-active entry proving the VM live, so an incomplete
+        // inventory vetoes the delete rather than routing on a partial view.
+        var provider = new TrackingSandboxProvider(SandboxProviderKinds.Incus)
+        {
+            InventoryIncomplete = true,
+        };
+        provider.SeedUntracked("codeybox-half-seen", DateTimeOffset.UtcNow - TimeSpan.FromHours(2));
+        var composite = new CompositeManagedSandboxProvider([provider]);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => composite.DisposeLeakedAsync("codeybox-half-seen", CancellationToken.None));
+
+        Assert.Contains("could not verify", ex.Message);
+        Assert.Empty(provider.DisposedNames);
+    }
+
+    [Fact]
+    public async Task DisposeLeaked_ByNameRoutesThroughFreshInventoryWithoutAPriorSweep()
+    {
+        // A name-only dispose with no prior sweep (the reported-by-name map
+        // is empty — e.g. first action after restart) must still reach the
+        // provider whose FRESH inventory reports the VM, not give up with the
+        // multi-provider ambiguity failure.
+        var hostA = new TrackingSandboxProvider(SandboxProviderKinds.Multipass);
+        var hostB = new TrackingSandboxProvider(SandboxProviderKinds.Incus);
+        hostB.SeedUntracked("codeybox-orphan-b", DateTimeOffset.UtcNow - TimeSpan.FromHours(3));
+        var composite = new CompositeManagedSandboxProvider([hostA, hostB]);
+
+        await composite.DisposeLeakedAsync("codeybox-orphan-b", CancellationToken.None);
+
+        Assert.Contains("codeybox-orphan-b", hostB.DisposedNames);
+        Assert.Empty(hostA.DisposedNames);
+    }
+
+    [Fact]
+    public async Task RunSweep_WarnsOncePerMisconfiguredThresholdMultiplierPair_ThenReArms()
+    {
+        // The shipped default couples LeakAgeThreshold to the phase-timeout
+        // ceiling via MinimumLeakAgeThreshold. An operator who raises
+        // CodeyBox:PhaseAbsoluteTimeoutMultiplier or lowers the threshold
+        // silently recreates the incident's hazard — the reaper must warn on
+        // the next sweep (hot reload covers the accessor too), once per
+        // misconfigured pair, and re-arm when the pair changes.
+        var provider = new TrackingSandboxProvider(SandboxProviderKinds.Incus);
+        var log = new ListLogger<SandboxLeakReaper>();
+        var opts = new SandboxLeakOptions
+        {
+            Enabled = true,
+            LeakAgeThreshold = TimeSpan.FromHours(1),
+            AutoDispose = false,
+        };
+        var reaper = new SandboxLeakReaper(
+            provider,
+            new NullWebhookDispatcher(),
+            () => opts,
+            log,
+            store: null,
+            phaseAbsoluteTimeoutMultiplierAccessor: () => 3.0);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        var warnings = log.Lines
+            .Where(e => e.Level == LogLevel.Warning
+                && e.Message.Contains("PhaseAbsoluteTimeoutMultiplier", StringComparison.Ordinal))
+            .ToList();
+        Assert.Single(warnings);
+        Assert.Contains("LeakAgeThreshold", warnings[0].Message, StringComparison.Ordinal);
+
+        // Correcting the threshold re-arms the latch: the next shortfall logs again.
+        opts.LeakAgeThreshold = SandboxLeakOptions.MinimumLeakAgeThreshold(3.0);
+        await reaper.RunSweepAsync(CancellationToken.None);
+        opts.LeakAgeThreshold = TimeSpan.FromHours(1);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        warnings = log.Lines
+            .Where(e => e.Level == LogLevel.Warning
+                && e.Message.Contains("PhaseAbsoluteTimeoutMultiplier", StringComparison.Ordinal))
+            .ToList();
+        Assert.Equal(2, warnings.Count);
     }
 
     [Fact]
@@ -220,14 +335,51 @@ public sealed class SandboxLeakReaperLiveTrackingTests
         public void Dispose() => Services.Dispose();
     }
 
+    /// <summary>
+    /// Reads the shipped <c>src/CodeyBox.Api/appsettings.json</c> so the
+    /// threshold test asserts the values an operator actually deploys rather
+    /// than test-injected config. Absent keys fall back to the options
+    /// defaults — which is what a deployment without those keys runs.
+    /// </summary>
+    private static (double? PhaseMultiplier, TimeSpan? LeakThreshold) LoadShippedSandboxLeakConfig()
+    {
+        var path = Path.Combine(FindRepoRoot(), "src", "CodeyBox.Api", "appsettings.json");
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        if (!doc.RootElement.TryGetProperty("CodeyBox", out var codeyBox))
+            return (null, null);
+
+        double? multiplier = codeyBox.TryGetProperty("PhaseAbsoluteTimeoutMultiplier", out var m)
+            && m.ValueKind == JsonValueKind.Number
+            ? m.GetDouble()
+            : null;
+        TimeSpan? threshold = codeyBox.TryGetProperty("SandboxLeak", out var leak)
+            && leak.TryGetProperty("LeakAgeThreshold", out var lt)
+            && lt.ValueKind == JsonValueKind.String
+            ? TimeSpan.Parse(lt.GetString()!, CultureInfo.InvariantCulture)
+            : null;
+        return (multiplier, threshold);
+    }
+
+    private static string FindRepoRoot()
+    {
+        var dir = AppContext.BaseDirectory;
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir, "CodeyBox.slnx")))
+                return dir;
+            dir = Path.GetDirectoryName(dir);
+        }
+        throw new InvalidOperationException("Could not locate repo root from " + AppContext.BaseDirectory);
+    }
+
     private static Wiring BuildWiring(TrackingSandboxProvider incus)
     {
         var multipass = new TrackingSandboxProvider(SandboxProviderKinds.Multipass);
         var registry = new SandboxProviderRegistry(
             kind => kind switch
             {
-                "incus" => incus,
-                "multipass" => multipass,
+                SandboxProviderKinds.Incus => incus,
+                SandboxProviderKinds.Multipass => multipass,
                 _ => throw new InvalidOperationException($"Unexpected provider kind '{kind}'"),
             });
         var services = new ServiceCollection()
@@ -244,6 +396,25 @@ public sealed class SandboxLeakReaperLiveTrackingTests
             services,
             registry,
             services.GetRequiredService<ISandboxProvider>());
+    }
+
+    private sealed class ListLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Lines { get; } = new();
+
+        IDisposable? ILogger.BeginScope<TState>(TState state) => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Lines.Add((logLevel, formatter(state, exception)));
+        }
     }
 
     private sealed class StaticOptionsMonitor<T> : IOptionsMonitor<T>
@@ -317,6 +488,23 @@ public sealed class SandboxLeakReaperLiveTrackingTests
             return Task.FromResult<ISandbox>(sandbox);
         }
 
+        /// <summary>A VM on the backend still registered in this instance's
+        /// live registry — the tracked-active-in-fresh-inventory shape.</summary>
+        public void SeedTrackedActive(string name, DateTimeOffset createdAt)
+        {
+            lock (_gate)
+            {
+                _liveRegistry.Add(name);
+                _backend[name] = new Entry(
+                    new ManagedSandboxInfo(name, createdAt, null, IsTrackedActive: false),
+                    Handle: null);
+            }
+        }
+
+        /// <summary>When true, <see cref="ListManagedInventoryAsync"/> reports
+        /// a partial enumeration — the fail-closed veto input.</summary>
+        public bool InventoryIncomplete { get; set; }
+
         /// <summary>A VM visible on the backend with no live registry entry —
         /// e.g. created by a crashed process.</summary>
         public void SeedUntracked(string name, DateTimeOffset createdAt)
@@ -360,6 +548,19 @@ public sealed class SandboxLeakReaperLiveTrackingTests
                     _backend.Values
                         .Select(e => e.Info with { IsTrackedActive = _liveRegistry.Contains(e.Info.Name) })
                         .ToList());
+            }
+        }
+
+        public Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
+        {
+            _ = ct;
+            lock (_gate)
+            {
+                return Task.FromResult(new ManagedSandboxInventory(
+                    _backend.Values
+                        .Select(e => e.Info with { IsTrackedActive = _liveRegistry.Contains(e.Info.Name) })
+                        .ToList(),
+                    isComplete: !InventoryIncomplete));
             }
         }
 

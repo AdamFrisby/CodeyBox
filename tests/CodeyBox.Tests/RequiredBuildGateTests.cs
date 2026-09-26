@@ -558,6 +558,25 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public void SandboxDeferralGuard_ExecutionTransportLossIsNotWrapped()
+    {
+        // A dead exec transport carries the same recoverable-infrastructure
+        // meaning as a provisioning deferral: terminal-mapping boundaries must
+        // not flatten it into AuditUnavailableException / Unavailable results —
+        // doing so strands the item terminal and hands its clone to the repo
+        // reaper.
+        var transportLoss = new SandboxExecutionUnavailableException(255);
+        var resumeLoss = new AgentResumePreparationUnavailableException(255);
+
+        Assert.True(SandboxDeferralGuard.IsExecutionTransportLoss(transportLoss));
+        Assert.True(SandboxDeferralGuard.IsExecutionTransportLoss(resumeLoss));
+        Assert.False(SandboxDeferralGuard.IsExecutionTransportLoss(new InvalidOperationException("boom")));
+
+        Assert.False(SandboxDeferralGuard.ShouldWrap(transportLoss));
+        Assert.False(SandboxDeferralGuard.ShouldWrap(resumeLoss));
+    }
+
+    [Fact]
     public async Task RetryFromWork_DefaultCodeyBoxOwnedBranchWithBrokenBuild_ResetsAndRunsCleanWork()
     {
         // retry-from-work must not let inherited non-compiling state dead-end

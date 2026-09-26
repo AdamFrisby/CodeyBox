@@ -1482,6 +1482,67 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task DisposeLeakedAsync_refuses_to_delete_a_vm_still_tracked_active()
+    {
+        // The destructive-sink guard: a VM a live work phase still owns must
+        // never reach multipass delete. Before this guard the bare-name path
+        // force-disposed the active sandbox through its registered cleanup —
+        // the leak-reaper incident shape.
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await provider.DisposeLeakedAsync(sb.Id, CancellationToken.None));
+
+        Assert.Contains("still tracked as active", ex.Message);
+        Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("delete"));
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_managed_sandbox_refuses_to_delete_a_vm_still_tracked_active()
+    {
+        // Same refuse-when-active guarantee through the ManagedSandboxInfo
+        // overload the composite lifecycle routes to.
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec { ImageReference = "24.04" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await provider.DisposeLeakedAsync(new ManagedSandboxInfo(
+                sb.Id,
+                DateTimeOffset.UtcNow,
+                DiskBytes: null,
+                IsTrackedActive: true,
+                HostId: opts.HostId.Length == 0 ? "default" : opts.HostId), CancellationToken.None));
+
+        Assert.Contains("still tracked as active", ex.Message);
+        Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("delete"));
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
     public async Task DisposeAsync_delete_failure_is_best_effort_and_releases_host_reservation()
     {
         var opts = DefaultOptions() with { MaxConcurrentSandboxes = 1 };

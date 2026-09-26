@@ -226,20 +226,22 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task PresenceProbeExecutionUnavailable_ThrowsCouldNotVerifyInsteadOfSkip()
+    public async Task PresenceProbeExecutionUnavailable_ThrowsTransportLossInsteadOfSkipOrUnavailable()
     {
+        // A dead exec transport is infrastructure, not audit unavailability:
+        // the exception must propagate so the pipeline parks the item for
+        // retry — a terminal could-not-verify would hand its clone to the
+        // repo reaper.
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(1, "", "provider unavailable", ExecutionUnavailable: true)
             : new SandboxExecResult(99, "should not run", ""));
 
-        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+        await Assert.ThrowsAsync<SandboxExecutionUnavailableException>(() =>
             new BuildScriptAuditor().RunAsync(
                 sandbox,
                 "/work/repo",
                 Ctx(required: false)));
 
-        Assert.Contains("could-not-verify", ex.Message);
-        Assert.Contains("presence check", ex.Message);
         Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
     }
 
@@ -259,20 +261,19 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task ProviderExecUnavailableResult_ThrowsCouldNotVerifyInsteadOfBuildFinding()
+    public async Task ProviderExecUnavailableResult_ThrowsTransportLossInsteadOfBuildFinding()
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
             : new SandboxExecResult(1, "", "sandbox provider unavailable", ExecutionUnavailable: true));
 
-        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxExecutionUnavailableException>(() =>
             new BuildScriptAuditor().RunAsync(
                 sandbox,
                 "/work/repo",
                 Ctx()));
 
-        Assert.Contains("could-not-verify", ex.Message);
-        Assert.Contains("build.sh could not execute", ex.Message);
+        Assert.Equal(1, ex.ExitCode);
     }
 
     [Fact]

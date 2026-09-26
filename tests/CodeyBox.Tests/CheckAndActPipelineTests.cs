@@ -532,6 +532,108 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecutionUnavailableAgentFailureDuringCheck_ParksWaitingForTransientRetry_AsInfrastructure()
+    {
+        // The leak-reaper incident shape for check-and-act items: the agent's
+        // sandbox is destroyed mid-run and the runner reports an
+        // infrastructure failure flagged execution-unavailable. The item must
+        // park for bounded retry — a terminal failure hands its clone to the
+        // repo reaper and destroys the working tree.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions());
+
+        tp.Agent.CheckResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 255",
+            Stdout: null,
+            Stderr: "Error: read vsock host:3:1 connection reset by peer")
+        {
+            ExecutionUnavailable = true,
+        });
+
+        var check = NewCheckItem("codeybox/checkact-exec-unavailable");
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Null(final.Verdict);
+    }
+
+    [Fact]
+    public async Task RawExecutionTransportLossDuringCheck_ParksWaitingForTransientRetry_AsInfrastructure()
+    {
+        // A raw SandboxExecutionUnavailableException — e.g. the git-clone exec
+        // reporting a dead transport — must park the check item the same way
+        // the flagged agent failure does: the sandbox itself is gone, the work
+        // is not at fault, and a fresh sandbox reproduces the environment.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: new ExecutionUnavailableSandboxProvider(),
+            transientRetryOptions: TransientRetryOptions());
+
+        var check = NewCheckItem("codeybox/checkact-exec-loss");
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Null(final.Verdict);
+    }
+
+    /// <summary>
+    /// Sandbox provider whose sandboxes report a dead execution transport on
+    /// every exec — the shape a VM reaped mid-phase produces — so
+    /// <c>Run</c> converts the result into a
+    /// <see cref="SandboxExecutionUnavailableException"/>.
+    /// </summary>
+    private sealed class ExecutionUnavailableSandboxProvider : ISandboxProvider
+    {
+        public string Name => "exec-unavailable";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            _ = spec;
+            _ = ct;
+            return Task.FromResult<ISandbox>(new ExecutionUnavailableSandbox());
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        {
+            _ = ct;
+            return Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        }
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        {
+            _ = name;
+            _ = ct;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ExecutionUnavailableSandbox : ISandbox
+    {
+        public string Id => "codeybox-exec-unavailable";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _ = exec;
+            _ = ct;
+            return Task.FromResult(new SandboxExecResult(255, "", "", ExecutionUnavailable: true));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    [Fact]
     public async Task AuthPromptDuringCheck_FailsItemWithoutFleetBench()
     {
         // A stdout-only auth prompt during the check phase, with in-VM smoke

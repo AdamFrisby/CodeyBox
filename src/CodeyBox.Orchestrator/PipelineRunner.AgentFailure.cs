@@ -16,6 +16,25 @@ namespace CodeyBox.Orchestrator;
 // PipelineRunner.AgentFailure.cs — Agent-failure classification: transient/infrastructure/auth failure mapping and follow-up enqueue.
 public sealed partial class PipelineRunner
 {
+    /// <summary>
+    /// True when the exception proves the sandbox's execution transport was
+    /// lost underneath running work — the VM was destroyed (e.g. by the leak
+    /// reaper), the host crashed, or the exec channel died. Widens
+    /// <see cref="SandboxDeferralGuard.IsExecutionTransportLoss"/> with the
+    /// flagged failure types this assembly owns
+    /// (<see cref="AgentInfrastructureFailureException"/> and
+    /// <see cref="CodeyBox.Sandbox.SandboxCredentialFileWriteException"/>
+    /// carrying <c>ExecutionUnavailable</c>). Catch boundaries that map
+    /// failures to terminal item outcomes must let these propagate to the
+    /// transient-retry park instead — a terminal transition marks the item
+    /// failed and hands its working tree to the clone reaper even though a
+    /// fresh sandbox reproduces a working environment.
+    /// </summary>
+    private static bool IsExecutionTransportLoss(Exception ex) =>
+        SandboxDeferralGuard.IsExecutionTransportLoss(ex)
+        || ex is AgentInfrastructureFailureException { ExecutionUnavailable: true }
+            or SandboxCredentialFileWriteException { ExecutionUnavailable: true };
+
     private void ThrowIfTransientAgentFailure(
         IAgentRunner runner,
         AgentResult result,

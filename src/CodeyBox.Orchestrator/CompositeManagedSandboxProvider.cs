@@ -107,13 +107,9 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
-        await RequireNotOwnedByLiveWorkAsync(name, hostId: null, ct).ConfigureAwait(false);
+        var reporters = await RequireNotOwnedByLiveWorkAsync(name, hostId: null, ct).ConfigureAwait(false);
 
-        ProviderEntry[] candidates;
-        lock (_lastListLock)
-        {
-            _lastReportedByName.TryGetValue(name, out candidates!);
-        }
+        ProviderEntry[]? candidates = reporters.Length > 0 ? reporters : LastReportedCandidates(name);
 
         if (candidates is not { Length: > 0 })
         {
@@ -141,7 +137,7 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
             return;
         }
 
-        await RequireNotOwnedByLiveWorkAsync(sandbox.Name, sandbox.HostId, ct).ConfigureAwait(false);
+        _ = await RequireNotOwnedByLiveWorkAsync(sandbox.Name, sandbox.HostId, ct).ConfigureAwait(false);
 
         var outerProviderId = sandbox.LifecycleProviderId;
         string? innerProviderId = null;
@@ -175,43 +171,70 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
     /// every constituent lifecycle's active-work snapshot, plus a fresh
     /// managed inventory where ANY provider reporting the name as
     /// tracked-active vetoes the delete. Verification failures fail closed —
-    /// the sweep retries on its next pass rather than deleting an unverifiable
-    /// VM.
+    /// a provider that could not fully enumerate its inventory (e.g. an
+    /// unreachable executor host on a multi-host backend) also vetoes the
+    /// delete, since a partial view can hide the tracked-active entry that
+    /// proves the VM live. The sweep retries on its next pass rather than
+    /// deleting an unverifiable VM.
     /// </summary>
-    private async Task RequireNotOwnedByLiveWorkAsync(string name, string? hostId, CancellationToken ct)
+    /// <returns>
+    /// The lifecycles whose fresh inventory reported <paramref name="name"/> —
+    /// the same evidence the last sweep's reported-by-name map holds, but
+    /// current, so a caller that has not swept recently can still route.
+    /// </returns>
+    private async Task<ProviderEntry[]> RequireNotOwnedByLiveWorkAsync(string name, string? hostId, CancellationToken ct)
     {
+        var liveNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var provider in _providers)
         {
-            if (provider.Lifecycle is IActiveSandboxProvider active
-                && active.SnapshotActiveSandboxes().Any(e =>
-                    string.Equals(e.Sandbox.Id, name, StringComparison.Ordinal)))
+            if (provider.Lifecycle is IActiveSandboxProvider active)
             {
-                throw new InvalidOperationException(
-                    $"Refusing to dispose managed sandbox '{name}': a live work phase still owns it.");
+                foreach (var entry in active.SnapshotActiveSandboxes())
+                    liveNames.Add(entry.Sandbox.Id);
             }
-
-            if (provider.Lifecycle is IActiveSandboxProgressProvider progress
-                && progress.SnapshotActiveSandboxProgress().Any(e =>
-                    string.Equals(e.SandboxId, name, StringComparison.Ordinal)))
+            if (provider.Lifecycle is IActiveSandboxProgressProvider progress)
             {
-                throw new InvalidOperationException(
-                    $"Refusing to dispose managed sandbox '{name}': a live work phase still owns it.");
+                foreach (var entry in progress.SnapshotActiveSandboxProgress())
+                    liveNames.Add(entry.SandboxId);
             }
         }
+        if (liveNames.Contains(name))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to dispose managed sandbox '{name}': a live work phase still owns it.");
+        }
 
+        var reporters = new List<ProviderEntry>();
         foreach (var provider in _providers)
         {
-            var managed = await provider.Lifecycle.ListAllManagedAsync(ct).ConfigureAwait(false);
-            foreach (var info in managed)
+            var inventory = await provider.Lifecycle.ListManagedInventoryAsync(ct).ConfigureAwait(false);
+            if (!inventory.IsComplete
+                && (hostId is null || !inventory.InventoriedHostIds.Contains(hostId)))
             {
+                throw new InvalidOperationException(
+                    $"Refusing to dispose managed sandbox '{name}': provider '{provider.Id}' could not verify its full inventory.");
+            }
+            foreach (var info in inventory)
+            {
+                if (!string.Equals(info.Name, name, StringComparison.Ordinal))
+                    continue;
+                reporters.Add(provider);
                 if (info.IsTrackedActive
-                    && string.Equals(info.Name, name, StringComparison.Ordinal)
                     && (hostId is null || string.Equals(info.HostId, hostId, StringComparison.Ordinal)))
                 {
                     throw new InvalidOperationException(
                         $"Refusing to dispose managed sandbox '{name}': provider '{provider.Id}' reports it tracked-active.");
                 }
             }
+        }
+        return reporters.ToArray();
+    }
+
+    private ProviderEntry[]? LastReportedCandidates(string name)
+    {
+        lock (_lastListLock)
+        {
+            return _lastReportedByName.TryGetValue(name, out var candidates) ? candidates : null;
         }
     }
 

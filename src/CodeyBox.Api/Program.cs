@@ -5381,7 +5381,8 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     },
     sp.GetRequiredService<IStartupRecoveryInputSink>(),
     sp.GetRequiredService<IInfrastructureDeferralScheduler>(),
-    sp.GetRequiredService<IHostApplicationLifetime>()));
+    sp.GetRequiredService<IHostApplicationLifetime>(),
+    leakDisposal: sp.GetRequiredService<IManagedSandboxLifecycle>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the
@@ -5504,7 +5505,8 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
         () => monitor.CurrentValue.SandboxLeak,
         sp.GetRequiredService<ILogger<SandboxLeakReaper>>(),
         sp.GetRequiredService<IWorkItemStore>(),
-        leakSink: sp.GetRequiredService<LeakDetectionSink>());
+        leakSink: sp.GetRequiredService<LeakDetectionSink>(),
+        phaseAbsoluteTimeoutMultiplierAccessor: () => monitor.CurrentValue.PhaseAbsoluteTimeoutMultiplier);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 

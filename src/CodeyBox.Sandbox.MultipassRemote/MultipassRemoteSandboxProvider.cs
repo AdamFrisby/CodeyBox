@@ -556,6 +556,21 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             .Where(kv => string.Equals(kv.Key.Name, name, StringComparison.Ordinal))
             .Select(kv => kv.Value)
             .ToArray();
+        // An entry still tracked-active whose DisposeAsync never started
+        // belongs to a live work phase, not a leak: refuse the destructive
+        // delete — matching the Incus/local providers' refuse-when-active
+        // semantics. A tracked entry whose dispose already ran is a zombie
+        // no phase owns (e.g. deferred at sync-back, tracking left held)
+        // and is reclaimed below.
+        var liveMatches = activeMatches
+            .Where(static sb => sb.IsTrackedActive && !sb.DisposalStarted)
+            .ToArray();
+        if (liveMatches.Length == 1)
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' because it is still tracked as active on executor host '{liveMatches[0].HostId}'.");
+        if (liveMatches.Length > 1)
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' by bare name because it is active on multiple executor hosts.");
         if (activeMatches.Length == 1)
         {
             await activeMatches[0].ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
@@ -622,6 +637,14 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         if (!string.IsNullOrWhiteSpace(sandbox.HostId)
             && _active.TryGetValue(new RemoteSandboxIdentity(sandbox.HostId!, sandbox.Name), out var active))
         {
+            // Still owned by a live work phase (dispose never started) —
+            // refuse the destructive delete rather than killing the VM the
+            // phase is running on. A handle whose DisposeAsync already ran
+            // is a zombie no phase owns: reclaim it, skipping the fallible
+            // sync-back that stranded the tracking in the first place.
+            if (active.IsTrackedActive && !active.DisposalStarted)
+                throw new InvalidOperationException(
+                    $"Refusing to dispose remote VM '{sandbox.Name}' on host '{sandbox.HostId}' because it is still tracked as active.");
             await active.ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
             return;
         }
