@@ -85,7 +85,7 @@ internal sealed record MajordomoProposalDecisionOutcome(
 /// <para>
 /// In-process, every decision on one proposal id — approval, rejection,
 /// supersession — serializes through a fixed stripe of the
-/// <see cref="DecisionGates"/> pool, so a rejection can never interpose
+/// <see cref="_decisionGates"/> pool, so a rejection can never interpose
 /// between an approval's commit and its recorded transition. The stripe
 /// table is bounded and never evicts: keys hash a route-supplied id, and a
 /// keyed dictionary that evicted while a caller still held the semaphore
@@ -119,16 +119,20 @@ internal sealed class MajordomoProposalService
     internal const string InterruptedCommitNote =
         " (closed a claimed commit — its mutation may have already applied)";
 
+    /// <summary>Stripes in the <see cref="_decisionGates"/> pool.</summary>
+    private const int DecisionGateCount = 64;
+
     /// <summary>
     /// Striped serialization for decisions on one proposal. A fixed pool
     /// keyed by the id's hash: bounded (caller-supplied route ids cannot grow
     /// it), never evicted (an evict-while-in-use race would hand two callers
     /// different semaphores for the same proposal). Unrelated ids may share
     /// a stripe — that only serializes rare operator decisions, never
-    /// correctness.
+    /// correctness. Instance-scoped like the executor's mutation gates, so
+    /// co-hosted service instances never share stripes.
     /// </summary>
-    private static readonly SemaphoreSlim[] DecisionGates =
-        Enumerable.Range(0, 64).Select(static _ => new SemaphoreSlim(1, 1)).ToArray();
+    private readonly SemaphoreSlim[] _decisionGates =
+        Enumerable.Range(0, DecisionGateCount).Select(static _ => new SemaphoreSlim(1, 1)).ToArray();
 
     private readonly IMajordomoProposalStore _store;
     private readonly MajordomoMutateBackend _mutates;
@@ -164,11 +168,12 @@ internal sealed class MajordomoProposalService
         CancellationToken ct = default)
     {
         var policy = _options.CurrentValue.ToPolicy();
+        var now = _time.GetUtcNow();
         var record = MajordomoProposalRecord.Create(
-            tool.Name, args, proposedBy, _time.GetUtcNow(), args.Reasoning, reviewedChangeSet);
+            tool.Name, args, proposedBy, now, args.Reasoning, reviewedChangeSet);
         try
         {
-            await _store.EnqueueAsync(record, policy, _time.GetUtcNow(), ct).ConfigureAwait(false);
+            await _store.EnqueueAsync(record, policy, now, ct).ConfigureAwait(false);
         }
         catch (MajordomoProposalQueueFullException)
         {
@@ -304,7 +309,7 @@ internal sealed class MajordomoProposalService
                         id, MajordomoProposalState.Pending, claim, ct).ConfigureAwait(false))
                 {
                     return await CommitClaimedAsync(
-                        record, id, safeId, tool!, decidedBy, initiator, cancelCascade, now, ct)
+                        record, tool!, decidedBy, initiator, cancelCascade, now, ct)
                         .ConfigureAwait(false);
                 }
                 // Lost the claim — loop re-reads and reports the winning state.
@@ -337,8 +342,6 @@ internal sealed class MajordomoProposalService
     /// </param>
     private async Task<MajordomoProposalApprovalOutcome> CommitClaimedAsync(
         MajordomoProposalRecord record,
-        string id,
-        string safeId,
         MajordomoTool tool,
         string decidedBy,
         WorkInitiator initiator,
@@ -346,6 +349,8 @@ internal sealed class MajordomoProposalService
         DateTimeOffset now,
         CancellationToken ct)
     {
+        var id = record.Id;
+        var safeId = Validation.DescribeUntrustedValue(id);
         MajordomoMutationResult mutation;
         try
         {
@@ -587,8 +592,8 @@ internal sealed class MajordomoProposalService
             outcome,
             detail);
 
-    private static SemaphoreSlim GateFor(string id) =>
-        DecisionGates[(id.GetHashCode() & int.MaxValue) % DecisionGates.Length];
+    private SemaphoreSlim GateFor(string id) =>
+        _decisionGates[(id.GetHashCode() & int.MaxValue) % _decisionGates.Length];
 
     internal static string NormalizeDecisionReason(string? reason)
     {

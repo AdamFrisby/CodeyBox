@@ -84,5 +84,5 @@ ee80b4ddd9b086f55aa67d06a9e949f0e7f988b8:tests/CodeyBox.Tests/PullRequestDescrip
 # tokens exercising the operator/majordomo/executor gate, never live
 # credentials. The literals were replaced with "test-token-*" placeholders;
 # these entries cover the pre-fix commit only.
-bea86aa6e02bc475c2a2cd72ec9fec88d95ebe2c:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:764
-bea86aa6e02bc475c2a2cd72ec9fec88d95ebe2c:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:765
+e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:764
+e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:765

@@ -47,13 +47,26 @@ public sealed record MajordomoProposalRecord
     /// <summary>Current lifecycle state.</summary>
     public MajordomoProposalState State { get; init; } = MajordomoProposalState.Pending;
 
-    /// <summary>When the terminal state was recorded; null while pending.</summary>
+    /// <summary>
+    /// When the decision was recorded; null while pending. Also stamped when a
+    /// commit is claimed (<see cref="MajordomoProposalState.Applying"/>) so an
+    /// interrupted commit keeps its attribution — a non-null value alone does
+    /// not mean decided; <see cref="IsDecided"/> is that check.
+    /// </summary>
     public DateTimeOffset? DecidedAt { get; init; }
 
-    /// <summary>Who recorded the terminal state; null while pending.</summary>
+    /// <summary>
+    /// Who recorded the decision; null while pending. Also stamped when a
+    /// commit is claimed (<see cref="MajordomoProposalState.Applying"/>), for
+    /// the same attribution reason as <see cref="DecidedAt"/>.
+    /// </summary>
     public string? DecidedBy { get; init; }
 
-    /// <summary>Why the terminal state was recorded; null while pending.</summary>
+    /// <summary>
+    /// Why the decision was recorded; null while pending. On
+    /// <see cref="MajordomoProposalState.Applying"/> rows this carries the
+    /// claim marker or a partial-commit note rather than a terminal rationale.
+    /// </summary>
     public string? DecisionReason { get; init; }
 
     /// <summary>

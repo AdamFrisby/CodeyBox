@@ -1,10 +1,12 @@
 namespace CodeyBox.Majordomo;
 
 /// <summary>
-/// Durable store for majordomo proposals. Implementations must survive
-/// orchestrator restarts (the SQLite implementation shares the state
-/// database file); the queue of operator suggestions must not evaporate
-/// with the process.
+/// Store for majordomo proposals. Implementations backing production hosts
+/// must survive orchestrator restarts (the SQLite implementation shares the
+/// state database file); the queue of operator suggestions must not
+/// evaporate with the process. Volatile implementations such as
+/// <see cref="InMemoryMajordomoProposalStore"/> serve tests and hosts that
+/// explicitly opt out of persistence.
 /// </summary>
 public interface IMajordomoProposalStore
 {
