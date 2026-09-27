@@ -3,7 +3,8 @@
 Auditor plugin wrapping [PMD](https://pmd-code.org/) 7: it analyses the audited
 repository with `pmd check --dir . --format xml --rulesets
 rulesets/java/quickstart.xml --relativize-paths-with <worktree> --no-progress
---suppress-marker <token>` and reports each rule violation as an audit finding
+--suppress-marker <token> --show-suppressed` and reports each rule violation as
+an audit finding
 with the PMD rule id (e.g. `UnusedLocalVariable`, `EmptyCatchBlock`) and
 `file:line` location. PMD is multi-language — Java, Kotlin, Scala, Apex,
 JavaScript, PLSQL, XML, Velocity, and more — but the ruleset decides which
@@ -23,6 +24,13 @@ languages are checked; the default is PMD's curated Java starter set.
   `config-error`. Under the default invocation they are unreachable — a
   recoverable error exits `5` and is infrastructure before parsing — but when an
   operator passes `--no-fail-on-error` they keep partial-coverage gaps visible.
+- `<suppressedviolation>` elements (violations the repository silenced via
+  `@SuppressWarnings`, `// NOPMD`, or ruleset-level XPath/regex suppressors)
+  are reported as advisory findings under the synthetic level
+  `suppressed-violation`, carrying the file, the suppression mechanism
+  (`suppressiontype`), and the violation message. The default invocation passes
+  `--show-suppressed` precisely so a repo-authored suppression cannot hide a
+  finding — it is downgraded to advisory, not deleted.
 - **Gate behaviour: hybrid / severity-driven — not blocking on every finding.**
   PMD rule priorities 1 and 2 map to `Error` and fail the audit; priority 3 maps
   to `Warning` (advisory); priorities 4 and 5 map to `Info`. This mirrors PMD's
@@ -37,12 +45,14 @@ languages are checked; the default is PMD's curated Java starter set.
   default `rulesets/java/quickstart.xml` checks `.java` sources only. For Kotlin,
   Apex, JavaScript, XML, or multi-language coverage, point `RulesetPath` (or `-R`
   in `ExtraArguments`) at a ruleset that pulls those languages' rules in.
-- **`@SuppressWarnings("PMD…")` is still honored.** The scan neutralizes the
-  `// NOPMD` comment marker (see below), but PMD offers no CLI switch to ignore
-  the Java annotation channel — that is a tool limitation, documented honestly
-  rather than worked around. A repo-authored `@SuppressWarnings` can still hide a
-  Java finding; narrow it with `violationSuppressXPath`/`violationSuppressRegex`
-  in an operator-pinned ruleset if that matters to your gate.
+- **Suppressed violations lose their detail.** The scan neutralizes the
+  `// NOPMD` comment marker (see below), and `--show-suppressed` makes every
+  remaining suppression channel — `@SuppressWarnings("PMD…")` annotations,
+  ruleset-level `violationSuppressXPath`/`violationSuppressRegex` — emit a
+  `<suppressedviolation>` element that surfaces as an advisory finding. What it
+  cannot recover is the suppressed violation's rule id or line number: PMD's
+  report carries only the file, the suppression mechanism, and the message, so
+  the finding cannot tell you which rule was silenced or where in the file.
 - **Type-resolution-dependent precision.** PMD runs without an auxclasspath by
   default; rules that resolve types degrade gracefully (they under-report rather
   than error). Operators can pass `--aux-classpath` in `ExtraArguments` for
@@ -130,24 +140,28 @@ Scoped under `CodeyBox:Plugins:codeybox.pmd`, resolved per run (hot-reloadable):
 |---|---|---|
 | `ExpectedVersion` | `7.26.0` | Pinned PMD release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
 | `RulesetPath` | `rulesets/java/quickstart.xml` | `-R`/`--rulesets` value: a built-in resource path (e.g. `rulesets/java/errorprone.xml`, `rulesets/ecmascript/basic.xml`) or an operator-owned file path/URL. **Do not point this into the audited repository** — a repo-authored ruleset lets the subject redefine the gate. Ignored when `ExtraArguments` supplies `-R`/`--rulesets`. |
-| `TrustRepositorySuppression` | `false` | When `true`, no `--suppress-marker` override is passed and PMD's default `NOPMD` comment marker is honored — repository comments can suppress findings. Default keeps them inert. |
+| `TrustRepositorySuppression` | `false` | When `true`, no `--suppress-marker` override is passed (PMD's default `NOPMD` comment marker is honored) and `--show-suppressed` is dropped (repository-silenced violations leave no advisory trace). Default keeps comment markers inert and surfaces every suppressed violation as an advisory finding. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
 | `IncludedRules` / `ExcludedRules` | — | Exact PMD rule ids to keep/drop (e.g. `UnusedLocalVariable`, `EmptyCatchBlock`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `external/`, `node_modules/`, `target/`, `build/`, `out/`, `dist/`, `generated/`, `coverage/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan; report paths are worktree-relative so these prefixes match. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--no-fail-on-error`, `--aux-classpath <cp>`, `--threads <n>`, `--encoding <charset>`, `--use-version java-17`, `--show-suppressed`, an operator `-R`/`--rulesets` (replaces `RulesetPath`/default), `--dir`/`--file-list`/`--uri` (replaces the default whole-tree scan), `--suppress-marker` (replaces the neutralised marker), or a custom `--format` (changes the report shape the parser expects — the run fails closed as infrastructure) or `--report-file` (redirects the report off stdout — same effect). |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--no-fail-on-error`, `--aux-classpath <cp>`, `--threads <n>`, `--encoding <charset>`, `--use-version java-17`, an operator `-R`/`--rulesets` (replaces `RulesetPath`/default), `--dir`/`--file-list`/`--uri` (replaces the default whole-tree scan), `--suppress-marker` (replaces the neutralised marker), or a custom `--format` (changes the report shape the parser expects — the run fails closed as infrastructure) or `--report-file` (redirects the report off stdout — same effect). |
 | `TimeoutSeconds` | `300` | Per-run bound. Exceeding it is infrastructure, not a pass. Raise toward the 3600 s ceiling for very large trees. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation (a truncated XML report fails the parse as infrastructure — raise the cap rather than accepting partial findings). |
 
 **Repository-controlled suppression is off by default.** The audit subject
 writes the repository, and PMD lets source files suppress the analyser with
-`// NOPMD` comments. The scan passes `--suppress-marker` set to an unguessable
-token generated fresh for each run — a fixed token would be forgeable, since
-the audit subject can read this plugin's source — so those comments are inert
-and findings surface for code the comments would have suppressed. Expect *more* findings than a stock `pmd check`
-run on repos that rely on suppression comments; that is the gate working as
-intended. `@SuppressWarnings("PMD…")` annotations remain honored regardless — a
-documented tool limitation (see above). Set `TrustRepositorySuppression` to
-restore PMD's default marker.
+`// NOPMD` comments or `@SuppressWarnings("PMD…")` annotations. The scan passes
+`--suppress-marker` set to an unguessable token generated fresh for each run —
+a fixed token would be forgeable, since the audit subject can read this
+plugin's source — so those comments are inert and findings surface for code
+the comments would have suppressed. Expect *more* findings than a stock
+`pmd check` run on repos that rely on suppression comments; that is the gate
+working as intended. The annotation channel cannot be switched off (PMD offers
+no flag for it), so the scan also passes `--show-suppressed`: every violation
+the repository silenced — by annotation, marker, or ruleset suppressor —
+surfaces as an advisory `suppressed-violation` finding instead of
+disappearing. Set `TrustRepositorySuppression` to restore PMD's default marker
+and drop `--show-suppressed`.
 
 ## Default scope
 

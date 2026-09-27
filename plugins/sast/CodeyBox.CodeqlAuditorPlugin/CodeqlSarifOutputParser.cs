@@ -40,7 +40,7 @@ public sealed class CodeqlSarifOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid SARIF JSON: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid SARIF JSON: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
 

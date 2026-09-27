@@ -47,7 +47,7 @@ internal sealed class EslintJsonOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid ESLint JSON: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid ESLint JSON: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
 
@@ -123,8 +123,8 @@ internal sealed class EslintJsonOutputParser : IExternalToolOutputParser
 
         return new ExternalToolFinding(
             SeverityLevel: severity,
-            RuleId: NullIfWhiteSpace(GetString(message, "ruleId"u8)),
-            Message: NullIfWhiteSpace(GetString(message, "message"u8)) ?? "(no message)",
+            RuleId: ToolOutputText.NullIfWhiteSpace(GetString(message, "ruleId"u8)),
+            Message: ToolOutputText.NullIfWhiteSpace(GetString(message, "message"u8)) ?? "(no message)",
             Path: path,
             Line: line);
     }

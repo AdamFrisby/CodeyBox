@@ -18,10 +18,12 @@ namespace CodeyBox.Tests;
 ///   else are infrastructure.
 /// - PMD XML on stdout maps to findings with rule ids, locations, and priority-mapped severity.
 /// - Severity mapping is declared and applied (priorities 1–5 plus the parser's synthetic
-///   processing-error/config-error tokens); raw tool levels never pass through.
+///   processing-error/config-error/suppressed-violation tokens); raw tool levels never
+///   pass through.
 /// - Default flags: XML report, quickstart ruleset, whole-worktree scan, repo-relative paths
-///   (-z with the absolute worktree), NOPMD neutralisation; scoped knobs (ExpectedVersion,
-///   RulesetPath, TrustRepositorySuppression, ExtraArguments, ExcludePaths).
+///   (-z with the absolute worktree), NOPMD neutralisation, --show-suppressed so
+///   repository-suppressed violations surface as advisory findings; scoped knobs
+///   (ExpectedVersion, RulesetPath, TrustRepositorySuppression, ExtraArguments, ExcludePaths).
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled; when
 ///   enabled it declares pmd (no apt package — distros ship PMD 6) and the java runtime.
 /// - Real binary execution tests under [Trait("requires_pmd", "true")].
@@ -121,7 +123,7 @@ public sealed class PmdAuditorTests
         </file>
         <error filename="src/Broken.java" msg="PMDException: Error while parsing src/Broken.java"><![CDATA[stack detail]]></error>
         <configerror rule="GhostRule" msg="Unable to find referenced rule GhostRule"/>
-        <suppressedviolation filename="src/Supp.java" suppressiontype="nopmd" msg="suppressed" usermsg=""/>
+        <suppressedviolation filename="src/Supp.java" suppressiontype="annotation" msg="Avoid empty catch blocks." usermsg="known flaky handler"/>
         </pmd>
         """;
 
@@ -264,12 +266,15 @@ public sealed class PmdAuditorTests
     public async Task ExceptionAndUsageErrorExits_AreInfrastructure(int exitCode)
     {
         // 1 = exception during execution; 2 = usage error (e.g. missing -R):
-        // "could not run" regardless of what stdout carries.
+        // "could not run" regardless of what stdout carries. The scan returns
+        // a parseable report so the asserted throw can only come from the
+        // exit-code classification — an empty stdout would produce the same
+        // exception type through the parse-failure backstop.
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
-            return Task.FromResult(new SandboxExecResult(exitCode, "", "pmd: usage error"));
+            return Task.FromResult(new SandboxExecResult(exitCode, XmlWithFindings, "pmd: usage error"));
         });
 
         IAuditor auditor = new PmdAuditor();
@@ -341,9 +346,10 @@ public sealed class PmdAuditorTests
         IAuditor auditor = new PmdAuditor();
         var result = await auditor.RunAsync(sandbox, WorkDir, FakeContext(), CancellationToken.None);
 
-        // Violation + processing error + config error; the suppressed
-        // violation element is never a finding.
-        Assert.Equal(3, result.Findings.Count);
+        // Violation + processing error + config error + suppressed
+        // violation: a repo-silenced finding surfaces as advisory — the
+        // audited repository must not be able to hide it.
+        Assert.Equal(4, result.Findings.Count);
         Assert.True(result.Passed);
 
         var processingError = Assert.Single(
@@ -354,6 +360,12 @@ public sealed class PmdAuditorTests
         var configError = Assert.Single(
             result.Findings, f => f.Title.Contains("GhostRule", StringComparison.Ordinal));
         Assert.Equal(AuditSeverity.Warning, configError.Severity);
+
+        var suppressed = Assert.Single(
+            result.Findings, f => f.Location == "src/Supp.java");
+        Assert.Equal(AuditSeverity.Warning, suppressed.Severity);
+        Assert.Contains("suppressed", suppressed.Title, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("annotation", suppressed.Title, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -401,8 +413,12 @@ public sealed class PmdAuditorTests
         Assert.StartsWith(PmdAuditor.DisabledSuppressMarkerPrefix, marker, StringComparison.Ordinal);
         Assert.True(marker.Length > PmdAuditor.DisabledSuppressMarkerPrefix.Length);
         var secondMarkerIndex = scanArgvs[1].ToList().IndexOf("--suppress-marker");
+        Assert.True(secondMarkerIndex >= 0 && secondMarkerIndex + 1 < scanArgvs[1].Count);
         Assert.NotEqual(marker, scanArgvs[1][secondMarkerIndex + 1]);
-        Assert.DoesNotContain("--show-suppressed", argv);
+        // --show-suppressed keeps the suppression channels PMD cannot
+        // disable (@SuppressWarnings, ruleset XPath/regex) visible:
+        // suppressed violations arrive in the report instead of vanishing.
+        Assert.Contains("--show-suppressed", argv);
         Assert.DoesNotContain("--report-file", argv);
         Assert.DoesNotContain("--cache", argv);
     }
@@ -615,8 +631,11 @@ public sealed class PmdAuditorTests
         await ((IAuditor)auditor).RunAsync(sandbox, WorkDir, FakeContext(), CancellationToken.None);
 
         Assert.NotNull(scanExec);
-        // No --suppress-marker flag: PMD's default NOPMD marker is honored again.
+        // No --suppress-marker flag: PMD's default NOPMD marker is honored
+        // again — and no --show-suppressed, so violations the repo silences
+        // leave no advisory trace.
         Assert.DoesNotContain("--suppress-marker", scanExec!.Argv);
+        Assert.DoesNotContain("--show-suppressed", scanExec!.Argv);
     }
 
     [Fact]
@@ -891,12 +910,17 @@ public sealed class PmdAuditorTests
             };
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain both pipes concurrently: a child that fills the stderr
+            // pipe while stdout is being read would deadlock the probe.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 15_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            var stdout = stdoutTask.GetAwaiter().GetResult();
+            _ = stderrTask.GetAwaiter().GetResult();
             return process.ExitCode == 0 ? PmdAuditor.ExtractPmdVersion(stdout) : null;
         }
         catch

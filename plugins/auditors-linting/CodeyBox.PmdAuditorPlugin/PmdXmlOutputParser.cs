@@ -24,13 +24,22 @@ namespace CodeyBox.PmdAuditorPlugin;
 /// auditor classifies as infrastructure before parsing); they matter only
 /// when an operator passes <c>--no-fail-on-error</c> in
 /// <c>ExtraArguments</c>, where they keep partial-analysis gaps visible
-/// instead of silently zeroing coverage. <c>&lt;suppressedviolation&gt;</c>
-/// elements (present only when an operator passes
-/// <c>--show-suppressed</c>) are skipped: they describe violations the
-/// repository already suppressed, not findings.</para>
+/// instead of silently zeroing coverage.</para>
+///
+/// <para><c>&lt;suppressedviolation&gt;</c> elements — present only when
+/// <c>--show-suppressed</c> is passed, which the auditor does under its
+/// default untrusted posture — are emitted as findings with the synthetic
+/// severity token <c>suppressed-violation</c> mapped to advisory. The audit
+/// subject writes the repository, and a repo-authored
+/// <c>@SuppressWarnings("PMD…")</c> (the one suppression channel PMD offers
+/// no CLI switch to disable) must not silently hide a finding: surfacing
+/// the suppression as an advisory finding records what the repository
+/// suppressed, by which mechanism (<c>suppressiontype</c>: annotation,
+/// nopmd, xpath, regex), and where.</para>
 ///
 /// <para>Severity stays in PMD's own vocabulary (<c>"1"</c>–<c>"5"</c>,
-/// <c>processing-error</c>, <c>config-error</c>);
+/// <c>processing-error</c>, <c>config-error</c>,
+/// <c>suppressed-violation</c>);
 /// <see cref="ExternalToolAuditorBase"/> maps it through the auditor's
 /// declared <see cref="ExternalToolSeverityMapping"/> — raw levels never
 /// reach findings.</para>
@@ -50,7 +59,10 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
     /// <summary>Synthetic severity token for <c>&lt;configerror&gt;</c> (rule configuration failure) elements.</summary>
     internal const string ConfigErrorLevel = "config-error";
 
-    /// <summary>Element name for violations suppressed by NOPMD/annotation markers — reported only, never findings.</summary>
+    /// <summary>Synthetic severity token for <c>&lt;suppressedviolation&gt;</c> (repository-suppressed violation) elements.</summary>
+    internal const string SuppressedViolationLevel = "suppressed-violation";
+
+    /// <summary>Element name for violations suppressed by repository-authored markers/annotations.</summary>
     private const string SuppressedElementName = "suppressedviolation";
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
@@ -139,8 +151,7 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
                             ?? "PMD rule configuration error (rule could not run — coverage is partial)"));
                     break;
                 case SuppressedElementName:
-                    // Suppressed violations are not findings; present only
-                    // when the operator passed --show-suppressed.
+                    findings.Add(ParseSuppressedViolation(reader));
                     break;
             }
         }
@@ -183,6 +194,29 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
             Message: message,
             Path: currentFile,
             Line: line);
+    }
+
+    // <suppressedviolation> is an attribute-only element (filename,
+    // suppressiontype, msg, usermsg — PMD renders no rule id or line), so
+    // it is read directly off the current node without a subtree reader.
+    private static ExternalToolFinding ParseSuppressedViolation(XmlReader reader)
+    {
+        var path = ToolOutputText.NullIfWhiteSpace(reader.GetAttribute("filename"));
+        var suppressionType = ToolOutputText.NullIfWhiteSpace(reader.GetAttribute("suppressiontype"))
+            ?? "unknown";
+        var message = ToolOutputText.NullIfWhiteSpace(reader.GetAttribute("msg"))
+            ?? "(no message)";
+        var userMessage = ToolOutputText.NullIfWhiteSpace(reader.GetAttribute("usermsg"));
+
+        var text = $"Suppressed violation ({suppressionType}): {message}";
+        if (userMessage is not null)
+            text += $" — suppression note: {userMessage}";
+
+        return new ExternalToolFinding(
+            SeverityLevel: SuppressedViolationLevel,
+            RuleId: null,
+            Message: text,
+            Path: path);
     }
 
     private static ExternalToolFinding ParseProcessingError(XmlReader reader)

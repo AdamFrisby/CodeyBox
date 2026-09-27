@@ -68,7 +68,7 @@ internal sealed class KubeconformJsonOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid kubeconform JSON: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid kubeconform JSON: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
 
@@ -105,11 +105,11 @@ internal sealed class KubeconformJsonOutputParser : IExternalToolOutputParser
         if (string.IsNullOrWhiteSpace(status) || IsNonProblemStatus(status))
             return null;
 
-        var kind = NullIfWhiteSpace(GetString(resource, "kind"u8));
-        var name = NullIfWhiteSpace(GetString(resource, "name"u8));
-        var version = NullIfWhiteSpace(GetString(resource, "version"u8));
-        var msg = NullIfWhiteSpace(GetString(resource, "msg"u8)) ?? "(no message)";
-        var path = NullIfWhiteSpace(GetString(resource, "filename"u8));
+        var kind = ToolOutputText.NullIfWhiteSpace(GetString(resource, "kind"u8));
+        var name = ToolOutputText.NullIfWhiteSpace(GetString(resource, "name"u8));
+        var version = ToolOutputText.NullIfWhiteSpace(GetString(resource, "version"u8));
+        var msg = ToolOutputText.NullIfWhiteSpace(GetString(resource, "msg"u8)) ?? "(no message)";
+        var path = ToolOutputText.NullIfWhiteSpace(GetString(resource, "filename"u8));
 
         // statusError marks "could not validate" (unreadable file, YAML parse
         // failure, schema unavailable); statusInvalid marks a schema
@@ -159,8 +159,8 @@ internal sealed class KubeconformJsonOutputParser : IExternalToolOutputParser
             {
                 if (error.ValueKind != JsonValueKind.Object)
                     continue;
-                var field = NullIfWhiteSpace(GetString(error, "path"u8));
-                var detail = NullIfWhiteSpace(GetString(error, "msg"u8));
+                var field = ToolOutputText.NullIfWhiteSpace(GetString(error, "path"u8));
+                var detail = ToolOutputText.NullIfWhiteSpace(GetString(error, "msg"u8));
                 if (field is null && detail is null)
                     continue;
                 if (appended >= MaxValidationErrorsInMessage)

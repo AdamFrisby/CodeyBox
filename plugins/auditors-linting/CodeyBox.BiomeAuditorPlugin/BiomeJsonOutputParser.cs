@@ -49,7 +49,7 @@ internal sealed class BiomeJsonOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid Biome JSON: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid Biome JSON: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
 
@@ -79,9 +79,9 @@ internal sealed class BiomeJsonOutputParser : IExternalToolOutputParser
 
     private static ExternalToolFinding ParseDiagnostic(JsonElement diagnostic)
     {
-        var severity = NullIfWhiteSpace(GetString(diagnostic, "severity"u8));
-        var ruleId = NullIfWhiteSpace(GetString(diagnostic, "category"u8));
-        var message = NullIfWhiteSpace(GetString(diagnostic, "message"u8)) ?? "(no message)";
+        var severity = ToolOutputText.NullIfWhiteSpace(GetString(diagnostic, "severity"u8));
+        var ruleId = ToolOutputText.NullIfWhiteSpace(GetString(diagnostic, "category"u8));
+        var message = ToolOutputText.NullIfWhiteSpace(GetString(diagnostic, "message"u8)) ?? "(no message)";
 
         string? path = null;
         int? line = null;

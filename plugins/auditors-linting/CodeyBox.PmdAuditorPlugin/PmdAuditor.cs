@@ -30,7 +30,10 @@ namespace CodeyBox.PmdAuditorPlugin;
 /// operator inspects the XML findings or a SARIF export. With the default
 /// <c>rulesets/java/quickstart.xml</c> most findings are advisory; enabling
 /// higher-priority rulesets (e.g. category/java/security.xml) is what turns
-/// the auditor into a hard gate. <c>MinimumSeverity</c> only drops
+/// the auditor into a hard gate. Synthetic report-element levels —
+/// <c>processing-error</c>, <c>config-error</c>,
+/// <c>suppressed-violation</c> — are advisory
+/// (<see cref="AuditSeverity.Warning"/>). <c>MinimumSeverity</c> only drops
 /// findings, it never raises them.</para>
 ///
 /// <para><b>Exit-code convention (from the PMD 7 CLI reference — PMD does
@@ -84,19 +87,23 @@ namespace CodeyBox.PmdAuditorPlugin;
 /// would suppress, and repo code cannot contain a token it cannot predict —
 /// a fixed token would be forgeable because the audit subject can read this
 /// assembly. PMD offers no CLI switch to ignore
-/// <c>@SuppressWarnings</c> — that annotation channel stays honored and is
-/// documented as a limitation (a rule-level
-/// <c>violationSuppressXPath</c>/<c>violationSuppressRegex</c> in an
-/// operator-pinned ruleset can further narrow it). Operators who
-/// deliberately trust repo-authored suppression set
-/// <c>TrustRepositorySuppression</c> in scoped config, restoring PMD's
-/// default <c>NOPMD</c> marker. PMD reads no configuration file from the
-/// audited tree — the ruleset is always supplied explicitly
-/// (<c>-R</c>).</para>
+/// <c>@SuppressWarnings</c> — that annotation channel (and any ruleset-level
+/// <c>violationSuppressXPath</c>/<c>violationSuppressRegex</c>) cannot be
+/// disabled, so the scan instead passes <c>--show-suppressed</c> and the
+/// parser emits each <c>&lt;suppressedviolation&gt;</c> element as an
+/// advisory <c>suppressed-violation</c> finding: a repo-silenced violation
+/// surfaces in the report — mechanism, file, and message — rather than
+/// vanishing from the verdict. Operators who deliberately trust
+/// repo-authored suppression set <c>TrustRepositorySuppression</c> in
+/// scoped config, restoring PMD's default <c>NOPMD</c> marker and dropping
+/// <c>--show-suppressed</c> so suppressed violations stay silent. PMD reads
+/// no configuration file from the audited tree — the ruleset is always
+/// supplied explicitly (<c>-R</c>).</para>
 ///
 /// <para><b>Scope and defaults.</b> The scan is
 /// <c>pmd check -d . -f xml -R rulesets/java/quickstart.xml -z &lt;worktree&gt;
-/// --no-progress --suppress-marker &lt;token&gt;</c>: the whole worktree is
+/// --no-progress --suppress-marker &lt;token&gt; --show-suppressed</c>: the
+/// whole worktree is
 /// collected and PMD's language detection skips anything its rulesets do not
 /// cover, so the effective scope is "the ruleset's languages" — Java by
 /// default (the curated quickstart ruleset), more via an operator ruleset
@@ -160,10 +167,11 @@ public sealed class PmdAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <summary>
     /// Scoped-config key opting in to repository-authored suppression —
     /// PMD's <c>// NOPMD</c> comment marker (the default
-    /// <c>--suppress-marker</c> is restored). Default false: the audited
-    /// repo must not be able to silence findings by comment. The
-    /// <c>@SuppressWarnings("PMD…")</c> annotation channel cannot be
-    /// disabled from the CLI either way.
+    /// <c>--suppress-marker</c> is restored) and silent suppression
+    /// reporting (<c>--show-suppressed</c> is dropped, so
+    /// <c>@SuppressWarnings</c> and ruleset-level suppressions leave no
+    /// advisory trace). Default false: the audited repo must not be able
+    /// to silence findings by comment or hide the ones it did suppress.
     /// </summary>
     public const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
 
@@ -231,7 +239,9 @@ public sealed class PmdAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// warning, 4–5 → note) so "high" means what every other auditor's
     /// "high" means. <c>&lt;error&gt;</c>/<c>&lt;configerror&gt;</c> report
     /// elements (partial-coverage signals under
-    /// <c>--no-fail-on-error</c>) map to advisory. Raw levels never reach
+    /// <c>--no-fail-on-error</c>) and <c>&lt;suppressedviolation&gt;</c>
+    /// elements (repository-silenced violations under
+    /// <c>--show-suppressed</c>) map to advisory. Raw levels never reach
     /// findings.
     /// </summary>
     protected override ExternalToolSeverityMapping SeverityMapping { get; } =
@@ -244,6 +254,7 @@ public sealed class PmdAuditor : ExternalToolAuditorBase, IPluginInitializer
             ["5"] = AuditSeverity.Info,
             [PmdXmlOutputParser.ProcessingErrorLevel] = AuditSeverity.Warning,
             [PmdXmlOutputParser.ConfigErrorLevel] = AuditSeverity.Warning,
+            [PmdXmlOutputParser.SuppressedViolationLevel] = AuditSeverity.Warning,
         }, AuditSeverity.Warning);
 
     /// <inheritdoc />
@@ -289,14 +300,23 @@ public sealed class PmdAuditor : ExternalToolAuditorBase, IPluginInitializer
         // The audited repository must not silence the gate: the marker is a
         // fresh unguessable token per invocation, so `// NOPMD` comments are
         // inert and the subject cannot pre-embed the token even though this
-        // assembly is readable to it. Operators opt in to repo-authored
-        // suppression via TrustRepositorySuppression (or by supplying their
-        // own --suppress-marker).
-        if (!_trustRepositorySuppression()
-            && !ExtraArgumentsSupplyFlag(options, "--suppress-marker"))
+        // assembly is readable to it. --show-suppressed covers the channels
+        // PMD cannot switch off (@SuppressWarnings annotations, ruleset
+        // XPath/regex suppressors): suppressed violations render into the
+        // report as <suppressedviolation> elements and the parser surfaces
+        // them as advisory findings instead of letting them vanish.
+        // Operators opt in to repo-authored suppression via
+        // TrustRepositorySuppression (or by supplying their own
+        // --suppress-marker / --show-suppressed).
+        if (!_trustRepositorySuppression())
         {
-            args.Add("--suppress-marker");
-            args.Add(NewSuppressMarkerToken());
+            if (!ExtraArgumentsSupplyFlag(options, "--suppress-marker"))
+            {
+                args.Add("--suppress-marker");
+                args.Add(NewSuppressMarkerToken());
+            }
+            if (!ExtraArgumentsSupplyFlag(options, "--show-suppressed"))
+                args.Add("--show-suppressed");
         }
 
         // Scan input: the whole worktree, collected with automatic language
