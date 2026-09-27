@@ -3,7 +3,6 @@ using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk;
-using CodeyBox.PluginSdk.Tools;
 using CodeyBox.DetektAuditorPlugin;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Configuration;
@@ -20,6 +19,9 @@ namespace CodeyBox.Tests;
 /// - The SARIF report is read from stderr (--report sarif:/dev/stderr): detekt's console
 ///   reports and IssuesFound message go to stdout, so a verdict exit with no SARIF on
 ///   stderr fails closed as infrastructure.
+/// - The scan passes --base-path . so detekt records repository-relative artifact URIs
+///   (without it SARIF carries absolute file:/// URIs) — an operator --base-path in
+///   ExtraArguments wins.
 /// - detekt SARIF maps to findings with namespaced rule ids, locations, and mapped severity
 ///   (error→Error, warning→Warning, note→Info) — raw levels never pass through.
 /// - Default exclusions (vendored/generated paths), repo detekt.yml discovery under
@@ -449,11 +451,46 @@ public sealed class DetektAuditorTests
         var inputIndex = argv.ToList().IndexOf("--input");
         Assert.True(inputIndex >= 0 && inputIndex + 1 < argv.Count);
         Assert.Equal(".", argv[inputIndex + 1]);
+        // Without a base path detekt emits absolute file:/// artifact URIs —
+        // "." anchors them repository-relative so Location and ExcludePaths work.
+        var basePathIndex = argv.ToList().IndexOf("--base-path");
+        Assert.True(basePathIndex >= 0 && basePathIndex + 1 < argv.Count);
+        Assert.Equal(".", argv[basePathIndex + 1]);
         var reportIndex = argv.ToList().IndexOf("--report");
         Assert.True(reportIndex >= 0 && reportIndex + 1 < argv.Count);
         Assert.Equal("sarif:/dev/stderr", argv[reportIndex + 1]);
         // No repo detekt.yml present in the fixture: no --config is passed.
         Assert.DoesNotContain("--config", argv);
+    }
+
+    [Fact]
+    public async Task ExtraArguments_BasePath_SuppressesTheBuiltInOne()
+    {
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsConfigProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, "", SarifClean));
+        });
+
+        var auditor = new DetektAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--base-path=/opt/elsewhere",
+            }),
+            CancellationToken.None);
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        var argv = scanExec!.Argv.ToList();
+        // The operator's attached-form --base-path is the only one passed;
+        // the auditor does not stack its own "." selection on top of it.
+        Assert.DoesNotContain("--base-path", argv);
+        Assert.Contains("--base-path=/opt/elsewhere", argv);
     }
 
     [Fact]
@@ -660,15 +697,22 @@ public sealed class DetektAuditorTests
         var plugins = loader.DiscoverPlugins();
         Assert.Contains(plugins, p => p.PluginId == DetektAuditor.PluginId);
 
-        var tool = Assert.Single(loader.GetEnabledPluginTools());
-        Assert.Equal("detekt", tool.Binary);
+        var tools = loader.GetEnabledPluginTools();
+        var detekt = Assert.Single(tools, t => t.Binary == "detekt");
         // No apt package carries a version pin: presence is verified at bake
         // time and the operator provisions the release via the install hint.
-        Assert.Null(tool.AptPackage);
+        Assert.Null(detekt.AptPackage);
+        // The detekt launcher execs a JVM — the runtime is declared so bake
+        // verifies (and apt-installs) the whole dependency chain.
+        var java = Assert.Single(tools, t => t.Binary == "java");
+        Assert.Equal("default-jre-headless", java.AptPackage);
 
-        var contributions = PluginBaselineProvisioning.BuildContributions(loader.GetEnabledPluginTools());
-        var verification = Assert.Single(contributions.VerificationCommands);
-        Assert.Contains("detekt", string.Join(" ", verification.Argv), StringComparison.Ordinal);
+        var contributions = PluginBaselineProvisioning.BuildContributions(tools);
+        Assert.Contains(contributions.InstallCommands, c => c.Contains("default-jre-headless", StringComparison.Ordinal));
+        var verification = string.Join(
+            "\n", contributions.VerificationCommands.SelectMany(static v => v.Argv));
+        Assert.Contains("detekt", verification, StringComparison.Ordinal);
+        Assert.Contains("java", verification, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -711,6 +755,12 @@ public sealed class DetektAuditorTests
                 Assert.False(string.IsNullOrWhiteSpace(f.Title));
                 Assert.False(string.IsNullOrWhiteSpace(f.Location));
             });
+            // The seeded `return 42` is line 4 of Fixture.kt at the worktree
+            // root; --base-path . anchors the artifact URI repository-relative.
+            var magic = Assert.Single(
+                result.Findings,
+                f => f.Title.Contains("detekt.style.MagicNumber", StringComparison.Ordinal));
+            Assert.Equal("Fixture.kt:4", magic.Location);
         }
         finally
         {
@@ -830,12 +880,18 @@ public sealed class DetektAuditorTests
             };
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain both streams asynchronously: a full stderr pipe would block
+            // the child's exit, and ReadToEnd would wait for EOF with the exit
+            // timeout never reached. Bound the wait on exit first, then read.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 60_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            process.WaitForExit(); // let the redirected streams flush to EOF
+            var stdout = stdoutTask.GetAwaiter().GetResult();
             var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }

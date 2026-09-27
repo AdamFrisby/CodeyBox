@@ -1,18 +1,20 @@
 # CodeyBox: detekt Kotlin Analyser
 
 Auditor plugin wrapping [detekt](https://detekt.dev): it analyses the audited
-repository with `detekt --input . --report sarif:/dev/stderr` and reports each
-finding as an audit finding with the namespaced rule id (e.g.
-`detekt.style.MagicNumber`, `detekt.potential-bugs.UnsafeCallOnNullableType`)
-and `file:line` location. Kotlin source analysis only.
+repository with `detekt --input . --base-path . --report sarif:/dev/stderr`
+and reports each finding as an audit finding with the namespaced rule id
+(e.g. `detekt.style.MagicNumber`,
+`detekt.potential-bugs.EqualsAlwaysReturnsTrueOrFalse`) and `file:line`
+location. Kotlin source analysis only.
 
 ## What it reports
 
 - One finding per detekt issue. The title carries the rule id and the first
   line of the message; the description carries the tool, rule, tool-reported
   SARIF level, location, and the full message. `Location` is
-  `path:startLine` — detekt reports repository-relative artifact URIs when the
-  file is under the base path.
+  `path:startLine` — the scan passes `--base-path .`, so detekt records
+  artifact URIs relative to the worktree root (without a base path it would
+  emit absolute `file:///` URIs).
 - **Gate behaviour: blocking on findings by default — the tool's own
   semantics.** detekt's default severity for every rule is `error` (per the
   detekt docs), and its own CLI gate fails the build on any issue. The
@@ -49,7 +51,7 @@ and `file:line` location. Kotlin source analysis only.
 |---|---|
 | `ExpectedVersion` | Pinned detekt release (default `1.23.8`). The auditor probes `detekt --version` before every scan; a missing binary, unrecognised version, or mismatch is an infrastructure failure naming `detekt`. |
 | `ConfigPath` | Operator-owned detekt config passed as `--config`. Should live outside the audited tree. When set it is the only config passed. |
-| `TrustRepositoryConfig` | Default `true`: the first present of `detekt.yml`, `detekt.yaml`, `config/detekt/detekt.yml`, `config/detekt/detekt.yaml` is passed as `--config` (the CLI does not auto-discover it). `false` = the repo's config is never loaded. |
+| `TrustRepositoryConfig` | Default `true`: the first present of `detekt.yml`, `detekt.yaml`, `config/detekt/detekt.yml`, `config/detekt/detekt.yaml` is passed as `--config` (the CLI does not auto-discover it). The load is logged at info level so the audit trail shows the gate ran under repo-authored configuration. `false` = the repo's config is never loaded. |
 | `MinimumSeverity`, `IncludedRules`, `ExcludedRules`, `ExcludePaths`, `ExtraArguments`, `TimeoutSeconds`, `MaxOutputBytesPerStream`, `MaxFindings` | Shared per-auditor knobs (`ExternalToolAuditorOptions`). Rule ids are detekt-namespaced (`detekt.<ruleset>.<rule>`). |
 
 **Trust warning:** the repo detekt config is executable configuration — it
@@ -78,20 +80,22 @@ never a passing audit.
 
 ## Default scope and exclusions
 
-Whole-tree scan (`--input .`); findings under `vendor/`, `third_party/`,
-`node_modules/`, `dist/`, `build/`, `out/`, `coverage/` are dropped by the
-default `ExcludePaths` — vendored and generated Kotlin is not the change
-under audit. `buildSrc/` is deliberately **not** excluded: it is authored
-build logic, not generated output. The scan writes nothing into the audited
-tree.
+Whole-tree scan (`--input . --base-path .`); findings under `vendor/`,
+`third_party/`, `node_modules/`, `dist/`, `build/`, `out/`, `coverage/` are
+dropped by the default `ExcludePaths` — vendored and generated Kotlin is not
+the change under audit. `buildSrc/` is deliberately **not** excluded: it is
+authored build logic, not generated output. The scan writes nothing into the
+audited tree.
 
 ## Provisioning
 
-The `detekt` requirement is declared via `[CodeyBoxPluginRequiresTool]`, so
-baseline provisioning installs it **only when this plugin is enabled** and the
-plugin defaults to disabled. There is no apt package carrying a pinned detekt:
-provision a Java runtime plus the `detekt-cli` distribution (the `bin/detekt`
-script) from the GitHub releases page via
+The `detekt` and `java` requirements are declared via
+`[CodeyBoxPluginRequiresTool]`, so baseline provisioning installs them **only
+when this plugin is enabled** and the plugin defaults to disabled. The `java`
+requirement covers the JVM the `detekt` launcher script execs — the declared
+`default-jre-headless` apt package installs it automatically. There is no apt
+package carrying a pinned detekt: provision the `detekt-cli` distribution
+(the `bin/detekt` script) from the GitHub releases page via
 `CodeyBox:MultipassExtraRuncmd` / `CodeyBox:Incus:ExtraRuncmd` or
 `ExecutableProvisions`, and set `ExpectedVersion` if the provisioned build
 differs from the default pin.

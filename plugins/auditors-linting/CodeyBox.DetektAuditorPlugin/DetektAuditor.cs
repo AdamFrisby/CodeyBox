@@ -2,6 +2,7 @@ using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using CodeyBox.PluginSdk.Tools;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.DetektAuditorPlugin;
 
@@ -63,7 +64,8 @@ namespace CodeyBox.DetektAuditorPlugin;
 /// the detekt CLI does not auto-discover a repo <c>detekt.yml</c> — the
 /// auditor probes the conventional locations and passes one explicitly when
 /// <c>TrustRepositoryConfig</c> is true (the default): linting against the
-/// project's own lint contract is the meaningful check. The contract is
+/// project's own lint contract is the meaningful check — and the load is
+/// announced at info level so the gate posture is auditable. The contract is
 /// executable configuration: a repo-authored config can deactivate rules or
 /// lower severities, and an <c>output-reports</c> exclude of
 /// <c>SarifOutputReport</c> would stop the report — which fails closed as
@@ -75,14 +77,22 @@ namespace CodeyBox.DetektAuditorPlugin;
 /// deliberately through <c>ExtraArguments</c>.</para>
 ///
 /// <para><b>Scope and limits.</b> The scan is
-/// <c>detekt --input . --report sarif:/dev/stderr</c>: the whole audited tree,
-/// every <c>.kt</c>/<c>.kts</c>. detekt CLI runs light analysis (no type
-/// resolution) — rules annotated <c>@RequiresTypeResolution</c> do not run
-/// without a <c>--classpath</c> the operator can pass via
-/// <c>ExtraArguments</c>. A tree with no Kotlin sources is a clean pass, not
-/// an error. Findings under vendored and generated-output prefixes are
-/// dropped by the default <c>ExcludePaths</c>; operators re-include by
-/// overriding it. The scan writes nothing into the audited tree.</para>
+/// <c>detekt --input . --base-path . --report sarif:/dev/stderr</c>: the
+/// whole audited tree, every <c>.kt</c>/<c>.kts</c>. <c>--base-path .</c> is
+/// load-bearing: detekt only records a path relative to the base path when
+/// one is given (<c>CliArgs.basePath</c> → <c>KtCompiler.createKtFile</c>'s
+/// <c>RELATIVE_PATH</c>); without it the SARIF emitter (<c>Results.kt</c>)
+/// writes absolute <c>file:///…</c> URIs, producing host-shaped finding
+/// locations and paths the repository-relative <c>ExcludePaths</c> prefixes
+/// could never match. Resolved against the scan's working directory,
+/// <c>.</c> makes artifact URIs repository-relative wherever the sandbox
+/// runs the tool. detekt CLI runs light analysis (no type resolution) —
+/// rules annotated <c>@RequiresTypeResolution</c> do not run without a
+/// <c>--classpath</c> the operator can pass via <c>ExtraArguments</c>. A tree
+/// with no Kotlin sources is a clean pass, not an error. Findings under
+/// vendored and generated-output prefixes are dropped by the default
+/// <c>ExcludePaths</c>; operators re-include by overriding it. The scan
+/// writes nothing into the audited tree.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: PluginId,
@@ -91,10 +101,18 @@ namespace CodeyBox.DetektAuditorPlugin;
 [CodeyBoxPluginRequiresTool(
     "detekt",
     InstallHint = "provision the pinned detekt CLI release (see ExpectedVersion, default "
-        + DefaultExpectedVersion + ") into the sandbox baseline — a Java runtime plus the "
+        + DefaultExpectedVersion + ") into the sandbox baseline — the "
         + "detekt-cli distribution from https://github.com/detekt/detekt/releases — via "
         + "CodeyBox:MultipassExtraRuncmd / CodeyBox:Incus:ExtraRuncmd or ExecutableProvisions; "
         + "no distro apt package carries a version pin")]
+// The detekt CLI launcher is a shell script that execs java — the runtime is
+// a real dependency of the scan, so it is declared and verified (and
+// apt-installed) alongside the launcher rather than left implicit.
+[CodeyBoxPluginRequiresTool(
+    "java",
+    AptPackage = "default-jre-headless",
+    InstallHint = "the detekt CLI launcher execs a JVM — install a Java runtime "
+        + "(the declared apt package covers it) or provision a JDK/JRE and set JAVA_HOME")]
 public sealed class DetektAuditor : ExternalToolAuditorBase, IPluginInitializer
 {
     /// <summary>Plugin id used in <c>Plugins:Enabled</c> and the scoped-config section.</summary>
@@ -157,6 +175,7 @@ public sealed class DetektAuditor : ExternalToolAuditorBase, IPluginInitializer
     private Func<string?> _expectedVersion = static () => DefaultExpectedVersion;
     private Func<string?> _configPath = static () => null;
     private Func<bool> _trustRepositoryConfig = static () => true;
+    private ILogger _logger = NullLogger.Instance;
 
     /// <inheritdoc />
     public override string Name => "codeybox:detekt";
@@ -206,6 +225,18 @@ public sealed class DetektAuditor : ExternalToolAuditorBase, IPluginInitializer
             ".",
         };
 
+        if (!ExtraArgumentsSupplyFlag(options, "--base-path", "-bp"))
+        {
+            // detekt records a file's path relative to the base path only when
+            // one is given; with none, its SARIF emitter writes absolute
+            // file:/// URIs and repository-relative ExcludePaths could never
+            // match. "." resolves against the scan's working directory — the
+            // worktree root as the tool sees it — so artifact URIs come out
+            // repository-relative. An operator --base-path wins outright.
+            args.Add("--base-path");
+            args.Add(".");
+        }
+
         if (!ExtraArgumentsSupplyFlag(options, "--report", "-r"))
         {
             // Machine-readable SARIF 2.1.0 on stderr: console reports and the
@@ -244,7 +275,18 @@ public sealed class DetektAuditor : ExternalToolAuditorBase, IPluginInitializer
         var present = await ProbeRepositoryFilesPresentAsync(
             sandbox, workingDirectory, ToolName, RepositoryConfigCandidates, options, ct)
             .ConfigureAwait(false);
-        return present.Count == 0 ? [] : ["--config", present[0]];
+        if (present.Count == 0)
+            return [];
+
+        // Repo-authored config is executable configuration: announce the load
+        // so the audit trail shows the gate ran under the repository's own
+        // lint contract rather than silently inheriting it. The path is one
+        // of the fixed candidates, never arbitrary input.
+        _logger.LogInformation(
+            "detekt: loading repository-authored config {ConfigFile} (--config); "
+            + "set {TrustKey}=false for a fully operator-owned run",
+            present[0], TrustRepositoryConfigKey);
+        return ["--config", present[0]];
     }
 
     /// <inheritdoc />
@@ -257,6 +299,7 @@ public sealed class DetektAuditor : ExternalToolAuditorBase, IPluginInitializer
         _configPath = () => scoped[ConfigPathKey];
         _trustRepositoryConfig = () =>
             !bool.TryParse(scoped[TrustRepositoryConfigKey], out var trust) || trust;
+        _logger = context.Logger;
         context.Logger.LogInformation(
             "DetektAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
