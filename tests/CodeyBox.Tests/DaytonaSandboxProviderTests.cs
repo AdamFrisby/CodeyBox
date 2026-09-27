@@ -865,6 +865,78 @@ public sealed class DaytonaSandboxProviderTests
     }
 
     [Fact]
+    public void ServiceUrl_RemoteHttpRejected_EvenWithUnsafeHttpOptIn()
+    {
+        // AllowUnsafeHttp is a loopback-only test hook: with the flag set, a
+        // remote cleartext URL must still be refused so one operator edit can
+        // never send the API key cleartext to an arbitrary host.
+        var refused = Assert.Throws<DaytonaApiException>(() =>
+            DaytonaApiClient.TryParseAbsoluteUrl(
+                "http://proxy.example/toolbox", "sandbox toolboxProxyUrl", allowUnsafeHttp: true));
+        Assert.Equal(DaytonaFailureKind.Unexpected, refused.Kind);
+        Assert.Contains("AllowUnsafeHttp", refused.Message);
+
+        Assert.Throws<DaytonaApiException>(() =>
+            DaytonaApiClient.TryParseAbsoluteUrl(
+                "http://192.168.0.9/toolbox", "sandbox toolboxProxyUrl", allowUnsafeHttp: true));
+
+        // Loopback http stays usable for local tests under the opt-in.
+        var loopback = DaytonaApiClient.TryParseAbsoluteUrl(
+            "http://127.0.0.1/toolbox", "sandbox toolboxProxyUrl", allowUnsafeHttp: true);
+        Assert.Equal("http://127.0.0.1/toolbox", loopback!.ToString());
+    }
+
+    [Fact]
+    public void UntrustedText_SanitizedForSingleLineLogSurfaces()
+    {
+        Assert.Equal("a b c", DaytonaTextUtil.SanitizeForLog("a\nb\rc"));
+        Assert.Equal("a b", DaytonaTextUtil.SanitizeForLog("a\tb"));
+        Assert.Equal("abc", DaytonaTextUtil.SanitizeForLog("abc"));
+
+        // Guest stderr tails reach exception messages and structured logs, so
+        // Tail folds line breaks that would otherwise forge log lines.
+        Assert.Equal("oops  boom", DaytonaTextUtil.Tail("oops\n boom"));
+    }
+
+    [Fact]
+    public async Task LogDemuxer_ChunkedFeed_DemuxesAcrossFrameBoundaries()
+    {
+        var stdout = new List<byte>();
+        var stderr = new List<byte>();
+        var demuxer = new DaytonaLogDemuxer(
+            onStdout: bytes => { stdout.AddRange(bytes); return Task.CompletedTask; },
+            onStderr: bytes => { stderr.AddRange(bytes); return Task.CompletedTask; });
+
+        const int messages = 500;
+        var stream = new List<byte>();
+        var expectedStdout = new StringBuilder();
+        var expectedStderr = new StringBuilder();
+        for (var i = 0; i < messages; i++)
+        {
+            var outText = "out-" + i + ";";
+            var errText = "err-" + i + ";";
+            expectedStdout.Append(outText);
+            expectedStderr.Append(errText);
+            stream.AddRange(DaytonaLogDemuxer.StdoutPrefix);
+            stream.AddRange(Encoding.UTF8.GetBytes(outText));
+            stream.AddRange(DaytonaLogDemuxer.StderrPrefix);
+            stream.AddRange(Encoding.UTF8.GetBytes(errText));
+        }
+
+        // Odd chunk sizes guarantee channel prefixes straddle feed boundaries.
+        const int chunkSize = 7;
+        for (var offset = 0; offset < stream.Count; offset += chunkSize)
+        {
+            var count = Math.Min(chunkSize, stream.Count - offset);
+            await demuxer.FeedAsync(new ReadOnlyMemory<byte>(stream.ToArray(), offset, count));
+        }
+        await demuxer.CompleteAsync();
+
+        Assert.Equal(expectedStdout.ToString(), Encoding.UTF8.GetString(stdout.ToArray()));
+        Assert.Equal(expectedStderr.ToString(), Encoding.UTF8.GetString(stderr.ToArray()));
+    }
+
+    [Fact]
     public void ToolboxClient_RejectsCleartextBase_WithoutUnsafeHttpOptIn()
     {
         // Guard at the credential sink: even a caller that bypassed the

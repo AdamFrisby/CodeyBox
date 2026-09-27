@@ -203,8 +203,10 @@ public sealed record DaytonaSandboxOptions
     public int ProvisioningRecheckSeconds { get; init; } = 60;
 
     /// <summary>
-    /// Test hook: allow plain-http control-plane and toolbox URLs. Never set in
-    /// production — the API key rides every request.
+    /// Test hook: allow plain-http control-plane and toolbox URLs, but only
+    /// for loopback hosts (localhost / 127.0.0.1 / ::1). Remote http URLs are
+    /// refused even with this set — the API key rides every request.
+    /// Never set in production.
     /// </summary>
     public bool AllowUnsafeHttp { get; init; }
 

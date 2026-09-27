@@ -942,17 +942,17 @@ public sealed class DaytonaSandboxProvider :
         if (!Uri.TryCreate(opts.ApiUrl, UriKind.Absolute, out var apiUri)
             || (apiUri.Scheme != Uri.UriSchemeHttps && apiUri.Scheme != Uri.UriSchemeHttp))
             throw new InvalidOperationException("CodeyBox:Plugins:codeybox.daytona-sandbox:ApiUrl must be an absolute http(s) URL.");
-        if (apiUri.Scheme == Uri.UriSchemeHttp && !opts.AllowUnsafeHttp)
+        if (apiUri.Scheme == Uri.UriSchemeHttp && !DaytonaApiClient.IsCleartextHttpPermitted(apiUri, opts.AllowUnsafeHttp))
             throw new InvalidOperationException(
                 "CodeyBox:Plugins:codeybox.daytona-sandbox:ApiUrl must use https://. " +
-                "Set AllowUnsafeHttp=true only for local tests.");
+                "AllowUnsafeHttp=true permits http only for loopback test URLs, never for remote hosts.");
         if (!Uri.TryCreate(opts.ToolboxProxyUrl, UriKind.Absolute, out var toolboxUri)
             || (toolboxUri.Scheme != Uri.UriSchemeHttps && toolboxUri.Scheme != Uri.UriSchemeHttp))
             throw new InvalidOperationException("CodeyBox:Plugins:codeybox.daytona-sandbox:ToolboxProxyUrl must be an absolute http(s) URL.");
-        if (toolboxUri.Scheme == Uri.UriSchemeHttp && !opts.AllowUnsafeHttp)
+        if (toolboxUri.Scheme == Uri.UriSchemeHttp && !DaytonaApiClient.IsCleartextHttpPermitted(toolboxUri, opts.AllowUnsafeHttp))
             throw new InvalidOperationException(
                 "CodeyBox:Plugins:codeybox.daytona-sandbox:ToolboxProxyUrl must use https://. " +
-                "Set AllowUnsafeHttp=true only for local tests.");
+                "AllowUnsafeHttp=true permits http only for loopback test URLs, never for remote hosts.");
         if (string.IsNullOrWhiteSpace(opts.ApiKeyEnvVar))
             throw new InvalidOperationException("CodeyBox:Plugins:codeybox.daytona-sandbox:ApiKeyEnvVar must be set.");
         if (string.IsNullOrWhiteSpace(opts.NamePrefix) || !opts.NamePrefix.All(IsNameChar))

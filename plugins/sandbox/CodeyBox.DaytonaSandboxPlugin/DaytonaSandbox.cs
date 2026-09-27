@@ -79,6 +79,12 @@ internal sealed class DaytonaSandbox :
     // conventional timeout(1) 124 so orchestrator tooling reads it as timeout.
     private const int WallClockTimeoutExitCode = 124;
 
+    // Exit code reported when the Daytona service is unreachable or the exec
+    // stream is unobservable (transport failure, missing exit marker). It is
+    // not a verdict on the work item diff: results carrying it set
+    // ExecutionUnavailable so the orchestrator classifies them as infra.
+    private const int ExecutionUnavailableExitCode = 255;
+
     private readonly string _name;
     private readonly SandboxSpec _spec;
     private readonly Func<DaytonaSandboxOptions> _readOptions;
@@ -247,7 +253,7 @@ internal sealed class DaytonaSandbox :
             stdout.Flush();
             stderr.Flush();
             return new SandboxExecResult(
-                exitCode ?? 255,
+                exitCode ?? ExecutionUnavailableExitCode,
                 stdout.ToString(),
                 stderr.ToString(),
                 stdout.LimitExceeded,
@@ -260,9 +266,9 @@ internal sealed class DaytonaSandbox :
             // command may still be running; kill the session (best-effort) and
             // report ExecutionUnavailable so the orchestrator classifies this
             // as infrastructure, never as a verdict on the work item's diff.
-            await TryDeleteSessionAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
+            await DeleteSessionBestEffortAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
             return new SandboxExecResult(
-                255,
+                ExecutionUnavailableExitCode,
                 string.Empty,
                 $"daytona exec transport failure: {ex.Message}",
                 ExecutionUnavailable: true);
@@ -272,7 +278,7 @@ internal sealed class DaytonaSandbox :
             // The spec's wall-clock limit fired (the caller's token did not):
             // kill the remote command and report a deterministic timeout,
             // not a cancellation and not an infra outage.
-            await TryDeleteSessionAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
+            await DeleteSessionBestEffortAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
             return new SandboxExecResult(
                 WallClockTimeoutExitCode,
                 string.Empty,
@@ -285,7 +291,7 @@ internal sealed class DaytonaSandbox :
             // the tracking set first owns the delete (kill-on-limit, catch,
             // or normal completion).
             if (sessionRegistered && _activeSessions.TryRemove(sessionId, out _))
-                await TryDeleteSessionAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
+                await DeleteSessionBestEffortAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -350,7 +356,7 @@ internal sealed class DaytonaSandbox :
                 {
                     killRequested = true;
                     if (_activeSessions.TryRemove(sessionId, out _))
-                        await TryDeleteSessionAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
+                        await DeleteSessionBestEffortAsync(toolbox, sessionId, CancellationToken.None).ConfigureAwait(false);
                 }
             }
             await demuxer.CompleteAsync().ConfigureAwait(false);
@@ -453,7 +459,7 @@ internal sealed class DaytonaSandbox :
     }
 
     /// <summary>Best-effort session teardown — kills every command in the session.</summary>
-    internal async Task TryDeleteSessionAsync(DaytonaToolboxClient toolbox, string sessionId, CancellationToken ct)
+    internal async Task DeleteSessionBestEffortAsync(DaytonaToolboxClient toolbox, string sessionId, CancellationToken ct)
     {
         try
         {
@@ -469,7 +475,7 @@ internal sealed class DaytonaSandbox :
     {
         var toolbox = Toolbox;
         foreach (var sessionId in _activeSessions.Keys.ToList())
-            await TryDeleteSessionAsync(toolbox, sessionId, ct).ConfigureAwait(false);
+            await DeleteSessionBestEffortAsync(toolbox, sessionId, ct).ConfigureAwait(false);
     }
 
     // ------------------------------------------------------------------

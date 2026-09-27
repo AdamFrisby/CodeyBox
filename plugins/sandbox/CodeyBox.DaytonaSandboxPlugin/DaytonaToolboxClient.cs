@@ -37,10 +37,11 @@ internal sealed class DaytonaToolboxClient
         _sandboxBase = toolboxBaseUri ?? throw new ArgumentNullException(nameof(toolboxBaseUri));
         if (_sandboxBase.Scheme != Uri.UriSchemeHttp && _sandboxBase.Scheme != Uri.UriSchemeHttps)
             throw new ArgumentException("Toolbox base URI must be http(s).", nameof(toolboxBaseUri));
-        if (_sandboxBase.Scheme == Uri.UriSchemeHttp && !endpoint.AllowUnsafeHttp)
+        if (_sandboxBase.Scheme == Uri.UriSchemeHttp && !DaytonaApiClient.IsCleartextHttpPermitted(_sandboxBase, endpoint.AllowUnsafeHttp))
             throw new ArgumentException(
-                "Toolbox base URI uses cleartext http but AllowUnsafeHttp is not set; " +
-                "the API key rides every toolbox request, so https is required outside local tests.",
+                "Toolbox base URI uses cleartext http that is not permitted; " +
+                "the API key rides every toolbox request, so https is required outside loopback tests " +
+                "(AllowUnsafeHttp permits http only for loopback hosts).",
                 nameof(toolboxBaseUri));
     }
 

@@ -239,8 +239,19 @@ internal sealed class DaytonaApiClient
     }
 
     /// <summary>
+    /// Cleartext http is permitted only for loopback test URLs under the
+    /// dev-only <c>AllowUnsafeHttp</c> opt-in: the API key rides every
+    /// toolbox request, so one operator edit must never send it cleartext to
+    /// a remote host.
+    /// </summary>
+    internal static bool IsCleartextHttpPermitted(Uri uri, bool allowUnsafeHttp) =>
+        allowUnsafeHttp
+        && uri.Scheme == Uri.UriSchemeHttp
+        && uri.IsLoopback;
+
+    /// <summary>
     /// Remote URLs are untrusted input to an outbound-request sink: an absolute
-    /// https URI (http only under the dev-only <c>AllowUnsafeHttp</c> opt-in,
+    /// https URI (http only when <see cref="IsCleartextHttpPermitted"/> holds,
     /// since the API key rides every toolbox request) or nothing — never a
     /// relative path, never another scheme.
     /// </summary>
@@ -256,13 +267,14 @@ internal sealed class DaytonaApiClient
                 $"parse {what}",
                 $"service returned a non-absolute or non-http(s) URL: '{raw.Trim()}'");
         }
-        if (uri.Scheme == Uri.UriSchemeHttp && !allowUnsafeHttp)
+        if (uri.Scheme == Uri.UriSchemeHttp && !IsCleartextHttpPermitted(uri, allowUnsafeHttp))
         {
             throw new DaytonaApiException(
                 DaytonaFailureKind.Unexpected,
                 $"parse {what}",
-                "service returned a cleartext http toolbox URL but AllowUnsafeHttp is not set; " +
-                $"refusing to send the API key over cleartext: '{raw.Trim()}'");
+                "service returned a cleartext http toolbox URL that is not permitted; " +
+                "refusing to send the API key over cleartext: '" + raw.Trim() + "'. " +
+                "AllowUnsafeHttp permits http only for loopback test URLs, never for remote hosts.");
         }
         return uri;
     }
@@ -352,7 +364,8 @@ internal sealed class DaytonaApiClient
             if (string.IsNullOrWhiteSpace(raw))
                 return null;
             var trimmed = raw.Trim();
-            return trimmed.Length > MaxErrorBodyChars ? trimmed[..MaxErrorBodyChars] : trimmed;
+            var bounded = trimmed.Length > MaxErrorBodyChars ? trimmed[..MaxErrorBodyChars] : trimmed;
+            return DaytonaTextUtil.SanitizeForLog(bounded);
         }
         catch (Exception)
         {

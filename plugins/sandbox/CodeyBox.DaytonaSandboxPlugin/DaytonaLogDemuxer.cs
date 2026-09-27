@@ -21,6 +21,13 @@ internal sealed class DaytonaLogDemuxer
     private readonly Func<byte[], Task> _onStderr;
     private byte _channel;
 
+    // Consumed head offset into _buffer. Draining advances _head instead of
+    // removing from the head (which memmoves the tail, quadratic on large
+    // exec streams); the prefix is compacted only once the head grows past
+    // CompactionThresholdBytes, keeping steady-state drain amortized O(1).
+    private int _head;
+    private const int CompactionThresholdBytes = 64 * 1024;
+
     public DaytonaLogDemuxer(Func<byte[], Task> onStdout, Func<byte[], Task> onStderr)
     {
         _onStdout = onStdout ?? throw new ArgumentNullException(nameof(onStdout));
@@ -35,6 +42,7 @@ internal sealed class DaytonaLogDemuxer
         foreach (var b in chunk.Span)
             _buffer.Add(b);
         await DrainAsync().ConfigureAwait(false);
+        CompactIfNeeded();
     }
 
     /// <summary>Flushes any retained tail when the stream ends.</summary>
@@ -42,22 +50,29 @@ internal sealed class DaytonaLogDemuxer
     {
         // Anything left is payload (a trailing partial prefix cannot be one
         // once the stream is closed — emit it so nothing is silently dropped).
-        if (_buffer.Count == 0)
+        if (Available == 0)
             return;
-        await EmitAsync(_buffer.ToArray()).ConfigureAwait(false);
+        await EmitAsync(_buffer.GetRange(_head, Available).ToArray()).ConfigureAwait(false);
         _buffer.Clear();
+        _head = 0;
+    }
+
+    private int Available => _buffer.Count - _head;
+
+    private void CompactIfNeeded()
+    {
+        if (_head < CompactionThresholdBytes)
+            return;
+        _buffer.RemoveRange(0, _head);
+        _head = 0;
     }
 
     private async Task DrainAsync()
     {
-        while (_buffer.Count > 0)
+        while (Available > 0)
         {
-            var safeLength = SafeEmitLength();
-            if (safeLength <= 0)
-                return;
-
-            var stdoutIndex = IndexOf(StdoutPrefix, safeLength);
-            var stderrIndex = IndexOf(StderrPrefix, safeLength);
+            var stdoutIndex = IndexOf(StdoutPrefix, Available);
+            var stderrIndex = IndexOf(StderrPrefix, Available);
             var nextIndex = -1;
             byte nextChannel = 0;
             if (stdoutIndex >= 0 && (stderrIndex < 0 || stdoutIndex < stderrIndex))
@@ -73,44 +88,54 @@ internal sealed class DaytonaLogDemuxer
 
             if (nextIndex < 0)
             {
-                await EmitAsync(_buffer.GetRange(0, safeLength).ToArray()).ConfigureAwait(false);
-                _buffer.RemoveRange(0, safeLength);
+                // No marker in the window: emit everything except a trailing
+                // run that a later chunk could complete into a marker. When
+                // nothing is emittable, wait for more bytes (CompleteAsync
+                // flushes the remainder at stream end).
+                var holdBack = TrailingMarkerRunLength();
+                var emitLength = Available - holdBack;
+                if (emitLength <= 0)
+                    return;
+                await EmitAsync(_buffer.GetRange(_head, emitLength).ToArray()).ConfigureAwait(false);
+                _head += emitLength;
                 continue;
             }
 
             if (nextIndex > 0)
-                await EmitAsync(_buffer.GetRange(0, nextIndex).ToArray()).ConfigureAwait(false);
-            _buffer.RemoveRange(0, nextIndex + MaxPrefixLength);
+                await EmitAsync(_buffer.GetRange(_head, nextIndex).ToArray()).ConfigureAwait(false);
+            _head += nextIndex + MaxPrefixLength;
             _channel = nextChannel;
         }
     }
 
     /// <summary>
-    /// Bytes in the last MaxPrefixLength-1 slots can extend into a marker on
-    /// the next chunk — hold them back. Mirrors the SDK's safe-region rule.
+    /// Length (0-2) of the trailing run of one marker byte value that a later
+    /// chunk could extend into a full 3-byte channel marker. Markers are
+    /// homogeneous triples, so only a uniform trailing run of 0x01/0x02 can
+    /// become one - and a complete marker would already have been consumed by
+    /// the scan above, so the run is always shorter than a full marker.
     /// </summary>
-    private int SafeEmitLength()
+    private int TrailingMarkerRunLength()
     {
-        var length = _buffer.Count;
-        if (length < MaxPrefixLength)
-            return length - (MaxPrefixLength - 1);
-
-        var last = _buffer[length - 1];
+        var available = Available;
+        if (available == 0)
+            return 0;
+        var last = _buffer[_head + available - 1];
         if (last is not 0x01 and not 0x02)
-            return length;
-        if (length < MaxPrefixLength + 1)
-            return length - (MaxPrefixLength - 1);
-        var secondLast = _buffer[length - 2];
-        if (secondLast is not 0x01 and not 0x02)
-            return length - 1;
-        return length - (MaxPrefixLength - 1);
+            return 0;
+        var run = 1;
+        while (run < available && run < MaxPrefixLength - 1 && _buffer[_head + available - 1 - run] == last)
+            run++;
+        return run;
     }
 
+    // Searches the unconsumed window; the returned index is relative to
+    // _head so callers can advance the head without re-scanning.
     private int IndexOf(byte[] needle, int within)
     {
         for (var i = 0; i + needle.Length <= within; i++)
         {
-            if (_buffer[i] == needle[0] && _buffer[i + 1] == needle[1] && _buffer[i + 2] == needle[2])
+            if (_buffer[_head + i] == needle[0] && _buffer[_head + i + 1] == needle[1] && _buffer[_head + i + 2] == needle[2])
                 return i;
         }
         return -1;

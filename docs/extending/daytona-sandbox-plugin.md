@@ -106,7 +106,10 @@ falling back to another provider.
 Every endpoint that carries the API key — the configured `ApiUrl` /
 `ToolboxProxyUrl` and any per-sandbox `toolboxProxyUrl` the service returns —
 must be `https`. A cleartext `http` URL is refused unless the dev-only
-`AllowUnsafeHttp` option is set, which exists only for loopback tests.
+`AllowUnsafeHttp` option is set, and even then only for loopback hosts
+(`localhost` / `127.0.0.1` / `::1`): remote `http` URLs are refused
+unconditionally, so the API key can never ride a cleartext request to a
+remote host because of one operator edit.
 
 ## Capacity and placement
 
