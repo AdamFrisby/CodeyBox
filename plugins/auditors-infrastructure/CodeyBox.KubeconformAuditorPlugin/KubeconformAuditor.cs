@@ -306,6 +306,7 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
+        IRunContext? runContext,
         CancellationToken ct)
     {
         await ThrowIfToolVersionMismatchAsync(sandbox, workingDirectory, tool, options, ct)

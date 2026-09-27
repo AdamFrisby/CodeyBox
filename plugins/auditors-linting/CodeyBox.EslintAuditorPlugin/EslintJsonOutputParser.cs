@@ -28,8 +28,8 @@ namespace CodeyBox.EslintAuditorPlugin;
 /// </summary>
 internal sealed class EslintJsonOutputParser : IExternalToolOutputParser
 {
-    // Same per-document result bound the shared SARIF parser applies.
-    private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
+    // The shared per-document result bound every parser applies.
+    private const int MaxResults = ExternalToolParseLimits.DefaultMaxResults;
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
@@ -145,7 +145,6 @@ internal sealed class EslintJsonOutputParser : IExternalToolOutputParser
         => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
-
 
     private static string SingleLine(string message)
         => ToolOutputText.SingleLine(message);

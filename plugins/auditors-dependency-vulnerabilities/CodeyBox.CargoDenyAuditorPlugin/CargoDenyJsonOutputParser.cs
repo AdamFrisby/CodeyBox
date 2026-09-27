@@ -49,8 +49,8 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
     /// <summary>Rule id for diagnostics with no lint code.</summary>
     internal const string FallbackRuleId = "cargo-deny/diagnostic";
 
-    // Same per-document result bound the shared SARIF parser applies.
-    private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
+    // The shared per-document result bound every parser applies.
+    private const int MaxResults = ExternalToolParseLimits.DefaultMaxResults;
 
     // A diagnostic can carry a label per affected span and arbitrary notes;
     // bound how many are folded into the message so one diagnostic cannot

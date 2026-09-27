@@ -346,7 +346,7 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
-    public async Task RepositoryFileProbe_ReportsPresent_AndFailsClosedOnProbeError()
+    public async Task RepositoryPathProbe_ReportsPresent_AndFailsClosedOnProbeError()
     {
         var auditor = new ProbeExposingAuditor();
 
@@ -376,7 +376,7 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
-    public async Task RepositoryFileProbe_RejectsPathsOutsideTheWorktree()
+    public async Task RepositoryPathProbe_RejectsPathsOutsideTheWorktree()
     {
         var auditor = new ProbeExposingAuditor();
         var noop = new FakeSandbox((exec, _) =>
@@ -469,9 +469,9 @@ public sealed class ExternalToolAuditorTests
 
         public Task<IReadOnlyList<string>> ProbeAsync(
             ISandbox sandbox, IReadOnlyList<string> paths, CancellationToken ct)
-            => ProbeRepositoryFilesPresentAsync(
+            => ProbeRepositoryPathsAsync(
                 sandbox, "/work", ToolName, "suppression check", paths,
-                RepositoryFileProbe.Present, new ExternalToolAuditorOptions(), ct);
+                RepositoryPathProbe.Present, new ExternalToolAuditorOptions(), ct);
 
         public static bool SuppliesFlag(ExternalToolAuditorOptions options, params string[] flags)
             => ExtraArgumentsSupplyFlag(options, flags);

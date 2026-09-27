@@ -58,11 +58,43 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// <summary>What the auditor needs to do its job.</summary>
     public virtual AuditCapabilities Required => AuditCapabilities.None;
 
+    /// <summary>
+    /// Marker for auditor-defined per-run state: the value returned by
+    /// <see cref="CreateRunContext"/> is handed back to
+    /// <see cref="BuildToolArguments(ExternalToolAuditorOptions, IRunContext?)"/>
+    /// and <see cref="VerifyToolAsync"/> — the explicit channel for inputs
+    /// that must stay identical between the argv the scan launches with and
+    /// the gates that verify it, even if scoped configuration reloads
+    /// mid-run. The base never inspects the implementation.
+    /// </summary>
+    protected interface IRunContext { }
+
     /// <summary>Bare binary name the auditor invokes (e.g. <c>"trivy"</c>). Validated fail-closed.</summary>
     protected abstract string ToolName { get; }
 
     /// <summary>Author-defined arguments for the tool (before any operator <c>ExtraArguments</c>).</summary>
     protected abstract IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options);
+
+    /// <summary>
+    /// Argument build with the per-run <paramref name="runContext"/> from
+    /// <see cref="CreateRunContext"/>. Auditors whose argv must consume the
+    /// frozen run inputs override this overload and recover their concrete
+    /// context type with a pattern match; the default delegates to
+    /// <see cref="BuildToolArguments(ExternalToolAuditorOptions)"/>.
+    /// </summary>
+    protected virtual IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options, IRunContext? runContext)
+        => BuildToolArguments(options);
+
+    /// <summary>
+    /// Per-run state hook, invoked once inside <see cref="RunAsync"/> before
+    /// the argv build; the same value is passed to
+    /// <see cref="BuildToolArguments(ExternalToolAuditorOptions, IRunContext?)"/>
+    /// and <see cref="VerifyToolAsync"/>. Override it to resolve scoped-config
+    /// inputs exactly once per run — a mid-run configuration reload can then
+    /// never make the preconditions disagree with the argv already built.
+    /// Default null: no per-run state.
+    /// </summary>
+    protected virtual IRunContext? CreateRunContext(ExternalToolAuditorOptions options) => null;
 
     /// <summary>Parses finished tool output. SARIF tools use <see cref="SarifToolOutputParser"/>.</summary>
     protected abstract IExternalToolOutputParser OutputParser { get; }
@@ -116,10 +148,14 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// cannot express — e.g. a repository-state gate — and throw
     /// <see cref="AuditUnavailableException"/> to fail closed: a failed
     /// precondition is infrastructure, never a pass.
-    /// Use <see cref="ExecToolBoundedAsync"/> for precondition probes so they
-    /// get the same timeout bounding and failure classification as the scan;
-    /// <see cref="ProbeRepositoryFilesPresentAsync"/> covers the common
-    /// "does a repository-controlled file exist" gate.
+    /// <paramref name="runContext"/> is the per-run value
+    /// <see cref="CreateRunContext"/> produced for this invocation — the same
+    /// instance the argv was built from.
+    /// Use <see cref="ExecProbeOrThrowAsync(ISandbox, string, string, string, IReadOnlyList{string}, TimeSpan, CancellationToken)"/>
+    /// for precondition probes — it applies the probe output caps and
+    /// transport classification on top of the same timeout bounding the scan
+    /// gets; <see cref="ProbeRepositoryPathsAsync"/> covers the common
+    /// "does a repository-controlled path exist" gate.
     /// <para>The returned findings are supplemental: they are merged ahead of
     /// the tool's parsed report findings before severity mapping and
     /// selection — for problems the tool would never print (e.g. files the
@@ -132,6 +168,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
+        IRunContext? runContext,
         CancellationToken ct)
         => Task.FromResult<IReadOnlyList<ExternalToolFinding>>([]);
 
@@ -147,11 +184,12 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
         var tool = ExternalToolNames.Validate(ToolName, nameof(ToolName));
         var options = OptionsAccessor() ?? new ExternalToolAuditorOptions();
-        var argv = BuildArgv(tool, options);
+        var runContext = CreateRunContext(options);
+        var argv = BuildArgv(tool, options, runContext);
 
         await ThrowIfToolMissingAsync(sandbox, workingDirectory, tool, ct).ConfigureAwait(false);
         await VerifyToolVersionPinAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
-        var supplemental = await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false)
+        var supplemental = await VerifyToolAsync(sandbox, workingDirectory, tool, options, runContext, ct).ConfigureAwait(false)
             ?? [];
         var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
 
@@ -175,9 +213,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
         return new AuditResult(passed, selection.Findings, RawOutput: BuildRawOutput(result, options, selection));
     }
 
-    private IReadOnlyList<string> BuildArgv(string tool, ExternalToolAuditorOptions options)
+    private IReadOnlyList<string> BuildArgv(string tool, ExternalToolAuditorOptions options, IRunContext? runContext)
     {
-        var built = BuildToolArguments(options) ?? [];
+        var built = BuildToolArguments(options, runContext) ?? [];
         if (built.Count > MaxBuiltArguments)
             throw new InvalidOperationException(
                 $"Auditor '{Name}' built {built.Count} tool arguments, exceeding the bound of {MaxBuiltArguments}.");
@@ -269,8 +307,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// transport failure as <see cref="AuditUnavailableException"/> naming the
     /// tool — infrastructure, never a pass. Cooperative cancellation and
     /// sandbox-provisioning deferrals propagate unwrapped. The scan path uses
-    /// this; <see cref="VerifyToolAsync"/> overrides use it for precondition
-    /// probes. <paramref name="operation"/> names the invocation in failure
+    /// this; <see cref="VerifyToolAsync"/> overrides reach it through
+    /// <see cref="ExecProbeOrThrowAsync(ISandbox, string, string, string, IReadOnlyList{string}, TimeSpan, CancellationToken)"/>,
+    /// which adds the probe output caps and transport classification.
+    /// <paramref name="operation"/> names the invocation in failure
     /// messages (e.g. "scan", "version check"). <paramref name="timeout"/>
     /// must be a positive finite duration — <see cref="TimeSpan.Zero"/> would
     /// fire immediately and <see cref="Timeout.InfiniteTimeSpan"/> would
@@ -365,8 +405,8 @@ public abstract class ExternalToolAuditorBase : IAuditor
             { IsDeterministic = true };
     }
 
-    /// <summary>What a repository-file probe tests each candidate path for.</summary>
-    protected enum RepositoryFileProbe
+    /// <summary>What a repository-path probe tests each candidate path for.</summary>
+    protected enum RepositoryPathProbe
     {
         /// <summary>Present at all — regular file or symlink (the symlink arm also catches dangling links).</summary>
         Present,
@@ -379,7 +419,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// root — e.g. suppression files the audit subject could use to hide
     /// findings from the tool, or symlinked paths that would redirect a scan
     /// outside the worktree. Returns the subset of
-    /// <paramref name="relativePaths"/> matching <paramref name="mode"/>.
+    /// <paramref name="relativePaths"/> matching <paramref name="mode"/> —
+    /// under <see cref="RepositoryPathProbe.Symlinked"/> that is the paths
+    /// that are themselves links, not the paths that are present.
     /// Fails closed: an exec-transport failure or any non-zero probe exit
     /// throws <see cref="AuditUnavailableException"/> — a failed probe is
     /// never treated as a negative result. Path entries must be relative;
@@ -388,13 +430,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// one-name-per-line protocol. <paramref name="operation"/> names the
     /// probe in failure messages (e.g. "suppression check", "target check").
     /// </summary>
-    protected static async Task<IReadOnlyList<string>> ProbeRepositoryFilesPresentAsync(
+    protected static async Task<IReadOnlyList<string>> ProbeRepositoryPathsAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         string operation,
         IReadOnlyList<string> relativePaths,
-        RepositoryFileProbe mode,
+        RepositoryPathProbe mode,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
@@ -404,7 +446,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var requested = new HashSet<string>(StringComparer.Ordinal);
         var argv = new List<string>(relativePaths.Count + 4)
         {
-            "sh", "-c", mode == RepositoryFileProbe.Symlinked
+            "sh", "-c", mode == RepositoryPathProbe.Symlinked
                 ? RepositoryFileSymlinkScript
                 : RepositoryFilePresenceScript, "sh",
         };

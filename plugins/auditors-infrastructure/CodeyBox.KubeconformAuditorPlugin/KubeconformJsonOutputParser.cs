@@ -44,8 +44,8 @@ internal sealed class KubeconformJsonOutputParser : IExternalToolOutputParser
     /// <summary>Rule id prefix for schema violations: <c>kubeconform/&lt;Kind&gt;</c>.</summary>
     internal const string InvalidRulePrefix = "kubeconform/";
 
-    // Same per-document result bound the shared SARIF parser applies.
-    private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
+    // The shared per-document result bound every parser applies.
+    private const int MaxResults = ExternalToolParseLimits.DefaultMaxResults;
 
     // validationErrors entries carry an in-document JSON path, not a file
     // location — append a bounded number to the message so a single resource
@@ -203,7 +203,6 @@ internal sealed class KubeconformJsonOutputParser : IExternalToolOutputParser
         => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
-
 
     private static string SingleLine(string message)
         => ToolOutputText.SingleLine(message);

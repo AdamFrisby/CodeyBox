@@ -370,14 +370,17 @@ public sealed class AstGrepAuditorTests
     }
 
     [Fact]
-    public async Task ConfigFile_And_RuleFile_BothSet_IsDeterministicInfrastructure()
+    public async Task ConfigFile_And_RuleFile_BothSet_EmitsBothArguments()
     {
-        var scanExecs = 0;
+        // ast-grep accepts -c together with -r — the pinned config still
+        // registers customLanguages while the rule file drives the scan —
+        // so the auditor emits both pins rather than rejecting the pair.
+        SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (ProbeAnswer(exec) is { } probe)
                 return Task.FromResult(probe);
-            scanExecs++;
+            scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -390,12 +393,14 @@ public sealed class AstGrepAuditorTests
             }),
             CancellationToken.None);
 
-        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
-            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
 
-        Assert.True(ex.IsDeterministic);
-        Assert.Contains("ConfigFile", ex.Message, StringComparison.Ordinal);
-        Assert.Equal(0, scanExecs);
+        Assert.NotNull(scanExec);
+        var argv = scanExec!.Argv;
+        var configIndex = argv.ToList().IndexOf("--config");
+        Assert.True(configIndex >= 0 && argv[configIndex + 1] == "sgconfig.yml");
+        var ruleIndex = argv.ToList().IndexOf("--rule");
+        Assert.True(ruleIndex >= 0 && argv[ruleIndex + 1] == "rules/one.yml");
     }
 
     [Fact]
@@ -463,7 +468,7 @@ public sealed class AstGrepAuditorTests
         var targetProbes = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec) && !exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            if (IsRepositoryPathProbe(exec) && !exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
             {
                 targetProbes++;
                 // The presence script echoes each existing path, one per line.
@@ -501,7 +506,7 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec))
+            if (IsRepositoryPathProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "src\n", ""));
             if (ProbeAnswer(exec) is { } probe)
                 return Task.FromResult(probe);
@@ -655,7 +660,7 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec))
+            if (IsRepositoryPathProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
             if (IsConfigContentProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -680,7 +685,7 @@ public sealed class AstGrepAuditorTests
         var configProbes = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec))
+            if (IsRepositoryPathProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
             if (IsConfigContentProbe(exec))
             {
@@ -740,7 +745,7 @@ public sealed class AstGrepAuditorTests
         var configContentProbes = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            if (IsRepositoryPathProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
             {
                 // sgconfig.yml is present — a dead opt-in would run the
                 // content probe (scripted to report dynamic keys) and fail
@@ -782,7 +787,7 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            if (IsRepositoryPathProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
                 return Task.FromResult(new SandboxExecResult(0, "sgconfig.yaml\n", ""));
             if (IsConfigContentProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -809,7 +814,7 @@ public sealed class AstGrepAuditorTests
         var configProbes = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            if (IsRepositoryPathProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
             {
                 configProbes++;
                 return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
@@ -842,7 +847,7 @@ public sealed class AstGrepAuditorTests
         // the customLanguages gate must still run.
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            if (IsRepositoryPathProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
                 return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
             if (IsConfigContentProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -874,7 +879,7 @@ public sealed class AstGrepAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
+            if (IsRepositoryPathProbe(exec) && exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
             {
                 configProbes++;
                 return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
@@ -911,7 +916,7 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec))
+            if (IsRepositoryPathProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
             if (IsConfigEscapeProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -1202,7 +1207,7 @@ public sealed class AstGrepAuditorTests
         var report = "[" + string.Join(',',
             Enumerable.Repeat(
                 """{"ruleId":"r","severity":"error","message":"m","file":"a.js"}""",
-                SarifToolOutputParser.DefaultMaxResults + 1)) + "]";
+                ExternalToolParseLimits.DefaultMaxResults + 1)) + "]";
 
         var parser = new AstGrepJsonOutputParser();
         var ex = Assert.Throws<ExternalToolParseException>(
@@ -1247,7 +1252,7 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec))
+            if (IsRepositoryPathProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "src\n", ""));
             if (IsSymlinkProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "src\n", ""));
@@ -1282,7 +1287,7 @@ public sealed class AstGrepAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsRepositoryFileProbe(exec) && exec.Argv.Contains("a/b", StringComparer.Ordinal)
+            if (IsRepositoryPathProbe(exec) && exec.Argv.Contains("a/b", StringComparer.Ordinal)
                 && !exec.Argv.Contains("sgconfig.yml", StringComparer.Ordinal))
                 return Task.FromResult(new SandboxExecResult(0, "a/b\n", ""));
             if (IsSymlinkProbe(exec))
@@ -1575,7 +1580,7 @@ public sealed class AstGrepAuditorTests
     {
         if (IsPresenceProbe(exec) || IsVersionProbe(exec))
             return Ok(exec);
-        if (IsRepositoryFileProbe(exec) || IsSymlinkProbe(exec))
+        if (IsRepositoryPathProbe(exec) || IsSymlinkProbe(exec))
             return new SandboxExecResult(0, "", "");
         if (IsConfigPathResolveProbe(exec))
             return ConfigPathResolveAnswer(exec);
@@ -1604,7 +1609,7 @@ public sealed class AstGrepAuditorTests
 
     // The shared presence script echoes existing (-e or -L) repo-relative
     // paths, one per line.
-    private static bool IsRepositoryFileProbe(SandboxExec exec)
+    private static bool IsRepositoryPathProbe(SandboxExec exec)
         => exec.Argv.Count >= 4
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"

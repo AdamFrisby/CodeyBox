@@ -232,6 +232,7 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
+        IRunContext? runContext,
         CancellationToken ct)
     {
         if (!_trustRepositorySuppression())
@@ -254,13 +255,13 @@ public sealed class GitleaksAuditor : ExternalToolAuditorBase, IPluginInitialize
         // would let the subject hide a leak. A repo-root .gitleaks.toml is
         // gated alongside it: gitleaks exempts its own config path from the
         // scan, so the file's contents are never checked for secrets at all.
-        var present = await ProbeRepositoryFilesPresentAsync(
+        var present = await ProbeRepositoryPathsAsync(
             sandbox,
             workingDirectory,
             tool,
             "suppression check",
             [RepositoryIgnoreFile, RepositoryConfigFile],
-            RepositoryFileProbe.Present,
+            RepositoryPathProbe.Present,
             options,
             ct).ConfigureAwait(false);
         if (present.Count > 0)

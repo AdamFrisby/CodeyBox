@@ -30,8 +30,8 @@ namespace CodeyBox.KnipAuditorPlugin;
 /// </summary>
 internal sealed class KnipJsonOutputParser : IExternalToolOutputParser
 {
-    // Same per-document result bound the shared SARIF parser applies.
-    private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
+    // The shared per-document result bound every parser applies.
+    private const int MaxResults = ExternalToolParseLimits.DefaultMaxResults;
     private const int MessageMaxChars = 512;
 
     internal const string FilesIssueType = "files";
@@ -252,7 +252,6 @@ internal sealed class KnipJsonOutputParser : IExternalToolOutputParser
         => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
-
 
     private static string Truncate(string value, int maxChars)
         => ToolOutputText.Truncate(value, maxChars);

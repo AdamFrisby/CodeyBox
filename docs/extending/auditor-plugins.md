@@ -321,13 +321,19 @@ declaratively:
 - `VerifyToolAsync` — a pre-scan precondition hook invoked inside `RunAsync`
   after the tool's presence and declared `VersionPin` are confirmed. Override
   it for repository-state gates (e.g. refusing repo-authored suppression
-  files — `ProbeRepositoryFilesPresentAsync` is the shared fail-closed probe
+  files — `ProbeRepositoryPathsAsync` is the shared fail-closed probe
   for that), throwing `AuditUnavailableException` to fail closed. It returns
   supplemental findings — problems the tool's own report would never print —
   which are merged ahead of the parsed report findings before severity
   mapping and selection; return an empty list when there is nothing to add.
-  Run probes through `ExecToolBoundedAsync` so they inherit the same timeout
-  bounding and failure classification as the scan.
+  Run probes through `ExecProbeOrThrowAsync` — it applies the
+  `ProbeMaxOutputBytes` per-stream caps and kill-on-limit, and classifies an
+  unavailable exec transport as infrastructure; `ExecToolBoundedAsync` remains
+  for nonstandard probes that need a custom `SandboxExec` shape.
+  When gate inputs come from scoped config, resolve them once in
+  `CreateRunContext` and consume the `runContext` the base passes to both
+  `VerifyToolAsync` and the `BuildToolArguments` overload that takes it — a
+  mid-run config reload must not split the gates from the argv.
 - `BuildToolEnvironment` — extra environment variables for the tool process,
   for tools whose behavior is env-controlled (e.g. pinning configuration that
   must not come from the audited repository).

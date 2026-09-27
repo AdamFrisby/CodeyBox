@@ -373,6 +373,7 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
+        IRunContext? runContext,
         CancellationToken ct)
     {
         if (_trustRepositorySuppression())
@@ -381,9 +382,9 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
         var manifestDirs = ManifestAncestors(_manifestPath()).Take(MaxManifestAncestors).ToList();
 
         var exceptionCandidates = BuildCandidates(RepositoryExceptionsFiles, manifestDirs);
-        var present = await ProbeRepositoryFilesPresentAsync(
+        var present = await ProbeRepositoryPathsAsync(
             sandbox, workingDirectory, tool, "suppression check", exceptionCandidates,
-            RepositoryFileProbe.Present, options, ct).ConfigureAwait(false);
+            RepositoryPathProbe.Present, options, ct).ConfigureAwait(false);
         if (present.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled exceptions "
@@ -395,9 +396,9 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
             { IsDeterministic = true };
 
         var cargoConfigCandidates = BuildCandidates(RepositoryCargoConfigFiles, manifestDirs);
-        var cargoConfigs = await ProbeRepositoryFilesPresentAsync(
+        var cargoConfigs = await ProbeRepositoryPathsAsync(
             sandbox, workingDirectory, tool, "suppression check", cargoConfigCandidates,
-            RepositoryFileProbe.Present, options, ct).ConfigureAwait(false);
+            RepositoryPathProbe.Present, options, ct).ConfigureAwait(false);
         if (cargoConfigs.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled cargo config "
@@ -415,9 +416,9 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
             return [];
 
         var policyCandidates = BuildCandidates(RepositoryPolicyFiles, manifestDirs);
-        var policies = await ProbeRepositoryFilesPresentAsync(
+        var policies = await ProbeRepositoryPathsAsync(
             sandbox, workingDirectory, tool, "suppression check", policyCandidates,
-            RepositoryFileProbe.Present, options, ct).ConfigureAwait(false);
+            RepositoryPathProbe.Present, options, ct).ConfigureAwait(false);
         if (policies.Count == 0)
             return [];
 

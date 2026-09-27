@@ -70,7 +70,10 @@ namespace CodeyBox.AstGrepAuditorPlugin;
 /// <c>sgconfig.yml</c>/<c>sgconfig.yaml</c> + <c>ruleDirs</c> by default (the
 /// project's own structural-lint contract, like an ESLint flat config), an
 /// operator-pinned project config via <c>ConfigFile</c> (<c>-c</c>), or a
-/// single operator-pinned rule file via <c>RuleFile</c> (<c>-r</c>). With
+/// single operator-pinned rule file via <c>RuleFile</c> (<c>-r</c>) — the
+/// two pins may be combined, since ast-grep accepts <c>-c</c> together with
+/// <c>-r</c> (the config still registers <c>customLanguages</c> while the
+/// rule file drives the scan). With
 /// none of these the scan cannot run and fails closed as infrastructure. A
 /// repo-authored ruleset is the meaningful check for a structural-pattern
 /// auditor — but a repo-root <c>sgconfig</c> is more than rules: its
@@ -165,15 +168,20 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// operator-owned, so the <c>customLanguages</c> gate does not apply; a
     /// pinned path resolving inside the worktree is still
     /// repository-controlled and is probed like a discovered sgconfig.
-    /// Conflicts with <see cref="RuleFileKey"/>. Unset → ast-grep's default
+    /// Combines with <see cref="RuleFileKey"/>: ast-grep accepts
+    /// <c>-c</c> together with <c>-r</c>, so a pinned config can still
+    /// register custom languages while a single rule file drives the scan.
+    /// Unset → ast-grep's default
     /// <c>sgconfig.yml</c>/<c>sgconfig.yaml</c> lookup.
     /// </summary>
     public const string ConfigFileKey = "ConfigFile";
 
     /// <summary>
     /// Scoped-config key for a single rule file (<c>-r/--rule</c>): scans
-    /// the targets with just that rule. Conflicts with
-    /// <see cref="ConfigFileKey"/>.
+    /// the targets with just that rule. Combines with
+    /// <see cref="ConfigFileKey"/> — the project config still applies
+    /// (including its <c>customLanguages</c> registration) while the rule
+    /// file supplies the scan's rule.
     /// </summary>
     public const string RuleFileKey = "RuleFile";
 
@@ -338,23 +346,20 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     private Func<bool> _trustRepositoryCustomLanguages = static () => false;
 
     /// <summary>
-    /// Gate-relevant scoped config resolved once per run, when argv is built
-    /// — <see cref="BuildToolArguments"/> stores it and
-    /// <see cref="VerifyToolAsync"/> (which the base invokes afterwards in the
-    /// same logical flow) reads the same values, so a mid-run scoped-config
-    /// reload can never make the gates disagree with the argv already built.
+    /// Gate-relevant scoped config resolved once per run by
+    /// <see cref="CreateRunContext"/> — the base hands the same instance to
+    /// the argv build and to <see cref="VerifyToolAsync"/>, so a mid-run
+    /// scoped-config reload can never make the gates disagree with the argv
+    /// already built. Plugin auditors are DI singletons shared by concurrent
+    /// workers, so the snapshot travels as an explicit argument, never an
+    /// instance field that would bleed across runs.
     /// </summary>
     private sealed record RunGateContext(
         IReadOnlyList<string> Targets,
         string? ConfigFile,
+        string? RuleFile,
         bool TrustRepositorySuppression,
-        bool TrustRepositoryCustomLanguages);
-
-    // Plugin auditors are DI singletons shared by concurrent workers, so
-    // per-run state flows through AsyncLocal — an instance field would let
-    // one run's snapshot bleed into another's gates or report. Established
-    // in-repo pattern (WorkSandboxContext, PipelineRunner ambient lifecycle).
-    private readonly AsyncLocal<RunGateContext?> _runGateContext = new();
+        bool TrustRepositoryCustomLanguages) : IRunContext;
 
     /// <inheritdoc />
     public override string Name => "codeybox:ast-grep";
@@ -395,24 +400,30 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         new(PluginId, _expectedVersion, DefaultExpectedVersion,
             ["--version", "--config", EmptyProbeConfig]);
 
+    /// <summary>
+    /// Resolves the gate-relevant scoped inputs once per run; the base passes
+    /// the same instance to the argv build and <see cref="VerifyToolAsync"/>.
+    /// </summary>
+    protected override IRunContext? CreateRunContext(ExternalToolAuditorOptions options)
+        => new RunGateContext(
+            ResolveTargets(),
+            _configFile(),
+            _ruleFile(),
+            _trustRepositorySuppression(),
+            _trustRepositoryCustomLanguages());
+
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
+        => BuildToolArguments(options, CreateRunContext(options));
+
+    /// <inheritdoc />
+    protected override IReadOnlyList<string> BuildToolArguments(
+        ExternalToolAuditorOptions options, IRunContext? runContext)
     {
-        var configFile = _configFile();
-        var ruleFile = _ruleFile();
-        var targets = ResolveTargets();
-        // Freeze the gate inputs alongside the argv build: VerifyToolAsync
-        // must probe exactly what this argv bakes, even if scoped config
-        // reloads between the two calls.
-        var gate = new RunGateContext(
-            targets, configFile, _trustRepositorySuppression(), _trustRepositoryCustomLanguages());
-        _runGateContext.Value = gate;
-        if (!string.IsNullOrWhiteSpace(configFile) && !string.IsNullOrWhiteSpace(ruleFile))
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' has both ConfigFile and RuleFile set — ast-grep "
-                + $"rejects -c/--config together with -r/--rule. Set one under "
-                + $"CodeyBox:Plugins:{PluginId}.")
-            { IsDeterministic = true };
+        var gate = RequireRunGate(runContext);
+        var configFile = gate.ConfigFile;
+        var ruleFile = gate.RuleFile;
+        var targets = gate.Targets;
 
         var args = new List<string>
         {
@@ -462,13 +473,16 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         // joined "-cFILE" in ExtraArguments therefore does NOT suppress our
         // --config — the pinned file must still reach argv as a spelling
         // ast-grep will honor, or repository discovery would stay live.
+        // --config and --rule are independent: ast-grep accepts both
+        // together (the pinned config still registers customLanguages while
+        // the single rule file drives the scan).
         if (!string.IsNullOrWhiteSpace(configFile)
             && !ExtraArgumentsPinProjectConfig(options))
         {
             args.Add("--config");
             args.Add(configFile.Trim());
         }
-        else if (!string.IsNullOrWhiteSpace(ruleFile)
+        if (!string.IsNullOrWhiteSpace(ruleFile)
             && !ExtraArgumentsSupplyFlag(options, "--rule", "-r"))
         {
             args.Add("--rule");
@@ -515,20 +529,19 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// silent-pass trap / a scan root escaping the worktree); and the
     /// suppression-marker sweep, returned as supplemental findings so
     /// silently-honored <c>ast-grep-ignore</c> directives stay visible.
-    /// Every gate input comes from the run-scoped snapshot built with argv
-    /// (<see cref="RunGateContext"/>), never re-read from live config.
+    /// Every gate input comes from the per-run snapshot the base passes in
+    /// (<paramref name="runContext"/>) — the same instance the argv was built
+    /// from, never re-read from live config.
     /// </summary>
     protected override async Task<IReadOnlyList<ExternalToolFinding>> VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
+        IRunContext? runContext,
         CancellationToken ct)
     {
-        // RunAsync always builds argv (BuildToolArguments) before this hook,
-        // so the snapshot exists; resolving again covers only a caller that
-        // skipped argv construction.
-        var gate = _runGateContext.Value ?? ResolveRunGateContext();
+        var gate = RequireRunGate(runContext);
 
         if (!gate.TrustRepositoryCustomLanguages)
             await ThrowIfProjectConfigLoadsNativeCodeAsync(
@@ -613,11 +626,17 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
             || arg.StartsWith("--config=", StringComparison.Ordinal)
             || arg.StartsWith("-c=", StringComparison.Ordinal));
 
-    private RunGateContext ResolveRunGateContext() => new(
-        ResolveTargets(),
-        _configFile(),
-        _trustRepositorySuppression(),
-        _trustRepositoryCustomLanguages());
+    /// <summary>
+    /// Narrows the run context the base hands back to the concrete snapshot
+    /// this auditor produces in <see cref="CreateRunContext"/>. Anything else
+    /// — a null, or another implementation — is a contract violation, not a
+    /// cue to re-read live configuration.
+    /// </summary>
+    private static RunGateContext RequireRunGate(IRunContext? runContext)
+        => runContext as RunGateContext
+            ?? throw new InvalidOperationException(
+                "AstGrepAuditor requires the run context its CreateRunContext returns — the base "
+                + "must invoke it once per run before building arguments or running preconditions.");
 
     /// <summary>
     /// Applies the dynamic-language gate to whichever project config
@@ -655,9 +674,9 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
             return;
         }
 
-        var present = await ProbeRepositoryFilesPresentAsync(
+        var present = await ProbeRepositoryPathsAsync(
             sandbox, workingDirectory, tool, "repository config check",
-            RepositoryProjectConfigNames, RepositoryFileProbe.Present,
+            RepositoryProjectConfigNames, RepositoryPathProbe.Present,
             options, ct).ConfigureAwait(false);
         if (present.Count == 0)
             return;
@@ -713,7 +732,9 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
                 + $"pinned config paths (exit {probe.ExitCode}) — a failed probe is infrastructure, "
                 + "not evidence that the pinned config is operator-owned.",
                 probe.ExitCode,
-                probe.Stdout + "\n" + probe.Stderr);
+                // realpath echoes operand bytes verbatim — flatten so
+                // repo-controlled filename escapes cannot reach the tail.
+                SingleLine(probe.Stdout + "\n" + probe.Stderr));
 
         // Protocol: one canonical line per pinned path, then the canonical
         // worktree root. Anything else means the output was corrupted.
@@ -805,12 +826,16 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     private static AuditUnavailableException ConfigProbeFailed(
         string tool, string configPath, SandboxExecResult probe)
+        // Both sinks are sanitized: the message embeds the canonicalized —
+        // repository-controlled — config path verbatim otherwise (terminal-
+        // escape/log injection), and grep's stderr echoes that same path into
+        // the stored output tail, so it is flattened to a single line.
         => new(
             $"could-not-verify: audit tool '{tool}' repository config check could not inspect "
-            + $"'{configPath}' (exit {probe.ExitCode}) — a failed probe is "
+            + $"'{TruncateForMessage(configPath)}' (exit {probe.ExitCode}) — a failed probe is "
             + "infrastructure, not evidence that dynamic-language entries are absent.",
             probe.ExitCode,
-            probe.Stdout + "\n" + probe.Stderr);
+            SingleLine(probe.Stdout + "\n" + probe.Stderr));
 
     /// <summary>
     /// Configured <c>Targets</c> must exist in the worktree (ast-grep's
@@ -828,9 +853,9 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        var present = await ProbeRepositoryFilesPresentAsync(
+        var present = await ProbeRepositoryPathsAsync(
             sandbox, workingDirectory, tool, "target check", targets,
-            RepositoryFileProbe.Present, options, ct).ConfigureAwait(false);
+            RepositoryPathProbe.Present, options, ct).ConfigureAwait(false);
         var presentSet = new HashSet<string>(present, StringComparer.Ordinal);
         var missing = targets.Where(t => !presentSet.Contains(t)).ToList();
         if (missing.Count > 0)
@@ -847,9 +872,9 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
             .SelectMany(SelfAndAncestors)
             .Distinct(StringComparer.Ordinal)
             .ToList();
-        var linked = await ProbeRepositoryFilesPresentAsync(
+        var linked = await ProbeRepositoryPathsAsync(
             sandbox, workingDirectory, tool, "target check", components,
-            RepositoryFileProbe.Symlinked, options, ct).ConfigureAwait(false);
+            RepositoryPathProbe.Symlinked, options, ct).ConfigureAwait(false);
         if (linked.Count > 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' has Targets that resolve through repository "
@@ -923,7 +948,9 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
                 + $"scan targets (exit {result.ExitCode}) — a failed sweep is infrastructure, not "
                 + "evidence that no suppression directives exist.",
                 result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
+                // The sweep's stdout is a repository-shaped path list —
+                // flatten so filename escapes cannot reach the tail.
+                SingleLine(result.Stdout + "\n" + result.Stderr));
 
         var findings = new List<ExternalToolFinding>();
         var seen = new HashSet<string>(StringComparer.Ordinal);

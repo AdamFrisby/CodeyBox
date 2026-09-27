@@ -366,6 +366,7 @@ public sealed class LycheeAuditor : ExternalToolAuditorBase, IPluginInitializer
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
+        IRunContext? runContext,
         CancellationToken ct)
     {
         if (!_trustRepositorySuppression())
@@ -386,13 +387,13 @@ public sealed class LycheeAuditor : ExternalToolAuditorBase, IPluginInitializer
         // link — and no flag redirects or disables that load, so presence is
         // gated rather than outranked. (.gitignore/.ignore need no gate: the
         // scan runs --no-ignore so they cannot suppress input files.)
-        var present = await ProbeRepositoryFilesPresentAsync(
+        var present = await ProbeRepositoryPathsAsync(
             sandbox,
             workingDirectory,
             tool,
             "suppression check",
             [RepositoryIgnoreFile],
-            RepositoryFileProbe.Present,
+            RepositoryPathProbe.Present,
             options,
             ct).ConfigureAwait(false);
         if (present.Count > 0)

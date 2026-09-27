@@ -29,6 +29,21 @@ public sealed record ExternalToolParseInput(
     int ExitCode);
 
 /// <summary>
+/// Parser-agnostic bounds for single-document tool reports — owned by the
+/// parser contract rather than any one parser, since a dropped diagnostic
+/// would be invisible to the verdict in every format.
+/// </summary>
+public static class ExternalToolParseLimits
+{
+    /// <summary>
+    /// Upper bound on results consumed from one report document. Parsers
+    /// that cannot report truncation must fail closed at this bound; parsers
+    /// that do report it may stop collecting there.
+    /// </summary>
+    public const int DefaultMaxResults = 10_000;
+}
+
+/// <summary>
 /// Parses a finished tool invocation into findings. The tool does not need to
 /// emit SARIF — implement this interface for line-based or JSON output.
 /// Throw <see cref="ExternalToolParseException"/> when the output is not
@@ -80,12 +95,9 @@ public sealed class DelegateToolOutputParser : IExternalToolOutputParser
 /// </summary>
 public sealed class SarifToolOutputParser : IExternalToolOutputParser
 {
-    /// <summary>Upper bound on results consumed from one document.</summary>
-    public const int DefaultMaxResults = 10_000;
-
     private readonly int _maxResults;
 
-    public SarifToolOutputParser(int maxResults = DefaultMaxResults)
+    public SarifToolOutputParser(int maxResults = ExternalToolParseLimits.DefaultMaxResults)
     {
         if (maxResults <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxResults), "Maximum SARIF results must be positive.");

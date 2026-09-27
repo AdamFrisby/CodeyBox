@@ -30,8 +30,8 @@ namespace CodeyBox.AstGrepAuditorPlugin;
 /// </summary>
 internal sealed class AstGrepJsonOutputParser : IExternalToolOutputParser
 {
-    // Same per-document result bound the shared SARIF parser applies.
-    private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
+    // The shared per-document result bound every parser applies.
+    private const int MaxResults = ExternalToolParseLimits.DefaultMaxResults;
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {

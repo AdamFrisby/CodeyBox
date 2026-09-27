@@ -43,8 +43,8 @@ namespace CodeyBox.LycheeAuditorPlugin;
 /// </summary>
 internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
 {
-    // Same per-document result bound the shared SARIF parser applies.
-    private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
+    // The shared per-document result bound every parser applies.
+    private const int MaxResults = ExternalToolParseLimits.DefaultMaxResults;
     private const int MessageMaxChars = 512;
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
@@ -168,7 +168,6 @@ internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
             path = path[2..];
         return path.Length == 0 ? null : path;
     }
-
 
     private static string SingleLine(string message)
         => ToolOutputText.SingleLine(message);
