@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.CargoDenyAuditorPlugin;
 
@@ -254,12 +255,4 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
             && parsed > 0
             ? parsed
             : null;
-
-    private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
 }

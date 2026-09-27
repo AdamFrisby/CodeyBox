@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.LycheeAuditorPlugin;
 
@@ -152,9 +153,7 @@ internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
     }
 
     private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? NullIfWhiteSpace(value.GetString())
-            : null;
+        => NullIfWhiteSpace(ExternalToolJsonHelpers.GetString(element, name));
 
     // Input sources arrive as the walker reported them ("./docs/guide.md",
     // "README.md", "stdin", a URL for remote inputs). Strip the "./" prefix so
@@ -163,15 +162,9 @@ internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
     {
         if (string.IsNullOrWhiteSpace(raw))
             return null;
-        var path = raw.Trim().Replace('\\', '/');
+        var path = NormalizePath(raw);
         while (path.StartsWith("./", StringComparison.Ordinal))
             path = path[2..];
         return path.Length == 0 ? null : path;
     }
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 }
