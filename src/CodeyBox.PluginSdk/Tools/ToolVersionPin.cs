@@ -29,11 +29,21 @@ namespace CodeyBox.PluginSdk.Tools;
 /// <c>["--version"]</c>, or <c>["version"]</c> for subcommand-style CLIs.
 /// Empty falls back to <c>--version</c>.
 /// </param>
+/// <param name="VersionExtractor">
+/// Optional extraction of the reported version from the probe's stdout;
+/// return null when no version token is present so the pin fails closed.
+/// Default null uses the shared first-<c>major.minor.patch</c>-token
+/// extraction — supply one when the tool's banner prints another
+/// component's version first (e.g. govulncheck prints the Go toolchain's
+/// version before <c>govulncheck@v…</c>, so the first token is the wrong
+/// component to pin).
+/// </param>
 public sealed record ToolVersionPin(
     string PluginId,
     Func<string?> ConfiguredExpectedVersion,
     string DefaultExpectedVersion,
-    IReadOnlyList<string> VersionProbeArguments)
+    IReadOnlyList<string> VersionProbeArguments,
+    Func<string, string?>? VersionExtractor = null)
 {
     /// <summary>
     /// Scoped-config key every external-tool auditor honors for overriding

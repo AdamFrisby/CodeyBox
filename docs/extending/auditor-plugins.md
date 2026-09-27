@@ -313,7 +313,12 @@ A pinned tool version is declared, not implemented: set `VersionPin` to a
 default release, and the version-probe arguments — `["--version"]` for most
 tools, `["version"]` for subcommand-style CLIs) and `RunAsync` probes the
 tool before every scan, failing closed on a missing binary, an unrecognised
-version, or a mismatch.
+version, or a mismatch. The default extraction takes the first
+`major.minor.patch` token in the probe output; when a tool's version banner
+prints another component's version first (e.g. govulncheck prints the Go
+toolchain's version before `govulncheck@v…`), pass a `VersionExtractor`
+that returns the tool's own token — see
+`plugins/auditors-dependency-vulnerabilities/CodeyBox.GovulncheckAuditorPlugin/`.
 
 Two extension points cover tool requirements the base cannot express
 declaratively:

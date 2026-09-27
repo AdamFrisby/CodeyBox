@@ -207,7 +207,7 @@ public sealed class GrypeAuditor : ExternalToolAuditorBase, IPluginInitializer
             "--fail-on", "negligible",
         };
 
-        AddPathFlag(args, "--config", _configPath());
+        AddValueFlag(args, "--config", _configPath());
         return args;
     }
 
@@ -278,13 +278,5 @@ public sealed class GrypeAuditor : ExternalToolAuditorBase, IPluginInitializer
                 + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to "
                 + "trust repository-authored grype config.")
             { IsDeterministic = true };
-    }
-
-    private static void AddPathFlag(List<string> args, string flag, string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return;
-        args.Add(flag);
-        args.Add(value.Trim());
     }
 }

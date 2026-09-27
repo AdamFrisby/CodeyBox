@@ -301,9 +301,9 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
         if (_locked())
             args.Add("--locked");
 
-        AddPathFlag(args, "--config", _configPath());
-        AddPathFlag(args, "--manifest-path", _manifestPath());
-        AddPathFlag(args, "--metadata-path", _metadataPath());
+        AddValueFlag(args, "--config", _configPath());
+        AddValueFlag(args, "--manifest-path", _manifestPath());
+        AddValueFlag(args, "--metadata-path", _metadataPath());
 
         foreach (var target in _targets()
             .Where(static t => !string.IsNullOrWhiteSpace(t))
@@ -465,7 +465,6 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
     }
 
     private const int MaxManifestAncestors = 32;
-    private const int MessageValueMaxChars = 64;
 
     private const string AdvisoryDataSourceProbeScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then "
@@ -530,23 +529,5 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
                 matched.Add(line);
         }
         return matched;
-    }
-
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
-    }
-
-    private static void AddPathFlag(List<string> args, string flag, string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return;
-        args.Add(flag);
-        args.Add(value.Trim());
     }
 }

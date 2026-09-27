@@ -13,7 +13,7 @@ namespace CodeyBox.KubeconformAuditorPlugin;
 /// output caps, exit-code classification, severity mapping, finding identity,
 /// and per-auditor configuration. This class adds the kubeconform JSON report
 /// parser (<see cref="KubeconformJsonOutputParser"/>), the pinned tool-version
-/// probe via <see cref="ExternalToolAuditorBase.VerifyToolAsync"/>, and the
+/// declaration via <see cref="ExternalToolAuditorBase.VersionPin"/>, and the
 /// kubeconform-specific arguments and knobs below.
 ///
 /// <para><b>Gate behaviour: blocking.</b> kubeconform has no severity
@@ -140,11 +140,6 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
     /// </summary>
     public const string IgnoreMissingSchemasKey = "IgnoreMissingSchemas";
 
-    private const int MessageValueMaxChars = 64;
-    private static readonly Regex VersionPattern = new(
-        @"\d+\.\d+\.\d+[\w.\-]*",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
-
     // Same shape as kubeconform's own -kubernetes-version UnmarshalText
     // validation; checked here so a bad value is a deterministic
     // configuration failure naming the scoped key, not a bare exit 1.
@@ -213,6 +208,10 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
 
     /// <inheritdoc />
     protected override Func<ExternalToolAuditorOptions> OptionsAccessor => _optionsAccessor;
+
+    /// <inheritdoc />
+    protected override ToolVersionPin? VersionPin =>
+        new(PluginId, _expectedVersion, DefaultExpectedVersion, ["-v"]);
 
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
@@ -285,7 +284,7 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
         ArgumentNullException.ThrowIfNull(context);
         var scoped = context.ScopedConfig;
         _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
-        _expectedVersion = () => scoped["ExpectedVersion"];
+        _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _schemaLocations = () => SplitList(scoped[SchemaLocationsKey]);
         _kubernetesVersion = () => scoped[KubernetesVersionKey];
         _targets = () => SplitList(scoped[TargetsKey]);
@@ -295,99 +294,6 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
         context.Logger.LogInformation(
             "KubeconformAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// kubeconform-specific precondition on the live path: the installed
-    /// binary must match the pinned release (<c>ExpectedVersion</c>). A
-    /// mismatch fails closed as infrastructure before the scan runs.
-    /// </summary>
-    protected override async Task VerifyToolAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        await ThrowIfToolVersionMismatchAsync(sandbox, workingDirectory, tool, options, ct)
-            .ConfigureAwait(false);
-    }
-
-    private async Task ThrowIfToolVersionMismatchAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var configured = _expectedVersion();
-        var expected = NormalizeVersion(configured);
-        if (expected is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' has an unparseable ExpectedVersion "
-                + $"('{TruncateForMessage(configured)}'); set CodeyBox:Plugins:{PluginId}:ExpectedVersion "
-                + $"to a {tool} release such as '{DefaultExpectedVersion}'.")
-            { IsDeterministic = true };
-
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            "version check",
-            new SandboxExec
-            {
-                Argv = [tool, "-v"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        var reported = ExtractVersion(result.Stdout);
-        if (result.ExecutionUnavailable
-            || result.ExitCode != 0
-            || reported is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' version could not be determined "
-                + $"(exit {result.ExitCode}). The pinned release is required before the scan can run — "
-                + $"a missing or foreign '{tool}' is infrastructure, not a verdict on the diff.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        if (!string.Equals(reported, expected, StringComparison.Ordinal))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is version {reported}, but this auditor is "
-                + $"pinned to {expected}. A different scanner version changes the findings; provision "
-                + "the pinned release or set ExpectedVersion to the version you provisioned.")
-            { IsDeterministic = true };
-    }
-
-    private static string? ExtractVersion(string stdout)
-    {
-        // `kubeconform -v` prints the release version (e.g. "v0.8.0") — or
-        // "development" for unpinned source builds, which matches nothing.
-        var match = VersionPattern.Match(stdout);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string? NormalizeVersion(string? configured)
-    {
-        var value = string.IsNullOrWhiteSpace(configured)
-            ? DefaultExpectedVersion
-            : configured.Trim();
-        var match = VersionPattern.Match(value);
-        return match.Success ? match.Value : null;
-    }
-
-    private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
     }
 
     private static List<string> SplitList(string? value)

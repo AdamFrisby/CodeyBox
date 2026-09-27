@@ -294,8 +294,8 @@ public sealed class CargoAuditAuditor : ExternalToolAuditorBase, IPluginInitiali
             "--file", lockfilePath,
         };
 
-        AddPathFlag(args, "--db", _databasePath());
-        AddPathFlag(args, "--url", _databaseUrl());
+        AddValueFlag(args, "--db", _databasePath());
+        AddValueFlag(args, "--url", _databaseUrl());
 
         if (_offline())
             args.Add("--no-fetch");
@@ -384,13 +384,5 @@ public sealed class CargoAuditAuditor : ExternalToolAuditorBase, IPluginInitiali
                 + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to "
                 + "trust repository-authored cargo-audit config.")
             { IsDeterministic = true };
-    }
-
-    private static void AddPathFlag(List<string> args, string flag, string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return;
-        args.Add(flag);
-        args.Add(value.Trim());
     }
 }
