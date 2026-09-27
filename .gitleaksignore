@@ -86,3 +86,5 @@ ee80b4ddd9b086f55aa67d06a9e949f0e7f988b8:tests/CodeyBox.Tests/PullRequestDescrip
 # these entries cover the pre-fix commit only.
 e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:764
 e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:765
+3e97c04303fb6f1bda1301ad242a958299852280:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:764
+3e97c04303fb6f1bda1301ad242a958299852280:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:765
