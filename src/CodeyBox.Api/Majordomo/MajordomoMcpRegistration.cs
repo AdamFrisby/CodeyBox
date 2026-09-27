@@ -1,7 +1,9 @@
 using CodeyBox.Majordomo;
+using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ModelContextProtocol.Server;
 
@@ -22,6 +24,20 @@ internal static class MajordomoMcpRegistration
         services.AddSingleton<MajordomoTurnLedger>();
         services.AddSingleton<MajordomoReadBackend>();
         services.AddSingleton<MajordomoMutateBackend>();
+        services.AddSingleton<IMajordomoProposalStore>(sp =>
+        {
+            var path = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.StateDatabasePath;
+            return new SqliteMajordomoProposalStore(
+                path,
+                sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
+                sp.GetService<ILogger<SqliteMajordomoProposalStore>>());
+        });
+        services.AddSingleton<MajordomoProposalService>(sp =>
+            new MajordomoProposalService(
+                sp.GetRequiredService<IMajordomoProposalStore>(),
+                sp.GetRequiredService<MajordomoMutateBackend>(),
+                sp.GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>(),
+                sp.GetService<TimeProvider>() ?? TimeProvider.System));
         services.AddSingleton<MajordomoExecutor>();
         services.AddHttpContextAccessor();
 

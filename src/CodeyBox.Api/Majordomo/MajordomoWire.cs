@@ -21,6 +21,20 @@ internal static class MajordomoRefusalReasons
     public const string DependencyNotFound = "dependency_not_found";
     public const string DependencyTerminal = "dependency_terminal";
     public const string UnknownAgent = "unknown_agent";
+    public const string ProposalNotFound = "proposal_not_found";
+    public const string ProposalNotPending = "proposal_not_pending";
+    public const string ProposalExpired = "proposal_expired";
+    public const string ProposalToolRetired = "proposal_tool_retired";
+    public const string ProposalCorrupt = "proposal_corrupt";
+
+    /// <summary>The live re-plan no longer matches the change set the operator reviewed.</summary>
+    public const string ProposalDrifted = "proposal_drifted";
+
+    /// <summary>A claimed commit is in flight or was interrupted before its outcome was recorded.</summary>
+    public const string ProposalCommitIncomplete = "proposal_commit_incomplete";
+
+    /// <summary>The proposal queue is at its configured bound on undecided proposals.</summary>
+    public const string ProposalQueueFull = "proposal_queue_full";
 }
 
 /// <summary>
@@ -33,6 +47,9 @@ internal static class MajordomoOutcomes
     public const string DryRun = "dry_run";
     public const string Proposed = "proposed";
     public const string Refused = "refused";
+
+    /// <summary>An operator decision (reject/supersede) was recorded — distinct from a refused call.</summary>
+    public const string Decided = "decided";
 
     /// <summary>The call threw before it could settle — writes may have landed.</summary>
     public const string Error = "error";

@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Text.Json;
 using CodeyBox.Composition;
 using CodeyBox.Core;
@@ -22,6 +23,64 @@ namespace CodeyBox.Api.Majordomo;
 /// </remarks>
 internal sealed class MajordomoMutateBackend
 {
+    /// <param name="cancelCascadeTargets">
+    /// For <c>cancel_work_item</c>, the dependents enumerated at decision
+    /// time — the plan must commit exactly the measured set, not a re-scan.
+    /// Null for every other tool, and for a cancel that should enumerate the
+    /// live cascade itself.
+    /// </param>
+    internal delegate Task<MajordomoMutationResult> MutateHandler(
+        MajordomoMutateBackend backend,
+        MajordomoMutateArgs args,
+        WorkInitiator initiator,
+        IReadOnlyList<WorkItem>? cancelCascadeTargets,
+        bool commit,
+        CancellationToken ct);
+
+    /// <summary>
+    /// The single tool→backend dispatch for the MUTATE vocabulary, keyed on
+    /// the descriptor object so a rename cannot drift the table from the
+    /// catalog. Autonomous calls, proposals, and proposal approvals all run
+    /// through this one table — <see cref="MajordomoExecutor.VerifyVocabularyWiring"/>
+    /// fails composition when a MUTATE descriptor lacks an entry, so a tool
+    /// can never be proposable-but-uncommittable.
+    /// </summary>
+    internal static readonly FrozenDictionary<MajordomoTool, MutateHandler> Mutations =
+        new Dictionary<MajordomoTool, MutateHandler>
+        {
+            [MajordomoTools.CreateWorkItem] = static (b, a, initiator, _, commit, ct) =>
+                b.CreateAsync((CreateWorkItemArgs)a, initiator, commit, ct),
+            [MajordomoTools.CreateWorkItemChain] = static (b, a, initiator, _, commit, ct) =>
+                b.CreateChainAsync((CreateWorkItemChainArgs)a, initiator, commit, ct),
+            [MajordomoTools.UpdateWorkItem] = static (b, a, _, _, commit, ct) =>
+                b.UpdateAsync((UpdateWorkItemArgs)a, commit, ct),
+            [MajordomoTools.CancelWorkItem] = static (b, a, _, cascade, commit, ct) =>
+                b.CancelAsync((CancelWorkItemArgs)a, cascade, commit, ct),
+            [MajordomoTools.RetryWorkItem] = static (b, a, _, _, commit, ct) =>
+                b.RetryAsync((RetryWorkItemArgs)a, commit, ct),
+        }.ToFrozenDictionary();
+
+    /// <summary>True when <paramref name="tool"/> is a MUTATE descriptor with a backend arm.</summary>
+    internal static bool CanMutate(MajordomoTool tool) =>
+        tool.Class == MajordomoToolClass.Mutate && Mutations.ContainsKey(tool);
+
+    /// <summary>
+    /// Runs a MUTATE call through the descriptor's backend arm. Planning-only
+    /// (<paramref name="commit"/> false) and committing calls share the same
+    /// arm, so what a dry-run/proposal computes is what an approval commits.
+    /// </summary>
+    internal Task<MajordomoMutationResult> MutateAsync(
+        MajordomoTool tool,
+        MajordomoMutateArgs args,
+        WorkInitiator initiator,
+        IReadOnlyList<WorkItem>? cancelCascadeTargets,
+        bool commit,
+        CancellationToken ct) =>
+        Mutations.TryGetValue(tool, out var handler)
+            ? handler(this, args, initiator, cancelCascadeTargets, commit, ct)
+            : Task.FromResult(MajordomoMutationResult.Refused(new MajordomoRefusal(
+                MajordomoRefusalReasons.UnknownTool, $"no mutate backend for '{tool.Name}'")));
+
     private readonly IWorkItemStore _store;
     private readonly WorkItemCreationService _creation;
     private readonly WorkItemCommandService _commands;
@@ -350,6 +409,8 @@ internal sealed class MajordomoMutateBackend
         if (priorityPlan is not null)
         {
             var outcome = await _commands.CommitPriorityAsync(priorityPlan.Plan!, ct).ConfigureAwait(false);
+            // A no-op priority commit (item already at the target priority)
+            // reports WritesApplied false — nothing landed to charge for.
             writesApplied |= outcome.WritesApplied;
             if (!outcome.Succeeded)
                 return MajordomoMutationResult.Refused(
@@ -359,7 +420,6 @@ internal sealed class MajordomoMutateBackend
                         Item: args.Id.ToString(),
                         Field: "patch.priority"),
                     writesApplied: writesApplied);
-            writesApplied = true;
         }
 
         if (extIdsPlan is not null)

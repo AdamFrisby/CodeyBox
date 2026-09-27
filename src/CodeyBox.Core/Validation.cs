@@ -300,17 +300,7 @@ public static partial class Validation
         var builder = new StringBuilder(length + 1);
         for (var i = 0; i < length; i++)
         {
-            var width = char.IsHighSurrogate(value[i])
-                && i + 1 < length
-                && char.IsLowSurrogate(value[i + 1])
-                ? 2
-                : 1;
-            // GetUnicodeCategory(string, int) decodes a surrogate pair to the
-            // pair's category; a lone surrogate resolves to Surrogate and is
-            // dropped below.
-            var category = width == 2
-                ? char.GetUnicodeCategory(value, i)
-                : char.GetUnicodeCategory(value[i]);
+            var (width, category) = ScalarAt(value, i, length);
             if (IsEchoableCategory(category))
                 builder.Append(value, i, width);
             i += width - 1;
@@ -328,4 +318,52 @@ public static partial class Validation
             or UnicodeCategory.OtherNotAssigned
             or UnicodeCategory.LineSeparator
             or UnicodeCategory.ParagraphSeparator);
+
+    /// <summary>
+    /// True when every character of <paramref name="value"/> is in the
+    /// display-echoable class <see cref="DescribeUntrustedValue"/> keeps —
+    /// so storing it cannot smuggle bidi overrides, zero-width or
+    /// private-use characters, lone surrogates, or terminal escapes into a
+    /// rendered surface. <paramref name="allowProseWhitespace"/> additionally
+    /// permits CR/LF/TAB for multi-line stored text (majordomo reasoning);
+    /// single-line values echoed into audit records must leave it off so a
+    /// line break cannot forge a log entry. Null is echoable.
+    /// </summary>
+    public static bool IsEchoableText(string? value, bool allowProseWhitespace = false)
+    {
+        if (value is null)
+            return true;
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (allowProseWhitespace && value[i] is '\r' or '\n' or '\t')
+                continue;
+            var (width, category) = ScalarAt(value, i, value.Length);
+            if (!IsEchoableCategory(category))
+                return false;
+            i += width - 1;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Decodes the UTF-16 scalar starting at <paramref name="index"/>: a
+    /// valid surrogate pair reads as one scalar of width 2 judged by the
+    /// pair's category (<c>GetUnicodeCategory(string, int)</c> performs the
+    /// pair decode); anything else — including a lone surrogate — is a
+    /// width-1 char judged by its own category. <paramref name="limit"/>
+    /// bounds the pair look-ahead so a pair straddling a truncation
+    /// boundary resolves as a lone surrogate and is dropped.
+    /// </summary>
+    private static (int Width, UnicodeCategory Category) ScalarAt(string value, int index, int limit)
+    {
+        var width = char.IsHighSurrogate(value[index])
+            && index + 1 < limit
+            && char.IsLowSurrogate(value[index + 1])
+            ? 2
+            : 1;
+        var category = width == 2
+            ? char.GetUnicodeCategory(value, index)
+            : char.GetUnicodeCategory(value[index]);
+        return (width, category);
+    }
 }

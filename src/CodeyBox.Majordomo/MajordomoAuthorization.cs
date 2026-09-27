@@ -62,7 +62,7 @@ public static class MajordomoAuthorization
                 $"unknown tool '{DescribeToolName(toolName)}'");
         }
 
-        if (arguments is null || arguments.GetType() != tool.ArgumentsType)
+        if (!tool.AcceptsArguments(arguments))
         {
             return new MajordomoDecision.Refuse(
                 MajordomoRefusalReason.ArgumentContractMismatch,

@@ -14,11 +14,12 @@ internal sealed record MajordomoRefusal(
     string? Field = null);
 
 /// <summary>
-/// The proposal a Proposed-mode mutation produces: the tool call itself plus
-/// the change set the dry-run machinery computed for it, so the operator's
-/// review sees exactly what approval would commit.
+/// The proposal a Proposed-mode mutation produces: the durable proposal id,
+/// the tool call itself plus the change set the dry-run machinery computed
+/// for it, so the operator's review sees exactly what approval would commit.
 /// </summary>
 internal sealed record MajordomoProposalView(
+    string ProposalId,
     string Tool,
     System.Text.Json.Nodes.JsonNode? Arguments,
     int AffectedItems,

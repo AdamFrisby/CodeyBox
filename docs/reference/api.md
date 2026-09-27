@@ -67,7 +67,18 @@ it accepts only the named API client configured by
 `CodeyBox:Majordomo:ClientName` (default `majordomo`). Every other credential —
 the operator key included — is refused, so the majordomo's calls are
 attributable to its own principal and the token can be revoked without
-rotating the operator key.
+rotating the operator key. The confinement runs both ways: the majordomo
+credential itself is refused on every route other than `/mcp/majordomo`, so
+the token that drives the prompt-injectable MCP client can only exercise the
+reviewed tool vocabulary and cannot reach the REST surface directly.
+
+In `proposed` mode, mutations are persisted as operator-reviewable proposals
+under `/majordomo/proposals` (list, inspect, approve, reject, supersede —
+see the `Majordomo` configuration reference). That surface is operator-only:
+the majordomo client itself and executor-bound tokens are refused, so the
+credential whose calls are being reviewed can never approve them. Approval
+commits through the same path as Autonomous mode, revalidated against live
+queue state.
 
 ### GitHub App delivery credentials
 

@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace CodeyBox.Majordomo;
 
 /// <summary>
@@ -70,4 +72,14 @@ public sealed record MajordomoTool
     /// already-cancelled item succeeds without further mutation.
     /// </summary>
     public bool Idempotent { get; }
+
+    /// <summary>
+    /// Whether <paramref name="arguments"/> is exactly this tool's declared
+    /// contract type — an exact runtime-type match, not assignability, so a
+    /// derived payload cannot smuggle extra fields past the vocabulary's
+    /// contract. The single check every caller pairing a name with a
+    /// payload must pass.
+    /// </summary>
+    public bool AcceptsArguments([NotNullWhen(true)] MajordomoToolArgs? arguments) =>
+        arguments is not null && arguments.GetType() == ArgumentsType;
 }

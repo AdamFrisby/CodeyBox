@@ -22,7 +22,7 @@ internal sealed class MajordomoMcpTool : McpServerTool
         {
             Name = descriptor.Name,
             Description = descriptor.Description,
-            InputSchema = MajordomoJson.InputSchemaFor(descriptor.ArgumentsType),
+            InputSchema = MajordomoToolSchema.InputSchemaFor(descriptor.ArgumentsType),
             Annotations = new ToolAnnotations
             {
                 ReadOnlyHint = descriptor.Class == MajordomoToolClass.Read,

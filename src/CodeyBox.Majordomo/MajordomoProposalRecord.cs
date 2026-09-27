@@ -1,0 +1,150 @@
+using CodeyBox.Core;
+
+namespace CodeyBox.Majordomo;
+
+/// <summary>
+/// One persisted majordomo proposal: the exact tool call the assistant made
+/// (tool plus typed arguments), the change set the operator reviewed, the
+/// reasoning the majordomo gave, who proposed it and when, and the current
+/// lifecycle state. The record is immutable — state changes produce a new
+/// record via <c>with</c> and persist through
+/// <see cref="IMajordomoProposalStore.TryTransitionAsync"/>, which applies
+/// the update only while the stored row is still in the expected state, so a
+/// claim, revert, or settle can never overwrite a decision that raced it.
+/// </summary>
+public sealed record MajordomoProposalRecord
+{
+    /// <summary>Maximum stored reasoning length; mirrors the question-text cap.</summary>
+    public const int MaxReasoningLength = 4000;
+
+    /// <summary>Unique proposal id (GUID, N format).</summary>
+    public required string Id { get; init; }
+
+    /// <summary>Canonical MUTATE tool name as resolved by <see cref="MajordomoTools.TryGet"/>.</summary>
+    public required string ToolName { get; init; }
+
+    /// <summary>The exact typed arguments approval replays.</summary>
+    public required MajordomoMutateArgs Arguments { get; init; }
+
+    /// <summary>The reasoning the majordomo gave for the call; null when it gave none.</summary>
+    public string? Reasoning { get; init; }
+
+    /// <summary>
+    /// The dry-run change set shown to the operator at proposal time.
+    /// Approval re-plans against live queue state and refuses when the live
+    /// plan no longer matches this one — the committed mutation can never
+    /// exceed what was reviewed. Null only on rows persisted before the plan
+    /// was recorded; those approve without the drift check.
+    /// </summary>
+    public MajordomoChangeSet? ReviewedChangeSet { get; init; }
+
+    /// <summary>Identity that proposed (the majordomo API-client name).</summary>
+    public required string ProposedBy { get; init; }
+
+    /// <summary>When the proposal was persisted.</summary>
+    public required DateTimeOffset ProposedAt { get; init; }
+
+    /// <summary>Current lifecycle state.</summary>
+    public MajordomoProposalState State { get; init; } = MajordomoProposalState.Pending;
+
+    /// <summary>
+    /// When the decision was recorded; null while pending. Also stamped when a
+    /// commit is claimed (<see cref="MajordomoProposalState.Applying"/>) so an
+    /// interrupted commit keeps its attribution — a non-null value alone does
+    /// not mean decided; <see cref="IsDecided"/> is that check.
+    /// </summary>
+    public DateTimeOffset? DecidedAt { get; init; }
+
+    /// <summary>
+    /// Who recorded the decision; null while pending. Also stamped when a
+    /// commit is claimed (<see cref="MajordomoProposalState.Applying"/>), for
+    /// the same attribution reason as <see cref="DecidedAt"/>.
+    /// </summary>
+    public string? DecidedBy { get; init; }
+
+    /// <summary>
+    /// Why the decision was recorded; null while pending. On
+    /// <see cref="MajordomoProposalState.Applying"/> rows this carries the
+    /// claim marker or a partial-commit note rather than a terminal rationale.
+    /// </summary>
+    public string? DecisionReason { get; init; }
+
+    /// <summary>
+    /// Work items the approval committed; set only on <see cref="MajordomoProposalState.Approved"/>.
+    /// A repeated approval replays these ids without touching the queue again,
+    /// which is what makes approval idempotent.
+    /// </summary>
+    public IReadOnlyList<WorkItemId>? ResultAffectedItems { get; init; }
+
+    /// <summary>Mints a proposal id.</summary>
+    public static string NewId() => Guid.NewGuid().ToString("N");
+
+    /// <summary>
+    /// Creates a pending proposal, validating the tool/argument pairing the
+    /// same way <see cref="MajordomoAuthorization"/> does: the tool must be a
+    /// known MUTATE tool and the arguments must be exactly its contract type.
+    /// <paramref name="reviewedChangeSet"/> is required — the drift check at
+    /// approval time is only as strong as the plan the operator reviewed, so
+    /// a proposal without one cannot be created.
+    /// </summary>
+    public static MajordomoProposalRecord Create(
+        string toolName,
+        MajordomoMutateArgs arguments,
+        string proposedBy,
+        DateTimeOffset proposedAt,
+        MajordomoChangeSet reviewedChangeSet,
+        string? reasoning = null)
+    {
+        ArgumentNullException.ThrowIfNull(arguments);
+        ArgumentNullException.ThrowIfNull(reviewedChangeSet);
+        if (!MajordomoTools.TryGetMutate(toolName, out var tool))
+            throw new ArgumentException($"'{toolName}' is not a known MUTATE tool", nameof(toolName));
+        if (!tool.AcceptsArguments(arguments))
+            throw new ArgumentException(
+                $"tool '{tool.Name}' requires arguments of type {tool.ArgumentsType.Name}", nameof(arguments));
+        if (string.IsNullOrWhiteSpace(proposedBy))
+            throw new ArgumentException("proposedBy is required", nameof(proposedBy));
+
+        return new MajordomoProposalRecord
+        {
+            Id = NewId(),
+            ToolName = tool.Name,
+            Arguments = arguments,
+            Reasoning = NormalizeReasoning(reasoning ?? arguments.Reasoning, nameof(reasoning)),
+            ReviewedChangeSet = reviewedChangeSet,
+            ProposedBy = proposedBy,
+            ProposedAt = proposedAt,
+            State = MajordomoProposalState.Pending,
+        };
+    }
+
+    /// <summary>
+    /// True once the proposal is in a terminal state (approved, rejected,
+    /// expired, superseded). <see cref="MajordomoProposalState.Applying"/> is
+    /// not decided: the commit was claimed but no outcome is recorded yet.
+    /// </summary>
+    public bool IsDecided => State is not MajordomoProposalState.Pending
+        and not MajordomoProposalState.Applying;
+
+    /// <summary>True when <paramref name="now"/> is past the expiry deadline for this proposal.</summary>
+    public bool IsExpiredAt(DateTimeOffset now, TimeSpan timeToLive) => ProposedAt + timeToLive <= now;
+
+    internal static string? NormalizeReasoning(string? value, string paramName)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        var trimmed = value.Trim();
+        if (trimmed.Length > MaxReasoningLength)
+            throw new ArgumentException(
+                $"reasoning must be <= {MaxReasoningLength} chars", paramName);
+        // Reasoning is rendered to operators, so terminal escapes and
+        // display-spoofing characters (bidi overrides/isolates, zero-width
+        // and other Unicode format characters, unassigned code points) must
+        // not ride it into a log or dashboard. Newlines and tabs are
+        // legitimate prose; every other non-echoable character is refused.
+        if (!Validation.IsEchoableText(trimmed, allowProseWhitespace: true))
+            throw new ArgumentException(
+                "reasoning must not contain control or display-spoofing characters", paramName);
+        return trimmed;
+    }
+}

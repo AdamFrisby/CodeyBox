@@ -33,6 +33,30 @@ public sealed class MajordomoServerOptions
     /// <summary>Largest accepted <see cref="TurnWindowSeconds"/>.</summary>
     public const int MaxTurnWindowSeconds = 3600;
 
+    /// <summary>Default proposal time-to-live in seconds (24 hours).</summary>
+    public static readonly int DefaultProposalTimeToLiveSeconds =
+        (int)MajordomoOptions.DefaultProposalTimeToLive.TotalSeconds;
+
+    /// <summary>Shortest accepted proposal time-to-live in seconds (1 minute).</summary>
+    public static readonly int MinProposalTimeToLiveSeconds =
+        (int)MajordomoOptions.MinProposalTimeToLive.TotalSeconds;
+
+    /// <summary>Longest accepted proposal time-to-live in seconds (30 days).</summary>
+    public static readonly int MaxProposalTimeToLiveSeconds =
+        (int)MajordomoOptions.MaxProposalTimeToLive.TotalSeconds;
+
+    /// <summary>Shortest accepted decided-proposal retention in seconds (1 minute).</summary>
+    public static readonly int MinDecidedProposalRetentionSeconds =
+        (int)MajordomoOptions.MinDecidedProposalRetention.TotalSeconds;
+
+    /// <summary>Longest accepted decided-proposal retention in seconds (90 days).</summary>
+    public static readonly int MaxDecidedProposalRetentionSeconds =
+        (int)MajordomoOptions.MaxDecidedProposalRetention.TotalSeconds;
+
+    /// <summary>Default decided-proposal retention in seconds (7 days).</summary>
+    public static readonly int DefaultDecidedProposalRetentionSeconds =
+        (int)MajordomoOptions.DefaultDecidedProposalRetention.TotalSeconds;
+
     /// <summary>
     /// Whether MUTATE tools execute immediately or produce operator
     /// proposals. Mirrors <see cref="MajordomoOptions.Mode"/>; defaults to
@@ -59,11 +83,43 @@ public sealed class MajordomoServerOptions
     /// </summary>
     public int TurnWindowSeconds { get; set; } = DefaultTurnWindowSeconds;
 
+    /// <summary>
+    /// How long a queued proposal stays approvable, in seconds. Approving
+    /// past the deadline is refused and the proposal is marked expired, so a
+    /// stale queue cannot be approved long after the reasoning behind it
+    /// stopped being true. Between <see cref="MinProposalTimeToLiveSeconds"/>
+    /// and <see cref="MaxProposalTimeToLiveSeconds"/> seconds. Mirrors
+    /// <see cref="MajordomoOptions.ProposalTimeToLive"/>.
+    /// </summary>
+    public int ProposalTimeToLiveSeconds { get; set; } = DefaultProposalTimeToLiveSeconds;
+
+    /// <summary>
+    /// Maximum proposals awaiting an operator decision at once — pending rows
+    /// plus claimed commits still in <c>applying</c>. Enqueue refuses past
+    /// the cap so the proposal table cannot grow at request rate. Between 1
+    /// and <see cref="MajordomoOptions.MaxAllowedPendingProposals"/>. Mirrors
+    /// <see cref="MajordomoOptions.MaxPendingProposals"/>.
+    /// </summary>
+    public int MaxPendingProposals { get; set; } = MajordomoOptions.DefaultMaxPendingProposals;
+
+    /// <summary>
+    /// How long a decided (approved, rejected, expired, superseded) proposal
+    /// row is retained for review before the enqueue sweep removes it, in
+    /// seconds. Undecided rows are never reaped by retention. Between
+    /// <see cref="MinDecidedProposalRetentionSeconds"/> and
+    /// <see cref="MaxDecidedProposalRetentionSeconds"/> seconds. Mirrors
+    /// <see cref="MajordomoOptions.DecidedProposalRetention"/>.
+    /// </summary>
+    public int DecidedProposalRetentionSeconds { get; set; } = DefaultDecidedProposalRetentionSeconds;
+
     /// <summary>Builds the policy record the authorization gate consumes.</summary>
     public MajordomoOptions ToPolicy() => new()
     {
         Mode = Mode,
         MaxMutatedItemsPerTurn = MaxMutatedItemsPerTurn,
+        ProposalTimeToLive = TimeSpan.FromSeconds(ProposalTimeToLiveSeconds),
+        MaxPendingProposals = MaxPendingProposals,
+        DecidedProposalRetention = TimeSpan.FromSeconds(DecidedProposalRetentionSeconds),
     };
 
     /// <summary>Hot-reload validator: returns the failure message or null.</summary>
@@ -75,8 +131,20 @@ public sealed class MajordomoServerOptions
             return $"{SectionName}:MaxMutatedItemsPerTurn must be within [1, {MajordomoOptions.MaxAllowedMutatedItemsPerTurn}]";
         if (string.IsNullOrWhiteSpace(opts.ClientName) || opts.ClientName.Any(char.IsControl))
             return $"{SectionName}:ClientName must be a non-empty ApiClients entry name";
+        // The auth-disabled sentinel is reserved: pointing ClientName at it
+        // would confine the loopback operator itself to the MCP route.
+        if (string.Equals(opts.ClientName, ApiKeyAuth.AuthenticationDisabledClientName, StringComparison.Ordinal))
+            return $"{SectionName}:ClientName '{ApiKeyAuth.AuthenticationDisabledClientName}' is reserved";
         if (opts.TurnWindowSeconds is < 1 or > MaxTurnWindowSeconds)
             return $"{SectionName}:TurnWindowSeconds must be within [1, {MaxTurnWindowSeconds}]";
+        if (opts.ProposalTimeToLiveSeconds < MinProposalTimeToLiveSeconds
+            || opts.ProposalTimeToLiveSeconds > MaxProposalTimeToLiveSeconds)
+            return $"{SectionName}:ProposalTimeToLiveSeconds must be within [{MinProposalTimeToLiveSeconds}, {MaxProposalTimeToLiveSeconds}]";
+        if (opts.MaxPendingProposals < 1 || opts.MaxPendingProposals > MajordomoOptions.MaxAllowedPendingProposals)
+            return $"{SectionName}:MaxPendingProposals must be within [1, {MajordomoOptions.MaxAllowedPendingProposals}]";
+        if (opts.DecidedProposalRetentionSeconds < MinDecidedProposalRetentionSeconds
+            || opts.DecidedProposalRetentionSeconds > MaxDecidedProposalRetentionSeconds)
+            return $"{SectionName}:DecidedProposalRetentionSeconds must be within [{MinDecidedProposalRetentionSeconds}, {MaxDecidedProposalRetentionSeconds}]";
         return null;
     }
 }
