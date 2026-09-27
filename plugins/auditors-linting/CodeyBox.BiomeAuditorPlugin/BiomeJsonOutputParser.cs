@@ -1,6 +1,6 @@
-using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.BiomeAuditorPlugin;
 
@@ -112,26 +112,7 @@ internal sealed class BiomeJsonOutputParser : IExternalToolOutputParser
     {
         if (string.IsNullOrWhiteSpace(raw))
             return null;
-        var path = raw.Trim().Replace('\\', '/');
+        var path = NormalizePath(raw);
         return path.StartsWith("./", StringComparison.Ordinal) ? path[2..] : path;
-    }
-
-    private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string Truncate(string value, int maxChars)
-        => value.Length <= maxChars ? value : value[..maxChars] + "...";
-
-    private static string SingleLine(string message)
-    {
-        var builder = new StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
     }
 }

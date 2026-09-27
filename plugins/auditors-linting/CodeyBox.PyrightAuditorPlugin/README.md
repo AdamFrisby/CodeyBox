@@ -15,7 +15,11 @@ each diagnostic as an audit finding with the pyright rule identifier (e.g.
   against the audited worktree root, and `range.start.line` is converted
   from pyright's 0-based numbering. Diagnostics that carry no `rule` (some
   syntax/config-level errors) still produce findings; diagnostics outside
-  the worktree keep their absolute path so nothing is silently rewritten.
+  the worktree keep their absolute path with an explicit `file://` marker
+  (e.g. `file:///opt/typeshed/stdlib/builtins.pyi:7`) so an out-of-tree
+  path can never be mistaken for a repository file — the shared finding
+  pipeline trims a bare leading `/`, which would otherwise hide that the
+  path was outside the audited tree.
 - **Gate behaviour: hybrid / severity-driven — not blocking on every
   finding.** Pyright's severities go through a declared map, never raw:
   `error` → `Error` (fails the audit); `warning` → `Warning` (advisory);
@@ -39,6 +43,18 @@ each diagnostic as an audit finding with the pyright rule identifier (e.g.
   them by provisioning the environment (`venv`/`venvPath` in the repo's
   config, or `PYRIGHT_PYTHON_*`/extra args) rather than by excluding rules
   blindly.
+- **The repo's config selects the interpreter pyright executes.** Pyright
+  spawns the configured interpreter — `pythonPath`, or
+  `<venvPath>/<venv>/bin/python` — to discover import search paths, and the
+  audit subject writes that config: a shipped `pyrightconfig.json` pointing
+  at a repo-controlled binary means that binary runs inside the audit
+  sandbox during every scan. This is the same exposure class as ESLint's
+  executable config and is contained the same way — the auditor declares
+  `AuditCapabilities.None`, so the scan runs with no agent credentials and
+  no network inside the provider's scrubbed environment. Operators who want
+  interpreter selection immune to the audited repository pin a provisioned
+  interpreter via `PythonPath` (`--pythonpath`), which overrides
+  `pythonPath`/`venvPath`/`venv`.
 - **Inline suppressions stay honored.** `# type: ignore` and
   `# pyright: ignore` comments are authored inside the audited repository,
   and pyright has no `--no-inline-config`-style flag to disable them
@@ -88,13 +104,15 @@ probes `pyright --version` before every run and reports an infrastructure
 failure on any other version.
 
 The tool requirement is declared **verify-only** — no `AptPackage`: pyright
-ships via npm (the `pyright` package bundles its own Node.js runtime) and
-the pip `pyright` package is a wrapper that downloads the same npm release;
-no distro package carries a version pin. Provision the pinned release in
-your sandbox baseline **only when this plugin is enabled**:
+ships via npm, and the npm package's entry point is a Node.js script — it
+requires Node.js already installed on PATH. (The pip `pyright` package is a
+community wrapper that provisions a Node runtime itself and runs the same
+release.) No distro package carries a version pin. Provision the pinned
+release in your sandbox baseline **only when this plugin is enabled**:
 
 ```sh
-# baseline bake step
+# baseline bake step — Node.js must already be installed
+apt-get install -y nodejs npm   # stock baselines already carry nodejs+npm
 npm install -g pyright@1.1.414
 pyright --version   # must print "pyright 1.1.414"
 ```
@@ -130,6 +148,7 @@ Scoped under `CodeyBox:Plugins:codeybox.pyright`, resolved per run
 |---|---|---|
 | `ExpectedVersion` | `1.1.414` | Pinned pyright release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
 | `ProjectPath` | `null` | Passed to `--project` — a `pyrightconfig.json` file or a directory containing one. Ignored when `ExtraArguments` already supplies `--project`/`-p`. Caveat: pyright derives the project root (analysis scope) from this location, so an out-of-repo config must retarget the repository via its own include/execution-environments. Positional file arguments via `ExtraArguments` are mutually exclusive with `--project`. |
+| `PythonPath` | `null` | Passed to `--pythonpath` — the Python interpreter pyright executes to discover import search paths, overriding the audited repo's `pythonPath`/`venvPath`/`venv`. Ignored when `ExtraArguments` already supplies `--pythonpath`. Pin a provisioned interpreter here when the audited repository must not choose the executed binary (see "What it cannot see"). |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
 | `IncludedRules` / `ExcludedRules` | — | Exact pyright rule ids to keep/drop (e.g. `reportAssignmentType`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/`, `.venv/`, `venv/`, `.tox/`, `dist/`, `build/`, `out/`, `coverage/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |

@@ -438,8 +438,9 @@ public sealed class PyrightAuditorTests
 
         var tool = Assert.Single(loader.GetEnabledPluginTools());
         Assert.Equal("pyright", tool.Binary);
-        // Verify-only by design: pyright ships via npm (or the pip wrapper over
-        // the same release); no distro apt package carries a version pin.
+        // Verify-only by design: pyright ships via npm (requires Node.js on
+        // PATH) or the pip wrapper that provisions Node itself; no distro apt
+        // package carries a version pin.
         Assert.Null(tool.AptPackage);
 
         var contributions = PluginBaselineProvisioning.BuildContributions(loader.GetEnabledPluginTools());
@@ -520,7 +521,7 @@ public sealed class PyrightAuditorTests
 
         // vendor/, .venv/, dist/ findings are dropped by the default
         // ExcludePaths; the src/ error and the diagnostic outside the scan
-        // root (kept verbatim, normalized) survive.
+        // root survive.
         Assert.Equal(2, result.Findings.Count);
 
         // No range in the report -> file-only location (0-based lines need no
@@ -528,8 +529,11 @@ public sealed class PyrightAuditorTests
         var srcFinding = Assert.Single(result.Findings, f => f.Location == "src/broken.py");
         Assert.Equal(AuditSeverity.Error, srcFinding.Severity);
 
+        // Out-of-root absolute paths keep a file:// marker: the base strips a
+        // bare leading '/', so without the marker "opt/..." would read as a
+        // repository-relative path.
         var outsideFinding = Assert.Single(result.Findings, f => f.Title.Contains("Stub outside", StringComparison.Ordinal));
-        Assert.Equal("opt/typeshed/stdlib/builtins.pyi:7", outsideFinding.Location);
+        Assert.Equal("file:///opt/typeshed/stdlib/builtins.pyi:7", outsideFinding.Location);
     }
 
     [Fact]
@@ -555,6 +559,62 @@ public sealed class PyrightAuditorTests
         var finding = Assert.Single(result.Findings);
         Assert.Contains("reportUnusedVariable", finding.Title, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public async Task ConcurrentRuns_ScanRootStaysPerInvocation()
+    {
+        // Plugin auditor types are DI singletons shared across concurrent
+        // work-item audits, and each run's sandbox may translate the same
+        // working directory differently. Run B resolving its scan root while
+        // run A is between probe and parse must not relativize A's findings
+        // against B's tree — the root travels on the invocation's async
+        // context, not on the shared instance.
+        var bRootResolved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var sandbox = new FakeSandbox(async (exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Ok(exec);
+            if (IsScanRootProbe(exec))
+            {
+                if (exec.WorkingDirectory == "/b")
+                    bRootResolved.TrySetResult();
+                return new SandboxExecResult(0, exec.WorkingDirectory + "\n", "");
+            }
+            // Hold run A's report until B has resolved its own scan root: if
+            // the root were shared state on the auditor, B's value would
+            // overwrite A's before A's output is parsed.
+            if (exec.WorkingDirectory == "/a")
+                await bRootResolved.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            return new SandboxExecResult(1, JsonForFile(exec.WorkingDirectory + "/src/app.py"), "");
+        });
+
+        IAuditor auditor = new PyrightAuditor();
+        var results = await Task.WhenAll(
+            auditor.RunAsync(sandbox, "/a", FakeContext(), CancellationToken.None),
+            auditor.RunAsync(sandbox, "/b", FakeContext(), CancellationToken.None));
+
+        Assert.Equal("src/app.py:1", Assert.Single(results[0].Findings).Location);
+        Assert.Equal("src/app.py:1", Assert.Single(results[1].Findings).Location);
+    }
+
+    private static string JsonForFile(string absoluteFile) => $$"""
+        {
+          "version": "1.1.414",
+          "time": "1759094400000",
+          "generalDiagnostics": [
+            {
+              "file": "{{absoluteFile}}",
+              "severity": "error",
+              "message": "Type \"str\" is not assignable to declared type \"int\"",
+              "range": { "start": { "line": 0, "character": 8 }, "end": { "line": 0, "character": 15 } },
+              "rule": "reportAssignmentType"
+            }
+          ],
+          "summary": { "filesAnalyzed": 1, "errorCount": 1, "warningCount": 0, "informationCount": 0, "timeInSec": 0.1 }
+        }
+        """;
 
     [Fact]
     [Trait("requires_pyright", "true")]
@@ -714,18 +774,20 @@ public sealed class PyrightAuditorTests
             {
                 FileName = "pyright",
                 RedirectStandardOutput = true,
-                RedirectStandardError = true,
                 UseShellExecute = false,
             };
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain stdout asynchronously while waiting for exit: a synchronous
+            // ReadToEnd before WaitForExit can deadlock on a full pipe and
+            // would hang the whole class — this probe feeds a static field.
+            var stdout = process.StandardOutput.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
-            var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
+            var match = Regex.Match(stdout.GetAwaiter().GetResult(), @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }
         catch

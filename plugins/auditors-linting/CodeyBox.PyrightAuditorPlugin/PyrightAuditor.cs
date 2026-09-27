@@ -13,8 +13,10 @@ namespace CodeyBox.PyrightAuditorPlugin;
 /// per-auditor configuration. This class adds the pyright JSON output parser
 /// (<see cref="PyrightJsonOutputParser"/> — pyright's built-in
 /// <c>--outputjson</c> report, which emits absolute <c>file</c> paths and no
-/// embedded cwd, so the parser relativizes against the scan root captured
-/// per run through <see cref="ResolveContextArgumentsAsync"/>), the pinned
+/// embedded cwd, so the parser relativizes against the scan root resolved
+/// per run by <see cref="ResolveScanRootAsync"/> and carried to it on
+/// <see cref="ExternalToolParseInput.ScanRoot"/> — an explicit per-invocation
+/// input, never shared state on this (singleton) auditor), the pinned
 /// tool-version declaration via <see cref="ExternalToolAuditorBase.VersionPin"/>,
 /// and the repository-configuration posture below.
 ///
@@ -66,14 +68,29 @@ namespace CodeyBox.PyrightAuditorPlugin;
 /// <c>pyproject.toml</c> decides the type-checking mode and the include /
 /// exclude sets, and a repo could weaken its own contract (e.g.
 /// <c>"typeCheckingMode": "off"</c>). That posture matches the sibling
-/// linters: the project's own analysis contract is the meaningful check —
-/// and unlike ESLint's executable config, pyright's is declarative JSON, so
-/// honoring it carries no code-execution risk; the audit still runs with
-/// <see cref="AuditCapabilities.None"/>. Operators who need a
-/// fully operator-owned ruleset pin one via <c>ProjectPath</c> (see the
-/// README for pyright's project-root caveat) and treat a local run that
-/// disagrees with the audit as a signal to inspect the diff's suppression
-/// comments and config changes.</para>
+/// linters: the project's own analysis contract is the meaningful check.</para>
+///
+/// <para><b>Repo config selects the interpreter pyright executes.</b>
+/// Pyright's config is declarative JSON, but honoring it is not
+/// execution-free: pyright spawns the configured Python interpreter —
+/// <c>pythonPath</c>, or the environment located via
+/// <c>venvPath</c>/<c>venv</c> (<c>&lt;venvPath&gt;/&lt;venv&gt;/bin/python</c>)
+/// — to discover import search paths, and the audit subject writes that
+/// config, so a shipped <c>pyrightconfig.json</c> can point pyright at a
+/// repo-controlled binary that then runs inside the audit sandbox during
+/// every scan. That is the same exposure class as ESLint's executable
+/// config and is contained the same way: this auditor runs with
+/// <see cref="AuditCapabilities.None"/> — no agent credentials and no
+/// network — inside the provider's scrubbed environment. Operators who want
+/// interpreter selection immune to the audited repository pin one via
+/// <c>PythonPath</c> (<c>--pythonpath</c> overrides
+/// <c>pythonPath</c>/<c>venvPath</c>/<c>venv</c>); it is opt-in rather than
+/// defaulted because repositories legitimately need their configured
+/// virtualenv for import resolution. Operators who need a fully
+/// operator-owned ruleset pin one via <c>ProjectPath</c> (see the README
+/// for pyright's project-root caveat) and treat a local run that disagrees
+/// with the audit as a signal to inspect the diff's suppression comments
+/// and config changes.</para>
 ///
 /// <para><b>Scope and defaults.</b> The scan is <c>pyright --outputjson</c>
 /// with no positional arguments: pyright analyzes the project rooted at the
@@ -94,8 +111,9 @@ namespace CodeyBox.PyrightAuditorPlugin;
     "pyright",
     InstallHint = "provision the pinned pyright release (see ExpectedVersion, default "
         + DefaultExpectedVersion + ") into the sandbox baseline via npm (npm install -g pyright@"
-        + DefaultExpectedVersion + ") — the pip 'pyright' package is a wrapper that downloads the same "
-        + "npm release; no distro apt package carries a version pin — through "
+        + DefaultExpectedVersion + " — the npm package's entry point is a Node.js script, so Node.js "
+        + "must already be on PATH; the pip 'pyright' package is a wrapper that provisions a Node "
+        + "runtime and the same release itself); no distro apt package carries a version pin — through "
         + "CodeyBox:MultipassExtraRuncmd / CodeyBox:Incus:ExtraRuncmd or ExecutableProvisions")]
 public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
 {
@@ -120,6 +138,16 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// </summary>
     public const string ProjectPathKey = "ProjectPath";
 
+    /// <summary>
+    /// Scoped-config key for an explicit Python interpreter — passed to
+    /// <c>--pythonpath</c>, which overrides the audited repository's
+    /// <c>pythonPath</c>/<c>venvPath</c>/<c>venv</c> settings. Pyright
+    /// executes the configured interpreter to discover import search paths;
+    /// pinning this to a provisioned interpreter keeps a repo-authored
+    /// config from selecting the binary that runs inside the sandbox.
+    /// </summary>
+    public const string PythonPathKey = "PythonPath";
+
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
         // 0 = no errors reported; 1 = one or more errors reported. Both emit
@@ -143,10 +171,10 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
         ExcludePaths = ["vendor/", "third_party/", "node_modules/", ".venv/", "venv/", ".tox/", "dist/", "build/", "out/", "coverage/"],
     };
 
-    private readonly PyrightJsonOutputParser _parser = new();
     private Func<ExternalToolAuditorOptions> _optionsAccessor = () => AuditorDefaults;
     private Func<string?> _expectedVersion = static () => DefaultExpectedVersion;
     private Func<string?> _projectPath = static () => null;
+    private Func<string?> _pythonPath = static () => null;
 
     /// <inheritdoc />
     public override string Name => "codeybox:pyright";
@@ -155,7 +183,7 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
     protected override string ToolName => "pyright";
 
     /// <inheritdoc />
-    protected override IExternalToolOutputParser OutputParser => _parser;
+    protected override IExternalToolOutputParser OutputParser { get; } = new PyrightJsonOutputParser();
 
     /// <summary>
     /// Declared mapping from pyright's severity vocabulary to CodeyBox's
@@ -210,6 +238,14 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
             args.Add(projectPath.Trim());
         }
 
+        var pythonPath = _pythonPath();
+        if (!string.IsNullOrWhiteSpace(pythonPath)
+            && !ExtraArgumentsSupplyFlag(options, "--pythonpath"))
+        {
+            args.Add("--pythonpath");
+            args.Add(pythonPath.Trim());
+        }
+
         // No positional file arguments: pyright analyzes the project rooted
         // at the worktree per the config's include/exclude, and positional
         // arguments are mutually exclusive with --project anyway.
@@ -217,7 +253,7 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <inheritdoc />
-    protected override async Task<IReadOnlyList<string>> ResolveContextArgumentsAsync(
+    protected override async Task<string?> ResolveScanRootAsync(
         ISandbox sandbox,
         string workingDirectory,
         AuditContext context,
@@ -228,26 +264,11 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
         // so the parser relativizes against the directory the tool actually
         // ran in. That is not necessarily the `workingDirectory` string:
         // sandbox providers may translate it (the process provider maps
-        // "/work" onto a host temp path), so it is resolved here with a
-        // bounded `pwd` probe — the same cwd the scan will see. RunAsync
-        // resolves context arguments before it executes the tool and parses
-        // its output — that ordering is the base's contract — and tool
-        // auditors run sequentially, so the captured root cannot be
-        // overwritten by a concurrent run before the parse reads it.
-        _parser.ScanRoot = await ResolveScanRootAsync(sandbox, workingDirectory, options, ct)
-            .ConfigureAwait(false);
-        return [];
-    }
-
-    private async Task<string> ResolveScanRootAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        // `pwd` is a shell builtin — the audited repository cannot shadow it
-        // via PATH — and it prints the process's own logical cwd, which is
-        // exactly the path prefix pyright embeds in its absolute `file` values.
+        // "/work" onto a host temp path), so it is resolved with a bounded
+        // `pwd` probe — the same cwd the scan will see. `pwd` is a shell
+        // builtin — the audited repository cannot shadow it via PATH — and
+        // it prints the process's own logical cwd, which is exactly the path
+        // prefix pyright embeds in its absolute `file` values.
         var result = await ExecToolBoundedAsync(
             sandbox,
             ToolName,
@@ -279,7 +300,7 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
 
-        return PyrightJsonOutputParser.NormalizePath(root);
+        return ExternalToolJsonHelpers.NormalizePath(root);
     }
 
     /// <inheritdoc />
@@ -290,6 +311,7 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
         _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
         _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _projectPath = () => scoped[ProjectPathKey];
+        _pythonPath = () => scoped[PythonPathKey];
         context.Logger.LogInformation(
             "PyrightAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;

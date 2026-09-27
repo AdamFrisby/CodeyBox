@@ -141,6 +141,28 @@ public abstract class ExternalToolAuditorBase : IAuditor
         CancellationToken ct)
         => Task.FromResult<IReadOnlyList<string>>([]);
 
+    /// <summary>
+    /// Optional per-run hook invoked inside <see cref="RunAsync"/> after the
+    /// tool-presence, version, and <see cref="VerifyToolAsync"/> checks and
+    /// immediately before the scan executes — for tools whose reports carry
+    /// absolute paths but embed no working directory. Return the absolute
+    /// directory the scan will actually run in: sandbox providers may
+    /// translate <paramref name="workingDirectory"/> (the process provider
+    /// maps it onto a host path), so resolve it with a bounded probe such as
+    /// <c>pwd</c> through <see cref="ExecToolBoundedAsync"/>. The value is
+    /// carried to the parser on <see cref="ExternalToolParseInput.ScanRoot"/>
+    /// — a per-invocation channel, so output parsing stays a pure function
+    /// of its input and concurrent audits on this (singleton) auditor cannot
+    /// cross-contaminate each other's roots. Default: null.
+    /// </summary>
+    protected virtual Task<string?> ResolveScanRootAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+        => Task.FromResult<string?>(null);
+
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -160,6 +182,8 @@ public abstract class ExternalToolAuditorBase : IAuditor
         await ThrowIfToolMissingAsync(sandbox, workingDirectory, tool, ct).ConfigureAwait(false);
         await VerifyToolVersionPinAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
         await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
+        var scanRoot = await ResolveScanRootAsync(sandbox, workingDirectory, context, options, ct)
+            .ConfigureAwait(false);
         var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
 
         if (result.ExecutionUnavailable)
@@ -172,7 +196,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
                 result);
 
-        var parsed = ParseOutput(tool, result);
+        var parsed = ParseOutput(tool, result, scanRoot);
         var findings = ToFindings(tool, parsed, options);
         var truncated = findings.Count < parsed.Count;
         var passed = findings.All(f => f.Severity < AuditSeverity.Error);
@@ -491,9 +515,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// </summary>
     protected static string? NormalizeExcludePathEntry(string? entry)
     {
-        if (string.IsNullOrWhiteSpace(entry))
-            return null;
-        var normalized = entry.Replace('\\', '/').Trim().TrimStart('/');
+        var normalized = ExternalToolJsonHelpers.NormalizePath(entry).TrimStart('/');
         return normalized.Length == 0 ? null : normalized;
     }
 
@@ -529,7 +551,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         // Probe paths are baked into the sh script's "$@" list: refuse
         // anything that could escape the worktree or break the
         // one-name-per-line protocol.
-        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim();
+        var normalized = ExternalToolJsonHelpers.NormalizePath(path);
         if (normalized.Length == 0
             || normalized[0] == '/'
             || normalized.IndexOf('\n') >= 0
@@ -550,11 +572,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
             : single;
     }
 
-    private IReadOnlyList<ExternalToolFinding> ParseOutput(string tool, SandboxExecResult result)
+    private IReadOnlyList<ExternalToolFinding> ParseOutput(
+        string tool, SandboxExecResult result, string? scanRoot)
     {
         try
         {
-            return OutputParser.Parse(new ExternalToolParseInput(tool, result.Stdout, result.Stderr, result.ExitCode)) ?? [];
+            return OutputParser.Parse(
+                new ExternalToolParseInput(tool, result.Stdout, result.Stderr, result.ExitCode, scanRoot)) ?? [];
         }
         catch (ExternalToolParseException ex)
         {
@@ -669,7 +693,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     private static string NormalizeFindingPath(string? path)
-        => (path ?? string.Empty).Replace('\\', '/').Trim().TrimStart('/');
+        => ExternalToolJsonHelpers.NormalizePath(path).TrimStart('/');
 
     private static string BuildRawOutput(
         SandboxExecResult result,
@@ -738,7 +762,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         => value.Replace("\x1b", string.Empty, StringComparison.Ordinal);
 
     private static string Truncate(string value, int maxChars)
-        => value.Length <= maxChars ? value : value[..maxChars] + "...";
+        => ExternalToolJsonHelpers.Truncate(value, maxChars);
 
     private static string Tail(string text, int maxChars)
         => text.Length <= maxChars ? text : text[^maxChars..];
@@ -750,12 +774,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// sequences into logged messages or persisted failure reasons.
     /// </summary>
     protected static string SingleLine(string message)
-    {
-        var builder = new StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
-    }
+        => ExternalToolJsonHelpers.SingleLine(message);
 
     private static string FormatTimeout(TimeSpan timeout)
         => timeout.TotalMinutes >= 1

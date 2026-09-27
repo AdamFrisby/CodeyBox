@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.KubeconformAuditorPlugin;
 
@@ -198,15 +199,4 @@ internal sealed class KubeconformJsonOutputParser : IExternalToolOutputParser
     private static bool IsStatusError(string status)
         => status.Equals("statusError", StringComparison.OrdinalIgnoreCase)
             || status.Equals("error", StringComparison.OrdinalIgnoreCase);
-
-    private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 }

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.PyrightAuditorPlugin;
 
@@ -12,11 +13,18 @@ namespace CodeyBox.PyrightAuditorPlugin;
 /// <para>Pyright emits <c>file</c> as an absolute path
 /// (<c>fileUri.getFilePath()</c> upstream) and, unlike ESLint's
 /// <c>json-with-metadata</c>, the report embeds no <c>cwd</c>, so paths are
-/// relativized against <see cref="ScanRoot"/> — the audited worktree root the
-/// auditor captures per run before the scan executes. Diagnostics outside the
-/// scan root (e.g. a typeshed stub or an absolute path an operator added via
-/// <c>ExtraArguments</c>) are kept verbatim so nothing is silently
-/// rewritten.</para>
+/// relativized against <see cref="ExternalToolParseInput.ScanRoot"/> — the
+/// directory the scan actually ran in, resolved by the auditor per run and
+/// carried on the parse input so this parser stays stateless and shared
+/// across concurrent audits. Diagnostics outside the scan root (e.g. a
+/// typeshed stub or an absolute path an operator added via
+/// <c>ExtraArguments</c>) are re-marked with an explicit <c>file://</c>
+/// scheme on their absolute path: the base's finding-path normalization
+/// trims a bare leading <c>/</c>, which would otherwise de-root
+/// <c>/opt/typeshed/x.pyi</c> into <c>opt/typeshed/x.pyi</c> — a string that
+/// reads as a repository path and could accidentally match repo-relative
+/// <c>ExcludePaths</c> entries. The marker keeps out-of-tree evidence
+/// distinguishable in the reported location.</para>
 ///
 /// <para>Range lines are 0-based in the report; findings carry the 1-based
 /// line. A diagnostic without <c>range</c> (config- or project-level) keeps a
@@ -37,13 +45,6 @@ internal sealed class PyrightJsonOutputParser : IExternalToolOutputParser
     private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
 
     private const string FileSchemePrefix = "file://";
-
-    /// <summary>
-    /// Normalized absolute path of the directory the scan ran in, captured by
-    /// the auditor per invocation before the tool executes. Null leaves
-    /// absolute <c>file</c> values unrelativized.
-    /// </summary>
-    internal string? ScanRoot { get; set; }
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
@@ -78,14 +79,14 @@ internal sealed class PyrightJsonOutputParser : IExternalToolOutputParser
                 if (findings.Count >= MaxResults)
                     break;
                 if (diagnostic.ValueKind == JsonValueKind.Object)
-                    findings.Add(ParseDiagnostic(diagnostic));
+                    findings.Add(ParseDiagnostic(diagnostic, input.ScanRoot));
             }
 
             return findings;
         }
     }
 
-    private ExternalToolFinding ParseDiagnostic(JsonElement diagnostic)
+    private static ExternalToolFinding ParseDiagnostic(JsonElement diagnostic, string? scanRoot)
     {
         int? line = null;
         if (diagnostic.TryGetProperty("range"u8, out var range)
@@ -102,11 +103,11 @@ internal sealed class PyrightJsonOutputParser : IExternalToolOutputParser
             SeverityLevel: NullIfWhiteSpace(GetString(diagnostic, "severity"u8)),
             RuleId: NullIfWhiteSpace(GetString(diagnostic, "rule"u8)),
             Message: NullIfWhiteSpace(GetString(diagnostic, "message"u8)) ?? "(no message)",
-            Path: NormalizeFilePath(GetString(diagnostic, "file"u8)),
+            Path: NormalizeFilePath(GetString(diagnostic, "file"u8), scanRoot),
             Line: line);
     }
 
-    private string? NormalizeFilePath(string? raw)
+    private static string? NormalizeFilePath(string? raw, string? scanRoot)
     {
         if (string.IsNullOrWhiteSpace(raw))
             return null;
@@ -114,29 +115,15 @@ internal sealed class PyrightJsonOutputParser : IExternalToolOutputParser
         if (path.StartsWith(FileSchemePrefix, StringComparison.OrdinalIgnoreCase))
             path = path[FileSchemePrefix.Length..];
 
-        var root = ScanRoot;
-        if (!string.IsNullOrEmpty(root)
-            && path.StartsWith(root + "/", StringComparison.Ordinal))
-            path = path[(root.Length + 1)..];
+        var relative = RelativizeToRoot(path, scanRoot);
+        if (!string.Equals(relative, path, StringComparison.Ordinal))
+            return relative;
+
+        // Out-of-root and absolute: re-mark with the file:// scheme so the
+        // reported location stays distinguishable from a repository-relative
+        // path — the base trims a bare leading '/' from finding paths.
+        if (path.StartsWith("/", StringComparison.Ordinal))
+            return FileSchemePrefix + path;
         return path;
     }
-
-    /// <summary>
-    /// Normalizes a path for prefix comparison — forward slashes, trimmed, no
-    /// trailing slash (except the filesystem root, which collapses to empty
-    /// and therefore never relativizes).
-    /// </summary>
-    internal static string NormalizePath(string? path)
-        => (path ?? string.Empty).Replace('\\', '/').Trim().TrimEnd('/');
-
-    private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 }
