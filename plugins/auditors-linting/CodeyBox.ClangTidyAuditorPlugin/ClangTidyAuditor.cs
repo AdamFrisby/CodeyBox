@@ -122,6 +122,14 @@ public sealed class ClangTidyAuditor : ExternalToolAuditorBase, IPluginInitializ
     // can never fit a scan that always carries at least --export-fixes.
     private const int DiscoveryHeadLimit = 257;
 
+    // Conservative per-entry bound so a single overlong discovery line can
+    // neither bloat the scan argv nor the failure message that quotes it.
+    private const int MaxDiscoveredPathLength = 1024;
+
+    // Single source of truth for the translation-unit policy on the C# side —
+    // keep in sync with the -name globs in DiscoveryScript above.
+    private static readonly string[] SourceExtensions = [".c", ".C", ".cc", ".cpp", ".cxx", ".cp", ".c++"];
+
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
         // 0 = ran (clean, or warnings with a report). 1 = ran with errors
@@ -305,14 +313,20 @@ public sealed class ClangTidyAuditor : ExternalToolAuditorBase, IPluginInitializ
     // Discovery output is repository file content — untrusted. Every entry
     // must be a repository-relative source path, or the scan scope cannot be
     // trusted and the run fails closed instead of scanning a narrowed set.
+    // In particular an entry starting with '-' after the protective "./"
+    // prefix is stripped would be option-parsed by the tool (LLVM keeps the
+    // last occurrence of flags such as --checks/--config-file/--export-fixes,
+    // and ExtraArguments are appended after the file list), so such entries
+    // fail closed here instead of reaching the scan argv.
     private static string NormalizeDiscoveredPath(string entry)
     {
         var normalized = entry.Replace('\\', '/').Trim();
         if (normalized.StartsWith("./", StringComparison.Ordinal))
             normalized = normalized[2..];
         if (normalized.Length == 0
-            || normalized.Length > 1024
+            || normalized.Length > MaxDiscoveredPathLength
             || normalized.StartsWith("/", StringComparison.Ordinal)
+            || normalized.StartsWith("-", StringComparison.Ordinal)
             || normalized.Contains('\n', StringComparison.Ordinal)
             || normalized.Contains('\r', StringComparison.Ordinal)
             || normalized.Split('/').Contains("..", StringComparer.Ordinal)
@@ -326,13 +340,15 @@ public sealed class ClangTidyAuditor : ExternalToolAuditorBase, IPluginInitializ
     }
 
     private static bool HasSourceExtension(string path)
-        => path.EndsWith(".c", StringComparison.Ordinal)
-            || path.EndsWith(".C", StringComparison.Ordinal)
-            || path.EndsWith(".cc", StringComparison.Ordinal)
-            || path.EndsWith(".cpp", StringComparison.Ordinal)
-            || path.EndsWith(".cxx", StringComparison.Ordinal)
-            || path.EndsWith(".cp", StringComparison.Ordinal)
-            || path.EndsWith(".c++", StringComparison.Ordinal);
+    {
+        foreach (var extension in SourceExtensions)
+        {
+            if (path.EndsWith(extension, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
 
     /// <inheritdoc />
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)

@@ -199,11 +199,16 @@ internal sealed class ClangTidyYamlOutputParser : IExternalToolOutputParser
         Path: diagnostic.Path,
         Line: null);
 
+    // Unit separator delimiting the fields of the duplicate-suppression identity
+    // key below: a control character that cannot appear in tool output, so the
+    // concatenation can never collide across field boundaries.
+    private const string IdentityFieldSeparator = "\u001f";
+
     private static string IdentityKey(ParsedDiagnostic diagnostic)
         => string.Concat(
-            diagnostic.RuleId ?? string.Empty, "\u001f",
-            diagnostic.Path ?? string.Empty, "\u001f",
-            diagnostic.FileOffset?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty, "\u001f",
+            diagnostic.RuleId ?? string.Empty, IdentityFieldSeparator,
+            diagnostic.Path ?? string.Empty, IdentityFieldSeparator,
+            diagnostic.FileOffset?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty, IdentityFieldSeparator,
             diagnostic.Message);
 
     private static string? NullIfWhiteSpace(string? value)

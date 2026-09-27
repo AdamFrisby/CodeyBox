@@ -43,6 +43,11 @@ diagnostic as an audit finding with the check name (e.g.
   `coverage/`, `.venv/`, `venv/` and `__pycache__/` at any depth. Findings
   under those prefixes (e.g. diagnostics in an included vendored header) are
   additionally dropped by the default `ExcludePaths`.
+- **Untrusted discovery entries fail closed.** Discovery output is
+  repository-controlled, so every entry must be a repository-relative source
+  path — absolute paths, `..` escapes, overlong lines, and entries starting
+  with `-` (which the tool would option-parse as a flag such as `--checks`)
+  are infrastructure failures, never silently skipped scope.
 - **Suppressed diagnostics.** `// NOLINT` / `// NOLINTNEXTLINE` comments
   authored in the audited tree are honored — clang-tidy offers no switch to
   ignore them, so a suppressed diagnostic never becomes a finding. Suppression

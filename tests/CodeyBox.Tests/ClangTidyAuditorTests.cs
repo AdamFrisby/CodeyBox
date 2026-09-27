@@ -20,7 +20,8 @@ namespace CodeyBox.Tests;
 ///   the tool reports byte offsets, not lines); cross-TU duplicates collapse to one finding.
 /// - Raw tool levels go through the declared mapping (Warning advisory, Error failing).
 /// - Warnings alone pass: the gate is explicitly non-blocking by default.
-/// - Discovery: empty scope, overflow, truncation, and untrusted entries are infrastructure.
+/// - Discovery: empty scope, overflow, truncation, untrusted entries, and
+///   dash-prefixed entries (CLI flag injection) are infrastructure.
 /// - Scoped options (ExpectedVersion, Checks, ConfigFile, CompileFlags).
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled; when
 ///   enabled it declares the clang-tidy apt package.
@@ -633,6 +634,31 @@ public sealed class ClangTidyAuditorTests
         IAuditor auditor = new ClangTidyAuditor();
         await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DiscoveryDashPrefixedEntry_IsInfrastructureFailure_NeverReachesScanArgv()
+    {
+        // A repository file named like a CLI flag (find reports it as
+        // ./--checks=.c) must fail closed in discovery: LLVM keeps the last
+        // occurrence of --checks/--config-file/--export-fixes and the tool
+        // accepts options in any position, so passing it through would let
+        // repo-controlled content override the auditor's own flags.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsDiscoveryProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "src/app.cpp\n./--checks=.c\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, string.Empty, ""));
+        });
+
+        IAuditor auditor = new ClangTidyAuditor();
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+        Assert.Equal(0, scanExecs);
     }
 
     [Fact]
