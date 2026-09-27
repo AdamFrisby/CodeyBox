@@ -6,8 +6,8 @@ namespace CodeyBox.PluginSdk.Tools;
 /// Shared text helpers for <see cref="IExternalToolOutputParser"/>
 /// implementations: blank normalization, positive line-number parsing, and
 /// flattening untrusted tool output to a single line for exception
-/// messages. Centralizing them keeps every tool parser on the same
-/// sanitization semantics instead of growing per-parser copies.
+/// messages. New tool parsers should use these instead of growing
+/// per-parser copies; pre-existing parsers migrate as they are touched.
 /// </summary>
 public static class ToolOutputText
 {
