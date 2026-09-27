@@ -88,6 +88,21 @@ public abstract class ExternalToolAuditorBase : IAuditor
         => null;
 
     /// <summary>
+    /// Environment variables that must be absent from the tool process,
+    /// delivered via <see cref="SandboxExec.EnvironmentVariablesToUnset"/> at
+    /// exec time — removal wins deterministically over both the sandbox
+    /// baseline and <see cref="BuildToolEnvironment"/>. Override when a
+    /// feature is armed by a variable's mere <em>presence</em>, where
+    /// assigning an empty value through <see cref="BuildToolEnvironment"/>
+    /// would not neutralize it (a tool that presence-checks with
+    /// <c>LookupEnv</c>-style semantics would still see the variable). Names
+    /// should be author-chosen constants, never untrusted data — each is
+    /// validated as a POSIX identifier at exec build. Default: none.
+    /// </summary>
+    protected virtual IReadOnlyList<string>? BuildToolEnvironmentRemovals(ExternalToolAuditorOptions options)
+        => null;
+
+    /// <summary>
     /// Optional pinned-version declaration. Non-null makes
     /// <see cref="RunAsync"/> probe the tool with the pin's
     /// <see cref="ToolVersionPin.VersionProbeArguments"/> before every scan —
@@ -173,10 +188,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 result);
 
         var parsed = ParseOutput(tool, result);
-        var findings = ToFindings(tool, parsed, options);
-        var truncated = findings.Count < parsed.Count;
-        var passed = findings.All(f => f.Severity < AuditSeverity.Error);
-        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, parsed.Count - findings.Count, truncated));
+        var (findings, droppedCount, droppedError) = ToFindings(tool, parsed, options);
+        // The verdict is computed over every finding the tool produced —
+        // including the ones MaxFindings dropped. Otherwise a subject could
+        // flood the report with advisory findings and push Error-severity
+        // findings past the cap into silence.
+        var passed = !droppedError && findings.All(f => f.Severity < AuditSeverity.Error);
+        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, droppedCount, droppedError));
     }
 
     private IReadOnlyList<string> BuildArgv(
@@ -257,6 +275,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 MaxStderrBytes = maxBytes,
                 KillOnOutputLimit = false,
                 ExtraEnvironment = BuildToolEnvironment(options),
+                EnvironmentVariablesToUnset = BuildToolEnvironmentRemovals(options) ?? [],
             },
             EffectiveTimeout(options),
             ct);
@@ -498,6 +517,27 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// Normalizes a repository-relative path — backslashes to <c>/</c>,
+    /// trimmed — and returns it, or <see langword="null"/> when it is empty,
+    /// rooted at <c>/</c>, carries a newline, or escapes the worktree
+    /// through a <c>..</c> segment. The single source of truth for
+    /// "confined to the audited worktree": repository probes bake the
+    /// result into a script's <c>$@</c> list, and auditors gate operator
+    /// path entries (e.g. <c>ExtraArguments</c> package patterns) on it.
+    /// Callers translate the null into their own error type.
+    /// </summary>
+    protected static string? TryNormalizeWorktreeRelativePath(string? path)
+    {
+        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim();
+        if (normalized.Length == 0
+            || normalized[0] == '/'
+            || normalized.IndexOf('\n') >= 0
+            || normalized.Split('/').Contains("..", StringComparer.Ordinal))
+            return null;
+        return normalized;
+    }
+
+    /// <summary>
     /// Bounded timeout for precondition probes: shares the configured scan
     /// timeout below a fixed cap — a probe is a liveness check, not the scan.
     /// </summary>
@@ -525,30 +565,18 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     private static string NormalizeProbePath(string? path)
-    {
         // Probe paths are baked into the sh script's "$@" list: refuse
         // anything that could escape the worktree or break the
         // one-name-per-line protocol.
-        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim();
-        if (normalized.Length == 0
-            || normalized[0] == '/'
-            || normalized.IndexOf('\n') >= 0
-            || normalized.Split('/').Contains("..", StringComparer.Ordinal))
-            throw new ArgumentException(
+        => TryNormalizeWorktreeRelativePath(path)
+            ?? throw new ArgumentException(
                 "Repository probe paths must be relative paths inside the worktree.",
                 nameof(path));
-        return normalized;
-    }
 
     private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
-    }
+        => string.IsNullOrWhiteSpace(value)
+            ? "(empty)"
+            : ToolOutputText.SingleLine(value, MessageValueMaxChars);
 
     private IReadOnlyList<ExternalToolFinding> ParseOutput(string tool, SandboxExecResult result)
     {
@@ -570,7 +598,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         }
     }
 
-    private List<AuditFinding> ToFindings(
+    private (List<AuditFinding> Findings, int DroppedCount, bool DroppedError) ToFindings(
         string tool,
         IReadOnlyList<ExternalToolFinding> parsed,
         ExternalToolAuditorOptions options)
@@ -578,11 +606,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var mapping = SeverityMapping ?? ExternalToolSeverityMapping.Default;
         var maxFindings = Math.Max(1, options.MaxFindings);
         var findings = new List<AuditFinding>(Math.Min(parsed.Count, maxFindings));
+        var droppedCount = 0;
+        var droppedError = false;
 
         foreach (var item in parsed)
         {
-            if (findings.Count >= maxFindings)
-                break;
             if (item is null)
                 continue;
             if (IsRuleFiltered(item, options) || IsPathExcluded(item, options))
@@ -592,6 +620,16 @@ public abstract class ExternalToolAuditorBase : IAuditor
             if (severity < options.MinimumSeverity)
                 continue;
 
+            // Past the cap the loop keeps scanning so a dropped finding's
+            // severity still feeds the verdict — capping the list must never
+            // cap the gate.
+            if (findings.Count >= maxFindings)
+            {
+                droppedCount++;
+                droppedError |= severity == AuditSeverity.Error;
+                continue;
+            }
+
             findings.Add(new AuditFinding(
                 AuditorName: Name,
                 Severity: severity,
@@ -600,7 +638,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 Location: BuildLocation(item)));
         }
 
-        return findings;
+        return (findings, droppedCount, droppedError);
     }
 
     private static bool IsRuleFiltered(ExternalToolFinding item, ExternalToolAuditorOptions options)
@@ -656,7 +694,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var location = BuildLocation(item);
         if (location is not null)
             builder.Append("Location: ").Append(location).Append('\n');
-        builder.Append('\n').Append(StripEscapes(item.Message).Trim());
+        builder.Append('\n').Append(ToolOutputText.FlattenControls(item.Message).Trim());
         return builder.ToString().TrimEnd();
     }
 
@@ -675,7 +713,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         SandboxExecResult result,
         ExternalToolAuditorOptions options,
         int droppedFindings,
-        bool findingsTruncated)
+        bool droppedError)
     {
         var maxBytes = Math.Clamp(
             options.MaxOutputBytesPerStream,
@@ -696,8 +734,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
         else
             combined = stdout + "\n" + stderr;
 
-        if (findingsTruncated)
-            combined += $"\n[findings truncated: {droppedFindings} finding(s) beyond MaxFindings {Math.Max(1, options.MaxFindings)} were dropped]";
+        if (droppedFindings > 0)
+        {
+            combined += $"\n[findings truncated: {droppedFindings} finding(s) beyond MaxFindings {Math.Max(1, options.MaxFindings)} were dropped";
+            combined += droppedError
+                ? ", including at least one Error-severity finding — the audit fails on the dropped severity]"
+                : "]";
+        }
         return combined;
     }
 
@@ -717,25 +760,16 @@ public abstract class ExternalToolAuditorBase : IAuditor
     {
         if (string.IsNullOrWhiteSpace(message))
             return string.Empty;
-        var stripped = StripEscapes(message);
+        // Tool output is untrusted: control bytes are flattened before the
+        // first line is taken, so a crafted message cannot inject terminal
+        // sequences into a rendered title.
+        var stripped = ToolOutputText.FlattenControls(message);
         var newline = stripped.IndexOf('\n');
-        var first = (newline < 0 ? stripped : stripped[..newline]).Trim().Replace('\r', ' ');
-        return first.Trim();
+        return (newline < 0 ? stripped : stripped[..newline]).Trim();
     }
 
     private static string SanitizeSingleLine(string? value, int maxChars)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return string.Empty;
-        var stripped = StripEscapes(value).Replace('\r', ' ').Replace('\n', ' ').Trim();
-        return Truncate(stripped, maxChars);
-    }
-
-    // Tool output is untrusted input that ends up in rendered findings: strip
-    // terminal escape sequences so a scanner cannot inject control sequences
-    // into operator-facing output.
-    private static string StripEscapes(string value)
-        => value.Replace("\x1b", string.Empty, StringComparison.Ordinal);
+        => ToolOutputText.SingleLine(value, maxChars);
 
     private static string Truncate(string value, int maxChars)
         => value.Length <= maxChars ? value : value[..maxChars] + "...";
@@ -750,12 +784,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// sequences into logged messages or persisted failure reasons.
     /// </summary>
     protected static string SingleLine(string message)
-    {
-        var builder = new StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
-    }
+        => ToolOutputText.SingleLine(message);
 
     private static string FormatTimeout(TimeSpan timeout)
         => timeout.TotalMinutes >= 1

@@ -334,7 +334,12 @@ scanner version and keep repo-authored suppression files from silencing the
 audit. A worked example lives at
 `plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/`.
 The knip unused-JS/TS auditor is at
-`plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/`.
+`plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/`. The gosec Go
+security scanner is at
+`plugins/auditors-sast/CodeyBox.GosecAuditorPlugin/` — it adds a custom
+parser layer that recovers gosec's native severities (which SARIF
+`level` flattens) and discriminates gosec's shared "findings or
+failure" exit code by report content.
 
 ## Sample plugin
 
