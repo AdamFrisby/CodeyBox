@@ -52,6 +52,7 @@
     <ProjectReference Include="..\..\plugins\auditors-architecture\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.CargoDenyAuditorPlugin\CodeyBox.CargoDenyAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.GrypeAuditorPlugin\CodeyBox.GrypeAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.PipAuditAuditorPlugin\CodeyBox.PipAuditAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-documentation\CodeyBox.LycheeAuditorPlugin\CodeyBox.LycheeAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.KubeconformAuditorPlugin\CodeyBox.KubeconformAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ExampleSarifAuditorPlugin\CodeyBox.ExampleSarifAuditorPlugin.csproj" />
