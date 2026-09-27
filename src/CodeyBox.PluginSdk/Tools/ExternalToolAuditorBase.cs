@@ -108,8 +108,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// Use <see cref="ExecToolBoundedAsync"/> for precondition probes so they
     /// get the same timeout bounding and failure classification as the scan;
     /// <see cref="ProbeRepositoryFilesPresentAsync"/> covers the common
-    /// "does a repository-controlled file exist" gate. The default imposes no
-    /// extra preconditions.
+    /// "does a repository-controlled file exist" gate and
+    /// <see cref="ThrowIfBinaryMissingAsync"/> an auxiliary binary the tool
+    /// shells out to. The default imposes no extra preconditions.
     /// </summary>
     protected virtual Task VerifyToolAsync(
         ISandbox sandbox,
@@ -157,7 +158,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             sandbox, workingDirectory, context, options, ct).ConfigureAwait(false) ?? [];
         var argv = BuildArgv(tool, options, contextArguments);
 
-        await ThrowIfToolMissingAsync(sandbox, workingDirectory, tool, ct).ConfigureAwait(false);
+        await ThrowIfBinaryMissingAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
         await VerifyToolVersionPinAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
         await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
         var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
@@ -199,38 +200,55 @@ public abstract class ExternalToolAuditorBase : IAuditor
         return argv;
     }
 
-    private static async Task ThrowIfToolMissingAsync(
+    /// <summary>
+    /// Bounded presence probe for a binary the auditor invokes — the
+    /// declared <see cref="ToolName"/> itself (<see cref="RunAsync"/> calls
+    /// this) or an auxiliary binary a <see cref="VerifyToolAsync"/> override
+    /// needs (e.g. the toolchain a scanner shells out to). Fails closed: an
+    /// exec-transport failure, a timeout, or any non-zero probe exit throws
+    /// <see cref="AuditUnavailableException"/> naming the binary — "could
+    /// not confirm presence" is never treated as "present".
+    /// <paramref name="purpose"/> optionally states why the binary is
+    /// required (e.g. which tool shells out to it); keep it an
+    /// author-chosen constant.
+    /// </summary>
+    protected static async Task ThrowIfBinaryMissingAsync(
         ISandbox sandbox,
         string workingDirectory,
-        string tool,
-        CancellationToken ct)
+        string binary,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct,
+        string? purpose = null)
     {
-        SandboxExecResult probe;
-        try
-        {
-            probe = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", tool],
-                WorkingDirectory = workingDirectory,
-            }, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
-        {
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor tool '{tool}' presence check could not run: {SingleLine(ex.Message)}",
-                ex);
-        }
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentNullException.ThrowIfNull(options);
+        ExternalToolNames.Validate(binary, nameof(binary));
 
+        var probe = await ExecToolBoundedAsync(
+            sandbox,
+            binary,
+            "presence check",
+            new SandboxExec
+            {
+                Argv = ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", binary],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        var reason = purpose is null ? string.Empty : $" ({SingleLine(purpose)})";
         if (probe.ExecutionUnavailable)
             throw new AuditUnavailableException(
-                $"could-not-verify: auditor tool '{tool}' presence check could not run: the sandbox exec transport was unavailable.");
+                $"could-not-verify: binary '{binary}' presence check could not run: the sandbox exec "
+                + $"transport was unavailable.{reason}");
         if (probe.ExitCode != 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is not installed in the audit sandbox. Install it in the sandbox baseline; the check did not run, so this is infrastructure, not a verdict on the diff.");
+                $"could-not-verify: required binary '{binary}' is not installed in the audit sandbox."
+                + $"{reason} Install it in the sandbox baseline; the check did not run, so this is "
+                + "infrastructure, not a verdict on the diff.");
     }
 
     private Task<SandboxExecResult> ExecToolAsync(
@@ -353,7 +371,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             ProbeTimeout(options),
             ct).ConfigureAwait(false);
 
-        var reported = ExtractToolVersion(result.Stdout);
+        var reported = (pin.VersionExtractor ?? ExtractToolVersion)(result.Stdout);
         if (result.ExecutionUnavailable
             || result.ExitCode != 0
             || reported is null)
@@ -483,6 +501,20 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// Appends "<paramref name="flag"/> <paramref name="value"/>" as two argv
+    /// entries when the configured value is non-blank; blank values emit
+    /// nothing. The value is passed as its own argv entry — it is never
+    /// concatenated into a flag token or shell string.
+    /// </summary>
+    protected static void AddValueFlag(List<string> args, string flag, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return;
+        args.Add(flag);
+        args.Add(value.Trim());
+    }
+
+    /// <summary>
     /// Normalizes an <see cref="ExternalToolAuditorOptions.ExcludePaths"/>
     /// entry to its repository-relative form — the single source of truth for
     /// the finding-level filter and for auditors translating entries into
@@ -540,7 +572,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
         return normalized;
     }
 
-    private static string TruncateForMessage(string? value)
+    /// <summary>
+    /// Single-lines a (possibly configured) value for an exception message
+    /// and bounds it to <see cref="MessageValueMaxChars"/> chars — operator
+    /// values echoed into failure reasons never run unbounded. Blank or
+    /// null values render as <c>(empty)</c>.
+    /// </summary>
+    protected static string TruncateForMessage(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
             return "(empty)";
@@ -731,11 +769,21 @@ public abstract class ExternalToolAuditorBase : IAuditor
         return Truncate(stripped, maxChars);
     }
 
-    // Tool output is untrusted input that ends up in rendered findings: strip
-    // terminal escape sequences so a scanner cannot inject control sequences
-    // into operator-facing output.
+    // Tool output is untrusted input that ends up in rendered findings:
+    // strip terminal escape bytes and every other control character (C1
+    // CSI, BEL, stray CR, …) so a scanner cannot inject control sequences
+    // into operator-facing output. The newline separating message lines
+    // survives — descriptions are multi-line.
     private static string StripEscapes(string value)
-        => value.Replace("\x1b", string.Empty, StringComparison.Ordinal);
+    {
+        var builder = new StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            if (c == '\n' || !char.IsControl(c))
+                builder.Append(c);
+        }
+        return builder.ToString();
+    }
 
     private static string Truncate(string value, int maxChars)
         => value.Length <= maxChars ? value : value[..maxChars] + "...";

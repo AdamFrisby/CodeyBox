@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.GovulncheckAuditorPlugin;
 using CodeyBox.Orchestrator;
@@ -31,7 +30,9 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class GovulncheckAuditorTests
 {
-    private static readonly string? InstalledGovulncheckVersion = ProbeInstalledVersion();
+    // Lazy so the host probes only run for the trait-gated real-binary tests,
+    // not for every run of the fake-sandbox tests.
+    private static readonly Lazy<string?> InstalledGovulncheckVersion = new(ProbeInstalledVersion);
     private static readonly Lazy<bool> GovulncheckEndToEndAvailable = new(ProbeGovulncheckEndToEnd);
 
     private const string SarifWithFindings =
@@ -598,6 +599,68 @@ public sealed class GovulncheckAuditorTests
     }
 
     [Fact]
+    public async Task ScopedConfiguration_ExcludePathsGoMod_IsDeterministicInfrastructure()
+    {
+        // Every govulncheck finding locates at go.mod, so an ExcludePaths
+        // entry for it would drop the whole report and pass silently — the
+        // auditor must reject it outright instead.
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++; // the configuration failure precedes every probe
+            return Task.FromResult(Ok(exec));
+        });
+
+        var auditor = new GovulncheckAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExcludePaths"] = "vendor/,go.mod",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("go.mod", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task ScopedConfiguration_Offline_DropsNetworkRequirement_AndPinsGoProxy()
+    {
+        var auditor = new GovulncheckAuditor();
+        Assert.Equal(AuditCapabilities.Network, auditor.Required);
+
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:Offline"] = "true",
+            }),
+            CancellationToken.None);
+
+        Assert.Equal(AuditCapabilities.None, auditor.Required);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsGoPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        // Offline pins GOPROXY=off so the go-driven package load uses only
+        // the pre-seeded module cache.
+        Assert.Equal("off", scanExec!.ExtraEnvironment?["GOPROXY"]);
+    }
+
+    [Fact]
     public void ExtractGovulncheckVersion_AnchorsOnScannerToken_NotGoVersion()
     {
         const string banner =
@@ -675,7 +738,7 @@ public sealed class GovulncheckAuditorTests
     [Trait("requires_govulncheck", "true")]
     public async Task RealGovulncheck_VulnerableFixture_ProducesFindingWithRuleIdAndLocation()
     {
-        if (InstalledGovulncheckVersion is null || !GovulncheckEndToEndAvailable.Value)
+        if (InstalledGovulncheckVersion.Value is null || !GovulncheckEndToEndAvailable.Value)
             return;
 
         var fixtureDir = await SeedGovulncheckVulnerableRepoAsync();
@@ -698,7 +761,7 @@ public sealed class GovulncheckAuditorTests
             await auditor.InitializeAsync(
                 BuildPluginContext(new Dictionary<string, string?>
                 {
-                    ["Scoped:ExpectedVersion"] = InstalledGovulncheckVersion,
+                    ["Scoped:ExpectedVersion"] = InstalledGovulncheckVersion.Value,
                 }),
                 CancellationToken.None);
 
@@ -722,7 +785,7 @@ public sealed class GovulncheckAuditorTests
     [Trait("requires_govulncheck", "true")]
     public async Task RealGovulncheck_CleanFixture_Passes()
     {
-        if (InstalledGovulncheckVersion is null || !GovulncheckEndToEndAvailable.Value)
+        if (InstalledGovulncheckVersion.Value is null || !GovulncheckEndToEndAvailable.Value)
             return;
 
         var fixtureDir = SeedGovulncheckCleanRepo();
@@ -742,7 +805,7 @@ public sealed class GovulncheckAuditorTests
             await auditor.InitializeAsync(
                 BuildPluginContext(new Dictionary<string, string?>
                 {
-                    ["Scoped:ExpectedVersion"] = InstalledGovulncheckVersion,
+                    ["Scoped:ExpectedVersion"] = InstalledGovulncheckVersion.Value,
                 }),
                 CancellationToken.None);
 
@@ -811,10 +874,7 @@ public sealed class GovulncheckAuditorTests
     private static string? ProbeInstalledVersion()
     {
         var stdout = RunHostProbe("govulncheck", 10_000, null, "-version");
-        if (stdout is null)
-            return null;
-        var match = Regex.Match(stdout, @"govulncheck@v(\d+\.\d+\.\d+[\w.\-]*)");
-        return match.Success ? match.Groups[1].Value : null;
+        return stdout is null ? null : GovulncheckAuditor.ExtractGovulncheckVersion(stdout);
     }
 
     private static bool ProbeGovulncheckEndToEnd()

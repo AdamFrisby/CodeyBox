@@ -12,8 +12,9 @@ namespace CodeyBox.GovulncheckAuditorPlugin;
 /// invocation with a bounded timeout, per-stream output caps, exit-code
 /// classification, severity mapping, finding identity, and per-auditor
 /// configuration. This class adds the govulncheck-specific arguments and
-/// knobs, plus a pinned tool-version precondition via
-/// <see cref="VerifyToolAsync"/>.
+/// knobs, the pinned tool-version declaration via
+/// <see cref="ExternalToolAuditorBase.VersionPin"/>, and a precondition
+/// probe for the <c>go</c> toolchain govulncheck shells out to.
 ///
 /// <para><b>Gate behaviour: severity-driven (blocking on error).</b> At the
 /// default symbol scan level govulncheck marks a vulnerability
@@ -43,15 +44,15 @@ namespace CodeyBox.GovulncheckAuditorPlugin;
 /// (<c>-format sarif</c>); progress and error text goes to stderr. The
 /// shared <see cref="SarifToolOutputParser"/> reads stdout.</para>
 ///
-/// <para><b>Version pin — custom, not the shared pin.</b> govulncheck's
-/// <c>-version</c> banner prints <c>Go: go&lt;toolchain-version&gt;</c>
-/// before <c>Scanner: govulncheck@v&lt;version&gt;</c>, and the shared
-/// <see cref="ToolVersionPin"/> extraction takes the first semver token —
-/// so it would verify the Go toolchain's version, not govulncheck's, and
-/// fail closed on every correctly provisioned baseline. The pin is instead
-/// enforced in <see cref="VerifyToolAsync"/>, which extracts the
-/// <c>govulncheck@v…</c> token specifically (see
-/// <see cref="ExtractGovulncheckVersion"/>). A missing binary, an
+/// <para><b>Version pin — shared, with a banner-anchored extractor.</b>
+/// govulncheck's <c>-version</c> banner prints
+/// <c>Go: go&lt;toolchain-version&gt;</c> before <c>Scanner:
+/// govulncheck@v&lt;version&gt;</c>, and the pin's default extraction takes
+/// the first semver token — which would verify the Go toolchain's version,
+/// not govulncheck's, and fail closed on every correctly provisioned
+/// baseline. The declared <see cref="VersionPin"/> therefore supplies
+/// <see cref="ExtractGovulncheckVersion"/>, which reads the
+/// <c>govulncheck@v…</c> token specifically. A missing binary, an
 /// unrecognised banner, or a version other than <c>ExpectedVersion</c> is
 /// an infrastructure failure naming the tool — never a pass, never a
 /// finding.</para>
@@ -74,18 +75,24 @@ namespace CodeyBox.GovulncheckAuditorPlugin;
 /// than a second report. All findings locate at <c>go.mod</c> —
 /// govulncheck's SARIF attaches each result to the manifest with a stub
 /// line 1; call-site positions live in the report's stacks/codeFlows which
-/// the shared parser does not read — so <c>ExcludePaths</c> has nothing to
-/// match and is inert. Binary mode (<c>-mode binary</c>) is out of scope:
-/// the audit subject is the worktree's source.</para>
+/// the shared parser does not read. <c>ExcludePaths</c> can therefore only
+/// ever match <c>go.mod</c> itself — an all-or-nothing suppression, not a
+/// path filter — so a <c>go.mod</c> entry is rejected outright as a
+/// deterministic configuration failure rather than silently zeroing the
+/// audit. Binary mode (<c>-mode binary</c>) is out of scope: the audit
+/// subject is the worktree's source.</para>
 ///
 /// <para><b>Network.</b> govulncheck queries the Go vulnerability database
 /// (default <c>https://vuln.go.dev</c>, override via <c>DbUrl</c>) and the
 /// <c>go</c>-driven package load may reach the module proxy, so the auditor
 /// declares <see cref="AuditCapabilities.Network"/> — the database and
 /// proxy hosts must be in the deployment's <c>AuditToolAllowedHosts</c>
-/// egress list. The declared capability permits egress, it does not force
-/// it: offline deployments point <c>DbUrl</c> at a provisioned local
-/// database and pre-seed the module cache.</para>
+/// egress list. Fully offline deployments set <c>Offline</c>, which drops
+/// the capability (the auditor then joins the no-egress sandbox group) and
+/// pins <c>GOPROXY=off</c> so the package load uses only the pre-seeded
+/// module cache; <c>DbUrl</c> must point at a provisioned local database —
+/// the database decides the verdict, so prefer <c>https://</c> or a
+/// local/loopback source over a plaintext <c>http://</c> feed.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: PluginId,
@@ -122,7 +129,11 @@ public sealed class GovulncheckAuditor : ExternalToolAuditorBase, IPluginInitial
     /// Scoped-config key for the vulnerability database URL (<c>-db</c>).
     /// Unset uses govulncheck's built-in default, the public database at
     /// <c>https://vuln.go.dev</c>. Set it to point at an operator-owned
-    /// mirror or a provisioned local database for offline deployments.
+    /// mirror or a provisioned local database for offline deployments. The
+    /// database contents decide the audit verdict, so prefer an
+    /// <c>https://</c> or local/loopback source — a plaintext
+    /// <c>http://</c> feed offers no integrity for the evidence this
+    /// auditor reports.
     /// </summary>
     public const string DbUrlKey = "DbUrl";
 
@@ -166,6 +177,18 @@ public sealed class GovulncheckAuditor : ExternalToolAuditorBase, IPluginInitial
     /// </summary>
     public const string PatternsKey = "Patterns";
 
+    /// <summary>
+    /// Scoped-config boolean declaring that the deployment needs no
+    /// network: drops the <see cref="AuditCapabilities.Network"/>
+    /// requirement so the auditor joins the no-egress sandbox group, and
+    /// pins <c>GOPROXY=off</c> for the tool process so the <c>go</c>-driven
+    /// package load uses only the pre-seeded module cache. Point
+    /// <see cref="DbUrlKey"/> at a provisioned local database first — a
+    /// remote <c>-db</c> with <c>Offline</c> set fails loudly in the
+    /// no-egress sandbox.
+    /// </summary>
+    public const string OfflineKey = "Offline";
+
     /// <summary>govulncheck scan levels the auditor accepts for <see cref="ScanLevelKey"/>.</summary>
     private static readonly IReadOnlySet<string> AllowedScanLevels =
         new HashSet<string>(StringComparer.Ordinal)
@@ -200,12 +223,13 @@ public sealed class GovulncheckAuditor : ExternalToolAuditorBase, IPluginInitial
     private Func<IReadOnlyList<string>> _buildTags = static () => [];
     private Func<bool> _includeTests = static () => false;
     private Func<IReadOnlyList<string>> _patterns = static () => [];
+    private Func<bool> _offline = static () => false;
 
     /// <inheritdoc />
     public override string Name => "codeybox:govulncheck";
 
     /// <inheritdoc />
-    public override AuditCapabilities Required => AuditCapabilities.Network;
+    public override AuditCapabilities Required => _offline() ? AuditCapabilities.None : AuditCapabilities.Network;
 
     /// <inheritdoc />
     protected override string ToolName => "govulncheck";
@@ -233,8 +257,20 @@ public sealed class GovulncheckAuditor : ExternalToolAuditorBase, IPluginInitial
     protected override Func<ExternalToolAuditorOptions> OptionsAccessor => _optionsAccessor;
 
     /// <inheritdoc />
+    protected override ToolVersionPin? VersionPin =>
+        new(PluginId, _expectedVersion, DefaultExpectedVersion, ["-version"], ExtractGovulncheckVersion);
+
+    /// <inheritdoc />
+    protected override IReadOnlyDictionary<string, string>? BuildToolEnvironment(ExternalToolAuditorOptions options)
+        => _offline()
+            ? new Dictionary<string, string>(StringComparer.Ordinal) { ["GOPROXY"] = "off" }
+            : null;
+
+    /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
+        ThrowIfExcludePathsNeutersAudit(options);
+
         var scanLevel = ResolveScanLevel();
         var patterns = ResolvePatterns(scanLevel);
 
@@ -281,115 +317,35 @@ public sealed class GovulncheckAuditor : ExternalToolAuditorBase, IPluginInitial
         _buildTags = () => ExternalToolAuditorOptions.SplitCommaSeparatedList(scoped[BuildTagsKey]);
         _includeTests = () => bool.TryParse(scoped[IncludeTestsKey], out var tests) && tests;
         _patterns = () => ExternalToolAuditorOptions.SplitCommaSeparatedList(scoped[PatternsKey]);
+        _offline = () => bool.TryParse(scoped[OfflineKey], out var offline) && offline;
         context.Logger.LogInformation(
             "GovulncheckAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
     }
 
     /// <summary>
-    /// govulncheck-specific preconditions on the live path: the <c>go</c>
-    /// toolchain the scanner shells out to (probed explicitly — its absence
-    /// otherwise surfaces as a misleading "no go.mod" run failure), and the
-    /// pinned tool version, which the shared <see cref="ToolVersionPin"/>
-    /// cannot express because <c>govulncheck -version</c> prints the Go
-    /// toolchain's version before the scanner's and the shared extractor
-    /// takes the first semver token. Both failures are infrastructure —
-    /// never a pass, never a finding.
+    /// govulncheck-specific precondition on the live path: the <c>go</c>
+    /// toolchain the scanner shells out to, probed explicitly — its absence
+    /// otherwise surfaces as a misleading "no go.mod" run failure. The
+    /// pinned tool version is declared via <see cref="VersionPin"/> with a
+    /// banner-anchored extractor, because <c>govulncheck -version</c> prints
+    /// the Go toolchain's version before the scanner's. Both failures are
+    /// infrastructure — never a pass, never a finding.
     /// </summary>
-    protected override async Task VerifyToolAsync(
+    protected override Task VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
-    {
-        await ThrowIfGoMissingAsync(sandbox, workingDirectory, options, ct).ConfigureAwait(false);
-        await VerifyPinnedVersionAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
-    }
-
-    private async Task ThrowIfGoMissingAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var probe = await ExecToolBoundedAsync(
+        => ThrowIfBinaryMissingAsync(
             sandbox,
-            "govulncheck",
-            "go toolchain check",
-            new SandboxExec
-            {
-                Argv = ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", "go"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                "could-not-verify: audit tool 'govulncheck' could not check for the 'go' toolchain: "
-                + "the sandbox exec transport was unavailable.");
-        if (probe.ExitCode != 0)
-            throw new AuditUnavailableException(
-                "could-not-verify: audit tool 'govulncheck' requires the 'go' toolchain in the audit "
-                + "sandbox (govulncheck shells out to `go env`/`go list` for module and package "
-                + "loading). Install it in the sandbox baseline; the check did not run, so this is "
-                + "infrastructure, not a verdict on the diff.");
-    }
-
-    private async Task VerifyPinnedVersionAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var configured = _expectedVersion();
-        var expected = ExtractToolVersion(
-            string.IsNullOrWhiteSpace(configured) ? DefaultExpectedVersion : configured.Trim());
-        if (expected is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' has an unparseable {ToolVersionPin.ExpectedVersionKey} "
-                + $"('{SingleLine(configured ?? string.Empty)}'); set CodeyBox:Plugins:{PluginId}:"
-                + $"{ToolVersionPin.ExpectedVersionKey} to a govulncheck release such as "
-                + $"'{DefaultExpectedVersion}'.")
-            { IsDeterministic = true };
-
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            "version check",
-            new SandboxExec
-            {
-                Argv = [tool, "-version"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        var reported = result.Stdout is null ? null : ExtractGovulncheckVersion(result.Stdout);
-        if (result.ExecutionUnavailable || result.ExitCode != 0 || reported is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' version could not be determined "
-                + $"(exit {result.ExitCode}). The pinned release is required before the scan can run — "
-                + $"a missing or foreign '{tool}' is infrastructure, not a verdict on the diff.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        if (!string.Equals(reported, expected, StringComparison.Ordinal))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is version {reported}, but this auditor is "
-                + $"pinned to {expected}. A different release changes the tool's checks and its "
-                + $"findings; provision the pinned release or set {ToolVersionPin.ExpectedVersionKey} "
-                + "to the version you provisioned.")
-            { IsDeterministic = true };
-    }
+            workingDirectory,
+            "go",
+            options,
+            ct,
+            purpose: "audit tool 'govulncheck' requires the 'go' toolchain — govulncheck shells out "
+                + "to `go env`/`go list` for module and package loading");
 
     /// <summary>
     /// Extracts the scanner's version from the <c>govulncheck -version</c>
@@ -417,11 +373,30 @@ public sealed class GovulncheckAuditor : ExternalToolAuditorBase, IPluginInitial
         if (!AllowedScanLevels.Contains(level))
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' has an invalid {ScanLevelKey} "
-                + $"('{SingleLine(configured ?? string.Empty)}'); expected one of: "
+                + $"('{TruncateForMessage(configured)}'); expected one of: "
                 + $"{string.Join(", ", AllowedScanLevels.Order())}. Set "
                 + $"CodeyBox:Plugins:{PluginId}:{ScanLevelKey} to a supported scan level.")
             { IsDeterministic = true };
         return level;
+    }
+
+    // govulncheck attaches every SARIF result to go.mod:1 (see the class
+    // doc), so an ExcludePaths entry that normalizes to 'go.mod' is not a
+    // path filter — it drops the entire report and the audit passes on
+    // nothing. Reject it as a deterministic configuration failure rather
+    // than silently zeroing the audit.
+    private void ThrowIfExcludePathsNeutersAudit(ExternalToolAuditorOptions options)
+    {
+        foreach (var entry in options.ExcludePaths)
+        {
+            if (string.Equals(NormalizeExcludePathEntry(entry), "go.mod", StringComparison.Ordinal))
+                throw new AuditUnavailableException(
+                    $"could-not-verify: auditor '{Name}' was configured with ExcludePaths 'go.mod', "
+                    + "but every govulncheck finding locates at go.mod — the entry would drop the "
+                    + "whole report and pass silently. To stand the auditor down, remove it from "
+                    + "CodeyBox:Plugins:Enabled or the project's Audit.Custom list.")
+                { IsDeterministic = true };
+        }
     }
 
     private IReadOnlyList<string> ResolvePatterns(string scanLevel)
@@ -459,20 +434,12 @@ public sealed class GovulncheckAuditor : ExternalToolAuditorBase, IPluginInitial
             if (pattern.StartsWith('-'))
                 throw new AuditUnavailableException(
                     $"could-not-verify: auditor '{Name}' has a {PatternsKey} entry "
-                    + $"('{SingleLine(pattern)}') starting with '-' — patterns are positional "
+                    + $"('{TruncateForMessage(pattern)}') starting with '-' — patterns are positional "
                     + "arguments emitted after every flag, so a leading-dash entry would be parsed "
                     + "as a govulncheck flag. Use the dedicated scoped keys for flags.")
                 { IsDeterministic = true };
         }
 
         return configured;
-    }
-
-    private static void AddValueFlag(List<string> args, string flag, string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return;
-        args.Add(flag);
-        args.Add(value.Trim());
     }
 }
