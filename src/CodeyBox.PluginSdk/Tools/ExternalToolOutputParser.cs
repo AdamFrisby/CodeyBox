@@ -22,11 +22,19 @@ public sealed record ExternalToolFinding(
     int? Line = null);
 
 /// <summary>Inputs handed to an <see cref="IExternalToolOutputParser"/>.</summary>
+/// <param name="WorkingDirectory">
+/// The directory the tool ran in (the exec working directory). Tools that
+/// report absolute paths (e.g. PHPStan's JSON report keys <c>files</c> by
+/// absolute path) use it to relativize them onto repository-relative paths so
+/// finding locations and <see cref="ExternalToolAuditorOptions.ExcludePaths"/>
+/// behave like every other auditor's. Null when the caller did not supply one.
+/// </param>
 public sealed record ExternalToolParseInput(
     string ToolName,
     string Stdout,
     string Stderr,
-    int ExitCode);
+    int ExitCode,
+    string? WorkingDirectory = null);
 
 /// <summary>
 /// Parses a finished tool invocation into findings. The tool does not need to
