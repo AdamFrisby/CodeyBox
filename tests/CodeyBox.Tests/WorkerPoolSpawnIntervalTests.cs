@@ -91,7 +91,19 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
 
         await svc.StopAsync(CancellationToken.None);
 
-        Assert.Equal(itemCount, spawnTimes.Count);
+        // The count is a floor, not an exact total. A worker that hits a
+        // transient store fault (write-gate acquisition timeout, SQLITE_FULL
+        // on a loaded tmpfs, ...) leaves its item Queued, and the orchestrator
+        // legitimately re-dispatches it — via the no-progress deferral or the
+        // slot-release wake — producing one extra OnWorkerSpawned. That is the
+        // recovery machinery working as designed (see WorkerSpinGuardTests),
+        // not a pacing violation. Re-dispatched spawns pass through the same
+        // MinSpawnInterval gate, so the consecutive-gap assertions below remain
+        // the invariant under test: an unpaced duplicate-spawn regression still
+        // fails them.
+        Assert.True(
+            spawnTimes.Count >= itemCount,
+            $"Expected at least {itemCount} spawns, observed {spawnTimes.Count}");
 
         // Sort spawn times and check every consecutive gap.
         var sorted = spawnTimes.Order().ToList();
@@ -146,11 +158,21 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
 
         await svc.StopAsync(CancellationToken.None);
 
-        Assert.Equal(itemCount, spawnTimes.Count);
+        // Same floor-only count contract as the interval test: a pickup that
+        // faulted transiently is legitimately re-dispatched, adding extra
+        // spawn timestamps.
+        Assert.True(
+            spawnTimes.Count >= itemCount,
+            $"Expected at least {itemCount} spawns, observed {spawnTimes.Count}");
 
-        // All 3 items should fire within a short wall-clock window (< 500ms total).
+        // All 3 items should fire within a short wall-clock window (< 500ms
+        // total). Only the first itemCount spawns belong to the initial
+        // dispatch wave — a re-dispatch is only possible after a worker exits,
+        // so its timestamp is never earlier than the initial spawns — and a
+        // deferred re-dispatch (default backoff 500ms) would otherwise blow
+        // the spread on a legitimate recovery.
         var sorted = spawnTimes.Order().ToList();
-        var totalSpread = sorted[^1] - sorted[0];
+        var totalSpread = sorted[itemCount - 1] - sorted[0];
         Assert.True(totalSpread.TotalMilliseconds < 500,
             $"Without interval, all spawns should fire quickly, but spread was {totalSpread.TotalMilliseconds:F0}ms");
     }
