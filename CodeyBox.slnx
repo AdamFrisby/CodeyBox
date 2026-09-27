@@ -79,6 +79,7 @@
     <Project Path="plugins/auditors-linting/CodeyBox.RuffAuditorPlugin/CodeyBox.RuffAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.RubocopAuditorPlugin/CodeyBox.RubocopAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.CppcheckAuditorPlugin/CodeyBox.CppcheckAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.CredoAuditorPlugin/CodeyBox.CredoAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.SpotBugsAuditorPlugin/CodeyBox.SpotBugsAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PyrightAuditorPlugin/CodeyBox.PyrightAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PhpstanAuditorPlugin/CodeyBox.PhpstanAuditorPlugin.csproj" />
