@@ -80,12 +80,13 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// files below the worktree root (vendor/, testdata/, dot- and
 /// underscore-prefixed directories pruned — the go tool never reaches them
 /// either) and fails closed listing any roots beyond the root module's.
-/// Operators who accept the residual scope — or who cover the nested
-/// modules with a <c>go.work</c> workspace the loader resolves — set
+/// Operators who accept the residual scope set
 /// <c>AllowNestedModules</c>, which downgrades the gate to a warning log
-/// naming the roots. Files behind build constraints the sandbox does not
-/// satisfy (other GOOS/GOARCH, custom <c>//go:build</c> tags not in
-/// <c>BuildTags</c>) are likewise never analyzed.</para>
+/// naming the roots — the <c>./...</c> pattern does not widen to cover
+/// nested modules even in workspace mode, so a <c>go.work</c> is not a
+/// substitute for acknowledging them. Files behind build constraints the
+/// sandbox does not satisfy (other GOOS/GOARCH, custom <c>//go:build</c>
+/// tags not in <c>BuildTags</c>) are likewise never analyzed.</para>
 ///
 /// <para><b>Version pin.</b> gosec's rule set and SARIF shape change between
 /// releases, so findings are only meaningful from the build the auditor was
@@ -115,8 +116,9 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// <para><b>Environment hygiene.</b> gosec's opt-in AI fix feature
 /// (<c>GOSEC_AI_PROVIDER</c>/<c>GOSEC_AI_API_KEY</c>/<c>GOSEC_AI_BASE_URL</c>)
 /// would ship source snippets to an external service when enabled from the
-/// baseline environment; the auditor clears those variables for the tool
-/// process so the scan is always the deterministic, offline analysis.</para>
+/// baseline environment; the auditor removes those variables from the
+/// tool process's environment outright so the scan is always the
+/// deterministic, offline analysis.</para>
 ///
 /// <para><b>Scope and defaults.</b> The scan is <c>./...</c> — every Go
 /// package under the worktree root, gated by the nested-module probe
@@ -201,7 +203,7 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// gosec's <c>#nosec</c> and <c>//gosec:disable</c> comments. Default
     /// false: the audited repo must not be able to silence the audit.
     /// </summary>
-    internal const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
+    public const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
 
     /// <summary>
     /// Scoped-config boolean acknowledging nested Go module roots. Default
@@ -211,16 +213,22 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// run proceeds and the uncovered roots are logged as a warning; the
     /// operator accepts the residual scope.
     /// </summary>
-    internal const string AllowNestedModulesKey = "AllowNestedModules";
+    public const string AllowNestedModulesKey = "AllowNestedModules";
 
-    // Enumerates candidate nested Go module roots: every go.mod below the
-    // worktree root. Directories the go tool itself never reaches — vendor,
-    // testdata, dot- and underscore-prefixed — are pruned so a go.mod in a
-    // tree the scan cannot see anyway is not a false positive; the root
-    // module's own ./go.mod is filtered out by the caller. find does not
-    // follow symlinks, matching `go list`.
+    // Enumerates candidate nested Go module roots: every go.mod node below
+    // the worktree root. Directories the go tool itself never reaches —
+    // vendor, testdata, dot- and underscore-prefixed — are pruned so a
+    // go.mod in a tree the scan cannot see anyway is not a false positive;
+    // the root module's own ./go.mod is filtered out by the caller.
+    // -print0 NUL-delimits the records because a legal directory name can
+    // contain '\n', which would split a newline-delimited listing into
+    // unrecognizable fragments and silently lose a root. The match has no
+    // -type restriction: the go tool decides module boundaries with a
+    // Stat-based name check, so a symlinked or otherwise non-regular
+    // go.mod still carves the tree — over-reporting only costs the
+    // operator a visible failure, while under-reporting is silent evasion.
     private const string NestedModuleProbeScript =
-        "find . -mindepth 1 -type d \\( -name vendor -o -name testdata -o -name '.*' -o -name '_*' \\) -prune -o -type f -name go.mod -print";
+        "find . -mindepth 1 -type d \\( -name vendor -o -name testdata -o -name '.*' -o -name '_*' \\) -prune -o -name go.mod -print0";
 
     private const int MaxModuleRootsInMessage = 8;
     private const int ModuleRootMaxChars = 120;
@@ -355,18 +363,14 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <inheritdoc />
-    protected override IReadOnlyDictionary<string, string>? BuildToolEnvironment(
+    protected override IReadOnlyList<string>? BuildToolEnvironmentRemovals(
         ExternalToolAuditorOptions options)
         // gosec's AI autofix is opt-in via environment; a baseline that
         // exports GOSEC_AI_* would ship audited source to an external
-        // provider. An auditor run is deterministic analysis — clear the
-        // knobs unconditionally.
-        => new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["GOSEC_AI_PROVIDER"] = string.Empty,
-            ["GOSEC_AI_API_KEY"] = string.Empty,
-            ["GOSEC_AI_BASE_URL"] = string.Empty,
-        };
+        // provider. An auditor run is deterministic analysis, so the knobs
+        // are removed outright — presence alone can arm the feature, which
+        // an empty value would not neutralize.
+        => ["GOSEC_AI_PROVIDER", "GOSEC_AI_API_KEY", "GOSEC_AI_BASE_URL"];
 
     /// <summary>
     /// Pre-scan scope gate: <c>go list ./...</c> — the loader behind gosec —
@@ -392,26 +396,21 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
         if (nestedRoots.Count == 0)
             return;
 
-        var named = string.Join(
-            ", ",
-            nestedRoots.Take(MaxModuleRootsInMessage)
-                .Select(root => "'" + ToolOutputText.SingleLine(root, ModuleRootMaxChars) + "'"));
-        var remainder = nestedRoots.Count > MaxModuleRootsInMessage
-            ? $", … +{nestedRoots.Count - MaxModuleRootsInMessage} more"
-            : string.Empty;
+        var named = ToolOutputText.FormatBoundedList(
+            nestedRoots, MaxModuleRootsInMessage, ModuleRootMaxChars);
 
         if (_allowNestedModules())
         {
             _logger?.LogWarning(
                 "GosecAuditor: {NestedModuleCount} nested Go module root(s) are outside the './...' "
-                + "scan scope (AllowNestedModules): {NestedModuleRoots}{More}",
-                nestedRoots.Count, named, remainder);
+                + "scan scope (AllowNestedModules): {NestedModuleRoots}",
+                nestedRoots.Count, named);
             return;
         }
 
         throw new AuditUnavailableException(
             $"could-not-verify: audit tool '{tool}' cannot prove its scan scope: the worktree holds "
-            + $"{nestedRoots.Count} nested Go module root(s) ({named}{remainder}), and 'go list ./...' "
+            + $"{nestedRoots.Count} nested Go module root(s) ({named}), and 'go list ./...' "
             + "never descends into a directory carrying its own go.mod — code there is silently "
             + "unscanned, so the audit cannot pass on a partial tree. Merge the modules into the "
             + "root module, or acknowledge the residual scope via "
@@ -424,11 +423,15 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// carry their own <c>go.mod</c>. The <c>find</c> prunes directories the
     /// go tool itself never descends into (vendor, testdata, dot- and
     /// underscore-prefixed), so only roots that look like part of the
-    /// scanned tree — but are silently skipped — come back. The root
-    /// module's own <c>./go.mod</c> carries no intermediate directory and
-    /// is filtered out. Fails closed: a transport failure or a non-zero
-    /// exit (including the kill fired when output exceeds the bound) is
-    /// infrastructure, never "no nested modules". Output lines are
+    /// scanned tree — but are silently skipped — come back. The listing is
+    /// NUL-delimited (<c>-print0</c>): a legal directory name can contain
+    /// a newline, which would split a line-based listing into fragments
+    /// and silently lose a root. The root module's own <c>./go.mod</c>
+    /// carries no intermediate directory and is filtered out. Fails
+    /// closed: a transport failure, a non-zero exit, or a
+    /// capture-limit flag — find can exit 0 before
+    /// <c>KillOnOutputLimit</c> lands, silently dropping trailing roots —
+    /// is infrastructure, never "no nested modules". Output records are
     /// untrusted — they are only ever sanitized into a message or log,
     /// never used as paths.
     /// </summary>
@@ -458,6 +461,13 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' module-scope probe could not run: the sandbox "
                 + "exec transport was unavailable.");
+        if (result.OutputLimitExceeded)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' could not enumerate nested Go module roots: "
+                + "the probe output exceeded the capture bound, so a trailing module root may have "
+                + "been dropped — an unverifiable scan scope must not ride a passing verdict.",
+                result.ExitCode,
+                result.Stdout + "\n" + result.Stderr);
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' could not enumerate nested Go module roots "
@@ -467,14 +477,14 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
                 result.Stdout + "\n" + result.Stderr);
 
         var roots = new List<string>();
-        foreach (var line in result.Stdout.Split(
-            '\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var record in result.Stdout.Split(
+            '\0', StringSplitOptions.RemoveEmptyEntries))
         {
             // find prints './<dir>/go.mod'; the root module's own go.mod is
             // the scan's anchor, not a coverage gap.
-            if (!line.StartsWith("./", StringComparison.Ordinal))
+            if (!record.StartsWith("./", StringComparison.Ordinal))
                 continue;
-            var relative = line[2..];
+            var relative = record[2..];
             if (!relative.EndsWith("/go.mod", StringComparison.Ordinal))
                 continue;
             var dir = relative[..^"/go.mod".Length];

@@ -5,6 +5,7 @@ using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -178,11 +179,13 @@ public sealed class GosecAuditorTests
         // Repository-authored #nosec suppression is inert by default.
         Assert.Contains("-nosec", argv);
 
-        // gosec's AI autofix knobs are neutralized for the tool process.
-        Assert.NotNull(scanExec.ExtraEnvironment);
-        Assert.Equal("", scanExec.ExtraEnvironment["GOSEC_AI_PROVIDER"]);
-        Assert.Equal("", scanExec.ExtraEnvironment["GOSEC_AI_API_KEY"]);
-        Assert.Equal("", scanExec.ExtraEnvironment["GOSEC_AI_BASE_URL"]);
+        // gosec's AI autofix knobs are removed from the tool process's
+        // environment outright — presence alone could arm the feature, so
+        // an empty value is not enough.
+        Assert.Null(scanExec.ExtraEnvironment);
+        Assert.Contains("GOSEC_AI_PROVIDER", scanExec.EnvironmentVariablesToUnset);
+        Assert.Contains("GOSEC_AI_API_KEY", scanExec.EnvironmentVariablesToUnset);
+        Assert.Contains("GOSEC_AI_BASE_URL", scanExec.EnvironmentVariablesToUnset);
     }
 
     [Fact]
@@ -560,7 +563,7 @@ public sealed class GosecAuditorTests
                 return Task.FromResult(Ok(exec));
             if (IsModuleProbe(exec))
                 return Task.FromResult(new SandboxExecResult(
-                    0, "./go.mod\n./services/hidden/go.mod\n./tools/x/go.mod\n", ""));
+                    0, "./go.mod\0./services/hidden/go.mod\0./tools/x/go.mod\0", ""));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
@@ -587,7 +590,7 @@ public sealed class GosecAuditorTests
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsModuleProbe(exec))
-                return Task.FromResult(new SandboxExecResult(0, "./go.mod\n", ""));
+                return Task.FromResult(new SandboxExecResult(0, "./go.mod\0", ""));
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
@@ -600,12 +603,15 @@ public sealed class GosecAuditorTests
     [Fact]
     public async Task NestedModuleRoots_OperatorAcknowledgement_ProceedsWithWarning()
     {
+        var logger = new CapturingLogger();
         var auditor = new GosecAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
-            {
-                ["Scoped:" + GosecAuditor.AllowNestedModulesKey] = "true",
-            }),
+            BuildPluginContext(
+                new Dictionary<string, string?>
+                {
+                    ["Scoped:" + GosecAuditor.AllowNestedModulesKey] = "true",
+                },
+                logger),
             CancellationToken.None);
 
         var scanExecs = 0;
@@ -615,7 +621,7 @@ public sealed class GosecAuditorTests
                 return Task.FromResult(Ok(exec));
             if (IsModuleProbe(exec))
                 return Task.FromResult(new SandboxExecResult(
-                    0, "./go.mod\n./services/hidden/go.mod\n", ""));
+                    0, "./go.mod\0./services/hidden/go.mod\0", ""));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
@@ -625,6 +631,56 @@ public sealed class GosecAuditorTests
 
         Assert.True(result.Passed);
         Assert.Equal(1, scanExecs);
+
+        // The acknowledgement is only meaningful because the residual
+        // scope gap is logged — the warning naming the uncovered roots is
+        // the audit trail distinguishing acknowledgement from silence.
+        var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains("services/hidden", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("nested", warning.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task NestedModuleRoots_NewlineInDirectoryName_StillFailsClosed()
+    {
+        // A legal-in-git directory name containing '\n' splits a
+        // line-delimited find listing into unrecognizable fragments; the
+        // probe's NUL-delimited (-print0) records keep the root
+        // enumerable, so the gate still fails closed and names it.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsModuleProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    0, "./go.mod\0./evil\ntwin/go.mod\0", ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
+        });
+
+        IAuditor auditor = new GosecAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("nested Go module root", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("evil", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ModuleScopeProbe_FailsClosed_OnTruncatedOutput()
+    {
+        // KillOnOutputLimit races a fast find: it can exit 0 with the
+        // capture bound already hit, silently dropping trailing roots. A
+        // truncated listing is unverifiable scope — infrastructure, never
+        // a pass.
+        var truncated = new FakeSandbox((exec, _) => Task.FromResult(
+            IsModuleProbe(exec)
+                ? new SandboxExecResult(0, "./go.mod\0", "", StdoutLimitExceeded: true)
+                : Ok(exec)));
+
+        IAuditor auditor = new GosecAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(truncated, "/work", FakeContext(), CancellationToken.None));
+        Assert.Contains("module roots", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -954,7 +1010,8 @@ public sealed class GosecAuditorTests
         return path;
     }
 
-    private static PluginContext BuildPluginContext(IReadOnlyDictionary<string, string?> scopedValues)
+    private static PluginContext BuildPluginContext(
+        IReadOnlyDictionary<string, string?> scopedValues, ILogger? logger = null)
     {
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(scopedValues)
@@ -963,7 +1020,7 @@ public sealed class GosecAuditorTests
             HostApiVersion: "1.0",
             PluginId: GosecAuditor.PluginId,
             PluginDisplayName: "CodeyBox: Gosec Go Security",
-            Host: new TestPluginHost(config.GetSection("Scoped")));
+            Host: new TestPluginHost(config.GetSection("Scoped"), logger));
     }
 
     private static SandboxExecResult Ok(SandboxExec exec)
@@ -1102,9 +1159,9 @@ public sealed class GosecAuditorTests
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
 
-    private sealed class TestPluginHost(IConfigurationSection scoped) : IPluginHost
+    private sealed class TestPluginHost(IConfigurationSection scoped, ILogger? logger) : IPluginHost
     {
-        public Microsoft.Extensions.Logging.ILogger Logger { get; } = NullLogger.Instance;
+        public ILogger Logger { get; } = logger ?? NullLogger.Instance;
         public IConfigurationSection ScopedConfig { get; } = scoped;
     }
 

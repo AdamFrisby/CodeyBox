@@ -56,10 +56,10 @@ below).
   failure) listing every nested root beyond the root module's — trees the
   go tool never reaches (`vendor/`, `testdata/`, dot- and
   underscore-prefixed dirs) are pruned and do not trip the gate. Operators
-  who accept the residual scope — or who cover the nested modules with a
-  `go.work` workspace the loader resolves — set
-  `AllowNestedModules: true`, which downgrades the gate to a warning log
-  naming the roots.
+  who accept the residual scope set `AllowNestedModules: true`, which
+  downgrades the gate to a warning log naming the roots. (`./...` does not
+  widen to cover nested modules even in workspace mode, so a `go.work` is
+  not a substitute for acknowledging them.)
 - **Vendor and dot trees.** gosec's built-in `-exclude-dir` defaults skip
   `vendor/` and `.git/` at scan time; `vendor/` is also the only default
   `ExcludePaths` entry — a finding-level backstop, since vendor semantics
@@ -183,8 +183,9 @@ findings inline. The scan therefore passes `-nosec` unless
 
 gosec's AI autofix (`GOSEC_AI_PROVIDER`/`GOSEC_AI_API_KEY`/
 `GOSEC_AI_BASE_URL`) ships source snippets to an external service when
-enabled; the auditor clears those variables for the tool process so the
-scan is always deterministic local analysis.
+enabled; the auditor removes those variables from the tool process's
+environment outright — presence alone could arm the feature — so the scan
+is always deterministic local analysis.
 
 ## Default scope
 

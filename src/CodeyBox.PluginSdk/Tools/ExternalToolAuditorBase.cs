@@ -88,6 +88,21 @@ public abstract class ExternalToolAuditorBase : IAuditor
         => null;
 
     /// <summary>
+    /// Environment variables that must be absent from the tool process,
+    /// delivered via <see cref="SandboxExec.EnvironmentVariablesToUnset"/> at
+    /// exec time — removal wins deterministically over both the sandbox
+    /// baseline and <see cref="BuildToolEnvironment"/>. Override when a
+    /// feature is armed by a variable's mere <em>presence</em>, where
+    /// assigning an empty value through <see cref="BuildToolEnvironment"/>
+    /// would not neutralize it (a tool that presence-checks with
+    /// <c>LookupEnv</c>-style semantics would still see the variable). Names
+    /// should be author-chosen constants, never untrusted data — each is
+    /// validated as a POSIX identifier at exec build. Default: none.
+    /// </summary>
+    protected virtual IReadOnlyList<string>? BuildToolEnvironmentRemovals(ExternalToolAuditorOptions options)
+        => null;
+
+    /// <summary>
     /// Optional pinned-version declaration. Non-null makes
     /// <see cref="RunAsync"/> probe the tool with the pin's
     /// <see cref="ToolVersionPin.VersionProbeArguments"/> before every scan —
@@ -232,6 +247,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 MaxStderrBytes = maxBytes,
                 KillOnOutputLimit = false,
                 ExtraEnvironment = BuildToolEnvironment(options),
+                EnvironmentVariablesToUnset = BuildToolEnvironmentRemovals(options) ?? [],
             },
             EffectiveTimeout(options),
             ct);
@@ -523,14 +539,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 nameof(path));
 
     private static string TruncateForMessage(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "(empty)";
-        var single = SingleLine(value);
-        return single.Length > MessageValueMaxChars
-            ? single[..MessageValueMaxChars] + "…"
-            : single;
-    }
+        => string.IsNullOrWhiteSpace(value)
+            ? "(empty)"
+            : ToolOutputText.SingleLine(value, MessageValueMaxChars);
 
     private IReadOnlyList<ExternalToolFinding> ParseOutput(string tool, SandboxExecResult result)
     {

@@ -40,6 +40,29 @@ public static class ToolOutputText
     }
 
     /// <summary>
+    /// Bounded <c>", "</c>-joined rendering of untrusted names for failure
+    /// messages and logs: each entry is flattened to a single line capped at
+    /// <paramref name="maxCharsPerName"/> and wrapped in single quotes so a
+    /// name carrying spaces or commas cannot spoof extra list entries, at
+    /// most <paramref name="maxNamed"/> entries are shown, and any remainder
+    /// is summarized as <c>", … +K more"</c> — the shared policy for naming
+    /// untrusted items inside a bounded message.
+    /// </summary>
+    public static string FormatBoundedList(
+        IReadOnlyCollection<string> names,
+        int maxNamed,
+        int maxCharsPerName)
+    {
+        ArgumentNullException.ThrowIfNull(names);
+        var named = string.Join(
+            ", ",
+            names.Take(maxNamed).Select(n => "'" + SingleLine(n, maxCharsPerName) + "'"));
+        return names.Count > maxNamed
+            ? named + $", … +{names.Count - maxNamed} more"
+            : named;
+    }
+
+    /// <summary>
     /// Flattens control characters in <paramref name="value"/> except line
     /// feeds — for multi-line bodies such as finding descriptions, where the
     /// text keeps its line structure but cannot inject terminal escapes or

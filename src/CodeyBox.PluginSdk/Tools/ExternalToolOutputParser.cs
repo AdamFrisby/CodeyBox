@@ -77,10 +77,19 @@ public sealed class DelegateToolOutputParser : IExternalToolOutputParser
 /// artifact URI plus <c>region.startLine</c>). Reads from stdout; a non-empty
 /// stderr is kept for the audit raw output but does not affect parsing.
 /// Malformed JSON throws <see cref="ExternalToolParseException"/>.
+///
+/// The parser is deliberately fail-closed on its result bound: a document
+/// carrying more results than the cap throws <see cref="ExternalToolParseException"/>
+/// rather than returning a silently truncated list. Dropped results are
+/// gate-relevant — one could carry an Error-mapped severity — so a
+/// truncated report can never stand in for the whole verdict.
 /// </summary>
 public sealed class SarifToolOutputParser : IExternalToolOutputParser
 {
-    /// <summary>Upper bound on results consumed from one document.</summary>
+    /// <summary>
+    /// Upper bound on results consumed from one document; a document
+    /// carrying more results fails parsing outright.
+    /// </summary>
     public const int DefaultMaxResults = 10_000;
 
     private readonly int _maxResults;
@@ -121,8 +130,6 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
             var findings = new List<ExternalToolFinding>();
             foreach (var run in runs.EnumerateArray())
             {
-                if (findings.Count >= _maxResults)
-                    break;
                 if (run.ValueKind != JsonValueKind.Object
                     || !run.TryGetProperty("results"u8, out var results)
                     || results.ValueKind != JsonValueKind.Array)
@@ -130,10 +137,21 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
 
                 foreach (var result in results.EnumerateArray())
                 {
+                    if (result.ValueKind != JsonValueKind.Object)
+                        continue;
+                    // Results past the cap are gate-relevant — one could
+                    // carry an Error-mapped severity — so overflow fails
+                    // closed as a parse failure instead of silently dropping
+                    // the tail and computing the verdict on partial evidence.
                     if (findings.Count >= _maxResults)
-                        break;
-                    if (result.ValueKind == JsonValueKind.Object)
-                        findings.Add(ParseResult(result));
+                    {
+                        throw new ExternalToolParseException(
+                            $"Tool '{input.ToolName}' produced more SARIF results than the parser's "
+                            + $"{_maxResults}-result bound; the report was cut off, so the audit "
+                            + "cannot be computed over partial evidence.");
+                    }
+
+                    findings.Add(ParseResult(result));
                 }
             }
 

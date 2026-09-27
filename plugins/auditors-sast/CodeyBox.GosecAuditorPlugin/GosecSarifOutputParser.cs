@@ -33,7 +33,11 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// unreadable channel fails closed too: no evidence of empty is not
 /// evidence of absence. All three throw
 /// <see cref="ExternalToolParseException"/> — reported by the base as
-/// infrastructure, never a pass.</para>
+/// infrastructure, never a pass. The shared parser's result bound fails
+/// closed the same way: a report exceeding
+/// <see cref="SarifToolOutputParser.DefaultMaxResults"/> throws rather
+/// than silently truncating, so gate-relevant results can never be pushed
+/// past the cap into silence.</para>
 /// </summary>
 internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
 {
@@ -118,16 +122,11 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
 
         if (errorPaths.Count > 0)
         {
-            var named = string.Join(
-                ", ",
-                errorPaths.Take(MaxErrorPathsInMessage)
-                    .Select(path => ToolOutputText.SingleLine(path, ErrorPathMaxChars)));
-            var remainder = errorPaths.Count > MaxErrorPathsInMessage
-                ? $", … +{errorPaths.Count - MaxErrorPathsInMessage} more"
-                : string.Empty;
+            var named = ToolOutputText.FormatBoundedList(
+                errorPaths, MaxErrorPathsInMessage, ErrorPathMaxChars);
             throw new ExternalToolParseException(
                 $"Tool '{input.ToolName}' recorded {errorPaths.Count} analysis error(s) alongside its "
-                + $"findings — packages it could not load or parse ({named}{remainder}) — so part of "
+                + $"findings — packages it could not load or parse ({named}) — so part of "
                 + "the tree was never analyzed and the findings cannot stand as a verdict.");
         }
     }
