@@ -83,6 +83,7 @@
     <Project Path="plugins/auditors-linting/CodeyBox.SwiftlintAuditorPlugin/CodeyBox.SwiftlintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PyrightAuditorPlugin/CodeyBox.PyrightAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PhpstanAuditorPlugin/CodeyBox.PhpstanAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.PmdAuditorPlugin/CodeyBox.PmdAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/CodeyBox.GitleaksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-schema/CodeyBox.SpectralAuditorPlugin/CodeyBox.SpectralAuditorPlugin.csproj" />
     <Project Path="plugins/sast/CodeyBox.CodeqlAuditorPlugin/CodeyBox.CodeqlAuditorPlugin.csproj" />
