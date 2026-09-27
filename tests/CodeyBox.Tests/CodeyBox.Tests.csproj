@@ -69,6 +69,7 @@
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.RubocopAuditorPlugin\CodeyBox.RubocopAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.CppcheckAuditorPlugin\CodeyBox.CppcheckAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.SpotBugsAuditorPlugin\CodeyBox.SpotBugsAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.SwiftlintAuditorPlugin\CodeyBox.SwiftlintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PyrightAuditorPlugin\CodeyBox.PyrightAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PhpstanAuditorPlugin\CodeyBox.PhpstanAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.GitleaksAuditorPlugin\CodeyBox.GitleaksAuditorPlugin.csproj" />
