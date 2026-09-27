@@ -23,20 +23,29 @@ public sealed record ExternalToolFinding(
 
 /// <summary>
 /// Inputs handed to an <see cref="IExternalToolOutputParser"/>.
-/// <paramref name="ScanRoot"/> is the absolute directory the tool's scan ran
+/// </summary>
+/// <param name="ScanRoot">The absolute directory the tool's scan ran
 /// in as the tool saw it — sandbox providers may translate the audit's
 /// working directory, so auditors that need it resolve it per run through
 /// <see cref="ExternalToolAuditorBase.ResolveScanRootAsync"/>. Parsers use
 /// it to relativize absolute paths the tool reports when the report itself
 /// embeds no working directory. Null when the auditor did not resolve one —
 /// parsers must then leave absolute paths unrelativized rather than guess.
-/// </summary>
+/// </param>
+/// <param name="WorkingDirectory">
+/// The directory the tool ran in (the exec working directory). Tools that
+/// report absolute paths (e.g. PHPStan's JSON report keys <c>files</c> by
+/// absolute path) use it to relativize them onto repository-relative paths so
+/// finding locations and <see cref="ExternalToolAuditorOptions.ExcludePaths"/>
+/// behave like every other auditor's. Null when the caller did not supply one.
+/// </param>
 public sealed record ExternalToolParseInput(
     string ToolName,
     string Stdout,
     string Stderr,
     int ExitCode,
-    string? ScanRoot = null);
+    string? ScanRoot = null,
+    string? WorkingDirectory = null);
 
 /// <summary>
 /// Parses a finished tool invocation into findings. The tool does not need to

@@ -197,7 +197,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
                 result);
 
-        var parsed = ParseOutput(tool, result, scanRoot);
+        var parsed = ParseOutput(tool, result, scanRoot, workingDirectory);
         var findings = ToFindings(tool, parsed, options);
         var truncated = findings.Count < parsed.Count;
         var passed = findings.All(f => f.Severity < AuditSeverity.Error);
@@ -611,12 +611,14 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     private IReadOnlyList<ExternalToolFinding> ParseOutput(
-        string tool, SandboxExecResult result, string? scanRoot)
+        string tool, SandboxExecResult result, string? scanRoot, string? workingDirectory)
     {
         try
         {
             return OutputParser.Parse(
-                new ExternalToolParseInput(tool, result.Stdout, result.Stderr, result.ExitCode, scanRoot)) ?? [];
+                new ExternalToolParseInput(
+                    tool, result.Stdout, result.Stderr, result.ExitCode,
+                    ScanRoot: scanRoot, WorkingDirectory: workingDirectory)) ?? [];
         }
         catch (ExternalToolParseException ex)
         {
