@@ -12,9 +12,11 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Covers the gosec auditor plugin: a missing or wrong-version binary is
 /// infrastructure naming the tool (never a pass), gosec's ambiguous exit 1
-/// is discriminated by the SARIF on stdout (findings → verdict, empty
-/// report → infrastructure), findings carry the gosec rule id and
-/// file:line, severity goes through the declared mapping on gosec's native
+/// is discriminated by the SARIF on stdout plus the JSON
+/// <c>"Golang errors"</c> channel on stderr (findings + empty channel →
+/// verdict, empty report / recorded errors / unreadable channel →
+/// infrastructure), findings carry the gosec rule id and file:line,
+/// severity goes through the declared mapping on gosec's native
 /// HIGH/MEDIUM/LOW vocabulary — recovered from rule descriptors, not the
 /// flattened SARIF level — and the plugin is inert until enabled. Every
 /// run is dispatched through <see cref="IAuditor"/> so the version-pin
@@ -75,6 +77,29 @@ public sealed class GosecAuditorTests
         }
         """;
 
+    // The JSON report gosec writes to stderr (-fmt json -out /dev/stderr):
+    // "Golang errors" is the per-package analysis-error channel SARIF
+    // lacks — empty on a fully-analyzed run.
+    private const string ErrorsJsonEmpty = """
+        {
+          "Golang errors": {},
+          "Issues": [],
+          "Stats": { "numfiles": 2, "numlines": 40, "numnosec": 0, "numfound": 0 },
+          "GosecVersion": "2.28.0"
+        }
+        """;
+
+    private const string ErrorsJsonWithUnloadablePackage = """
+        {
+          "Golang errors": {
+            "hidden/evil.go": [{ "line": 0, "column": 0, "error": "could not load package" }]
+          },
+          "Issues": [],
+          "Stats": { "numfiles": 1, "numlines": 20, "numnosec": 0, "numfound": 1 },
+          "GosecVersion": "2.28.0"
+        }
+        """;
+
     [Fact]
     public async Task MissingBinary_IsInfrastructureFailure_NamingGosec_NeverAPass()
     {
@@ -86,7 +111,7 @@ public sealed class GosecAuditorTests
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(127, "", "gosec: command not found"));
             scanExecs++;
-            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
         IAuditor auditor = new GosecAuditor();
@@ -107,7 +132,7 @@ public sealed class GosecAuditorTests
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(
-                GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, ""));
+                GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, ErrorsJsonEmpty));
         });
 
         IAuditor auditor = new GosecAuditor();
@@ -123,10 +148,22 @@ public sealed class GosecAuditorTests
         Assert.NotNull(scanExec);
         var argv = scanExec!.Argv;
         Assert.Equal("gosec", argv[0]);
+        // Two-channel report: -fmt json selects the -out (stderr) report —
+        // the "Golang errors" channel — while -verbose sarif keeps the
+        // stdout report SARIF and -log /dev/null keeps stderr JSON-only.
         var fmt = argv.ToList().IndexOf("-fmt");
         Assert.True(fmt >= 0 && fmt + 1 < argv.Count);
-        Assert.Equal("sarif", argv[fmt + 1]);
+        Assert.Equal("json", argv[fmt + 1]);
         Assert.Contains("-stdout", argv);
+        var verbose = argv.ToList().IndexOf("-verbose");
+        Assert.True(verbose >= 0 && verbose + 1 < argv.Count);
+        Assert.Equal("sarif", argv[verbose + 1]);
+        var output = argv.ToList().IndexOf("-out");
+        Assert.True(output >= 0 && output + 1 < argv.Count);
+        Assert.Equal("/dev/stderr", argv[output + 1]);
+        var log = argv.ToList().IndexOf("-log");
+        Assert.True(log >= 0 && log + 1 < argv.Count);
+        Assert.Equal("/dev/null", argv[log + 1]);
         Assert.Contains("-exclude-generated", argv);
         // Positional ./... — required: gosec relativizes SARIF artifact URIs
         // against the positional scan roots, so -r alone would emit empty
@@ -181,13 +218,53 @@ public sealed class GosecAuditorTests
         // write failure. Not a verdict.
         await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(
-                HealthyTool(GosecAuditor.IssuesOrErrorsExitCode, "No packages found\n"),
+                HealthyTool(GosecAuditor.IssuesOrErrorsExitCode, "No packages found\n", ""),
                 "/work", FakeContext(), CancellationToken.None));
 
         // Usage errors exit 2; any undeclared convention is infrastructure.
         await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(
-                HealthyTool(2, "flag provided but not defined: -bogus\n"),
+                HealthyTool(2, "flag provided but not defined: -bogus\n", "flag provided but not defined: -bogus\n"),
+                "/work", FakeContext(), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task FindingsCannotMaskAnalysisErrors_UnscannedPackagesFailClosed()
+    {
+        IAuditor auditor = new GosecAuditor();
+
+        // Findings alongside recorded analysis errors on the stderr error
+        // channel: part of the tree was never analyzed — a deliberately
+        // unloadable package (broken go.mod, uncached dep) must not hide
+        // behind the reported findings.
+        var masked = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(
+                HealthyTool(GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, ErrorsJsonWithUnloadablePackage),
+                "/work", FakeContext(), CancellationToken.None));
+        Assert.Contains("analysis error", masked.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("hidden/evil.go", masked.Message, StringComparison.Ordinal);
+
+        // An absent or unreadable channel cannot prove the map is empty —
+        // findings alone never suffice for a verdict.
+        foreach (var stderr in new[]
+        {
+            "",
+            "not json",
+            "{ }",
+            """{ "Golang errors": "not-an-object" }""",
+        })
+        {
+            await Assert.ThrowsAsync<AuditUnavailableException>(
+                () => auditor.RunAsync(
+                    HealthyTool(GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, stderr),
+                    "/work", FakeContext(), CancellationToken.None));
+        }
+
+        // A clean-looking run with a missing channel is unverifiable too:
+        // the JSON report is the only place analysis errors can appear.
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(
+                HealthyTool(0, SarifClean, ""),
                 "/work", FakeContext(), CancellationToken.None));
     }
 
@@ -246,7 +323,7 @@ public sealed class GosecAuditorTests
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(
-                GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, ""));
+                GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, ErrorsJsonEmpty));
         });
 
         var result = await ((IAuditor)auditor).RunAsync(
@@ -275,7 +352,7 @@ public sealed class GosecAuditorTests
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
-            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
         await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
@@ -311,7 +388,7 @@ public sealed class GosecAuditorTests
         var sandbox = new FakeSandbox((exec, _) =>
         {
             execs++;
-            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
@@ -337,7 +414,7 @@ public sealed class GosecAuditorTests
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
-            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
         await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
@@ -362,7 +439,7 @@ public sealed class GosecAuditorTests
         var sandbox = new FakeSandbox((exec, _) =>
         {
             execs++;
-            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
@@ -391,7 +468,7 @@ public sealed class GosecAuditorTests
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
-            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
         await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
@@ -412,7 +489,7 @@ public sealed class GosecAuditorTests
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "Version: 2.20.0\nGit tag: v2.20.0\nBuild date: 2025-01-01\n", ""));
             scanExecs++;
-            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
         });
 
         IAuditor auditor = new GosecAuditor();
@@ -446,7 +523,7 @@ public sealed class GosecAuditorTests
                 ? new SandboxExecResult(0, "Version: 2.27.1\nGit tag: v2.27.1\nBuild date: 2026-06-01\n", "")
                 : IsPresenceProbe(exec)
                     ? new SandboxExecResult(0, "", "")
-                    : new SandboxExecResult(GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, "")));
+                    : new SandboxExecResult(GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, ErrorsJsonEmpty)));
 
         var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
 
@@ -494,8 +571,8 @@ public sealed class GosecAuditorTests
     [Trait("requires_gosec", "true")]
     public async Task RealGosec_WeakRandInSource_YieldsFinding_WithRuleIdAndLocation()
     {
-        var installed = ProbeInstalledGosecVersion();
-        if (installed is null || !BinaryOnPath("go"))
+        var installed = await ProbeInstalledGosecVersionAsync();
+        if (installed is null || !await BinaryOnPathAsync("go"))
             return;
 
         var repo = await SeedFixtureRepoAsync(vulnerable: true);
@@ -536,6 +613,57 @@ public sealed class GosecAuditorTests
     }
 
     /// <summary>
+    /// Real-binary regression for the masked-error case: a package gosec's
+    /// loader cannot analyze (an import no module provides — unresolvable
+    /// in the no-network audit sandbox) sitting beside a real finding must
+    /// fail closed as infrastructure. Exit 1 covers both cases and SARIF
+    /// alone cannot tell them apart; only the stderr "Golang errors"
+    /// channel can.
+    /// </summary>
+    [Fact]
+    [Trait("requires_gosec", "true")]
+    public async Task RealGosec_UnloadablePackageBesideFindings_IsInfrastructure()
+    {
+        var installed = await ProbeInstalledGosecVersionAsync();
+        if (installed is null || !await BinaryOnPathAsync("go"))
+            return;
+
+        var repo = await SeedFixtureRepoAsync(vulnerable: true);
+        var hiddenDir = Path.Combine(repo, "hidden");
+        Directory.CreateDirectory(hiddenDir);
+        await File.WriteAllTextAsync(
+            Path.Combine(hiddenDir, "hidden.go"),
+            "package hidden\n\nimport _ \"nonexistent.invalid/dep\"\n");
+        try
+        {
+            var auditor = new GosecAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                }),
+                CancellationToken.None);
+
+            var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+            await using var sandbox = await provider.CreateAsync(
+                new SandboxSpec
+                {
+                    ImageReference = "ignored",
+                    WorkingDirectory = "/work",
+                    Mounts = [new SandboxMount { SandboxPath = "/work", HostPath = repo }],
+                },
+                CancellationToken.None);
+
+            await Assert.ThrowsAsync<AuditUnavailableException>(
+                () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+        }
+        finally
+        {
+            TryDeleteDirectory(repo);
+        }
+    }
+
+    /// <summary>
     /// Companion real-binary check: a fixture Go module with no issues
     /// passes with zero findings.
     /// </summary>
@@ -543,8 +671,8 @@ public sealed class GosecAuditorTests
     [Trait("requires_gosec", "true")]
     public async Task RealGosec_CleanFixtureModule_Passes_WithNoFindings()
     {
-        var installed = ProbeInstalledGosecVersion();
-        if (installed is null || !BinaryOnPath("go"))
+        var installed = await ProbeInstalledGosecVersionAsync();
+        if (installed is null || !await BinaryOnPathAsync("go"))
             return;
 
         var repo = await SeedFixtureRepoAsync(vulnerable: false);
@@ -668,11 +796,11 @@ public sealed class GosecAuditorTests
             ? new SandboxExecResult(0, "Version: " + GosecAuditor.DefaultExpectedVersion + "\nGit tag: v" + GosecAuditor.DefaultExpectedVersion + "\nBuild date: 2026-07-14\n", "")
             : new SandboxExecResult(0, "", "");
 
-    private static FakeSandbox HealthyTool(int scanExit, string scanStdout)
+    private static FakeSandbox HealthyTool(int scanExit, string scanStdout, string scanStderr = ErrorsJsonEmpty)
         => new((exec, _) => Task.FromResult(
             IsPresenceProbe(exec) || IsVersionProbe(exec)
                 ? Ok(exec)
-                : new SandboxExecResult(scanExit, scanStdout, "")));
+                : new SandboxExecResult(scanExit, scanStdout, scanStderr)));
 
     private static bool IsPresenceProbe(SandboxExec exec)
         => exec.Argv.Count >= 3
@@ -683,12 +811,12 @@ public sealed class GosecAuditorTests
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "gosec" && exec.Argv[1] == "-version";
 
-    private static bool BinaryOnPath(string binary)
-        => TryRunProbe(binary, "version")?.ExitCode == 0;
+    private static async Task<bool> BinaryOnPathAsync(string binary)
+        => (await TryRunProbeAsync(binary, "version").ConfigureAwait(false))?.ExitCode == 0;
 
-    private static string? ProbeInstalledGosecVersion()
+    private static async Task<string?> ProbeInstalledGosecVersionAsync()
     {
-        var probe = TryRunProbe("gosec", "-version");
+        var probe = await TryRunProbeAsync("gosec", "-version").ConfigureAwait(false);
         if (probe is null || probe.Value.ExitCode != 0)
             return null;
         // "Version: 2.28.0\nGit tag: v2.28.0\n..." — `go install` builds
@@ -702,12 +830,12 @@ public sealed class GosecAuditorTests
     }
 
     // Runs a one-shot version-style probe with a hard bound: both streams
-    // are drained before WaitForExit so a chatty tool cannot block, and a
-    // process outliving the timeout is killed. Null means "could not run"
-    // — a missing binary, a start failure, or a timeout — which the gated
-    // tests treat as absence and return early rather than fail on a host
-    // without the tool.
-    private static (int ExitCode, string Stdout)? TryRunProbe(string binary, string argument)
+    // are drained concurrently with the wait so a chatty tool cannot block
+    // on a full pipe, and a process outliving the timeout is killed. Null
+    // means "could not run" — a missing binary, a start failure, or a
+    // timeout — which the gated tests treat as absence and return early
+    // rather than fail on a host without the tool.
+    private static async Task<(int ExitCode, string Stdout)?> TryRunProbeAsync(string binary, string argument)
     {
         try
         {
@@ -720,14 +848,22 @@ public sealed class GosecAuditorTests
             };
             psi.ArgumentList.Add(argument);
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
-            process.StandardError.ReadToEnd();
-            if (!process.WaitForExit(milliseconds: ProbeTimeoutMilliseconds))
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(ProbeTimeoutMilliseconds);
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
+                try { await Task.WhenAll(stdout, stderr).ConfigureAwait(false); }
+                catch { /* drained pipes may fault after the kill — observed, not a result */ }
                 return null;
             }
-            return (process.ExitCode, stdout);
+            await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
+            return (process.ExitCode, stdout.Result);
         }
         catch
         {

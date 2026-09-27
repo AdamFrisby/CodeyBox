@@ -1,12 +1,14 @@
+using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
 
 namespace CodeyBox.GosecAuditorPlugin;
 
 /// <summary>
-/// SARIF parser for gosec's <c>-fmt sarif -stdout</c> report. Delegates the
-/// run/result → finding shape to the shared <see cref="SarifToolOutputParser"/>
-/// and adds the two things the shared parser cannot express for this tool:
+/// SARIF parser for gosec's stdout report (<c>-stdout -verbose sarif</c>).
+/// Delegates the run/result → finding shape to the shared
+/// <see cref="SarifToolOutputParser"/> and adds the two things the shared
+/// parser cannot express for this tool:
 ///
 /// <para><b>Native severity recovery.</b> gosec flattens its LOW/MEDIUM/HIGH
 /// severity into the SARIF <c>level</c> (LOW → <c>warning</c>, MEDIUM and
@@ -18,20 +20,35 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// vocabulary. When the descriptor carries no recognizable severity the
 /// finding keeps its SARIF <c>level</c>, which the map also covers.</para>
 ///
-/// <para><b>Exit-1 discrimination.</b> gosec exits 1 both for "found
-/// unsuppressed issues" and for "recorded per-file/per-package analysis
-/// errors" — and its SARIF report carries no error detail, so a run that
-/// could not analyze anything emits a perfectly valid document with an
-/// empty <c>results</c> array. Reading that as a clean pass would let a
-/// broken or unloaded package evade the audit, so exit 1 with zero parsed
-/// findings throws <see cref="ExternalToolParseException"/> — reported by
-/// the base as infrastructure, never a pass.</para>
+/// <para><b>Exit-1 discrimination and the error channel.</b> gosec exits 1
+/// both for "found unsuppressed issues" and for "recorded
+/// per-file/per-package analysis errors". Its SARIF report carries no
+/// error detail, so the scan is invoked to write the JSON report — the
+/// only format containing the <c>"Golang errors"</c> map — to stderr
+/// (<c>-fmt json -out /dev/stderr</c>, logger parked at
+/// <c>-log /dev/null</c>). Two failure shapes fail closed here: exit 1
+/// with a valid-but-empty results array (the run recorded errors and no
+/// issues), and any run whose error channel is non-empty — findings can
+/// never mask a package the scan could not load, because a deliberately
+/// broken package would otherwise ride a passing verdict. A missing or
+/// unreadable channel fails closed too: no evidence of empty is not
+/// evidence of absence. All three throw
+/// <see cref="ExternalToolParseException"/> — reported by the base as
+/// infrastructure, never a pass.</para>
 /// </summary>
 internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
 {
     // A scan's rule set is the ~150 built-in rules; a bound guards against a
     // malformed document carrying a huge descriptor list.
     private const int MaxRuleDescriptors = 4096;
+
+    // The JSON ReportInfo member holding gosec's per-file analysis errors:
+    // "Golang errors": { "<file>": [{ "line", "column", "error" }] }.
+    private const string AnalysisErrorsProperty = "Golang errors";
+
+    // How many failing paths to name in the failure message.
+    private const int MaxErrorPathsInMessage = 3;
+    private const int ErrorPathMaxChars = 160;
 
     private static readonly HashSet<string> SeverityTags = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -54,9 +71,11 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
             throw new ExternalToolParseException(
                 $"Tool '{input.ToolName}' exited {GosecAuditor.IssuesOrErrorsExitCode} with a SARIF report "
                 + "carrying no findings. gosec raises that exit for analysis errors (packages it could "
-                + "not load or parse) as well as for issues, and its SARIF report has no error channel — "
-                + "an empty report here means the scan errored, not that the tree is clean.");
+                + "not load or parse) as well as for issues — an empty report here means the scan "
+                + "errored, not that the tree is clean.");
         }
+
+        ThrowOnAnalysisErrors(input);
 
         var severities = ExtractRuleSeverities(input.Stdout);
         if (severities.Count == 0)
@@ -73,6 +92,98 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
         }
 
         return remapped;
+    }
+
+    /// <summary>
+    /// Fails closed when the run's error channel — the JSON report gosec
+    /// writes to stderr — records analysis errors, or when the channel
+    /// cannot be read at all. A SARIF report with findings can coexist
+    /// with packages gosec never analyzed (the audited repository controls
+    /// loadability: a broken <c>go.mod</c>, an uncached module, a package
+    /// that does not compile). Exit 1 with findings is a verdict only when
+    /// the channel proves every package was analyzed; anything else is
+    /// infrastructure, never a pass. On exit 0 the map is provably empty
+    /// (<c>computeExitCode</c> would have raised 1), but the channel is
+    /// still required readable so a broken invocation fails loudly.
+    /// </summary>
+    private static void ThrowOnAnalysisErrors(ExternalToolParseInput input)
+    {
+        if (!TryReadAnalysisErrorPaths(input.Stderr, out var errorPaths))
+        {
+            throw new ExternalToolParseException(
+                $"Tool '{input.ToolName}' produced a SARIF report but the analysis-error channel on "
+                + "stderr was absent or unreadable — gosec reports per-package analysis failures only "
+                + "in the JSON report the scan writes there, and without it a broken package could "
+                + "hide behind the findings.");
+        }
+
+        if (errorPaths.Count > 0)
+        {
+            var named = string.Join(
+                ", ",
+                errorPaths.Take(MaxErrorPathsInMessage).Select(SanitizePath));
+            var remainder = errorPaths.Count > MaxErrorPathsInMessage
+                ? $", … +{errorPaths.Count - MaxErrorPathsInMessage} more"
+                : string.Empty;
+            throw new ExternalToolParseException(
+                $"Tool '{input.ToolName}' recorded {errorPaths.Count} analysis error(s) alongside its "
+                + $"findings — packages it could not load or parse ({named}{remainder}) — so part of "
+                + "the tree was never analyzed and the findings cannot stand as a verdict.");
+        }
+    }
+
+    /// <summary>
+    /// Reads the file paths carrying entries in the JSON report's
+    /// <c>"Golang errors"</c> map written to stderr. Returns false when the
+    /// stream is empty, malformed, or carries no readable map — the caller
+    /// treats that as an unverifiable channel, not an empty one. A
+    /// <see langword="null"/> map (never produced by a healthy run) reads
+    /// as empty.
+    /// </summary>
+    private static bool TryReadAnalysisErrorPaths(string stderr, out IReadOnlyList<string> errorPaths)
+    {
+        errorPaths = [];
+        if (string.IsNullOrWhiteSpace(stderr))
+            return false;
+        try
+        {
+            using var document = JsonDocument.Parse(stderr);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object
+                || !root.TryGetProperty(AnalysisErrorsProperty, out var errors))
+                return false;
+            if (errors.ValueKind == JsonValueKind.Null)
+                return true;
+            if (errors.ValueKind != JsonValueKind.Object)
+                return false;
+
+            var paths = new List<string>();
+            foreach (var entry in errors.EnumerateObject())
+                paths.Add(entry.Name);
+            errorPaths = paths;
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Flattens an error-channel path (subject-controlled file names) to a
+    /// bounded single line for the failure message — control characters and
+    /// escape bytes become spaces so a crafted path cannot inject terminal
+    /// sequences.
+    /// </summary>
+    private static string SanitizePath(string path)
+    {
+        var builder = new StringBuilder(path.Length);
+        foreach (var c in path)
+            builder.Append(char.IsControl(c) ? ' ' : c);
+        var sanitized = builder.ToString().Trim();
+        return sanitized.Length > ErrorPathMaxChars
+            ? sanitized[..ErrorPathMaxChars]
+            : sanitized;
     }
 
     /// <summary>

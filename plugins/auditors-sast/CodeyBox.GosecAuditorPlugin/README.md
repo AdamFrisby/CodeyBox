@@ -1,10 +1,13 @@
 # CodeyBox: Gosec Go Security Auditor
 
 Auditor plugin wrapping [gosec](https://github.com/securego/gosec): it scans
-the audited repository's Go packages with `gosec -fmt sarif -stdout
--exclude-generated -nosec ./...` and reports each issue as an audit finding
-with the gosec rule id and `file:line` location. Go only — non-Go
-repositories fail loudly (see below).
+the audited repository's Go packages with `gosec -stdout -verbose sarif
+-fmt json -out /dev/stderr -log /dev/null -exclude-generated -nosec ./...`
+— the stdout report is SARIF (the findings channel) and the JSON report
+is written to stderr (the analysis-error channel SARIF lacks) — and
+reports each issue as an audit finding with the gosec rule id and
+`file:line` location. Go only — non-Go repositories fail loudly (see
+below).
 
 ## What it reports
 
@@ -28,12 +31,15 @@ repositories fail loudly (see below).
 
 - **Files gosec's loader cannot analyze.** gosec analyzes type-checked Go
   packages through the `go` toolchain. Files in packages that fail to load
-  (missing modules, broken `go.mod`, no `go` binary) record per-file errors
-  — which gosec's SARIF report does not carry. The auditor fails closed:
-  exit 1 with an empty report is reported as infrastructure, never a pass.
-  When errors coexist with real findings the findings are still reported
-  (and still fail the audit when HIGH); the error detail itself is not
-  visible in SARIF — that is a gosec limitation, not a finding.
+  (missing modules, broken `go.mod`, no `go` binary, compile errors) record
+  per-file errors — which gosec's SARIF report does not carry; they exist
+  only in the JSON report's `"Golang errors"` map. The scan therefore
+  writes that JSON report to stderr (`-fmt json -out /dev/stderr`, with
+  `-log /dev/null` keeping it the only stderr writer) so the error channel
+  travels in-band. The auditor fails closed — infrastructure, never a pass
+  — whenever the channel records errors, *even alongside real findings*:
+  a package the scan could not load must not ride a passing verdict. An
+  absent or unreadable channel fails closed too.
 - **Test files.** gosec's `-tests` is off by default; `_test.go` files are
   not scanned. Opt in via the `ScanTests` key.
 - **Generated code.** `-exclude-generated` skips files carrying the
@@ -53,18 +59,21 @@ repositories fail loudly (see below).
 
 gosec does **not** follow the common "1 = findings, 2 = could not run"
 convention (verified against v2.28 source): `computeExitCode` returns `1`
-for findings *and* for per-package analysis errors, and every operational
-failure also returns `1`. The SARIF report on stdout is the discriminator:
+for findings *and* for per-package analysis errors, and every post-parse
+operational failure also returns `1`. The SARIF report on stdout plus the
+JSON `"Golang errors"` channel on stderr discriminate the cases:
 
-| Exit | Stdout | Meaning | Classification |
-|---|---|---|---|
-| `0` | SARIF | Clean run — no unsuppressed issues, no analysis errors | Verdict (pass) |
-| `1` | SARIF with ≥1 result | Ran and found issues | Verdict (`Passed = false` when any finding maps to `Error`) |
-| `1` | SARIF with 0 results | Ran but recorded analysis errors (unbuildable/unparseable packages — invisible in SARIF) | Infrastructure — fails closed |
-| `1` | no SARIF | Could not run: bad `-conf`, "No packages found" (non-Go repo), analyzer/report failure | Infrastructure |
-| `2` | text | Flag-parse (usage) error | Infrastructure |
-| `126`/`127` | — | Binary not executable or not found | Infrastructure |
-| anything else | — | Unknown convention | Infrastructure (fails loud, never a pass) |
+| Exit | Stdout | Stderr error channel | Meaning | Classification |
+|---|---|---|---|---|
+| `0` | SARIF | empty map | Clean run — no unsuppressed issues, no analysis errors | Verdict (pass) |
+| `1` | SARIF with ≥1 result | empty map | Ran and found issues | Verdict (`Passed = false` when any finding maps to `Error`) |
+| `1` | SARIF with ≥1 result | ≥1 error | Findings *and* unscanned packages | Infrastructure — fails closed |
+| `1` | SARIF with 0 results | any | Ran but recorded analysis errors (unbuildable/unparseable packages — invisible in SARIF) | Infrastructure — fails closed |
+| `0`/`1` | SARIF | absent or unreadable | Error channel unverifiable — cannot prove the tree was fully analyzed | Infrastructure — fails closed |
+| `1` | no SARIF | — | Could not run: bad `-conf`, "No packages found" (non-Go repo), analyzer/report failure | Infrastructure |
+| `2` | text | — | Flag-parse (usage) error | Infrastructure |
+| `126`/`127` | — | — | Binary not executable or not found | Infrastructure |
+| anything else | — | — | Unknown convention | Infrastructure (fails loud, never a pass) |
 
 A missing `gosec` is always an infrastructure failure naming the tool —
 never a passing audit.

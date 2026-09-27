@@ -28,16 +28,28 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// <para><b>Exit-code convention (verified against gosec 2.28.0).</b> gosec
 /// does NOT follow the "1 = findings, 2 = could not run" convention:
 /// <c>computeExitCode</c> returns <c>1</c> whenever there are unsuppressed
-/// issues <em>or</em> per-package analysis errors, and every operational
-/// failure — bad flags, bad <c>-conf</c>, "No packages found", analyzer or
-/// report-write failure — returns the same <c>1</c>. The discriminator is
-/// the SARIF report on stdout: exit 1 with findings is a verdict; exit 1
-/// with a valid-but-empty results array means the run recorded analysis
-/// errors (files/packages it could not load — gosec's SARIF has no error
-/// channel) and fails closed as infrastructure; exit 1 with no SARIF is an
-/// operational failure, also infrastructure. <c>-no-fail</c> would hide the
-/// error signal entirely (exit 0 on analysis errors), so it is never
-/// passed. Flag-parse errors exit 2, 126/127 is cannot-execute — all
+/// issues <em>or</em> per-package analysis errors, and every post-parse
+/// operational failure — a bad <c>-conf</c>, "No packages found", analyzer
+/// or report-write failure — returns the same <c>1</c>. Flag-parse errors
+/// exit 2; 126/127 is cannot-execute — all infrastructure. <c>-no-fail</c>
+/// would hide the error signal entirely (exit 0 on analysis errors), so it
+/// is never passed.</para>
+///
+/// <para><b>The two-channel report.</b> gosec's SARIF carries no error
+/// detail — the per-file/per-package analysis errors behind the same exit
+/// 1 exist only in the JSON report's <c>"Golang errors"</c> map. The scan
+/// therefore emits that JSON report to stderr (<c>-fmt json</c> selects the
+/// <c>-out</c> format, <c>-out /dev/stderr</c> lands it on the captured
+/// stream) while <c>-stdout -verbose sarif</c> keeps the stdout report
+/// SARIF. <c>-log /dev/null</c> parks the progress logger so the JSON is
+/// the only stderr writer. <see cref="GosecSarifOutputParser"/>
+/// discriminates: exit 1 with findings is a verdict only when the error
+/// channel confirms an empty map — findings alongside recorded analysis
+/// errors, or an unreadable channel, fail closed as infrastructure,
+/// because an unscanned package (a broken <c>go.mod</c>, an uncached
+/// dependency) must not ride a passing verdict. Exit 1 with a
+/// valid-but-empty results array means the run recorded errors and no
+/// issues; exit 1 with no SARIF is an operational failure — both
 /// infrastructure.</para>
 ///
 /// <para><b>Scan scope and the positional argument.</b> The scan target is
@@ -48,7 +60,8 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// parsing at the first positional, so flag-shaped
 /// <see cref="ExternalToolAuditorOptions.ExtraArguments"/> cannot reach
 /// gosec's flag parser — gosec would silently treat them as package paths
-/// ("Skipping: … Path doesn't exist"). They are rejected deterministically;
+/// ("Skipping: … Path doesn't exist"). They are rejected deterministically
+/// when the operator options are bound (see <see cref="InitializeAsync"/>);
 /// the dedicated keys (<c>ConfigPath</c>, <c>ScanTests</c>,
 /// <c>BuildTags</c>) cover the flags operators actually need, and path-like
 /// extras still work as additional scan patterns.</para>
@@ -123,8 +136,9 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     /// <summary>
     /// gosec's "found unsuppressed issues or recorded analysis errors" exit —
-    /// also every operational failure. The SARIF report on stdout
-    /// discriminates the two cases; see <see cref="GosecSarifOutputParser"/>.
+    /// also every post-parse operational failure. The SARIF report on stdout
+    /// and the JSON <c>"Golang errors"</c> map on stderr discriminate the
+    /// cases; see <see cref="GosecSarifOutputParser"/>.
     /// </summary>
     internal const int IssuesOrErrorsExitCode = 1;
 
@@ -170,6 +184,9 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
         ExcludePaths = ["vendor/", "third_party/"],
     };
 
+    // Pre-initialization accessor: the shared defaults carry no extras, so
+    // normalization is identity here — InitializeAsync swaps in a bound
+    // copy whose extras are validated/normalized per run.
     private Func<ExternalToolAuditorOptions> _optionsAccessor = () => AuditorDefaults;
     private Func<string?> _expectedVersion = static () => DefaultExpectedVersion;
     private Func<string?> _configPath = static () => null;
@@ -219,13 +236,23 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
-        NormalizeExtraArguments(options);
-
         var args = new List<string>
         {
-            "-fmt", "sarif",
-            // Explicit stdout contract: the report is the verdict channel.
+            // stdout carries the findings channel: -verbose overrides the
+            // -fmt selection for the printed report, keeping it SARIF.
             "-stdout",
+            "-verbose", "sarif",
+            // gosec's SARIF has no error channel — the per-package analysis
+            // errors that also drive exit 1 exist only in the JSON
+            // ReportInfo ("Golang errors"). -fmt selects the -out format:
+            // writing that report to /dev/stderr puts the error evidence
+            // on the captured stderr stream in the same bounded invocation,
+            // so findings can never mask an unscanned package.
+            "-fmt", "json",
+            "-out", "/dev/stderr",
+            // The JSON must be the only stderr writer: gosec's progress
+            // logger defaults to stderr and would corrupt the channel.
+            "-log", "/dev/null",
         };
 
         // Generated files (// Code generated … DO NOT EDIT) are not the
@@ -283,7 +310,15 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     {
         ArgumentNullException.ThrowIfNull(context);
         var scoped = context.ScopedConfig;
-        _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
+        // ExtraArguments are validated and normalized here — at bind time,
+        // inside the per-run accessor — so BuildToolArguments stays a pure
+        // query over whatever options the base hands it.
+        _optionsAccessor = () =>
+        {
+            var bound = ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
+            bound.ExtraArguments = NormalizePackagePatterns(bound.ExtraArguments);
+            return bound;
+        };
         _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _configPath = () => scoped[ConfigPathKey];
         _scanTests = () => bool.TryParse(scoped[ScanTestsKey], out var scan) && scan;
@@ -298,8 +333,9 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <summary>
-    /// Rewrites <see cref="ExternalToolAuditorOptions.ExtraArguments"/> to
-    /// its validated, normalized form. Entries land after the positional
+    /// Validates <see cref="ExternalToolAuditorOptions.ExtraArguments"/> and
+    /// returns the normalized list to forward — a pure function; the options
+    /// object is never mutated. Entries land after the positional
     /// <c>./...</c> scan target, and Go's flag package stops flag parsing
     /// at the first positional — a flag-shaped extra would be silently
     /// swallowed as a (nonexistent) package path instead of reaching
@@ -310,10 +346,10 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// whose padding gosec would read as a different, nonexistent path.
     /// Package-pattern entries (e.g. <c>./pkg/...</c>) pass through.
     /// </summary>
-    private static void NormalizeExtraArguments(ExternalToolAuditorOptions options)
+    private static IReadOnlyList<string> NormalizePackagePatterns(IReadOnlyList<string> extraArguments)
     {
-        var normalized = new List<string>(options.ExtraArguments.Count);
-        foreach (var arg in options.ExtraArguments)
+        var normalized = new List<string>(extraArguments.Count);
+        foreach (var arg in extraArguments)
         {
             var pattern = TryNormalizeWorktreeRelativePath(arg)
                 ?? throw new AuditUnavailableException(
@@ -333,6 +369,6 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
                 { IsDeterministic = true };
             normalized.Add(pattern);
         }
-        options.ExtraArguments = normalized;
+        return normalized;
     }
 }
