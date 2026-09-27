@@ -499,25 +499,10 @@ public sealed class CargoDenyAuditor : ExternalToolAuditorBase, IPluginInitializ
     {
         var argv = new List<string>(policyFiles.Count + 4) { "sh", "-c", AdvisoryDataSourceProbeScript, "sh" };
         argv.AddRange(policyFiles);
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            "suppression check",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
+        var result = await ExecProbeOrThrowAsync(
+            sandbox, workingDirectory, tool, "suppression check", argv,
+            ProbeTimeout(options), ct).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
-                + "transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-file "

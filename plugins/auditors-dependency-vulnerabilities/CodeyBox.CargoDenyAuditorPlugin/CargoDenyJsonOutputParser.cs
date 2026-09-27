@@ -135,9 +135,9 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
 
     private static ExternalToolFinding ParseDiagnostic(JsonElement fields)
     {
-        var severity = NullIfWhiteSpace(GetString(fields, "severity"u8));
-        var code = NullIfWhiteSpace(GetString(fields, "code"u8));
-        var message = NullIfWhiteSpace(GetString(fields, "message"u8)) ?? "(no message)";
+        var severity = ToolOutputText.NullIfWhiteSpace(GetString(fields, "severity"u8));
+        var code = ToolOutputText.NullIfWhiteSpace(GetString(fields, "code"u8));
+        var message = ToolOutputText.NullIfWhiteSpace(GetString(fields, "message"u8)) ?? "(no message)";
 
         var builder = new StringBuilder(message);
 
@@ -145,10 +145,10 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
         // (e.g. RUSTSEC-2024-0001) so the finding names the actual advisory.
         if (fields.TryGetProperty("advisory"u8, out var advisory)
             && advisory.ValueKind == JsonValueKind.Object
-            && NullIfWhiteSpace(GetString(advisory, "id"u8)) is { } advisoryId)
+            && ToolOutputText.NullIfWhiteSpace(GetString(advisory, "id"u8)) is { } advisoryId)
         {
             builder.Append("; advisory ").Append(advisoryId);
-            if (NullIfWhiteSpace(GetString(advisory, "title"u8)) is { } advisoryTitle)
+            if (ToolOutputText.NullIfWhiteSpace(GetString(advisory, "title"u8)) is { } advisoryTitle)
                 builder.Append(" (").Append(advisoryTitle).Append(')');
         }
 
@@ -174,7 +174,7 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
                 notes,
                 MaxNotesInMessage,
                 static element => element.ValueKind == JsonValueKind.String
-                    && NullIfWhiteSpace(element.GetString()) is { } text
+                    && ToolOutputText.NullIfWhiteSpace(element.GetString()) is { } text
                     ? "note: " + text
                     : null,
                 static detail => "; " + detail,
@@ -218,8 +218,8 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
 
     private static string? BuildLabelDetail(JsonElement label)
     {
-        var message = NullIfWhiteSpace(GetString(label, "message"u8));
-        var span = NullIfWhiteSpace(GetString(label, "span"u8));
+        var message = ToolOutputText.NullIfWhiteSpace(GetString(label, "message"u8));
+        var span = ToolOutputText.NullIfWhiteSpace(GetString(label, "span"u8));
         var line = ReadPositiveInt(label, "line"u8);
         var column = ReadPositiveInt(label, "column"u8);
 
@@ -260,6 +260,4 @@ internal sealed class CargoDenyJsonOutputParser : IExternalToolOutputParser
             ? value.GetString()
             : null;
 
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
 }

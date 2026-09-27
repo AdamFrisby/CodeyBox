@@ -381,8 +381,8 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// outside the worktree. Returns the subset of
     /// <paramref name="relativePaths"/> matching <paramref name="mode"/>.
     /// Fails closed: an exec-transport failure or any non-zero probe exit
-    /// throws <see cref="AuditUnavailableException"/> — "could not confirm
-    /// absence" is never treated as "absent". Path entries must be relative;
+    /// throws <see cref="AuditUnavailableException"/> — a failed probe is
+    /// never treated as a negative result. Path entries must be relative;
     /// absolute paths, <c>..</c> segments, and embedded newlines are rejected
     /// so the probe can never escape the worktree or corrupt its
     /// one-name-per-line protocol. <paramref name="operation"/> names the
@@ -417,25 +417,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
         if (requested.Count == 0)
             return [];
 
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            operation,
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
+        var result = await ExecProbeOrThrowAsync(
+            sandbox, workingDirectory, tool, operation, argv, ProbeTimeout(options), ct)
+            .ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
-                + "transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' {operation} could not inspect repository "
@@ -453,6 +438,61 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 present.Add(line);
         }
         return present;
+    }
+
+    /// <summary>
+    /// One bounded precondition exec: wraps <see cref="ExecToolBoundedAsync"/>
+    /// with the <see cref="ProbeMaxOutputBytes"/> per-stream caps and
+    /// kill-on-limit, and translates an unavailable exec transport into
+    /// <see cref="AuditUnavailableException"/> naming the tool and operation.
+    /// Callers keep only their own exit-code classification.
+    /// </summary>
+    protected static Task<SandboxExecResult> ExecProbeOrThrowAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        string operation,
+        IReadOnlyList<string> argv,
+        TimeSpan timeout,
+        CancellationToken ct)
+        => ExecProbeOrThrowAsync(
+            sandbox, workingDirectory, tool, operation, argv, ProbeMaxOutputBytes, timeout, ct);
+
+    /// <summary>
+    /// <see cref="ExecProbeOrThrowAsync(ISandbox, string, string, string, IReadOnlyList{string}, TimeSpan, CancellationToken)"/>
+    /// with an explicit per-stream capture bound for probes whose protocol
+    /// legitimately emits more than <see cref="ProbeMaxOutputBytes"/>.
+    /// </summary>
+    protected static async Task<SandboxExecResult> ExecProbeOrThrowAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        string operation,
+        IReadOnlyList<string> argv,
+        int maxOutputBytesPerStream,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            operation,
+            new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = maxOutputBytesPerStream,
+                MaxStderrBytes = maxOutputBytesPerStream,
+                KillOnOutputLimit = true,
+            },
+            timeout,
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
+                + "transport was unavailable.");
+        return result;
     }
 
     /// <summary>
@@ -596,7 +636,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 continue;
             var severity = mapping.Map(item.SeverityLevel);
             if (IsRuleFiltered(item, options)
-                || IsPathExcluded(item, options)
+                || IsPathExcluded(item.Path, options)
                 || severity < options.MinimumSeverity)
             {
                 filtered++;
@@ -633,11 +673,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
             && (string.IsNullOrWhiteSpace(item.RuleId) || !options.IncludedRules.Contains(item.RuleId));
     }
 
-    private static bool IsPathExcluded(ExternalToolFinding item, ExternalToolAuditorOptions options)
+    /// <summary>
+    /// True when a repository-relative finding path falls under an
+    /// <see cref="ExternalToolAuditorOptions.ExcludePaths"/> entry (exact
+    /// path, or directory prefix when the entry ends in <c>/</c>). The single
+    /// source of truth for findings-level exclusion — pre-scan sweeps that
+    /// must not count files the report would drop reuse it for the same
+    /// paths.
+    /// </summary>
+    protected static bool IsPathExcluded(string? path, ExternalToolAuditorOptions options)
     {
-        if (options.ExcludePaths.Count == 0 || string.IsNullOrWhiteSpace(item.Path))
+        if (options.ExcludePaths.Count == 0 || string.IsNullOrWhiteSpace(path))
             return false;
-        var path = NormalizeFindingPath(item.Path);
+        var normalizedPath = NormalizeFindingPath(path);
         foreach (var entry in options.ExcludePaths)
         {
             var normalized = NormalizeExcludePathEntry(entry);
@@ -645,10 +693,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 continue;
             if (normalized.EndsWith("/", StringComparison.Ordinal))
             {
-                if (path.StartsWith(normalized, StringComparison.Ordinal))
+                if (normalizedPath.StartsWith(normalized, StringComparison.Ordinal))
                     return true;
             }
-            else if (path.Equals(normalized, StringComparison.Ordinal))
+            else if (normalizedPath.Equals(normalized, StringComparison.Ordinal))
             {
                 return true;
             }
@@ -761,11 +809,12 @@ public abstract class ExternalToolAuditorBase : IAuditor
         return Truncate(stripped, maxChars);
     }
 
-    // Tool output is untrusted input that ends up in rendered findings: strip
-    // terminal escape sequences so a scanner cannot inject control sequences
-    // into operator-facing output.
+    // Tool output is untrusted input that ends up in rendered findings:
+    // collapse terminal escape sequences — ESC and the C1 controls alike —
+    // so a scanner cannot inject control sequences into operator-facing
+    // output. Shared implementation: ToolOutputText.CollapseControlCharacters.
     private static string StripEscapes(string value)
-        => value.Replace("\x1b", string.Empty, StringComparison.Ordinal);
+        => ToolOutputText.CollapseControlCharacters(value);
 
     private static string Truncate(string value, int maxChars)
         => ToolOutputText.Truncate(value, maxChars);

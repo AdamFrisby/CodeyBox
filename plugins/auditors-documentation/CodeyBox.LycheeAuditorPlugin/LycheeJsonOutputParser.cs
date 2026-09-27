@@ -153,7 +153,7 @@ internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
 
     private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
         => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? NullIfWhiteSpace(value.GetString())
+            ? ToolOutputText.NullIfWhiteSpace(value.GetString())
             : null;
 
     // Input sources arrive as the walker reported them ("./docs/guide.md",
@@ -169,8 +169,6 @@ internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
         return path.Length == 0 ? null : path;
     }
 
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static string SingleLine(string message)
         => ToolOutputText.SingleLine(message);

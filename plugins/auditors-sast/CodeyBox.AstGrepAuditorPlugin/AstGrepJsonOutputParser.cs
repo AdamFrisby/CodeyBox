@@ -61,10 +61,17 @@ internal sealed class AstGrepJsonOutputParser : IExternalToolOutputParser
             var findings = new List<ExternalToolFinding>();
             foreach (var element in document.RootElement.EnumerateArray())
             {
-                if (findings.Count >= MaxResults)
-                    break;
                 if (element.ValueKind != JsonValueKind.Object)
                     continue;
+                // Silently dropping diagnostics past the bound could hide an
+                // error-severity match from the verdict — a truncated report
+                // fails closed as unparseable, matching the missing/corrupt
+                // cases above.
+                if (findings.Count >= MaxResults)
+                    throw new ExternalToolParseException(
+                        $"Tool '{input.ToolName}' produced more than {MaxResults} ast-grep matches — "
+                        + "beyond the parse bound a dropped diagnostic is invisible to the verdict, "
+                        + "so the report fails closed instead of truncating.");
                 findings.Add(ParseMatch(element));
             }
 
@@ -74,13 +81,13 @@ internal sealed class AstGrepJsonOutputParser : IExternalToolOutputParser
 
     private static ExternalToolFinding ParseMatch(JsonElement match)
     {
-        var ruleId = NullIfWhiteSpace(GetString(match, "ruleId"u8));
-        var severity = NullIfWhiteSpace(GetString(match, "severity"u8));
-        var message = NullIfWhiteSpace(GetString(match, "message"u8)) ?? "(no message)";
-        var note = NullIfWhiteSpace(GetString(match, "note"u8));
+        var ruleId = ToolOutputText.NullIfWhiteSpace(GetString(match, "ruleId"u8));
+        var severity = ToolOutputText.NullIfWhiteSpace(GetString(match, "severity"u8));
+        var message = ToolOutputText.NullIfWhiteSpace(GetString(match, "message"u8)) ?? "(no message)";
+        var note = ToolOutputText.NullIfWhiteSpace(GetString(match, "note"u8));
         if (note is not null)
             message = message + " " + note;
-        var path = NullIfWhiteSpace(GetString(match, "file"u8));
+        var path = ToolOutputText.NullIfWhiteSpace(GetString(match, "file"u8));
 
         int? line = null;
         if (match.TryGetProperty("range"u8, out var range)
@@ -106,7 +113,4 @@ internal sealed class AstGrepJsonOutputParser : IExternalToolOutputParser
         => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
 }

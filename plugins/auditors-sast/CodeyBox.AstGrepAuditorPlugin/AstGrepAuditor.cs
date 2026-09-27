@@ -80,9 +80,15 @@ namespace CodeyBox.AstGrepAuditorPlugin;
 /// audited repository, and the loaded code can write a clean report to
 /// stdout — forged gate evidence. So by default a repo-root
 /// <c>sgconfig</c> that declares dynamic-load keys fails closed as
-/// deterministic infrastructure; the opt-ins are an operator-pinned
-/// <c>ConfigFile</c> (repo discovery is replaced entirely) or the explicit
-/// <c>TrustRepositoryCustomLanguages</c> consent flag. A repo
+/// deterministic infrastructure — judged on what the YAML decoder would
+/// see, not only the file's literal bytes: the probe also fails closed on
+/// backslash escapes inside double-quoted scalars, because
+/// <c>"custom\u004canguages"</c> deserializes to <c>customLanguages</c>
+/// without carrying its literal text. The opt-ins are an operator-pinned
+/// <c>ConfigFile</c> or the explicit <c>TrustRepositoryCustomLanguages</c>
+/// consent flag — but a pinned config that resolves <i>inside</i> the
+/// worktree is still repository-controlled and gets the same probe; only a
+/// pin resolving outside the worktree is operator-owned. A repo
 /// <c>sgconfig</c> without dynamic loading is used as-is: rules, rule
 /// severity, and <c>util</c> definitions are the project's own
 /// structural-lint contract. Config discovery also walks the worktree's
@@ -154,8 +160,11 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// Scoped-config key for an explicit ast-grep project config path
     /// (<c>-c/--config</c>). Use it to pin an operator-owned
     /// <c>sgconfig.yml</c> provisioned into the baseline, instead of the
-    /// audited repository's — pinning it also replaces the repository's
-    /// config entirely, so the <c>customLanguages</c> gate does not apply.
+    /// audited repository's — pinning replaces the repository's config
+    /// entirely. A pinned path that resolves <i>outside</i> the worktree is
+    /// operator-owned, so the <c>customLanguages</c> gate does not apply; a
+    /// pinned path resolving inside the worktree is still
+    /// repository-controlled and is probed like a discovered sgconfig.
     /// Conflicts with <see cref="RuleFileKey"/>. Unset → ast-grep's default
     /// <c>sgconfig.yml</c>/<c>sgconfig.yaml</c> lookup.
     /// </summary>
@@ -250,6 +259,44 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     // which is the safe direction.
     private const string DynamicLanguageKeyPattern =
         @"(^|[^[:alnum:]_])['""]?(customLanguages|libraryPath)['""]?([^[:alnum:]_]|$)";
+
+    // The literal-key grep above decides on raw file bytes, but serde_yaml
+    // decodes keys: inside a DOUBLE-quoted scalar, \xNN / \uXXXX / \U /
+    // \N{} / \0 escapes and the backslash line-continuation are processed —
+    // "custom\u004canguages" deserializes to customLanguages while carrying
+    // none of its literal bytes. A key spelled that way evades the raw
+    // pattern, so any backslash that could sit inside a double-quoted
+    // scalar fails closed instead. The pattern matches a '"' followed by
+    // non-quote non-backslash characters and then a '\'; with -z the file
+    // is one line, so the quote and the backslash may sit on different
+    // physical lines (the line-continuation form). It also fires on a
+    // backslash merely FOLLOWING a quoted scalar — a false positive in the
+    // safe direction. Single-quoted and plain scalars decode no escapes,
+    // and no other YAML feature changes decoded key text, so a file
+    // passing both greps cannot hide a decoded dynamic-language key.
+    private const string DoubleQuotedEscapePattern = "\"[^\"\\\\]*\\\\";
+
+    // Canonicalizes each pinned project-config path — resolved the way
+    // ast-grep resolves -c/--config, relative to the scan working directory
+    // — and then the worktree root itself, one absolute path per line, so
+    // the caller can tell which pinned paths land inside
+    // repository-controlled space. -m canonicalizes without requiring the
+    // file to exist, resolving symlinks in the components that do exist —
+    // a pinned path through a repo-committed link is classified by where it
+    // actually points.
+    private const string PinnedConfigResolveScript =
+        "for p in \"$@\"; do realpath -m -- \"$p\" || exit 1; done; realpath -m -- .";
+
+    // The marker sweep emits one path per line and repository trees can
+    // carry many directives (a vendored ast-grep checkout has hundreds), so
+    // it gets a wider bound than ProbeMaxOutputBytes — still kill-on-limit
+    // and fail-closed, because a truncated sweep cannot prove coverage.
+    private const int SuppressionSweepMaxOutputBytes = 512 * 1024;
+
+    // Pinned config paths must survive the resolve probe's
+    // one-path-per-line protocol — a newline inside a value would corrupt
+    // it, so such values are rejected before the probe.
+    private static readonly char[] NewlineChars = ['\n', '\r'];
 
     // One visibility finding per marker-bearing file, bounded independently
     // of the report cap. Exceeding it — like a truncated sweep — fails
@@ -457,11 +504,13 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     /// <summary>
     /// ast-grep-specific preconditions on the live path, each fail-closed as
-    /// infrastructure before the scan runs:
-    /// a repository <c>sgconfig.yml</c>/<c>sgconfig.yaml</c> that declares
-    /// <c>customLanguages</c>/<c>libraryPath</c> (native code the audited
-    /// repository would execute inside the scanner process — and which could
-    /// write a clean report, forging a pass); configured <c>Targets</c> that
+    /// infrastructure before the scan runs: a project config declaring
+    /// <c>customLanguages</c>/<c>libraryPath</c> — the repository's
+    /// <c>sgconfig.yml</c>/<c>sgconfig.yaml</c>, or a pinned
+    /// <c>-c/--config</c> resolving inside the worktree — would execute
+    /// repository-controlled native code inside the scanner process, which
+    /// could also write a clean report and forge a pass; configured
+    /// <c>Targets</c> that
     /// do not exist in the worktree or resolve through symlinks (ast-grep's
     /// silent-pass trap / a scan root escaping the worktree); and the
     /// suppression-marker sweep, returned as supplemental findings so
@@ -481,10 +530,9 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         // skipped argv construction.
         var gate = _runGateContext.Value ?? ResolveRunGateContext();
 
-        if (!gate.TrustRepositoryCustomLanguages
-            && !OperatorPinnedProjectConfig(gate, options))
-            await ThrowIfRepoConfigLoadsNativeCodeAsync(sandbox, workingDirectory, tool, options, ct)
-                .ConfigureAwait(false);
+        if (!gate.TrustRepositoryCustomLanguages)
+            await ThrowIfProjectConfigLoadsNativeCodeAsync(
+                sandbox, workingDirectory, tool, gate, options, ct).ConfigureAwait(false);
 
         if (gate.Targets.Count > 0)
             await VerifyScanTargetsAsync(sandbox, workingDirectory, tool, gate.Targets, options, ct)
@@ -497,20 +545,59 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <summary>
-    /// True when an operator-pinned <c>-c/--config</c> (via
-    /// <c>ConfigFile</c> or <c>ExtraArguments</c>) replaces ast-grep's
-    /// sgconfig discovery: the repository's own project config is then not
-    /// loaded at all. A set <c>ConfigFile</c> counts because
-    /// <see cref="BuildToolArguments"/> emits it as a recognized
-    /// <c>--config</c> whenever ExtraArguments don't already supply one —
-    /// the emitted argv and this credit are the same decision. Not
-    /// exempted: <c>-r/--rule</c> and <c>--inline-rules</c>, which need no
-    /// project but still leave project-config discovery — and therefore a
-    /// repo sgconfig's customLanguages — reachable.
+    /// Every project-config value ast-grep's pre-dispatch raw-argv scan
+    /// would honor as a <c>-c/--config</c> pin: a set <c>ConfigFile</c> —
+    /// but only when <c>ExtraArguments</c> don't already pin one, since
+    /// <see cref="BuildToolArguments"/> suppresses our --config in that
+    /// case and the unused value must not be gated — plus each
+    /// <c>-c VALUE</c>, <c>-c=VALUE</c>, <c>--config VALUE</c>,
+    /// <c>--config=VALUE</c>. The joined <c>-cFILE</c> form is deliberately
+    /// excluded: clap parses it but the pre-dispatch scan does not, so
+    /// repository discovery stays live and the repository gate must run.
+    /// Not pinning: <c>-r/--rule</c> and <c>--inline-rules</c>, which leave
+    /// discovery — and a repo sgconfig's customLanguages — reachable.
+    /// Values carrying a newline cannot survive the resolve probe's
+    /// one-path-per-line protocol and are rejected before it runs.
     /// </summary>
-    private static bool OperatorPinnedProjectConfig(RunGateContext gate, ExternalToolAuditorOptions options)
-        => !string.IsNullOrWhiteSpace(gate.ConfigFile)
-            || ExtraArgumentsPinProjectConfig(options);
+    private IReadOnlyList<string> PinnedProjectConfigValues(
+        RunGateContext gate, ExternalToolAuditorOptions options)
+    {
+        var values = new List<string>();
+        if (!string.IsNullOrWhiteSpace(gate.ConfigFile)
+            && !ExtraArgumentsPinProjectConfig(options))
+            values.Add(gate.ConfigFile.Trim());
+
+        var extra = options.ExtraArguments;
+        for (var i = 0; i < extra.Count; i++)
+        {
+            var arg = extra[i];
+            string? value = null;
+            if (string.Equals(arg, "-c", StringComparison.Ordinal)
+                || string.Equals(arg, "--config", StringComparison.Ordinal))
+            {
+                if (i + 1 < extra.Count)
+                    value = extra[++i];
+            }
+            else if (arg.StartsWith("--config=", StringComparison.Ordinal))
+            {
+                value = arg["--config=".Length..];
+            }
+            else if (arg.StartsWith("-c=", StringComparison.Ordinal))
+            {
+                value = arg["-c=".Length..];
+            }
+            if (!string.IsNullOrWhiteSpace(value))
+                values.Add(value);
+        }
+
+        if (values.Any(static v => v.IndexOfAny(NewlineChars) >= 0))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' has a pinned project config path containing a "
+                + $"newline — it cannot be canonicalized safely. Fix "
+                + $"CodeyBox:Plugins:{PluginId}:{ConfigFileKey} or the -c/--config ExtraArguments.")
+            { IsDeterministic = true };
+        return values;
+    }
 
     /// <summary>
     /// True when <c>ExtraArguments</c> carries a config flag spelled the way
@@ -533,50 +620,41 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         _trustRepositoryCustomLanguages());
 
     /// <summary>
-    /// One bounded precondition exec: wraps <see
-    /// cref="ExecToolBoundedAsync"/> with the shared probe output caps and
-    /// converts an unavailable exec transport into
-    /// <see cref="AuditUnavailableException"/>. Callers keep only their own
-    /// exit-code classification.
+    /// Applies the dynamic-language gate to whichever project config
+    /// ast-grep will actually load. With no recognized <c>-c/--config</c>
+    /// pin, that is the worktree-root <c>sgconfig.yml</c>/<c>sgconfig.yaml</c>
+    /// (ancestor-directory hits are baseline-owned and trusted); with a pin,
+    /// discovery is replaced — but only a pinned path resolving
+    /// <i>outside</i> the worktree is operator-owned. A worktree-resident
+    /// pin is still repository-controlled content, so each such path gets
+    /// the same probe.
     /// </summary>
-    private static async Task<SandboxExecResult> ExecProbeOrThrowAsync(
+    private async Task ThrowIfProjectConfigLoadsNativeCodeAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
-        string operation,
-        IReadOnlyList<string> argv,
-        TimeSpan timeout,
-        CancellationToken ct)
-    {
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            operation,
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            timeout,
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
-                + "transport was unavailable.");
-        return result;
-    }
-
-    private async Task ThrowIfRepoConfigLoadsNativeCodeAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string tool,
+        RunGateContext gate,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
+        var pinned = PinnedProjectConfigValues(gate, options);
+        if (pinned.Count > 0)
+        {
+            var resident = await ResolveWorktreeResidentPathsAsync(
+                sandbox, workingDirectory, tool, pinned, options, ct).ConfigureAwait(false);
+            foreach (var path in resident)
+                await ThrowIfConfigLoadsNativeCodeAsync(
+                    sandbox,
+                    workingDirectory,
+                    tool,
+                    $"the pinned project config '{TruncateForMessage(path)}' resolves inside the "
+                        + "audited worktree — repository-controlled content",
+                    path,
+                    options,
+                    ct).ConfigureAwait(false);
+            return;
+        }
+
         var present = await ProbeRepositoryFilesPresentAsync(
             sandbox, workingDirectory, tool, "repository config check",
             RepositoryProjectConfigNames, RepositoryFileProbe.Present,
@@ -588,34 +666,151 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         // first present entry is the config ast-grep would actually load
         // (sgconfig.yml wins over sgconfig.yaml at the same directory).
         var config = present[0];
+        await ThrowIfConfigLoadsNativeCodeAsync(
+            sandbox,
+            workingDirectory,
+            tool,
+            $"the audited repository's '{config}'",
+            "./" + config,
+            options,
+            ct).ConfigureAwait(false);
+    }
 
-        // The sgconfig is the audited repository's own file; grep -q answers
-        // the one question that matters — does it register a dlopen'd
-        // language library — without echoing file contents anywhere.
+    /// <summary>
+    /// Canonicalizes every pinned config path — resolved the way ast-grep
+    /// resolves <c>-c/--config</c>, relative to the scan working directory —
+    /// plus the worktree root, and returns the distinct subset landing
+    /// inside the worktree. Fails closed: a resolve failure or malformed
+    /// output is infrastructure, never evidence that a path is
+    /// operator-owned.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> ResolveWorktreeResidentPathsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> pinned,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var argv = new List<string>(pinned.Count + 4)
+        {
+            "sh", "-c", PinnedConfigResolveScript, "sh",
+        };
+        argv.AddRange(pinned);
         var probe = await ExecProbeOrThrowAsync(
-            sandbox, workingDirectory, tool, "repository config check",
-            ["grep", "-qEe", DynamicLanguageKeyPattern, "--", "./" + config],
+            sandbox, workingDirectory, tool, "pinned config check", argv,
             ProbeTimeout(options), ct).ConfigureAwait(false);
 
-        if (probe.ExitCode == 0)
+        if (probe.StdoutLimitExceeded)
             throw new AuditUnavailableException(
-                $"could-not-verify: the audited repository's '{config}' declares "
+                $"could-not-verify: audit tool '{tool}' pinned config check exceeded its output "
+                + "bound — a truncated path list is infrastructure, not evidence that the pinned "
+                + "config is operator-owned.")
+            { IsDeterministic = true };
+        if (probe.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' pinned config check could not resolve the "
+                + $"pinned config paths (exit {probe.ExitCode}) — a failed probe is infrastructure, "
+                + "not evidence that the pinned config is operator-owned.",
+                probe.ExitCode,
+                probe.Stdout + "\n" + probe.Stderr);
+
+        // Protocol: one canonical line per pinned path, then the canonical
+        // worktree root. Anything else means the output was corrupted.
+        var lines = probe.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length != pinned.Count + 1)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' pinned config check returned a malformed "
+                + "path list — infrastructure, not evidence that the pinned config is "
+                + "operator-owned.");
+
+        var root = lines[^1];
+        var rootPrefix = root == "/" ? "/" : root + "/";
+        var resident = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < pinned.Count; i++)
+        {
+            var canonical = lines[i];
+            if ((string.Equals(canonical, root, StringComparison.Ordinal)
+                    || canonical.StartsWith(rootPrefix, StringComparison.Ordinal))
+                && seen.Add(canonical))
+                resident.Add(canonical);
+        }
+        return resident;
+    }
+
+    /// <summary>
+    /// Fail-closed check that one sgconfig file cannot register a dlopen'd
+    /// tree-sitter library, decided on what ast-grep's YAML decoder would
+    /// see rather than only the file's literal bytes. Two bounded greps,
+    /// neither echoing file contents: the literal word-bounded
+    /// <c>customLanguages</c>/<c>libraryPath</c> keys, then any backslash
+    /// that could sit inside a double-quoted scalar — YAML decodes escapes
+    /// there, so a key spelled <c>"custom\u004canguages"</c> would
+    /// deserialize to <c>customLanguages</c> while evading the literal
+    /// check (see <see cref="DoubleQuotedEscapePattern"/>). Both failure
+    /// modes and any unreadable file fail closed as deterministic
+    /// infrastructure.
+    /// </summary>
+    private async Task ThrowIfConfigLoadsNativeCodeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        string configSubject,
+        string configPath,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var literal = await ExecProbeOrThrowAsync(
+            sandbox, workingDirectory, tool, "repository config check",
+            ["grep", "-qEe", DynamicLanguageKeyPattern, "--", configPath],
+            ProbeTimeout(options), ct).ConfigureAwait(false);
+
+        if (literal.ExitCode == 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: {configSubject} declares "
                 + "customLanguages/libraryPath — ast-grep resolves that library path relative to the "
-                + "config and loads it into the scan process (dlopen), so repository-committed native "
-                + "code would run inside the auditor and could write a clean report to forge a pass. "
-                + $"Remove the dynamic-language entries, pin an operator-owned config via "
-                + $"CodeyBox:Plugins:{PluginId}:{ConfigFileKey}, or set "
+                + "config and loads it into the scan process (dlopen), so repository-controlled "
+                + "native code would run inside the auditor and could write a clean report to forge "
+                + $"a pass. Remove the dynamic-language entries, pin an operator-owned config via "
+                + $"CodeyBox:Plugins:{PluginId}:{ConfigFileKey} at a path outside the worktree, or set "
                 + $"CodeyBox:Plugins:{PluginId}:{TrustRepositoryCustomLanguagesKey} to true to consent "
                 + "to repository-controlled code execution in the audit sandbox.")
             { IsDeterministic = true };
-        if (probe.ExitCode != 1)
+        if (literal.ExitCode != 1)
+            throw ConfigProbeFailed(tool, configPath, literal);
+
+        // A literal-clean file can still spell the keys through YAML
+        // double-quoted escapes — grep cannot decode them, so any possible
+        // escaped scalar fails closed.
+        var escaped = await ExecProbeOrThrowAsync(
+            sandbox, workingDirectory, tool, "repository config check",
+            ["grep", "-qzEe", DoubleQuotedEscapePattern, "--", configPath],
+            ProbeTimeout(options), ct).ConfigureAwait(false);
+
+        if (escaped.ExitCode == 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' repository config check could not inspect "
-                + $"'{config}' (exit {probe.ExitCode}) — a failed probe is "
-                + "infrastructure, not evidence that dynamic-language entries are absent.",
-                probe.ExitCode,
-                probe.Stdout + "\n" + probe.Stderr);
+                $"could-not-verify: {configSubject} contains a backslash inside a "
+                + "double-quoted scalar — YAML decodes \\xNN/\\uXXXX escapes and backslash "
+                + "line-continuations there, so a key spelled e.g. \"custom\\u004canguages\" would "
+                + "deserialize to customLanguages while evading the literal-key check. Remove the "
+                + "escapes (single-quoted and plain scalars decode none), pin an operator-owned "
+                + $"config via CodeyBox:Plugins:{PluginId}:{ConfigFileKey} at a path outside the "
+                + $"worktree, or set CodeyBox:Plugins:{PluginId}:{TrustRepositoryCustomLanguagesKey} "
+                + "to true.")
+            { IsDeterministic = true };
+        if (escaped.ExitCode != 1)
+            throw ConfigProbeFailed(tool, configPath, escaped);
     }
+
+    private static AuditUnavailableException ConfigProbeFailed(
+        string tool, string configPath, SandboxExecResult probe)
+        => new(
+            $"could-not-verify: audit tool '{tool}' repository config check could not inspect "
+            + $"'{configPath}' (exit {probe.ExitCode}) — a failed probe is "
+            + "infrastructure, not evidence that dynamic-language entries are absent.",
+            probe.ExitCode,
+            probe.Stdout + "\n" + probe.Stderr);
 
     /// <summary>
     /// Configured <c>Targets</c> must exist in the worktree (ast-grep's
@@ -686,9 +881,14 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// indistinguishable from a suppressed one. Runs as a bounded
     /// <c>grep -l</c> over the same targets the scan will walk —
     /// <c>-a</c> so files grep would classify as binary are still swept,
-    /// matching ast-grep's tolerant parser. Any truncation or a cap
-    /// overflow fails closed: partial coverage must never read as "no
-    /// suppressions". Skipped under
+    /// matching ast-grep's tolerant parser. Emitted paths under
+    /// <see cref="ExternalToolAuditorOptions.ExcludePaths"/> are skipped
+    /// before they are counted: the scan never crawls those trees (they are
+    /// pruned via <c>--globs</c>) and the findings-level filter would drop
+    /// their findings anyway, so letting them exhaust the reporting bound
+    /// would fail an audit the exclusions make irrelevant. Any truncation
+    /// or a cap overflow fails closed: partial coverage must never read as
+    /// "no suppressions". Skipped under
     /// <see cref="TrustRepositorySuppressionKey"/>.
     /// </summary>
     private async Task<IReadOnlyList<ExternalToolFinding>> FindSuppressionSitesAsync(
@@ -706,6 +906,7 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         // it shares the scan's timeout budget rather than the probe cap.
         var result = await ExecProbeOrThrowAsync(
             sandbox, workingDirectory, tool, "suppression-marker check", argv,
+            SuppressionSweepMaxOutputBytes,
             EffectiveTimeout(options), ct).ConfigureAwait(false);
 
         if (result.StdoutLimitExceeded)
@@ -730,14 +931,10 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
         foreach (var raw in lines)
         {
             var path = raw.StartsWith("./", StringComparison.Ordinal) ? raw[2..] : raw;
-            if (path.Length == 0 || !seen.Add(path))
+            // Marker files the report would drop under ExcludePaths must
+            // not consume the bound — the scan never walks those trees.
+            if (path.Length == 0 || IsPathExcluded(path, options) || !seen.Add(path))
                 continue;
-            findings.Add(new ExternalToolFinding(
-                SeverityLevel: "warning",
-                RuleId: SuppressionSiteRuleId,
-                Message: "file contains ast-grep-ignore suppression directive(s); diagnostics it "
-                    + "suppresses never reach this report",
-                Path: path));
             if (findings.Count >= MaxSuppressionSiteFindings)
                 throw new AuditUnavailableException(
                     $"could-not-verify: audit tool '{tool}' suppression-marker check found more than "
@@ -747,6 +944,12 @@ public sealed class AstGrepAuditor : ExternalToolAuditorBase, IPluginInitializer
                     + $"CodeyBox:Plugins:{PluginId}:{TargetsKey}, or consent to repository "
                     + $"suppression via CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey}.")
                 { IsDeterministic = true };
+            findings.Add(new ExternalToolFinding(
+                SeverityLevel: "warning",
+                RuleId: SuppressionSiteRuleId,
+                Message: "file contains ast-grep-ignore suppression directive(s); diagnostics it "
+                    + "suppresses never reach this report",
+                Path: path));
         }
         return findings;
     }

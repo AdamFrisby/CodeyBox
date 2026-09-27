@@ -139,9 +139,9 @@ internal sealed class KnipJsonOutputParser : IExternalToolOutputParser
 
     private static ExternalToolFinding ParseItem(string issueType, JsonElement item, string? path)
     {
-        var name = NullIfWhiteSpace(GetString(item, "name"u8));
-        var ns = NullIfWhiteSpace(GetString(item, "namespace"u8));
-        var severity = NullIfWhiteSpace(GetString(item, "severity"u8))
+        var name = ToolOutputText.NullIfWhiteSpace(GetString(item, "name"u8));
+        var ns = ToolOutputText.NullIfWhiteSpace(GetString(item, "namespace"u8));
+        var severity = ToolOutputText.NullIfWhiteSpace(GetString(item, "severity"u8))
             ?? DefaultSeverityForIssueType(issueType);
 
         int? line = null;
@@ -168,10 +168,10 @@ internal sealed class KnipJsonOutputParser : IExternalToolOutputParser
         {
             if (member.ValueKind != JsonValueKind.Object)
                 continue;
-            var name = NullIfWhiteSpace(GetString(member, "name"u8));
+            var name = ToolOutputText.NullIfWhiteSpace(GetString(member, "name"u8));
             if (name is not null)
                 names.Add(name);
-            severity ??= NullIfWhiteSpace(GetString(member, "severity"u8));
+            severity ??= ToolOutputText.NullIfWhiteSpace(GetString(member, "severity"u8));
             if (line is null
                 && member.TryGetProperty("line"u8, out var lineElement)
                 && lineElement.ValueKind == JsonValueKind.Number
@@ -253,8 +253,6 @@ internal sealed class KnipJsonOutputParser : IExternalToolOutputParser
             ? value.GetString()
             : null;
 
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static string Truncate(string value, int maxChars)
         => ToolOutputText.Truncate(value, maxChars);

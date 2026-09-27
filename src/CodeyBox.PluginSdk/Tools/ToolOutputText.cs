@@ -53,4 +53,29 @@ public static class ToolOutputText
     /// <summary>Truncates <paramref name="value"/> to <paramref name="maxChars"/> with an ellipsis suffix.</summary>
     public static string Truncate(string value, int maxChars)
         => value.Length <= maxChars ? value : value[..maxChars] + "...";
+
+    /// <summary>
+    /// Null when <paramref name="value"/> is null, empty, or whitespace-only;
+    /// otherwise the value unchanged. Shared so output parsers do not each
+    /// carry a private copy.
+    /// </summary>
+    public static string? NullIfWhiteSpace(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    /// <summary>
+    /// Maps every control character except the line feed to a space: ESC and
+    /// the C1 controls (CSI, OSC, NEL, …) let untrusted tool output inject
+    /// terminal escape sequences into rendered findings; newlines are kept
+    /// because finding descriptions are legitimately multi-line.
+    /// <see cref="SingleLine"/> is the stricter variant for surfaces that must
+    /// stay on one line.
+    /// </summary>
+    public static string CollapseControlCharacters(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        var builder = new StringBuilder(value.Length);
+        foreach (var c in value)
+            builder.Append(char.IsControl(c) && c != '\n' ? ' ' : c);
+        return builder.ToString();
+    }
 }

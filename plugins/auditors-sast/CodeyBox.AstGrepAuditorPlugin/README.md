@@ -47,17 +47,20 @@ makes every suppression surface visible instead:
   targets emits a `Warning` finding (rule id `ast-grep/suppression-site`)
   per file containing the marker, so a clean report cannot silently mean
   "suppressed". The sweep runs `grep -rla` (binary-looking files are still
-  swept, matching ast-grep's tolerant parser) and **fails closed** when its
-  output is truncated or more than 200 marker-bearing files are found —
-  partial coverage is never reported as "no suppressions".
+  swept, matching ast-grep's tolerant parser), skips paths the report
+  would drop under `ExcludePaths` (the scan never crawls those trees), and
+  **fails closed** when its output is truncated or more than 200
+  marker-bearing files are found — partial coverage is never reported as
+  "no suppressions".
 
 Setting `TrustRepositorySuppression` to true opts back in to
 repository-authored suppression wholesale: it drops the `--no-ignore`
 flags, the `no-suppress-all` escalation, and the marker sweep.
 
-The precondition probes (`sh` + `grep`) are assumed present in the sandbox
-baseline — they are ubiquitous on any POSIX image, but are invoked by
-argv, never through a constructed shell string.
+The precondition probes (`sh` + `grep` + `realpath` for canonicalizing
+pinned config paths) are assumed present in the sandbox baseline — they are
+ubiquitous on any POSIX image, but are invoked by argv, never through a
+constructed shell string.
 
 ## Repository config and dynamic languages
 
@@ -70,12 +73,20 @@ execution the audit subject controls, which could also write a clean
 report and forge a pass.
 
 By default the auditor fails closed as deterministic infrastructure when
-the repo-root sgconfig declares those keys (either extension; the
-dynamic-load keys are matched wherever they appear, including flow-style
-YAML). The opt-ins, in order of preference:
+the repo-root sgconfig declares those keys (either extension). The check
+decides on what ast-grep's YAML decoder would see, not only the file's
+literal bytes: a bounded probe fails on the word-bounded
+`customLanguages`/`libraryPath` keys wherever they appear (including
+flow-style YAML and quoted keys), **and** on any backslash inside a
+double-quoted scalar — because `"custom\u004canguages"` deserializes to
+`customLanguages` while evading the literal check. A file with no
+double-quoted escapes cannot hide a decoded dynamic-language key.
+The opt-ins, in order of preference:
 
 - pin an operator-owned `sgconfig.yml` via `ConfigFile` (`-c` replaces the
-  repository's config entirely — the gate then does not run). In
+  repository's config entirely — the gate does not run **as long as the
+  pinned path resolves outside the worktree**; a pinned path inside the
+  worktree is still repository-controlled and is probed the same way). In
   `ExtraArguments`, only the spellings ast-grep's own pre-dispatch scan
   honors count as pinning: `-c FILE`, `-c=FILE`, `--config FILE`,
   `--config=FILE`. The joined short form `-cFILE` is parsed by clap but
@@ -229,7 +240,7 @@ Scoped under `CodeyBox:Plugins:codeybox.ast-grep`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `0.45.3` | Pinned ast-grep release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `ConfigFile` | — (repo `sgconfig.yml`) | `-c/--config` project config path. Pin an operator-owned sgconfig provisioned into the baseline instead of trusting the audited repository's — also replaces the repo config entirely, so the `customLanguages` gate does not run. Conflicts with `RuleFile`. |
+| `ConfigFile` | — (repo `sgconfig.yml`) | `-c/--config` project config path. Pin an operator-owned sgconfig provisioned into the baseline instead of trusting the audited repository's — also replaces the repo config entirely. The `customLanguages` gate is skipped only when the pinned path resolves **outside** the worktree; a worktree-resident pin is repository-controlled and probed like a discovered sgconfig. Conflicts with `RuleFile`. |
 | `RuleFile` | — | `-r/--rule` single rule file. Conflicts with `ConfigFile`. Note it does not exempt the `customLanguages` gate: ast-grep still discovers a repo-root `sgconfig.yml` to register languages. |
 | `Targets` | `.` | Comma-separated repository-relative files/folders scanned positionally. Must exist in the worktree — a missing target is a deterministic infrastructure failure (ast-grep would otherwise report it as an empty pass) — and must not resolve through a symlink at any ancestor component, which would redirect the scan root outside the worktree. |
 | `TrustRepositorySuppression` | `false` | Trust repository-authored suppression surfaces: drops the `--no-ignore` flags, the `no-suppress-all` escalation, and the suppression-marker sweep. |

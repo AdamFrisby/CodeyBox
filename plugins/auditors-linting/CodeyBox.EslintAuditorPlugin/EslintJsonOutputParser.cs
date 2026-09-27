@@ -122,8 +122,8 @@ internal sealed class EslintJsonOutputParser : IExternalToolOutputParser
 
         return new ExternalToolFinding(
             SeverityLevel: severity,
-            RuleId: NullIfWhiteSpace(GetString(message, "ruleId"u8)),
-            Message: NullIfWhiteSpace(GetString(message, "message"u8)) ?? "(no message)",
+            RuleId: ToolOutputText.NullIfWhiteSpace(GetString(message, "ruleId"u8)),
+            Message: ToolOutputText.NullIfWhiteSpace(GetString(message, "message"u8)) ?? "(no message)",
             Path: path,
             Line: line);
     }
@@ -146,8 +146,6 @@ internal sealed class EslintJsonOutputParser : IExternalToolOutputParser
             ? value.GetString()
             : null;
 
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static string SingleLine(string message)
         => ToolOutputText.SingleLine(message);

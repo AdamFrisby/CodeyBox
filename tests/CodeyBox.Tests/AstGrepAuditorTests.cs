@@ -4,6 +4,7 @@ using CodeyBox.AstGrepAuditorPlugin;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Tools;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -28,8 +29,10 @@ namespace CodeyBox.Tests;
 ///   .gitignore/.ignore files and hidden paths stay in the crawl, and ExcludePaths doubles
 ///   as the crawl boundary via --globs.
 /// - A repo-root sgconfig.yml declaring customLanguages/libraryPath fails closed (ast-grep
-///   would dlopen repo-supplied native code into the scanner); an operator-pinned ConfigFile
-///   or TrustRepositoryCustomLanguages bypasses the gate.
+///   would dlopen repo-supplied native code into the scanner) — decided on decoded YAML
+///   semantics, so double-quoted escape spellings fail closed too; an operator-pinned
+///   ConfigFile bypasses the gate only when it resolves outside the worktree, and
+///   TrustRepositoryCustomLanguages bypasses it entirely.
 /// - ast-grep-ignore markers become visible Warning findings via a pre-scan grep sweep —
 ///   rule-scoped suppressions are silent in the report otherwise.
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
@@ -693,7 +696,9 @@ public sealed class AstGrepAuditorTests
         var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
 
         Assert.True(result.Passed);
-        Assert.Equal(1, configProbes);
+        // The literal-key grep and the double-quoted-escape grep both ran
+        // and both came back clean.
+        Assert.Equal(2, configProbes);
     }
 
     [Fact]
@@ -895,6 +900,133 @@ public sealed class AstGrepAuditorTests
     }
 
     [Fact]
+    public async Task RepoSgconfig_EscapeEncodedKey_IsDeterministicInfrastructure()
+    {
+        // serde_yaml decodes \uXXXX/\xNN escapes and backslash
+        // line-continuations inside double-quoted scalars, so
+        // "custom\u004canguages" deserializes to customLanguages while
+        // carrying none of the bytes the literal-key grep inspects. The
+        // escape probe must fail closed rather than let an escape-spelled
+        // dlopen through.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsRepositoryFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "sgconfig.yml\n", ""));
+            if (IsConfigEscapeProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("escape", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task OperatorPinnedConfigFile_InsideWorktree_IsProbed_LikeRepoConfig()
+    {
+        // "ConfigFile: sgconfig.yml" resolves relative to the scan working
+        // directory — inside the worktree — so the pinned file is still
+        // repository-controlled and must pass the same dynamic-language
+        // probe instead of being credited as operator-owned.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsConfigContentProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new AstGrepAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigFile"] = "sgconfig.yml",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("resolves inside the audited worktree", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task OperatorPinnedConfigFile_InsideWorktree_Clean_Scans()
+    {
+        // A worktree-resident pin that passes the content probe (literal
+        // and escape greps both clean) is honored — only outside-worktree
+        // pins skip it entirely.
+        var contentProbes = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsConfigContentProbe(exec))
+            {
+                contentProbes++;
+                return Task.FromResult(new SandboxExecResult(1, "", ""));
+            }
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new AstGrepAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigFile"] = "sgconfig.yml",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(2, contentProbes);
+    }
+
+    [Fact]
+    public async Task ExtraArguments_ConfigInsideWorktree_IsProbed_LikeRepoConfig()
+    {
+        // The separated "--config VALUE" spelling pins the project config
+        // the same as ConfigFile — a worktree-relative value is still
+        // repository-controlled.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsConfigContentProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new AstGrepAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--config,sgconfig.yml",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("resolves inside the audited worktree", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task SuppressionMarkers_BecomeVisibleWarningFindings()
     {
         // Rule-scoped ast-grep-ignore suppressions leave no trace in the JSON
@@ -991,6 +1123,92 @@ public sealed class AstGrepAuditorTests
 
         Assert.True(ex.IsDeterministic);
         Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task SuppressionMarkerSweep_ExcludedTrees_DoNotConsumeTheBound()
+    {
+        // A vendored checkout of ast-grep itself carries hundreds of
+        // suppression directives; the scan never crawls vendor/ (--globs)
+        // and the findings filter drops such paths anyway, so they must
+        // not exhaust the reporting bound.
+        var markerFiles = string.Concat(Enumerable.Range(0, 300).Select(i => $"vendor/m{i}.js\n"));
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsMarkerProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, markerFiles, ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+    }
+
+    [Fact]
+    public async Task SuppressionMarkerSweep_AtReportingBound_IsAllowed()
+    {
+        // The bound admits exactly 200 marker-bearing files — "more than
+        // 200" must stay literally true, so 200 is not an error.
+        var markerFiles = string.Concat(Enumerable.Range(0, 200).Select(i => $"src/m{i}.js\n"));
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsMarkerProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, markerFiles, ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(200, result.Findings.Count);
+    }
+
+    [Fact]
+    public async Task SuppressionMarkerSweep_SkipsExcludedMarkerFiles()
+    {
+        // Marker paths the report would drop under ExcludePaths are
+        // filtered before counting or emitting — the sweep reports only
+        // files the scan actually walks.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsMarkerProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "vendor/m.js\nnode_modules/m2.js\nsrc/m.js\n", ""));
+            if (ProbeAnswer(exec) is { } probe)
+                return Task.FromResult(probe);
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new AstGrepAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("src/m.js", finding.Location);
+    }
+
+    [Fact]
+    public void Parser_OverResultBound_Throws_FailClosed()
+    {
+        // Diagnostics dropped silently past MaxResults could hide an
+        // error-severity match from the verdict — an oversized report must
+        // fail closed as unparseable, not truncate.
+        var report = "[" + string.Join(',',
+            Enumerable.Repeat(
+                """{"ruleId":"r","severity":"error","message":"m","file":"a.js"}""",
+                SarifToolOutputParser.DefaultMaxResults + 1)) + "]";
+
+        var parser = new AstGrepJsonOutputParser();
+        var ex = Assert.Throws<ExternalToolParseException>(
+            () => parser.Parse(new ExternalToolParseInput("ast-grep", report, "", 1)));
+
+        Assert.Contains("ast-grep", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1359,6 +1577,8 @@ public sealed class AstGrepAuditorTests
             return Ok(exec);
         if (IsRepositoryFileProbe(exec) || IsSymlinkProbe(exec))
             return new SandboxExecResult(0, "", "");
+        if (IsConfigPathResolveProbe(exec))
+            return ConfigPathResolveAnswer(exec);
         if (IsGrepProbe(exec))
             return new SandboxExecResult(1, "", "");
         return null;
@@ -1404,9 +1624,33 @@ public sealed class AstGrepAuditorTests
     private static bool IsGrepProbe(SandboxExec exec)
         => exec.Argv.Count >= 3 && exec.Argv[0] == "grep";
 
-    // Content check for dynamic-load keys in the repo's sgconfig.yml.
+    // Canonicalizes pinned -c/--config values (realpath -m, one line each,
+    // then the worktree root) so the auditor can tell which resolve inside
+    // the worktree. The fake answers with the obvious canonicalization:
+    // absolute values pass through, relative ones land under /work.
+    private static bool IsConfigPathResolveProbe(SandboxExec exec)
+        => exec.Argv.Count >= 4
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2].Contains("realpath", StringComparison.Ordinal);
+
+    private static SandboxExecResult ConfigPathResolveAnswer(SandboxExec exec)
+        => new(0,
+            string.Concat(
+                exec.Argv.Skip(4)
+                    .Select(static p => p.StartsWith('/') ? p : "/work/" + p)
+                    .Append("/work")
+                    .Select(static p => p + "\n")),
+            "");
+
+    // Content checks for dynamic-load keys in a project config: the
+    // literal-key grep (-qEe) and the double-quoted-escape grep (-qzEe).
     private static bool IsConfigContentProbe(SandboxExec exec)
-        => IsGrepProbe(exec) && exec.Argv.Contains("-qEe", StringComparer.Ordinal);
+        => IsGrepProbe(exec)
+            && exec.Argv.Any(static a => a is "-qEe" or "-qzEe");
+
+    private static bool IsConfigEscapeProbe(SandboxExec exec)
+        => IsGrepProbe(exec) && exec.Argv.Contains("-qzEe", StringComparer.Ordinal);
 
     // Suppression-marker sweep over the scan targets.
     private static bool IsMarkerProbe(SandboxExec exec)
