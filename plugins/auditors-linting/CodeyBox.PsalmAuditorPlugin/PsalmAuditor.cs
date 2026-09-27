@@ -57,7 +57,13 @@ namespace CodeyBox.PsalmAuditorPlugin;
 /// probes <c>psalm --version</c> before the scan; a missing binary, an
 /// unrecognised version string, or a version other than
 /// <c>ExpectedVersion</c> is an infrastructure failure naming the tool —
-/// never a pass, never a finding.</para>
+/// never a pass, never a finding. Because psalm resolves the project's
+/// composer autoloader even for <c>--version</c>, the probe runs in a
+/// fresh directory outside the audited tree
+/// (<see cref="ExternalToolAuditorBase.VersionProbeRunsOutsideWorktree"/>)
+/// and the reported version is anchored on the <c>Psalm </c> banner —
+/// repository code can neither execute during the probe nor print a
+/// forged token that satisfies the pin.</para>
 ///
 /// <para><b>Repository-controlled code execution — stated, not hidden.</b>
 /// Psalm is not a passive reader of the audited repository: it requires the
@@ -68,14 +74,18 @@ namespace CodeyBox.PsalmAuditorPlugin;
 /// the same exposure class as ESLint's executable config and
 /// golangci-lint's custom <c>.so</c> linters, and it is contained the same
 /// way: this auditor runs with <see cref="AuditCapabilities.None"/> — no
-/// agent credentials and no network — inside the provider's scrubbed
-/// environment. Note the autoloader is loaded even by
-/// <c>psalm --version</c> (psalm resolves it before printing the version),
-/// so the exposure applies to the version probe too. Operators who need the
+/// agent credentials and, on providers that enforce egress, no network
+/// (the process provider has no network isolation) — inside the
+/// provider's scrubbed environment. Note the autoloader would be loaded
+/// even by <c>psalm --version</c> (psalm resolves it before printing the
+/// version), so the version probe runs from a fresh directory outside the
+/// worktree where no repo autoloader is reachable. Operators who need the
 /// <em>config</em> half of this surface closed set
-/// <c>TrustRepositoryConfig</c> to <c>false</c> — which requires pinning an
-/// out-of-repo config via <c>ConfigPath</c> — but the autoloader surface is
-/// inherent to psalm and remains either way.</para>
+/// <c>TrustRepositoryConfig</c> to <c>false</c> — which requires pinning
+/// an out-of-repo config via <c>ConfigPath</c>, whose location the
+/// auditor does not verify; the operator is responsible for pointing it
+/// at a file the audited repository cannot influence — but the
+/// autoloader surface is inherent to psalm and remains either way.</para>
 ///
 /// <para><b>Repository-controlled suppression.</b> Psalm honors
 /// <c>@psalm-suppress</c> docblocks and <c>@psalm-ignore-*</c> annotations
@@ -121,8 +131,10 @@ namespace CodeyBox.PsalmAuditorPlugin;
         + DefaultExpectedVersion + ") into the sandbox baseline — psalm needs PHP >= 8.1 CLI on PATH "
         + "and ships via composer (composer global require vimeo/psalm:" + DefaultExpectedVersion
         + " with the composer global bin-dir on PATH), phive (phive install psalm@"
-        + DefaultExpectedVersion + "), or the release psalm.phar renamed to 'psalm'; no distro apt "
-        + "package carries a version pin — through CodeyBox:MultipassExtraRuncmd / "
+        + DefaultExpectedVersion + " — phive verifies the release's GPG signature), or the "
+        + "release psalm.phar verified against psalm.phar.asc and renamed to 'psalm' — never "
+        + "install an unverified phar; no distro apt package carries a version pin — through "
+        + "CodeyBox:MultipassExtraRuncmd / "
         + "CodeyBox:Incus:ExtraRuncmd or ExecutableProvisions")]
 public sealed class PsalmAuditor : ExternalToolAuditorBase, IPluginInitializer
 {
@@ -206,43 +218,55 @@ public sealed class PsalmAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     /// <summary>
     /// Declared mapping from psalm's severity vocabulary to CodeyBox's
-    /// <see cref="AuditSeverity"/>. Psalm reports <c>error</c> and
-    /// <c>info</c> only (issues below the configured error level are
-    /// reported as <c>info</c>); the neighbouring levels common to other
-    /// scanners are mapped identically so a future issue shape carrying
-    /// them is not a unique dialect. Unclassified issues default to
-    /// <see cref="AuditSeverity.Warning"/>: advisory rather than silently
-    /// absent. Raw tool levels never reach findings.
+    /// <see cref="AuditSeverity"/> — the shared
+    /// <see cref="ExternalToolSeverityMapping.Default"/> extended with the
+    /// extra dialect words (<c>fatal</c>/<c>information</c>/<c>advice</c>/
+    /// <c>hint</c>) so the entries every auditor shares cannot drift.
+    /// Psalm reports <c>error</c> and <c>info</c> only (issues below the
+    /// configured error level are reported as <c>info</c>); the
+    /// neighbouring levels common to other scanners are mapped identically
+    /// so a future issue shape carrying them is not a unique dialect.
+    /// Unclassified issues default to <see cref="AuditSeverity.Warning"/>:
+    /// advisory rather than silently absent. Raw tool levels never reach
+    /// findings.
     /// </summary>
     protected override ExternalToolSeverityMapping SeverityMapping { get; } =
-        new(new Dictionary<string, AuditSeverity>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["error"] = AuditSeverity.Error,
-            ["fatal"] = AuditSeverity.Error,
-            ["high"] = AuditSeverity.Error,
-            ["fail"] = AuditSeverity.Error,
-            ["failure"] = AuditSeverity.Error,
-            ["critical"] = AuditSeverity.Error,
-            ["warning"] = AuditSeverity.Warning,
-            ["warn"] = AuditSeverity.Warning,
-            ["medium"] = AuditSeverity.Warning,
-            ["moderate"] = AuditSeverity.Warning,
-            ["info"] = AuditSeverity.Info,
-            ["information"] = AuditSeverity.Info,
-            ["informational"] = AuditSeverity.Info,
-            ["advice"] = AuditSeverity.Info,
-            ["hint"] = AuditSeverity.Info,
-            ["low"] = AuditSeverity.Info,
-            ["note"] = AuditSeverity.Info,
-            ["none"] = AuditSeverity.Info,
-        }, AuditSeverity.Warning);
+        ExternalToolSeverityMapping.Default.Extend(
+            new Dictionary<string, AuditSeverity>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["fatal"] = AuditSeverity.Error,
+                ["information"] = AuditSeverity.Info,
+                ["advice"] = AuditSeverity.Info,
+                ["hint"] = AuditSeverity.Info,
+            });
 
     /// <inheritdoc />
     protected override Func<ExternalToolAuditorOptions> OptionsAccessor => _optionsAccessor;
 
     /// <inheritdoc />
     protected override ToolVersionPin? VersionPin =>
-        new(PluginId, _expectedVersion, DefaultExpectedVersion, ["--version"]);
+        new(PluginId, _expectedVersion, DefaultExpectedVersion, ["--version"], ExtractPsalmVersion);
+
+    /// <inheritdoc />
+    protected override bool VersionProbeRunsOutsideWorktree => true;
+
+    /// <summary>
+    /// Extracts the reported version anchored on the <c>Psalm </c> banner —
+    /// psalm's <c>--version</c> output is <c>Psalm X.Y.Z@&lt;sha&gt;</c>.
+    /// The probe already runs outside the audited tree
+    /// (<see cref="VersionProbeRunsOutsideWorktree"/>) so repository code
+    /// cannot write a forged banner ahead of the real one; the anchor
+    /// additionally keeps PHP/composer startup notices printed before the
+    /// banner on a healthy install from feeding the pin check. Returns null
+    /// when the banner is absent — the pin then fails closed.
+    /// </summary>
+    internal static string? ExtractPsalmVersion(string output)
+    {
+        const string banner = "Psalm ";
+        ArgumentNullException.ThrowIfNull(output);
+        var index = output.IndexOf(banner, StringComparison.Ordinal);
+        return index < 0 ? null : ExtractToolVersion(output[(index + banner.Length)..]);
+    }
 
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
@@ -252,8 +276,8 @@ public sealed class PsalmAuditor : ExternalToolAuditorBase, IPluginInitializer
         // config — so the operator must pin one. Deterministic
         // misconfiguration: fail closed before any sandbox exec.
         var configPath = _configPath();
-        var configSupplied = !string.IsNullOrWhiteSpace(configPath)
-            || ExtraArgumentsSupplyFlag(options, "--config", "-c");
+        var extrasSupplyConfig = ExtraArgumentsSupplyFlag(options, "--config", "-c");
+        var configSupplied = !string.IsNullOrWhiteSpace(configPath) || extrasSupplyConfig;
         if (!_trustRepositoryConfig() && !configSupplied)
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' has TrustRepositoryConfig=false but no "
@@ -292,8 +316,7 @@ public sealed class PsalmAuditor : ExternalToolAuditorBase, IPluginInitializer
         // readable reason, not carriage-return noise.
         args.Add("--no-progress");
 
-        if (!string.IsNullOrWhiteSpace(configPath)
-            && !ExtraArgumentsSupplyFlag(options, "--config", "-c"))
+        if (!string.IsNullOrWhiteSpace(configPath) && !extrasSupplyConfig)
         {
             args.Add("--config");
             args.Add(configPath.Trim());
@@ -311,49 +334,11 @@ public sealed class PsalmAuditor : ExternalToolAuditorBase, IPluginInitializer
         AuditContext context,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
-    {
         // Psalm's report carries absolute `file_path` values and no embedded
-        // cwd, so the parser relativizes against the directory the tool
-        // actually ran in. That is not necessarily the `workingDirectory`
-        // string: sandbox providers may translate it (the process provider
-        // maps "/work" onto a host temp path), so it is resolved with a
-        // bounded `pwd` probe — the same cwd the scan will see. `pwd` is a
-        // shell builtin — the audited repository cannot shadow it via PATH —
-        // and it prints the process's own logical cwd, which is exactly the
-        // path prefix psalm embeds in its absolute `file_path` values.
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "scan-root probe",
-            new SandboxExec
-            {
-                Argv = ["sh", "-c", "pwd", "sh"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' scan-root probe could not run: the sandbox exec "
-                + "transport was unavailable.");
-
-        var root = result.Stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        if (result.ExitCode != 0 || string.IsNullOrEmpty(root))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not resolve the scan root (exit "
-                + $"{result.ExitCode}) — the worktree root must be resolvable for findings to be "
-                + "reported repository-relative.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        return ExternalToolJsonHelpers.NormalizePath(root);
-    }
+        // cwd, so the parser relativizes against the directory the scan
+        // actually ran in — the shared bounded `pwd` probe resolves it.
+        => await ResolveScanRootViaPwdAsync(sandbox, workingDirectory, ToolName, options, ct)
+            .ConfigureAwait(false);
 
     /// <inheritdoc />
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)
@@ -363,10 +348,24 @@ public sealed class PsalmAuditor : ExternalToolAuditorBase, IPluginInitializer
         _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
         _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _configPath = () => scoped[ConfigPathKey];
-        // Unset or unparseable keeps the historical default: the repo's own
-        // psalm.xml is trusted (loaded by psalm's config discovery).
+        // Unset keeps the default: the repo's own psalm.xml is trusted
+        // (loaded by psalm's config discovery). A present-but-unparseable
+        // value is a deterministic infrastructure failure — a security
+        // posture the operator intended but the auditor cannot read must
+        // fail closed, not silently revert to trusting repository config.
         _trustRepositoryConfig = () =>
-            !bool.TryParse(scoped[TrustRepositoryConfigKey], out var trust) || trust;
+        {
+            var raw = scoped[TrustRepositoryConfigKey];
+            if (string.IsNullOrWhiteSpace(raw))
+                return true;
+            if (bool.TryParse(raw, out var trust))
+                return trust;
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' has an unparseable {TrustRepositoryConfigKey} "
+                + $"('{TruncateForMessage(raw)}'); set CodeyBox:Plugins:{PluginId}:{TrustRepositoryConfigKey} "
+                + "to 'true' or 'false'.")
+            { IsDeterministic = true };
+        };
         context.Logger.LogInformation(
             "PsalmAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;

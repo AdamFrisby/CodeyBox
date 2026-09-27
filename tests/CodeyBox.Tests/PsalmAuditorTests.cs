@@ -13,6 +13,9 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Covers the psalm auditor plugin:
 /// - Missing or wrong-version binary is an infrastructure failure naming psalm (never a pass or finding).
+///   The version probe runs wrapped in a fresh mktemp directory outside the audited tree
+///   (psalm resolves the repo's composer autoloader even for --version) and the reported
+///   version is anchored on the `Psalm ` banner, not the first semver token in the output.
 /// - Psalm's inverted exit convention: 0 = no error-severity issues (info issues may still
 ///   be in the report), 2 = error-severity issues found — both are verdicts; 1 (could not
 ///   run: bad args, missing/unparseable psalm.xml, uncaught exception), 255 (PHP fatal) and
@@ -225,6 +228,15 @@ public sealed class PsalmAuditorTests
         ]
         """;
 
+    private const string JsonFileNameFallbackLocations = """
+        [
+          { "severity": "error", "line_from": 4, "type": "StubFileName", "message": "absolute file_name outside the scan root", "file_name": "/opt/php-stubs/dep.php", "file_path": "" },
+          { "severity": "error", "line_from": 5, "type": "TraversalFileName", "message": "file_name escaping the root", "file_name": "../outside.php", "file_path": "" },
+          { "severity": "error", "line_from": 6, "type": "RelativeFileName", "message": "ordinary relative file_name", "file_name": "src/fine.php", "file_path": "" },
+          { "severity": "error", "line_from": 7, "type": "ReducedDots", "message": "file_name with in-root .. segments", "file_name": "src/sub/../reduced.php", "file_path": "" }
+        ]
+        """;
+
     private const string JsonWithSeverities = """
         [
           { "severity": "error", "line_from": 1, "line_to": 1, "type": "IssueError", "message": "Error-level issue.", "file_name": "src/a.php", "file_path": "/work/src/a.php", "snippet": "", "selected_text": "", "from": 0, "to": 1, "snippet_from": 0, "snippet_to": 1, "column_from": 1, "column_to": 2, "shortcode": 0, "error_level": 1, "link": "", "taint_trace": null, "other_references": null },
@@ -306,6 +318,93 @@ public sealed class PsalmAuditorTests
         Assert.Contains("psalm", ex.Message, StringComparison.Ordinal);
         Assert.Contains("5.26.1", ex.Message, StringComparison.Ordinal);
         Assert.Contains(PsalmAuditor.DefaultExpectedVersion, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task VersionProbe_RunsInFreshDirectory_OutsideTheAuditedWorktree()
+    {
+        // psalm resolves the project's composer autoloader even for
+        // --version, so the probe must not execute in the audited tree:
+        // the base wraps it so the tool runs inside a fresh mktemp
+        // directory, where repo code can neither run nor print a forged
+        // banner ahead of the real one.
+        SandboxExec? versionExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsScanRootProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (exec.Argv.Contains("psalm", StringComparer.Ordinal)
+                && exec.Argv.Contains("--version", StringComparer.Ordinal))
+            {
+                versionExec = exec;
+                return Task.FromResult(new SandboxExecResult(
+                    0, "Psalm " + PsalmAuditor.DefaultExpectedVersion + "@abcdef12\n", ""));
+            }
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new PsalmAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(versionExec);
+        // Not a bare `psalm --version` in the worktree: sh enters a fresh
+        // mktemp directory and execs the tool there.
+        Assert.Equal("sh", versionExec!.Argv[0]);
+        Assert.Equal("-c", versionExec.Argv[1]);
+        Assert.Contains("mktemp -d", versionExec.Argv[2], StringComparison.Ordinal);
+        Assert.Equal("psalm", versionExec.Argv[^2]);
+        Assert.Equal("--version", versionExec.Argv[^1]);
+    }
+
+    [Fact]
+    public async Task VersionProbe_NoiseBeforeBanner_IsIgnored_BannerAnchorWins()
+    {
+        // Text preceding the `Psalm ` banner (composer/PHP startup notices
+        // on a healthy install) must not feed the pin — extraction anchors
+        // on the banner token, not the first semver in the output.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsScanRootProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsVersionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    0,
+                    "composer notice pulling 9.9.9\nPsalm " + PsalmAuditor.DefaultExpectedVersion + "@abcdef12\n",
+                    ""));
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new PsalmAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+    }
+
+    [Fact]
+    public async Task VersionProbe_OutputWithoutPsalmBanner_FailsClosed()
+    {
+        // A bare semver with no `Psalm ` banner is unrecognised output —
+        // the pin fails closed rather than trusting a token that did not
+        // come from psalm's own banner.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsScanRootProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsVersionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    0, PsalmAuditor.DefaultExpectedVersion + "\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new PsalmAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("could not be determined", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -451,6 +550,9 @@ public sealed class PsalmAuditorTests
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains("psalm", ex.Message, StringComparison.Ordinal);
+        // Pin the failure class: the report failed to parse, not merely a
+        // non-findings exit code rejection.
+        Assert.Contains("could not be parsed", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -564,7 +666,7 @@ public sealed class PsalmAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec))
+            if (IsPresenceProbe(exec) || IsScanRootProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "Psalm 5.26.1@abcd1234\n", ""));
@@ -645,6 +747,37 @@ public sealed class PsalmAuditorTests
     }
 
     [Fact]
+    public async Task MalformedTrustRepositoryConfig_FailsClosed_NotSilentlyTrusted()
+    {
+        // A present-but-unparseable posture must not silently revert to
+        // trusting the repo's psalm.xml — fail closed instead.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsScanRootProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new PsalmAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:TrustRepositoryConfig"] = "flase",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("TrustRepositoryConfig", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("flase", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
     public async Task DistrustRepoConfig_WithConfigPath_RunsWithOperatorConfig()
     {
         SandboxExec? scanExec = null;
@@ -704,6 +837,39 @@ public sealed class PsalmAuditorTests
         // still reports (psalm emits these on findings exits).
         var baselineFinding = Assert.Single(result.Findings, f => f.Title.Contains("UnusedBaselineEntry", StringComparison.Ordinal));
         Assert.Null(baselineFinding.Location);
+    }
+
+    [Fact]
+    public async Task FileNameFallback_OutOfRootPaths_KeepFileUriMarker()
+    {
+        // When file_path is unusable, psalm's own file_name is the
+        // fallback — and it is subject to the same containment marking: an
+        // absolute file_name outside the scan root (psalm emits absolute
+        // file_name for out-of-base files) or a '..'-escaping one must not
+        // be de-rooted into a repository-relative-looking location.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsScanRootProbe(exec))
+                return Task.FromResult(Ok(exec));
+            return Task.FromResult(new SandboxExecResult(2, JsonFileNameFallbackLocations, ""));
+        });
+
+        IAuditor auditor = new PsalmAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.Equal(4, result.Findings.Count);
+        Assert.Equal(
+            "file:///opt/php-stubs/dep.php:4",
+            Assert.Single(result.Findings, f => f.Title.Contains("StubFileName", StringComparison.Ordinal)).Location);
+        Assert.Equal(
+            "file:///outside.php:5",
+            Assert.Single(result.Findings, f => f.Title.Contains("TraversalFileName", StringComparison.Ordinal)).Location);
+        Assert.Equal(
+            "src/fine.php:6",
+            Assert.Single(result.Findings, f => f.Title.Contains("RelativeFileName", StringComparison.Ordinal)).Location);
+        Assert.Equal(
+            "src/reduced.php:7",
+            Assert.Single(result.Findings, f => f.Title.Contains("ReducedDots", StringComparison.Ordinal)).Location);
     }
 
     [Fact]
@@ -925,7 +1091,15 @@ public sealed class PsalmAuditorTests
             && exec.Argv.Contains("psalm", StringComparer.Ordinal);
 
     private static bool IsVersionProbe(SandboxExec exec)
-        => exec.Argv.Count == 2 && exec.Argv[0] == "psalm" && exec.Argv[1] == "--version";
+        // The version probe runs wrapped: `sh -c <isolated-dir script> sh
+        // psalm --version` — a fresh mktemp directory outside the audited
+        // tree so repo autoload code cannot run or forge the banner.
+        => exec.Argv.Count >= 4
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2].Contains("mktemp -d", StringComparison.Ordinal)
+            && exec.Argv.Contains("psalm", StringComparer.Ordinal)
+            && exec.Argv.Contains("--version", StringComparer.Ordinal);
 
     private static async Task<string> SeedPsalmFixtureRepoAsync(bool clean)
     {

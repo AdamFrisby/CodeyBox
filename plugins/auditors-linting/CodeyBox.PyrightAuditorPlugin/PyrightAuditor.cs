@@ -187,29 +187,24 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     /// <summary>
     /// Declared mapping from pyright's severity vocabulary to CodeyBox's
-    /// <see cref="AuditSeverity"/>. Pyright reports <c>error</c>,
-    /// <c>warning</c>, and <c>information</c> (only those categories reach
-    /// the JSON report); the neighbouring levels common to other scanners are
-    /// mapped identically so a future diagnostic shape carrying them is not a
-    /// unique dialect. Raw tool levels never reach findings.
+    /// <see cref="AuditSeverity"/> — the shared
+    /// <see cref="ExternalToolSeverityMapping.Default"/> extended with the
+    /// extra dialect words (<c>fatal</c>/<c>information</c>/<c>hint</c>) so
+    /// the entries every auditor shares cannot drift. Pyright reports
+    /// <c>error</c>, <c>warning</c>, and <c>information</c> (only those
+    /// categories reach the JSON report); the neighbouring levels common to
+    /// other scanners are mapped identically so a future diagnostic shape
+    /// carrying them is not a unique dialect. Raw tool levels never reach
+    /// findings.
     /// </summary>
     protected override ExternalToolSeverityMapping SeverityMapping { get; } =
-        new(new Dictionary<string, AuditSeverity>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["error"] = AuditSeverity.Error,
-            ["fatal"] = AuditSeverity.Error,
-            ["high"] = AuditSeverity.Error,
-            ["fail"] = AuditSeverity.Error,
-            ["warning"] = AuditSeverity.Warning,
-            ["warn"] = AuditSeverity.Warning,
-            ["medium"] = AuditSeverity.Warning,
-            ["information"] = AuditSeverity.Info,
-            ["informational"] = AuditSeverity.Info,
-            ["info"] = AuditSeverity.Info,
-            ["note"] = AuditSeverity.Info,
-            ["hint"] = AuditSeverity.Info,
-            ["low"] = AuditSeverity.Info,
-        }, AuditSeverity.Warning);
+        ExternalToolSeverityMapping.Default.Extend(
+            new Dictionary<string, AuditSeverity>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["fatal"] = AuditSeverity.Error,
+                ["information"] = AuditSeverity.Info,
+                ["hint"] = AuditSeverity.Info,
+            });
 
     /// <inheritdoc />
     protected override Func<ExternalToolAuditorOptions> OptionsAccessor => _optionsAccessor;
@@ -259,49 +254,11 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
         AuditContext context,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
-    {
-        // Pyright's report carries absolute `file` paths and no embedded cwd,
-        // so the parser relativizes against the directory the tool actually
-        // ran in. That is not necessarily the `workingDirectory` string:
-        // sandbox providers may translate it (the process provider maps
-        // "/work" onto a host temp path), so it is resolved with a bounded
-        // `pwd` probe — the same cwd the scan will see. `pwd` is a shell
-        // builtin — the audited repository cannot shadow it via PATH — and
-        // it prints the process's own logical cwd, which is exactly the path
-        // prefix pyright embeds in its absolute `file` values.
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "scan-root probe",
-            new SandboxExec
-            {
-                Argv = ["sh", "-c", "pwd", "sh"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' scan-root probe could not run: the sandbox exec "
-                + "transport was unavailable.");
-
-        var root = result.Stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        if (result.ExitCode != 0 || string.IsNullOrEmpty(root))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not resolve the scan root (exit "
-                + $"{result.ExitCode}) — the worktree root must be resolvable for findings to be "
-                + "reported repository-relative.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        return ExternalToolJsonHelpers.NormalizePath(root);
-    }
+        // Pyright's report carries absolute `file` paths and no embedded
+        // cwd, so the parser relativizes against the directory the scan
+        // actually ran in — the shared bounded `pwd` probe resolves it.
+        => await ResolveScanRootViaPwdAsync(sandbox, workingDirectory, ToolName, options, ct)
+            .ConfigureAwait(false);
 
     /// <inheritdoc />
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)

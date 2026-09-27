@@ -237,7 +237,7 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
         if (string.IsNullOrWhiteSpace(uri))
             return null;
         var trimmed = uri.Trim();
-        const string fileScheme = "file://";
+        var fileScheme = ExternalToolJsonHelpers.FileUriSchemePrefix;
         if (trimmed.StartsWith(fileScheme, StringComparison.OrdinalIgnoreCase))
             trimmed = trimmed[fileScheme.Length..].TrimStart('/');
         return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;

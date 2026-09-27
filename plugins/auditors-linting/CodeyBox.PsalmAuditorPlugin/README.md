@@ -12,13 +12,13 @@ reports each issue as an audit finding with the psalm issue type (e.g.
   type 'int' for f is incorrect`); the description carries the tool, issue
   type, tool-reported level, location, and the full message. `Location` is
   `path:line` — the report's `file_path` is an absolute path relativized
-  against the audited worktree root (`file_name` is the fallback), and
-  `line_from` is already 1-based. Issues outside the worktree keep their
-  absolute path with an explicit `file://` marker (e.g.
-  `file:///opt/stubs/x.php:7`) so an out-of-tree path can never be mistaken
-  for a repository file — the shared finding pipeline trims a bare leading
-  `/`, which would otherwise hide that the path was outside the audited
-  tree. Config-level issues that carry no file (e.g.
+  against the audited worktree root (`file_name` is the fallback, with the
+  same handling), and `line_from` is already 1-based. Issues outside the
+  worktree keep their absolute path with an explicit `file://` marker
+  (e.g. `file:///opt/stubs/x.php:7`) so an out-of-tree path can never be
+  mistaken for a repository file — the shared finding pipeline trims a
+  bare leading `/`, which would otherwise hide that the path was outside
+  the audited tree. Config-level issues that carry no file (e.g.
   `UnusedBaselineEntry`) produce findings with no location.
 - **Gate behaviour: blocking on error-severity issues — the same verdict
   psalm itself returns.** Psalm's severities go through a declared map,
@@ -54,13 +54,17 @@ reports each issue as an audit finding with the psalm issue type (e.g.
   project's composer autoloader (`vendor/autoload.php` — including any
   `autoload.files` entries, which execute arbitrary PHP) and a
   repo-authored `psalm.xml` can name `<pluginClass>` entries whose code
-  psalm loads during the scan. This applies even to `psalm --version`,
-  which resolves the autoloader before printing. Containment: the auditor
-  declares `AuditCapabilities.None` — no agent credentials, no network —
-  inside the provider's scrubbed environment. `TrustRepositoryConfig=false`
-  plus an operator-owned `ConfigPath` removes the `<pluginClass>` /
-  `issueHandlers` half of this surface; the autoloader half is inherent to
-  psalm.
+  psalm loads during the scan. Psalm resolves the autoloader even for
+  `psalm --version`, so the version probe runs from a fresh directory
+  outside the worktree where no repo autoloader is reachable (and the
+  reported version is anchored on the `Psalm ` banner) — otherwise repo
+  code could print a forged token that satisfies the pin. Containment:
+  the auditor declares `AuditCapabilities.None` — no agent credentials
+  and, on providers that enforce egress, no network (the process provider
+  has no network isolation) — inside the provider's scrubbed environment.
+  `TrustRepositoryConfig=false` plus an operator-owned `ConfigPath`
+  removes the `<pluginClass>` / `issueHandlers` half of this surface; the
+  autoloader half is inherent to psalm.
 - **Inline suppressions and the baseline stay honored.** `@psalm-suppress`
   docblocks, `@psalm-ignore-*` annotations, and the config's
   `errorBaseline` file (`psalm-baseline.xml`) are authored inside the
@@ -98,7 +102,12 @@ The auditor is pinned to **psalm `6.17.2`** (`ExpectedVersion` in scoped
 config). A static analyzer's issue implementations and its report shape
 change between releases, so an unpinned tool would change findings under
 you: the auditor probes `psalm --version` before every run and reports an
-infrastructure failure on any other version.
+infrastructure failure on any other version. The probe runs inside a
+fresh `mktemp` directory outside the audited tree — psalm resolves the
+project's composer autoloader even for `--version`, and repo-authored
+`autoload.files` code could otherwise print a forged banner ahead of the
+real one — and the extracted version is anchored on the `Psalm ` banner
+rather than the first semver token in the output.
 
 The tool requirement is declared **verify-only** — no `AptPackage`: psalm
 ships via Composer, Phive, or as `psalm.phar` release download, and needs
@@ -109,10 +118,24 @@ plugin is enabled**:
 ```sh
 # baseline bake step — PHP CLI must already be installed
 composer global require vimeo/psalm:6.17.2
-# ensure the composer global bin-dir is on PATH, or:
-curl -fsSL -o /usr/local/bin/psalm https://github.com/vimeo/psalm/releases/download/6.17.2/psalm.phar
-chmod +x /usr/local/bin/psalm
+# ensure the composer global bin-dir is on PATH, or install the signed
+# release phar through phive, which verifies psalm.phar against its
+# published GPG signature (psalm.phar.asc) before installing:
+phive install psalm@6.17.2
+install -m 0755 tools/psalm /usr/local/bin/psalm
 psalm --version   # must print "Psalm 6.17.2@<sha>"
+```
+
+If you fetch `psalm.phar` directly, verify it against the release's GPG
+signature (`psalm.phar.asc`, published next to the phar, checked with the
+maintainer's published key) before installing — a supply-chain-swapped
+scanner binary invalidates every finding the auditor reports:
+
+```sh
+curl -fsSLO https://github.com/vimeo/psalm/releases/download/6.17.2/psalm.phar
+curl -fsSLO https://github.com/vimeo/psalm/releases/download/6.17.2/psalm.phar.asc
+gpg --verify psalm.phar.asc psalm.phar   # must report a good signature
+install -m 0755 psalm.phar /usr/local/bin/psalm
 ```
 
 ## Enabling
@@ -145,8 +168,8 @@ Scoped under `CodeyBox:Plugins:codeybox.psalm`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `6.17.2` | Pinned psalm release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `ConfigPath` | `null` | Passed to `--config` — an operator-owned `psalm.xml`. Ignored when `ExtraArguments` already supplies `--config`/`-c`. Caveat: psalm derives its base directory from the config location when `resolveFromConfigFile` applies, so an out-of-repo config must retarget the repository through its own `projectFiles` entries. |
-| `TrustRepositoryConfig` | `true` | `false` refuses to load the audited repo's `psalm.xml`/`psalm.xml.dist`. Psalm cannot run config-free, so this **requires** `ConfigPath` (or `--config` in `ExtraArguments`) pointing at a configuration the audit subject does not control — otherwise the run fails closed as a deterministic infrastructure error. |
+| `ConfigPath` | `null` | Passed to `--config` — an operator-owned `psalm.xml`. Ignored when `ExtraArguments` already supplies `--config`/`-c`. Caveat: psalm derives its base directory from the config location when `resolveFromConfigFile` applies, so an out-of-repo config must retarget the repository through its own `projectFiles` entries. The auditor does not verify the path's location — the operator is responsible for pointing it at a file outside the audited tree that the repository cannot influence. |
+| `TrustRepositoryConfig` | `true` | `false` refuses to load the audited repo's `psalm.xml`/`psalm.xml.dist`. Psalm cannot run config-free, so this **requires** `ConfigPath` (or `--config` in `ExtraArguments`) pointing at a configuration the audit subject does not control — otherwise the run fails closed as a deterministic infrastructure error. A present-but-unparseable value fails closed the same way rather than silently reverting to `true`. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
 | `IncludedRules` / `ExcludedRules` | — | Exact psalm issue types to keep/drop (e.g. `InvalidReturnType`, `PossiblyNullReference`). |
 | `ExcludePaths` | `vendor/`, `node_modules/`, `var/cache/`, `storage/framework/`, `bootstrap/cache/`, `generated/`, `dist/`, `build/`, `out/`, `coverage/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |

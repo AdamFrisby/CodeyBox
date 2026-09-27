@@ -328,6 +328,41 @@ public sealed class ExternalToolAuditorTests
         Assert.False(ProbeExposingAuditor.SuppliesFlag(new ExternalToolAuditorOptions(), "--config"));
     }
 
+    [Theory]
+    [InlineData("/work/src/a.php", "/work", "src/a.php")]
+    [InlineData("/opt/stubs/x.php", "/work", "file:///opt/stubs/x.php")]
+    [InlineData("file:///opt/stubs/x.php", "/work", "file:///opt/stubs/x.php")]
+    [InlineData("../outside.php", "/work", "file:///outside.php")]
+    [InlineData("../../escape.php", "/work", "file:///escape.php")]
+    [InlineData("src/sub/../reduced.php", "/work", "src/reduced.php")]
+    [InlineData("src/x.php", "/work", "src/x.php")]
+    [InlineData("", "/work", null)]
+    [InlineData(null, "/work", null)]
+    public void RelativizeOrMarkFileUri_MarksOutOfRoot_AndResolvesEscapes(
+        string? raw, string root, string? expected)
+        // An out-of-root path — absolute or '..' escaping — must return
+        // file://-marked so the base's leading-'/' trim can never de-root
+        // it into a repository-relative-looking location.
+        => Assert.Equal(expected, ExternalToolJsonHelpers.RelativizeOrMarkFileUri(raw, root));
+
+    [Fact]
+    public void SeverityMapping_Extend_LayersExtraLevelsOverDefault()
+    {
+        var extended = ExternalToolSeverityMapping.Default.Extend(
+            new Dictionary<string, AuditSeverity>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["fatal"] = AuditSeverity.Error,
+                ["hint"] = AuditSeverity.Info,
+            });
+
+        Assert.Equal(AuditSeverity.Error, extended.Map("fatal"));
+        Assert.Equal(AuditSeverity.Info, extended.Map("hint"));
+        // Entries and the fallback are inherited from the shared default.
+        Assert.Equal(AuditSeverity.Error, extended.Map("error"));
+        Assert.Equal(AuditSeverity.Info, extended.Map("info"));
+        Assert.Equal(AuditSeverity.Warning, extended.Map("unseen-level"));
+    }
+
     [Fact]
     public void InvalidToolName_IsRejectedFailClosed()
     {
