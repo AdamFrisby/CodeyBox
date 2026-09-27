@@ -42,7 +42,19 @@ public sealed class MajordomoMcpTests
             http,
             loggerFactory: null,
             ownsHttpClient: false);
-        return await McpClient.CreateAsync(transport);
+        // The client's default 5 s DiscoverProbeTimeout aborts the server/discover
+        // POST mid-flight so slow servers can fall back to the initialize
+        // handshake. On a loaded serial test host the server can legitimately
+        // take longer than that to answer, and the SDK then completes the
+        // response without the reply, which escapes the fallback as an
+        // McpException instead of retrying. Our server is the same SDK version
+        // and always answers server/discover, so the probe bound buys nothing;
+        // InitializationTimeout still bounds the overall connect.
+        var options = new McpClientOptions
+        {
+            DiscoverProbeTimeout = Timeout.InfiniteTimeSpan,
+        };
+        return await McpClient.CreateAsync(transport, options);
     }
 
     private static JsonElement Structured(CallToolResult result)
