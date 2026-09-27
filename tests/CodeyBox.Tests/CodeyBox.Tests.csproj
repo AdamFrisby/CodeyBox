@@ -65,6 +65,7 @@
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.OxlintAuditorPlugin\CodeyBox.OxlintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.RuffAuditorPlugin\CodeyBox.RuffAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.CppcheckAuditorPlugin\CodeyBox.CppcheckAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.SpotBugsAuditorPlugin\CodeyBox.SpotBugsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.GitleaksAuditorPlugin\CodeyBox.GitleaksAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SpectralAuditorPlugin\CodeyBox.SpectralAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.CodeqlAuditorPlugin\CodeyBox.CodeqlAuditorPlugin.csproj" />
