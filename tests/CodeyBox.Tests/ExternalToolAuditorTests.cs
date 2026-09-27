@@ -116,6 +116,40 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
+    public async Task SarifResultCap_ExceedsTheBound_FailsClosed()
+    {
+        // Findings past the cap are gate-relevant — one could map to Error —
+        // so a report exceeding the parser's bound is a parse failure
+        // (infrastructure), never a silently truncated verdict. A report at
+        // exactly the cap is complete and parses normally.
+        var sarif = """
+            { "version": "2.1.0", "runs": [{ "results": [
+              { "ruleId": "r1", "level": "error", "message": { "text": "one" } },
+              { "ruleId": "r2", "level": "error", "message": { "text": "two" } },
+              { "ruleId": "r3", "level": "error", "message": { "text": "three" } }
+            ] }] }
+            """;
+
+        var overCap = Assert.Throws<ExternalToolParseException>(
+            () => new SarifToolOutputParser(maxResults: 2).Parse(
+                new ExternalToolParseInput("fictional-scanner", sarif, "", 0)));
+        Assert.Contains("result", overCap.Message, StringComparison.OrdinalIgnoreCase);
+
+        var atCap = new SarifToolOutputParser(maxResults: 3).Parse(
+            new ExternalToolParseInput("fictional-scanner", sarif, "", 0));
+        Assert.Equal(3, atCap.Count);
+
+        // Through the full audit path the same overflow surfaces as
+        // infrastructure — never as a pass on partial evidence.
+        var sandbox = ToolReturning(0, sarif, "");
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => new TestToolAuditor(
+                    new ExternalToolAuditorOptions { FindingsExitCodes = new HashSet<int> { 0 } },
+                    parser: new SarifToolOutputParser(maxResults: 2))
+                .RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+    }
+
+    [Fact]
     public async Task SeverityMapping_IsApplied_RatherThanRawVocabulary()
     {
         // Under the default map "high" is an Error; this custom map demotes it.
@@ -171,6 +205,51 @@ public sealed class ExternalToolAuditorTests
 
         var finding = Assert.Single(result.Findings);
         Assert.Contains("keep-me", finding.Title);
+    }
+
+    [Fact]
+    public async Task FindingsBeyondMaxFindings_StillFeedTheVerdict()
+    {
+        // A flood of advisory findings must not push an Error-severity
+        // finding past MaxFindings into silence: the cap bounds the returned
+        // list, but dropped findings still feed the verdict — truncation
+        // can never turn a failing report into a pass.
+        const string flood = """
+            {
+              "version": "2.1.0",
+              "runs": [{
+                "results": [
+                  {
+                    "ruleId": "noise-1", "level": "warning", "message": { "text": "noise" },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "a.js" }, "region": { "startLine": 1 } } }]
+                  },
+                  {
+                    "ruleId": "noise-2", "level": "warning", "message": { "text": "noise" },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "b.js" }, "region": { "startLine": 2 } } }]
+                  },
+                  {
+                    "ruleId": "real-bug", "level": "error", "message": { "text": "pushed past the cap" },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "c.js" }, "region": { "startLine": 3 } } }]
+                  }
+                ]
+              }]
+            }
+            """;
+        var result = await new TestToolAuditor(
+            new ExternalToolAuditorOptions { MaxFindings = 2 }).RunAsync(
+            ToolReturning(0, flood, ""), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.Equal(2, result.Findings.Count);
+        Assert.Contains("findings truncated", result.RawOutput, StringComparison.Ordinal);
+
+        // Dropped advisory findings truncate the list but not the verdict:
+        // the same report with warnings only still passes.
+        var advisoryOnly = flood.Replace("\"level\": \"error\"", "\"level\": \"warning\"");
+        var passed = await new TestToolAuditor(
+            new ExternalToolAuditorOptions { MaxFindings = 2 }).RunAsync(
+            ToolReturning(0, advisoryOnly, ""), "/work", FakeContext(), CancellationToken.None);
+        Assert.True(passed.Passed);
     }
 
     [Fact]
@@ -370,12 +449,13 @@ public sealed class ExternalToolAuditorTests
 
     private sealed class TestToolAuditor(
         ExternalToolAuditorOptions options,
-        ExternalToolSeverityMapping? mapping = null)
+        ExternalToolSeverityMapping? mapping = null,
+        IExternalToolOutputParser? parser = null)
         : ExternalToolAuditorBase
     {
         public override string Name => "test:tool";
         protected override string ToolName => "fictional-scanner";
-        protected override IExternalToolOutputParser OutputParser { get; } = new SarifToolOutputParser();
+        protected override IExternalToolOutputParser OutputParser { get; } = parser ?? new SarifToolOutputParser();
         protected override ExternalToolSeverityMapping SeverityMapping => mapping ?? ExternalToolSeverityMapping.Default;
         protected override Func<ExternalToolAuditorOptions> OptionsAccessor => () => options;
         protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions toolOptions) => ["scan", "."];
