@@ -1,3 +1,4 @@
+using System.Text;
 using System.Xml;
 using CodeyBox.PluginSdk.Tools;
 
@@ -80,7 +81,7 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
         catch (XmlException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid PMD XML: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid PMD XML: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
     }
@@ -117,7 +118,12 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
             switch (reader.LocalName)
             {
                 case "file":
-                    currentFile = NullIfWhiteSpace(reader.GetAttribute("name"));
+                    // A self-closing <file name="x"/> produces no EndElement:
+                    // clear rather than set so later root-level violations
+                    // are not misattributed to a path that wrapped nothing.
+                    currentFile = reader.IsEmptyElement
+                        ? null
+                        : ToolOutputText.NullIfWhiteSpace(reader.GetAttribute("name"));
                     break;
                 case "violation":
                     findings.Add(ParseViolation(reader, currentFile));
@@ -128,8 +134,8 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
                 case "configerror":
                     findings.Add(new ExternalToolFinding(
                         SeverityLevel: ConfigErrorLevel,
-                        RuleId: NullIfWhiteSpace(reader.GetAttribute("rule")),
-                        Message: NullIfWhiteSpace(reader.GetAttribute("msg"))
+                        RuleId: ToolOutputText.NullIfWhiteSpace(reader.GetAttribute("rule")),
+                        Message: ToolOutputText.NullIfWhiteSpace(reader.GetAttribute("msg"))
                             ?? "PMD rule configuration error (rule could not run — coverage is partial)"));
                     break;
                 case SuppressedElementName:
@@ -150,21 +156,22 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
         using var violation = reader.ReadSubtree();
         violation.Read();
 
-        var ruleId = NullIfWhiteSpace(violation.GetAttribute("rule"));
-        var priority = NullIfWhiteSpace(violation.GetAttribute("priority"));
-        var line = ParseLine(violation.GetAttribute("beginline"));
-        var ruleset = NullIfWhiteSpace(violation.GetAttribute("ruleset"));
-        var externalInfo = NullIfWhiteSpace(violation.GetAttribute("externalInfoUrl"));
+        var ruleId = ToolOutputText.NullIfWhiteSpace(violation.GetAttribute("rule"));
+        var priority = ToolOutputText.NullIfWhiteSpace(violation.GetAttribute("priority"));
+        var line = ToolOutputText.ParseLine(violation.GetAttribute("beginline"));
+        var ruleset = ToolOutputText.NullIfWhiteSpace(violation.GetAttribute("ruleset"));
+        var externalInfo = ToolOutputText.NullIfWhiteSpace(violation.GetAttribute("externalInfoUrl"));
 
         // The violation element's text content is the violation message.
-        string? message = null;
+        // XmlReader may deliver it in chunks — accumulate, don't re-copy.
+        var messageText = new StringBuilder();
         while (violation.Read())
         {
             if (violation.NodeType is XmlNodeType.Text or XmlNodeType.CDATA)
-                message = (message ?? string.Empty) + violation.Value;
+                messageText.Append(violation.Value);
         }
 
-        message = NullIfWhiteSpace(message) ?? "(no message)";
+        var message = ToolOutputText.NullIfWhiteSpace(messageText.ToString()) ?? "(no message)";
         if (ruleset is not null)
             message = $"{message} [ruleset: {ruleset}]";
         if (externalInfo is not null)
@@ -183,10 +190,10 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
         using var error = reader.ReadSubtree();
         error.Read();
 
-        var path = NullIfWhiteSpace(error.GetAttribute("filename"));
+        var path = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("filename"));
         // The element body is the error detail (stack trace); keep findings
         // to the one-line message.
-        var message = NullIfWhiteSpace(error.GetAttribute("msg"))
+        var message = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("msg"))
             ?? "PMD processing error (file could not be analysed — coverage is partial)";
 
         return new ExternalToolFinding(
@@ -195,19 +202,4 @@ internal sealed class PmdXmlOutputParser : IExternalToolOutputParser
             Message: message,
             Path: path);
     }
-
-    private static int? ParseLine(string? value)
-        => int.TryParse(
-                value,
-                System.Globalization.NumberStyles.Integer,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out var parsed) && parsed > 0
-            ? parsed
-            : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 }

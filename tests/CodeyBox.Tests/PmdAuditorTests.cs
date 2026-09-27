@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk;
@@ -133,7 +132,10 @@ public sealed class PmdAuditorTests
         {
             if (IsPresenceProbe(exec))
                 return Task.FromResult(new SandboxExecResult(1, "", "command -v: pmd not found"));
-            throw new InvalidOperationException("scan must not run when the presence probe fails");
+            // If the presence check were bypassed the scan would "succeed":
+            // a clean report here makes the oracle red unless the run really
+            // was rejected at the missing-binary gate.
+            return Task.FromResult(new SandboxExecResult(0, XmlClean, ""));
         });
 
         IAuditor auditor = new PmdAuditor();
@@ -143,6 +145,7 @@ public sealed class PmdAuditorTests
         // A scanner that silently passes because it did not run is the worst
         // outcome: this throws (infrastructure) instead, naming pmd.
         Assert.Contains("pmd", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("is not installed", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -155,7 +158,10 @@ public sealed class PmdAuditorTests
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(
                     0, "PMD 6.55.0 (abc, 2023-01-01)\nJava version: 17.0.9\n", ""));
-            throw new InvalidOperationException("scan must not run on a version mismatch");
+            // If the version pin were absent the scan would "succeed": a
+            // clean report here makes the oracle red unless the run really
+            // was rejected at the pin.
+            return Task.FromResult(new SandboxExecResult(0, XmlClean, ""));
         });
 
         IAuditor auditor = new PmdAuditor();
@@ -163,6 +169,9 @@ public sealed class PmdAuditorTests
             () => auditor.RunAsync(sandbox, WorkDir, FakeContext(), CancellationToken.None));
 
         Assert.Contains("pmd", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // Discriminator unique to the pin-rejection path: it names the
+        // reported version — a generic "pmd could not run" does not.
+        Assert.Contains("is version 6.55.0", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -350,20 +359,23 @@ public sealed class PmdAuditorTests
     [Fact]
     public async Task BuiltArguments_SelectXmlReport_QuickstartRuleset_AndNeutralizedSuppression()
     {
-        SandboxExec? scanExec = null;
+        var scanArgvs = new List<IReadOnlyList<string>>();
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
-            scanExec = exec;
+            scanArgvs.Add(exec.Argv);
             return Task.FromResult(new SandboxExecResult(0, XmlClean, ""));
         });
 
         IAuditor auditor = new PmdAuditor();
+        // Two scans prove the suppress marker is generated per invocation —
+        // a fixed token would repeat and stay forgeable by the audited repo.
+        await auditor.RunAsync(sandbox, WorkDir, FakeContext(), CancellationToken.None);
         await auditor.RunAsync(sandbox, WorkDir, FakeContext(), CancellationToken.None);
 
-        Assert.NotNull(scanExec);
-        var argv = scanExec!.Argv;
+        Assert.Equal(2, scanArgvs.Count);
+        var argv = scanArgvs[0];
         Assert.Equal("pmd", argv[0]);
         Assert.Equal("check", argv[1]);
         var formatIndex = argv.ToList().IndexOf("-f");
@@ -380,10 +392,16 @@ public sealed class PmdAuditorTests
         Assert.True(relativizeIndex >= 0 && relativizeIndex + 1 < argv.Count);
         Assert.Equal(Path.GetFullPath(WorkDir), argv[relativizeIndex + 1]);
         // The audited tree must not be able to silence findings by comment:
-        // the NOPMD marker is pinned to an operator-side token by default.
+        // the NOPMD marker is replaced by an unguessable per-invocation
+        // token — assert the shape, never a literal value the repo could
+        // pre-embed.
         var markerIndex = argv.ToList().IndexOf("--suppress-marker");
         Assert.True(markerIndex >= 0 && markerIndex + 1 < argv.Count);
-        Assert.Equal(PmdAuditor.DisabledSuppressMarker, argv[markerIndex + 1]);
+        var marker = argv[markerIndex + 1];
+        Assert.StartsWith(PmdAuditor.DisabledSuppressMarkerPrefix, marker, StringComparison.Ordinal);
+        Assert.True(marker.Length > PmdAuditor.DisabledSuppressMarkerPrefix.Length);
+        var secondMarkerIndex = scanArgvs[1].ToList().IndexOf("--suppress-marker");
+        Assert.NotEqual(marker, scanArgvs[1][secondMarkerIndex + 1]);
         Assert.DoesNotContain("--show-suppressed", argv);
         Assert.DoesNotContain("--report-file", argv);
         Assert.DoesNotContain("--cache", argv);
@@ -537,6 +555,41 @@ public sealed class PmdAuditorTests
         Assert.True(rulesetIndex >= 0 && rulesetIndex + 1 < argv.Count);
         Assert.Equal("rulesets/java/errorprone.xml", argv[rulesetIndex + 1]);
         Assert.DoesNotContain(PmdAuditor.DefaultRuleset, argv);
+    }
+
+    [Fact]
+    public async Task ScopedConfiguration_RulesetInExtraArguments_ReplacesRulesetPath()
+    {
+        // PMD treats a repeated --rulesets as additive, so the operator's
+        // -R must suppress the scoped RulesetPath emission entirely —
+        // stacking both would merge rulesets rather than replace.
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, XmlClean, ""));
+        });
+
+        var auditor = new PmdAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:RulesetPath"] = "/opt/codeybox/pmd-ruleset.xml",
+                ["Scoped:ExtraArguments"] = "-R,rulesets/java/errorprone.xml",
+            }),
+            CancellationToken.None);
+
+        await ((IAuditor)auditor).RunAsync(sandbox, WorkDir, FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        var argv = scanExec!.Argv;
+        var rulesetIndex = argv.ToList().IndexOf("-R");
+        Assert.True(rulesetIndex >= 0 && rulesetIndex + 1 < argv.Count);
+        Assert.Equal("rulesets/java/errorprone.xml", argv[rulesetIndex + 1]);
+        Assert.DoesNotContain("--rulesets", argv);
+        Assert.DoesNotContain("/opt/codeybox/pmd-ruleset.xml", argv);
     }
 
     [Fact]
@@ -844,8 +897,7 @@ public sealed class PmdAuditorTests
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
-            var match = Regex.Match(stdout, @"PMD\s+(\d+\.\d+\.\d+[\w.\-]*)");
-            return process.ExitCode == 0 && match.Success ? match.Groups[1].Value.TrimEnd('.') : null;
+            return process.ExitCode == 0 ? PmdAuditor.ExtractPmdVersion(stdout) : null;
         }
         catch
         {

@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
@@ -77,9 +78,12 @@ namespace CodeyBox.PmdAuditorPlugin;
 /// <c>// NOPMD</c>-style comment markers and <c>@SuppressWarnings("PMD…")</c>
 /// annotations authored inside the audited repository — and the audit
 /// subject writes that repository. By default the scan passes
-/// <c>--suppress-marker</c> with a fixed operator-side token, which makes
-/// the comment marker inert (only the token would suppress, and repo code
-/// does not contain it). PMD offers no CLI switch to ignore
+/// <c>--suppress-marker</c> with an unguessable token generated per
+/// invocation (a CSPRNG suffix on <see cref="DisabledSuppressMarkerPrefix"/>),
+/// which makes the comment marker inert: only a line containing the token
+/// would suppress, and repo code cannot contain a token it cannot predict —
+/// a fixed token would be forgeable because the audit subject can read this
+/// assembly. PMD offers no CLI switch to ignore
 /// <c>@SuppressWarnings</c> — that annotation channel stays honored and is
 /// documented as a limitation (a rule-level
 /// <c>violationSuppressXPath</c>/<c>violationSuppressRegex</c> in an
@@ -161,14 +165,21 @@ public sealed class PmdAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <c>@SuppressWarnings("PMD…")</c> annotation channel cannot be
     /// disabled from the CLI either way.
     /// </summary>
-    internal const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
+    public const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
 
     /// <summary>
-    /// Marker passed to <c>--suppress-marker</c> when repository suppression
-    /// is not trusted: a fixed author-chosen token no real source file
-    /// contains, so <c>// NOPMD</c> comments in the audited tree are inert.
+    /// Prefix of the per-invocation token passed to <c>--suppress-marker</c>
+    /// when repository suppression is not trusted. The full token carries a
+    /// random suffix generated at scan-argument build time, so
+    /// <c>// NOPMD</c> comments in the audited tree are inert and the
+    /// subject cannot pre-embed the token: a fixed compile-time token would
+    /// be forgeable — this assembly's source is readable to the subject.
     /// </summary>
-    internal const string DisabledSuppressMarker = "CODEYBOX-PMD-NOSUPPRESS-DISABLED";
+    internal const string DisabledSuppressMarkerPrefix = "CODEYBOX-PMD-NOSUPPRESS-";
+
+    // 128 bits of CSPRNG entropy per scan: unguessable, and short enough for
+    // one argv token.
+    private const int SuppressMarkerEntropyBytes = 16;
 
     // Version banner line the pin anchors on: `pmd --version` prints the
     // ASCII banner, then "PMD <version> (<commit>, <timestamp>)", then a
@@ -264,27 +275,28 @@ public sealed class PmdAuditor : ExternalToolAuditorBase, IPluginInitializer
         if (!ExtraArgumentsSupplyFlag(options, "--no-progress", "--progress"))
             args.Add("--no-progress");
 
-        var rulesetPath = _rulesetPath();
-        if (!string.IsNullOrWhiteSpace(rulesetPath))
+        // An operator -R/--rulesets in ExtraArguments wins over both the
+        // scoped RulesetPath and the built-in default: PMD accepts a
+        // repeated --rulesets as additive, so emitting ours alongside the
+        // operator's would merge rather than replace.
+        if (!ExtraArgumentsSupplyFlag(options, "--rulesets", "-R"))
         {
-            AddValueFlag(args, "--rulesets", rulesetPath);
-        }
-        else if (!ExtraArgumentsSupplyFlag(options, "--rulesets", "-R"))
-        {
+            var rulesetPath = _rulesetPath();
             args.Add("--rulesets");
-            args.Add(DefaultRuleset);
+            args.Add(string.IsNullOrWhiteSpace(rulesetPath) ? DefaultRuleset : rulesetPath.Trim());
         }
 
-        // The audited repository must not silence the gate: with the marker
-        // pinned to an operator-side token, `// NOPMD` comments are inert.
-        // Operators opt in to repo-authored suppression via
-        // TrustRepositorySuppression (or by supplying their own
-        // --suppress-marker).
+        // The audited repository must not silence the gate: the marker is a
+        // fresh unguessable token per invocation, so `// NOPMD` comments are
+        // inert and the subject cannot pre-embed the token even though this
+        // assembly is readable to it. Operators opt in to repo-authored
+        // suppression via TrustRepositorySuppression (or by supplying their
+        // own --suppress-marker).
         if (!_trustRepositorySuppression()
             && !ExtraArgumentsSupplyFlag(options, "--suppress-marker"))
         {
             args.Add("--suppress-marker");
-            args.Add(DisabledSuppressMarker);
+            args.Add(NewSuppressMarkerToken());
         }
 
         // Scan input: the whole worktree, collected with automatic language
@@ -317,6 +329,12 @@ public sealed class PmdAuditor : ExternalToolAuditorBase, IPluginInitializer
         return Task.FromResult<IReadOnlyList<string>>(
             ["--relativize-paths-with", Path.GetFullPath(workingDirectory)]);
     }
+
+    // Unguessable suppress marker for one invocation — see
+    // DisabledSuppressMarkerPrefix.
+    private static string NewSuppressMarkerToken()
+        => DisabledSuppressMarkerPrefix
+            + Convert.ToHexString(RandomNumberGenerator.GetBytes(SuppressMarkerEntropyBytes));
 
     /// <inheritdoc />
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)

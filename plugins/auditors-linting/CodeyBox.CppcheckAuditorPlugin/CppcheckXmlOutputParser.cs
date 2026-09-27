@@ -74,7 +74,7 @@ internal sealed class CppcheckXmlOutputParser : IExternalToolOutputParser
         catch (XmlException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid cppcheck XML: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid cppcheck XML: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
     }
@@ -113,12 +113,12 @@ internal sealed class CppcheckXmlOutputParser : IExternalToolOutputParser
     {
         error.Read();
 
-        var ruleId = NullIfWhiteSpace(error.GetAttribute("id"));
-        var severity = NullIfWhiteSpace(error.GetAttribute("severity"));
-        var message = NullIfWhiteSpace(error.GetAttribute("verbose"))
-            ?? NullIfWhiteSpace(error.GetAttribute("msg"))
+        var ruleId = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("id"));
+        var severity = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("severity"));
+        var message = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("verbose"))
+            ?? ToolOutputText.NullIfWhiteSpace(error.GetAttribute("msg"))
             ?? "(no message)";
-        var cwe = NullIfWhiteSpace(error.GetAttribute("cwe"));
+        var cwe = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("cwe"));
         if (cwe is not null)
             message = $"{message} [CWE-{cwe}]";
 
@@ -126,14 +126,14 @@ internal sealed class CppcheckXmlOutputParser : IExternalToolOutputParser
         // shared SARIF parser's first-physical-location convention);
         // location-less entries fall back to file/line attributes on the
         // <error> element itself, else carry no position.
-        string? path = NullIfWhiteSpace(error.GetAttribute("file"));
-        int? line = ParseLine(error.GetAttribute("line"));
+        string? path = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("file"));
+        int? line = ToolOutputText.ParseLine(error.GetAttribute("line"));
         while (path is null && error.Read())
         {
             if (error.NodeType == XmlNodeType.Element && error.Name == "location")
             {
-                path = NullIfWhiteSpace(error.GetAttribute("file"));
-                line = ParseLine(error.GetAttribute("line"));
+                path = ToolOutputText.NullIfWhiteSpace(error.GetAttribute("file"));
+                line = ToolOutputText.ParseLine(error.GetAttribute("line"));
                 break;
             }
         }
@@ -145,19 +145,4 @@ internal sealed class CppcheckXmlOutputParser : IExternalToolOutputParser
             Path: path,
             Line: line);
     }
-
-    private static int? ParseLine(string? value)
-        => int.TryParse(
-                value,
-                System.Globalization.NumberStyles.Integer,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out var parsed) && parsed > 0
-            ? parsed
-            : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 }

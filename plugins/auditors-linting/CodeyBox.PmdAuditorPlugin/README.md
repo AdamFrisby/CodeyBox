@@ -140,9 +140,10 @@ Scoped under `CodeyBox:Plugins:codeybox.pmd`, resolved per run (hot-reloadable):
 
 **Repository-controlled suppression is off by default.** The audit subject
 writes the repository, and PMD lets source files suppress the analyser with
-`// NOPMD` comments. The scan passes `--suppress-marker` pinned to an
-operator-side token, so those comments are inert — findings surface for code the
-comments would have suppressed. Expect *more* findings than a stock `pmd check`
+`// NOPMD` comments. The scan passes `--suppress-marker` set to an unguessable
+token generated fresh for each run — a fixed token would be forgeable, since
+the audit subject can read this plugin's source — so those comments are inert
+and findings surface for code the comments would have suppressed. Expect *more* findings than a stock `pmd check`
 run on repos that rely on suppression comments; that is the gate working as
 intended. `@SuppressWarnings("PMD…")` annotations remain honored regardless — a
 documented tool limitation (see above). Set `TrustRepositorySuppression` to
