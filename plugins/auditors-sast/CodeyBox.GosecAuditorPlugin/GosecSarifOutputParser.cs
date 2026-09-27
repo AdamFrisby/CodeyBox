@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
 
@@ -121,7 +120,8 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
         {
             var named = string.Join(
                 ", ",
-                errorPaths.Take(MaxErrorPathsInMessage).Select(SanitizePath));
+                errorPaths.Take(MaxErrorPathsInMessage)
+                    .Select(path => ToolOutputText.SingleLine(path, ErrorPathMaxChars)));
             var remainder = errorPaths.Count > MaxErrorPathsInMessage
                 ? $", … +{errorPaths.Count - MaxErrorPathsInMessage} more"
                 : string.Empty;
@@ -137,8 +137,9 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
     /// <c>"Golang errors"</c> map written to stderr. Returns false when the
     /// stream is empty, malformed, or carries no readable map — the caller
     /// treats that as an unverifiable channel, not an empty one. A
-    /// <see langword="null"/> map (never produced by a healthy run) reads
-    /// as empty.
+    /// <see langword="null"/> map is never produced by a healthy run
+    /// (gosec initializes the map in <c>NewReportInfo</c>), so it fails
+    /// closed like every other non-object shape.
     /// </summary>
     private static bool TryReadAnalysisErrorPaths(string stderr, out IReadOnlyList<string> errorPaths)
     {
@@ -152,8 +153,6 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
             if (root.ValueKind != JsonValueKind.Object
                 || !root.TryGetProperty(AnalysisErrorsProperty, out var errors))
                 return false;
-            if (errors.ValueKind == JsonValueKind.Null)
-                return true;
             if (errors.ValueKind != JsonValueKind.Object)
                 return false;
 
@@ -167,23 +166,6 @@ internal sealed class GosecSarifOutputParser : IExternalToolOutputParser
         {
             return false;
         }
-    }
-
-    /// <summary>
-    /// Flattens an error-channel path (subject-controlled file names) to a
-    /// bounded single line for the failure message — control characters and
-    /// escape bytes become spaces so a crafted path cannot inject terminal
-    /// sequences.
-    /// </summary>
-    private static string SanitizePath(string path)
-    {
-        var builder = new StringBuilder(path.Length);
-        foreach (var c in path)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        var sanitized = builder.ToString().Trim();
-        return sanitized.Length > ErrorPathMaxChars
-            ? sanitized[..ErrorPathMaxChars]
-            : sanitized;
     }
 
     /// <summary>

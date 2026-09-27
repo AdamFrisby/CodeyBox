@@ -174,6 +174,51 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
+    public async Task FindingsBeyondMaxFindings_StillFeedTheVerdict()
+    {
+        // A flood of advisory findings must not push an Error-severity
+        // finding past MaxFindings into silence: the cap bounds the returned
+        // list, but dropped findings still feed the verdict — truncation
+        // can never turn a failing report into a pass.
+        const string flood = """
+            {
+              "version": "2.1.0",
+              "runs": [{
+                "results": [
+                  {
+                    "ruleId": "noise-1", "level": "warning", "message": { "text": "noise" },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "a.js" }, "region": { "startLine": 1 } } }]
+                  },
+                  {
+                    "ruleId": "noise-2", "level": "warning", "message": { "text": "noise" },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "b.js" }, "region": { "startLine": 2 } } }]
+                  },
+                  {
+                    "ruleId": "real-bug", "level": "error", "message": { "text": "pushed past the cap" },
+                    "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "c.js" }, "region": { "startLine": 3 } } }]
+                  }
+                ]
+              }]
+            }
+            """;
+        var result = await new TestToolAuditor(
+            new ExternalToolAuditorOptions { MaxFindings = 2 }).RunAsync(
+            ToolReturning(0, flood, ""), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.Equal(2, result.Findings.Count);
+        Assert.Contains("findings truncated", result.RawOutput, StringComparison.Ordinal);
+
+        // Dropped advisory findings truncate the list but not the verdict:
+        // the same report with warnings only still passes.
+        var advisoryOnly = flood.Replace("\"level\": \"error\"", "\"level\": \"warning\"");
+        var passed = await new TestToolAuditor(
+            new ExternalToolAuditorOptions { MaxFindings = 2 }).RunAsync(
+            ToolReturning(0, advisoryOnly, ""), "/work", FakeContext(), CancellationToken.None);
+        Assert.True(passed.Passed);
+    }
+
+    [Fact]
     public async Task ToolExceedingTimeout_IsBounded_AndReportedAsInfrastructure()
     {
         var options = new ExternalToolAuditorOptions

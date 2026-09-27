@@ -25,7 +25,8 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// — consistent with every other auditor. <c>MinimumSeverity</c> only drops
 /// findings, it never raises them.</para>
 ///
-/// <para><b>Exit-code convention (verified against gosec 2.28.0).</b> gosec
+/// <para><b>Exit-code convention (verified against the gosec 2.28.0 source;
+/// live-checked against a 2.22.x binary).</b> gosec
 /// does NOT follow the "1 = findings, 2 = could not run" convention:
 /// <c>computeExitCode</c> returns <c>1</c> whenever there are unsuppressed
 /// issues <em>or</em> per-package analysis errors, and every post-parse
@@ -64,7 +65,27 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// when the operator options are bound (see <see cref="InitializeAsync"/>);
 /// the dedicated keys (<c>ConfigPath</c>, <c>ScanTests</c>,
 /// <c>BuildTags</c>) cover the flags operators actually need, and path-like
-/// extras still work as additional scan patterns.</para>
+/// extras still work as additional scan patterns — normalized to a
+/// <c>./</c>-relative form first, because gosec forwards patterns to
+/// <c>packages.Load</c>, where a bare pattern (<c>std</c>, <c>all</c>,
+/// <c>golang.org/x/...</c>) resolves against GOROOT or the module build
+/// list — code outside the audited worktree.</para>
+///
+/// <para><b>Nested module roots evade <c>./...</c>.</b>
+/// <c>go list ./...</c> — the loader behind gosec — does not descend into a
+/// directory carrying its own <c>go.mod</c>: each is a separate module
+/// root, skipped with no error recorded, so subject code under
+/// <c>tools/</c>, <c>services/</c> or any nested module would ride a
+/// passing verdict. A bounded pre-scan therefore enumerates <c>go.mod</c>
+/// files below the worktree root (vendor/, testdata/, dot- and
+/// underscore-prefixed directories pruned — the go tool never reaches them
+/// either) and fails closed listing any roots beyond the root module's.
+/// Operators who accept the residual scope — or who cover the nested
+/// modules with a <c>go.work</c> workspace the loader resolves — set
+/// <c>AllowNestedModules</c>, which downgrades the gate to a warning log
+/// naming the roots. Files behind build constraints the sandbox does not
+/// satisfy (other GOOS/GOARCH, custom <c>//go:build</c> tags not in
+/// <c>BuildTags</c>) are likewise never analyzed.</para>
 ///
 /// <para><b>Version pin.</b> gosec's rule set and SARIF shape change between
 /// releases, so findings are only meaningful from the build the auditor was
@@ -84,7 +105,12 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// Operators who deliberately trust repo-authored suppression set
 /// <c>TrustRepositorySuppression</c>. gosec loads no repository-authored
 /// config file on its own — <c>-conf</c> is explicit-only, so no repo file
-/// can steer the ruleset.</para>
+/// can steer the ruleset. The same posture applies to
+/// <c>-exclude-generated</c>: the <c>// Code generated … DO NOT EDIT</c>
+/// marker is authored in the repository too, so one comment line would
+/// erase a file from analysis — generated files are scanned by default and
+/// the marker only takes effect when an operator sets
+/// <c>ExcludeGenerated</c>.</para>
 ///
 /// <para><b>Environment hygiene.</b> gosec's opt-in AI fix feature
 /// (<c>GOSEC_AI_PROVIDER</c>/<c>GOSEC_AI_API_KEY</c>/<c>GOSEC_AI_BASE_URL</c>)
@@ -93,16 +119,18 @@ namespace CodeyBox.GosecAuditorPlugin;
 /// process so the scan is always the deterministic, offline analysis.</para>
 ///
 /// <para><b>Scope and defaults.</b> The scan is <c>./...</c> — every Go
-/// package under the worktree root. gosec itself already excludes
-/// <c>vendor/</c> and <c>.git/</c> at scan time and the Go package loader
-/// never sees <c>testdata/</c>; on top of that the auditor passes
-/// <c>-exclude-generated</c> so files carrying the <c>// Code generated …
-/// DO NOT EDIT</c> marker are not analyzed, and drops findings under
-/// vendored prefixes as a finding-level backstop — problems in vendored or
-/// generated code belong to upstream tooling, not the change under audit.
-/// Test files are not scanned by default (<c>ScanTests</c> opt-in). A
-/// repository with no loadable Go packages fails loudly as infrastructure
-/// ("No packages found"), never as a pass.</para>
+/// package under the worktree root, gated by the nested-module probe
+/// above. gosec itself already excludes <c>vendor/</c> and <c>.git/</c> at
+/// scan time and the Go package loader never sees <c>testdata/</c>; a
+/// finding-level <c>vendor/</c> backstop is the only default
+/// <c>ExcludePaths</c> entry — vendor semantics are tool-enforced, while a
+/// subject-named directory (<c>third_party/</c>, …) is ordinary shippable
+/// code and excluding it would be a subject-controlled suppression
+/// channel. Generated files ARE analyzed: their marker is repo-authored
+/// and dropping it by default would be the same channel (<c>ExcludeGenerated</c>
+/// opts out). Test files are not scanned by default (<c>ScanTests</c>
+/// opt-in). A repository with no loadable Go packages fails loudly as
+/// infrastructure ("No packages found"), never as a pass.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: PluginId,
@@ -158,11 +186,15 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     public const string BuildTagsKey = "BuildTags";
 
     /// <summary>
-    /// Scoped-config boolean: when true, omits <c>-exclude-generated</c> so
-    /// generated files (<c>// Code generated … DO NOT EDIT</c>) are analyzed.
-    /// Default false — generated code is not the change under audit.
+    /// Scoped-config boolean: when true, passes <c>-exclude-generated</c> so
+    /// files carrying the <c>// Code generated … DO NOT EDIT</c> marker are
+    /// skipped. Default false — the marker is authored inside the audited
+    /// repository, so honoring it by default would let the audit subject
+    /// erase a file from analysis with one comment line, the same
+    /// suppression class <c>-nosec</c> blocks. Generated code is scanned
+    /// unless the operator opts out here.
     /// </summary>
-    public const string IncludeGeneratedKey = "IncludeGenerated";
+    public const string ExcludeGeneratedKey = "ExcludeGenerated";
 
     /// <summary>
     /// Scoped-config key opting in to repository-authored suppression —
@@ -171,6 +203,28 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// </summary>
     internal const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
 
+    /// <summary>
+    /// Scoped-config boolean acknowledging nested Go module roots. Default
+    /// false: a <c>go.mod</c> below the worktree root fails the run
+    /// deterministically because <c>go list ./...</c> never descends into a
+    /// nested module root — code there is silently unscanned. When true the
+    /// run proceeds and the uncovered roots are logged as a warning; the
+    /// operator accepts the residual scope.
+    /// </summary>
+    internal const string AllowNestedModulesKey = "AllowNestedModules";
+
+    // Enumerates candidate nested Go module roots: every go.mod below the
+    // worktree root. Directories the go tool itself never reaches — vendor,
+    // testdata, dot- and underscore-prefixed — are pruned so a go.mod in a
+    // tree the scan cannot see anyway is not a false positive; the root
+    // module's own ./go.mod is filtered out by the caller. find does not
+    // follow symlinks, matching `go list`.
+    private const string NestedModuleProbeScript =
+        "find . -mindepth 1 -type d \\( -name vendor -o -name testdata -o -name '.*' -o -name '_*' \\) -prune -o -type f -name go.mod -print";
+
+    private const int MaxModuleRootsInMessage = 8;
+    private const int ModuleRootMaxChars = 120;
+
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
         // 0 = clean run; 1 = ran with findings or analysis errors, OR could
@@ -178,10 +232,15 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
         // else (2 usage error, 126/127 cannot-execute, unknown) is
         // infrastructure.
         FindingsExitCodes = new HashSet<int> { 0, IssuesOrErrorsExitCode },
-        // gosec already skips vendor/ and .git/ at scan time via its built-in
-        // -exclude-dir defaults; these entries are a finding-level backstop.
-        // Findings there describe upstream code, not the change under audit.
-        ExcludePaths = ["vendor/", "third_party/"],
+        // vendor/ is the only default exclusion: Go tooling enforces its
+        // meaning (packages beneath it are never part of the build and
+        // gosec already skips them at scan time), so this is a finding-level
+        // backstop, not a suppression surface. No name-based exclusions
+        // beyond it — a directory like third_party/ is ordinary shippable
+        // code whose name the audit subject chooses, and dropping its
+        // findings would be a subject-controlled suppression channel.
+        // Operators add their own paths via ExcludePaths in scoped config.
+        ExcludePaths = ["vendor/"],
     };
 
     // Pre-initialization accessor: the shared defaults carry no extras, so
@@ -192,8 +251,10 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
     private Func<string?> _configPath = static () => null;
     private Func<bool> _scanTests = static () => false;
     private Func<string?> _buildTags = static () => null;
-    private Func<bool> _includeGenerated = static () => false;
+    private Func<bool> _excludeGenerated = static () => false;
     private Func<bool> _trustRepositorySuppression = static () => false;
+    private Func<bool> _allowNestedModules = static () => false;
+    private ILogger? _logger;
 
     /// <inheritdoc />
     public override string Name => "codeybox:gosec";
@@ -255,9 +316,11 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
             "-log", "/dev/null",
         };
 
-        // Generated files (// Code generated … DO NOT EDIT) are not the
-        // change under audit.
-        if (!_includeGenerated())
+        // -exclude-generated is operator opt-in only: the "Code generated …
+        // DO NOT EDIT" marker is authored inside the audited repository, so
+        // honoring it by default would let the subject remove a file from
+        // analysis with one comment line.
+        if (_excludeGenerated())
             args.Add("-exclude-generated");
 
         if (_scanTests())
@@ -305,6 +368,122 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
             ["GOSEC_AI_BASE_URL"] = string.Empty,
         };
 
+    /// <summary>
+    /// Pre-scan scope gate: <c>go list ./...</c> — the loader behind gosec —
+    /// does not descend into a directory carrying its own <c>go.mod</c>
+    /// (each is a separate module root, skipped with no error recorded), so
+    /// subject code under a nested module would be silently unscanned while
+    /// the run still passes. A bounded <c>find</c> enumerates every go.mod
+    /// below the worktree root; any root beyond the root module's fails the
+    /// audit deterministically, unless the operator set
+    /// <see cref="AllowNestedModulesKey"/>, in which case the uncovered
+    /// roots are logged and the run proceeds. Both outcomes happen before
+    /// the scan: an unscanned subtree must never ride a passing verdict.
+    /// </summary>
+    protected override async Task VerifyToolAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var nestedRoots = await ProbeNestedModuleRootsAsync(
+            sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
+        if (nestedRoots.Count == 0)
+            return;
+
+        var named = string.Join(
+            ", ",
+            nestedRoots.Take(MaxModuleRootsInMessage)
+                .Select(root => "'" + ToolOutputText.SingleLine(root, ModuleRootMaxChars) + "'"));
+        var remainder = nestedRoots.Count > MaxModuleRootsInMessage
+            ? $", … +{nestedRoots.Count - MaxModuleRootsInMessage} more"
+            : string.Empty;
+
+        if (_allowNestedModules())
+        {
+            _logger?.LogWarning(
+                "GosecAuditor: {NestedModuleCount} nested Go module root(s) are outside the './...' "
+                + "scan scope (AllowNestedModules): {NestedModuleRoots}{More}",
+                nestedRoots.Count, named, remainder);
+            return;
+        }
+
+        throw new AuditUnavailableException(
+            $"could-not-verify: audit tool '{tool}' cannot prove its scan scope: the worktree holds "
+            + $"{nestedRoots.Count} nested Go module root(s) ({named}{remainder}), and 'go list ./...' "
+            + "never descends into a directory carrying its own go.mod — code there is silently "
+            + "unscanned, so the audit cannot pass on a partial tree. Merge the modules into the "
+            + "root module, or acknowledge the residual scope via "
+            + $"CodeyBox:Plugins:{PluginId}:{AllowNestedModulesKey}.")
+        { IsDeterministic = true };
+    }
+
+    /// <summary>
+    /// Bounded probe listing the directories under the worktree root that
+    /// carry their own <c>go.mod</c>. The <c>find</c> prunes directories the
+    /// go tool itself never descends into (vendor, testdata, dot- and
+    /// underscore-prefixed), so only roots that look like part of the
+    /// scanned tree — but are silently skipped — come back. The root
+    /// module's own <c>./go.mod</c> carries no intermediate directory and
+    /// is filtered out. Fails closed: a transport failure or a non-zero
+    /// exit (including the kill fired when output exceeds the bound) is
+    /// infrastructure, never "no nested modules". Output lines are
+    /// untrusted — they are only ever sanitized into a message or log,
+    /// never used as paths.
+    /// </summary>
+    private static async Task<IReadOnlyList<string>> ProbeNestedModuleRootsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "module-scope probe",
+            new SandboxExec
+            {
+                Argv = ["sh", "-c", NestedModuleProbeScript],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' module-scope probe could not run: the sandbox "
+                + "exec transport was unavailable.");
+        if (result.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' could not enumerate nested Go module roots "
+                + $"(exit {result.ExitCode}) — an unverifiable scan scope must not ride a passing "
+                + "verdict.",
+                result.ExitCode,
+                result.Stdout + "\n" + result.Stderr);
+
+        var roots = new List<string>();
+        foreach (var line in result.Stdout.Split(
+            '\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            // find prints './<dir>/go.mod'; the root module's own go.mod is
+            // the scan's anchor, not a coverage gap.
+            if (!line.StartsWith("./", StringComparison.Ordinal))
+                continue;
+            var relative = line[2..];
+            if (!relative.EndsWith("/go.mod", StringComparison.Ordinal))
+                continue;
+            var dir = relative[..^"/go.mod".Length];
+            if (dir.Length > 0)
+                roots.Add(dir);
+        }
+        return roots;
+    }
+
     /// <inheritdoc />
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)
     {
@@ -323,10 +502,13 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
         _configPath = () => scoped[ConfigPathKey];
         _scanTests = () => bool.TryParse(scoped[ScanTestsKey], out var scan) && scan;
         _buildTags = () => scoped[BuildTagsKey];
-        _includeGenerated = () =>
-            bool.TryParse(scoped[IncludeGeneratedKey], out var include) && include;
+        _excludeGenerated = () =>
+            bool.TryParse(scoped[ExcludeGeneratedKey], out var exclude) && exclude;
         _trustRepositorySuppression = () =>
             bool.TryParse(scoped[TrustRepositorySuppressionKey], out var trust) && trust;
+        _allowNestedModules = () =>
+            bool.TryParse(scoped[AllowNestedModulesKey], out var allow) && allow;
+        _logger = context.Logger;
         context.Logger.LogInformation(
             "GosecAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
@@ -334,17 +516,22 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     /// <summary>
     /// Validates <see cref="ExternalToolAuditorOptions.ExtraArguments"/> and
-    /// returns the normalized list to forward — a pure function; the options
-    /// object is never mutated. Entries land after the positional
-    /// <c>./...</c> scan target, and Go's flag package stops flag parsing
-    /// at the first positional — a flag-shaped extra would be silently
-    /// swallowed as a (nonexistent) package path instead of reaching
-    /// gosec's flag parser. Flag-shaped and tree-escaping entries are
-    /// rejected deterministically rather than letting configured behavior
-    /// evaporate, and the forwarded argv carries the trimmed
-    /// <c>/</c>-separated pattern that was validated — not a raw entry
-    /// whose padding gosec would read as a different, nonexistent path.
-    /// Package-pattern entries (e.g. <c>./pkg/...</c>) pass through.
+    /// returns the normalized list to forward — a pure function; the shared
+    /// defaults and the caller's list are never mutated. Entries land after
+    /// the positional <c>./...</c> scan target, and Go's flag package stops
+    /// flag parsing at the first positional — a flag-shaped extra would be
+    /// silently swallowed as a (nonexistent) package path instead of
+    /// reaching gosec's flag parser. Flag-shaped and tree-escaping entries
+    /// are rejected deterministically rather than letting configured
+    /// behavior evaporate. Surviving entries are confined to the worktree:
+    /// gosec forwards them to <c>packages.Load</c>, where only a
+    /// <c>./</c>-prefixed pattern is directory-relative — a bare pattern
+    /// (<c>std</c>, <c>all</c>, <c>golang.org/x/...</c>) would resolve
+    /// against GOROOT or the module build list, outside the audited tree —
+    /// so each forwarded pattern is normalized to its <c>./</c>-relative
+    /// form, and the argv carries the validated pattern rather than a raw
+    /// entry whose padding or slashes gosec would read as a different,
+    /// nonexistent path.
     /// </summary>
     private static IReadOnlyList<string> NormalizePackagePatterns(IReadOnlyList<string> extraArguments)
     {
@@ -367,6 +554,8 @@ public sealed class GosecAuditor : ExternalToolAuditorBase, IPluginInitializer
                     + "severity/rule/path options under "
                     + $"CodeyBox:Plugins:{PluginId} instead.")
                 { IsDeterministic = true };
+            if (!pattern.StartsWith("./", StringComparison.Ordinal))
+                pattern = "./" + pattern;
             normalized.Add(pattern);
         }
         return normalized;

@@ -18,9 +18,11 @@ namespace CodeyBox.Tests;
 /// infrastructure), findings carry the gosec rule id and file:line,
 /// severity goes through the declared mapping on gosec's native
 /// HIGH/MEDIUM/LOW vocabulary — recovered from rule descriptors, not the
-/// flattened SARIF level — and the plugin is inert until enabled. Every
-/// run is dispatched through <see cref="IAuditor"/> so the version-pin
-/// precondition cannot be bypassed by interface dispatch.
+/// flattened SARIF level — and the plugin is inert until enabled. A
+/// pre-scan <c>find</c> gate fails closed on nested Go module roots, which
+/// <c>go list ./...</c> silently skips. Every run is dispatched through
+/// <see cref="IAuditor"/> so the version-pin precondition cannot be
+/// bypassed by interface dispatch.
 /// </summary>
 public sealed class GosecAuditorTests
 {
@@ -128,7 +130,7 @@ public sealed class GosecAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(
@@ -164,7 +166,10 @@ public sealed class GosecAuditorTests
         var log = argv.ToList().IndexOf("-log");
         Assert.True(log >= 0 && log + 1 < argv.Count);
         Assert.Equal("/dev/null", argv[log + 1]);
-        Assert.Contains("-exclude-generated", argv);
+        // Generated files are scanned by default: the "Code generated …
+        // DO NOT EDIT" marker is repo-authored, so honoring it by default
+        // would let the subject erase a file from analysis.
+        Assert.DoesNotContain("-exclude-generated", argv);
         // Positional ./... — required: gosec relativizes SARIF artifact URIs
         // against the positional scan roots, so -r alone would emit empty
         // locations. It must come after every flag.
@@ -245,13 +250,16 @@ public sealed class GosecAuditorTests
         Assert.Contains("hidden/evil.go", masked.Message, StringComparison.Ordinal);
 
         // An absent or unreadable channel cannot prove the map is empty —
-        // findings alone never suffice for a verdict.
+        // findings alone never suffice for a verdict. A null map is never
+        // produced by a healthy run either (gosec initializes the map), so
+        // it fails closed like every other non-object shape.
         foreach (var stderr in new[]
         {
             "",
             "not json",
             "{ }",
             """{ "Golang errors": "not-an-object" }""",
+            """{ "Golang errors": null }""",
         })
         {
             await Assert.ThrowsAsync<AuditUnavailableException>(
@@ -319,7 +327,7 @@ public sealed class GosecAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(
@@ -349,7 +357,7 @@ public sealed class GosecAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
@@ -411,7 +419,7 @@ public sealed class GosecAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
@@ -422,6 +430,39 @@ public sealed class GosecAuditorTests
         var argv = scanExec!.Argv;
         Assert.Equal("./subpkg/...", argv[^1]);
         Assert.Equal("./...", argv[^2]);
+    }
+
+    [Fact]
+    public async Task BarePackagePatternExtras_AreConfinedToTheWorktree()
+    {
+        // gosec hands scan patterns to packages.Load, where only a ./-relative
+        // pattern is directory-relative: a bare "std", "all", or
+        // "golang.org/x/..." would resolve against GOROOT or the module build
+        // list — outside the audited tree. Bare entries are normalized to
+        // their ./ form so an extra can never widen scope beyond the worktree.
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "subpkg/..., std",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
+        });
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        var argv = scanExec!.Argv;
+        Assert.Equal("./std", argv[^1]);
+        Assert.Equal("./subpkg/...", argv[^2]);
+        Assert.Equal("./...", argv[^3]);
     }
 
     [Fact]
@@ -465,7 +506,7 @@ public sealed class GosecAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
@@ -474,6 +515,140 @@ public sealed class GosecAuditorTests
         await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
 
         Assert.Equal("./subpkg/...", scanExec!.Argv[^1]);
+    }
+
+    [Fact]
+    public async Task ExcludeGenerated_OptsIntoRepoAuthoredMarkerSkipping()
+    {
+        // Default off — honoring the "Code generated … DO NOT EDIT" marker
+        // by default would let the audit subject erase a file from analysis
+        // with one comment line. The operator opt-in passes the flag.
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:" + GosecAuditor.ExcludeGeneratedKey] = "true",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
+        });
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.Contains("-exclude-generated", scanExec!.Argv);
+    }
+
+    [Fact]
+    public async Task NestedModuleRoots_FailClosed_BeforeTheScanRuns()
+    {
+        // `go list ./...` never descends into a directory carrying its own
+        // go.mod — a separate module root is skipped with no error recorded,
+        // so subject code there would ride a passing verdict. The pre-scan
+        // probe enumerates every go.mod under the worktree and fails closed
+        // listing the roots beyond the root module's.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsModuleProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    0, "./go.mod\n./services/hidden/go.mod\n./tools/x/go.mod\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
+        });
+
+        IAuditor auditor = new GosecAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("nested Go module root", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("services/hidden", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("tools/x", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task NestedModuleRoots_PrunedTreesDoNotTripTheGate()
+    {
+        // go.mod files in trees the go tool never reaches — vendor/,
+        // testdata/, dot- and underscore-prefixed dirs — are pruned by the
+        // probe, so only the root module's remains and the scan proceeds.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsModuleProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "./go.mod\n", ""));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
+        });
+
+        IAuditor auditor = new GosecAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+    }
+
+    [Fact]
+    public async Task NestedModuleRoots_OperatorAcknowledgement_ProceedsWithWarning()
+    {
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:" + GosecAuditor.AllowNestedModulesKey] = "true",
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsModuleProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    0, "./go.mod\n./services/hidden/go.mod\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ErrorsJsonEmpty));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(1, scanExecs);
+    }
+
+    [Fact]
+    public async Task ModuleScopeProbe_FailsClosed_OnProbeFailure()
+    {
+        IAuditor auditor = new GosecAuditor();
+
+        // A probe that cannot complete cannot prove the scan covers the
+        // tree — unverifiable scope is infrastructure, never a pass.
+        var failing = new FakeSandbox((exec, _) => Task.FromResult(
+            IsModuleProbe(exec)
+                ? new SandboxExecResult(1, "", "find: unknown predicate")
+                : Ok(exec)));
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(failing, "/work", FakeContext(), CancellationToken.None));
+        Assert.Contains("module roots", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        var unavailable = new FakeSandbox((exec, _) => Task.FromResult(
+            IsModuleProbe(exec)
+                ? new SandboxExecResult(0, "", "", ExecutionUnavailable: true)
+                : Ok(exec)));
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(unavailable, "/work", FakeContext(), CancellationToken.None));
     }
 
     [Fact]
@@ -521,7 +696,7 @@ public sealed class GosecAuditorTests
         var sandbox = new FakeSandbox((exec, _) => Task.FromResult(
             IsVersionProbe(exec)
                 ? new SandboxExecResult(0, "Version: 2.27.1\nGit tag: v2.27.1\nBuild date: 2026-06-01\n", "")
-                : IsPresenceProbe(exec)
+                : IsPresenceProbe(exec) || IsModuleProbe(exec)
                     ? new SandboxExecResult(0, "", "")
                     : new SandboxExecResult(GosecAuditor.IssuesOrErrorsExitCode, SarifWithWeakRand, ErrorsJsonEmpty)));
 
@@ -798,7 +973,7 @@ public sealed class GosecAuditorTests
 
     private static FakeSandbox HealthyTool(int scanExit, string scanStdout, string scanStderr = ErrorsJsonEmpty)
         => new((exec, _) => Task.FromResult(
-            IsPresenceProbe(exec) || IsVersionProbe(exec)
+            IsPresenceProbe(exec) || IsVersionProbe(exec) || IsModuleProbe(exec)
                 ? Ok(exec)
                 : new SandboxExecResult(scanExit, scanStdout, scanStderr)));
 
@@ -810,6 +985,14 @@ public sealed class GosecAuditorTests
 
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "gosec" && exec.Argv[1] == "-version";
+
+    // The pre-scan nested-module gate: a `find` enumerating go.mod files
+    // under the worktree root. An empty stdout means "no nested modules".
+    private static bool IsModuleProbe(SandboxExec exec)
+        => exec.Argv.Count == 3
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2].Contains("go.mod", StringComparison.Ordinal);
 
     private static async Task<bool> BinaryOnPathAsync(string binary)
         => (await TryRunProbeAsync(binary, "version").ConfigureAwait(false))?.ExitCode == 0;
