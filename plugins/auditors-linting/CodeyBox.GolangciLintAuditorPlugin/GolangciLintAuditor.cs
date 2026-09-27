@@ -75,6 +75,27 @@ namespace CodeyBox.GolangciLintAuditorPlugin;
 /// with the audit as a signal to inspect the diff's suppression
 /// comments.</para>
 ///
+/// <para><b>Repository-controlled configuration: code execution and file
+/// writes.</b> Beyond suppression, the repository's <c>.golangci.*</c>
+/// configuration is executable in two further senses, and it is loaded by
+/// default config discovery because the scan does not pass
+/// <c>--no-config</c> unless the operator opts out (see
+/// <c>TrustRepositoryConfig</c>): (a) custom-linter entries under
+/// <c>linters.settings.custom</c> whose <c>path</c> points at a Go plugin
+/// (a <c>.so</c> shipped next to the config) are loaded in-process by the
+/// tool, so a repo-authored config runs repo-authored native code inside
+/// the audit sandbox; (b) <c>output.formats.&lt;format&gt;.path</c> entries
+/// make the tool write report files to the configured paths — the auditor
+/// pins only <c>--output.json.path stdout</c>, so any additional
+/// file-writing format the repo config declares still fires. The auditor
+/// runs with <see cref="AuditCapabilities.None"/> (no agent credentials,
+/// no network), which bounds exfiltration but does not break this
+/// source-to-sink path: a hostile config can still tamper with the sandbox
+/// the audit runs in. Operators who need a fully operator-owned run set
+/// <c>TrustRepositoryConfig</c> to <c>false</c> in scoped config — the scan
+/// then passes <c>--no-config</c> so the repo's config is not loaded at
+/// all — and pin an out-of-repo configuration via <c>ConfigPath</c>.</para>
+///
 /// <para><b>Scope and defaults.</b> The scan is
 /// <c>golangci-lint run --output.json.path stdout --show-stats=false
 /// ./...</c>: the whole audited tree as Go packages, with the tool's own
@@ -116,6 +137,17 @@ public sealed class GolangciLintAuditor : ExternalToolAuditorBase, IPluginInitia
     /// <summary>Scoped-config key for an explicit golangci-lint configuration file path.</summary>
     public const string ConfigPathKey = "ConfigPath";
 
+    /// <summary>
+    /// Scoped-config key opting out of repository-authored tool configuration.
+    /// Default true: the audited repo's <c>.golangci.*</c> config is loaded by
+    /// the tool's default discovery, because linting against the project's own
+    /// lint contract is the meaningful check. Set to <c>false</c> for a fully
+    /// operator-owned run: the scan passes <c>--no-config</c> so the repo's
+    /// config — including its custom-linter plugins and report file paths —
+    /// is not loaded at all. Pair with <see cref="ConfigPathKey"/>.
+    /// </summary>
+    internal const string TrustRepositoryConfigKey = "TrustRepositoryConfig";
+
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
         // 0 = ran clean; 1 = ran with issues found (the default of the
@@ -135,6 +167,7 @@ public sealed class GolangciLintAuditor : ExternalToolAuditorBase, IPluginInitia
     private Func<ExternalToolAuditorOptions> _optionsAccessor = () => AuditorDefaults;
     private Func<string?> _expectedVersion = static () => DefaultExpectedVersion;
     private Func<string?> _configPath = static () => null;
+    private Func<bool> _trustRepositoryConfig = static () => true;
 
     /// <inheritdoc />
     public override string Name => "codeybox:golangci-lint";
@@ -218,6 +251,18 @@ public sealed class GolangciLintAuditor : ExternalToolAuditorBase, IPluginInitia
             args.Add(configPath.Trim());
         }
 
+        // The audited repository authors the .golangci.* config loaded by
+        // default discovery, and that config can point the tool at native
+        // plugin code and at report file paths (see the class doc). Keep
+        // loading it unless the operator opts out; the hardened posture is
+        // TrustRepositoryConfig=false (adds --no-config here) plus an
+        // operator-pinned ConfigPath above.
+        if (!_trustRepositoryConfig()
+            && !ExtraArgumentsSupplyFlag(options, "--no-config"))
+        {
+            args.Add("--no-config");
+        }
+
         // The whole audited tree as Go packages; the tool's own
         // configuration decides which linters run and which files count.
         args.Add("./...");
@@ -232,6 +277,10 @@ public sealed class GolangciLintAuditor : ExternalToolAuditorBase, IPluginInitia
         _optionsAccessor = () => ExternalToolAuditorOptions.Bind(scoped, AuditorDefaults);
         _expectedVersion = () => scoped[ToolVersionPin.ExpectedVersionKey];
         _configPath = () => scoped[ConfigPathKey];
+        // Unset or unparseable keeps the historical default: the repo's own
+        // config is trusted (loaded by tool discovery).
+        _trustRepositoryConfig = () =>
+            !bool.TryParse(scoped[TrustRepositoryConfigKey], out var trust) || trust;
         context.Logger.LogInformation(
             "GolangciLintAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;

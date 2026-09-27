@@ -147,7 +147,8 @@ Scoped under `CodeyBox:Plugins:codeybox.golangci-lint`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `2.14.0` | Pinned golangci-lint release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `ConfigPath` | `null` | Path passed to `--config` — an operator-pinned configuration outside the repository, or a repo file overriding golangci-lint's default config discovery. Ignored when `ExtraArguments` already supplies `--config`/`-c`. Pair with `--no-config` in `ExtraArguments` to keep the repo's own config fully out of the run. |
+| `ConfigPath` | `null` | Path passed to `--config` — an operator-pinned configuration outside the repository, or a repo file overriding golangci-lint's default config discovery. Ignored when `ExtraArguments` already supplies `--config`/`-c`. To keep the repo's own config fully out of the run, set `TrustRepositoryConfig` to `false` (which passes `--no-config`) rather than hand-rolling `--no-config` in `ExtraArguments`. |
+| `TrustRepositoryConfig` | `true` | Whether the audited repo's `.golangci.*` config is loaded by the tool's default discovery. Keep `true` to lint against the project's own lint contract. Set to `false` for a fully operator-owned run: the scan passes `--no-config` (unless `ExtraArguments` already supplies it) so the repo's config — including its custom-linter plugins and report file paths — is not loaded at all; pair with `ConfigPath`. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
 | `IncludedRules` / `ExcludedRules` | — | Exact linter names to keep/drop (e.g. `errcheck`, `govet`, `staticcheck`). |
 | `ExcludePaths` | `vendor/`, `third_party/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
@@ -166,6 +167,23 @@ and changes to it are visible in the audited diff. For a fully
 operator-owned gate, pin an out-of-repo config via `ConfigPath` (which
 still leaves `//nolint` honored) and review suppression comments in the
 diff.
+
+**Repository-controlled configuration can also execute code and write
+files — not just suppress findings.** The repo's `.golangci.*` config,
+loaded by default discovery, is executable in two further senses: (a)
+custom-linter entries under `linters.settings.custom` whose `path` points
+at a Go plugin (a `.so` shipped next to the config) are loaded
+in-process by the tool, so a repo-authored config runs repo-authored
+native code inside the audit sandbox; (b) `output.formats.<format>.path`
+entries make the tool write report files to the configured paths — the
+auditor pins only `--output.json.path stdout`, so any additional
+file-writing format the repo config declares still fires. The auditor
+runs with no agent credentials and no network, which bounds
+exfiltration but does not break this source-to-sink path: a hostile
+config can still tamper with the sandbox the audit runs in. Operators
+who need a fully operator-owned run set `TrustRepositoryConfig` to
+`false` (the scan then passes `--no-config`, so the repo's config is not
+loaded at all) and pin an out-of-repo configuration via `ConfigPath`.
 
 ## Default scope
 

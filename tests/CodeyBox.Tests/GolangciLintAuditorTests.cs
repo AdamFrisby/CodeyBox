@@ -18,7 +18,7 @@ namespace CodeyBox.Tests;
 ///   infrastructure via the exit code, not a clean pass.
 /// - golangci-lint JSON maps to findings with linter names, locations, and mapped severity.
 /// - Raw tool severities go through the declared mapping; empty severity (the common case) maps to Warning.
-/// - Default exclusions (vendor/ + third_party/) and scoped options (ExpectedVersion, ConfigPath).
+/// - Default exclusions (vendor/ + third_party/) and scoped options (ExpectedVersion, ConfigPath, TrustRepositoryConfig).
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_golangci-lint", "true")].
 /// </summary>
@@ -563,6 +563,87 @@ public sealed class GolangciLintAuditorTests
         var configIndex = argv.ToList().IndexOf("--config");
         Assert.True(configIndex >= 0 && configIndex + 1 < argv.Count);
         Assert.Equal("/opt/codeybox/golangci.operator.yml", argv[configIndex + 1]);
+    }
+
+    [Fact]
+    public async Task ScopedConfiguration_TrustRepositoryConfig_DefaultKeepsRepoConfigDiscovery()
+    {
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new GolangciLintAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>()),
+            CancellationToken.None);
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        Assert.DoesNotContain("--no-config", scanExec!.Argv);
+    }
+
+    [Fact]
+    public async Task ScopedConfiguration_TrustRepositoryConfig_FalsePassesNoConfig_AlongsideOperatorConfig()
+    {
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new GolangciLintAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:TrustRepositoryConfig"] = "false",
+                ["Scoped:ConfigPath"] = "/opt/codeybox/golangci.operator.yml",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        Assert.Equal(1, scanExec!.Argv.Count(a => a == "--no-config"));
+        var configIndex = scanExec.Argv.ToList().IndexOf("--config");
+        Assert.True(configIndex >= 0 && configIndex + 1 < scanExec.Argv.Count);
+        Assert.Equal("/opt/codeybox/golangci.operator.yml", scanExec.Argv[configIndex + 1]);
+    }
+
+    [Fact]
+    public async Task ScopedConfiguration_TrustRepositoryConfig_FalseDoesNotDuplicateOperatorNoConfig()
+    {
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new GolangciLintAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:TrustRepositoryConfig"] = "false",
+                ["Scoped:ExtraArguments"] = "--no-config",
+            }),
+            CancellationToken.None);
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        Assert.Equal(1, scanExec!.Argv.Count(a => a == "--no-config"));
     }
 
     [Fact]
