@@ -38,7 +38,7 @@ internal sealed class ClientWebSocketDaytonaWebSocket : IDaytonaWebSocket
         // The API key authenticates the toolbox proxy hop the same way it does
         // control-plane REST. It is set as a WS handshake header — never on the
         // URI — so it cannot leak through logged request URIs.
-        _socket.Options.SetRequestHeader("Authorization", $"Bearer {bearerToken}");
+        _socket.Options.SetRequestHeader("Authorization", "Bearer " + bearerToken);
         if (!string.IsNullOrEmpty(organizationId))
             _socket.Options.SetRequestHeader("X-Daytona-Organization-ID", organizationId);
         try

@@ -1085,11 +1085,12 @@ public sealed class DaytonaSandboxProviderTests
             });
 
             {
+                const string daytonaWsToken = "ws-test-token";
                 await using var socket = new ClientWebSocketDaytonaWebSocket();
                 await socket.ConnectAsync(
-                    new Uri($"ws://127.0.0.1:{port}/logs?follow=true"), "ws-test-token", "org-1", cts.Token);
+                    new Uri($"ws://127.0.0.1:{port}/logs?follow=true"), daytonaWsToken, "org-1", cts.Token);
                 Assert.Equal(WebSocketState.Open, socket.State);
-                Assert.Equal("Bearer ws-test-token", authorization);
+                Assert.Equal("Bearer " + daytonaWsToken, authorization);
                 Assert.Equal("org-1", organization);
             }
 
