@@ -117,3 +117,9 @@ not; `NotEnforced` providers are logged as a warning stating the restriction.
 - The early static configuration gate only knows built-in kinds; the authoritative
   platform-support and workload-trust checks run at provider construction with the
   live plugin instance.
+
+## In-repo provider plugins
+
+- [`daytona-sandbox-plugin.md`](daytona-sandbox-plugin.md) — hosted Daytona
+  sandboxes (`ProviderKind: daytona`; `NotEnforced` classification, baseline
+  snapshots, suspend/resume, retain/adopt).

@@ -93,6 +93,7 @@
     <Project Path="plugins/notifications/CodeyBox.SlackPlugin/CodeyBox.SlackPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.GotifyPlugin/CodeyBox.GotifyPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.NtfyPlugin/CodeyBox.NtfyPlugin.csproj" />
+    <Project Path="plugins/sandbox/CodeyBox.DaytonaSandboxPlugin/CodeyBox.DaytonaSandboxPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />
