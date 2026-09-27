@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.EslintAuditorPlugin;
 
@@ -129,26 +130,5 @@ internal sealed class EslintJsonOutputParser : IExternalToolOutputParser
     }
 
     private static string? NormalizeFilePath(string? raw, string? scanRoot)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return null;
-        var path = raw.Trim().Replace('\\', '/');
-        var root = scanRoot?.Trim().Replace('\\', '/').TrimEnd('/');
-        if (!string.IsNullOrEmpty(root)
-            && path.Length > root.Length + 1
-            && path.StartsWith(root + "/", StringComparison.Ordinal))
-            path = path[(root.Length + 1)..];
-        return path;
-    }
-
-    private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        => string.IsNullOrWhiteSpace(raw) ? null : RelativizeToRoot(raw, scanRoot);
 }

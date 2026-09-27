@@ -28,6 +28,13 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class E2eExecutionTests : IDisposable
 {
+    // Shared bound for waits that observe dispatcher/store progress (status
+    // transitions, dispatch drain, exec-start signals). It exists only to
+    // turn a true hang into a test failure — it is not a performance
+    // assertion — so it must tolerate a CI runner whose thread pool is
+    // saturated by the rest of the parallel suite.
+    private static readonly TimeSpan ProgressWaitBudget = TimeSpan.FromSeconds(30);
+
     private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-e2e-");
     private readonly string _dbPath;
     private readonly SqliteWorkItemStore _itemStore;
@@ -1185,7 +1192,7 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.False(fourth.IsCompleted);
 
         await slot1.DisposeAsync();
-        var slot4 = await fourth.WaitAsync(TimeSpan.FromSeconds(2));
+        var slot4 = await fourth.WaitAsync(ProgressWaitBudget);
         Assert.Equal(3, pool.InFlight);
 
         await slot2.DisposeAsync();
@@ -1442,7 +1449,7 @@ public sealed class E2eExecutionTests : IDisposable
         }
 
         // Wait for all runs to terminalise.
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        var deadline = DateTimeOffset.UtcNow + ProgressWaitBudget;
         while (DateTimeOffset.UtcNow < deadline)
         {
             var terminal = 0;
@@ -1512,7 +1519,7 @@ public sealed class E2eExecutionTests : IDisposable
         for (var i = 0; i < total; i++)
             Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+        var deadline = DateTimeOffset.UtcNow + ProgressWaitBudget;
         while (provider.MaxConcurrentSeen < total && DateTimeOffset.UtcNow < deadline)
             await Task.Delay(10);
 
@@ -1707,7 +1714,7 @@ public sealed class E2eExecutionTests : IDisposable
             NullLogger<E2eRunDispatcher>.Instance);
 
         Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
-        await provider.ExecStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await provider.ExecStarted.Task.WaitAsync(ProgressWaitBudget);
 
         // Same order as the cancel endpoint: mark the record first, then signal
         // the in-flight replay. Reversing these lets the dispatcher's own
@@ -1748,7 +1755,7 @@ public sealed class E2eExecutionTests : IDisposable
 
         using var shutdown = new CancellationTokenSource();
         Assert.True(await dispatcher.TryDispatchOneAsync(shutdown.Token));
-        await provider.ExecStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await provider.ExecStarted.Task.WaitAsync(ProgressWaitBudget);
 
         await shutdown.CancelAsync();
 
@@ -1801,7 +1808,7 @@ public sealed class E2eExecutionTests : IDisposable
         var dispatched = await dispatcher.TryDispatchOneAsync(CancellationToken.None);
         Assert.True(dispatched);
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        var deadline = DateTimeOffset.UtcNow + ProgressWaitBudget;
         E2eRun? terminal = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -1924,7 +1931,7 @@ public sealed class E2eExecutionTests : IDisposable
         await dispatcher.StartAsync(CancellationToken.None);
         try
         {
-            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            var deadline = DateTimeOffset.UtcNow + ProgressWaitBudget;
             E2eRun? recovered;
             do
             {
@@ -1941,7 +1948,7 @@ public sealed class E2eExecutionTests : IDisposable
         }
         finally
         {
-            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var stopCts = new CancellationTokenSource(ProgressWaitBudget);
             await dispatcher.StopAsync(stopCts.Token);
         }
     }
@@ -2171,7 +2178,7 @@ public sealed class E2eExecutionTests : IDisposable
 
         var crashed = await logger.WaitForEntryAsync(
             e => e.Exception is InvalidOperationException && e.Exception.Message.Contains("affected no rows"),
-            TimeSpan.FromSeconds(5));
+            ProgressWaitBudget);
         Assert.NotNull(crashed.Exception);
         Assert.NotNull(store.UpdatedStatus); // a persist WAS attempted before the throw
         var testCase = await _testCases.GetAsync(tcId);
@@ -2495,7 +2502,7 @@ public sealed class E2eExecutionTests : IDisposable
 
     private async Task<E2eRun> WaitForRunStatusAsync(string runId, E2eRunStatus status)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        var deadline = DateTimeOffset.UtcNow + ProgressWaitBudget;
         E2eRun? current = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -2509,7 +2516,7 @@ public sealed class E2eExecutionTests : IDisposable
 
     private static async Task WaitForDispatcherIdleAsync(E2eRunDispatcher dispatcher)
     {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(ProgressWaitBudget);
         await dispatcher.WaitForIdleAsync(cts.Token);
     }
 
