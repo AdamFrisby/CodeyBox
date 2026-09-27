@@ -61,6 +61,7 @@
   <Folder Name="/plugins/">
     <Project Path="plugins/auditors-api-compatibility/CodeyBox.CargoSemverChecksAuditorPlugin/CodeyBox.CargoSemverChecksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-architecture/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-dependency-vulnerabilities/CodeyBox.CargoAuditAuditorPlugin/CodeyBox.CargoAuditAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-dependency-vulnerabilities/CodeyBox.CargoDenyAuditorPlugin/CodeyBox.CargoDenyAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-dependency-vulnerabilities/CodeyBox.GrypeAuditorPlugin/CodeyBox.GrypeAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-documentation/CodeyBox.LycheeAuditorPlugin/CodeyBox.LycheeAuditorPlugin.csproj" />
