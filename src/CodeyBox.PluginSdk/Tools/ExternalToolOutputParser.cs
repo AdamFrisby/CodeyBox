@@ -21,12 +21,22 @@ public sealed record ExternalToolFinding(
     /// <summary>1-based line number when the tool supplies one. Null otherwise.</summary>
     int? Line = null);
 
-/// <summary>Inputs handed to an <see cref="IExternalToolOutputParser"/>.</summary>
+/// <summary>
+/// Inputs handed to an <see cref="IExternalToolOutputParser"/>.
+/// <paramref name="ScanRoot"/> is the absolute directory the tool's scan ran
+/// in as the tool saw it — sandbox providers may translate the audit's
+/// working directory, so auditors that need it resolve it per run through
+/// <see cref="ExternalToolAuditorBase.ResolveScanRootAsync"/>. Parsers use
+/// it to relativize absolute paths the tool reports when the report itself
+/// embeds no working directory. Null when the auditor did not resolve one —
+/// parsers must then leave absolute paths unrelativized rather than guess.
+/// </summary>
 public sealed record ExternalToolParseInput(
     string ToolName,
     string Stdout,
     string Stderr,
-    int ExitCode);
+    int ExitCode,
+    string? ScanRoot = null);
 
 /// <summary>
 /// Parses a finished tool invocation into findings. The tool does not need to
@@ -211,7 +221,7 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
         => element.TryGetProperty(name, out var value) ? value : default;
 
     private static string? CoerceString(JsonElement element)
-        => element.ValueKind == JsonValueKind.String ? element.GetString() : null;
+        => ExternalToolJsonHelpers.CoerceString(element);
 
     private static string? NormalizeArtifactUri(string? uri)
     {
@@ -225,5 +235,5 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
     }
 
     private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        => ExternalToolJsonHelpers.SingleLine(message);
 }

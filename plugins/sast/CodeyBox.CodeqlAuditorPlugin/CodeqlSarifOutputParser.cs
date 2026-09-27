@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.CodeqlAuditorPlugin;
 
@@ -64,7 +65,7 @@ public sealed class CodeqlSarifOutputParser : IExternalToolOutputParser
         }
 
         return _inner.Parse(new ExternalToolParseInput(
-            input.ToolName, root.ToJsonString(), input.Stderr, input.ExitCode));
+            input.ToolName, root.ToJsonString(), input.Stderr, input.ExitCode, input.ScanRoot));
     }
 
     private static Dictionary<string, string> CollectRuleSeverities(JsonObject run)
@@ -108,7 +109,4 @@ public sealed class CodeqlSarifOutputParser : IExternalToolOutputParser
             && !string.IsNullOrWhiteSpace(text)
             ? text
             : null;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 }
