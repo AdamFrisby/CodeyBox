@@ -73,6 +73,7 @@
     <Project Path="plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/CodeyBox.KnipAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.BiomeAuditorPlugin/CodeyBox.BiomeAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.OxlintAuditorPlugin/CodeyBox.OxlintAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.RuffAuditorPlugin/CodeyBox.RuffAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/CodeyBox.GitleaksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-schema/CodeyBox.SpectralAuditorPlugin/CodeyBox.SpectralAuditorPlugin.csproj" />
     <Project Path="plugins/sast/CodeyBox.CodeqlAuditorPlugin/CodeyBox.CodeqlAuditorPlugin.csproj" />
