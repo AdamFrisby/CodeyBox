@@ -1,9 +1,11 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.OasdiffAuditorPlugin;
 using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Tools;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -216,6 +218,137 @@ public sealed class OasdiffAuditorTests
 
         Assert.Contains("oasdiff", ex.Message, StringComparison.Ordinal);
         Assert.Contains("could not be parsed", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TruncatedScanReport_IsInfrastructureFailure_NeverAPass()
+    {
+        // A provider can return exit 0/1 alongside the stdout-limit flag:
+        // the surviving prefix parses cleanly but may drop whole spec
+        // sections, so a truncated verdict stream must never be trusted.
+        var handler = new Handler
+        {
+            ScanExitCode = 1,
+            ScanStdout = ReportWithBreakingChanges,
+            ScanStdoutLimitExceeded = true,
+        };
+
+        IAuditor auditor = new OasdiffAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("oasdiff", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("truncated", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TruncatedDiscoveryProbe_IsInfrastructureFailure_NeverNarrowsScope()
+    {
+        // ls-files output capped mid-stream would silently intersect spec
+        // candidates out of the audit — a partial probe verdict is never
+        // evidence of absence.
+        var handler = new Handler { DiscoveryOutputLimitExceeded = true };
+
+        IAuditor auditor = new OasdiffAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("oasdiff", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("truncated", ex.Message, StringComparison.Ordinal);
+        Assert.Null(handler.ScanExec);
+    }
+
+    [Fact]
+    public async Task FindingsBeyondMaxFindings_AreInfrastructureFailure_NotACappedPass()
+    {
+        // Report order is repo-controlled: emitting only the first
+        // MaxFindings could evict a blocking ERR while the survivors pass.
+        var handler = new Handler
+        {
+            ScanExitCode = 1,
+            ScanStdout = """
+                === openapi.yaml ===
+                [{"id":"flood-warn","text":"warn filler","level":2},{"id":"check-err","text":"real break","level":3,"revisionSource":{"file":"openapi.yaml","line":5}}]
+                """,
+        };
+
+        var auditor = new OasdiffAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:MaxFindings"] = "1",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(
+                handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("oasdiff", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("MaxFindings", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parser_NonObjectChangeElement_IsParseFailure_NotSkipped()
+    {
+        var parser = new OasdiffBreakingFilesReportParser();
+        var input = new ExternalToolParseInput(
+            "oasdiff",
+            "=== openapi.yaml ===\n[{\"id\":\"a\",\"text\":\"x\",\"level\":3}, 42]\n",
+            "",
+            1);
+
+        Assert.Throws<ExternalToolParseException>(() => parser.Parse(input));
+    }
+
+    [Fact]
+    public void Parser_ExceedingResultBound_IsParseFailure_NotCapped()
+    {
+        const string change = "{\"id\":\"a\",\"text\":\"x\",\"level\":2}";
+        var stdout = "=== openapi.yaml ===\n["
+            + string.Join(",", Enumerable.Repeat(change, 10_001))
+            + "]\n";
+        var parser = new OasdiffBreakingFilesReportParser();
+
+        Assert.Throws<ExternalToolParseException>(
+            () => parser.Parse(new ExternalToolParseInput("oasdiff", stdout, "", 1)));
+    }
+
+    [Fact]
+    public async Task SpecPresenceProbe_SizesStdoutCapToTheVerdictStream()
+    {
+        // ~40 configured paths at ~430 chars echo ~18 KB — past the default
+        // 16 KiB probe cap. The probe must request a cap sized to its own
+        // verdict stream or a legal configuration would fail closed (or
+        // worse, silently narrow scope).
+        var specPaths = Enumerable.Range(0, 40)
+            .Select(i => $"apis/{i:D2}/" + new string('s', 400) + "-openapi.yaml")
+            .ToList();
+        var echoBytes = specPaths.Sum(p => Encoding.UTF8.GetByteCount(p) + 1);
+        var handler = new Handler { ScanStdout = ReportClean };
+        foreach (var specPath in specPaths)
+            handler.PresentNames.Add(specPath);
+
+        var auditor = new OasdiffAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:SpecPaths"] = string.Join(",", specPaths),
+                ["Scoped:BaseRef"] = "main",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            handler.Sandbox(), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        var probe = Assert.Single(handler.Execs,
+            e => e.Argv.Count >= 4
+                && e.Argv[0] == "sh"
+                && e.Argv.Contains(specPaths[0], StringComparer.Ordinal));
+        Assert.True(
+            probe.MaxStdoutBytes is null || probe.MaxStdoutBytes >= echoBytes,
+            $"probe stdout cap {probe.MaxStdoutBytes} is below the {echoBytes}-byte verdict stream");
     }
 
     [Fact]
@@ -835,12 +968,12 @@ public sealed class OasdiffAuditorTests
                       description: ok
             """;
 
-        await GitAsync(dir, "init -b main");
-        await GitAsync(dir, "config user.email test@example.invalid");
-        await GitAsync(dir, "config user.name test");
+        await GitAsync(dir, "init", "-b", "main");
+        await GitAsync(dir, "config", "user.email", "test@example.invalid");
+        await GitAsync(dir, "config", "user.name", "test");
         await File.WriteAllTextAsync(Path.Combine(dir, "openapi.yaml"), baseSpec);
-        await GitAsync(dir, "add openapi.yaml");
-        await GitAsync(dir, "commit -m baseline");
+        await GitAsync(dir, "add", "openapi.yaml");
+        await GitAsync(dir, "commit", "-m", "baseline");
 
         if (breaking)
         {
@@ -892,17 +1025,18 @@ public sealed class OasdiffAuditorTests
         return dir;
     }
 
-    private static async Task GitAsync(string workdir, string args)
+    private static async Task GitAsync(string workdir, params string[] args)
     {
         var psi = new ProcessStartInfo
         {
             FileName = "git",
-            Arguments = args,
             WorkingDirectory = workdir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
         using var process = Process.Start(psi)!;
         await process.WaitForExitAsync();
         Assert.Equal(0, process.ExitCode);
@@ -921,12 +1055,15 @@ public sealed class OasdiffAuditorTests
             };
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Bound the wait BEFORE reading: ReadToEnd blocks until the child
+            // closes stdout, so reading first would make a wedged probe hang
+            // forever and the 10 s cap would never apply.
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            var stdout = process.StandardOutput.ReadToEnd();
             var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }
@@ -979,9 +1116,11 @@ public sealed class OasdiffAuditorTests
         public string GitStdout { get; init; } = BaseSha + "\n";
         public int DiscoveryExitCode { get; init; }
         public string DiscoveryOutput { get; init; } = "openapi.yaml\0";
+        public bool DiscoveryOutputLimitExceeded { get; init; }
         public int ScanExitCode { get; init; }
         public string ScanStdout { get; init; } = ReportClean;
         public string ScanStderr { get; init; } = "";
+        public bool ScanStdoutLimitExceeded { get; init; }
 
         public ISandbox Sandbox() => new FakeSandbox(Handle);
 
@@ -995,10 +1134,14 @@ public sealed class OasdiffAuditorTests
             if (argv.Count >= 2 && argv[0] == "oasdiff" && argv[1] == "breaking-files")
             {
                 ScanExec = exec;
-                return new SandboxExecResult(ScanExitCode, ScanStdout, ScanStderr);
+                return new SandboxExecResult(
+                    ScanExitCode, ScanStdout, ScanStderr,
+                    StdoutLimitExceeded: ScanStdoutLimitExceeded);
             }
             if (argv.Count >= 2 && argv[0] == "git" && argv[1] == "ls-files")
-                return new SandboxExecResult(DiscoveryExitCode, DiscoveryOutput, "");
+                return new SandboxExecResult(
+                    DiscoveryExitCode, DiscoveryOutput, "",
+                    StdoutLimitExceeded: DiscoveryOutputLimitExceeded);
             if (argv[0] == "git")
                 return new SandboxExecResult(GitExitCode, GitStdout, "");
             if (argv.Count >= 3 && argv[0] == "sh" && argv[2].Contains("command -v", StringComparison.Ordinal))

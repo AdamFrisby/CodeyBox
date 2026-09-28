@@ -197,7 +197,7 @@ Scoped under `CodeyBox:Plugins:codeybox.oasdiff`, resolved per run
 | `ExcludePaths` | `vendor/, third_party/, node_modules/` | Repo-relative paths excluded — exact path, or directory prefix when trailing `/`. Applied to spec discovery *and* to reported finding paths (a finding sourced to an excluded `$ref`'d file is filtered too). |
 | `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--match-path`, `--unmatch-path`, `--stability-level`, `--deprecation-days-*`, `--severity-levels <file>`, `--err-ignore/--warn-ignore <file>`, `--config <file>`, or a different `--fail-on`/`--base`. Take care: an operator-supplied `--format`/`-f` or `--template` breaks the JSON output contract and is a deterministic configuration failure; `--allow-external-refs` must go through the `AllowExternalRefs` scoped key (it additionally declares the `Network` capability); `--fetch` is likewise rejected (it would make oasdiff run `git fetch origin <base>` — network egress the sandbox profile never declared; keep the base commit in the clone instead); `--severity-levels`/`--err-ignore`/`--warn-ignore` point into the repo at your own trust. |
 | `TimeoutSeconds` | `300` | Per-run bound; exceeding it is infrastructure, not a pass. Baseline/discovery probes share it under a 30 s cap. |
-| `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
+| `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; an overrun is a fail-closed infrastructure failure, never a truncated report graded as a verdict. |
 | `FindingsExitCodes` | `0, 1` | The verdict exits; do not change unless oasdiff's convention changes. |
 
 ## Default scope
@@ -205,7 +205,8 @@ Scoped under `CodeyBox:Plugins:codeybox.oasdiff`, resolved per run
 One `breaking-files` run at the repository root over every candidate spec:
 git `ls-files` (tracked plus untracked-but-not-ignored files) filtered to
 basenames containing `openapi` or `swagger` with a `.yaml`/`.yml`/`.json`
-extension — the convention oasdiff's own pre-commit hook ships — minus
+extension — a deliberate broadening of oasdiff's shipped pre-commit hook,
+which matches only the exact `openapi.{yaml,yml,json}` basename — minus
 `ExcludePaths` (`vendor/`, `third_party/`, `node_modules/` by default, so
 upstream contract copies and dependency bundles never produce noise), then
 intersected with regular, non-symlink files actually present in the

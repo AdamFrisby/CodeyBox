@@ -30,7 +30,8 @@ namespace CodeyBox.OasdiffAuditorPlugin;
 ///
 /// <para>Unrecognised output fails closed: content before the first
 /// section header, an empty section body, a body that is neither the skip
-/// notice nor a JSON array, malformed JSON, or a non-array document all
+/// notice nor a JSON array, malformed JSON, a non-array document, a
+/// non-object change element, or a report exceeding the result bound all
 /// throw <see cref="ExternalToolParseException"/> — infrastructure, never a
 /// pass. The exit code and the report cross-check each other: exit
 /// <c>1</c> asserts at least one finding at or above the run's
@@ -145,10 +146,18 @@ internal sealed class OasdiffBreakingFilesReportParser : IExternalToolOutputPars
 
             foreach (var change in document.RootElement.EnumerateArray())
             {
+                // Spec order and report volume are both repo-controlled, so
+                // silently capping here would let surplus low-severity
+                // changes evict an ERR in a later section while the audit
+                // passed on the survivors — overflow is infrastructure.
                 if (findings.Count >= MaxResults)
-                    return;
+                    throw new ExternalToolParseException(
+                        $"Tool '{tool}' emitted more than {MaxResults} changes — the report "
+                        + "exceeds the parser's result bound.");
                 if (change.ValueKind != JsonValueKind.Object)
-                    continue;
+                    throw new ExternalToolParseException(
+                        $"Tool '{tool}' emitted section '{Truncate(sectionPath)}' whose changes "
+                        + "array carries a non-object element — not the expected report shape.");
                 findings.Add(ParseChange(change, sectionPath));
             }
         }

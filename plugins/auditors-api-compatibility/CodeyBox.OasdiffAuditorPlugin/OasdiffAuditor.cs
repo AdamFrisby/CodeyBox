@@ -59,8 +59,9 @@ namespace CodeyBox.OasdiffAuditorPlugin;
 /// list when configured, otherwise every tracked or untracked
 /// (non-gitignored) worktree file whose basename contains
 /// <c>openapi</c> or <c>swagger</c> with a <c>.yaml</c>/<c>.yml</c>/<c>.json</c>
-/// extension — oasdiff's own pre-commit convention — minus
-/// <c>ExcludePaths</c>. Only regular, non-symlink files inside the worktree
+/// extension — a deliberate broadening of oasdiff's shipped pre-commit
+/// convention, which matches only the exact <c>openapi.*</c> basename —
+/// minus <c>ExcludePaths</c>. Only regular, non-symlink files inside the worktree
 /// are compared: a repo-committed symlink would redirect oasdiff's read
 /// outside the audited tree, so the presence probe rejects any spec whose
 /// path (leaf or ancestor directory) is a symlink. Specs absent from the
@@ -190,14 +191,17 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
     private const int MaxSpecPathChars = 512;
     private const int DiscoveryMaxOutputBytes = 256 * 1024;
 
-    // Discovery follows oasdiff's own filename convention — its shipped
-    // pre-commit hook matches openapi.{yaml,yml,json} — plus the swagger.*
-    // spelling for OpenAPI 2.0 specs. Intentionally narrow: over-inclusion
-    // fails closed (a matched non-spec is a load error, i.e. a loud audit
-    // failure), so the default errs toward fewer, surer candidates and
-    // SpecPaths covers the rest. git pathspec :(icase,glob) magic matches
-    // case-insensitively at any depth; --others --exclude-standard adds
-    // untracked-but-not-ignored worktree files.
+    // Discovery deliberately broadens oasdiff's own filename convention —
+    // its shipped pre-commit hook matches basenames named exactly
+    // openapi.{yaml,yml,json} at any depth, while these pathspecs match
+    // basenames *containing* openapi or swagger (petstore-openapi.yaml,
+    // swagger.json, ...) so the swagger.* spelling for OpenAPI 2.0 specs
+    // and common per-API names are also found. Over-inclusion still fails
+    // closed (a matched non-spec is a load error, i.e. a loud audit
+    // failure), and SpecPaths covers whatever the net misses. git
+    // pathspec :(icase,glob) magic matches case-insensitively at any
+    // depth; --others --exclude-standard adds untracked-but-not-ignored
+    // worktree files.
     private static readonly IReadOnlyList<string> DiscoveryPathspecs =
     [
         ":(icase,glob)**/*openapi*.yaml",
@@ -284,37 +288,37 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         // ExtraArguments would silently void it (a yaml/text report parses
         // as infrastructure anyway — fail the configuration deterministically
         // instead, before the binary is even probed).
-        if (ExtraArgumentsSupplyFlag(options, "--format", "-f", "--template"))
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' requires oasdiff's per-spec JSON report on "
-                + "stdout — ExtraArguments may not supply --format/-f or --template.")
-            { IsDeterministic = true };
+        ThrowIfExtraArgumentsSupply(
+            options,
+            "requires oasdiff's per-spec JSON report on stdout — ExtraArguments may not "
+            + "supply --format/-f or --template.",
+            "--format", "-f", "--template");
 
         // --allow-external-refs must come through the named scoped key, not
         // raw argv: opting in is also what flips this auditor's Required
         // capabilities to Network, and a verbatim ExtraArguments flag would
         // grant audited specs outbound fetches inside a sandbox profile that
         // was never declared network-capable.
-        if (ExtraArgumentsSupplyFlag(options, AllowExternalRefsFlag))
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' does not accept '{AllowExternalRefsFlag}' via "
-                + $"ExtraArguments — set CodeyBox:Plugins:{PluginId}:{AllowExternalRefsKey} to true "
-                + "instead, which also schedules the audit into a network-capable sandbox profile "
-                + "for the outbound $ref fetches it enables.")
-            { IsDeterministic = true };
+        ThrowIfExtraArgumentsSupply(
+            options,
+            $"does not accept '{AllowExternalRefsFlag}' via ExtraArguments — set "
+            + $"CodeyBox:Plugins:{PluginId}:{AllowExternalRefsKey} to true instead, which also "
+            + "schedules the audit into a network-capable sandbox profile for the outbound "
+            + "$ref fetches it enables.",
+            AllowExternalRefsFlag);
 
         // --fetch makes oasdiff run 'git fetch origin <base>' when the base
         // commit is absent locally — network egress plus object-store writes
         // inside a sandbox profile that never declared the Network
         // capability. Same gated-flag reasoning as --allow-external-refs.
-        if (ExtraArgumentsSupplyFlag(options, FetchFlag))
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' does not accept '{FetchFlag}' via "
-                + "ExtraArguments — it would make oasdiff run 'git fetch origin <base>' (network "
-                + "egress and object-store writes) inside a sandbox profile that never declared "
-                + "the Network capability. Ensure the base commit is present in the audited clone "
-                + "(deepen the checkout at provisioning time) instead.")
-            { IsDeterministic = true };
+        ThrowIfExtraArgumentsSupply(
+            options,
+            $"does not accept '{FetchFlag}' via ExtraArguments — it would make oasdiff run "
+            + "'git fetch origin <base>' (network egress and object-store writes) inside a "
+            + "sandbox profile that never declared the Network capability. Ensure the base "
+            + "commit is present in the audited clone (deepen the checkout at provisioning "
+            + "time) instead.",
+            FetchFlag);
 
         return
         [
@@ -529,10 +533,11 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         // finding regardless.
         var discovered = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var excludedPaths = NormalizedExcludePaths(options);
         foreach (var entry in result.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries))
         {
             var normalized = NormalizeSpecPath(entry);
-            if (normalized is null || !seen.Add(normalized) || IsNormalizedPathExcluded(normalized, options))
+            if (normalized is null || !seen.Add(normalized) || IsNormalizedPathExcluded(normalized, excludedPaths))
                 continue;
             discovered.Add(normalized);
         }
@@ -599,6 +604,26 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             throw new AuditUnavailableException(
                 $"could-not-verify: spec scope resolved to {count} files, exceeding the bound of "
                 + $"{MaxSpecPaths} — narrow it via {SpecPathsKey} or ExcludePaths.")
+            { IsDeterministic = true };
+    }
+
+    /// <summary>
+    /// Deterministic configuration failure when
+    /// <see cref="ExternalToolAuditorOptions.ExtraArguments"/> already
+    /// supplies any of <paramref name="flags"/> — the shared throw skeleton
+    /// for the gated flags <see cref="BuildToolArguments"/> reserves for
+    /// built-in or capability-declaring use.
+    /// <paramref name="rationale"/> is an author-chosen constant completing
+    /// "auditor '&lt;name&gt;' &lt;rationale&gt;".
+    /// </summary>
+    private void ThrowIfExtraArgumentsSupply(
+        ExternalToolAuditorOptions options,
+        string rationale,
+        params string[] flags)
+    {
+        if (ExtraArgumentsSupplyFlag(options, flags))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' {rationale}")
             { IsDeterministic = true };
     }
 

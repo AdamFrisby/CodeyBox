@@ -220,12 +220,16 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 tool,
                 $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
                 result);
+        if (result.StdoutLimitExceeded)
+            throw Unavailable(
+                tool,
+                $"produced a report exceeding the {nameof(ExternalToolAuditorOptions.MaxOutputBytesPerStream)} capture bound — a truncated verdict stream is never evidence, so the audit cannot report what the scan found. Raise the cap or narrow the audited scope.",
+                result);
 
         var parsed = ParseOutput(tool, result, scanRoot, workingDirectory);
         var findings = ToFindings(tool, parsed, options);
-        var truncated = findings.Count < parsed.Count;
         var passed = findings.All(f => f.Severity < AuditSeverity.Error);
-        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, parsed.Count - findings.Count, truncated));
+        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options));
     }
 
     private IReadOnlyList<string> BuildArgv(
@@ -311,6 +315,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = maxBytes,
                 MaxStderrBytes = maxBytes,
+                // Let the process run to its own exit code — killing at the
+                // cap would hide whether the run found anything — then
+                // RunAsync fails closed on a truncated stdout: a partial
+                // report is never a verdict.
                 KillOnOutputLimit = false,
                 ExtraEnvironment = BuildToolEnvironment(options),
             },
@@ -377,12 +385,15 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// shared probe envelope — <see cref="ProbeMaxOutputBytes"/> per stream
     /// (or <paramref name="maxStdoutBytes"/> for probes that legitimately
     /// emit more), kill-on-limit, and the capped <see cref="ProbeTimeout"/>
-    /// — and classifies an exec-transport failure as
-    /// <see cref="AuditUnavailableException"/> naming the tool. Exit-code
-    /// interpretation stays with the caller: what a completed probe's exit
-    /// code means is probe-specific. <paramref name="operation"/> names the
-    /// invocation in failure messages (e.g. "presence check", "version
-    /// check"); keep it an author-chosen constant.
+    /// — and classifies an exec-transport failure or a truncated output
+    /// stream as <see cref="AuditUnavailableException"/> naming the tool:
+    /// probe stdout carries verdicts, and a provider that reports exit 0
+    /// alongside the limit flag returns a partial stream that is never
+    /// evidence of the probed state. Exit-code interpretation stays with
+    /// the caller: what a completed probe's exit code means is
+    /// probe-specific. <paramref name="operation"/> names the invocation in
+    /// failure messages (e.g. "presence check", "version check"); keep it
+    /// an author-chosen constant.
     /// </summary>
     protected static async Task<SandboxExecResult> RunBoundedProbeAsync(
         ISandbox sandbox,
@@ -417,6 +428,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
                 + "transport was unavailable.");
+        if (result.OutputLimitExceeded)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' {operation} exceeded the probe output "
+                + "bound — the returned stream is truncated and a partial probe verdict is never "
+                + "evidence about the audited state.");
         return result;
     }
 
@@ -552,17 +568,33 @@ public abstract class ExternalToolAuditorBase : IAuditor
         {
             "sh", "-c", script, "sh",
         };
+        // The script echoes each accepted name plus its newline, so the
+        // verdict stream can need more than the default probe cap — size it
+        // to the request. (The cap must never sit below the worst-case echo:
+        // a truncated reply reads as fewer-present and is now a fail-closed
+        // audit failure rather than silent scope narrowing.)
+        var echoBytes = 0;
         foreach (var path in relativePaths)
         {
             var normalized = NormalizeProbePath(path);
             if (requested.Add(normalized))
+            {
                 argv.Add(normalized);
+                echoBytes += Encoding.UTF8.GetByteCount(normalized) + 1;
+            }
         }
         if (requested.Count == 0)
             return [];
 
         var result = await RunBoundedProbeAsync(
-            sandbox, tool, operation, argv, workingDirectory, options, ct).ConfigureAwait(false);
+            sandbox,
+            tool,
+            operation,
+            argv,
+            workingDirectory,
+            options,
+            ct,
+            maxStdoutBytes: Math.Max(ProbeMaxOutputBytes, echoBytes)).ConfigureAwait(false);
 
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
@@ -774,6 +806,27 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// The <see cref="ExternalToolAuditorOptions.ExcludePaths"/> entries in
+    /// normalized form (<see cref="NormalizeExcludePathEntry"/> output, blank
+    /// entries dropped). Hoist this once per audit run when matching many
+    /// paths — normalization is loop-invariant — then call the
+    /// list-taking <see cref="IsNormalizedPathExcluded(string, IReadOnlyList{string})"/>
+    /// overload.
+    /// </summary>
+    protected static IReadOnlyList<string> NormalizedExcludePaths(ExternalToolAuditorOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var entries = new List<string>(options.ExcludePaths.Count);
+        foreach (var entry in options.ExcludePaths)
+        {
+            var normalized = NormalizeExcludePathEntry(entry);
+            if (normalized is not null)
+                entries.Add(normalized);
+        }
+        return entries;
+    }
+
+    /// <summary>
     /// The <see cref="ExternalToolAuditorOptions.ExcludePaths"/> matching
     /// contract — the single source of truth for both the finding-level
     /// filter below and auditors that must apply the same scope decision
@@ -790,13 +843,23 @@ public abstract class ExternalToolAuditorBase : IAuditor
         string normalizedRepoRelativePath,
         ExternalToolAuditorOptions options)
     {
-        ArgumentNullException.ThrowIfNull(normalizedRepoRelativePath);
         ArgumentNullException.ThrowIfNull(options);
-        foreach (var entry in options.ExcludePaths)
+        return IsNormalizedPathExcluded(normalizedRepoRelativePath, NormalizedExcludePaths(options));
+    }
+
+    /// <summary>
+    /// <see cref="IsNormalizedPathExcluded(string, ExternalToolAuditorOptions)"/>
+    /// over a precomputed <see cref="NormalizedExcludePaths"/> list — for
+    /// callers matching many paths against one options snapshot.
+    /// </summary>
+    protected static bool IsNormalizedPathExcluded(
+        string normalizedRepoRelativePath,
+        IReadOnlyList<string> normalizedExcludeEntries)
+    {
+        ArgumentNullException.ThrowIfNull(normalizedRepoRelativePath);
+        ArgumentNullException.ThrowIfNull(normalizedExcludeEntries);
+        foreach (var normalized in normalizedExcludeEntries)
         {
-            var normalized = NormalizeExcludePathEntry(entry);
-            if (normalized is null)
-                continue;
             if (normalized.EndsWith("/", StringComparison.Ordinal))
             {
                 if (normalizedRepoRelativePath.StartsWith(normalized, StringComparison.Ordinal))
@@ -901,19 +964,29 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var mapping = SeverityMapping ?? ExternalToolSeverityMapping.Default;
         var maxFindings = Math.Max(1, options.MaxFindings);
         var findings = new List<AuditFinding>(Math.Min(parsed.Count, maxFindings));
+        var excludedPaths = NormalizedExcludePaths(options);
 
         foreach (var item in parsed)
         {
-            if (findings.Count >= maxFindings)
-                break;
             if (item is null)
                 continue;
-            if (IsRuleFiltered(item, options) || IsPathExcluded(item, options))
+            if (IsRuleFiltered(item, options) || IsPathExcluded(item, excludedPaths))
                 continue;
 
             var severity = mapping.Map(item.SeverityLevel);
             if (severity < options.MinimumSeverity)
                 continue;
+
+            // The audit subject controls report order, so capping here would
+            // let a flood of low-severity entries evict a blocking one while
+            // the audit still passed on the survivors — an overflow is
+            // infrastructure, never a truncated report graded as a verdict.
+            if (findings.Count >= maxFindings)
+                throw new AuditUnavailableException(
+                    $"could-not-verify: audit tool '{tool}' reported more findings than the "
+                    + $"MaxFindings bound of {maxFindings} — a capped subset could hide "
+                    + "verdict-changing entries. Raise MaxFindings or narrow the audited scope "
+                    + "(ExcludedRules/ExcludePaths/MinimumSeverity).");
 
             findings.Add(new AuditFinding(
                 AuditorName: Name,
@@ -936,11 +1009,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
             && (string.IsNullOrWhiteSpace(item.RuleId) || !options.IncludedRules.Contains(item.RuleId));
     }
 
-    private static bool IsPathExcluded(ExternalToolFinding item, ExternalToolAuditorOptions options)
+    private static bool IsPathExcluded(
+        ExternalToolFinding item,
+        IReadOnlyList<string> normalizedExcludeEntries)
     {
-        if (options.ExcludePaths.Count == 0 || string.IsNullOrWhiteSpace(item.Path))
+        if (normalizedExcludeEntries.Count == 0 || string.IsNullOrWhiteSpace(item.Path))
             return false;
-        return IsNormalizedPathExcluded(NormalizeFindingPath(item.Path), options);
+        return IsNormalizedPathExcluded(NormalizeFindingPath(item.Path), normalizedExcludeEntries);
     }
 
     private static string BuildTitle(ExternalToolFinding item)
@@ -977,34 +1052,24 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private static string NormalizeFindingPath(string? path)
         => ExternalToolJsonHelpers.NormalizePath(path).TrimStart('/');
 
-    private static string BuildRawOutput(
-        SandboxExecResult result,
-        ExternalToolAuditorOptions options,
-        int droppedFindings,
-        bool findingsTruncated)
+    private static string BuildRawOutput(SandboxExecResult result, ExternalToolAuditorOptions options)
     {
         var maxBytes = Math.Clamp(
             options.MaxOutputBytesPerStream,
             ExternalToolAuditorOptions.MinCapturedOutputBytes,
             ExternalToolAuditorOptions.MaxCapturedOutputBytes);
+        // A truncated stdout never reaches this point — RunAsync fails
+        // closed on it above — so only the stderr marker can appear.
         var stdout = result.Stdout;
-        if (result.StdoutLimitExceeded)
-            stdout += $"\n[stdout truncated after {maxBytes} bytes]";
         var stderr = result.Stderr;
         if (result.StderrLimitExceeded)
             stderr += $"\n[stderr truncated after {maxBytes} bytes]";
 
-        string combined;
         if (string.IsNullOrEmpty(stderr))
-            combined = stdout;
-        else if (string.IsNullOrEmpty(stdout))
-            combined = stderr;
-        else
-            combined = stdout + "\n" + stderr;
-
-        if (findingsTruncated)
-            combined += $"\n[findings truncated: {droppedFindings} finding(s) beyond MaxFindings {Math.Max(1, options.MaxFindings)} were dropped]";
-        return combined;
+            return stdout;
+        if (string.IsNullOrEmpty(stdout))
+            return stderr;
+        return stdout + "\n" + stderr;
     }
 
     private static AuditUnavailableException Unavailable(string tool, string reason, SandboxExecResult result)
