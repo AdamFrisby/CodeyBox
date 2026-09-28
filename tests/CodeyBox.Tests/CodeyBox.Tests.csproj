@@ -49,6 +49,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-api-compatibility\CodeyBox.CargoSemverChecksAuditorPlugin\CodeyBox.CargoSemverChecksAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-api-compatibility\CodeyBox.OasdiffAuditorPlugin\CodeyBox.OasdiffAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-architecture\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.CargoAuditAuditorPlugin\CodeyBox.CargoAuditAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.CargoDenyAuditorPlugin\CodeyBox.CargoDenyAuditorPlugin.csproj" />
