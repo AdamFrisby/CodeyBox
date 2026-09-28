@@ -1,4 +1,5 @@
 using System.Text;
+using CodeyBox.Core;
 
 namespace CodeyBox.Api;
 
@@ -114,7 +115,7 @@ internal static class CheckoutRevisionReader
             return null;
 
         var full = Path.GetFullPath(Path.Combine(gitDir, refPath));
-        if (!IsWithinDirectory(gitDir, full))
+        if (!HostPathPolicy.IsStrictlyWithinDirectory(full, gitDir))
             return null;
 
         if (File.Exists(full))
@@ -134,7 +135,7 @@ internal static class CheckoutRevisionReader
             if (Directory.Exists(baseDir))
             {
                 var altFull = Path.GetFullPath(Path.Combine(baseDir, refPath));
-                if (IsWithinDirectory(baseDir, altFull) && File.Exists(altFull))
+                if (HostPathPolicy.IsStrictlyWithinDirectory(altFull, baseDir) && File.Exists(altFull))
                 {
                     var sha = ReadFirstLineCapped(altFull, MaxSmallFileBytes);
                     if (IsCommitSha(sha))
@@ -181,13 +182,6 @@ internal static class CheckoutRevisionReader
         !string.IsNullOrWhiteSpace(refPath)
         && !Path.IsPathFullyQualified(refPath)
         && !refPath.Contains("..", StringComparison.Ordinal);
-
-    private static bool IsWithinDirectory(string directory, string candidate)
-    {
-        var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            + Path.DirectorySeparatorChar;
-        return candidate.StartsWith(root, StringComparison.Ordinal);
-    }
 
     private static bool IsCommitSha(string? value)
     {

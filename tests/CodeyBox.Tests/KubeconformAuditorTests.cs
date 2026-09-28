@@ -609,7 +609,7 @@ public sealed class KubeconformAuditorTests
     }
 
     [Fact]
-    public async Task ScopedConfiguration_ExcludePaths_FiltersDefaultVendoredFindings()
+    public async Task DefaultExcludePaths_FiltersVendoredFindings()
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
@@ -837,12 +837,14 @@ public sealed class KubeconformAuditorTests
             };
             psi.ArgumentList.Add("-v");
             using var process = Process.Start(psi)!;
+            var stderr = process.StandardError.ReadToEndAsync();
             var stdout = process.StandardOutput.ReadToEnd();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            stderr.GetAwaiter().GetResult();
             var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }

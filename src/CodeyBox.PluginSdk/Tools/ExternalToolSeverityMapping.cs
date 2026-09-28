@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using CodeyBox.Core;
 
 namespace CodeyBox.PluginSdk.Tools;
@@ -11,7 +12,7 @@ namespace CodeyBox.PluginSdk.Tools;
 /// </summary>
 public sealed class ExternalToolSeverityMapping
 {
-    private readonly Dictionary<string, AuditSeverity> _levels;
+    private readonly ReadOnlyDictionary<string, AuditSeverity> _levels;
 
     /// <summary>
     /// Severity used when the tool reports a level absent from the map
@@ -19,12 +20,24 @@ public sealed class ExternalToolSeverityMapping
     /// </summary>
     public AuditSeverity DefaultSeverity { get; }
 
+    /// <summary>
+    /// The declared token → severity map (case-insensitive lookup). Exposed
+    /// so a plugin can derive its map from a shared baseline —
+    /// <c>new ExternalToolSeverityMapping(Default.Levels …adjusted…)</c> —
+    /// instead of copying the defaults and drifting when they evolve. The
+    /// view is genuinely read-only: the stored dictionary is wrapped at
+    /// construction, so a consumer cannot downcast and mutate the shared
+    /// <see cref="Default"/> map.
+    /// </summary>
+    public IReadOnlyDictionary<string, AuditSeverity> Levels => _levels;
+
     public ExternalToolSeverityMapping(
         IReadOnlyDictionary<string, AuditSeverity> levels,
         AuditSeverity defaultSeverity = AuditSeverity.Warning)
     {
         ArgumentNullException.ThrowIfNull(levels);
-        _levels = new Dictionary<string, AuditSeverity>(levels, StringComparer.OrdinalIgnoreCase);
+        _levels = new ReadOnlyDictionary<string, AuditSeverity>(
+            new Dictionary<string, AuditSeverity>(levels, StringComparer.OrdinalIgnoreCase));
         DefaultSeverity = defaultSeverity;
     }
 

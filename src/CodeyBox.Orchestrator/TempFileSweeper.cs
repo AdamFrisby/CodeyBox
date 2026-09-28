@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -187,8 +188,7 @@ public sealed class TempFileSweeper
             return;
         }
 
-        if (!fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            && !string.Equals(fullPath, root, StringComparison.Ordinal))
+        if (!HostPathPolicy.IsWithinDirectory(fullPath, root))
         {
             summary.Errors++;
             _log?.LogWarning("TempFileSweeper: temp entry {Entry} resolves outside the temp root; skipping", entry);
@@ -557,7 +557,7 @@ public sealed class TempFileSweeper
 
         if ((attributes & FileAttributes.ReparsePoint) != 0)
             return TempEntryDeleteOutcome.SkippedSymlink;
-        if (!IsWithinRoot(root, fullPath))
+        if (!HostPathPolicy.IsWithinDirectory(fullPath, root))
             return TempEntryDeleteOutcome.Failed;
 
         if ((attributes & FileAttributes.Directory) == 0)
@@ -616,10 +616,6 @@ public sealed class TempFileSweeper
                 : TempEntryDeleteOutcome.Failed;
         }
     }
-
-    private static bool IsWithinRoot(string root, string fullPath) =>
-        fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-        || string.Equals(fullPath, root, StringComparison.Ordinal);
 
     private static string ValidateChildName(string? name)
     {
