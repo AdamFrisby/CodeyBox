@@ -284,8 +284,7 @@ public sealed class LocalGitHost : IGitHost
         var stagingRoot = ((IGitHost)this).GetMergeStagingRoot(repositoryId);
         var canonicalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(stagingRoot));
         var canonicalTarget = Path.GetFullPath(targetPath);
-        if (!canonicalTarget.StartsWith(canonicalRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            && !string.Equals(canonicalTarget, canonicalRoot, StringComparison.Ordinal))
+        if (!HostPathPolicy.IsWithinDirectory(canonicalTarget, canonicalRoot))
         {
             throw new InvalidOperationException(
                 $"refusing to restore isolated merge clone outside staging root: target={canonicalTarget} root={canonicalRoot}");
@@ -1926,8 +1925,8 @@ public sealed class LocalGitHost : IGitHost
             var rootDir = Path.GetFullPath(_opts.RootDirectory);
             var mirrorDir = GetSharedMirrorDirectoryFullPath();
 
-            var isManaged = IsSameOrUnder(resolvedGitDir, rootDir)
-                            || IsSameOrUnder(resolvedGitDir, mirrorDir);
+            var isManaged = HostPathPolicy.IsWithinDirectory(resolvedGitDir, rootDir)
+                            || HostPathPolicy.IsWithinDirectory(resolvedGitDir, mirrorDir);
 
             if (!isManaged)
             {
@@ -1948,7 +1947,7 @@ public sealed class LocalGitHost : IGitHost
                     if (!string.IsNullOrEmpty(trimmedMeta))
                     {
                         var fullMetaPath = Path.GetFullPath(trimmedMeta);
-                        if (IsSameOrUnder(fullMetaPath, mirrorDir))
+                        if (HostPathPolicy.IsWithinDirectory(fullMetaPath, mirrorDir))
                         {
                             allowedPaths.Add(fullMetaPath);
                         }
@@ -2022,7 +2021,7 @@ public sealed class LocalGitHost : IGitHost
             }
 
             var fullPath = Path.GetFullPath(trimmed);
-            if (IsSameOrUnder(fullPath, mirrorDir))
+            if (HostPathPolicy.IsWithinDirectory(fullPath, mirrorDir))
             {
                 return fullPath;
             }
@@ -2042,18 +2041,6 @@ public sealed class LocalGitHost : IGitHost
         return Path.GetFullPath(Path.IsPathRooted(configured)
             ? configured
             : Path.Combine(_opts.RootDirectory, configured));
-    }
-
-    private static bool IsSameOrUnder(string path, string root)
-    {
-        var normalizedPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
-        var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
-        if (string.Equals(normalizedPath, normalizedRoot, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return normalizedPath.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal);
     }
 
     private string GetMirrorPath(string upstreamUrl)

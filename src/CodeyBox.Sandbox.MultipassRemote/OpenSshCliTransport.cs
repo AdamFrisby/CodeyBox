@@ -559,8 +559,7 @@ public sealed class OpenSshCliTransport : IRemotePortForwardTransport
 
     private static void EnsureContainedPath(string root, string candidate)
     {
-        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!candidate.StartsWith(normalizedRoot, StringComparison.Ordinal))
+        if (!HostPathPolicy.IsStrictlyWithinDirectory(candidate, root))
             throw ContentValidationException(
                 $"Unsafe extracted filesystem entry '{candidate}' escapes staging root '{root}'.");
     }

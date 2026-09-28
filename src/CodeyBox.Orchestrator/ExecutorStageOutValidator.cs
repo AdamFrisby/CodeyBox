@@ -276,8 +276,7 @@ public static class ExecutorStageOutValidator
 
     private static void EnsureContained(string root, string candidate)
     {
-        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!candidate.StartsWith(normalizedRoot, StringComparison.Ordinal))
+        if (!HostPathPolicy.IsStrictlyWithinDirectory(candidate, root))
             throw new ExecutorPhaseException(
                 $"Unsafe staged-back entry escapes staging root.");
     }

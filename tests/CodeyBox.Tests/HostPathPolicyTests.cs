@@ -87,6 +87,51 @@ public sealed class HostPathPolicyTests
     }
 
     [Fact]
+    public void IsWithinDirectory_ContainmentCases()
+    {
+        var root = OperatingSystem.IsWindows() ? "C:\\work" : "/work";
+        var sep = Path.DirectorySeparatorChar;
+        Assert.True(HostPathPolicy.IsWithinDirectory(root + sep + "a" + sep + "b.txt", root));
+        Assert.True(HostPathPolicy.IsWithinDirectory(root + sep + "sub" + sep + ".." + sep + "b.txt", root));
+        Assert.True(HostPathPolicy.IsWithinDirectory(root, root));
+        Assert.False(HostPathPolicy.IsWithinDirectory(root + sep + ".." + sep + "escape", root));
+        // A sibling sharing the root's string prefix is not a child.
+        Assert.False(HostPathPolicy.IsWithinDirectory(root + "other" + sep + "x", root));
+        Assert.False(HostPathPolicy.IsWithinDirectory(root + sep + "a" + sep + ".." + sep + ".." + sep + "x", root));
+    }
+
+    [Fact]
+    public void IsWithinDirectory_DotDotLeadingLeafName_IsInside_NotAnEscape()
+    {
+        // Path.GetRelativePath returns "..evil" for /work/..evil — a bare
+        // StartsWith("..") check fails open on committed files whose names
+        // merely begin with "..". The segment-aware check keeps them within.
+        var root = OperatingSystem.IsWindows() ? "C:\\work" : "/work";
+        var leaf = root + Path.DirectorySeparatorChar + "..evil";
+        Assert.True(HostPathPolicy.IsWithinDirectory(leaf, root));
+        Assert.True(HostPathPolicy.IsStrictlyWithinDirectory(leaf, root));
+    }
+
+    [Fact]
+    public void IsWithinDirectory_RejectsNonRootedInputs_RatherThanResolvingAgainstCwd()
+    {
+        var root = OperatingSystem.IsWindows() ? "C:\\work" : "/work";
+        Assert.False(HostPathPolicy.IsWithinDirectory("relative/child", root));
+        Assert.False(HostPathPolicy.IsWithinDirectory(root + Path.DirectorySeparatorChar + "child", "relative"));
+        Assert.False(HostPathPolicy.IsWithinDirectory("", root));
+    }
+
+    [Fact]
+    public void IsStrictlyWithinDirectory_ExcludesTheDirectoryItself()
+    {
+        var root = OperatingSystem.IsWindows() ? "C:\\work" : "/work";
+        var sep = Path.DirectorySeparatorChar;
+        Assert.True(HostPathPolicy.IsStrictlyWithinDirectory(root + sep + "child", root));
+        Assert.False(HostPathPolicy.IsStrictlyWithinDirectory(root, root));
+        Assert.False(HostPathPolicy.IsStrictlyWithinDirectory(root + sep + ".." + sep + "escape", root));
+    }
+
+    [Fact]
     public void GuestPaths_StayForwardSlash_RegardlessOfHost()
     {
         Assert.Equal("/work", CodeyBox.Sandbox.SandboxConventions.WorkDir);
