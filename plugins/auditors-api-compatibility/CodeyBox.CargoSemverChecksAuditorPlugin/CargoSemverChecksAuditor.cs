@@ -488,37 +488,6 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
         return mergeBaseSha;
     }
 
-    private async Task<SandboxExecResult> GitProbeAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        ExternalToolAuditorOptions options,
-        IReadOnlyList<string> args,
-        CancellationToken ct)
-    {
-        var argv = new List<string>(args.Count + 1) { "git" };
-        argv.AddRange(args);
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "baseline resolution",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' baseline resolution could not run: "
-                + "the sandbox exec transport was unavailable.");
-        return result;
-    }
-
     private async Task ThrowIfRepoLintConfigPresentAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -589,7 +558,7 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
     /// </param>
     private string? EffectiveManifestPath(ExternalToolAuditorOptions options, out bool fromScopedKey)
     {
-        var scoped = ValidatedScopedPath(_manifestPath(), ManifestPathKey);
+        var scoped = ValidatedScopedValue(_manifestPath(), ManifestPathKey);
         var extraSupplied = TryGetExtraArgumentsFlagValue(options, ManifestPathFlag, out var extra);
         fromScopedKey = scoped is not null;
         if (scoped is not null && extraSupplied)
@@ -607,41 +576,6 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
                 + "'--manifest-path=<path>'.")
             { IsDeterministic = true };
         return ValidatedArgumentValue(extra, $"ExtraArguments '{ManifestPathFlag}'");
-    }
-
-    /// <summary>
-    /// Extracts the value an operator's <c>ExtraArguments</c> supplies for a
-    /// long-form flag — the entry following a bare <c>--flag</c>, or the
-    /// text after <c>--flag=</c>, the same spellings
-    /// <see cref="ExtraArgumentsSupplyFlag"/> recognizes. The last
-    /// occurrence wins; a bare trailing flag yields a null value (the tool
-    /// would reject it — callers validate). Returns false when the flag is
-    /// absent.
-    /// </summary>
-    private static bool TryGetExtraArgumentsFlagValue(
-        ExternalToolAuditorOptions options,
-        string flag,
-        out string? value)
-    {
-        value = null;
-        var supplied = false;
-        var attachedPrefix = flag + "=";
-        var extraArguments = options.ExtraArguments;
-        for (var i = 0; i < extraArguments.Count; i++)
-        {
-            var arg = extraArguments[i];
-            if (string.Equals(arg, flag, StringComparison.Ordinal))
-            {
-                supplied = true;
-                value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
-            }
-            else if (arg.StartsWith(attachedPrefix, StringComparison.Ordinal))
-            {
-                supplied = true;
-                value = arg[attachedPrefix.Length..];
-            }
-        }
-        return supplied;
     }
 
     private List<(string Key, string Flag, string? Value)> ConfiguredBaselines() =>
@@ -668,50 +602,4 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
             + "no baseline is configured and the work item carries no usable base branch for "
             + "merge-base resolution. " + BaselineConfigHint)
         { IsDeterministic = true };
-
-    private static string? ValidatedScopedPath(string? value, string key)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return null;
-        return ValidatedArgumentValue(value, key);
-    }
-
-    /// <summary>
-    /// Validates a configured value that travels to the tool as an argv
-    /// entry: bounded length, no leading dash (it would be read as another
-    /// flag), no control characters. <paramref name="source"/> names the
-    /// knob that supplied the value for the failure message. Values are
-    /// never concatenated into a shell string — this only guards the argv
-    /// contract.
-    /// </summary>
-    private static string ValidatedArgumentValue(string value, string source)
-    {
-        var trimmed = value.Trim();
-        const int maxChars = 1024;
-        if (trimmed.Length == 0 || trimmed.Length > maxChars
-            || trimmed[0] == '-'
-            || trimmed.Any(char.IsControl))
-            throw new AuditUnavailableException(
-                $"could-not-verify: configured '{source}' is not a usable argument value "
-                + "(empty, overlong, leading '-', or contains control characters).")
-            { IsDeterministic = true };
-        return trimmed;
-    }
-
-    private static string? ReadCommitSha(string stdout)
-    {
-        var firstLine = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        if (firstLine is null)
-            return null;
-        try
-        {
-            Validation.ValidateCommitSha(firstLine, "git output");
-        }
-        catch (ArgumentException)
-        {
-            return null;
-        }
-        return firstLine;
-    }
 }

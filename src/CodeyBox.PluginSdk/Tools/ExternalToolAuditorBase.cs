@@ -562,6 +562,137 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// Bounded <c>git</c> probe for baseline resolution: runs
+    /// <paramref name="args"/> as <c>git</c> argv entries (never a shell
+    /// string) with the shared per-stream output caps and the probe timeout,
+    /// classifying transport failures as infrastructure naming the owning
+    /// tool. The single seam for "run git to resolve a baseline SHA" so
+    /// API-compatibility auditors cannot fork the policy.
+    /// </summary>
+    protected async Task<SandboxExecResult> GitProbeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        ExternalToolAuditorOptions options,
+        IReadOnlyList<string> args,
+        CancellationToken ct)
+    {
+        var argv = new List<string>(args.Count + 1) { "git" };
+        argv.AddRange(args);
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            ToolName,
+            "baseline resolution",
+            new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' baseline resolution could not run: "
+                + "the sandbox exec transport was unavailable.");
+        return result;
+    }
+
+    /// <summary>
+    /// Reads the first line of <c>git</c> probe stdout as a commit SHA,
+    /// failing closed (null) when it is absent or not a valid SHA. The
+    /// single definition of "a usable baseline SHA" shared by
+    /// API-compatibility auditors.
+    /// </summary>
+    protected static string? ReadCommitSha(string stdout)
+    {
+        var firstLine = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault();
+        if (firstLine is null)
+            return null;
+        try
+        {
+            Validation.ValidateCommitSha(firstLine, "git output");
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+        return firstLine;
+    }
+
+    /// <summary>
+    /// Validates a configured value that travels to the tool as an argv
+    /// entry: bounded length, no leading dash (it would be read as another
+    /// flag), no control characters. <paramref name="source"/> names the
+    /// knob that supplied the value for the failure message. Values are
+    /// never concatenated into a shell string — this only guards the argv
+    /// contract.
+    /// </summary>
+    protected static string ValidatedArgumentValue(string value, string source)
+    {
+        var trimmed = value.Trim();
+        const int maxChars = 1024;
+        if (trimmed.Length == 0 || trimmed.Length > maxChars
+            || trimmed[0] == '-'
+            || trimmed.Any(char.IsControl))
+            throw new AuditUnavailableException(
+                $"could-not-verify: configured '{source}' is not a usable argument value "
+                + "(empty, overlong, leading '-', or contains control characters).")
+            { IsDeterministic = true };
+        return trimmed;
+    }
+
+    /// <summary>
+    /// Validates a scoped-config value that travels to the tool as an argv
+    /// entry; blank values mean "unset" (null). The single seam so scoped
+    /// path-like knobs share one policy.
+    /// </summary>
+    protected static string? ValidatedScopedValue(string? value, string key)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        return ValidatedArgumentValue(value, key);
+    }
+
+    /// <summary>
+    /// Extracts the value an operator's <c>ExtraArguments</c> supplies for a
+    /// long-form flag — the entry following a bare <c>--flag</c>, or the
+    /// text after <c>--flag=</c>, the same spellings
+    /// <see cref="ExtraArgumentsSupplyFlag"/> recognizes. The last
+    /// occurrence wins; a bare trailing flag yields a null value (the tool
+    /// would reject it — callers validate). Returns false when the flag is
+    /// absent.
+    /// </summary>
+    protected static bool TryGetExtraArgumentsFlagValue(
+        ExternalToolAuditorOptions options,
+        string flag,
+        out string? value)
+    {
+        value = null;
+        var supplied = false;
+        var attachedPrefix = flag + "=";
+        var extraArguments = options.ExtraArguments;
+        for (var i = 0; i < extraArguments.Count; i++)
+        {
+            var arg = extraArguments[i];
+            if (string.Equals(arg, flag, StringComparison.Ordinal))
+            {
+                supplied = true;
+                value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
+            }
+            else if (arg.StartsWith(attachedPrefix, StringComparison.Ordinal))
+            {
+                supplied = true;
+                value = arg[attachedPrefix.Length..];
+            }
+        }
+        return supplied;
+    }
+
+    /// <summary>
     /// Extracts the first <c>major.minor.patch</c> version token from tool
     /// version output; null when the output carries none. A trailing sentence
     /// period (as in <c>CodeQL command-line toolchain release 2.27.1.</c>) is
