@@ -199,6 +199,36 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
+    public async Task TruncatedScanStdout_IsInfrastructure_NeverAPass()
+    {
+        // A provider can return a findings exit alongside the stdout-limit
+        // flag: the surviving prefix may parse cleanly while dropped report
+        // sections hid the verdict-changing findings — never grade it.
+        var sandbox = new FakeSandbox((exec, _) => Task.FromResult(IsToolProbe(exec)
+            ? new SandboxExecResult(0, "", "")
+            : new SandboxExecResult(0, SarifWithOneError, "", StdoutLimitExceeded: true)));
+
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => new TestToolAuditor(new ExternalToolAuditorOptions()).RunAsync(
+                sandbox, "/work", FakeContext(), CancellationToken.None));
+    }
+
+    [Fact]
+    public void SarifParser_ExceedingResultBound_IsParseFailure_NotCapped()
+    {
+        const string sarif = """
+            {
+              "version": "2.1.0",
+              "runs": [{ "results": [{}, {}, {}] }]
+            }
+            """;
+        var parser = new SarifToolOutputParser(maxResults: 2);
+
+        Assert.Throws<ExternalToolParseException>(
+            () => parser.Parse(new ExternalToolParseInput("tool", sarif, "", 0)));
+    }
+
+    [Fact]
     public async Task UnparseableOutput_IsInfrastructure_NotAPass()
     {
         var sandbox = ToolReturning(0, "this is not sarif", "");
@@ -294,6 +324,13 @@ public sealed class ExternalToolAuditorTests
             Task.FromResult(new SandboxExecResult(0, "", "", ExecutionUnavailable: true)));
         await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.ProbeAsync(unavailable, [".hiddenrc"], CancellationToken.None));
+
+        // A provider can report exit 0 alongside the limit flag — a
+        // truncated echo is a partial verdict, never evidence of absence.
+        var truncated = new FakeSandbox((exec, _) =>
+            Task.FromResult(new SandboxExecResult(0, ".hiddenrc\n", "", StdoutLimitExceeded: true)));
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.ProbeAsync(truncated, [".hiddenrc"], CancellationToken.None));
     }
 
     [Fact]

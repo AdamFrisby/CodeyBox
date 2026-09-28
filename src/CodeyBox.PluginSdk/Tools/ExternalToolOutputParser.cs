@@ -140,8 +140,6 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
             var findings = new List<ExternalToolFinding>();
             foreach (var run in runs.EnumerateArray())
             {
-                if (findings.Count >= _maxResults)
-                    break;
                 if (run.ValueKind != JsonValueKind.Object
                     || !run.TryGetProperty("results"u8, out var results)
                     || results.ValueKind != JsonValueKind.Array)
@@ -149,8 +147,14 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
 
                 foreach (var result in results.EnumerateArray())
                 {
+                    // Capping here would silently drop results — and report
+                    // order is tool-controlled, so the dropped tail could
+                    // hold the verdict-changing entries. Overflow is a parse
+                    // failure, i.e. infrastructure, never a partial report.
                     if (findings.Count >= _maxResults)
-                        break;
+                        throw new ExternalToolParseException(
+                            $"Tool '{input.ToolName}' produced more than {_maxResults} SARIF "
+                            + "results — the report exceeds the parser's result bound.");
                     if (result.ValueKind == JsonValueKind.Object)
                         findings.Add(ParseResult(result));
                 }
