@@ -34,10 +34,18 @@ public sealed class ExternalToolAuditorOptions
     /// </summary>
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(DefaultTimeoutSeconds);
 
-    /// <summary>Per-stream output capture cap. Excess is discarded and reported as truncated.</summary>
+    /// <summary>
+    /// Per-stream output capture cap. A scan report exceeding it is a
+    /// truncated verdict stream — the run is reported as infrastructure,
+    /// never graded as a pass on the partial output.
+    /// </summary>
     public int MaxOutputBytesPerStream { get; set; } = DefaultMaxOutputBytesPerStream;
 
-    /// <summary>Upper bound on findings returned from one run. Excess findings are dropped and the truncation is reported.</summary>
+    /// <summary>
+    /// Upper bound on findings returned from one run. A report carrying more
+    /// findings than the bound is an infrastructure failure — emitting a
+    /// capped subset could let surplus entries evict a blocking one.
+    /// </summary>
     public int MaxFindings { get; set; } = DefaultMaxFindings;
 
     /// <summary>
