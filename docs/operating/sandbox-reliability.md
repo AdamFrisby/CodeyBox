@@ -32,7 +32,8 @@ A provider-owned sandbox is classified as leaked when these conditions hold:
 
 The default is derived — not picked: it equals the longest legitimate phase
 duration (the `WorkTimeoutPolicy.MaxMinutes` ceiling × the phase
-absolute-timeout multiplier) plus a provisioning margin, so a mid-phase sandbox
+absolute-timeout multiplier) plus a provisioning margin (currently 1.00:30:00,
+i.e. 24:30:00 wall-clock), so a mid-phase sandbox
 can never out-age the threshold while its worker is still legitimately running.
 Operators who lower it must keep it at or above the bound
 `SandboxLeakOptions.MinimumLeakAgeThreshold` computes for their configured
