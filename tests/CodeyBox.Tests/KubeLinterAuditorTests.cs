@@ -716,6 +716,17 @@ public sealed class KubeLinterAuditorTests
         Assert.Equal(0, scanExecs);
     }
 
+    // Both real-binary runs pin the check set instead of trusting the
+    // installed build's default catalogue: the test overrides ExpectedVersion
+    // with whatever is installed, so default-catalogue drift across versions
+    // cannot turn the clean fixture noisy or the violating fixture quiet.
+    private static readonly IReadOnlyDictionary<string, string?> RealBinaryScopedConfig =
+        new Dictionary<string, string?>
+        {
+            ["Scoped:DoNotAutoAddDefaults"] = "true",
+            ["Scoped:IncludeChecks"] = "latest-tag, run-as-non-root",
+        };
+
     [Fact]
     [Trait("requires_kube-linter", "true")]
     public async Task RealKubeLinter_ViolatingPodFixture_ProducesFindings_WithRuleIdAndLocation()
@@ -740,7 +751,7 @@ public sealed class KubeLinterAuditorTests
 
             var auditor = new KubeLinterAuditor();
             await auditor.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(new Dictionary<string, string?>(RealBinaryScopedConfig)
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                 }),
@@ -785,7 +796,7 @@ public sealed class KubeLinterAuditorTests
 
             var auditor = new KubeLinterAuditor();
             await auditor.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(new Dictionary<string, string?>(RealBinaryScopedConfig)
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                 }),
