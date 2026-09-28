@@ -16,8 +16,10 @@ namespace CodeyBox.KubeLinterAuditorPlugin;
 /// arguments and knobs below. Output parsing is the shared
 /// <see cref="SarifToolOutputParser"/> — kube-linter's
 /// <c>--format sarif</c> report carries the check name as <c>ruleId</c>, the
-/// message, and the file/line (object start) location per result, so no
-/// plugin-local parser exists to drift.
+/// message, and the manifest path per result, so no plugin-local parser
+/// exists to drift. The reported line is always <c>1</c> — kube-linter's
+/// SARIF emitter does not carry the object's real position — so locations
+/// identify the file, not a line.
 ///
 /// <para><b>Gate behaviour: blocking.</b> kube-linter has no severity
 /// vocabulary — a check either fired or it did not, and its SARIF results
@@ -26,8 +28,9 @@ namespace CodeyBox.KubeLinterAuditorPlugin;
 /// violation to <see cref="AuditSeverity.Error"/>: an enabled check that
 /// fires is a policy failure, so each finding fails the audit. There is no
 /// advisory mode; narrow the check set with <c>ExcludeChecks</c>,
-/// <c>ExcludedRules</c>, a pinned <c>ConfigFile</c>, or the repository's own
-/// <c>.kube-linter.yaml</c> instead.</para>
+/// <c>ExcludedRules</c>, or a pinned <c>ConfigFile</c> instead — the
+/// repository's own <c>.kube-linter.yaml</c> is gated (see below) because
+/// the audit subject may not narrow the checks it is measured against.</para>
 ///
 /// <para><b>Exit-code convention (verified against kube-linter 0.8.3 by
 /// running the release binary).</b> kube-linter does NOT follow the common
@@ -61,23 +64,30 @@ namespace CodeyBox.KubeLinterAuditorPlugin;
 /// <c>ExpectedVersion</c> is an infrastructure failure naming the tool —
 /// never a pass, never a finding.</para>
 ///
-/// <para><b>Repository-controlled configuration.</b> kube-linter
+/// <para><b>Repository-controlled configuration is gated.</b> kube-linter
 /// auto-loads <c>.kube-linter.yaml</c>/<c>.kube-linter.yml</c> from the
-/// audited repository root (check selection, custom checks, exclusions).
-/// That file is the tool's normal configuration surface, not an auditor
-/// bypass: checks it excludes are excluded by the scanner itself, and a
-/// config that enables zero checks surfaces as an infrastructure failure
-/// (empty stdout), never a silent pass. Operators who want a fixed check
-/// set regardless of repository content pin it with <c>ConfigFile</c>
-/// (pointing outside the audited tree) or the
-/// <c>IncludeChecks</c>/<c>ExcludeChecks</c>/<c>DoNotAutoAddDefaults</c>
-/// knobs.</para>
+/// audited worktree root when no <c>--config</c> is given — that file
+/// selects the check set (<c>checks.exclude</c>/<c>include</c>/
+/// <c>doNotAutoAddDefaults</c>) and declares custom checks, so a committed
+/// config could drop every check the diff would violate and still produce
+/// a clean, passing audit. An auditor its subject can silence is not a
+/// gate, so by default the presence of either file at the worktree root
+/// fails closed as infrastructure before the scan runs
+/// (<see cref="VerifyToolAsync"/>). Operators opt in deliberately: pin an
+/// outside-the-tree policy with <c>ConfigFile</c> (which disables the
+/// auto-load) or set <c>TrustRepositorySuppression</c> to honor repo
+/// config; the <c>IncludeChecks</c>/<c>ExcludeChecks</c>/
+/// <c>DoNotAutoAddDefaults</c>/<c>AddAllBuiltIn</c> knobs shape the check
+/// set regardless. One suppression channel no gate can close remains:
+/// kube-linter unconditionally honors per-object
+/// <c>ignore-check.kube-linter.io/*</c> annotations on audited manifests —
+/// weigh that when choosing either opt-in.</para>
 ///
 /// <para><b>Scope and defaults.</b> The default scan is
 /// <c>kube-linter lint .</c>: kube-linter walks the tree for
 /// <c>*.yaml</c>/<c>*.yml</c> documents, renders Helm chart directories and
 /// Kustomize roots in place (no network — templating is embedded in the
-/// binary), and reports each object start as the finding location. On top
+/// binary), and reports the manifest file as the finding location. On top
 /// of that, findings under vendored and dependency trees (<c>vendor/</c>,
 /// <c>third_party/</c>, <c>node_modules/</c>) are dropped by default —
 /// problems there describe upstream packages, not the change under audit.
@@ -115,11 +125,14 @@ public sealed class KubeLinterAuditor : ExternalToolAuditorBase, IPluginInitiali
     public const string DefaultExpectedVersion = "0.8.3";
 
     /// <summary>
-    /// Scoped-config key for kube-linter's <c>--config</c> file. Unset →
-    /// kube-linter's own default (<c>.kube-linter.yaml</c>/
-    /// <c>.kube-linter.yml</c> auto-loaded from the audited repository
-    /// root). Point it outside the audited tree for a check set the
-    /// repository cannot narrow.
+    /// Scoped-config key for kube-linter's <c>--config</c> file — an
+    /// operator-pinned check-selection policy. It must resolve outside the
+    /// audited worktree: an in-tree config is repository-controlled by
+    /// another name and fails closed unless
+    /// <see cref="TrustRepositorySuppressionKey"/> is set. Unset →
+    /// kube-linter's own auto-load of <c>.kube-linter.yaml</c>/
+    /// <c>.kube-linter.yml</c> from the worktree root applies, which the
+    /// auditor fails closed on by default for the same reason.
     /// </summary>
     public const string ConfigFileKey = "ConfigFile";
 
@@ -167,9 +180,34 @@ public sealed class KubeLinterAuditor : ExternalToolAuditorBase, IPluginInitiali
 
     /// <summary>
     /// Scoped-config key for scan targets (comma-separated files/folders,
-    /// positional args). Unset → <c>.</c> (the whole work tree).
+    /// positional args). Unset → <c>.</c> (the whole work tree). Entries
+    /// must be repo-relative paths inside the worktree — absolute paths and
+    /// <c>..</c> segments are rejected deterministically.
     /// </summary>
     public const string TargetsKey = "Targets";
+
+    /// <summary>
+    /// Scoped-config boolean opting in to repository-authored kube-linter
+    /// configuration (<c>.kube-linter.yaml</c>/<c>.kube-linter.yml</c> at
+    /// the audited worktree root, or an in-tree <see cref="ConfigFileKey"/>).
+    /// Default false: the audited repository must not be able to narrow the
+    /// check set it is audited against. Does not affect the per-object
+    /// <c>ignore-check.kube-linter.io/*</c> annotations kube-linter always
+    /// honors.
+    /// </summary>
+    internal const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
+
+    /// <summary>
+    /// Worktree-root config files kube-linter auto-loads (against the
+    /// process working directory, which is the repository root) when no
+    /// <c>--config</c> is given — the repository-controlled check-selection
+    /// surface <see cref="VerifyToolAsync"/> gates on.
+    /// </summary>
+    private static readonly string[] RepositoryConfigFiles =
+    [
+        ".kube-linter.yaml",
+        ".kube-linter.yml",
+    ];
 
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
@@ -197,6 +235,7 @@ public sealed class KubeLinterAuditor : ExternalToolAuditorBase, IPluginInitiali
     private Func<IReadOnlyList<string>> _targets = static () => [];
     private Func<bool> _doNotAutoAddDefaults = static () => false;
     private Func<bool> _addAllBuiltIn = static () => false;
+    private Func<bool> _trustRepositorySuppression = static () => false;
 
     /// <inheritdoc />
     public override string Name => "codeybox:kube-linter";
@@ -214,8 +253,10 @@ public sealed class KubeLinterAuditor : ExternalToolAuditorBase, IPluginInitiali
     /// <summary>
     /// The shared SARIF parser: kube-linter's <c>--format sarif</c> report
     /// carries the check name as <c>ruleId</c>, the diagnostic message, and
-    /// the manifest path plus object-start line per result, so locations
-    /// are preserved without a plugin-local parser.
+    /// the manifest path per result — locations are preserved without a
+    /// plugin-local parser. kube-linter reports <c>startLine</c> 1 for every
+    /// result (the object's position is not emitted), so finding locations
+    /// carry file-level precision only.
     /// </summary>
     protected override IExternalToolOutputParser OutputParser { get; } = new SarifToolOutputParser();
 
@@ -251,14 +292,14 @@ public sealed class KubeLinterAuditor : ExternalToolAuditorBase, IPluginInitiali
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
         // --format is the auditor's parsing contract (the shared SARIF
-        // parser) and is repeatable in kube-linter — a second --format
-        // writes another report to stdout and corrupts the document; a
-        // paired --output diverts it to a file (leaving stdout empty — and
-        // writing into the audited tree, which an auditor must never do).
-        // --config duplicates the scoped ConfigFile knob. All three are
-        // rejected deterministically rather than left to misfire into an
-        // infrastructure failure that blames the tool instead of the
-        // configuration that caused it.
+        // parser). kube-linter rejects a second --format outright unless it
+        // pairs with --output ("multiple formats require explicit --output
+        // flags"), and a paired --output would divert the report to a file —
+        // leaving stdout empty and writing into the audited tree, which an
+        // auditor must never do. --config duplicates the scoped ConfigFile
+        // knob. All three are rejected deterministically rather than left to
+        // misfire into an infrastructure failure that blames the tool
+        // instead of the configuration that caused it.
         if (ExtraArgumentsSupplyFlag(options, "--format"))
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' was configured with a --format ExtraArguments "
@@ -313,12 +354,13 @@ public sealed class KubeLinterAuditor : ExternalToolAuditorBase, IPluginInitiali
 
         // kube-linter parses with pflag, which interleaves flags and
         // positionals, so ExtraArguments flags appended after the targets
-        // still reach the flag parser. Targets are validated argv values
-        // (never leading-dash, never control characters) so they cannot be
-        // mistaken for flags.
+        // still reach the flag parser. Targets are validated repo-relative
+        // argv values (never leading-dash, rooted, or traversing) so they
+        // cannot be mistaken for flags or point the scan outside the
+        // worktree.
         var targets = _targets()
             .Where(static t => !string.IsNullOrWhiteSpace(t))
-            .Select(t => ValidatedArgumentValue(t, $"{PluginId}:{TargetsKey}"))
+            .Select(t => ValidatedRepoRelativeTarget(t, $"{PluginId}:{TargetsKey}"))
             .ToList();
         if (targets.Count == 0)
             args.Add(".");
@@ -343,9 +385,83 @@ public sealed class KubeLinterAuditor : ExternalToolAuditorBase, IPluginInitiali
         _doNotAutoAddDefaults = () =>
             bool.TryParse(scoped[DoNotAutoAddDefaultsKey], out var value) && value;
         _addAllBuiltIn = () => bool.TryParse(scoped[AddAllBuiltInKey], out var value) && value;
+        _trustRepositorySuppression = () =>
+            bool.TryParse(scoped[TrustRepositorySuppressionKey], out var trust) && trust;
         context.Logger.LogInformation(
             "KubeLinterAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// kube-linter-specific precondition on the live path: kube-linter
+    /// auto-loads <c>.kube-linter.yaml</c>/<c>.kube-linter.yml</c> from the
+    /// process working directory — the audited worktree root — and that
+    /// file selects the check set, so the audit subject could commit a
+    /// config that drops the checks its manifests would violate and still
+    /// receive a clean audit. Unless the operator opted in via
+    /// <see cref="TrustRepositorySuppressionKey"/>, their presence at the
+    /// worktree root fails closed as infrastructure before the scan runs;
+    /// the probe is root-scoped because the auto-load resolves against the
+    /// process CWD only. An operator-pinned <see cref="ConfigFileKey"/>
+    /// disables the auto-load entirely — it becomes the check-selection
+    /// surface instead, so it must resolve outside the worktree: an in-tree
+    /// config is repository-controlled by another name and fails closed the
+    /// same way.
+    /// </summary>
+    protected override async Task VerifyToolAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        if (_trustRepositorySuppression())
+            return;
+
+        var configFile = _configFile();
+        if (!string.IsNullOrWhiteSpace(configFile))
+        {
+            if (ResolvesInsideWorktree(configFile.Trim(), workingDirectory))
+                throw new AuditUnavailableException(
+                    $"could-not-verify: auditor '{Name}' is configured with a {ConfigFileKey} "
+                    + $"('{TruncateForMessage(configFile)}') that resolves inside the audited "
+                    + "worktree — repository-controlled check selection. Point "
+                    + $"CodeyBox:Plugins:{PluginId}:{ConfigFileKey} at a path outside the tree, or set "
+                    + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to trust "
+                    + "repository-controlled kube-linter configuration.")
+                { IsDeterministic = true };
+            return;
+        }
+
+        var present = await ProbeRepositoryFilesPresentAsync(
+            sandbox, workingDirectory, tool, RepositoryConfigFiles, options, ct).ConfigureAwait(false);
+        if (present.Count > 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' found repository-controlled config file(s) "
+                + $"'{string.Join("', '", present)}' at the audited worktree root — kube-linter "
+                + "auto-loads it for check selection (checks.exclude/include/"
+                + "doNotAutoAddDefaults), so the audit subject could drop the checks its manifests "
+                + "would violate and still receive a clean audit. Remove the file(s), pin an "
+                + $"operator-owned config outside the tree via "
+                + $"CodeyBox:Plugins:{PluginId}:{ConfigFileKey}, or set "
+                + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true to trust "
+                + "repository-controlled check selection.")
+            { IsDeterministic = true };
+    }
+
+    /// <summary>
+    /// Lexical containment check: does <paramref name="path"/> resolve inside
+    /// <paramref name="workingDirectory"/> when interpreted by the tool in
+    /// the sandbox (relative entries resolve against the process CWD)?
+    /// Lexical by design — the gate only needs to catch a config the
+    /// repository's tracked content can supply.
+    /// </summary>
+    private static bool ResolvesInsideWorktree(string path, string workingDirectory)
+    {
+        var root = Path.GetFullPath(workingDirectory);
+        var full = Path.GetFullPath(path, workingDirectory);
+        return full.Equals(root, StringComparison.Ordinal)
+            || full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal);
     }
 
     private static string ValidatedCheckName(string value, string key)

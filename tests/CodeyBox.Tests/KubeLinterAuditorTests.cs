@@ -17,11 +17,15 @@ namespace CodeyBox.Tests;
 ///   the parser fails closed so "could not run" is infrastructure, not findings.
 /// - Vacuous scans (zero checks enabled, no valid objects) exit 0/1 with empty stdout and
 ///   fail closed as infrastructure — never a pass.
-/// - SARIF results map to findings with the check name as rule id and file/line locations.
+/// - SARIF results map to findings with the check name as rule id and the manifest
+///   path as location (kube-linter's SARIF emitter reports a fixed startLine of 1).
 /// - kube-linter carries no severity level, so every finding maps to Error through the
 ///   declared severity mapping (never passed through raw).
 /// - --format/--output/--config in ExtraArguments are rejected deterministically
 ///   (parsing contract, no writes into the audited tree, unambiguous config source).
+/// - A worktree-root .kube-linter.yaml/.yml (repo-controlled check selection) fails
+///   closed unless TrustRepositorySuppression or an out-of-tree ConfigFile is set.
+/// - Targets entries must be repo-relative — rooted/traversing paths are rejected.
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_kube-linter", "true")] need only
 ///   the binary: kube-linter renders everything locally, no network.
@@ -220,7 +224,7 @@ public sealed class KubeLinterAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -247,7 +251,7 @@ public sealed class KubeLinterAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(1, SarifWithViolations, "Error: found 2 lint errors"));
@@ -285,7 +289,7 @@ public sealed class KubeLinterAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
         });
@@ -302,7 +306,7 @@ public sealed class KubeLinterAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(1, SarifWithViolations, "Error: found 2 lint errors"));
         });
@@ -321,7 +325,7 @@ public sealed class KubeLinterAuditorTests
         // writes a plain-text error to stderr and no report.
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(1, "", "Error: unknown flag: --bogus-flag"));
         });
@@ -336,12 +340,13 @@ public sealed class KubeLinterAuditorTests
     [Fact]
     public async Task VacuousScan_Exit0_WithoutSarifReport_IsInfrastructureFailure()
     {
-        // A repo config enabling zero checks (or targets holding no objects
-        // before --fail-if-no-objects-found applies) exits 0 with only a
-        // stderr warning — "ran clean" without a report is not a pass.
+        // A config enabling zero checks exits 0 with only a stderr warning
+        // ("Warning: no checks enabled.") — "ran clean" without a report is
+        // not a pass. Targets holding no objects exit 1 instead under
+        // --fail-if-no-objects-found.
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(0, "", "Warning: no checks enabled."));
         });
@@ -358,7 +363,7 @@ public sealed class KubeLinterAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(2, "", "unexpected exit"));
         });
@@ -376,7 +381,7 @@ public sealed class KubeLinterAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(127, "", "kube-linter: command not found"));
         });
@@ -394,7 +399,7 @@ public sealed class KubeLinterAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(1, SarifWithLevels, "Error: found 3 lint errors"));
         });
@@ -427,7 +432,7 @@ public sealed class KubeLinterAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -455,7 +460,7 @@ public sealed class KubeLinterAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -483,7 +488,7 @@ public sealed class KubeLinterAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -597,7 +602,7 @@ public sealed class KubeLinterAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -650,7 +655,7 @@ public sealed class KubeLinterAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(1, SarifWithVendoredPaths, ""));
         });
@@ -667,7 +672,7 @@ public sealed class KubeLinterAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             return Task.FromResult(new SandboxExecResult(1, SarifWithViolations, ""));
         });
@@ -694,7 +699,7 @@ public sealed class KubeLinterAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -713,6 +718,180 @@ public sealed class KubeLinterAuditorTests
 
         Assert.True(ex.IsDeterministic);
         Assert.Contains("Targets", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Theory]
+    [InlineData("/repo/deploy")]
+    [InlineData("../outside")]
+    [InlineData("deploy/../../etc")]
+    [InlineData("a\\..\\b.yaml")]
+    public async Task RootedOrTraversingTarget_IsRejectedAsDeterministicInfrastructure(string target)
+    {
+        // Targets keep the repo-relative location contract: a rooted or
+        // traversing entry would scan outside the worktree and produce
+        // finding paths ExcludePaths cannot match.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var auditor = new KubeLinterAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:Targets"] = target,
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("Targets", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Theory]
+    [InlineData(".kube-linter.yaml")]
+    [InlineData(".kube-linter.yml")]
+    public async Task RepoKubeLinterConfig_FailsClosed_ScanNeverRuns(string configFile)
+    {
+        // kube-linter auto-loads a worktree-root .kube-linter.yaml/.yml for
+        // check selection — a committed config could exclude every check the
+        // diff would violate and still produce a clean audit, so presence
+        // fails closed unless the operator opts in.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsSuppressionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, configFile + "\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new KubeLinterAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains(configFile, ex.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            KubeLinterAuditor.TrustRepositorySuppressionKey, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task TrustedRepositorySuppression_SkipsRepoConfigGate_ScanRuns()
+    {
+        var auditor = new KubeLinterAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:" + KubeLinterAuditor.TrustRepositorySuppressionKey] = "true",
+            }),
+            CancellationToken.None);
+
+        var suppressionProbes = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSuppressionProbe(exec))
+            {
+                suppressionProbes++;
+                return Task.FromResult(new SandboxExecResult(0, ".kube-linter.yaml\n", ""));
+            }
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+        Assert.Equal(0, suppressionProbes);
+    }
+
+    [Theory]
+    [InlineData("/etc/codeybox/kube-linter.yaml")]
+    [InlineData("../policy/kube-linter.yaml")] // resolves to /policy/…, outside the "/work" tree
+    public async Task PinnedConfigFile_SkipsRepoConfigGate(string configFile)
+    {
+        // --config disables the worktree-root auto-load, so an
+        // operator-pinned config outside the audited tree removes the repo
+        // file from check selection — no probe is needed.
+        var auditor = new KubeLinterAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigFile"] = configFile,
+            }),
+            CancellationToken.None);
+
+        var suppressionProbes = 0;
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSuppressionProbe(exec))
+            {
+                suppressionProbes++;
+                return Task.FromResult(new SandboxExecResult(0, ".kube-linter.yaml\n", ""));
+            }
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(0, suppressionProbes);
+        Assert.NotNull(scanExec);
+        var configIndex = scanExec!.Argv.ToList().IndexOf("--config");
+        Assert.True(configIndex >= 0 && scanExec.Argv[configIndex + 1] == configFile);
+    }
+
+    [Theory]
+    [InlineData("ci/kube-linter.yaml")] // relative → resolves inside "/work"
+    [InlineData("/work/deploy/kube-linter.yaml")] // absolute inside "/work"
+    public async Task InTreeConfigFile_FailsClosed_AsRepositoryControlled(string configFile)
+    {
+        // A pinned --config inside the audited tree hands check selection to
+        // the repository under audit — repository-controlled by another
+        // name, so it fails closed like a worktree-root .kube-linter.yaml.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var auditor = new KubeLinterAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigFile"] = configFile,
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("ConfigFile", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            KubeLinterAuditor.TrustRepositorySuppressionKey, ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -847,6 +1026,15 @@ public sealed class KubeLinterAuditorTests
 
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "kube-linter" && exec.Argv[1] == "version";
+
+    // The repository-config gate probes the worktree root for
+    // .kube-linter.yaml/.kube-linter.yml via the shared presence script.
+    private static bool IsSuppressionProbe(SandboxExec exec)
+        => exec.Argv.Count >= 3
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && (exec.Argv.Contains(".kube-linter.yaml", StringComparer.Ordinal)
+                || exec.Argv.Contains(".kube-linter.yml", StringComparer.Ordinal));
 
     private static async Task<string> SeedKubeLinterFixtureRepoAsync(bool violating)
     {

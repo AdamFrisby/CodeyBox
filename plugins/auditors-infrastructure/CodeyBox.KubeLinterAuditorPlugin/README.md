@@ -16,14 +16,15 @@ and best-practice checks such as `run-as-non-root`, `no-read-only-root-fs`,
     (`<namespace>/<name> <group>/<version>, Kind=…`) and the check's
     remediation text (in the rule metadata).
   - `Location` — the manifest path kube-linter reports, relative to the
-    work tree for in-tree targets, with the object's start line
-    (`file.yaml:N`). kube-linter locates objects, not fields: the line is
-    the start of the YAML document the object came from.
+    work tree for in-tree targets (`file.yaml:1`). kube-linter's SARIF
+    emitter reports `startLine` 1 for every result — it does not carry the
+    object's real position — so findings locate the file, not a line.
 - **Severity: blocking.** kube-linter has no severity vocabulary — a check
   either fired or it did not — so the declared mapping sends every
   reported violation to `Error` and fails the audit. There is no advisory
-  mode; narrow the check set instead (`ExcludeChecks`, `ExcludedRules`, a
-  pinned `ConfigFile`, or the repo's own `.kube-linter.yaml`).
+  mode; narrow the check set instead (`ExcludeChecks`, `ExcludedRules`, or
+  a pinned `ConfigFile`; the repo's own `.kube-linter.yaml` is gated — see
+  below).
 
 ## What it cannot see
 
@@ -45,6 +46,10 @@ and best-practice checks such as `run-as-non-root`, `no-read-only-root-fs`,
   (kube-linter still scans them — the filter is post-scan). Re-include by
   overriding `ExcludePaths`, or keep them out of the scan entirely with
   `IgnorePaths`.
+- **Checks silenced by per-object annotations.** kube-linter honors
+  `ignore-check.kube-linter.io/<check>` annotations on audited objects
+  unconditionally — a manifest can self-exempt from specific checks and no
+  auditor knob prevents it (see below).
 
 ## Exit codes and failure classification
 
@@ -83,24 +88,44 @@ into the sandbox baseline via `CodeyBox:MultipassExtraRuncmd` /
 `CodeyBox:Incus:ExtraRuncmd` or `ExecutableProvisions`, e.g.:
 
 ```sh
-# baseline bake step (adjust arch; verify against the release checksums)
+# baseline bake step (adjust arch; kube-linter publishes .sigstore.json
+# bundles rather than checksums.txt, so pin the digest of the asset you
+# verified — shown here for the linux/amd64 build of v0.8.3)
 KUBE_LINTER_VERSION=0.8.3
-curl -fsSL "https://github.com/stackrox/kube-linter/releases/download/v${KUBE_LINTER_VERSION}/kube-linter-linux" -o /usr/local/bin/kube-linter
-chmod +x /usr/local/bin/kube-linter
+KUBE_LINTER_SHA256=618d299a3e2839c8ca9d86fce0db617be0fba41f0fecbbbfb7fbf1c04299fae1
+curl -fsSL "https://github.com/stackrox/kube-linter/releases/download/v${KUBE_LINTER_VERSION}/kube-linter-linux" -o /tmp/kube-linter
+echo "${KUBE_LINTER_SHA256}  /tmp/kube-linter" | sha256sum -c -
+install -c -m 0755 /tmp/kube-linter /usr/local/bin/kube-linter
 kube-linter version   # must print the pinned version
 ```
 
 ## Repository-controlled configuration
 
 kube-linter **auto-loads `.kube-linter.yaml`/`.kube-linter.yml` from the
-audited repository root** — check selection, custom checks, and ignore
-paths in that file are the tool's normal configuration surface and apply
-to the scan. A repo cannot silently blind the auditor: a config that
-enables zero checks produces `Warning: no checks enabled.` with no report,
-which fails closed as infrastructure. Operators who want a check set the
-repository cannot narrow pin one with `ConfigFile` (a path outside the
-audited tree) or drive selection with the `IncludeChecks`/`ExcludeChecks`/
-`DoNotAutoAddDefaults`/`AddAllBuiltIn` knobs.
+audited repository root** when no `--config` is given — that file selects
+the check set (`checks.exclude`/`checks.include`/`doNotAutoAddDefaults`)
+and declares custom checks, so a committed config could drop every check
+the diff would violate and still produce a clean, passing audit. An
+auditor its subject can silence is not a gate, so **the presence of either
+file at the worktree root fails closed as infrastructure** — by default,
+before the scan runs. Operators opt in deliberately:
+
+- `ConfigFile` — pin an operator-owned policy file **outside the audited
+  tree**. Passing `--config` disables the auto-load, so a pinned config
+  replaces the repo file as the check-selection surface; for that reason
+  a `ConfigFile` that resolves inside the worktree fails closed the same
+  way.
+- `TrustRepositorySuppression: true` — honor repo-authored config (and
+  permit an in-tree `ConfigFile`). Set this only when the audited
+  repositories legitimately carry `.kube-linter.yaml` policies.
+- `IncludeChecks`/`ExcludeChecks`/`DoNotAutoAddDefaults`/`AddAllBuiltIn`
+  shape the check set regardless of the gate.
+
+One suppression channel no gate can close: kube-linter unconditionally
+honors per-object `ignore-check.kube-linter.io/<check>` annotations on
+audited manifests — no flag or config disables them — so a manifest under
+audit can still self-exempt from individual checks. Weigh that when
+choosing either opt-in above.
 
 ## Enabling
 
@@ -136,8 +161,9 @@ Scoped under `CodeyBox:Plugins:codeybox.kube-linter`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `0.8.3` | Pinned kube-linter release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `ConfigFile` | — (repo `.kube-linter.yaml`) | `--config` path. Point it outside the audited tree for a check set the repository cannot narrow. |
-| `Targets` | `.` | Comma-separated files/folders scanned positionally. Repo-relative paths keep finding locations repo-relative. |
+| `ConfigFile` | — | `--config` path — an operator-pinned check-selection policy. Must resolve outside the audited worktree (in-tree paths are repository-controlled and fail closed). Unset → kube-linter's worktree-root auto-load applies, gated as described above. |
+| `TrustRepositorySuppression` | `false` | Honor repository-authored kube-linter configuration: a worktree-root `.kube-linter.yaml`/`.kube-linter.yml`, or an in-tree `ConfigFile`. When `false`, either fails the run closed as infrastructure — off by default because the audit subject authors those files. Does not affect the `ignore-check.kube-linter.io/*` annotations kube-linter always honors. |
+| `Targets` | `.` | Comma-separated files/folders scanned positionally. Must be repo-relative paths inside the worktree — absolute paths and `..` segments are rejected deterministically, keeping finding locations repo-relative. |
 | `IncludeChecks` | — | Comma-separated check names → repeatable `--include`. Adds to the default set; combine with `DoNotAutoAddDefaults` for exclusive selection. |
 | `ExcludeChecks` | — | Comma-separated check names → repeatable `--exclude`. Unknown names are silently ignored by kube-linter (more findings, never fewer). |
 | `DoNotAutoAddDefaults` | `false` | `--do-not-auto-add-defaults`: run only explicitly included checks. Zero enabled checks fail closed as infrastructure — pair it with `IncludeChecks`. |

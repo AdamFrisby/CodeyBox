@@ -145,7 +145,7 @@ Scoped under `CodeyBox:Plugins:codeybox.kubeconform`, resolved per run
 | `ExpectedVersion` | `0.8.0` | Pinned kubeconform release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
 | `SchemaLocations` | — (upstream default) | Comma-separated `-schema-location` values: `default`, URLs, local directories, or templates. Repeated per kubeconform's own semantics. |
 | `KubernetesVersion` | — (`master`) | `-kubernetes-version` value: `master` or full `x.y.z`. Pin for stable schema revisions — `master` tracks upstream schema changes. |
-| `Targets` | `.` | Comma-separated files/folders scanned positionally. Repo-relative paths keep finding locations repo-relative. |
+| `Targets` | `.` | Comma-separated files/folders scanned positionally. Must be repo-relative paths inside the worktree — absolute paths and `..` segments are rejected deterministically, keeping finding locations repo-relative. |
 | `Strict` | `false` | `-strict`: reject properties not in the schema and duplicated keys. |
 | `IgnoreMissingSchemas` | `false` | `-ignore-missing-schemas`: skip kinds with no resolvable schema instead of reporting `statusError`. Off by default because it turns "no schema" into a silent skip — opt in for CRD-bearing repos whose schemas you do not provision. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
