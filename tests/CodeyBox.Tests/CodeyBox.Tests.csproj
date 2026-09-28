@@ -85,6 +85,7 @@
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.GitleaksAuditorPlugin\CodeyBox.GitleaksAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SpectralAuditorPlugin\CodeyBox.SpectralAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SquawkAuditorPlugin\CodeyBox.SquawkAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-scripting\CodeyBox.ShellcheckAuditorPlugin\CodeyBox.ShellcheckAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.CodeqlAuditorPlugin\CodeyBox.CodeqlAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.DevSkimAuditorPlugin\CodeyBox.DevSkimAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
