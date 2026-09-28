@@ -63,7 +63,7 @@ internal sealed class LycheeJsonOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid JSON: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid JSON: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
 

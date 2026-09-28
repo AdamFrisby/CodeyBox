@@ -126,7 +126,7 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid SARIF JSON: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid SARIF JSON: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
 
@@ -242,7 +242,4 @@ public sealed class SarifToolOutputParser : IExternalToolOutputParser
             trimmed = trimmed[fileScheme.Length..].TrimStart('/');
         return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
     }
-
-    private static string SingleLine(string message)
-        => ExternalToolJsonHelpers.SingleLine(message);
 }
