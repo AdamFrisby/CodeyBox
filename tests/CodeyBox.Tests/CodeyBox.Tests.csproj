@@ -60,6 +60,7 @@
     <ProjectReference Include="..\..\plugins\auditors-documentation\CodeyBox.LycheeAuditorPlugin\CodeyBox.LycheeAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.ActionlintAuditorPlugin\CodeyBox.ActionlintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.KubeconformAuditorPlugin\CodeyBox.KubeconformAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.KubeLinterAuditorPlugin\CodeyBox.KubeLinterAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.TflintAuditorPlugin\CodeyBox.TflintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ClangTidyAuditorPlugin\CodeyBox.ClangTidyAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ExampleSarifAuditorPlugin\CodeyBox.ExampleSarifAuditorPlugin.csproj" />
