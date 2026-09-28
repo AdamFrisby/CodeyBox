@@ -127,8 +127,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// cannot express — e.g. a repository-state gate — and throw
     /// <see cref="AuditUnavailableException"/> to fail closed: a failed
     /// precondition is infrastructure, never a pass.
-    /// Use <see cref="ExecToolBoundedAsync"/> for precondition probes so they
-    /// get the same timeout bounding and failure classification as the scan;
+    /// Use <see cref="RunBoundedProbeAsync"/> for precondition probes — it
+    /// supplies the standard bounded envelope over
+    /// <see cref="ExecToolBoundedAsync"/> — or the latter directly when the
+    /// probe needs a nonstandard envelope;
     /// <see cref="ProbeRepositoryFilesPresentAsync"/> covers the common
     /// "does a repository-controlled file exist" gate and
     /// <see cref="ThrowIfBinaryMissingAsync"/> an auxiliary binary the tool
@@ -153,7 +155,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// <c>ExtraArguments</c>, and count toward the built-argument bound.
     /// The hook runs before the tool-presence, version, and
     /// <see cref="VerifyToolAsync"/> checks; use
-    /// <see cref="ExecToolBoundedAsync"/> for probes so they share the
+    /// <see cref="RunBoundedProbeAsync"/> for probes so they share the
     /// timeout bounding and failure classification. Default: no arguments.
     /// </summary>
     protected virtual Task<IReadOnlyList<string>> ResolveContextArgumentsAsync(
@@ -172,7 +174,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// directory the scan will actually run in: sandbox providers may
     /// translate <paramref name="workingDirectory"/> (the process provider
     /// maps it onto a host path), so resolve it with a bounded probe such as
-    /// <c>pwd</c> through <see cref="ExecToolBoundedAsync"/>. The value is
+    /// <c>pwd</c> through <see cref="RunBoundedProbeAsync"/>. The value is
     /// carried to the parser on <see cref="ExternalToolParseInput.ScanRoot"/>
     /// — a per-invocation channel, so output parsing stays a pure function
     /// of its input and concurrent audits on this (singleton) auditor cannot
@@ -270,26 +272,16 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ArgumentNullException.ThrowIfNull(options);
         ExternalToolNames.Validate(binary, nameof(binary));
 
-        var probe = await ExecToolBoundedAsync(
+        var reason = purpose is null ? string.Empty : $" ({SingleLine(purpose)})";
+        var probe = await RunBoundedProbeAsync(
             sandbox,
             binary,
-            "presence check",
-            new SandboxExec
-            {
-                Argv = ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", binary],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            $"presence check{reason}",
+            ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", binary],
+            workingDirectory,
+            options,
             ct).ConfigureAwait(false);
 
-        var reason = purpose is null ? string.Empty : $" ({SingleLine(purpose)})";
-        if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: binary '{binary}' presence check could not run: the sandbox exec "
-                + $"transport was unavailable.{reason}");
         if (probe.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: required binary '{binary}' is not installed in the audit sandbox."
@@ -379,6 +371,55 @@ public abstract class ExternalToolAuditorBase : IAuditor
         }
     }
 
+    /// <summary>
+    /// Runs one bounded precondition probe on behalf of
+    /// <paramref name="tool"/>: builds the <see cref="SandboxExec"/> with the
+    /// shared probe envelope — <see cref="ProbeMaxOutputBytes"/> per stream
+    /// (or <paramref name="maxStdoutBytes"/> for probes that legitimately
+    /// emit more), kill-on-limit, and the capped <see cref="ProbeTimeout"/>
+    /// — and classifies an exec-transport failure as
+    /// <see cref="AuditUnavailableException"/> naming the tool. Exit-code
+    /// interpretation stays with the caller: what a completed probe's exit
+    /// code means is probe-specific. <paramref name="operation"/> names the
+    /// invocation in failure messages (e.g. "presence check", "version
+    /// check"); keep it an author-chosen constant.
+    /// </summary>
+    protected static async Task<SandboxExecResult> RunBoundedProbeAsync(
+        ISandbox sandbox,
+        string tool,
+        string operation,
+        IReadOnlyList<string> argv,
+        string workingDirectory,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct,
+        int maxStdoutBytes = ProbeMaxOutputBytes)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentNullException.ThrowIfNull(argv);
+        ArgumentNullException.ThrowIfNull(options);
+
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            operation,
+            new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = maxStdoutBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
+                + "transport was unavailable.");
+        return result;
+    }
+
     private async Task VerifyToolVersionPinAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -402,24 +443,17 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var probeArguments = pin.VersionProbeArguments.Count > 0
             ? pin.VersionProbeArguments
             : ["--version"];
-        var result = await ExecToolBoundedAsync(
+        var result = await RunBoundedProbeAsync(
             sandbox,
             tool,
             "version check",
-            new SandboxExec
-            {
-                Argv = [tool, .. probeArguments],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            [tool, .. probeArguments],
+            workingDirectory,
+            options,
             ct).ConfigureAwait(false);
 
         var reported = (pin.VersionExtractor ?? ExtractToolVersion)(result.Stdout);
-        if (result.ExecutionUnavailable
-            || result.ExitCode != 0
+        if (result.ExitCode != 0
             || reported is null)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' version could not be determined "
@@ -527,25 +561,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
         if (requested.Count == 0)
             return [];
 
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            operation,
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
+        var result = await RunBoundedProbeAsync(
+            sandbox, tool, operation, argv, workingDirectory, options, ct).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
-                + "transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' {operation} could not {failureGoal} "
@@ -667,26 +685,14 @@ public abstract class ExternalToolAuditorBase : IAuditor
     {
         var argv = new List<string>(args.Count + 1) { "git" };
         argv.AddRange(args);
-        var result = await ExecToolBoundedAsync(
+        return await RunBoundedProbeAsync(
             sandbox,
             ToolName,
             "baseline resolution",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            argv,
+            workingDirectory,
+            options,
             ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' baseline resolution could not run: "
-                + "the sandbox exec transport was unavailable.");
-        return result;
     }
 
     private static string? ReadCommitSha(string stdout)
@@ -774,11 +780,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// BEFORE the scan runs (e.g. when narrowing which files are passed as
     /// tool arguments). <paramref name="normalizedRepoRelativePath"/> must
     /// already be in repo-relative normalized form (<c>\</c>→<c>/</c>, no
-    /// leading <c>/</c> — e.g. <c>ExternalToolJsonHelpers.NormalizePath</c>
-    /// output). An entry ending in <c>/</c> is a directory-prefix exclusion;
+    /// leading <c>/</c> or <c>./</c> — e.g.
+    /// <c>ExternalToolJsonHelpers.NormalizePath</c> output); a raw or
+    /// un-normalized path silently produces wrong decisions.
+    /// An entry ending in <c>/</c> is a directory-prefix exclusion;
     /// any other entry excludes exactly that path.
     /// </summary>
-    protected static bool IsPathExcluded(
+    protected static bool IsNormalizedPathExcluded(
         string normalizedRepoRelativePath,
         ExternalToolAuditorOptions options)
     {
@@ -932,7 +940,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     {
         if (options.ExcludePaths.Count == 0 || string.IsNullOrWhiteSpace(item.Path))
             return false;
-        return IsPathExcluded(NormalizeFindingPath(item.Path), options);
+        return IsNormalizedPathExcluded(NormalizeFindingPath(item.Path), options);
     }
 
     private static string BuildTitle(ExternalToolFinding item)

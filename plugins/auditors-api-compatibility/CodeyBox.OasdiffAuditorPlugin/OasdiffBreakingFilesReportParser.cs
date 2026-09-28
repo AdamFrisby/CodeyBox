@@ -45,6 +45,10 @@ internal sealed class OasdiffBreakingFilesReportParser : IExternalToolOutputPars
     // Same per-report result bound the shared SARIF parser applies.
     private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
 
+    // Echoed spec paths and report bodies land in parse-error messages —
+    // bound the snippet so untrusted output cannot flood the failure reason.
+    private const int MessageSnippetMaxChars = 120;
+
     private const string SkippedNotice = "new file, not in base ref, skipped";
 
     // breaking-files prints "=== <path> ===" before each spec's rendered
@@ -182,9 +186,12 @@ internal sealed class OasdiffBreakingFilesReportParser : IExternalToolOutputPars
 
     /// <summary>
     /// Location preference: <c>revisionSource</c> (where the new spec
-    /// carries the change) first, then <c>baseSource</c>. Either may point
-    /// into a relative-$ref'd sibling file — legitimately, since in-repo
-    /// refs resolve under <c>--allow-external-refs=false</c>.
+    /// carries the change) first, then <c>baseSource</c>. Under the default
+    /// <c>--allow-external-refs=false</c> only <c>baseSource</c> can point
+    /// into a relative-$ref'd sibling file — the baseline is loaded through
+    /// <c>git show</c>, which resolves in-repo refs, while the worktree-side
+    /// load refuses every non-fragment $ref; with external refs enabled,
+    /// either side may carry a resolved sibling path.
     /// </summary>
     private static (string? File, int? Line) ChangeLocation(JsonElement change)
     {
@@ -239,7 +246,7 @@ internal sealed class OasdiffBreakingFilesReportParser : IExternalToolOutputPars
         => ExternalToolJsonHelpers.SingleLine(message);
 
     private static string Truncate(string? value)
-        => ExternalToolJsonHelpers.Truncate(value ?? string.Empty, 120);
+        => ExternalToolJsonHelpers.Truncate(value ?? string.Empty, MessageSnippetMaxChars);
 
     private static IEnumerable<string> SplitLines(string text)
     {

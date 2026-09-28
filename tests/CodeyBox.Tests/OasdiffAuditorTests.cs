@@ -382,6 +382,22 @@ public sealed class OasdiffAuditorTests
     }
 
     [Fact]
+    public async Task SpecDiscoveryFailure_IsInfrastructureFailure_NotEmptyScope()
+    {
+        var handler = new Handler { DiscoveryExitCode = 128 };
+
+        IAuditor auditor = new OasdiffAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
+
+        // A failed ls-files proves nothing about the spec set — it must
+        // fail closed, never fall through to "no specs found".
+        Assert.Contains("oasdiff", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("ls-files exit 128", ex.Message, StringComparison.Ordinal);
+        Assert.Null(handler.ScanExec);
+    }
+
+    [Fact]
     public async Task Discovery_ExcludesVendoredAndNonArgumentPaths()
     {
         var handler = new Handler
@@ -389,6 +405,16 @@ public sealed class OasdiffAuditorTests
             DiscoveryOutput =
                 "openapi.yaml\0vendor/petstore-openapi.yaml\0node_modules/pkg/swagger.json\0"
                 + "api:old-openapi.yaml\0--weird-openapi.yaml\0",
+            // Every candidate reports present, so only the production
+            // NormalizeSpecPath/IsNormalizedPathExcluded filtering — not the
+            // stubbed presence probe — can keep them out of argv.
+            PresentNames =
+            {
+                "vendor/petstore-openapi.yaml",
+                "node_modules/pkg/swagger.json",
+                "api:old-openapi.yaml",
+                "--weird-openapi.yaml",
+            },
             ScanStdout = ReportClean,
         };
 
@@ -447,74 +473,104 @@ public sealed class OasdiffAuditorTests
                 handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
 
         Assert.True(ex.IsDeterministic);
+        // Pin the invalid-path branch specifically: the "not a usable spec
+        // path" wording distinguishes a rejected entry from the
+        // absent-from-worktree branch, which fails identically.
+        Assert.Contains("not a usable spec path", ex.Message, StringComparison.Ordinal);
         Assert.Null(handler.ScanExec);
     }
 
     [Fact]
     public async Task ConfiguredSpecPath_ResolvingToSymlink_IsDeterministicFailure()
     {
-        var handler = new Handler { ScanStdout = ReportClean };
-        handler.PresentNames.Add("linked-openapi.yaml");
-        handler.SymlinkNames.Add("linked-openapi.yaml");
+        var root = await SeedProbeWorktreeAsync(
+            symlinks: new Dictionary<string, string> { ["linked-openapi.yaml"] = "openapi.yaml" },
+            regularFiles: ["openapi.yaml"]);
+        try
+        {
+            var handler = new Handler { ScanStdout = ReportClean, RealProbeRoot = root };
 
-        var auditor = new OasdiffAuditor();
-        await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
-            {
-                ["Scoped:SpecPaths"] = "linked-openapi.yaml",
-                ["Scoped:BaseRef"] = "main",
-            }),
-            CancellationToken.None);
+            var auditor = new OasdiffAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:SpecPaths"] = "linked-openapi.yaml",
+                    ["Scoped:BaseRef"] = "main",
+                }),
+                CancellationToken.None);
 
-        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
-            () => ((IAuditor)auditor).RunAsync(
-                handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
+            var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+                () => ((IAuditor)auditor).RunAsync(
+                    handler.Sandbox(), root, FakeContext(), CancellationToken.None));
 
-        Assert.True(ex.IsDeterministic);
-        Assert.Contains("linked-openapi.yaml", ex.Message, StringComparison.Ordinal);
-        Assert.Null(handler.ScanExec);
+            Assert.True(ex.IsDeterministic);
+            Assert.Contains("linked-openapi.yaml", ex.Message, StringComparison.Ordinal);
+            Assert.Null(handler.ScanExec);
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
     }
 
     [Fact]
     public async Task DiscoveredSpec_ThatIsASymlink_IsNeverPassedToOasdiff()
     {
-        var handler = new Handler
+        var root = await SeedProbeWorktreeAsync(
+            symlinks: new Dictionary<string, string> { ["linked-openapi.yaml"] = "openapi.yaml" },
+            regularFiles: ["openapi.yaml"]);
+        try
         {
-            DiscoveryOutput = "openapi.yaml\0linked-openapi.yaml\0",
-            ScanStdout = ReportClean,
-        };
-        handler.PresentNames.Add("linked-openapi.yaml");
-        handler.SymlinkNames.Add("linked-openapi.yaml");
+            var handler = new Handler
+            {
+                DiscoveryOutput = "openapi.yaml\0linked-openapi.yaml\0",
+                ScanStdout = ReportClean,
+                RealProbeRoot = root,
+            };
 
-        IAuditor auditor = new OasdiffAuditor();
-        var result = await auditor.RunAsync(handler.Sandbox(), "/work", FakeContext(), CancellationToken.None);
+            IAuditor auditor = new OasdiffAuditor();
+            var result = await auditor.RunAsync(handler.Sandbox(), root, FakeContext(), CancellationToken.None);
 
-        Assert.True(result.Passed);
-        Assert.NotNull(handler.ScanExec);
-        Assert.Contains("openapi.yaml", handler.ScanExec!.Argv);
-        Assert.DoesNotContain("linked-openapi.yaml", handler.ScanExec!.Argv);
+            Assert.True(result.Passed);
+            Assert.NotNull(handler.ScanExec);
+            Assert.Contains("openapi.yaml", handler.ScanExec!.Argv);
+            Assert.DoesNotContain("linked-openapi.yaml", handler.ScanExec!.Argv);
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
     }
 
     [Fact]
     public async Task DiscoveredSpec_UnderSymlinkedDirectory_IsNeverPassedToOasdiff()
     {
-        var handler = new Handler
+        // Only the directory is a symlink — the real probe script's ancestor
+        // walk, not a leaf-only -L check, must keep this spec out of argv.
+        var root = await SeedProbeWorktreeAsync(
+            symlinks: new Dictionary<string, string> { ["linked-dir"] = "specs-target" },
+            regularFiles: ["openapi.yaml", "specs-target/swagger.yaml"]);
+        try
         {
-            DiscoveryOutput = "openapi.yaml\0linked-dir/swagger.yaml\0",
-            ScanStdout = ReportClean,
-        };
-        handler.PresentNames.Add("linked-dir/swagger.yaml");
-        // Only the directory is a symlink — a leaf-only -L check would still
-        // hand oasdiff a read outside the audited tree.
-        handler.SymlinkNames.Add("linked-dir");
+            var handler = new Handler
+            {
+                DiscoveryOutput = "openapi.yaml\0linked-dir/swagger.yaml\0",
+                ScanStdout = ReportClean,
+                RealProbeRoot = root,
+            };
 
-        IAuditor auditor = new OasdiffAuditor();
-        var result = await auditor.RunAsync(handler.Sandbox(), "/work", FakeContext(), CancellationToken.None);
+            IAuditor auditor = new OasdiffAuditor();
+            var result = await auditor.RunAsync(handler.Sandbox(), root, FakeContext(), CancellationToken.None);
 
-        Assert.True(result.Passed);
-        Assert.NotNull(handler.ScanExec);
-        Assert.Contains("openapi.yaml", handler.ScanExec!.Argv);
-        Assert.DoesNotContain("linked-dir/swagger.yaml", handler.ScanExec!.Argv);
+            Assert.True(result.Passed);
+            Assert.NotNull(handler.ScanExec);
+            Assert.Contains("openapi.yaml", handler.ScanExec!.Argv);
+            Assert.DoesNotContain("linked-dir/swagger.yaml", handler.ScanExec!.Argv);
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
     }
 
     [Fact]
@@ -801,6 +857,41 @@ public sealed class OasdiffAuditorTests
         return dir;
     }
 
+    /// <summary>
+    /// A real worktree directory for the repository-file presence probes:
+    /// <paramref name="regularFiles"/> become ordinary files and each
+    /// <paramref name="symlinks"/> entry becomes a symlink named by the key
+    /// pointing at the (worktree-relative) target. The auditor's probe runs
+    /// against this tree for real (see <see cref="Handler.RealProbeRoot"/>),
+    /// so the assertions exercise the production probe script rather than a
+    /// stubbed re-implementation of it.
+    /// </summary>
+    private static async Task<string> SeedProbeWorktreeAsync(
+        IReadOnlyDictionary<string, string> symlinks,
+        params string[] regularFiles)
+    {
+        var dir = Path.Combine(
+            Path.GetTempPath(), "codeybox-oasdiff-probe-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+
+        foreach (var file in regularFiles)
+        {
+            var path = Path.Combine(dir, file);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllTextAsync(path, "openapi: 3.0.0\n");
+        }
+        foreach (var (link, target) in symlinks)
+        {
+            var linkPath = Path.Combine(dir, link);
+            Directory.CreateDirectory(Path.GetDirectoryName(linkPath)!);
+            if (Directory.Exists(Path.Combine(dir, target)))
+                Directory.CreateSymbolicLink(linkPath, target);
+            else
+                File.CreateSymbolicLink(linkPath, target);
+        }
+        return dir;
+    }
+
     private static async Task GitAsync(string workdir, string args)
     {
         var psi = new ProcessStartInfo
@@ -867,17 +958,19 @@ public sealed class OasdiffAuditorTests
     /// existence and the suppression gate share the
     /// <c>sh -c … sh &lt;names&gt;</c> shape — names live at argv[4..]), then
     /// the scan. <see cref="PresentNames"/> is the set of worktree files the
-    /// presence probes report as existing; <see cref="SymlinkNames"/> is the
-    /// set of worktree paths (files or directories) that are symlinks — the
-    /// strict regular-file probe (script contains <c>[ -f</c>) reports a
-    /// path absent when the leaf or any ancestor is a symlink.
+    /// presence probes report as existing. When <see cref="RealProbeRoot"/>
+    /// is set, repository-file probes (<c>sh -c 'for f in …'</c>) execute
+    /// verbatim through a real <c>sh</c> in that directory, so the
+    /// production probe script itself decides presence — a regressed script
+    /// (e.g. a leaf-only symlink check) turns the test red instead of a
+    /// stubbed re-implementation keeping it green.
     /// </summary>
     private sealed class Handler
     {
         public List<SandboxExec> Execs { get; } = [];
         public SandboxExec? ScanExec { get; private set; }
         public HashSet<string> PresentNames { get; } = new(StringComparer.Ordinal) { "openapi.yaml" };
-        public HashSet<string> SymlinkNames { get; } = new(StringComparer.Ordinal);
+        public string? RealProbeRoot { get; init; }
         public int PresenceExitCode { get; init; }
         public int VersionExitCode { get; init; }
         public string VersionStdout { get; init; } =
@@ -892,48 +985,60 @@ public sealed class OasdiffAuditorTests
 
         public ISandbox Sandbox() => new FakeSandbox(Handle);
 
-        private Task<SandboxExecResult> Handle(SandboxExec exec, CancellationToken ct)
+        private async Task<SandboxExecResult> Handle(SandboxExec exec, CancellationToken ct)
         {
             Execs.Add(exec);
             var argv = exec.Argv;
 
             if (argv.Count >= 2 && argv[0] == "oasdiff" && argv[1] == "--version")
-                return Task.FromResult(new SandboxExecResult(VersionExitCode, VersionStdout, ""));
+                return new SandboxExecResult(VersionExitCode, VersionStdout, "");
             if (argv.Count >= 2 && argv[0] == "oasdiff" && argv[1] == "breaking-files")
             {
                 ScanExec = exec;
-                return Task.FromResult(new SandboxExecResult(ScanExitCode, ScanStdout, ScanStderr));
+                return new SandboxExecResult(ScanExitCode, ScanStdout, ScanStderr);
             }
             if (argv.Count >= 2 && argv[0] == "git" && argv[1] == "ls-files")
-                return Task.FromResult(new SandboxExecResult(DiscoveryExitCode, DiscoveryOutput, ""));
+                return new SandboxExecResult(DiscoveryExitCode, DiscoveryOutput, "");
             if (argv[0] == "git")
-                return Task.FromResult(new SandboxExecResult(GitExitCode, GitStdout, ""));
+                return new SandboxExecResult(GitExitCode, GitStdout, "");
             if (argv.Count >= 3 && argv[0] == "sh" && argv[2].Contains("command -v", StringComparison.Ordinal))
-                return Task.FromResult(new SandboxExecResult(PresenceExitCode, "", ""));
+                return new SandboxExecResult(PresenceExitCode, "", "");
+            if (RealProbeRoot is { } probeRoot
+                && argv.Count >= 4
+                && argv[0] == "sh"
+                && argv[1] == "-c"
+                && argv[2].StartsWith("for f in", StringComparison.Ordinal))
+                return await RunProbeForRealAsync(exec, probeRoot, ct).ConfigureAwait(false);
             if (argv.Count >= 4 && argv[0] == "sh")
             {
-                var strict = argv[2].Contains("[ -f ", StringComparison.Ordinal);
-                var present = argv.Skip(4)
-                    .Where(n => PresentNames.Contains(n) && !(strict && HasSymlinkComponent(n)))
-                    .ToList();
-                return Task.FromResult(new SandboxExecResult(
-                    0, present.Count == 0 ? "" : string.Join("\n", present) + "\n", ""));
+                var present = argv.Skip(4).Where(PresentNames.Contains).ToList();
+                return new SandboxExecResult(
+                    0, present.Count == 0 ? "" : string.Join("\n", present) + "\n", "");
             }
-            return Task.FromResult(new SandboxExecResult(0, "", ""));
+            return new SandboxExecResult(0, "", "");
         }
 
-        // The strict probe rejects a path when the leaf OR any ancestor
-        // directory is a symlink — mirror that component walk here.
-        private bool HasSymlinkComponent(string name)
+        // Runs the probe exec verbatim — production script and all — in a
+        // real worktree directory. Both repository-file probe scripts begin
+        // "for f in \"$@\""; other sh probes keep their scripted answers.
+        private static async Task<SandboxExecResult> RunProbeForRealAsync(
+            SandboxExec exec, string root, CancellationToken ct)
         {
-            for (var p = name; p.Length > 0;)
+            var startInfo = new ProcessStartInfo
             {
-                if (SymlinkNames.Contains(p))
-                    return true;
-                var cut = p.LastIndexOf('/');
-                p = cut < 0 ? "" : p[..cut];
-            }
-            return false;
+                FileName = exec.Argv[0],
+                WorkingDirectory = root,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var arg in exec.Argv.Skip(1))
+                startInfo.ArgumentList.Add(arg);
+            using var process = Process.Start(startInfo)!;
+            var stdout = process.StandardOutput.ReadToEndAsync(ct);
+            var stderr = process.StandardError.ReadToEndAsync(ct);
+            await process.WaitForExitAsync(ct).ConfigureAwait(false);
+            return new SandboxExecResult(process.ExitCode, await stdout, await stderr);
         }
     }
 

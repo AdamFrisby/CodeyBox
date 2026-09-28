@@ -320,7 +320,7 @@ toolchain's version before `govulncheck@v…`), pass a `VersionExtractor`
 that returns the tool's own token — see
 `plugins/auditors-dependency-vulnerabilities/CodeyBox.GovulncheckAuditorPlugin/`.
 
-Three extension points cover tool requirements the base cannot express
+Four extension points cover tool requirements the base cannot express
 declaratively:
 
 - `VerifyToolAsync` — a pre-scan precondition hook invoked inside `RunAsync`
@@ -328,7 +328,8 @@ declaratively:
   it for repository-state gates (e.g. refusing repo-authored suppression
   files — `ProbeRepositoryFilesPresentAsync` is the shared fail-closed probe
   for that), throwing `AuditUnavailableException` to fail closed. Run probes
-  through `ExecToolBoundedAsync` so they inherit the same timeout bounding
+  through `ExecToolBoundedAsync` (or `RunBoundedProbeAsync`, which supplies
+  the standard probe envelope) so they inherit the same timeout bounding
   and failure classification as the scan. When the probed names will be
   handed to the tool as file arguments, use
   `ProbeRepositoryRegularFilesPresentAsync` instead — it additionally
@@ -340,13 +341,20 @@ declaratively:
   `ResolveMergeBaseAsync` (merge-base of `HEAD` and `origin/<BaseBranch>`,
   fail-closed, parameterized by the auditor's baseline-config hint) —
   see `plugins/auditors-api-compatibility/` for both consumers.
+- `ResolveScanRootAsync` — invoked just before the scan; return the
+  absolute directory the scan actually runs in when the tool's report
+  carries absolute paths but embeds no working directory (sandbox
+  providers may translate the path you were given). The value reaches the
+  parser as `ExternalToolParseInput.ScanRoot` — see
+  `plugins/auditors-linting/CodeyBox.SwiftlintAuditorPlugin/`.
 - `BuildToolEnvironment` — extra environment variables for the tool process,
   for tools whose behavior is env-controlled (e.g. pinning configuration that
   must not come from the audited repository).
 
-`plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/` uses both to pin a
-scanner version and keep repo-authored suppression files from silencing the
-audit. A worked example lives at
+`plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/` uses
+`VerifyToolAsync` to keep repo-authored suppression files from silencing the
+audit and `BuildToolEnvironment` to pin the config the scanner reads.
+A worked example lives at
 `plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/`.
 The knip unused-JS/TS auditor is at
 `plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/`.

@@ -430,25 +430,15 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
         if (EffectiveManifestPath(options, out _) is { } manifestPath)
             argv.AddRange([ManifestPathFlag, manifestPath]);
 
-        var result = await ExecToolBoundedAsync(
+        var result = await RunBoundedProbeAsync(
             sandbox,
             tool,
             "suppression check",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            argv,
+            workingDirectory,
+            options,
             ct).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
-                + "transport was unavailable.");
         if (result.ExitCode == 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled lint configuration: "

@@ -44,14 +44,19 @@ with the check id and the spec file/line location.
   `*openapi*`/`*swagger*` basenames; a spec named `api.yaml` needs
   `SpecPaths`. Specs whose filenames cannot be a `breaking-files` argument
   (containing `:` or starting with `-`) are out of scope.
-- **External `$ref`s.** `--allow-external-refs=false` is passed by default —
-  http(s) refs and file paths outside the git tree fail the run (exit 123,
-  infrastructure). In-repo relative file refs resolve normally. Operators
-  whose audited specs genuinely need external refs set the dedicated
-  `AllowExternalRefs` scoped key (see below) — passing the flag through
-  `ExtraArguments` is a deterministic failure, because opting in must also
-  declare the `Network` audit capability so the run is scheduled into a
-  network-capable sandbox profile.
+- **`$ref`s that leave the spec file.** `--allow-external-refs=false` is
+  passed by default, and on the worktree (revision) side oasdiff refuses
+  *every* non-fragment `$ref` — not just http(s) targets but also in-repo
+  relative file refs like `./schemas.yaml#/Pet` — failing the run closed
+  (exit 123, infrastructure). Only the baseline side resolves in-repo file
+  refs: oasdiff loads `<base>:<path>` through `git show`, so a `$ref` into a
+  sibling file at the base ref resolves while the same `$ref` in the
+  worktree copy fails. A multi-file (split-`$ref`) OpenAPI spec therefore
+  needs the dedicated `AllowExternalRefs` scoped key (see below), which also
+  declares the `Network` audit capability so the run is scheduled into a
+  network-capable sandbox profile for the fetches it enables — passing the
+  flag through `ExtraArguments` is a deterministic failure for exactly that
+  reason.
 - **Symlinked specs.** A spec path that is a symlink — or sits under a
   symlinked directory — is never handed to oasdiff: a committed link could
   redirect the tool's read outside the audited tree. Such candidates are
@@ -190,7 +195,7 @@ Scoped under `CodeyBox:Plugins:codeybox.oasdiff`, resolved per run
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity — e.g. `error` keeps only `ERR`-level breaking changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact oasdiff check ids to keep/drop (e.g. `api-path-removed-without-deprecation`). |
 | `ExcludePaths` | `vendor/, third_party/, node_modules/` | Repo-relative paths excluded — exact path, or directory prefix when trailing `/`. Applied to spec discovery *and* to reported finding paths (a finding sourced to an excluded `$ref`'d file is filtered too). |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--match-path`, `--unmatch-path`, `--stability-level`, `--deprecation-days-*`, `--severity-levels <file>`, `--err-ignore/--warn-ignore <file>`, `--config <file>`, or a different `--fail-on`/`--base`. Take care: an operator-supplied `--format`/`-f` or `--template` breaks the JSON output contract and is a deterministic configuration failure; `--allow-external-refs` must go through the `AllowExternalRefs` scoped key (it additionally declares the `Network` capability); `--severity-levels`/`--err-ignore`/`--warn-ignore` point into the repo at your own trust. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--match-path`, `--unmatch-path`, `--stability-level`, `--deprecation-days-*`, `--severity-levels <file>`, `--err-ignore/--warn-ignore <file>`, `--config <file>`, or a different `--fail-on`/`--base`. Take care: an operator-supplied `--format`/`-f` or `--template` breaks the JSON output contract and is a deterministic configuration failure; `--allow-external-refs` must go through the `AllowExternalRefs` scoped key (it additionally declares the `Network` capability); `--fetch` is likewise rejected (it would make oasdiff run `git fetch origin <base>` — network egress the sandbox profile never declared; keep the base commit in the clone instead); `--severity-levels`/`--err-ignore`/`--warn-ignore` point into the repo at your own trust. |
 | `TimeoutSeconds` | `300` | Per-run bound; exceeding it is infrastructure, not a pass. Baseline/discovery probes share it under a 30 s cap. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 | `FindingsExitCodes` | `0, 1` | The verdict exits; do not change unless oasdiff's convention changes. |

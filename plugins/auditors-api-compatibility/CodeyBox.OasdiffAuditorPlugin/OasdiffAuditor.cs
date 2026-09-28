@@ -96,14 +96,19 @@ namespace CodeyBox.OasdiffAuditorPlugin;
 /// <para><b>External $refs.</b> The scan passes
 /// <c>--allow-external-refs=false</c>: audited specs are untrusted input and
 /// an external $ref is an outbound fetch (SSRF) or a read outside the git
-/// tree. A spec that needs one fails closed (exit 123 → infrastructure).
-/// Operators opt back in through the dedicated
-/// <see cref="AllowExternalRefsKey"/> scoped key — never via
+/// tree. Under the default the worktree-side (revision) load refuses
+/// <i>every</i> non-fragment $ref — including an in-repo relative file ref
+/// such as <c>./schemas.yaml#/Pet</c> — failing closed with exit 123
+/// (infrastructure). Only the baseline side resolves in-repo file refs:
+/// oasdiff loads <c>&lt;base&gt;:&lt;path&gt;</c> through a custom URI reader
+/// backed by <c>git show</c>, so a ref into a sibling file at the base ref
+/// resolves while the same ref in the worktree copy does not. A multi-file
+/// (split-$ref) OpenAPI spec therefore requires
+/// <see cref="AllowExternalRefsKey"/> set to true — and never the flag via
 /// <c>ExtraArguments</c>, which would bypass the capability declaration:
 /// opting in flips <see cref="Required"/> to
 /// <see cref="AuditCapabilities.Network"/> so the run is scheduled into a
-/// network-capable audit sandbox profile for the fetches it enables.
-/// In-repo relative file $refs are unaffected.</para>
+/// network-capable audit sandbox profile for the fetches it enables.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: PluginId,
@@ -177,6 +182,7 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     private const string BaseFlag = "--base";
     private const string AllowExternalRefsFlag = "--allow-external-refs";
+    private const string FetchFlag = "--fetch";
 
     /// <summary>Upper bound on specs compared in one run — argv growth and runtime both stay bounded.</summary>
     private const int MaxSpecPaths = 200;
@@ -297,6 +303,19 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
                 + "for the outbound $ref fetches it enables.")
             { IsDeterministic = true };
 
+        // --fetch makes oasdiff run 'git fetch origin <base>' when the base
+        // commit is absent locally — network egress plus object-store writes
+        // inside a sandbox profile that never declared the Network
+        // capability. Same gated-flag reasoning as --allow-external-refs.
+        if (ExtraArgumentsSupplyFlag(options, FetchFlag))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' does not accept '{FetchFlag}' via "
+                + "ExtraArguments — it would make oasdiff run 'git fetch origin <base>' (network "
+                + "egress and object-store writes) inside a sandbox profile that never declared "
+                + "the Network capability. Ensure the base commit is present in the audited clone "
+                + "(deepen the checkout at provisioning time) instead.")
+            { IsDeterministic = true };
+
         return
         [
             "breaking-files",
@@ -310,7 +329,7 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             "--color", "never",
             // Audited specs are untrusted input; an external $ref is an
             // outbound fetch or a read outside the git tree.
-            _allowExternalRefs() ? AllowExternalRefsFlag : "--allow-external-refs=false",
+            _allowExternalRefs() ? AllowExternalRefsFlag : AllowExternalRefsFlag + "=false",
         ];
     }
 
@@ -483,25 +502,16 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         };
         argv.AddRange(DiscoveryPathspecs);
 
-        var result = await ExecToolBoundedAsync(
+        var result = await RunBoundedProbeAsync(
             sandbox,
             ToolName,
             "spec discovery",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = DiscoveryMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
+            argv,
+            workingDirectory,
+            options,
+            ct,
+            DiscoveryMaxOutputBytes).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' spec discovery could not run: the sandbox "
-                + "exec transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{ToolName}' could not list candidate spec files "
@@ -522,7 +532,7 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         foreach (var entry in result.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries))
         {
             var normalized = NormalizeSpecPath(entry);
-            if (normalized is null || !seen.Add(normalized) || IsPathExcluded(normalized, options))
+            if (normalized is null || !seen.Add(normalized) || IsNormalizedPathExcluded(normalized, options))
                 continue;
             discovered.Add(normalized);
         }
