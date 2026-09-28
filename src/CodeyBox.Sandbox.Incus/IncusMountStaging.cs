@@ -321,8 +321,8 @@ internal static class IncusMountStaging
                         $"Mount source for '{mount.SandboxPath}' does not exist.");
                 sourcePath = AuthorizeHostSource(options, stagingRoot, sourcePath);
                 var canonicalStagingRoot = ResolveExistingRealPath(stagingRoot);
-                if (IsContained(sourcePath, canonicalStagingRoot)
-                    || IsContained(canonicalStagingRoot, sourcePath))
+                if (HostPathPolicy.IsWithinDirectory(sourcePath, canonicalStagingRoot)
+                    || HostPathPolicy.IsWithinDirectory(canonicalStagingRoot, sourcePath))
                 {
                     throw new UnauthorizedAccessException(
                         "Caller-supplied host mounts cannot expose the Incus provider's private staging tree.");
@@ -450,7 +450,7 @@ internal static class IncusMountStaging
         var fullRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
         var fullCandidate = Path.TrimEndingDirectorySeparator(Path.GetFullPath(candidate));
         if (string.Equals(fullCandidate, fullRoot, StringComparison.Ordinal)
-            || !IsContained(fullCandidate, fullRoot))
+            || !HostPathPolicy.IsWithinDirectory(fullCandidate, fullRoot))
             throw new InvalidOperationException("Refusing to delete a staging path outside the configured root.");
         if (!Directory.Exists(fullCandidate) && !File.Exists(fullCandidate))
             return;
@@ -463,7 +463,7 @@ internal static class IncusMountStaging
         var canonicalRoot = ResolveExistingRealPath(fullRoot);
         var canonicalCandidate = ResolveExistingRealPath(fullCandidate);
         if (!string.Equals(canonicalCandidate, fullCandidate, StringComparison.Ordinal)
-            || !IsContained(canonicalCandidate, canonicalRoot))
+            || !HostPathPolicy.IsWithinDirectory(canonicalCandidate, canonicalRoot))
             throw new InvalidOperationException("Refusing to delete a staging tree reached through symbolic links.");
         DeleteDirectoryNoFollow(canonicalCandidate, canonicalRoot);
     }
@@ -473,7 +473,7 @@ internal static class IncusMountStaging
         foreach (var entry in Directory.EnumerateFileSystemEntries(directory))
         {
             var fullEntry = Path.GetFullPath(entry);
-            if (!IsContained(fullEntry, canonicalRoot))
+            if (!HostPathPolicy.IsWithinDirectory(fullEntry, canonicalRoot))
                 throw new InvalidOperationException("Refusing to delete a staging entry outside its canonical root.");
             var attributes = File.GetAttributes(fullEntry);
             if ((attributes & FileAttributes.ReparsePoint) != 0)
@@ -813,7 +813,7 @@ internal static class IncusMountStaging
         var roots = options.AllowedHostMountRoots
             .Select(ResolveExistingRealPath)
             .Append(ResolveExistingRealPath(stagingRoot));
-        if (!roots.Any(root => IsContained(canonicalSource, root)))
+        if (!roots.Any(root => HostPathPolicy.IsWithinDirectory(canonicalSource, root)))
             throw new UnauthorizedAccessException($"Host mount source '{source}' is outside Incus AllowedHostMountRoots.");
         return canonicalSource;
     }
@@ -866,7 +866,7 @@ internal static class IncusMountStaging
             }
         }
         roots.Add(canonicalStagingRoot);
-        return roots.Any(root => IsContained(canonicalSource, root));
+        return roots.Any(root => HostPathPolicy.IsWithinDirectory(canonicalSource, root));
     }
 
     internal static string ResolveExistingRealPath(string path)
@@ -887,13 +887,6 @@ internal static class IncusMountStaging
                     ?? throw new IOException($"Unable to resolve host symlink '{current}'.");
         }
         return Path.GetFullPath(current);
-    }
-
-    private static bool IsContained(string candidate, string root)
-    {
-        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar);
-        return string.Equals(candidate, normalizedRoot, StringComparison.Ordinal)
-            || candidate.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal);
     }
 
     /// <summary>

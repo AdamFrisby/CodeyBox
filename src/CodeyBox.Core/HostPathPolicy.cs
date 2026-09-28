@@ -126,4 +126,66 @@ public static class HostPathPolicy
         var alt = Path.DirectorySeparatorChar == '/' ? '\\' : '/';
         return path.Replace(alt, Path.DirectorySeparatorChar);
     }
+
+    /// <summary>
+    /// The one canonical "is this path inside that directory" predicate:
+    /// both inputs are normalized with <see cref="Path.GetFullPath"/> (dot
+    /// segments collapsed), then <paramref name="path"/> is inside when it
+    /// equals <paramref name="directory"/> or sits under it. Security
+    /// guards must share this instead of re-implementing prefix checks with
+    /// divergent edge semantics. Lexical only — symlink components are NOT
+    /// resolved, so a boundary a symlink could cross must be checked
+    /// against already-canonicalized inputs.
+    /// <para>
+    /// Non-rooted, empty, or unparseable inputs return false rather than
+    /// resolving silently against the process's current directory — a
+    /// containment verdict must never depend on ambient state. The escape
+    /// check matches whole "<c>..</c>" segments only: a leaf whose name
+    /// merely begins with "<c>..</c>" (e.g. <c>..evil</c>) inside
+    /// <paramref name="directory"/> still counts as within.
+    /// </para>
+    /// </summary>
+    public static bool IsWithinDirectory(string path, string directory)
+        => ContainedRelativePath(path, directory) is not null;
+
+    /// <summary>
+    /// Strict form of <see cref="IsWithinDirectory"/> for guards that
+    /// require a real child entry: <paramref name="path"/> equal to
+    /// <paramref name="directory"/> itself is NOT within.
+    /// </summary>
+    public static bool IsStrictlyWithinDirectory(string path, string directory)
+    {
+        var relative = ContainedRelativePath(path, directory);
+        return relative is not null && relative != ".";
+    }
+
+    /// <summary>
+    /// <paramref name="path"/>'s <see cref="Path.GetRelativePath"/> location
+    /// under <paramref name="directory"/> — "<c>.</c>" for equality — when
+    /// contained, or null when it escapes or the inputs cannot be judged.
+    /// </summary>
+    private static string? ContainedRelativePath(string path, string directory)
+    {
+        if (string.IsNullOrWhiteSpace(path)
+            || string.IsNullOrWhiteSpace(directory)
+            || !Path.IsPathRooted(path)
+            || !Path.IsPathRooted(directory))
+            return null;
+
+        string relative;
+        try
+        {
+            relative = Path.GetRelativePath(Path.GetFullPath(directory), Path.GetFullPath(path));
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
+        {
+            return null;
+        }
+
+        var escapes = Path.IsPathRooted(relative)
+            || relative.Equals("..", StringComparison.Ordinal)
+            || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            || relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal);
+        return escapes ? null : relative;
+    }
 }

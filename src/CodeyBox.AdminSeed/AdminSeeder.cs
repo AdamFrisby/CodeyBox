@@ -83,8 +83,7 @@ public sealed class AdminSeeder
     {
         var fullRoot = Path.GetFullPath(containingRoot);
         var fullPath = Path.GetFullPath(Path.Combine(fullRoot, dbPath));
-        if (!fullPath.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            && !string.Equals(fullPath, fullRoot, StringComparison.Ordinal))
+        if (!HostPathPolicy.IsWithinDirectory(fullPath, fullRoot))
         {
             throw new ArgumentException(
                 $"Seed database path '{dbPath}' escapes the containing root.",
