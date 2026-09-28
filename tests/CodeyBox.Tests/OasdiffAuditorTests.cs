@@ -451,6 +451,121 @@ public sealed class OasdiffAuditorTests
     }
 
     [Fact]
+    public async Task ConfiguredSpecPath_ResolvingToSymlink_IsDeterministicFailure()
+    {
+        var handler = new Handler { ScanStdout = ReportClean };
+        handler.PresentNames.Add("linked-openapi.yaml");
+        handler.SymlinkNames.Add("linked-openapi.yaml");
+
+        var auditor = new OasdiffAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:SpecPaths"] = "linked-openapi.yaml",
+                ["Scoped:BaseRef"] = "main",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(
+                handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("linked-openapi.yaml", ex.Message, StringComparison.Ordinal);
+        Assert.Null(handler.ScanExec);
+    }
+
+    [Fact]
+    public async Task DiscoveredSpec_ThatIsASymlink_IsNeverPassedToOasdiff()
+    {
+        var handler = new Handler
+        {
+            DiscoveryOutput = "openapi.yaml\0linked-openapi.yaml\0",
+            ScanStdout = ReportClean,
+        };
+        handler.PresentNames.Add("linked-openapi.yaml");
+        handler.SymlinkNames.Add("linked-openapi.yaml");
+
+        IAuditor auditor = new OasdiffAuditor();
+        var result = await auditor.RunAsync(handler.Sandbox(), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(handler.ScanExec);
+        Assert.Contains("openapi.yaml", handler.ScanExec!.Argv);
+        Assert.DoesNotContain("linked-openapi.yaml", handler.ScanExec!.Argv);
+    }
+
+    [Fact]
+    public async Task DiscoveredSpec_UnderSymlinkedDirectory_IsNeverPassedToOasdiff()
+    {
+        var handler = new Handler
+        {
+            DiscoveryOutput = "openapi.yaml\0linked-dir/swagger.yaml\0",
+            ScanStdout = ReportClean,
+        };
+        handler.PresentNames.Add("linked-dir/swagger.yaml");
+        // Only the directory is a symlink — a leaf-only -L check would still
+        // hand oasdiff a read outside the audited tree.
+        handler.SymlinkNames.Add("linked-dir");
+
+        IAuditor auditor = new OasdiffAuditor();
+        var result = await auditor.RunAsync(handler.Sandbox(), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(handler.ScanExec);
+        Assert.Contains("openapi.yaml", handler.ScanExec!.Argv);
+        Assert.DoesNotContain("linked-dir/swagger.yaml", handler.ScanExec!.Argv);
+    }
+
+    [Fact]
+    public async Task ExtraArguments_AllowExternalRefs_IsDeterministicFailure()
+    {
+        var handler = new Handler { ScanStdout = ReportClean };
+
+        var auditor = new OasdiffAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--allow-external-refs",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(
+                handler.Sandbox(), "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains(OasdiffAuditor.AllowExternalRefsKey, ex.Message, StringComparison.Ordinal);
+        Assert.Null(handler.ScanExec);
+    }
+
+    [Fact]
+    public async Task ScopedAllowExternalRefs_EmitsFlag_AndDeclaresNetworkCapability()
+    {
+        var handler = new Handler { ScanStdout = ReportClean };
+
+        var auditor = new OasdiffAuditor();
+        Assert.Equal(AuditCapabilities.None, ((IAuditor)auditor).Required);
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:AllowExternalRefs"] = "true",
+            }),
+            CancellationToken.None);
+
+        // Opting in must declare the capability the fetches need — the
+        // pipeline groups auditors into sandboxes by Required.
+        Assert.True(((IAuditor)auditor).Required.HasFlag(AuditCapabilities.Network));
+
+        await ((IAuditor)auditor).RunAsync(
+            handler.Sandbox(), "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(handler.ScanExec);
+        Assert.Contains("--allow-external-refs", handler.ScanExec!.Argv);
+        Assert.DoesNotContain("--allow-external-refs=false", handler.ScanExec!.Argv);
+    }
+
+    [Fact]
     public async Task RepositoryOasdiffConfig_FailsClosed_BeforeScan()
     {
         var handler = new Handler
@@ -750,15 +865,19 @@ public sealed class OasdiffAuditorTests
     /// probe sequence: git baseline/discovery probes, the binary presence
     /// check, the version probe, the repository-file presence probes (spec
     /// existence and the suppression gate share the
-    /// <c>RepositoryFilePresenceScript</c> shape — names live at argv[4..]),
-    /// then the scan. <see cref="PresentNames"/> is the set of worktree files
-    /// the presence probes report as existing.
+    /// <c>sh -c … sh &lt;names&gt;</c> shape — names live at argv[4..]), then
+    /// the scan. <see cref="PresentNames"/> is the set of worktree files the
+    /// presence probes report as existing; <see cref="SymlinkNames"/> is the
+    /// set of worktree paths (files or directories) that are symlinks — the
+    /// strict regular-file probe (script contains <c>[ -f</c>) reports a
+    /// path absent when the leaf or any ancestor is a symlink.
     /// </summary>
     private sealed class Handler
     {
         public List<SandboxExec> Execs { get; } = [];
         public SandboxExec? ScanExec { get; private set; }
         public HashSet<string> PresentNames { get; } = new(StringComparer.Ordinal) { "openapi.yaml" };
+        public HashSet<string> SymlinkNames { get; } = new(StringComparer.Ordinal);
         public int PresenceExitCode { get; init; }
         public int VersionExitCode { get; init; }
         public string VersionStdout { get; init; } =
@@ -793,11 +912,28 @@ public sealed class OasdiffAuditorTests
                 return Task.FromResult(new SandboxExecResult(PresenceExitCode, "", ""));
             if (argv.Count >= 4 && argv[0] == "sh")
             {
-                var present = argv.Skip(4).Where(PresentNames.Contains).ToList();
+                var strict = argv[2].Contains("[ -f ", StringComparison.Ordinal);
+                var present = argv.Skip(4)
+                    .Where(n => PresentNames.Contains(n) && !(strict && HasSymlinkComponent(n)))
+                    .ToList();
                 return Task.FromResult(new SandboxExecResult(
                     0, present.Count == 0 ? "" : string.Join("\n", present) + "\n", ""));
             }
             return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        // The strict probe rejects a path when the leaf OR any ancestor
+        // directory is a symlink — mirror that component walk here.
+        private bool HasSymlinkComponent(string name)
+        {
+            for (var p = name; p.Length > 0;)
+            {
+                if (SymlinkNames.Contains(p))
+                    return true;
+                var cut = p.LastIndexOf('/');
+                p = cut < 0 ? "" : p[..cut];
+            }
+            return false;
         }
     }
 

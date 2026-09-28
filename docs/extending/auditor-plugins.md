@@ -320,7 +320,7 @@ toolchain's version before `govulncheck@v…`), pass a `VersionExtractor`
 that returns the tool's own token — see
 `plugins/auditors-dependency-vulnerabilities/CodeyBox.GovulncheckAuditorPlugin/`.
 
-Two extension points cover tool requirements the base cannot express
+Three extension points cover tool requirements the base cannot express
 declaratively:
 
 - `VerifyToolAsync` — a pre-scan precondition hook invoked inside `RunAsync`
@@ -329,7 +329,17 @@ declaratively:
   files — `ProbeRepositoryFilesPresentAsync` is the shared fail-closed probe
   for that), throwing `AuditUnavailableException` to fail closed. Run probes
   through `ExecToolBoundedAsync` so they inherit the same timeout bounding
-  and failure classification as the scan.
+  and failure classification as the scan. When the probed names will be
+  handed to the tool as file arguments, use
+  `ProbeRepositoryRegularFilesPresentAsync` instead — it additionally
+  rejects any path whose leaf or ancestor component is a symlink, so a
+  repo-committed link cannot redirect the tool's read outside the worktree.
+- `ResolveContextArgumentsAsync` — a per-run argv hook for arguments that
+  need the `AuditContext` or bounded sandbox probes. Auditors comparing
+  against the work item's base branch share
+  `ResolveMergeBaseAsync` (merge-base of `HEAD` and `origin/<BaseBranch>`,
+  fail-closed, parameterized by the auditor's baseline-config hint) —
+  see `plugins/auditors-api-compatibility/` for both consumers.
 - `BuildToolEnvironment` — extra environment variables for the tool process,
   for tools whose behavior is env-controlled (e.g. pinning configuration that
   must not come from the audited repository).

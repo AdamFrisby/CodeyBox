@@ -42,15 +42,16 @@ namespace CodeyBox.OasdiffAuditorPlugin;
 /// <para><b>Baseline resolution.</b> A breaking-change check needs the "old"
 /// API to compare against. Unless the operator pins a ref explicitly
 /// (<see cref="BaseRefKey"/> scoped key or a <c>--base</c> flag in
-/// <c>ExtraArguments</c>), the auditor resolves the merge-base of
-/// <c>HEAD</c> and the work item's <see cref="AuditContext.BaseBranch"/>
-/// (probing <c>origin/&lt;base&gt;</c> first, then the bare branch name) —
-/// the same three-dot semantics the pipeline's diff auditors use — and
-/// passes it to <c>breaking-files --base</c>. An invalid base branch, an
-/// unresolvable ref, or no common ancestor is a deterministic
-/// infrastructure failure — never a pass. Resolution needs the
-/// <see cref="AuditContext"/> that <c>BuildToolArguments</c> does not
-/// receive, so it runs inside the base's
+/// <c>ExtraArguments</c>), the shared
+/// <see cref="ExternalToolAuditorBase.ResolveMergeBaseAsync"/> helper resolves
+/// the merge-base of <c>HEAD</c> and the work item's
+/// <see cref="AuditContext.BaseBranch"/> (probing <c>origin/&lt;base&gt;</c>
+/// first, then the bare branch name) — the same three-dot semantics the
+/// pipeline's diff auditors use — and the auditor passes it to
+/// <c>breaking-files --base</c>. An invalid base branch, an unresolvable
+/// ref, or no common ancestor is a deterministic infrastructure failure —
+/// never a pass. Resolution needs the <see cref="AuditContext"/> that
+/// <c>BuildToolArguments</c> does not receive, so it runs inside the base's
 /// <see cref="ExternalToolAuditorBase.ResolveContextArgumentsAsync"/> seam.</para>
 ///
 /// <para><b>Spec scope.</b> Each audited OpenAPI document is one positional
@@ -59,12 +60,16 @@ namespace CodeyBox.OasdiffAuditorPlugin;
 /// (non-gitignored) worktree file whose basename contains
 /// <c>openapi</c> or <c>swagger</c> with a <c>.yaml</c>/<c>.yml</c>/<c>.json</c>
 /// extension — oasdiff's own pre-commit convention — minus
-/// <c>ExcludePaths</c>. Specs absent from the base ref are newly added and
-/// skipped by the tool itself. Zero resolved specs, an unreadable configured
-/// path, or a path that is not a plain relative file (a <c>:</c>-bearing or
-/// dash-leading name is rejected by oasdiff's own argument contract) is a
-/// deterministic infrastructure failure. A repository with no specs is a
-/// misconfiguration this auditor says loudly, not a silent skip.</para>
+/// <c>ExcludePaths</c>. Only regular, non-symlink files inside the worktree
+/// are compared: a repo-committed symlink would redirect oasdiff's read
+/// outside the audited tree, so the presence probe rejects any spec whose
+/// path (leaf or ancestor directory) is a symlink. Specs absent from the
+/// base ref are newly added and skipped by the tool itself. Zero resolved
+/// specs, an unreadable configured path, or a path that is not a plain
+/// relative file (a <c>:</c>-bearing or dash-leading name is rejected by
+/// oasdiff's own argument contract) is a deterministic infrastructure
+/// failure. A repository with no specs is a misconfiguration this auditor
+/// says loudly, not a silent skip.</para>
 ///
 /// <para><b>Version pin.</b> The check catalog, report shape, and exit
 /// convention change between releases, so findings are only meaningful from
@@ -91,9 +96,14 @@ namespace CodeyBox.OasdiffAuditorPlugin;
 /// <para><b>External $refs.</b> The scan passes
 /// <c>--allow-external-refs=false</c>: audited specs are untrusted input and
 /// an external $ref is an outbound fetch (SSRF) or a read outside the git
-/// tree. A spec that needs one fails closed (exit 123 → infrastructure);
-/// operators opt back in with <c>--allow-external-refs</c> in
-/// <c>ExtraArguments</c>. In-repo relative file $refs are unaffected.</para>
+/// tree. A spec that needs one fails closed (exit 123 → infrastructure).
+/// Operators opt back in through the dedicated
+/// <see cref="AllowExternalRefsKey"/> scoped key — never via
+/// <c>ExtraArguments</c>, which would bypass the capability declaration:
+/// opting in flips <see cref="Required"/> to
+/// <see cref="AuditCapabilities.Network"/> so the run is scheduled into a
+/// network-capable audit sandbox profile for the fetches it enables.
+/// In-repo relative file $refs are unaffected.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: PluginId,
@@ -154,10 +164,22 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// </summary>
     internal const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
 
+    /// <summary>
+    /// Scoped-config key opting in to external <c>$ref</c> resolution
+    /// (<c>--allow-external-refs</c>). Default false: audited specs are
+    /// untrusted input and an external $ref is an outbound fetch (SSRF) or a
+    /// read outside the git tree. When true the auditor also declares
+    /// <see cref="AuditCapabilities.Network"/> so the run is scheduled into a
+    /// network-capable audit sandbox profile — the flag cannot be smuggled
+    /// through <c>ExtraArguments</c> without that capability declaration.
+    /// </summary>
+    internal const string AllowExternalRefsKey = "AllowExternalRefs";
+
     private const string BaseFlag = "--base";
+    private const string AllowExternalRefsFlag = "--allow-external-refs";
 
     /// <summary>Upper bound on specs compared in one run — argv growth and runtime both stay bounded.</summary>
-    internal const int MaxSpecPaths = 200;
+    private const int MaxSpecPaths = 200;
 
     private const int MaxSpecPathChars = 512;
     private const int DiscoveryMaxOutputBytes = 256 * 1024;
@@ -208,9 +230,14 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
     private Func<string?> _baseRef = static () => null;
     private Func<IReadOnlyList<string>> _specPaths = static () => [];
     private Func<bool> _trustRepositorySuppression = static () => false;
+    private Func<bool> _allowExternalRefs = static () => false;
 
     /// <inheritdoc />
     public override string Name => "codeybox:oasdiff";
+
+    /// <inheritdoc />
+    public override AuditCapabilities Required =>
+        _allowExternalRefs() ? AuditCapabilities.Network : AuditCapabilities.None;
 
     /// <inheritdoc />
     protected override string ToolName => "oasdiff";
@@ -257,6 +284,19 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
                 + "stdout — ExtraArguments may not supply --format/-f or --template.")
             { IsDeterministic = true };
 
+        // --allow-external-refs must come through the named scoped key, not
+        // raw argv: opting in is also what flips this auditor's Required
+        // capabilities to Network, and a verbatim ExtraArguments flag would
+        // grant audited specs outbound fetches inside a sandbox profile that
+        // was never declared network-capable.
+        if (ExtraArgumentsSupplyFlag(options, AllowExternalRefsFlag))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' does not accept '{AllowExternalRefsFlag}' via "
+                + $"ExtraArguments — set CodeyBox:Plugins:{PluginId}:{AllowExternalRefsKey} to true "
+                + "instead, which also schedules the audit into a network-capable sandbox profile "
+                + "for the outbound $ref fetches it enables.")
+            { IsDeterministic = true };
+
         return
         [
             "breaking-files",
@@ -269,9 +309,8 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             "--format", "json",
             "--color", "never",
             // Audited specs are untrusted input; an external $ref is an
-            // outbound fetch or a read outside the git tree. Operators
-            // re-enable with an ExtraArguments --allow-external-refs flag.
-            "--allow-external-refs=false",
+            // outbound fetch or a read outside the git tree.
+            _allowExternalRefs() ? AllowExternalRefsFlag : "--allow-external-refs=false",
         ];
     }
 
@@ -311,7 +350,8 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             args.Add(BaseFlag);
             args.Add(!string.IsNullOrWhiteSpace(configuredBase)
                 ? ValidatedBaseRef(configuredBase!, BaseRefKey)
-                : await ResolveMergeBaseAsync(sandbox, workingDirectory, context, options, ct)
+                : await ResolveMergeBaseAsync(
+                        sandbox, workingDirectory, context, options, BaselineConfigHint, ct)
                     .ConfigureAwait(false));
         }
 
@@ -332,6 +372,8 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         _specPaths = () => ExternalToolAuditorOptions.SplitCommaSeparatedList(scoped[SpecPathsKey]);
         _trustRepositorySuppression = () =>
             bool.TryParse(scoped[TrustRepositorySuppressionKey], out var trust) && trust;
+        _allowExternalRefs = () =>
+            bool.TryParse(scoped[AllowExternalRefsKey], out var allow) && allow;
         context.Logger.LogInformation(
             "OasdiffAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
@@ -373,11 +415,13 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <summary>
     /// The specs to compare: the configured <see cref="SpecPathsKey"/> list
     /// when set, else the filename-convention discovery. Configured paths
-    /// are validated and confirmed present (a configured-but-absent path is
-    /// a deterministic configuration failure); discovered paths are
-    /// validated, <c>ExcludePaths</c>-filtered, deduplicated, and silently
-    /// intersected with worktree presence (a tracked path deleted in the
-    /// worktree has no revision side to compare). Zero results is a
+    /// are validated and confirmed present as regular files (a
+    /// configured-but-absent-or-symlinked path is a deterministic
+    /// configuration failure); discovered paths are validated,
+    /// <c>ExcludePaths</c>-filtered, deduplicated, and silently intersected
+    /// with regular-file presence (a tracked path deleted in the worktree
+    /// has no revision side to compare, and a symlinked one would redirect
+    /// the tool's read outside the audited tree). Zero results is a
     /// deterministic infrastructure failure — enabling this auditor on a
     /// repository with no OpenAPI specs is a loud misconfiguration, not a
     /// silent pass.
@@ -403,10 +447,12 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             }
             EnforceSpecBound(validated.Count);
 
-            // A configured path absent from the worktree is a mistyped
-            // scope, not a finding — name it instead of letting oasdiff's
-            // load failure say it opaquely mid-scan.
-            var present = await ProbeRepositoryFilesPresentAsync(
+            // A configured path absent from the worktree — or present only
+            // as a symlink or non-regular file, which would make oasdiff's
+            // read escape the audited tree — is a mistyped scope, not a
+            // finding: name it instead of letting the tool's load failure
+            // say it opaquely mid-scan.
+            var present = await ProbeRepositoryRegularFilesPresentAsync(
                 sandbox, workingDirectory, ToolName, validated, options, ct)
                 .ConfigureAwait(false);
             var presentSet = new HashSet<string>(present, StringComparer.Ordinal);
@@ -414,7 +460,8 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             if (missing.Count > 0)
                 throw new AuditUnavailableException(
                     $"could-not-verify: auditor '{Name}' configured spec path(s) "
-                    + $"'{string.Join("', '", missing)}' do not exist in the audited worktree — "
+                    + $"'{string.Join("', '", missing)}' do not resolve to regular, non-symlink "
+                    + "files inside the audited worktree — "
                     + $"fix CodeyBox:Plugins:{PluginId}:{SpecPathsKey}.")
                 { IsDeterministic = true };
             return validated;
@@ -475,7 +522,7 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         foreach (var entry in result.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries))
         {
             var normalized = NormalizeSpecPath(entry);
-            if (normalized is null || !seen.Add(normalized) || IsExcludedPath(normalized, options))
+            if (normalized is null || !seen.Add(normalized) || IsPathExcluded(normalized, options))
                 continue;
             discovered.Add(normalized);
         }
@@ -490,8 +537,10 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             { IsDeterministic = true };
 
         // ls-files reports the index; a tracked path deleted in the worktree
-        // has no revision side to load, so keep only what exists.
-        var present = await ProbeRepositoryFilesPresentAsync(
+        // has no revision side to load, and a symlinked candidate would hand
+        // oasdiff a read outside the audited tree — keep only regular,
+        // non-symlink files inside the worktree.
+        var present = await ProbeRepositoryRegularFilesPresentAsync(
             sandbox, workingDirectory, ToolName, discovered, options, ct)
             .ConfigureAwait(false);
         var presentSet = new HashSet<string>(present, StringComparer.Ordinal);
@@ -499,120 +548,10 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         if (specs.Count == 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' found OpenAPI spec candidates in git metadata "
-                + "but none exist in the audited worktree — nothing can be compared. This is "
-                + "infrastructure, not a pass.")
+                + "but none resolve to regular, non-symlink files inside the audited worktree — "
+                + "nothing can be compared. This is infrastructure, not a pass.")
             { IsDeterministic = true };
         return specs;
-    }
-
-    /// <summary>
-    /// Default baseline: the merge-base of <c>HEAD</c> and the work item's
-    /// <see cref="AuditContext.BaseBranch"/> — the same
-    /// <c>origin/&lt;base&gt;...HEAD</c> semantics the pipeline's own diff
-    /// auditors use, so API added to the base after the branch point is not
-    /// misread as removed. Probes <c>origin/&lt;base&gt;</c> first, then the
-    /// bare branch name. Any failure is deterministic infrastructure.
-    /// </summary>
-    private async Task<string> ResolveMergeBaseAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AuditContext context,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var baseBranch = context.BaseBranch?.Trim();
-        if (string.IsNullOrWhiteSpace(baseBranch))
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' has no baseline to compare against: no "
-                + $"{BaseRefKey} is configured and the work item carries no usable base branch "
-                + "for merge-base resolution. " + BaselineConfigHint)
-            { IsDeterministic = true };
-
-        try
-        {
-            Validation.ValidateBranchName(baseBranch, nameof(context.BaseBranch));
-        }
-        catch (ArgumentException ex)
-        {
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' cannot resolve a baseline: {SingleLine(ex.Message)}. "
-                + BaselineConfigHint, ex)
-            { IsDeterministic = true };
-        }
-
-        var baseBranchDisplay = SingleLine(baseBranch);
-
-        string? baseSha = null;
-        foreach (var candidate in new[] { $"origin/{baseBranch}", baseBranch })
-        {
-            var probe = await GitProbeAsync(
-                sandbox,
-                workingDirectory,
-                options,
-                ["rev-parse", "--verify", $"{candidate}^{{commit}}"],
-                ct).ConfigureAwait(false);
-            if (probe.ExitCode == 0)
-            {
-                baseSha = ReadCommitSha(probe.Stdout);
-                if (baseSha is not null)
-                    break;
-            }
-        }
-
-        if (baseSha is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not resolve base branch "
-                + $"'{baseBranchDisplay}' (tried 'origin/{baseBranchDisplay}' and "
-                + $"'{baseBranchDisplay}') in the audited repository — git must be available "
-                + "and the base ref present in the sandbox clone. " + BaselineConfigHint)
-            { IsDeterministic = true };
-
-        var mergeBase = await GitProbeAsync(
-            sandbox,
-            workingDirectory,
-            options,
-            ["merge-base", "HEAD", baseSha],
-            ct).ConfigureAwait(false);
-        var mergeBaseSha = mergeBase.ExitCode == 0 ? ReadCommitSha(mergeBase.Stdout) : null;
-        if (mergeBaseSha is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' found no merge base between HEAD and "
-                + $"base branch '{baseBranchDisplay}' — the audited history must share an "
-                + "ancestor with the base ref. " + BaselineConfigHint)
-            { IsDeterministic = true };
-
-        return mergeBaseSha;
-    }
-
-    private async Task<SandboxExecResult> GitProbeAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        ExternalToolAuditorOptions options,
-        IReadOnlyList<string> args,
-        CancellationToken ct)
-    {
-        var argv = new List<string>(args.Count + 1) { "git" };
-        argv.AddRange(args);
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "baseline resolution",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' baseline resolution could not run: "
-                + "the sandbox exec transport was unavailable.");
-        return result;
     }
 
     /// <summary>
@@ -642,32 +581,6 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
                 return null;
         }
         return path;
-    }
-
-    /// <summary>
-    /// The <c>ExcludePaths</c> contract applied at discovery time — exact
-    /// path, or directory prefix when the entry ends with '/' — mirroring
-    /// the base's finding-level filter so an excluded tree neither produces
-    /// findings nor fails a comparison it should never have entered.
-    /// </summary>
-    private static bool IsExcludedPath(string path, ExternalToolAuditorOptions options)
-    {
-        foreach (var entry in options.ExcludePaths)
-        {
-            var normalized = NormalizeExcludePathEntry(entry);
-            if (normalized is null)
-                continue;
-            if (normalized.EndsWith("/", StringComparison.Ordinal))
-            {
-                if (path.StartsWith(normalized, StringComparison.Ordinal))
-                    return true;
-            }
-            else if (path.Equals(normalized, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static void EnforceSpecBound(int count)
@@ -717,23 +630,6 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
     private static string BaselineConfigHint
         => $"Set CodeyBox:Plugins:{PluginId}:{BaseRefKey} to a git ref (branch, tag, or SHA), or "
             + $"pass {BaseFlag} <ref> via ExtraArguments, to pin the baseline explicitly.";
-
-    private static string? ReadCommitSha(string stdout)
-    {
-        var firstLine = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        if (firstLine is null)
-            return null;
-        try
-        {
-            Validation.ValidateCommitSha(firstLine, "git output");
-        }
-        catch (ArgumentException)
-        {
-            return null;
-        }
-        return firstLine;
-    }
 
     private static IReadOnlyList<string> BuildRepositoryConfigNames()
     {

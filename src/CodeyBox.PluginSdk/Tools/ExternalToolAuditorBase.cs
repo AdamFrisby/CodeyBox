@@ -45,6 +45,28 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private const string RepositoryFilePresenceScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then printf '%s\\n' \"$f\"; fi; done; exit 0";
 
+    // Stricter variant for paths an audit tool will OPEN: the candidate must
+    // be a regular file and no component of its path — leaf or any ancestor
+    // directory — may be a symlink. [ -f ] follows links, so the walk strips
+    // one component at a time (p=${p%/*}) and applies -L to each prefix; a
+    // symlinked leaf OR a symlinked directory both stop the walk with p
+    // non-empty and the path is not echoed. A path passing every check
+    // resolves to a regular file canonically inside the worktree — a
+    // repo-committed symlink cannot redirect the tool's read outside the
+    // audited tree. (A hardlink stays invisible to any path-level check;
+    // sandbox mounts keep the worktree on its own filesystem, so one cannot
+    // reach outside it.) Same contract as above: exit 0 once complete, names
+    // on stdout carry the verdict.
+    private const string RepositoryRegularFilePresenceScript =
+        "for f in \"$@\"; do "
+        + "if [ -f \"./$f\" ]; then "
+        + "p=$f; while [ -n \"$p\" ] && [ ! -L \"./$p\" ]; do "
+        + "case $p in */*) p=${p%/*} ;; *) p= ;; esac; "
+        + "done; "
+        + "if [ -z \"$p\" ]; then printf '%s\\n' \"$f\"; fi; "
+        + "fi; "
+        + "done; exit 0";
+
     /// <summary>Stable name for logs and findings.</summary>
     public abstract string Name { get; }
 
@@ -427,12 +449,65 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// rejected so the probe can never escape the worktree or corrupt its
     /// one-name-per-line protocol.
     /// </summary>
-    protected static async Task<IReadOnlyList<string>> ProbeRepositoryFilesPresentAsync(
+    protected static Task<IReadOnlyList<string>> ProbeRepositoryFilesPresentAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         IReadOnlyList<string> relativePaths,
         ExternalToolAuditorOptions options,
+        CancellationToken ct)
+        => ProbeRepositoryPathsAsync(
+            sandbox,
+            workingDirectory,
+            tool,
+            relativePaths,
+            options,
+            RepositoryFilePresenceScript,
+            "suppression check",
+            "confirm repository-file absence",
+            ct);
+
+    /// <summary>
+    /// Bounded presence probe for repository files an audit tool will OPEN —
+    /// stricter than <see cref="ProbeRepositoryFilesPresentAsync"/>: a path
+    /// counts as present only when it is a regular file AND no component of
+    /// it (leaf or ancestor directory) is a symlink. A name passing that
+    /// check resolves canonically inside the worktree, so a repo-committed
+    /// symlink cannot redirect the tool's read to a file outside the audited
+    /// tree — use this variant whenever the probed names will be handed to a
+    /// tool as file arguments rather than merely checked for existence (a
+    /// suppression-file gate wants the loose variant: a symlinked config
+    /// file IS a suppression surface). Same fail-closed contract: transport
+    /// failure or non-zero probe exit is <see cref="AuditUnavailableException"/>,
+    /// never evidence about the files.
+    /// </summary>
+    protected static Task<IReadOnlyList<string>> ProbeRepositoryRegularFilesPresentAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> relativePaths,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+        => ProbeRepositoryPathsAsync(
+            sandbox,
+            workingDirectory,
+            tool,
+            relativePaths,
+            options,
+            RepositoryRegularFilePresenceScript,
+            "file probe",
+            "confirm the probed paths are regular files inside the worktree",
+            ct);
+
+    private static async Task<IReadOnlyList<string>> ProbeRepositoryPathsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> relativePaths,
+        ExternalToolAuditorOptions options,
+        string script,
+        string operation,
+        string failureGoal,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(sandbox);
@@ -441,7 +516,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var requested = new HashSet<string>(StringComparer.Ordinal);
         var argv = new List<string>(relativePaths.Count + 4)
         {
-            "sh", "-c", RepositoryFilePresenceScript, "sh",
+            "sh", "-c", script, "sh",
         };
         foreach (var path in relativePaths)
         {
@@ -455,7 +530,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var result = await ExecToolBoundedAsync(
             sandbox,
             tool,
-            "suppression check",
+            operation,
             new SandboxExec
             {
                 Argv = argv,
@@ -469,17 +544,17 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
         if (result.ExecutionUnavailable)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
+                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
                 + "transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-file "
-                + $"absence (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
-                + "that the files are absent.",
+                $"could-not-verify: audit tool '{tool}' {operation} could not {failureGoal} "
+                + $"(exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
+                + "about the probed files.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
 
-        // The probe echoes each present path, one per line; intersect with
+        // The probe echoes each accepted path, one per line; intersect with
         // the requested set — output beyond it is not trusted.
         var present = new List<string>();
         foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -488,6 +563,147 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 present.Add(line);
         }
         return present;
+    }
+
+    /// <summary>
+    /// Resolves the merge-base of <c>HEAD</c> and the work item's
+    /// <see cref="AuditContext.BaseBranch"/> — the
+    /// <c>origin/&lt;base&gt;...HEAD</c> three-dot semantics the pipeline's own
+    /// diff auditors use, so upstream state added to the base after the
+    /// branch point is not misread as removed. Probes <c>origin/&lt;base&gt;</c>
+    /// first, then the bare branch name, via bounded <c>git</c> executions;
+    /// the <see cref="Validation.ValidateBranchName"/>-validated value reaches
+    /// git only as argv entries, never through a shell. Every failure — an
+    /// empty or invalid base branch, an unresolvable ref, no common ancestor —
+    /// is a deterministic <see cref="AuditUnavailableException"/>:
+    /// infrastructure, never a pass. <paramref name="baselineConfigHint"/> is
+    /// an author-chosen constant appended to those failures so operators can
+    /// find the auditor's explicit-baseline configuration knobs; keep it a
+    /// fixed string, never untrusted data.
+    /// </summary>
+    protected async Task<string> ResolveMergeBaseAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        ExternalToolAuditorOptions options,
+        string baselineConfigHint,
+        CancellationToken ct)
+    {
+        var baseBranch = context.BaseBranch?.Trim();
+        if (string.IsNullOrWhiteSpace(baseBranch))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' has no baseline to compare against: no baseline "
+                + "is configured and the work item carries no usable base branch for merge-base "
+                + $"resolution. {baselineConfigHint}")
+            { IsDeterministic = true };
+
+        try
+        {
+            Validation.ValidateBranchName(baseBranch, nameof(context.BaseBranch));
+        }
+        catch (ArgumentException ex)
+        {
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' cannot resolve a baseline: {SingleLine(ex.Message)}. "
+                + baselineConfigHint, ex)
+            { IsDeterministic = true };
+        }
+
+        var baseBranchDisplay = SingleLine(baseBranch);
+
+        // origin/<base> is the sandbox clone's canonical ref (the pipeline's
+        // own diff auditors use origin/<base>...HEAD); the bare name covers
+        // layouts that only carry a local branch.
+        string? baseSha = null;
+        foreach (var candidate in new[] { $"origin/{baseBranch}", baseBranch })
+        {
+            var probe = await GitProbeAsync(
+                sandbox,
+                workingDirectory,
+                options,
+                ["rev-parse", "--verify", $"{candidate}^{{commit}}"],
+                ct).ConfigureAwait(false);
+            if (probe.ExitCode == 0)
+            {
+                baseSha = ReadCommitSha(probe.Stdout);
+                if (baseSha is not null)
+                    break;
+            }
+        }
+
+        if (baseSha is null)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' could not resolve base branch "
+                + $"'{baseBranchDisplay}' (tried 'origin/{baseBranchDisplay}' and "
+                + $"'{baseBranchDisplay}') in the audited repository — git must be available "
+                + "and the base ref present in the sandbox clone. " + baselineConfigHint)
+            { IsDeterministic = true };
+
+        // Merge-base semantics match the pipeline's three-dot work diff: the
+        // state the change actually diverged from.
+        var mergeBase = await GitProbeAsync(
+            sandbox,
+            workingDirectory,
+            options,
+            ["merge-base", "HEAD", baseSha],
+            ct).ConfigureAwait(false);
+        var mergeBaseSha = mergeBase.ExitCode == 0 ? ReadCommitSha(mergeBase.Stdout) : null;
+        if (mergeBaseSha is null)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' found no merge base between HEAD and "
+                + $"base branch '{baseBranchDisplay}' — the audited history must share an "
+                + "ancestor with the base ref. " + baselineConfigHint)
+            { IsDeterministic = true };
+
+        return mergeBaseSha;
+    }
+
+    private async Task<SandboxExecResult> GitProbeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        ExternalToolAuditorOptions options,
+        IReadOnlyList<string> args,
+        CancellationToken ct)
+    {
+        var argv = new List<string>(args.Count + 1) { "git" };
+        argv.AddRange(args);
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            ToolName,
+            "baseline resolution",
+            new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' baseline resolution could not run: "
+                + "the sandbox exec transport was unavailable.");
+        return result;
+    }
+
+    private static string? ReadCommitSha(string stdout)
+    {
+        var firstLine = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault();
+        if (firstLine is null)
+            return null;
+        try
+        {
+            Validation.ValidateCommitSha(firstLine, "git output");
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+        return firstLine;
     }
 
     /// <summary>
@@ -549,6 +765,41 @@ public abstract class ExternalToolAuditorBase : IAuditor
     {
         var normalized = ExternalToolJsonHelpers.NormalizePath(entry).TrimStart('/');
         return normalized.Length == 0 ? null : normalized;
+    }
+
+    /// <summary>
+    /// The <see cref="ExternalToolAuditorOptions.ExcludePaths"/> matching
+    /// contract — the single source of truth for both the finding-level
+    /// filter below and auditors that must apply the same scope decision
+    /// BEFORE the scan runs (e.g. when narrowing which files are passed as
+    /// tool arguments). <paramref name="normalizedRepoRelativePath"/> must
+    /// already be in repo-relative normalized form (<c>\</c>→<c>/</c>, no
+    /// leading <c>/</c> — e.g. <c>ExternalToolJsonHelpers.NormalizePath</c>
+    /// output). An entry ending in <c>/</c> is a directory-prefix exclusion;
+    /// any other entry excludes exactly that path.
+    /// </summary>
+    protected static bool IsPathExcluded(
+        string normalizedRepoRelativePath,
+        ExternalToolAuditorOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(normalizedRepoRelativePath);
+        ArgumentNullException.ThrowIfNull(options);
+        foreach (var entry in options.ExcludePaths)
+        {
+            var normalized = NormalizeExcludePathEntry(entry);
+            if (normalized is null)
+                continue;
+            if (normalized.EndsWith("/", StringComparison.Ordinal))
+            {
+                if (normalizedRepoRelativePath.StartsWith(normalized, StringComparison.Ordinal))
+                    return true;
+            }
+            else if (normalizedRepoRelativePath.Equals(normalized, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
@@ -681,24 +932,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     {
         if (options.ExcludePaths.Count == 0 || string.IsNullOrWhiteSpace(item.Path))
             return false;
-        var path = NormalizeFindingPath(item.Path);
-        foreach (var entry in options.ExcludePaths)
-        {
-            var normalized = NormalizeExcludePathEntry(entry);
-            if (normalized is null)
-                continue;
-            if (normalized.EndsWith("/", StringComparison.Ordinal))
-            {
-                if (path.StartsWith(normalized, StringComparison.Ordinal))
-                    return true;
-            }
-            else if (path.Equals(normalized, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return IsPathExcluded(NormalizeFindingPath(item.Path), options);
     }
 
     private static string BuildTitle(ExternalToolFinding item)

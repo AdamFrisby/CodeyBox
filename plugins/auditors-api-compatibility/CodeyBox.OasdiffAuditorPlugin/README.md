@@ -46,9 +46,17 @@ with the check id and the spec file/line location.
   (containing `:` or starting with `-`) are out of scope.
 - **External `$ref`s.** `--allow-external-refs=false` is passed by default —
   http(s) refs and file paths outside the git tree fail the run (exit 123,
-  infrastructure). In-repo relative file refs resolve normally. Override
-  with `--allow-external-refs` in `ExtraArguments` if the audited specs
-  genuinely need it.
+  infrastructure). In-repo relative file refs resolve normally. Operators
+  whose audited specs genuinely need external refs set the dedicated
+  `AllowExternalRefs` scoped key (see below) — passing the flag through
+  `ExtraArguments` is a deterministic failure, because opting in must also
+  declare the `Network` audit capability so the run is scheduled into a
+  network-capable sandbox profile.
+- **Symlinked specs.** A spec path that is a symlink — or sits under a
+  symlinked directory — is never handed to oasdiff: a committed link could
+  redirect the tool's read outside the audited tree. Such candidates are
+  dropped from discovery, and a configured `SpecPaths` entry resolving to
+  one is a deterministic failure.
 
 ## Baseline selection
 
@@ -105,13 +113,22 @@ baseline provisioning only while the plugin is enabled:
 
 - `oasdiff` — no distro package carries it. Install the pinned release into
   the baseline via `CodeyBox:MultipassExtraRuncmd` /
-  `CodeyBox:Incus:ExtraRuncmd` or `ExecutableProvisions`:
+  `CodeyBox:Incus:ExtraRuncmd` or `ExecutableProvisions`, verifying the
+  published release checksum before unpacking:
 
   ```sh
-  curl -sSfL https://github.com/oasdiff/oasdiff/releases/download/v1.32.1/oasdiff_1.32.1_linux_amd64.tar.gz \
-      | tar -xz -C /usr/local/bin oasdiff
+  # baseline bake step (adjust arch; verify against the release checksums.txt)
+  OASDIFF_VERSION=1.32.1
+  curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${OASDIFF_VERSION}/oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" -o /tmp/oasdiff.tar.gz
+  curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${OASDIFF_VERSION}/checksums.txt" -o /tmp/oasdiff-checksums.txt
+  (cd /tmp && grep "oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" oasdiff-checksums.txt | sha256sum -c -)
+  tar -xzf /tmp/oasdiff.tar.gz -C /usr/local/bin oasdiff
   oasdiff --version   # must print 1.32.1
   ```
+
+  The alternative `go install github.com/oasdiff/oasdiff@v1.32.1` is
+  integrity-verified by the Go module checksum database if a Go toolchain
+  is already in the baseline.
 
 - `git` — ships in the stock sandbox baseline; declared because
   `breaking-files` reads `<base>:<path>` revisions through `git show`, and
@@ -167,12 +184,13 @@ Scoped under `CodeyBox:Plugins:codeybox.oasdiff`, resolved per run
 |---|---|---|
 | `ExpectedVersion` | `1.32.1` | Pinned oasdiff release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
 | `BaseRef` | merge-base of `origin/<BaseBranch>` | Git ref the specs are compared against (`--base`). Set here **or** as `--base` in `ExtraArguments` — setting both is a deterministic failure. |
-| `SpecPaths` | discovered | Comma-separated repo-relative OpenAPI spec paths to compare; overrides discovery. Entries must be plain relative file paths that exist in the worktree. |
+| `SpecPaths` | discovered | Comma-separated repo-relative OpenAPI spec paths to compare; overrides discovery. Entries must be plain relative paths to regular, non-symlink files inside the worktree. |
 | `TrustRepositorySuppression` | `false` | When `true`, repository-root `.oasdiff.*`/`oasdiff.*` config files are honored. When `false`, their presence fails the audit before the scan runs. |
+| `AllowExternalRefs` | `false` | When `true`, passes `--allow-external-refs` so specs can resolve http(s)/external file `$ref`s — **and** declares the `Network` audit capability, so the run lands in a network-capable audit sandbox profile (the project's `AuditTool` network profile must permit the egress the specs' refs need). This is an SSRF/out-of-tree-read surface over untrusted spec content; enable only where that is intended. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity — e.g. `error` keeps only `ERR`-level breaking changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact oasdiff check ids to keep/drop (e.g. `api-path-removed-without-deprecation`). |
 | `ExcludePaths` | `vendor/, third_party/, node_modules/` | Repo-relative paths excluded — exact path, or directory prefix when trailing `/`. Applied to spec discovery *and* to reported finding paths (a finding sourced to an excluded `$ref`'d file is filtered too). |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--match-path`, `--unmatch-path`, `--stability-level`, `--deprecation-days-*`, `--severity-levels <file>`, `--err-ignore/--warn-ignore <file>`, `--config <file>`, `--allow-external-refs`, or a different `--fail-on`/`--base`. Take care: an operator-supplied `--format`/`-f` or `--template` breaks the JSON output contract and is a deterministic configuration failure; `--severity-levels`/`--err-ignore`/`--warn-ignore` point into the repo at your own trust. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--match-path`, `--unmatch-path`, `--stability-level`, `--deprecation-days-*`, `--severity-levels <file>`, `--err-ignore/--warn-ignore <file>`, `--config <file>`, or a different `--fail-on`/`--base`. Take care: an operator-supplied `--format`/`-f` or `--template` breaks the JSON output contract and is a deterministic configuration failure; `--allow-external-refs` must go through the `AllowExternalRefs` scoped key (it additionally declares the `Network` capability); `--severity-levels`/`--err-ignore`/`--warn-ignore` point into the repo at your own trust. |
 | `TimeoutSeconds` | `300` | Per-run bound; exceeding it is infrastructure, not a pass. Baseline/discovery probes share it under a 30 s cap. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 | `FindingsExitCodes` | `0, 1` | The verdict exits; do not change unless oasdiff's convention changes. |
@@ -184,7 +202,9 @@ git `ls-files` (tracked plus untracked-but-not-ignored files) filtered to
 basenames containing `openapi` or `swagger` with a `.yaml`/`.yml`/`.json`
 extension — the convention oasdiff's own pre-commit hook ships — minus
 `ExcludePaths` (`vendor/`, `third_party/`, `node_modules/` by default, so
-upstream contract copies and dependency bundles never produce noise). The
+upstream contract copies and dependency bundles never produce noise), then
+intersected with regular, non-symlink files actually present in the
+worktree. The
 scope is deliberately narrow: a matched non-spec makes the run fail loudly
 (a load error is infrastructure, not a finding), so discovery errs toward
 fewer, surer candidates — name any other spec via `SpecPaths`. An unchanged
