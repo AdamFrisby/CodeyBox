@@ -45,6 +45,18 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private const string RepositoryFilePresenceScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then printf '%s\\n' \"$f\"; fi; done; exit 0";
 
+    // Version probes for VersionProbeRunsOutsideWorktree run inside a fresh,
+    // uniquely-named mktemp directory so a tool whose --version resolves
+    // repository-controlled code from the current directory (a composer
+    // autoloader, an executable config) finds no repo-authored input — it
+    // cannot execute during the probe and cannot print a forged version
+    // token ahead of the real banner. "$@" carries the tool plus its probe
+    // arguments; the tool's exit code is preserved and the directory is
+    // removed afterwards. A failed mktemp/cd exits non-zero, which the pin
+    // check classifies as "version could not be determined" — fail closed.
+    private const string IsolatedVersionProbeScript =
+        "d=$(mktemp -d /tmp/codeybox-version-probe.XXXXXX) || exit 1; cd \"$d\" || exit 1; \"$@\"; rc=$?; rm -rf -- \"$d\"; exit $rc";
+
     /// <summary>Stable name for logs and findings.</summary>
     public abstract string Name { get; }
 
@@ -99,6 +111,20 @@ public abstract class ExternalToolAuditorBase : IAuditor
     protected virtual ToolVersionPin? VersionPin => null;
 
     /// <summary>
+    /// When true, the <see cref="VersionPin"/> probe runs inside a fresh,
+    /// uniquely-named directory outside the audited worktree (created by
+    /// <c>mktemp -d</c> under the sandbox's tmp and removed afterwards)
+    /// instead of <c>workingDirectory</c>. Opt in for tools whose version
+    /// path resolves repository-controlled code from the current directory
+    /// — e.g. a composer autoloader — which could otherwise execute during
+    /// the probe and print a forged version token ahead of the real banner,
+    /// satisfying the pin while the provisioned binary is a different
+    /// release. Default false: most tools' version output touches no
+    /// repository content.
+    /// </summary>
+    protected virtual bool VersionProbeRunsOutsideWorktree => false;
+
+    /// <summary>
     /// Pre-scan precondition hook, invoked inside <see cref="RunAsync"/> after
     /// the tool's presence and declared <see cref="VersionPin"/> are confirmed
     /// and before the scan executes. Override for tool requirements the base
@@ -150,7 +176,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// directory the scan will actually run in: sandbox providers may
     /// translate <paramref name="workingDirectory"/> (the process provider
     /// maps it onto a host path), so resolve it with a bounded probe such as
-    /// <c>pwd</c> through <see cref="ExecToolBoundedAsync"/>. The value is
+    /// <c>pwd</c> through <see cref="ExecToolBoundedAsync"/> —
+    /// <see cref="ResolveScanRootViaPwdAsync"/> implements exactly that for
+    /// the common case. The value is
     /// carried to the parser on <see cref="ExternalToolParseInput.ScanRoot"/>
     /// — a per-invocation channel, so output parsing stays a pure function
     /// of its input and concurrent audits on this (singleton) auditor cannot
@@ -275,6 +303,61 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 + "infrastructure, not a verdict on the diff.");
     }
 
+    /// <summary>
+    /// Bounded <c>pwd</c> probe resolving the directory the tool's exec will
+    /// actually run in — the implementation
+    /// <see cref="ResolveScanRootAsync"/> prescribes for tools whose reports
+    /// carry absolute paths but embed no working directory. Sandbox
+    /// providers may translate <paramref name="workingDirectory"/> (the
+    /// process provider maps it onto a host path), so it is resolved through
+    /// the same exec path the scan uses; <c>pwd</c> is a shell builtin — the
+    /// audited repository cannot shadow it via PATH — and prints the
+    /// process's logical cwd, exactly the prefix such tools embed in their
+    /// absolute paths. Fails closed: a transport failure, a non-zero exit,
+    /// or empty output throws <see cref="AuditUnavailableException"/> —
+    /// findings must be reported repository-relative.
+    /// </summary>
+    protected static async Task<string> ResolveScanRootViaPwdAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "scan-root probe",
+            new SandboxExec
+            {
+                Argv = ["sh", "-c", "pwd", "sh"],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' scan-root probe could not run: the sandbox exec "
+                + "transport was unavailable.");
+
+        var root = result.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault();
+        if (result.ExitCode != 0 || string.IsNullOrEmpty(root))
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' could not resolve the scan root (exit "
+                + $"{result.ExitCode}) — the worktree root must be resolvable for findings to be "
+                + "reported repository-relative.",
+                result.ExitCode,
+                result.Stdout + "\n" + result.Stderr);
+
+        return ExternalToolJsonHelpers.NormalizePath(root);
+    }
+
     private Task<SandboxExecResult> ExecToolAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -380,13 +463,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var probeArguments = pin.VersionProbeArguments.Count > 0
             ? pin.VersionProbeArguments
             : ["--version"];
+        // Tools that resolve repository-controlled code from cwd while
+        // printing their version get an isolated working directory instead —
+        // repo code cannot run during the probe or forge the pinned banner.
+        IReadOnlyList<string> argv = VersionProbeRunsOutsideWorktree
+            ? ["sh", "-c", IsolatedVersionProbeScript, "sh", tool, .. probeArguments]
+            : [tool, .. probeArguments];
         var result = await ExecToolBoundedAsync(
             sandbox,
             tool,
             "version check",
             new SandboxExec
             {
-                Argv = [tool, .. probeArguments],
+                Argv = argv,
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
