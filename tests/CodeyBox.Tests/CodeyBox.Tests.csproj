@@ -74,6 +74,7 @@
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PyrightAuditorPlugin\CodeyBox.PyrightAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PhpstanAuditorPlugin\CodeyBox.PhpstanAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.DetektAuditorPlugin\CodeyBox.DetektAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PsalmAuditorPlugin\CodeyBox.PsalmAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.GitleaksAuditorPlugin\CodeyBox.GitleaksAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SpectralAuditorPlugin\CodeyBox.SpectralAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.CodeqlAuditorPlugin\CodeyBox.CodeqlAuditorPlugin.csproj" />
