@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
 
@@ -54,7 +53,7 @@ internal sealed class OxlintJsonOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced output that is not valid oxlint JSON: {SingleLine(ex.Message)}.",
+                $"Tool '{input.ToolName}' produced output that is not valid oxlint JSON: {ToolOutputText.SingleLine(ex.Message)}.",
                 ex);
         }
 
@@ -84,9 +83,9 @@ internal sealed class OxlintJsonOutputParser : IExternalToolOutputParser
 
     private static ExternalToolFinding ParseDiagnostic(JsonElement diagnostic)
     {
-        var severity = NullIfWhiteSpace(GetString(diagnostic, "severity"u8));
-        var ruleId = NullIfWhiteSpace(GetString(diagnostic, "code"u8));
-        var message = NullIfWhiteSpace(GetString(diagnostic, "message"u8)) ?? "(no message)";
+        var severity = ToolOutputText.NullIfWhiteSpace(GetString(diagnostic, "severity"u8));
+        var ruleId = ToolOutputText.NullIfWhiteSpace(GetString(diagnostic, "code"u8));
+        var message = ToolOutputText.NullIfWhiteSpace(GetString(diagnostic, "message"u8)) ?? "(no message)";
         var path = NormalizeFilePath(GetString(diagnostic, "filename"u8));
 
         int? line = null;
@@ -131,17 +130,6 @@ internal sealed class OxlintJsonOutputParser : IExternalToolOutputParser
             ? value.GetString()
             : null;
 
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
     private static string Truncate(string value, int maxChars)
         => value.Length <= maxChars ? value : value[..maxChars] + "...";
-
-    private static string SingleLine(string message)
-    {
-        var builder = new StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
-    }
 }

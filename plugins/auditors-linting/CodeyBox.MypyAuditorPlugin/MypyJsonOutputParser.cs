@@ -65,7 +65,7 @@ internal sealed class MypyJsonOutputParser : IExternalToolOutputParser
         catch (JsonException ex)
         {
             throw new ExternalToolParseException(
-                $"Tool '{toolName}' produced a line that is not valid mypy JSON: {SingleLine(line)}.",
+                $"Tool '{toolName}' produced a line that is not valid mypy JSON: {ToolOutputText.SingleLine(line)}.",
                 ex);
         }
 
@@ -76,12 +76,12 @@ internal sealed class MypyJsonOutputParser : IExternalToolOutputParser
                 || !element.TryGetProperty("message"u8, out var messageElement)
                 || messageElement.ValueKind != JsonValueKind.String)
                 throw new ExternalToolParseException(
-                    $"Tool '{toolName}' produced a JSON line that is not a mypy diagnostic object: {SingleLine(line)}.");
+                    $"Tool '{toolName}' produced a JSON line that is not a mypy diagnostic object: {ToolOutputText.SingleLine(line)}.");
 
-            var message = NullIfWhiteSpace(messageElement.GetString()) ?? "(no message)";
+            var message = ToolOutputText.NullIfWhiteSpace(messageElement.GetString()) ?? "(no message)";
             // mypy attaches remediation text ("hint": "…") to some codes;
             // keep it inside the finding message rather than dropping it.
-            var hint = NullIfWhiteSpace(GetString(element, "hint"u8));
+            var hint = ToolOutputText.NullIfWhiteSpace(GetString(element, "hint"u8));
             if (hint is not null)
                 message += "\n" + hint;
 
@@ -93,8 +93,8 @@ internal sealed class MypyJsonOutputParser : IExternalToolOutputParser
                 lineNumber = lineValue;
 
             return new ExternalToolFinding(
-                SeverityLevel: NullIfWhiteSpace(GetString(element, "severity"u8)),
-                RuleId: NullIfWhiteSpace(GetString(element, "code"u8)),
+                SeverityLevel: ToolOutputText.NullIfWhiteSpace(GetString(element, "severity"u8)),
+                RuleId: ToolOutputText.NullIfWhiteSpace(GetString(element, "code"u8)),
                 Message: message,
                 Path: NormalizeFilePath(GetString(element, "file"u8)),
                 Line: lineNumber);
@@ -120,10 +120,4 @@ internal sealed class MypyJsonOutputParser : IExternalToolOutputParser
         => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value;
-
-    private static string SingleLine(string message)
-        => message.Replace('\r', ' ').Replace('\n', ' ').Trim();
 }
