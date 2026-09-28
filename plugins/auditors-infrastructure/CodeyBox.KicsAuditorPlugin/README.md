@@ -13,8 +13,11 @@ rest of KICS's supported platforms — as audit findings.
   parser flattens that to one finding per location.
 - `Title` carries the query UUID (the rule id) plus the query name; the
   description carries the tool, rule, tool severity, location, the query
-  description, and per-file details KICS supplies (`issue_type`,
-  `search_key`, `expected`/`actual` values, `similarity_id`).
+  description, and the query/file metadata KICS supplies (`issue_type`,
+  `platform`, `category`, `similarity_id`). KICS's `search_key`/`expected_value`/`actual_value`
+  fields are deliberately **not** copied: for the "Passwords And Secrets"
+  queries they contain the matched literal secret, and findings are sent to
+  the rework prompt, webhooks, and the persisted audit report.
 - `Location` is `path:line` — repo-relative for the default `.` target;
   absolute paths are relativized against the probed scan root.
 - **Severity mapping (declared, never raw pass-through):**
@@ -60,6 +63,12 @@ per-run directory under the sandbox temp area containing a
 KICS's report open follows the symlink and the JSON report lands on captured
 stdout, where the shared parser reads it. `--silent` is load-bearing — it
 suppresses KICS's console output, so stdout carries only the report.
+
+The per-run directory is minted under the sandbox temp area and is not
+explicitly removed: VM sandboxes discard the whole temp area with the
+instance, so nothing accumulates. Under the host `ProcessSandboxProvider`
+(developer machines) a tiny directory per run can linger in the host temp
+directory until the OS sweeps it.
 
 ## Exit codes and failure classification
 
@@ -118,8 +127,11 @@ the report. The auditor therefore always passes `--config`: a generated
 empty JSON file by default, or your `ConfigFile` path. KICS's bind order
 only applies config values to flags absent from argv, so the pipeline flags
 (`--output-path`, `--silent`, `--ignore-on-exit`, …) cannot be turned by a
-config file — but an in-repo `ConfigFile` still hands query selection to
-the diff author, so prefer a path outside the repository.
+config file — but query selection still binds, so `ConfigFile` must be an
+absolute path that resolves **outside** the audited worktree. A relative
+path (KICS resolves it against the scan cwd — the worktree) or an absolute
+path inside the tree is rejected as a deterministic configuration failure
+before the scan runs.
 
 `KICS_*` environment variables can also set un-passed flags; they come from
 the sandbox baseline (operator-controlled), not from the audited tree.
@@ -159,7 +171,7 @@ Scoped under `CodeyBox:Plugins:codeybox.kics`, resolved per run
 |---|---|---|
 | `ExpectedVersion` | `2.2.0` | Pinned KICS release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
 | `Targets` | `.` | Comma-separated paths, each becoming a `--path` argument. Repo-relative paths keep finding locations repo-relative. |
-| `ConfigFile` | — (generated empty config) | Path passed verbatim to `--config`. See "The repository-config surface" above. |
+| `ConfigFile` | — (generated empty config) | Absolute path passed to `--config`; must resolve outside the audited worktree (rejected otherwise). See "The repository-config surface" above. |
 | `Platforms` | — (all) | Comma-separated KICS platform ids (`terraform`, `k8s`, `dockerfile`, `cloudFormation`, `ansible`, `openAPI`, `dockerCompose`, …), each becoming a `--type` entry. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. |
 | `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop — KICS query UUIDs, plus `kics/incomplete-scan` for the coverage finding. Post-scan filtering. |

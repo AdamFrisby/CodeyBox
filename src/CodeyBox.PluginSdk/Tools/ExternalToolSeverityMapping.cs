@@ -19,6 +19,14 @@ public sealed class ExternalToolSeverityMapping
     /// </summary>
     public AuditSeverity DefaultSeverity { get; }
 
+    /// <summary>
+    /// The declared token → severity map (case-insensitive lookup). Exposed
+    /// so a plugin can derive its map from a shared baseline —
+    /// <c>new ExternalToolSeverityMapping(Default.Levels …adjusted…)</c> —
+    /// instead of copying the defaults and drifting when they evolve.
+    /// </summary>
+    public IReadOnlyDictionary<string, AuditSeverity> Levels => _levels;
+
     public ExternalToolSeverityMapping(
         IReadOnlyDictionary<string, AuditSeverity> levels,
         AuditSeverity defaultSeverity = AuditSeverity.Warning)

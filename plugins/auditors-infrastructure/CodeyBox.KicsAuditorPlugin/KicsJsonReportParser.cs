@@ -18,8 +18,17 @@ namespace CodeyBox.KicsAuditorPlugin;
 /// pass. Counters of files KICS could not parse and queries that failed to
 /// execute surface as a synthetic <c>kics/incomplete-scan</c> warning finding:
 /// partial coverage must not pass silently.
+///
+/// <para><b>Secret redaction.</b> Per-file <c>search_key</c>,
+/// <c>expected_value</c>, and <c>actual_value</c> are deliberately NOT copied
+/// into findings: for KICS's "Passwords And Secrets" queries those fields
+/// carry the matched source snippet — the literal committed secret — and
+/// findings flow to the rework prompt, outbound webhooks, and the persisted
+/// audit report. Only non-value metadata (platform, category, issue_type,
+/// the similarity-id hash) is attached. The raw report still reaches
+/// <c>AuditResult.RawOutput</c>, which the pipeline redacts separately.</para>
 /// </summary>
-public sealed class KicsJsonReportParser : IExternalToolOutputParser
+internal sealed class KicsJsonReportParser : IExternalToolOutputParser
 {
     /// <summary>Upper bound on (query, file) findings consumed from one report.</summary>
     public const int DefaultMaxResults = 10_000;
@@ -137,12 +146,11 @@ public sealed class KicsJsonReportParser : IExternalToolOutputParser
         if (!string.IsNullOrWhiteSpace(description))
             builder.Append('\n').Append(Truncate(description.Trim(), DescriptionMaxChars));
 
+        // search_key / expected_value / actual_value are deliberately absent:
+        // KICS's secrets queries embed the matched literal secret in them.
         var details = new List<string>();
         AppendDetail(details, "platform", GetString(query, "platform"u8));
         AppendDetail(details, "category", GetString(query, "category"u8));
-        AppendDetail(details, "search_key", GetString(file, "search_key"u8));
-        AppendDetail(details, "expected", GetString(file, "expected_value"u8));
-        AppendDetail(details, "actual", GetString(file, "actual_value"u8));
         AppendDetail(details, "similarity_id", GetString(file, "similarity_id"u8));
         if (details.Count > 0)
             builder.Append('\n').Append(string.Join("; ", details));
@@ -159,19 +167,16 @@ public sealed class KicsJsonReportParser : IExternalToolOutputParser
 
     /// <summary>
     /// Normalizes a KICS-reported <c>file_name</c> to a repository-relative
-    /// path: <c>./</c> prefixes are dropped, and absolute paths are
-    /// relativized against the scan root (resolved per run from the sandbox,
-    /// since sandbox providers may translate the working directory) or the
-    /// exec working directory. An absolute path outside the root is kept
-    /// absolute rather than rewritten.
+    /// path: dot segments are collapsed (<c>./</c> dropped, <c>a/../b</c> →
+    /// <c>b</c>), and absolute paths are relativized against the scan root
+    /// (resolved per run from the sandbox, since sandbox providers may
+    /// translate the working directory) or the exec working directory. An
+    /// absolute path outside the root is kept absolute rather than
+    /// rewritten.
     /// </summary>
     private static string? NormalizeReportedPath(string? reported, ExternalToolParseInput input)
     {
-        var normalized = NormalizePath(reported);
-        if (normalized.Length == 0)
-            return null;
-        while (normalized.StartsWith("./", StringComparison.Ordinal))
-            normalized = normalized[2..];
+        var normalized = CollapseDotSegments(NormalizePath(reported));
         if (normalized.Length == 0 || !normalized.StartsWith("/", StringComparison.Ordinal))
             return normalized.Length == 0 ? null : normalized;
 
@@ -180,6 +185,32 @@ public sealed class KicsJsonReportParser : IExternalToolOutputParser
             return relative;
         relative = RelativizeToRoot(normalized, input.WorkingDirectory);
         return relative;
+    }
+
+    // Tool-reported paths are untrusted text: resolve "." and ".." lexically
+    // so a report cannot smuggle traversal segments into finding locations.
+    // A leading ".." on a relative path is kept — it cannot be resolved
+    // without a base and dropping it would silently rewrite the location.
+    private static string CollapseDotSegments(string path)
+    {
+        var rooted = path.StartsWith("/", StringComparison.Ordinal);
+        var segments = new List<string>();
+        foreach (var segment in path.Split('/'))
+        {
+            if (segment.Length == 0 || segment == ".")
+                continue;
+            if (segment == "..")
+            {
+                if (segments.Count > 0 && segments[^1] != "..")
+                    segments.RemoveAt(segments.Count - 1);
+                else if (!rooted)
+                    segments.Add(segment);
+                continue;
+            }
+            segments.Add(segment);
+        }
+        var joined = string.Join('/', segments);
+        return rooted ? "/" + joined : joined;
     }
 
     private static int ReadCounter(JsonElement root, ReadOnlySpan<byte> name)

@@ -37,6 +37,12 @@ public abstract class ExternalToolAuditorBase : IAuditor
         @"\d+\.\d+\.\d+[\w.\-]*",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
+    // Per-run scratch directory minted by MintPerRunTempDirectoryPath and
+    // consumed by VerifyToolAsync. AsyncLocal — not a field — because auditor
+    // instances are shared singletons: concurrent audits must not see each
+    // other's paths.
+    private readonly AsyncLocal<string?> _perRunTempDirectoryPath = new();
+
     // Each candidate is probed with -e (exists) and -L (symlink — catches a
     // dangling symlink that -e would miss) and echoed when present; the
     // script always exits 0 once it completes, so the exit code carries only
@@ -101,7 +107,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// <summary>
     /// Pre-scan precondition hook, invoked inside <see cref="RunAsync"/> after
     /// the tool's presence and declared <see cref="VersionPin"/> are confirmed
-    /// and before the scan executes. Override for tool requirements the base
+    /// and before the scan executes. The scan argv — and any
+    /// <see cref="MintPerRunTempDirectoryPath"/> call — is already built when
+    /// this runs. Override for tool requirements the base
     /// cannot express — e.g. a repository-state gate — and throw
     /// <see cref="AuditUnavailableException"/> to fail closed: a failed
     /// precondition is infrastructure, never a pass.
@@ -163,6 +171,45 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ExternalToolAuditorOptions options,
         CancellationToken ct)
         => Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Mints a unique per-run scratch directory path —
+    /// <c>&lt;temp&gt;/&lt;prefix&gt;&lt;guid&gt;</c> — and records it for the
+    /// current invocation so <see cref="VerifyToolAsync"/> and later hooks
+    /// recover it through <see cref="PerRunTempDirectoryPath"/>. Call this
+    /// from <see cref="BuildToolArguments"/>: <see cref="RunAsync"/> builds
+    /// the scan argv before the presence, version, and precondition checks,
+    /// so the same path can be named in argv and prepared by the hooks. The
+    /// directory is NOT created here — the hooks create it inside the
+    /// sandbox. The temp root is computed on the host but interpreted in the
+    /// sandbox's path space; on the supported Linux layout both resolve
+    /// under <c>/tmp</c>. VM sandboxes discard the directory with their temp
+    /// area; on process-provider hosts it may accumulate — sweep it in the
+    /// same preparation step when that matters.
+    /// </summary>
+    protected string MintPerRunTempDirectoryPath(string directoryPrefix)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(directoryPrefix);
+        var path = Path.Combine(
+            Path.GetTempPath(), directoryPrefix + Guid.NewGuid().ToString("N"));
+        _perRunTempDirectoryPath.Value = path;
+        return path;
+    }
+
+    /// <summary>
+    /// The path <see cref="MintPerRunTempDirectoryPath"/> minted for this
+    /// run. Throws a deterministic <see cref="AuditUnavailableException"/>
+    /// when no path was minted — a precondition hook that needs the
+    /// directory cannot recover by minting its own, because the scan argv
+    /// already names the original one.
+    /// </summary>
+    protected string PerRunTempDirectoryPath
+        => _perRunTempDirectoryPath.Value is { Length: > 0 } path
+            ? path
+            : throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' per-run scratch directory was not "
+                + "initialized for this run.")
+            { IsDeterministic = true };
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,

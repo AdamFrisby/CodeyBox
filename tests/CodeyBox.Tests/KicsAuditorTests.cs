@@ -20,6 +20,8 @@ namespace CodeyBox.Tests;
 ///   with the query UUID as rule id and file/line locations.
 /// - Tool severities are mapped through the declared mapping (never passed through); an empty or
 ///   unparseable report fails closed as infrastructure even on a findings-producing exit.
+/// - Secret-bearing report fields (search_key/expected_value/actual_value) never reach finding
+///   text; an empty scan-root probe and an in-worktree ConfigFile fail closed.
 /// - Reserved ExtraArguments flags are rejected deterministically.
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_kics", "true")] exercise the
@@ -126,6 +128,37 @@ public sealed class KicsAuditorTests
                 { "file_name": "third_party/ops/x.tf", "line": 3 },
                 { "file_name": "node_modules/pkg/x.tf", "line": 4 }
               ] }
+          ]
+        }
+        """;
+
+    // Mirrors KICS's "Passwords And Secrets" category output: the per-file
+    // search_key/expected_value/actual_value fields carry the matched source
+    // snippet — here standing in for a committed literal secret.
+    private const string JsonWithSecretEcho = """
+        {
+          "kics_version": "2.2.0",
+          "files_scanned": 1,
+          "files_failed_to_scan": 0,
+          "queries_failed_to_execute": 0,
+          "total_counter": 1,
+          "severity_counters": { "CRITICAL": 0, "HIGH": 1, "MEDIUM": 0, "LOW": 0, "INFO": 0, "TRACE": 0 },
+          "queries": [
+            {
+              "query_name": "Passwords And Secrets",
+              "query_id": "487f4be7-3fd9-4506-9389-f6b2879c9061",
+              "severity": "HIGH",
+              "platform": "Terraform",
+              "category": "Secret Management",
+              "description": "do not store plaintext secrets",
+              "files": [
+                { "file_name": "infra/db.tf", "line": 9, "issue_type": "IncorrectValue",
+                  "search_key": "aws_db_instance.db.password=hunter2-plaintext",
+                  "expected_value": "hunter2-plaintext",
+                  "actual_value": "hunter2-plaintext",
+                  "similarity_id": "sim-sec" }
+              ]
+            }
           ]
         }
         """;
@@ -257,7 +290,11 @@ public sealed class KicsAuditorTests
         Assert.Equal(AuditSeverity.Error, high.Severity);
         Assert.Equal("infra/main.tf:3", high.Location);
         Assert.Contains("S3 Bucket", high.Title, StringComparison.Ordinal);
-        Assert.Contains("search_key", high.Description, StringComparison.Ordinal);
+        Assert.Contains("similarity_id", high.Description, StringComparison.Ordinal);
+        // search_key is value-bearing (secrets queries embed the matched
+        // literal in it) and must not reach finding text.
+        Assert.DoesNotContain("search_key", high.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("aws_s3_bucket.data", high.Description, StringComparison.Ordinal);
 
         var low = Assert.Single(
             result.Findings, f => f.Title.Contains("11111111-2222-3333-4444-555555555555", StringComparison.Ordinal));
@@ -345,7 +382,9 @@ public sealed class KicsAuditorTests
         Assert.Contains("kics", ex.Message, StringComparison.Ordinal);
         // 126 is KICS's EngineErrorCode; the shared base also treats 126/127
         // as cannot-execute, so only the generic exits carry "exit N" text.
-        if (exitCode != 126)
+        if (exitCode == 126)
+            Assert.Contains("could not execute", ex.Message, StringComparison.Ordinal);
+        else
             Assert.Contains($"exit {exitCode}", ex.Message, StringComparison.Ordinal);
     }
 
@@ -443,7 +482,99 @@ public sealed class KicsAuditorTests
     }
 
     [Fact]
-    public async Task ScopedConfiguration_ExcludePaths_FiltersDefaultVendoredFindings()
+    public async Task SecretsReportFields_AreNotEchoedIntoFindings()
+    {
+        // Findings flow to the rework prompt, webhooks, and the persisted
+        // audit report — a secret-bearing search_key/expected/actual value
+        // must never reach them, the same reason the gitleaks auditor runs
+        // with --redact.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            return Task.FromResult(new SandboxExecResult(0, JsonWithSecretEcho, ""));
+        });
+
+        IAuditor auditor = new KicsAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("infra/db.tf:9", finding.Location);
+        Assert.Contains("similarity_id", finding.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("hunter2-plaintext", finding.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("hunter2-plaintext", finding.Title, StringComparison.Ordinal);
+        Assert.DoesNotContain("search_key", finding.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("actual_value", finding.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("expected_value", finding.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ScanRootProbe_EmptyOutput_IsInfrastructureFailure()
+    {
+        // A pwd probe that exits 0 but prints nothing used to degrade to a
+        // null scan root — absolute paths then survived normalization and
+        // the vendored-path exclusions silently stopped matching.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPwdProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec))
+                return Task.FromResult(Ok(exec));
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new KicsAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("scan root", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("kics.config")]
+    [InlineData("./config/kics.json")]
+    [InlineData("/work/kics.config")]
+    [InlineData("/work/sub/kics.json")]
+    [InlineData("/work/../work/nested.json")]
+    public async Task InTreeConfigFile_IsRejectedDeterministically(string configFile)
+    {
+        // A config inside the audited tree lets the diff author bind flags
+        // absent from argv (exclude-queries, exclude-severities) and empty
+        // the report — rejected before the scan ever runs.
+        var scanExecs = 0;
+        var prepExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsPrepProbe(exec))
+            {
+                prepExecs++;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new KicsAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigFile"] = configFile,
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("ConfigFile", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, prepExecs);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task DefaultExcludePaths_FiltersVendoredFindings()
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
@@ -632,8 +763,13 @@ public sealed class KicsAuditorTests
                 sandbox, "/work", FakeContext(), CancellationToken.None);
 
             Assert.False(result.Passed);
+            // The deliverable: a real scan over a fixture with a known IaC
+            // issue produces a finding carrying its rule id and location.
             Assert.Contains(result.Findings,
-                f => f.Location != null && f.Location.EndsWith(".tf", StringComparison.Ordinal));
+                f => f.Location != null
+                    && f.Location.EndsWith(".tf", StringComparison.Ordinal)
+                    && f.Description.Contains("Rule: ", StringComparison.Ordinal)
+                    && !f.Description.Contains("Rule: (none)", StringComparison.Ordinal));
             Assert.All(result.Findings, f => Assert.Equal("codeybox:kics", f.AuditorName));
         }
         finally
@@ -775,12 +911,14 @@ public sealed class KicsAuditorTests
             };
             psi.ArgumentList.Add("version");
             using var process = Process.Start(psi)!;
+            var stderr = process.StandardError.ReadToEndAsync();
             var stdout = process.StandardOutput.ReadToEnd();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
+            stderr.GetAwaiter().GetResult();
             var match = Regex.Match(stdout, @"\d+\.\d+\.\d+[\w.\-]*");
             return process.ExitCode == 0 && match.Success ? match.Value : null;
         }

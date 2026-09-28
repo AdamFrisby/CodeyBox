@@ -19,19 +19,21 @@ namespace CodeyBox.CodeqlAuditorPlugin;
 /// directly: <c>codeql database create</c> first extracts the source root
 /// into a relational database, then <c>codeql database analyze</c> runs the
 /// queries and emits SARIF. The base builds the scan argv before any probe
-/// runs, so the database path is agreed through an <see
-/// cref="AsyncLocal{T}"/> handoff: <see
+/// runs, so the database path is agreed through the shared per-run
+/// directory seam: <see
 /// cref="BuildToolArguments(ExternalToolAuditorOptions)"/> mints a fresh
-/// per-run directory under the system temp area, and <see
+/// per-run path with <see
+/// cref="ExternalToolAuditorBase.MintPerRunTempDirectoryPath"/>, and <see
 /// cref="VerifyToolAsync(ISandbox, string, string, ExternalToolAuditorOptions, CancellationToken)"/>
-/// creates the database there through the base's bounded exec helper (same
-/// timeout bounding and failure classification as the scan — not a
-/// hand-rolled invocation). The <c>AsyncLocal</c> (not a field) is load
-/// bearing: auditor instances are DI singletons shared across concurrent
-/// audits, so per-run state must flow with the invocation, not sit on the
-/// instance. Databases live outside the audited worktree so the scan never
-/// pollutes the diff or trips sibling auditors; they are per-run
-/// GUID-suffixed directories the sandbox discards with its temp area.</para>
+/// recovers it via <see cref="ExternalToolAuditorBase.PerRunTempDirectoryPath"/>
+/// to create the database there through the base's bounded exec helper
+/// (same timeout bounding and failure classification as the scan — not a
+/// hand-rolled invocation). The seam carries the path with the invocation —
+/// not on the instance — because auditor instances are DI singletons shared
+/// across concurrent audits. Databases live outside the audited worktree so
+/// the scan never pollutes the diff or trips sibling auditors; they are
+/// per-run GUID-suffixed directories the sandbox discards with its temp
+/// area.</para>
 ///
 /// <para><b>Gate behaviour: hybrid / severity-driven — not blocking on every
 /// finding.</b> CodeQL query severities go through a declared map, never
@@ -141,12 +143,6 @@ public sealed class CodeqlAuditor : ExternalToolAuditorBase, IPluginInitializer
         ExcludePaths = ["vendor/", "third_party/", "node_modules/"],
     };
 
-    // Per-run database root, minted in BuildToolArguments (which the base
-    // invokes before VerifyToolAsync) and consumed in VerifyToolAsync and the
-    // scan argv. AsyncLocal — not a field — because auditor instances are
-    // shared singletons: concurrent audits must not see each other's paths.
-    private readonly AsyncLocal<string?> _databaseRoot = new();
-
     private Func<ExternalToolAuditorOptions> _optionsAccessor = () => AuditorDefaults;
     private Func<string?> _expectedVersion = static () => DefaultExpectedVersion;
     private Func<string?> _language = static () => DefaultLanguage;
@@ -191,13 +187,13 @@ public sealed class CodeqlAuditor : ExternalToolAuditorBase, IPluginInitializer
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
         // Minted here — not in VerifyToolAsync — because the base builds the
-        // scan argv before running any probe. VerifyToolAsync consumes this
-        // same path to create the database the scan analyzes; the argv below
-        // already carries it. The leaf itself is the database: `database
-        // create` requires the parent to exist, and the system temp directory
-        // always does, so no setup step is needed.
-        var root = Path.Combine(Path.GetTempPath(), DatabaseDirectoryPrefix + Guid.NewGuid().ToString("N"));
-        _databaseRoot.Value = root;
+        // scan argv before running any probe. VerifyToolAsync recovers this
+        // same path via PerRunTempDirectoryPath to create the database the
+        // scan analyzes; the argv below already carries it. The leaf itself
+        // is the database: `database create` requires the parent to exist,
+        // and the system temp directory always does, so no setup step is
+        // needed.
+        var root = MintPerRunTempDirectoryPath(DatabaseDirectoryPrefix);
 
         var args = new List<string>
         {
@@ -253,12 +249,7 @@ public sealed class CodeqlAuditor : ExternalToolAuditorBase, IPluginInitializer
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        var root = _databaseRoot.Value;
-        if (string.IsNullOrWhiteSpace(root))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' database path was not initialized for this run.")
-            { IsDeterministic = true };
-
+        var root = PerRunTempDirectoryPath;
         var language = ResolveLanguage(tool, _language());
         var result = await ExecToolBoundedAsync(
             sandbox,
