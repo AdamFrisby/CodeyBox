@@ -59,6 +59,7 @@
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.GrypeAuditorPlugin\CodeyBox.GrypeAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-documentation\CodeyBox.LycheeAuditorPlugin\CodeyBox.LycheeAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.KubeconformAuditorPlugin\CodeyBox.KubeconformAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.HadolintAuditorPlugin\CodeyBox.HadolintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ClangTidyAuditorPlugin\CodeyBox.ClangTidyAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ExampleSarifAuditorPlugin\CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.EslintAuditorPlugin\CodeyBox.EslintAuditorPlugin.csproj" />
