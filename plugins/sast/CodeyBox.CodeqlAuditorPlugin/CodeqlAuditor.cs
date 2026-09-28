@@ -18,15 +18,13 @@ namespace CodeyBox.CodeqlAuditorPlugin;
 /// <para><b>Two phases, one verdict.</b> CodeQL cannot analyze source
 /// directly: <c>codeql database create</c> first extracts the source root
 /// into a relational database, then <c>codeql database analyze</c> runs the
-/// queries and emits SARIF. The base builds the scan argv before any probe
-/// runs, so the database path is agreed through the shared per-run
-/// directory seam: <see
-/// cref="BuildToolArguments(ExternalToolAuditorOptions)"/> mints a fresh
-/// per-run path with <see
-/// cref="ExternalToolAuditorBase.MintPerRunTempDirectoryPath"/>, and <see
+/// queries and emits SARIF. The base mints a fresh per-run scratch directory
+/// before the scan argv is built, so the database path is agreed through
+/// <see cref="ExternalToolAuditorBase.PerRunTempDirectoryPath"/>: <see
+/// cref="BuildToolArguments(ExternalToolAuditorOptions)"/> names it in argv
+/// and <see
 /// cref="VerifyToolAsync(ISandbox, string, string, ExternalToolAuditorOptions, CancellationToken)"/>
-/// recovers it via <see cref="ExternalToolAuditorBase.PerRunTempDirectoryPath"/>
-/// to create the database there through the base's bounded exec helper
+/// creates the database there through the base's bounded exec helper
 /// (same timeout bounding and failure classification as the scan — not a
 /// hand-rolled invocation). The seam carries the path with the invocation —
 /// not on the instance — because auditor instances are DI singletons shared
@@ -124,8 +122,6 @@ public sealed class CodeqlAuditor : ExternalToolAuditorBase, IPluginInitializer
         "swift",
     };
 
-    private const string DatabaseDirectoryPrefix = "codeybox-codeql-";
-
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
     {
         // codeql database analyze exits 0 whenever the analysis completes —
@@ -186,14 +182,12 @@ public sealed class CodeqlAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolArguments(ExternalToolAuditorOptions options)
     {
-        // Minted here — not in VerifyToolAsync — because the base builds the
-        // scan argv before running any probe. VerifyToolAsync recovers this
-        // same path via PerRunTempDirectoryPath to create the database the
-        // scan analyzes; the argv below already carries it. The leaf itself
-        // is the database: `database create` requires the parent to exist,
-        // and the system temp directory always does, so no setup step is
-        // needed.
-        var root = MintPerRunTempDirectoryPath(DatabaseDirectoryPrefix);
+        // The base mints the per-run scratch directory before argv is built;
+        // VerifyToolAsync recovers the same path via PerRunTempDirectoryPath
+        // to create the database the scan analyzes. The leaf itself is the
+        // database: `database create` requires the parent to exist, and the
+        // system temp directory always does, so no setup step is needed.
+        var root = PerRunTempDirectoryPath;
 
         var args = new List<string>
         {

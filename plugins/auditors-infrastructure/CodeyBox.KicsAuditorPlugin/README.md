@@ -56,13 +56,18 @@ rest of KICS's supported platforms — as audit findings.
 ## Report routing
 
 KICS cannot stream its report: `--report-formats` always writes files under
-`--output-path` (the output name is basename-sanitised, so `/dev/stdout`
-cannot be named directly). Before the scan, the auditor creates a fresh
-per-run directory under the sandbox temp area containing a
-`results.json` → `/dev/stdout` symlink, and points `--output-path` at it.
-KICS's report open follows the symlink and the JSON report lands on captured
-stdout, where the shared parser reads it. `--silent` is load-bearing — it
-suppresses KICS's console output, so stdout carries only the report.
+`--output-path`, and console output is a human-readable table, not machine
+output. The report is also **secret-bearing** — the "Passwords And Secrets"
+queries embed the matched literal secret in per-file fields — so it is
+deliberately kept off the captured scan streams: those bytes persist as
+`AuditResult.RawOutput`, tail into failure messages, and ship in webhook
+payloads. Instead the scan writes `results.json` as a plain file inside a
+per-run directory under the sandbox temp area, and after a
+findings-producing exit the auditor reads it back through a separate bounded
+`cat` exec — the report reaches only the parser. `--silent` stays pinned so
+KICS's console table (which echoes affected source lines) does not leak the
+same content onto captured stdout. A missing, oversized, or unparseable
+report fails closed as infrastructure — never a pass.
 
 The per-run directory is minted under the sandbox temp area and is not
 explicitly removed: VM sandboxes discard the whole temp area with the
@@ -127,11 +132,13 @@ the report. The auditor therefore always passes `--config`: a generated
 empty JSON file by default, or your `ConfigFile` path. KICS's bind order
 only applies config values to flags absent from argv, so the pipeline flags
 (`--output-path`, `--silent`, `--ignore-on-exit`, …) cannot be turned by a
-config file — but query selection still binds, so `ConfigFile` must be an
-absolute path that resolves **outside** the audited worktree. A relative
-path (KICS resolves it against the scan cwd — the worktree) or an absolute
-path inside the tree is rejected as a deterministic configuration failure
-before the scan runs.
+config file — but query selection still binds, so `ConfigFile` must resolve
+**outside** the audited worktree. Before the scan, the auditor canonicalizes
+the configured path and the scan cwd in the sandbox with `realpath -m` and
+rejects the run as a deterministic configuration failure when the canonical
+path lands inside the tree — relative paths (KICS resolves them against its
+cwd — the worktree), `..` segments, and symlinked components all collapse to
+the path KICS would actually open.
 
 `KICS_*` environment variables can also set un-passed flags; they come from
 the sandbox baseline (operator-controlled), not from the audited tree.
@@ -178,7 +185,7 @@ Scoped under `CodeyBox:Plugins:codeybox.kics`, resolved per run
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Post-scan filter; setting it replaces the default list. |
 | `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Reserved flags are rejected deterministically: `--output-path`/`-o`, `--output-name`, `--report-formats`, `--config`, `--ignore-on-exit`, `--silent`/`-s`, `--ci`, `--verbose`/`-v`, `--path`/`-p` — use the scoped keys instead. Everything else (e.g. `--exclude-queries`, `-e`/`--exclude-paths`, `--fail-on`, `--queries-path`) passes through to KICS. |
 | `TimeoutSeconds` | `600` | Per-run bound; exceeding it is infrastructure, not a pass. |
-| `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps. The report rides stdout, so a report larger than the stream cap is truncated — the parse fails closed as infrastructure; raise the cap for very large trees. |
+| `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps. The report file read shares the stream cap, so a report larger than it fails closed as deterministic infrastructure; raise the cap or narrow the scan for very large trees. |
 
 ## Default scope
 

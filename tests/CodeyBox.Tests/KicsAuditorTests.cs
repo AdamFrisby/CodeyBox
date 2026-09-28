@@ -16,16 +16,19 @@ namespace CodeyBox.Tests;
 /// - Completed scans exit 0 under the pinned --ignore-on-exit results; the semantic result
 ///   exits 20/30/40/50/60 are also findings-producing; engine failures (126), interrupts (130),
 ///   and every other exit are infrastructure.
-/// - The JSON report (routed onto stdout via the prepared /dev/stdout symlink) maps to findings
-///   with the query UUID as rule id and file/line locations.
-/// - Tool severities are mapped through the declared mapping (never passed through); an empty or
-///   unparseable report fails closed as infrastructure even on a findings-producing exit.
+/// - The JSON report (a real file under the per-run directory, fetched through a separate
+///   bounded read — never the captured scan streams) maps to findings with the query UUID
+///   as rule id and file/line locations.
+/// - Tool severities are mapped through the declared mapping (never passed through); an empty,
+///   missing, oversized, or unparseable report fails closed as infrastructure even on a
+///   findings-producing exit.
 /// - Secret-bearing report fields (search_key/expected_value/actual_value) never reach finding
-///   text; an empty scan-root probe and an in-worktree ConfigFile fail closed.
+///   text, and the report bytes never reach RawOutput; an empty scan-root probe and an
+///   in-worktree ConfigFile (including via canonicalized resolution) fail closed.
 /// - Reserved ExtraArguments flags are rejected deterministically.
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_kics", "true")] exercise the
-///   report-symlink plumbing end to end; they need the binary plus its bundled assets/.
+///   report-file plumbing end to end; they need the binary plus its bundled assets/.
 /// </summary>
 public sealed class KicsAuditorTests
 {
@@ -173,8 +176,9 @@ public sealed class KicsAuditorTests
                 return Task.FromResult(new SandboxExecResult(1, "", ""));
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(127, "", "kics: command not found"));
-            scanExecs++;
-            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
         });
 
         IAuditor auditor = new KicsAuditor();
@@ -195,8 +199,9 @@ public sealed class KicsAuditorTests
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(126, "", "engine exploded"));
-            scanExecs++;
-            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
         });
 
         IAuditor auditor = new KicsAuditor();
@@ -219,8 +224,9 @@ public sealed class KicsAuditorTests
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(
                     0, "Keeping Infrastructure as Code Secure 2.1.0\n", ""));
-            scanExecs++;
-            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
         });
 
         IAuditor auditor = new KicsAuditor();
@@ -241,8 +247,9 @@ public sealed class KicsAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
-            scanExecs++;
-            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
         });
 
         var auditor = new KicsAuditor();
@@ -274,7 +281,12 @@ public sealed class KicsAuditorTests
                 prepExecs++;
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
-            scanExec = exec;
+            if (IsScanExec(exec))
+            {
+                scanExec = exec;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            // The report file read, not the scan, yields the JSON report.
             return Task.FromResult(new SandboxExecResult(0, JsonWithFindings, ""));
         });
 
@@ -329,6 +341,8 @@ public sealed class KicsAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -353,7 +367,9 @@ public sealed class KicsAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
-            return Task.FromResult(new SandboxExecResult(exitCode, JsonWithFindings, ""));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(exitCode, "", ""));
+            return Task.FromResult(new SandboxExecResult(0, JsonWithFindings, ""));
         });
 
         IAuditor auditor = new KicsAuditor();
@@ -368,10 +384,16 @@ public sealed class KicsAuditorTests
     [InlineData(130)]
     public async Task CouldNotRunExits_AreInfrastructureFailure(int exitCode)
     {
+        var reportReads = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsReportRead(exec))
+            {
+                reportReads++;
+                return Task.FromResult(new SandboxExecResult(0, JsonWithFindings, ""));
+            }
             return Task.FromResult(new SandboxExecResult(exitCode, "", "engine error"));
         });
 
@@ -380,6 +402,9 @@ public sealed class KicsAuditorTests
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains("kics", ex.Message, StringComparison.Ordinal);
+        // A failed scan never reaches the report read — its bytes cannot
+        // leak into the failure message even if a partial report exists.
+        Assert.Equal(0, reportReads);
         // 126 is KICS's EngineErrorCode; the shared base also treats 126/127
         // as cannot-execute, so only the generic exits carry "exit N" text.
         if (exitCode == 126)
@@ -389,11 +414,34 @@ public sealed class KicsAuditorTests
     }
 
     [Fact]
-    public async Task FindingsProducingExit_WithoutReport_IsInfrastructureFailure()
+    public async Task FindingsProducingExit_WithoutReportFile_IsInfrastructureFailure()
     {
-        // A completed-scan exit code but no parseable report on stdout means
-        // the sink never produced — "could not confirm results" is
-        // infrastructure, never a clean pass.
+        // A completed-scan exit code but no readable report file means the
+        // scan did not produce its deliverable — "could not confirm results"
+        // is infrastructure, never a clean pass.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            return Task.FromResult(new SandboxExecResult(
+                1, "", "cat: results.json: No such file or directory"));
+        });
+
+        IAuditor auditor = new KicsAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("kics", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("report", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FindingsProducingExit_WithEmptyReport_IsInfrastructureFailure()
+    {
+        // A readable but empty report file is not a report — parse failure
+        // fails closed as infrastructure, never a clean pass.
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
@@ -410,6 +458,56 @@ public sealed class KicsAuditorTests
     }
 
     [Fact]
+    public async Task FindingsProducingExit_WithOversizedReport_IsDeterministicInfrastructure()
+    {
+        // A report past the capture bound cannot be parsed — it is
+        // deterministic infrastructure, not a truncated guess.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            return Task.FromResult(new SandboxExecResult(
+                0, "{ \"truncated", "", StdoutLimitExceeded: true));
+        });
+
+        IAuditor auditor = new KicsAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("capture bound", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SecretBearingReportBytes_NeverReachRawOutput()
+    {
+        // The KICS report embeds matched literal secrets — it is fetched
+        // through a bounded file read into the parser only, so the persisted
+        // RawOutput (audit-report store, API raw endpoint, webhook failure
+        // payloads) carries none of it.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            return Task.FromResult(new SandboxExecResult(0, JsonWithSecretEcho, ""));
+        });
+
+        IAuditor auditor = new KicsAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("infra/db.tf:9", finding.Location);
+        Assert.DoesNotContain("hunter2-plaintext", finding.Description, StringComparison.Ordinal);
+        Assert.DoesNotContain("hunter2-plaintext", result.RawOutput, StringComparison.Ordinal);
+        Assert.DoesNotContain("search_key", result.RawOutput, StringComparison.Ordinal);
+        Assert.DoesNotContain("kics_version", result.RawOutput, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ReportPreparationFailure_IsInfrastructureFailure_NamingKics()
     {
         var scanExecs = 0;
@@ -419,7 +517,8 @@ public sealed class KicsAuditorTests
                 return Task.FromResult(Ok(exec));
             if (IsPrepProbe(exec))
                 return Task.FromResult(new SandboxExecResult(1, "", "mkdir: cannot create directory"));
-            scanExecs++;
+            if (IsScanExec(exec))
+                scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -439,6 +538,8 @@ public sealed class KicsAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(0, JsonWithSeverities, ""));
         });
 
@@ -467,6 +568,8 @@ public sealed class KicsAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(0, JsonIncompleteScan, ""));
         });
 
@@ -492,6 +595,8 @@ public sealed class KicsAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(0, JsonWithSecretEcho, ""));
         });
 
@@ -520,6 +625,8 @@ public sealed class KicsAuditorTests
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -538,13 +645,17 @@ public sealed class KicsAuditorTests
     [InlineData("/work/../work/nested.json")]
     public async Task InTreeConfigFile_IsRejectedDeterministically(string configFile)
     {
-        // A config inside the audited tree lets the diff author bind flags
-        // absent from argv (exclude-queries, exclude-severities) and empty
-        // the report — rejected before the scan ever runs.
+        // A config resolving inside the audited tree — whether spelled
+        // relative, absolute, or through dot segments — lets the diff author
+        // bind flags absent from argv (exclude-queries, exclude-severities)
+        // and empty the report: rejected on canonicalization, before the
+        // scan ever runs.
         var scanExecs = 0;
         var prepExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
+            if (IsConfigProbe(exec))
+                return Task.FromResult(RealpathOk(exec));
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsPrepProbe(exec))
@@ -552,7 +663,8 @@ public sealed class KicsAuditorTests
                 prepExecs++;
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
-            scanExecs++;
+            if (IsScanExec(exec))
+                scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -574,12 +686,48 @@ public sealed class KicsAuditorTests
     }
 
     [Fact]
+    public async Task InTreeConfigFile_ViaSymlinkedResolution_IsRejectedDeterministically()
+    {
+        // The configured path is lexically OUTSIDE the tree, but realpath -m
+        // in the sandbox resolves a symlinked component into it — a
+        // lexical-only check would wave this through, letting repo-controlled
+        // config bind un-passed flags.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsConfigProbe(exec))
+                return Task.FromResult(RealpathOk(exec, _ => "/work/policy-link.json"));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new KicsAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigFile"] = "/opt/kics-policy/link.json",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("ConfigFile", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("/work/policy-link.json", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task DefaultExcludePaths_FiltersVendoredFindings()
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(0, JsonWithFilteredPaths, ""));
         });
 
@@ -596,9 +744,15 @@ public sealed class KicsAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
+            if (IsConfigProbe(exec))
+                return Task.FromResult(RealpathOk(exec));
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
-            scanExec = exec;
+            if (IsScanExec(exec))
+            {
+                scanExec = exec;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -608,7 +762,9 @@ public sealed class KicsAuditorTests
             {
                 ["Scoped:Targets"] = "infra/, deploy/main.tf",
                 ["Scoped:Platforms"] = "terraform, k8s",
-                ["Scoped:ConfigFile"] = "/opt/kics-policy/config.json",
+                // Dot segments canonicalize to the same out-of-tree path —
+                // argv carries the canonical spelling realpath returned.
+                ["Scoped:ConfigFile"] = "/opt/../opt/kics-policy/config.json",
             }),
             CancellationToken.None);
 
@@ -650,7 +806,8 @@ public sealed class KicsAuditorTests
         {
             if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPrepProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
-            scanExecs++;
+            if (IsScanExec(exec))
+                scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
         });
 
@@ -857,17 +1014,62 @@ public sealed class KicsAuditorTests
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "kics" && exec.Argv[1] == "version";
 
+    private static bool IsScanExec(SandboxExec exec)
+        => exec.Argv.Count >= 2 && exec.Argv[0] == "kics" && exec.Argv[1] == "scan";
+
+    // The report directory prep: sh -c <script> sh <dir>, where the script
+    // writes the generated empty --config file.
     private static bool IsPrepProbe(SandboxExec exec)
         => exec.Argv.Count >= 4
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"
-            && exec.Argv[2].Contains("ln -sfn", StringComparison.Ordinal);
+            && exec.Argv[2].Contains("codeybox-empty-kics.config.json", StringComparison.Ordinal);
 
     private static bool IsPwdProbe(SandboxExec exec)
         => exec.Argv.Count == 4
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"
             && exec.Argv[2] == "pwd";
+
+    // The config-file canonicalization probe: realpath -m -- <configured> .
+    private static bool IsConfigProbe(SandboxExec exec)
+        => exec.Argv.Count >= 4
+            && exec.Argv[0] == "/usr/bin/realpath"
+            && exec.Argv[1] == "-m";
+
+    // The post-scan bounded report fetch: cat <dir>/results.json.
+    private static bool IsReportRead(SandboxExec exec)
+        => exec.Argv.Count == 2 && exec.Argv[0] == "cat";
+
+    // Emulates the realpath probe: canonicalizes the configured path like
+    // realpath -m (relative input resolved against the /work cwd, dot
+    // segments collapsed) — or via the supplied override for simulated
+    // symlink targets — then echoes it plus the canonical cwd, one per line.
+    private static SandboxExecResult RealpathOk(SandboxExec exec, Func<string, string>? canonicalize = null)
+    {
+        var configured = exec.Argv[3];
+        var canonical = canonicalize?.Invoke(configured) ?? FakeRealpathM(configured);
+        return new SandboxExecResult(0, canonical + "\n/work\n", "");
+    }
+
+    private static string FakeRealpathM(string path)
+    {
+        var combined = path.StartsWith("/", StringComparison.Ordinal) ? path : "/work/" + path;
+        var segments = new List<string>();
+        foreach (var segment in combined.Split('/'))
+        {
+            if (segment.Length == 0 || segment == ".")
+                continue;
+            if (segment == "..")
+            {
+                if (segments.Count > 0)
+                    segments.RemoveAt(segments.Count - 1);
+                continue;
+            }
+            segments.Add(segment);
+        }
+        return "/" + string.Join('/', segments);
+    }
 
     private static async Task<string> SeedKicsFixtureRepoAsync(bool misconfigured)
     {

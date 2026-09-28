@@ -7,7 +7,8 @@ namespace CodeyBox.KicsAuditorPlugin;
 
 /// <summary>
 /// Parser for the KICS native JSON report (<c>--report-formats json</c>),
-/// which the auditor routes onto stdout (see <see cref="KicsAuditor"/>). One
+/// delivered as the parser input's stdout slot by the auditor's bounded
+/// report-file read (see <see cref="KicsAuditor"/>). One
 /// finding is emitted per (query, file) pair — KICS groups affected files
 /// under each query — carrying the tool's native severity token
 /// (<c>CRITICAL</c>/<c>HIGH</c>/<c>MEDIUM</c>/<c>LOW</c>/<c>INFO</c>/<c>TRACE</c>)
@@ -19,14 +20,16 @@ namespace CodeyBox.KicsAuditorPlugin;
 /// execute surface as a synthetic <c>kics/incomplete-scan</c> warning finding:
 /// partial coverage must not pass silently.
 ///
-/// <para><b>Secret redaction.</b> Per-file <c>search_key</c>,
+/// <para><b>Secret hygiene.</b> Per-file <c>search_key</c>,
 /// <c>expected_value</c>, and <c>actual_value</c> are deliberately NOT copied
 /// into findings: for KICS's "Passwords And Secrets" queries those fields
 /// carry the matched source snippet — the literal committed secret — and
 /// findings flow to the rework prompt, outbound webhooks, and the persisted
 /// audit report. Only non-value metadata (platform, category, issue_type,
-/// the similarity-id hash) is attached. The raw report still reaches
-/// <c>AuditResult.RawOutput</c>, which the pipeline redacts separately.</para>
+/// the similarity-id hash) is attached. The report bytes themselves never
+/// reach <c>AuditResult.RawOutput</c> either — the auditor fetches them
+/// through a separate bounded read that feeds only this parser, not the
+/// captured scan streams the pipeline persists.</para>
 /// </summary>
 internal sealed class KicsJsonReportParser : IExternalToolOutputParser
 {
@@ -53,7 +56,7 @@ internal sealed class KicsJsonReportParser : IExternalToolOutputParser
         ArgumentNullException.ThrowIfNull(input);
         if (string.IsNullOrWhiteSpace(input.Stdout))
             throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced no report output on stdout.");
+                $"Tool '{input.ToolName}' produced no report output.");
 
         JsonDocument document;
         try
@@ -136,11 +139,16 @@ internal sealed class KicsJsonReportParser : IExternalToolOutputParser
     private static string ComposeMessage(JsonElement query, JsonElement file, string? queryName)
     {
         var builder = new StringBuilder();
-        builder.Append(string.IsNullOrWhiteSpace(queryName) ? "KICS finding" : queryName.Trim());
+        // query_name and issue_type are report-controlled text like every
+        // other field — they get the same single-line truncation bound so a
+        // malformed report cannot inflate a finding's message unboundedly.
+        builder.Append(string.IsNullOrWhiteSpace(queryName)
+            ? "KICS finding"
+            : Truncate(SingleLine(queryName.Trim()), MessageDetailMaxChars));
 
         var issueType = GetString(file, "issue_type"u8);
         if (!string.IsNullOrWhiteSpace(issueType))
-            builder.Append(" (").Append(issueType.Trim()).Append(')');
+            builder.Append(" (").Append(Truncate(SingleLine(issueType.Trim()), MessageDetailMaxChars)).Append(')');
 
         var description = GetString(query, "description"u8);
         if (!string.IsNullOrWhiteSpace(description))
@@ -214,18 +222,17 @@ internal sealed class KicsJsonReportParser : IExternalToolOutputParser
     }
 
     private static int ReadCounter(JsonElement root, ReadOnlySpan<byte> name)
-        => root.TryGetProperty(name, out var value)
-            && value.ValueKind == JsonValueKind.Number
-            && value.TryGetInt32(out var parsed)
-            && parsed > 0
-                ? parsed
-                : 0;
+        => TryReadPositiveInt(root, name, out var parsed) ? parsed : 0;
 
     private static int? ReadPositiveInt(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value)
-            && value.ValueKind == JsonValueKind.Number
-            && value.TryGetInt32(out var parsed)
-            && parsed > 0
-                ? parsed
-                : null;
+        => TryReadPositiveInt(element, name, out var parsed) ? parsed : null;
+
+    private static bool TryReadPositiveInt(JsonElement element, ReadOnlySpan<byte> name, out int value)
+    {
+        value = 0;
+        return element.TryGetProperty(name, out var property)
+            && property.ValueKind == JsonValueKind.Number
+            && property.TryGetInt32(out value)
+            && value > 0;
+    }
 }

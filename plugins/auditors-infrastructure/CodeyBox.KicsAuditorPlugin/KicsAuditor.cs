@@ -28,22 +28,22 @@ namespace CodeyBox.KicsAuditorPlugin;
 /// <c>ExcludePaths</c>.</para>
 ///
 /// <para><b>Report routing.</b> KICS cannot stream its report: the report
-/// writers always create a real file under <c>--output-path</c> (the output
-/// name is basename-sanitised upstream, so <c>/dev/stdout</c> cannot be
-/// named), and console output is a human-readable table, not machine output.
-/// The shared base feeds the parser from the scan's stdout, so this auditor
-/// routes the report there: <see cref="VerifyToolAsync"/> prepares a fresh
-/// per-run output directory under the sandbox temp area whose
-/// <c>results.json</c> is a symlink to <c>/dev/stdout</c>, and the scan argv
-/// points <c>--output-path</c> at that directory. KICS's
-/// <c>os.OpenFile(path, O_WRONLY|O_CREATE|O_TRUNC)</c> follows the symlink and
-/// the report lands on captured stdout (the same open flags the shell's
-/// <c>&gt; /dev/stdout</c> redirection uses on a pipe — the truncate flag is a
-/// no-op on non-regular files). <c>--silent</c> is load-bearing: under it
-/// KICS nils out its <c>os.Stdout</c> and discards its logger, so the report
-/// bytes are the only thing on fd 1 — without it the console table would
-/// corrupt the JSON. An empty or unparseable stdout therefore means "no
-/// report was produced" and fails closed as infrastructure.</para>
+/// writers always create a real file under <c>--output-path</c>, and console
+/// output is a human-readable table, not machine output. The report is also
+/// secret-bearing — KICS's "Passwords And Secrets" queries embed the matched
+/// literal secret in per-file <c>search_key</c>/<c>expected_value</c>/
+/// <c>actual_value</c> fields — so it deliberately never rides the captured
+/// scan streams: those bytes persist as <see cref="AuditResult.RawOutput"/>,
+/// tail into unavailability messages, and ship in webhook payloads. Instead
+/// the scan writes <c>results.json</c> as a plain file inside the per-run
+/// scratch directory (<see cref="ExternalToolAuditorBase.PerRunTempDirectoryPath"/>),
+/// and <see cref="ResolveParserInputAsync(ISandbox, string, string, ExternalToolAuditorOptions, SandboxExecResult, string?, CancellationToken)"/>
+/// reads it back through the separate bounded read the base's parser-input
+/// seam exists for — the report reaches only the parser. <c>--silent</c>
+/// stays pinned so KICS's console table (which echoes affected source
+/// lines) does not leak the same content onto captured stdout. A missing,
+/// oversized, or unparseable report file fails closed as infrastructure —
+/// never a pass.</para>
 ///
 /// <para><b>Exit-code convention (verified against KICS v2.x source).</b>
 /// KICS does NOT follow the common "1 = findings" convention: completed scans
@@ -69,10 +69,14 @@ namespace CodeyBox.KicsAuditorPlugin;
 /// <c>ConfigFile</c> when configured. Only flags absent from argv bind from
 /// that file, so even an operator-chosen config cannot redirect the report
 /// sink or undo the pinned flags — but it can select queries, so a
-/// <c>ConfigFile</c> resolving inside the audited worktree (including any
-/// relative path, which KICS resolves against its cwd) is rejected as a
+/// <c>ConfigFile</c> resolving inside the audited worktree is rejected as a
 /// deterministic configuration failure: the audit subject must not
-/// influence query selection.</para>
+/// influence query selection. The check is resolved once per run inside
+/// <see cref="ResolveContextArgumentsAsync(ISandbox, string, AuditContext, ExternalToolAuditorOptions, CancellationToken)"/>
+/// — the same value that reaches argv — and both the configured path and the
+/// scan cwd are canonicalized in the sandbox with <c>realpath -m</c> before
+/// containment, so a relative path, a <c>..</c> segment, or a symlinked
+/// component cannot smuggle an in-tree file past the guard.</para>
 ///
 /// <para><b>Version pin.</b> KICS's query corpus changes between releases, so
 /// findings are only meaningful from the build the auditor was verified
@@ -145,20 +149,26 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// </summary>
     public const string PlatformsKey = "Platforms";
 
-    private const string ReportDirectoryPrefix = "codeybox-kics-";
     private const string ReportFileBaseName = "results";
+    private const string ReportFileName = ReportFileBaseName + ".json";
     private const string EmptyConfigFileName = "codeybox-empty-kics.config.json";
 
     // Fixed script — no configuration-derived text: the per-run directory
-    // arrives as $1, never spliced into the script. Creates the report dir,
-    // the empty config that holds the --config flag, and the results.json ->
-    // /dev/stdout symlink the report is routed through (ln -f unlinks any
-    // leftover destination itself).
+    // arrives as $1, never spliced into the script. Creates the report dir
+    // and the generated empty config that holds the --config flag; the
+    // report itself stays a plain file the auditor reads back after the
+    // scan (see the class docstring's Report routing paragraph).
     private const string ReportPreparationScript =
         "d=\"$1\""
         + " && mkdir -p \"$d\""
-        + " && printf '%s\\n' '{}' > \"$d/" + EmptyConfigFileName + "\""
-        + " && ln -sfn /dev/stdout \"$d/" + ReportFileBaseName + ".json\"";
+        + " && printf '%s\\n' '{}' > \"$d/" + EmptyConfigFileName + "\"";
+
+    // The config-file containment probe canonicalizes both the configured
+    // path and the scan cwd in the sandbox's own path space with realpath -m
+    // (which resolves symlink components and collapses dot segments without
+    // requiring the leaf to exist) — a lexical GetFullPath check on the host
+    // would be fooled by a symlinked path that resolves inside the worktree.
+    private const string ConfigCanonicalizationBinary = "/usr/bin/realpath";
 
     // Flags whose presence in ExtraArguments would redirect the report sink,
     // reopen the repository-controlled config surface, fight --silent, or
@@ -249,19 +259,20 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
     {
         RejectReservedExtraArguments(options);
 
-        // Minted here — not in VerifyToolAsync — because the base builds the
-        // scan argv before running the precondition hook. VerifyToolAsync
-        // recovers this same path via PerRunTempDirectoryPath to prepare the
-        // report sink the argv below names. The directory lives outside the
-        // audited worktree so the scan never pollutes the diff.
-        var reportDir = MintPerRunTempDirectoryPath(ReportDirectoryPrefix);
+        // The base mints the per-run scratch directory before argv is built;
+        // VerifyToolAsync prepares the report directory the argv names. The
+        // directory lives outside the audited worktree so the scan never
+        // pollutes the diff.
+        var reportDir = PerRunTempDirectoryPath;
 
         var args = new List<string>
         {
             "scan",
             // KICS writes its report only to files under --output-path; the
-            // prepared directory routes <base>.json onto stdout via a
-            // /dev/stdout symlink (see the class docstring).
+            // prepared directory keeps <base>.json a plain file the auditor
+            // reads back through the parser-input seam (see the class
+            // docstring — the report is secret-bearing and never rides the
+            // captured scan streams).
             "--output-path", reportDir,
             "--output-name", ReportFileBaseName,
             "--report-formats", "json",
@@ -270,21 +281,13 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
             // computes its semantic result code, so suppressing the result
             // exit loses nothing and collapses the convention to "0 = ran".
             "--ignore-on-exit", "results",
-            // Without --silent KICS prints its banner and results table to
-            // stdout, corrupting the report bytes the parser reads.
+            // --silent is secret hygiene, not cosmetics: without it KICS
+            // prints a results table echoing affected source lines — the same
+            // content the file-fetch design keeps out of captured output.
             "--silent",
             "--no-progress",
             "--no-color",
         };
-
-        // Always set --config: with a single -p target KICS would otherwise
-        // auto-load a kics.config sitting in the audited repository, letting
-        // the diff author inject flag values (query exclusions, severity
-        // filters). The generated empty file binds nothing; an operator's
-        // ConfigFile binds only flags absent from this argv.
-        args.Add("--config");
-        var configFile = ValidatedScopedValue(_configFile(), ConfigFileKey);
-        args.Add(configFile ?? Path.Combine(reportDir, EmptyConfigFileName));
 
         foreach (var platform in _platforms())
         {
@@ -315,6 +318,102 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
         return args;
     }
 
+    /// <summary>
+    /// Emits the <c>--config</c> pair — the one argv element that needs a
+    /// bounded sandbox probe to compute. Always set: with a single
+    /// <c>-p</c> target KICS would otherwise auto-load a <c>kics.config</c>
+    /// sitting in the audited repository, letting the diff author inject
+    /// flag values (query exclusions, severity filters). Unset
+    /// <c>ConfigFile</c> → the generated empty file in the report directory,
+    /// which binds nothing. An operator's <c>ConfigFile</c> is read once
+    /// here, canonicalized in the sandbox, rejected when it resolves inside
+    /// the worktree, and passed through verbatim — the value validated is
+    /// exactly the value argv carries (a mid-run scoped-config reload cannot
+    /// split the guard from the flag).
+    /// </summary>
+    protected override async Task<IReadOnlyList<string>> ResolveContextArgumentsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var configured = ValidatedScopedValue(_configFile(), ConfigFileKey);
+        if (configured is null)
+            return ["--config", Path.Combine(PerRunTempDirectoryPath, EmptyConfigFileName)];
+
+        var canonical = await CanonicalizeOutsideWorktreeAsync(
+            sandbox, workingDirectory, configured, options, ct).ConfigureAwait(false);
+        return ["--config", canonical];
+    }
+
+    /// <summary>
+    /// Canonicalizes the operator's <c>ConfigFile</c> inside the sandbox and
+    /// fails closed when it resolves inside the audited worktree. KICS
+    /// resolves a relative <c>--config</c> against its cwd — the worktree —
+    /// so the probe canonicalizes the configured path and the probe cwd with
+    /// one <c>realpath -m</c> call: relative paths, <c>..</c> segments, and
+    /// symlinked components all collapse to the path KICS would actually
+    /// open, and containment is judged against the same canonicalized scan
+    /// root. From inside the tree the diff author could bind flags absent
+    /// from argv (exclude-queries, exclude-severities) and silently empty
+    /// the report.
+    /// </summary>
+    private async Task<string> CanonicalizeOutsideWorktreeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string configured,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var probe = await ExecToolBoundedAsync(
+            sandbox,
+            ToolName,
+            "config-file check",
+            new SandboxExec
+            {
+                // Two operands, two output lines: the configured path and
+                // "." — the exec working directory canonicalized in the
+                // sandbox's own path space (providers may translate the
+                // host-side workingDirectory).
+                Argv = [ConfigCanonicalizationBinary, "-m", "--", configured, "."],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (probe.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' {ConfigFileKey} canonicalization could "
+                + "not run: the sandbox exec transport was unavailable.");
+
+        var lines = probe.Stdout.Split(
+            '\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (probe.ExitCode != 0 || lines.Length != 2)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' could not canonicalize {ConfigFileKey} "
+                + $"'{TruncateForMessage(configured)}' (exit {probe.ExitCode}) — an unchecked config "
+                + "path is never trusted, so this is infrastructure, not a verdict on the diff.",
+                probe.ExitCode,
+                probe.Stderr);
+
+        var canonicalConfig = ValidatedArgumentValue(lines[0], ConfigFileKey);
+        var canonicalWorktree = lines[1];
+        if (HostPathPolicy.IsWithinDirectory(canonicalConfig, canonicalWorktree))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor 'codeybox:kics' {ConfigFileKey} "
+                + $"'{TruncateForMessage(configured)}' resolves to '{TruncateForMessage(canonicalConfig)}' "
+                + "inside the audited worktree — a repository-controlled config can bind un-passed "
+                + "flags and empty the report. Set an absolute path outside the repository, or unset "
+                + "it to use the generated empty config.")
+            { IsDeterministic = true };
+
+        return canonicalConfig;
+    }
+
     /// <inheritdoc />
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)
     {
@@ -331,14 +430,11 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <summary>
-    /// Prepares the report sink the scan argv names: a fresh per-run output
-    /// directory (outside the worktree) containing the empty
-    /// <c>--config</c> file and a <c>results.json</c> symlink to
-    /// <c>/dev/stdout</c> that routes KICS's report write onto captured
-    /// stdout. A preparation failure — a sandbox that cannot create the
-    /// directory or the symlink — fails closed as infrastructure naming the
-    /// tool: the scan cannot produce its report without the sink. Also
-    /// rejects a <c>ConfigFile</c> resolving inside the audited worktree.
+    /// Prepares the report directory the scan argv names: a fresh per-run
+    /// output directory (outside the worktree) containing the generated
+    /// empty <c>--config</c> file. A preparation failure fails closed as
+    /// infrastructure naming the tool: the scan cannot produce its report
+    /// without the directory.
     /// </summary>
     protected override async Task VerifyToolAsync(
         ISandbox sandbox,
@@ -347,13 +443,11 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        RejectInTreeConfigFile(workingDirectory);
-
         var reportDir = PerRunTempDirectoryPath;
         var result = await ExecToolBoundedAsync(
             sandbox,
             tool,
-            "report sink preparation",
+            "report directory preparation",
             new SandboxExec
             {
                 Argv = ["sh", "-c", ReportPreparationScript, "sh", reportDir],
@@ -367,15 +461,80 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
 
         if (result.ExecutionUnavailable)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' report sink preparation could not run: "
+                $"could-not-verify: audit tool '{tool}' report directory preparation could not run: "
                 + "the sandbox exec transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' could not prepare its report directory "
-                + $"(exit {result.ExitCode}) — without the stdout sink the scan cannot produce a "
+                + $"(exit {result.ExitCode}) — without it the scan cannot produce a "
                 + "report, so this is infrastructure, not a verdict on the diff.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
+    }
+
+    /// <summary>
+    /// Reads the report file KICS wrote under the per-run directory through
+    /// a separate bounded sandbox read — the reason the report never touches
+    /// the captured scan streams: its per-file fields embed matched literal
+    /// secrets, and captured output is persisted as
+    /// <see cref="AuditResult.RawOutput"/>, tailed into unavailability
+    /// messages, and shipped in webhook payloads. The read shares the
+    /// configured per-stream capture bound; a missing or oversized report
+    /// fails closed as infrastructure. The read's own output is never copied
+    /// into a failure message — only <c>cat</c>'s stderr (provider error
+    /// text) is carried.
+    /// </summary>
+    protected override async Task<ExternalToolParseInput> ResolveParserInputAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        SandboxExecResult result,
+        string? scanRoot,
+        CancellationToken ct)
+    {
+        var reportPath = Path.Combine(PerRunTempDirectoryPath, ReportFileName);
+        var read = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "report read",
+            new SandboxExec
+            {
+                Argv = ["cat", reportPath],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = CapturedOutputLimit(options),
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (read.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' report read could not run: the sandbox exec "
+                + "transport was unavailable.");
+        if (read.StdoutLimitExceeded)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' wrote a report exceeding the "
+                + $"{CapturedOutputLimit(options)}-byte capture bound — the report is fetched "
+                + "through a bounded read, so an oversized one is infrastructure, never a partial "
+                + "parse. Raise MaxOutputBytesPerStream or narrow the scan (Targets, Platforms).")
+            { IsDeterministic = true };
+        if (read.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' completed its scan but produced no readable "
+                + $"report file (exit {read.ExitCode}) — a completed scan must leave a report, so "
+                + "this is infrastructure, not a verdict on the diff.",
+                read.ExitCode,
+                read.Stderr);
+
+        return new ExternalToolParseInput(
+            tool,
+            read.Stdout,
+            result.Stderr,
+            result.ExitCode,
+            ScanRoot: scanRoot,
+            WorkingDirectory: workingDirectory);
     }
 
     /// <summary>
@@ -423,40 +582,6 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
         return root;
-    }
-
-    /// <summary>
-    /// Fails closed when the operator's <c>ConfigFile</c> resolves inside the
-    /// audited worktree. KICS resolves a relative <c>--config</c> against its
-    /// cwd — the worktree — so any non-rooted path is repository-controlled;
-    /// so is an absolute path under the scan root. From inside the tree the
-    /// diff author could bind flags absent from argv (exclude-queries,
-    /// exclude-severities) and silently empty the report.
-    /// </summary>
-    private void RejectInTreeConfigFile(string workingDirectory)
-    {
-        var configured = _configFile();
-        if (string.IsNullOrWhiteSpace(configured))
-            return;
-        var trimmed = configured.Trim();
-        if (Path.IsPathFullyQualified(trimmed)
-            && Path.IsPathFullyQualified(workingDirectory)
-            && !IsWithinDirectory(trimmed, workingDirectory))
-            return;
-        throw new AuditUnavailableException(
-            $"could-not-verify: auditor 'codeybox:kics' {ConfigFileKey} '{TruncateForMessage(trimmed)}' "
-            + "resolves inside the audited worktree (or is relative, which KICS resolves against "
-            + "its scan cwd) — a repository-controlled config can bind un-passed flags and empty "
-            + "the report. Set an absolute path outside the repository, or unset it to use the "
-            + "generated empty config.")
-        { IsDeterministic = true };
-    }
-
-    private static bool IsWithinDirectory(string path, string directory)
-    {
-        var relative = Path.GetRelativePath(Path.GetFullPath(directory), Path.GetFullPath(path));
-        return relative == "."
-            || (!relative.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(relative));
     }
 
     private static void RejectReservedExtraArguments(ExternalToolAuditorOptions options)

@@ -126,4 +126,22 @@ public static class HostPathPolicy
         var alt = Path.DirectorySeparatorChar == '/' ? '\\' : '/';
         return path.Replace(alt, Path.DirectorySeparatorChar);
     }
+
+    /// <summary>
+    /// The one canonical "is this path inside that directory" predicate:
+    /// both inputs are normalized with <see cref="Path.GetFullPath"/> (dot
+    /// segments collapsed), then <paramref name="path"/> is inside when it
+    /// equals <paramref name="directory"/> or sits under it. Security
+    /// guards must share this instead of re-implementing prefix checks with
+    /// divergent edge semantics. Lexical only — symlink components are NOT
+    /// resolved, so a boundary a symlink could cross must be checked
+    /// against already-canonicalized inputs.
+    /// </summary>
+    public static bool IsWithinDirectory(string path, string directory)
+    {
+        var relative = Path.GetRelativePath(Path.GetFullPath(directory), Path.GetFullPath(path));
+        return relative == "."
+            || (!relative.StartsWith("..", StringComparison.Ordinal)
+                && !Path.IsPathRooted(relative));
+    }
 }

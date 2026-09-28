@@ -37,10 +37,14 @@ public abstract class ExternalToolAuditorBase : IAuditor
         @"\d+\.\d+\.\d+[\w.\-]*",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
-    // Per-run scratch directory minted by MintPerRunTempDirectoryPath and
-    // consumed by VerifyToolAsync. AsyncLocal — not a field — because auditor
-    // instances are shared singletons: concurrent audits must not see each
-    // other's paths.
+    // Per-run scratch directory minted by RunAsync itself before any hook or
+    // argv build, and consumed through PerRunTempDirectoryPath by the hooks
+    // that need it. AsyncLocal — not a field — because auditor instances are
+    // shared singletons: concurrent audits must not see each other's paths.
+    // The base owns the lifecycle (mint before ResolveContextArgumentsAsync,
+    // clear when the run finishes) so plugins can never mint at the wrong
+    // point in the call order — e.g. after the argv that names the path was
+    // already frozen.
     private readonly AsyncLocal<string?> _perRunTempDirectoryPath = new();
 
     // Each candidate is probed with -e (exists) and -L (symlink — catches a
@@ -107,9 +111,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// <summary>
     /// Pre-scan precondition hook, invoked inside <see cref="RunAsync"/> after
     /// the tool's presence and declared <see cref="VersionPin"/> are confirmed
-    /// and before the scan executes. The scan argv — and any
-    /// <see cref="MintPerRunTempDirectoryPath"/> call — is already built when
-    /// this runs. Override for tool requirements the base
+    /// and before the scan executes. The scan argv and the per-run scratch
+    /// directory (<see cref="PerRunTempDirectoryPath"/>) are already built
+    /// when this runs. Override for tool requirements the base
     /// cannot express — e.g. a repository-state gate — and throw
     /// <see cref="AuditUnavailableException"/> to fail closed: a failed
     /// precondition is infrastructure, never a pass.
@@ -152,6 +156,34 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
     /// <summary>
     /// Optional per-run hook invoked inside <see cref="RunAsync"/> after the
+    /// scan exits with a declared findings-producing code and before
+    /// <see cref="OutputParser"/> runs — the seam for tools whose report
+    /// must not ride the captured scan streams. The default feeds the parser
+    /// the captured stdout/stderr verbatim. Override when routing the report
+    /// over captured output would carry tool-controlled bytes into
+    /// <see cref="AuditResult.RawOutput"/>, unavailability messages, and
+    /// webhooks — e.g. a report format that embeds matched source snippets
+    /// (literal secrets). Fetch it instead through a separate bounded
+    /// sandbox read (a file the tool wrote, under
+    /// <see cref="PerRunTempDirectoryPath"/> or elsewhere) and return the
+    /// <see cref="ExternalToolParseInput"/> the parser should see; the
+    /// report bytes then reach only the parser, never the persisted raw
+    /// output or failure text.
+    /// </summary>
+    protected virtual Task<ExternalToolParseInput> ResolveParserInputAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        SandboxExecResult result,
+        string? scanRoot,
+        CancellationToken ct)
+        => Task.FromResult(new ExternalToolParseInput(
+            tool, result.Stdout, result.Stderr, result.ExitCode,
+            ScanRoot: scanRoot, WorkingDirectory: workingDirectory));
+
+    /// <summary>
+    /// Optional per-run hook invoked inside <see cref="RunAsync"/> after the
     /// tool-presence, version, and <see cref="VerifyToolAsync"/> checks and
     /// immediately before the scan executes — for tools whose reports carry
     /// absolute paths but embed no working directory. Return the absolute
@@ -173,43 +205,31 @@ public abstract class ExternalToolAuditorBase : IAuditor
         => Task.FromResult<string?>(null);
 
     /// <summary>
-    /// Mints a unique per-run scratch directory path —
-    /// <c>&lt;temp&gt;/&lt;prefix&gt;&lt;guid&gt;</c> — and records it for the
-    /// current invocation so <see cref="VerifyToolAsync"/> and later hooks
-    /// recover it through <see cref="PerRunTempDirectoryPath"/>. Call this
-    /// from <see cref="BuildToolArguments"/>: <see cref="RunAsync"/> builds
-    /// the scan argv before the presence, version, and precondition checks,
-    /// so the same path can be named in argv and prepared by the hooks. The
-    /// directory is NOT created here — the hooks create it inside the
-    /// sandbox. The temp root is computed on the host but interpreted in the
-    /// sandbox's path space; on the supported Linux layout both resolve
-    /// under <c>/tmp</c>. VM sandboxes discard the directory with their temp
-    /// area; on process-provider hosts it may accumulate — sweep it in the
-    /// same preparation step when that matters.
-    /// </summary>
-    protected string MintPerRunTempDirectoryPath(string directoryPrefix)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(directoryPrefix);
-        var path = Path.Combine(
-            Path.GetTempPath(), directoryPrefix + Guid.NewGuid().ToString("N"));
-        _perRunTempDirectoryPath.Value = path;
-        return path;
-    }
-
-    /// <summary>
-    /// The path <see cref="MintPerRunTempDirectoryPath"/> minted for this
-    /// run. Throws a deterministic <see cref="AuditUnavailableException"/>
-    /// when no path was minted — a precondition hook that needs the
-    /// directory cannot recover by minting its own, because the scan argv
-    /// already names the original one.
+    /// The per-run scratch directory — <c>&lt;temp&gt;/codeybox-&lt;tool&gt;-&lt;guid&gt;</c> —
+    /// that <see cref="RunAsync"/> mints for the current invocation before
+    /// <see cref="ResolveContextArgumentsAsync"/> and <see cref="BuildToolArguments"/>
+    /// run, so the same path can be named in the scan argv and prepared by
+    /// <see cref="VerifyToolAsync"/>. The directory is NOT created by the
+    /// mint — hooks create it inside the sandbox when they need it. The temp
+    /// root is computed on the host but interpreted in the sandbox's path
+    /// space; on the supported Linux layout both resolve under <c>/tmp</c>.
+    /// VM sandboxes discard the directory with their temp area; on
+    /// process-provider hosts it may accumulate — sweep it in a preparation
+    /// step when that matters. Throws a deterministic
+    /// <see cref="AuditUnavailableException"/> when read outside a run —
+    /// there is no correct way to recover by inventing another path, because
+    /// the argv would still name this one.
     /// </summary>
     protected string PerRunTempDirectoryPath
         => _perRunTempDirectoryPath.Value is { Length: > 0 } path
             ? path
             : throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' per-run scratch directory was not "
-                + "initialized for this run.")
+                $"could-not-verify: audit tool '{ToolName}' per-run scratch directory is only "
+                + "available while a run is in progress.")
             { IsDeterministic = true };
+
+    private static string MintPerRunTempDirectoryPath(string tool)
+        => Path.Combine(Path.GetTempPath(), "codeybox-" + tool + "-" + Guid.NewGuid().ToString("N"));
 
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
@@ -223,32 +243,46 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
         var tool = ExternalToolNames.Validate(ToolName, nameof(ToolName));
         var options = OptionsAccessor() ?? new ExternalToolAuditorOptions();
-        var contextArguments = await ResolveContextArgumentsAsync(
-            sandbox, workingDirectory, context, options, ct).ConfigureAwait(false) ?? [];
-        var argv = BuildArgv(tool, options, contextArguments);
+        _perRunTempDirectoryPath.Value = MintPerRunTempDirectoryPath(tool);
+        try
+        {
+            var contextArguments = await ResolveContextArgumentsAsync(
+                sandbox, workingDirectory, context, options, ct).ConfigureAwait(false) ?? [];
+            var argv = BuildArgv(tool, options, contextArguments);
 
-        await ThrowIfBinaryMissingAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
-        await VerifyToolVersionPinAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
-        await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
-        var scanRoot = await ResolveScanRootAsync(sandbox, workingDirectory, context, options, ct)
-            .ConfigureAwait(false);
-        var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
+            await ThrowIfBinaryMissingAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
+            await VerifyToolVersionPinAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
+            await VerifyToolAsync(sandbox, workingDirectory, tool, options, ct).ConfigureAwait(false);
+            var scanRoot = await ResolveScanRootAsync(sandbox, workingDirectory, context, options, ct)
+                .ConfigureAwait(false);
+            var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw Unavailable(tool, "could not execute: the sandbox exec transport was unavailable", result);
-        if (result.ExitCode is CommandCannotExecuteExitCode or CommandNotFoundExitCode)
-            throw Unavailable(tool, "could not execute (exit 127/126 — binary missing or not executable in the sandbox)", result);
-        if (!options.FindingsExitCodes.Contains(result.ExitCode))
-            throw Unavailable(
-                tool,
-                $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
-                result);
+            if (result.ExecutionUnavailable)
+                throw Unavailable(tool, "could not execute: the sandbox exec transport was unavailable", result);
+            if (result.ExitCode is CommandCannotExecuteExitCode or CommandNotFoundExitCode)
+                throw Unavailable(tool, "could not execute (exit 127/126 — binary missing or not executable in the sandbox)", result);
+            if (!options.FindingsExitCodes.Contains(result.ExitCode))
+                throw Unavailable(
+                    tool,
+                    $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
+                    result);
 
-        var parsed = ParseOutput(tool, result, scanRoot, workingDirectory);
-        var findings = ToFindings(tool, parsed, options);
-        var truncated = findings.Count < parsed.Count;
-        var passed = findings.All(f => f.Severity < AuditSeverity.Error);
-        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, parsed.Count - findings.Count, truncated));
+            var parseInput = await ResolveParserInputAsync(
+                    sandbox, workingDirectory, tool, options, result, scanRoot, ct)
+                .ConfigureAwait(false)
+                ?? new ExternalToolParseInput(
+                    tool, result.Stdout, result.Stderr, result.ExitCode,
+                    ScanRoot: scanRoot, WorkingDirectory: workingDirectory);
+            var parsed = ParseOutput(tool, parseInput);
+            var findings = ToFindings(tool, parsed, options);
+            var truncated = findings.Count < parsed.Count;
+            var passed = findings.All(f => f.Severity < AuditSeverity.Error);
+            return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, parsed.Count - findings.Count, truncated));
+        }
+        finally
+        {
+            _perRunTempDirectoryPath.Value = null;
+        }
     }
 
     private IReadOnlyList<string> BuildArgv(
@@ -330,10 +364,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        var maxBytes = Math.Clamp(
-            options.MaxOutputBytesPerStream,
-            ExternalToolAuditorOptions.MinCapturedOutputBytes,
-            ExternalToolAuditorOptions.MaxCapturedOutputBytes);
+        var maxBytes = CapturedOutputLimit(options);
         return ExecToolBoundedAsync(
             sandbox,
             tool,
@@ -350,6 +381,17 @@ public abstract class ExternalToolAuditorBase : IAuditor
             EffectiveTimeout(options),
             ct);
     }
+
+    /// <summary>
+    /// The configured per-stream capture bound clamped to the SDK floor and
+    /// ceiling — the single computation shared by the scan exec, report-file
+    /// reads, and raw-output truncation labelling.
+    /// </summary>
+    protected static int CapturedOutputLimit(ExternalToolAuditorOptions options)
+        => Math.Clamp(
+            options.MaxOutputBytesPerStream,
+            ExternalToolAuditorOptions.MinCapturedOutputBytes,
+            ExternalToolAuditorOptions.MaxCapturedOutputBytes);
 
     /// <summary>
     /// Effective per-invocation timeout: the configured value, or the default
@@ -789,14 +831,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     private IReadOnlyList<ExternalToolFinding> ParseOutput(
-        string tool, SandboxExecResult result, string? scanRoot, string? workingDirectory)
+        string tool, ExternalToolParseInput parseInput)
     {
         try
         {
-            return OutputParser.Parse(
-                new ExternalToolParseInput(
-                    tool, result.Stdout, result.Stderr, result.ExitCode,
-                    ScanRoot: scanRoot, WorkingDirectory: workingDirectory)) ?? [];
+            return OutputParser.Parse(parseInput) ?? [];
         }
         catch (ExternalToolParseException ex)
         {
@@ -919,10 +958,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         int droppedFindings,
         bool findingsTruncated)
     {
-        var maxBytes = Math.Clamp(
-            options.MaxOutputBytesPerStream,
-            ExternalToolAuditorOptions.MinCapturedOutputBytes,
-            ExternalToolAuditorOptions.MaxCapturedOutputBytes);
+        var maxBytes = CapturedOutputLimit(options);
         var stdout = result.Stdout;
         if (result.StdoutLimitExceeded)
             stdout += $"\n[stdout truncated after {maxBytes} bytes]";
