@@ -146,10 +146,7 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
 
         var relativeJson = normalised + ".json";
         var path = Path.GetFullPath(Path.Combine(root, relativeJson));
-        var rootWithSeparator = root.EndsWith(Path.DirectorySeparatorChar)
-            ? root
-            : root + Path.DirectorySeparatorChar;
-        if (!path.StartsWith(rootWithSeparator, StringComparison.Ordinal))
+        if (!HostPathPolicy.IsStrictlyWithinDirectory(path, root))
             throw new TaskTemplateLoadException("template path escapes the templates directory");
 
         // The caller-supplied ref becomes the template's display name and is

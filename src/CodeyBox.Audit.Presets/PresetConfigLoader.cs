@@ -447,10 +447,7 @@ internal sealed class PresetConfigLoader
         // Canonicalise-then-contain (defence in depth against '..' components):
         // the resolved file path must remain beneath the canonical preset directory.
         var fullPath = Path.GetFullPath(path);
-        var containedPrefix = canonicalDirectory.EndsWith(Path.DirectorySeparatorChar)
-            ? canonicalDirectory
-            : canonicalDirectory + Path.DirectorySeparatorChar;
-        if (!fullPath.StartsWith(containedPrefix, StringComparison.Ordinal))
+        if (!HostPathPolicy.IsStrictlyWithinDirectory(fullPath, canonicalDirectory))
         {
             throw new PresetConfigurationException(
                 $"{path}: repository preset files must reside within '{canonicalDirectory}'.");

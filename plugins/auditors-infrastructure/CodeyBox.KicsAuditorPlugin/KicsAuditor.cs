@@ -155,20 +155,15 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     // Fixed script — no configuration-derived text: the per-run directory
     // arrives as $1, never spliced into the script. Creates the report dir
-    // and the generated empty config that holds the --config flag; the
-    // report itself stays a plain file the auditor reads back after the
-    // scan (see the class docstring's Report routing paragraph).
+    // (mode 700: results.json embeds literal detected secrets, so the fresh
+    // directory must not be world-readable under the shared temp area) and
+    // the generated empty config that holds the --config flag; the report
+    // itself stays a plain file the auditor reads back after the scan (see
+    // the class docstring's Report routing paragraph).
     private const string ReportPreparationScript =
         "d=\"$1\""
-        + " && mkdir -p \"$d\""
+        + " && mkdir -m 700 -p \"$d\""
         + " && printf '%s\\n' '{}' > \"$d/" + EmptyConfigFileName + "\"";
-
-    // The config-file containment probe canonicalizes both the configured
-    // path and the scan cwd in the sandbox's own path space with realpath -m
-    // (which resolves symlink components and collapses dot segments without
-    // requiring the leaf to exist) — a lexical GetFullPath check on the host
-    // would be fooled by a symlinked path that resolves inside the worktree.
-    private const string ConfigCanonicalizationBinary = "/usr/bin/realpath";
 
     // Flags whose presence in ExtraArguments would redirect the report sink,
     // reopen the repository-controlled config surface, fight --silent, or
@@ -375,8 +370,11 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
                 // Two operands, two output lines: the configured path and
                 // "." — the exec working directory canonicalized in the
                 // sandbox's own path space (providers may translate the
-                // host-side workingDirectory).
-                Argv = [ConfigCanonicalizationBinary, "-m", "--", configured, "."],
+                // host-side workingDirectory). realpath resolves through
+                // PATH like the other probe binaries (sh, cat) rather than
+                // an assumed FHS location; a missing realpath exits
+                // non-zero and fails closed as infrastructure below.
+                Argv = ["realpath", "-m", "--", configured, "."],
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,

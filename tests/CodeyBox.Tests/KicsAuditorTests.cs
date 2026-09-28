@@ -643,6 +643,11 @@ public sealed class KicsAuditorTests
     [InlineData("/work/kics.config")]
     [InlineData("/work/sub/kics.json")]
     [InlineData("/work/../work/nested.json")]
+    // A leaf whose NAME begins with ".." canonicalizes inside the worktree
+    // (/work/..kicsrc) — a StartsWith("..") containment check would judge
+    // it outside and pass repository-controlled config to --config.
+    [InlineData("..kicsrc.json")]
+    [InlineData("/work/..kicsrc.json")]
     public async Task InTreeConfigFile_IsRejectedDeterministically(string configFile)
     {
         // A config resolving inside the audited tree — whether spelled
@@ -1034,7 +1039,7 @@ public sealed class KicsAuditorTests
     // The config-file canonicalization probe: realpath -m -- <configured> .
     private static bool IsConfigProbe(SandboxExec exec)
         => exec.Argv.Count >= 4
-            && exec.Argv[0] == "/usr/bin/realpath"
+            && exec.Argv[0] == "realpath"
             && exec.Argv[1] == "-m";
 
     // The post-scan bounded report fetch: cat <dir>/results.json.

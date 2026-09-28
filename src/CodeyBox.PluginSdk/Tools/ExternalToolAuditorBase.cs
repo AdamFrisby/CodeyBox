@@ -269,10 +269,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
             var parseInput = await ResolveParserInputAsync(
                     sandbox, workingDirectory, tool, options, result, scanRoot, ct)
-                .ConfigureAwait(false)
-                ?? new ExternalToolParseInput(
-                    tool, result.Stdout, result.Stderr, result.ExitCode,
-                    ScanRoot: scanRoot, WorkingDirectory: workingDirectory);
+                .ConfigureAwait(false);
             var parsed = ParseOutput(tool, parseInput);
             var findings = ToFindings(tool, parsed, options);
             var truncated = findings.Count < parsed.Count;

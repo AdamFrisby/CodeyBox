@@ -1130,8 +1130,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
                 throw new InvalidOperationException($"Sprite sync archive for {hostPath} exceeded file-count limit.");
 
             var destination = Path.GetFullPath(Path.Combine(root, entry.Name));
-            if (!destination.Equals(root, StringComparison.Ordinal) &&
-                !destination.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            if (!HostPathPolicy.IsWithinDirectory(destination, root))
             {
                 throw new InvalidOperationException($"Sprite sync archive for {hostPath} contains an unsafe path.");
             }
