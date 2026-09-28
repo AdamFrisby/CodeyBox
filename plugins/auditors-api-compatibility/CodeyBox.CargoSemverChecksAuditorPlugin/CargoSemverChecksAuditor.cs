@@ -51,17 +51,18 @@ namespace CodeyBox.CargoSemverChecksAuditorPlugin;
 /// auditing a <em>change</em> rather than a <em>release</em>. Unless the
 /// operator pins a baseline explicitly (one of <c>BaselineRev</c>,
 /// <c>BaselineVersion</c>, <c>BaselineRoot</c>, <c>BaselineRustdoc</c>, or a
-/// <c>--baseline-*</c> flag in <c>ExtraArguments</c>), the
-/// auditor resolves the merge-base of <c>HEAD</c> and the work item's
+/// <c>--baseline-*</c> flag in <c>ExtraArguments</c>), the shared
+/// <see cref="ExternalToolAuditorBase.ResolveMergeBaseAsync"/> helper resolves
+/// the merge-base of <c>HEAD</c> and the work item's
 /// <see cref="AuditContext.BaseBranch"/> — the same
 /// <c>origin/&lt;base&gt;...HEAD</c> semantics the pipeline's own diff
-/// auditors use — and passes it as <c>--baseline-rev</c>. Resolution probes
-/// <c>origin/&lt;base&gt;</c> first, then the bare branch name (the
-/// <see cref="Validation.ValidateBranchName"/>-validated value reaches git
-/// only as an argv entry, never through a shell). An empty/invalid base
-/// branch, an unresolvable ref, or no common ancestor is a deterministic
-/// infrastructure failure pointing at the baseline knobs — never a pass.
-/// The resolution needs the <see cref="AuditContext"/> that
+/// auditors use — and the auditor passes it as <c>--baseline-rev</c>.
+/// Resolution probes <c>origin/&lt;base&gt;</c> first, then the bare branch
+/// name (the <see cref="Validation.ValidateBranchName"/>-validated value
+/// reaches git only as an argv entry, never through a shell). An
+/// empty/invalid base branch, an unresolvable ref, or no common ancestor is
+/// a deterministic infrastructure failure pointing at the baseline knobs —
+/// never a pass. The resolution needs the <see cref="AuditContext"/> that
 /// <c>BuildToolArguments</c> does not receive, so it runs inside the base's
 /// <see cref="ExternalToolAuditorBase.ResolveContextArgumentsAsync"/> seam
 /// and returns the <c>--baseline-rev</c> pair as context arguments — no
@@ -335,8 +336,8 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
         if (operatorBaseline)
             return [];
 
-        var mergeBaseSha = await ResolveDefaultBaselineRevAsync(
-            sandbox, workingDirectory, context, options, ct).ConfigureAwait(false);
+        var mergeBaseSha = await ResolveMergeBaseAsync(
+            sandbox, workingDirectory, context, options, BaselineConfigHint, ct).ConfigureAwait(false);
         return [BaselineRevFlag, mergeBaseSha];
     }
 
@@ -414,80 +415,6 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
                 .ConfigureAwait(false);
     }
 
-    private async Task<string> ResolveDefaultBaselineRevAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AuditContext context,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var baseBranch = context.BaseBranch?.Trim();
-        if (string.IsNullOrWhiteSpace(baseBranch))
-            throw NoBaselineConfigured();
-
-        try
-        {
-            Validation.ValidateBranchName(baseBranch, nameof(context.BaseBranch));
-        }
-        catch (ArgumentException ex)
-        {
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' cannot resolve a baseline: {SingleLine(ex.Message)}. "
-                + BaselineConfigHint, ex)
-            { IsDeterministic = true };
-        }
-
-        var baseBranchDisplay = SingleLine(baseBranch);
-
-        // The work item's base branch is the previous public API state.
-        // origin/<base> is the sandbox clone's canonical ref (the pipeline's
-        // own diff auditors use origin/<base>...HEAD); the bare name covers
-        // layouts that only carry a local branch.
-        string? baseSha = null;
-        foreach (var candidate in new[] { $"origin/{baseBranch}", baseBranch })
-        {
-            var probe = await GitProbeAsync(
-                sandbox,
-                workingDirectory,
-                options,
-                ["rev-parse", "--verify", $"{candidate}^{{commit}}"],
-                ct).ConfigureAwait(false);
-            if (probe.ExitCode == 0)
-            {
-                baseSha = ReadCommitSha(probe.Stdout);
-                if (baseSha is not null)
-                    break;
-            }
-        }
-
-        if (baseSha is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not resolve base branch "
-                + $"'{baseBranchDisplay}' (tried 'origin/{baseBranchDisplay}' and "
-                + $"'{baseBranchDisplay}') in the audited repository — git must be available "
-                + "and the base ref present in the sandbox clone. " + BaselineConfigHint)
-            { IsDeterministic = true };
-
-        // Merge-base semantics match the pipeline's three-dot work diff:
-        // the API state the change actually diverged from, so API added to
-        // the base after the branch point is not misread as removed.
-        var mergeBase = await GitProbeAsync(
-            sandbox,
-            workingDirectory,
-            options,
-            ["merge-base", "HEAD", baseSha],
-            ct).ConfigureAwait(false);
-        var mergeBaseSha = mergeBase.ExitCode == 0 ? ReadCommitSha(mergeBase.Stdout) : null;
-        if (mergeBaseSha is null)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' found no merge base between HEAD and "
-                + $"base branch '{baseBranchDisplay}' — the audited history must share an "
-                + "ancestor with the base ref. " + BaselineConfigHint)
-            { IsDeterministic = true };
-
-        return mergeBaseSha;
-    }
-
     private async Task ThrowIfRepoLintConfigPresentAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -503,25 +430,15 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
         if (EffectiveManifestPath(options, out _) is { } manifestPath)
             argv.AddRange([ManifestPathFlag, manifestPath]);
 
-        var result = await ExecToolBoundedAsync(
+        var result = await RunBoundedProbeAsync(
             sandbox,
             tool,
             "suppression check",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            argv,
+            workingDirectory,
+            options,
             ct).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
-                + "transport was unavailable.");
         if (result.ExitCode == 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' found repository-controlled lint configuration: "
@@ -595,11 +512,4 @@ public sealed class CargoSemverChecksAuditor : ExternalToolAuditorBase, IPluginI
     private static string BaselineConfigHint
         => $"Set one of {BaselineKeysList}, or pass one --baseline-* flag via "
             + "ExtraArguments, to pin the baseline explicitly.";
-
-    private AuditUnavailableException NoBaselineConfigured()
-        => new(
-            $"could-not-verify: auditor '{Name}' has no baseline to compare against: "
-            + "no baseline is configured and the work item carries no usable base branch for "
-            + "merge-base resolution. " + BaselineConfigHint)
-        { IsDeterministic = true };
 }

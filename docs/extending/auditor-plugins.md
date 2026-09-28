@@ -290,7 +290,9 @@ Behaviour the base guarantees identically for every tool:
 
 - **Invocation** — argv vector (never a shell string) against the work tree,
   with a bounded timeout and per-stream output caps; stdout/stderr captured
-  separately, truncation reported explicitly in the raw output.
+  separately. A scan report exceeding the stdout cap is fail-closed
+  infrastructure — a truncated verdict stream is never graded — and a
+  truncated stderr is annotated in the raw output.
 - **Result mapping** — SARIF is first-class (`SarifToolOutputParser`);
   anything else gets an `IExternalToolOutputParser` implementation.
 - **Severity mapping** — the tool's levels go through the declared
@@ -300,7 +302,10 @@ Behaviour the base guarantees identically for every tool:
   and never a finding against the diff.
 - **Failure classification** — only exits listed in
   `FindingsExitCodes` (default `{0}`) are verdicts; anything else — including
-  an unknown convention — fails loudly as infrastructure.
+  an unknown convention — fails loudly as infrastructure. A report carrying
+  more findings than `MaxFindings` is likewise infrastructure: emitting a
+  capped subset could let surplus entries evict a blocking one while the
+  audit passed on the survivors.
 - **Finding identity** — each finding carries the tool, rule id, and
   file/line where the tool supplies them.
 - **Configuration** — `ExternalToolAuditorOptions` (severity threshold, rule
@@ -320,7 +325,7 @@ toolchain's version before `govulncheck@v…`), pass a `VersionExtractor`
 that returns the tool's own token — see
 `plugins/auditors-dependency-vulnerabilities/CodeyBox.GovulncheckAuditorPlugin/`.
 
-Two extension points cover tool requirements the base cannot express
+Four extension points cover tool requirements the base cannot express
 declaratively:
 
 - `VerifyToolAsync` — a pre-scan precondition hook invoked inside `RunAsync`
@@ -328,15 +333,33 @@ declaratively:
   it for repository-state gates (e.g. refusing repo-authored suppression
   files — `ProbeRepositoryFilesPresentAsync` is the shared fail-closed probe
   for that), throwing `AuditUnavailableException` to fail closed. Run probes
-  through `ExecToolBoundedAsync` so they inherit the same timeout bounding
-  and failure classification as the scan.
+  through `ExecToolBoundedAsync` (or `RunBoundedProbeAsync`, which supplies
+  the standard probe envelope) so they inherit the same timeout bounding
+  and failure classification as the scan. When the probed names will be
+  handed to the tool as file arguments, use
+  `ProbeRepositoryRegularFilesPresentAsync` instead — it additionally
+  rejects any path whose leaf or ancestor component is a symlink, so a
+  repo-committed link cannot redirect the tool's read outside the worktree.
+- `ResolveContextArgumentsAsync` — a per-run argv hook for arguments that
+  need the `AuditContext` or bounded sandbox probes. Auditors comparing
+  against the work item's base branch share
+  `ResolveMergeBaseAsync` (merge-base of `HEAD` and `origin/<BaseBranch>`,
+  fail-closed, parameterized by the auditor's baseline-config hint) —
+  see `plugins/auditors-api-compatibility/` for both consumers.
+- `ResolveScanRootAsync` — invoked just before the scan; return the
+  absolute directory the scan actually runs in when the tool's report
+  carries absolute paths but embeds no working directory (sandbox
+  providers may translate the path you were given). The value reaches the
+  parser as `ExternalToolParseInput.ScanRoot` — see
+  `plugins/auditors-linting/CodeyBox.SwiftlintAuditorPlugin/`.
 - `BuildToolEnvironment` — extra environment variables for the tool process,
   for tools whose behavior is env-controlled (e.g. pinning configuration that
   must not come from the audited repository).
 
-`plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/` uses both to pin a
-scanner version and keep repo-authored suppression files from silencing the
-audit. A worked example lives at
+`plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/` uses
+`VerifyToolAsync` to keep repo-authored suppression files from silencing the
+audit and `BuildToolEnvironment` to pin the config the scanner reads.
+A worked example lives at
 `plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/`.
 The knip unused-JS/TS auditor is at
 `plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/`.

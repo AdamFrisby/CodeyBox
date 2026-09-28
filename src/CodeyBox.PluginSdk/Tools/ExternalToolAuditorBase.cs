@@ -45,6 +45,28 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private const string RepositoryFilePresenceScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then printf '%s\\n' \"$f\"; fi; done; exit 0";
 
+    // Stricter variant for paths an audit tool will OPEN: the candidate must
+    // be a regular file and no component of its path — leaf or any ancestor
+    // directory — may be a symlink. [ -f ] follows links, so the walk strips
+    // one component at a time (p=${p%/*}) and applies -L to each prefix; a
+    // symlinked leaf OR a symlinked directory both stop the walk with p
+    // non-empty and the path is not echoed. A path passing every check
+    // resolves to a regular file canonically inside the worktree — a
+    // repo-committed symlink cannot redirect the tool's read outside the
+    // audited tree. (A hardlink stays invisible to any path-level check;
+    // sandbox mounts keep the worktree on its own filesystem, so one cannot
+    // reach outside it.) Same contract as above: exit 0 once complete, names
+    // on stdout carry the verdict.
+    private const string RepositoryRegularFilePresenceScript =
+        "for f in \"$@\"; do "
+        + "if [ -f \"./$f\" ]; then "
+        + "p=$f; while [ -n \"$p\" ] && [ ! -L \"./$p\" ]; do "
+        + "case $p in */*) p=${p%/*} ;; *) p= ;; esac; "
+        + "done; "
+        + "if [ -z \"$p\" ]; then printf '%s\\n' \"$f\"; fi; "
+        + "fi; "
+        + "done; exit 0";
+
     /// <summary>Stable name for logs and findings.</summary>
     public abstract string Name { get; }
 
@@ -105,8 +127,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// cannot express — e.g. a repository-state gate — and throw
     /// <see cref="AuditUnavailableException"/> to fail closed: a failed
     /// precondition is infrastructure, never a pass.
-    /// Use <see cref="ExecToolBoundedAsync"/> for precondition probes so they
-    /// get the same timeout bounding and failure classification as the scan;
+    /// Use <see cref="RunBoundedProbeAsync"/> for precondition probes — it
+    /// supplies the standard bounded envelope over
+    /// <see cref="ExecToolBoundedAsync"/> — or the latter directly when the
+    /// probe needs a nonstandard envelope;
     /// <see cref="ProbeRepositoryFilesPresentAsync"/> covers the common
     /// "does a repository-controlled file exist" gate and
     /// <see cref="ThrowIfBinaryMissingAsync"/> an auxiliary binary the tool
@@ -131,7 +155,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// <c>ExtraArguments</c>, and count toward the built-argument bound.
     /// The hook runs before the tool-presence, version, and
     /// <see cref="VerifyToolAsync"/> checks; use
-    /// <see cref="ExecToolBoundedAsync"/> for probes so they share the
+    /// <see cref="RunBoundedProbeAsync"/> for probes so they share the
     /// timeout bounding and failure classification. Default: no arguments.
     /// </summary>
     protected virtual Task<IReadOnlyList<string>> ResolveContextArgumentsAsync(
@@ -150,7 +174,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// directory the scan will actually run in: sandbox providers may
     /// translate <paramref name="workingDirectory"/> (the process provider
     /// maps it onto a host path), so resolve it with a bounded probe such as
-    /// <c>pwd</c> through <see cref="ExecToolBoundedAsync"/>. The value is
+    /// <c>pwd</c> through <see cref="RunBoundedProbeAsync"/>. The value is
     /// carried to the parser on <see cref="ExternalToolParseInput.ScanRoot"/>
     /// — a per-invocation channel, so output parsing stays a pure function
     /// of its input and concurrent audits on this (singleton) auditor cannot
@@ -196,12 +220,16 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 tool,
                 $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
                 result);
+        if (result.StdoutLimitExceeded)
+            throw Unavailable(
+                tool,
+                $"produced a report exceeding the {nameof(ExternalToolAuditorOptions.MaxOutputBytesPerStream)} capture bound — a truncated verdict stream is never evidence, so the audit cannot report what the scan found. Raise the cap or narrow the audited scope.",
+                result);
 
         var parsed = ParseOutput(tool, result, scanRoot, workingDirectory);
         var findings = ToFindings(tool, parsed, options);
-        var truncated = findings.Count < parsed.Count;
         var passed = findings.All(f => f.Severity < AuditSeverity.Error);
-        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options, parsed.Count - findings.Count, truncated));
+        return new AuditResult(passed, findings, RawOutput: BuildRawOutput(result, options));
     }
 
     private IReadOnlyList<string> BuildArgv(
@@ -248,26 +276,16 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ArgumentNullException.ThrowIfNull(options);
         ExternalToolNames.Validate(binary, nameof(binary));
 
-        var probe = await ExecToolBoundedAsync(
+        var reason = purpose is null ? string.Empty : $" ({SingleLine(purpose)})";
+        var probe = await RunBoundedProbeAsync(
             sandbox,
             binary,
-            "presence check",
-            new SandboxExec
-            {
-                Argv = ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", binary],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            $"presence check{reason}",
+            ["sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", binary],
+            workingDirectory,
+            options,
             ct).ConfigureAwait(false);
 
-        var reason = purpose is null ? string.Empty : $" ({SingleLine(purpose)})";
-        if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: binary '{binary}' presence check could not run: the sandbox exec "
-                + $"transport was unavailable.{reason}");
         if (probe.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: required binary '{binary}' is not installed in the audit sandbox."
@@ -297,6 +315,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = maxBytes,
                 MaxStderrBytes = maxBytes,
+                // Let the process run to its own exit code — killing at the
+                // cap would hide whether the run found anything — then
+                // RunAsync fails closed on a truncated stdout: a partial
+                // report is never a verdict.
                 KillOnOutputLimit = false,
                 ExtraEnvironment = BuildToolEnvironment(options),
             },
@@ -357,6 +379,63 @@ public abstract class ExternalToolAuditorBase : IAuditor
         }
     }
 
+    /// <summary>
+    /// Runs one bounded precondition probe on behalf of
+    /// <paramref name="tool"/>: builds the <see cref="SandboxExec"/> with the
+    /// shared probe envelope — <see cref="ProbeMaxOutputBytes"/> per stream
+    /// (or <paramref name="maxStdoutBytes"/> for probes that legitimately
+    /// emit more), kill-on-limit, and the capped <see cref="ProbeTimeout"/>
+    /// — and classifies an exec-transport failure or a truncated output
+    /// stream as <see cref="AuditUnavailableException"/> naming the tool:
+    /// probe stdout carries verdicts, and a provider that reports exit 0
+    /// alongside the limit flag returns a partial stream that is never
+    /// evidence of the probed state. Exit-code interpretation stays with
+    /// the caller: what a completed probe's exit code means is
+    /// probe-specific. <paramref name="operation"/> names the invocation in
+    /// failure messages (e.g. "presence check", "version check"); keep it
+    /// an author-chosen constant.
+    /// </summary>
+    protected static async Task<SandboxExecResult> RunBoundedProbeAsync(
+        ISandbox sandbox,
+        string tool,
+        string operation,
+        IReadOnlyList<string> argv,
+        string workingDirectory,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct,
+        int maxStdoutBytes = ProbeMaxOutputBytes)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentNullException.ThrowIfNull(argv);
+        ArgumentNullException.ThrowIfNull(options);
+
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            operation,
+            new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = maxStdoutBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' {operation} could not run: the sandbox exec "
+                + "transport was unavailable.");
+        if (result.OutputLimitExceeded)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' {operation} exceeded the probe output "
+                + "bound — the returned stream is truncated and a partial probe verdict is never "
+                + "evidence about the audited state.");
+        return result;
+    }
+
     private async Task VerifyToolVersionPinAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -380,24 +459,17 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var probeArguments = pin.VersionProbeArguments.Count > 0
             ? pin.VersionProbeArguments
             : ["--version"];
-        var result = await ExecToolBoundedAsync(
+        var result = await RunBoundedProbeAsync(
             sandbox,
             tool,
             "version check",
-            new SandboxExec
-            {
-                Argv = [tool, .. probeArguments],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
+            [tool, .. probeArguments],
+            workingDirectory,
+            options,
             ct).ConfigureAwait(false);
 
         var reported = (pin.VersionExtractor ?? ExtractToolVersion)(result.Stdout);
-        if (result.ExecutionUnavailable
-            || result.ExitCode != 0
+        if (result.ExitCode != 0
             || reported is null)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' version could not be determined "
@@ -427,12 +499,65 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// rejected so the probe can never escape the worktree or corrupt its
     /// one-name-per-line protocol.
     /// </summary>
-    protected static async Task<IReadOnlyList<string>> ProbeRepositoryFilesPresentAsync(
+    protected static Task<IReadOnlyList<string>> ProbeRepositoryFilesPresentAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         IReadOnlyList<string> relativePaths,
         ExternalToolAuditorOptions options,
+        CancellationToken ct)
+        => ProbeRepositoryPathsAsync(
+            sandbox,
+            workingDirectory,
+            tool,
+            relativePaths,
+            options,
+            RepositoryFilePresenceScript,
+            "suppression check",
+            "confirm repository-file absence",
+            ct);
+
+    /// <summary>
+    /// Bounded presence probe for repository files an audit tool will OPEN —
+    /// stricter than <see cref="ProbeRepositoryFilesPresentAsync"/>: a path
+    /// counts as present only when it is a regular file AND no component of
+    /// it (leaf or ancestor directory) is a symlink. A name passing that
+    /// check resolves canonically inside the worktree, so a repo-committed
+    /// symlink cannot redirect the tool's read to a file outside the audited
+    /// tree — use this variant whenever the probed names will be handed to a
+    /// tool as file arguments rather than merely checked for existence (a
+    /// suppression-file gate wants the loose variant: a symlinked config
+    /// file IS a suppression surface). Same fail-closed contract: transport
+    /// failure or non-zero probe exit is <see cref="AuditUnavailableException"/>,
+    /// never evidence about the files.
+    /// </summary>
+    protected static Task<IReadOnlyList<string>> ProbeRepositoryRegularFilesPresentAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> relativePaths,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+        => ProbeRepositoryPathsAsync(
+            sandbox,
+            workingDirectory,
+            tool,
+            relativePaths,
+            options,
+            RepositoryRegularFilePresenceScript,
+            "file probe",
+            "confirm the probed paths are regular files inside the worktree",
+            ct);
+
+    private static async Task<IReadOnlyList<string>> ProbeRepositoryPathsAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> relativePaths,
+        ExternalToolAuditorOptions options,
+        string script,
+        string operation,
+        string failureGoal,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(sandbox);
@@ -441,45 +566,45 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var requested = new HashSet<string>(StringComparer.Ordinal);
         var argv = new List<string>(relativePaths.Count + 4)
         {
-            "sh", "-c", RepositoryFilePresenceScript, "sh",
+            "sh", "-c", script, "sh",
         };
+        // The script echoes each accepted name plus its newline, so the
+        // verdict stream can need more than the default probe cap — size it
+        // to the request. (The cap must never sit below the worst-case echo:
+        // a truncated reply reads as fewer-present and is now a fail-closed
+        // audit failure rather than silent scope narrowing.)
+        var echoBytes = 0;
         foreach (var path in relativePaths)
         {
             var normalized = NormalizeProbePath(path);
             if (requested.Add(normalized))
+            {
                 argv.Add(normalized);
+                echoBytes += Encoding.UTF8.GetByteCount(normalized) + 1;
+            }
         }
         if (requested.Count == 0)
             return [];
 
-        var result = await ExecToolBoundedAsync(
+        var result = await RunBoundedProbeAsync(
             sandbox,
             tool,
-            "suppression check",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
+            operation,
+            argv,
+            workingDirectory,
+            options,
+            ct,
+            maxStdoutBytes: Math.Max(ProbeMaxOutputBytes, echoBytes)).ConfigureAwait(false);
 
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
-                + "transport was unavailable.");
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-file "
-                + $"absence (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
-                + "that the files are absent.",
+                $"could-not-verify: audit tool '{tool}' {operation} could not {failureGoal} "
+                + $"(exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
+                + "about the probed files.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
 
-        // The probe echoes each present path, one per line; intersect with
+        // The probe echoes each accepted path, one per line; intersect with
         // the requested set — output beyond it is not trusted.
         var present = new List<string>();
         foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -488,6 +613,135 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 present.Add(line);
         }
         return present;
+    }
+
+    /// <summary>
+    /// Resolves the merge-base of <c>HEAD</c> and the work item's
+    /// <see cref="AuditContext.BaseBranch"/> — the
+    /// <c>origin/&lt;base&gt;...HEAD</c> three-dot semantics the pipeline's own
+    /// diff auditors use, so upstream state added to the base after the
+    /// branch point is not misread as removed. Probes <c>origin/&lt;base&gt;</c>
+    /// first, then the bare branch name, via bounded <c>git</c> executions;
+    /// the <see cref="Validation.ValidateBranchName"/>-validated value reaches
+    /// git only as argv entries, never through a shell. Every failure — an
+    /// empty or invalid base branch, an unresolvable ref, no common ancestor —
+    /// is a deterministic <see cref="AuditUnavailableException"/>:
+    /// infrastructure, never a pass. <paramref name="baselineConfigHint"/> is
+    /// an author-chosen constant appended to those failures so operators can
+    /// find the auditor's explicit-baseline configuration knobs; keep it a
+    /// fixed string, never untrusted data.
+    /// </summary>
+    protected async Task<string> ResolveMergeBaseAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        ExternalToolAuditorOptions options,
+        string baselineConfigHint,
+        CancellationToken ct)
+    {
+        var baseBranch = context.BaseBranch?.Trim();
+        if (string.IsNullOrWhiteSpace(baseBranch))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' has no baseline to compare against: no baseline "
+                + "is configured and the work item carries no usable base branch for merge-base "
+                + $"resolution. {baselineConfigHint}")
+            { IsDeterministic = true };
+
+        try
+        {
+            Validation.ValidateBranchName(baseBranch, nameof(context.BaseBranch));
+        }
+        catch (ArgumentException ex)
+        {
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' cannot resolve a baseline: {SingleLine(ex.Message)}. "
+                + baselineConfigHint, ex)
+            { IsDeterministic = true };
+        }
+
+        var baseBranchDisplay = SingleLine(baseBranch);
+
+        // origin/<base> is the sandbox clone's canonical ref (the pipeline's
+        // own diff auditors use origin/<base>...HEAD); the bare name covers
+        // layouts that only carry a local branch.
+        string? baseSha = null;
+        foreach (var candidate in new[] { $"origin/{baseBranch}", baseBranch })
+        {
+            var probe = await GitProbeAsync(
+                sandbox,
+                workingDirectory,
+                options,
+                ["rev-parse", "--verify", $"{candidate}^{{commit}}"],
+                ct).ConfigureAwait(false);
+            if (probe.ExitCode == 0)
+            {
+                baseSha = ReadCommitSha(probe.Stdout);
+                if (baseSha is not null)
+                    break;
+            }
+        }
+
+        if (baseSha is null)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' could not resolve base branch "
+                + $"'{baseBranchDisplay}' (tried 'origin/{baseBranchDisplay}' and "
+                + $"'{baseBranchDisplay}') in the audited repository — git must be available "
+                + "and the base ref present in the sandbox clone. " + baselineConfigHint)
+            { IsDeterministic = true };
+
+        // Merge-base semantics match the pipeline's three-dot work diff: the
+        // state the change actually diverged from.
+        var mergeBase = await GitProbeAsync(
+            sandbox,
+            workingDirectory,
+            options,
+            ["merge-base", "HEAD", baseSha],
+            ct).ConfigureAwait(false);
+        var mergeBaseSha = mergeBase.ExitCode == 0 ? ReadCommitSha(mergeBase.Stdout) : null;
+        if (mergeBaseSha is null)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' found no merge base between HEAD and "
+                + $"base branch '{baseBranchDisplay}' — the audited history must share an "
+                + "ancestor with the base ref. " + baselineConfigHint)
+            { IsDeterministic = true };
+
+        return mergeBaseSha;
+    }
+
+    private async Task<SandboxExecResult> GitProbeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        ExternalToolAuditorOptions options,
+        IReadOnlyList<string> args,
+        CancellationToken ct)
+    {
+        var argv = new List<string>(args.Count + 1) { "git" };
+        argv.AddRange(args);
+        return await RunBoundedProbeAsync(
+            sandbox,
+            ToolName,
+            "baseline resolution",
+            argv,
+            workingDirectory,
+            options,
+            ct).ConfigureAwait(false);
+    }
+
+    private static string? ReadCommitSha(string stdout)
+    {
+        var firstLine = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault();
+        if (firstLine is null)
+            return null;
+        try
+        {
+            Validation.ValidateCommitSha(firstLine, "git output");
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+        return firstLine;
     }
 
     /// <summary>
@@ -549,6 +803,74 @@ public abstract class ExternalToolAuditorBase : IAuditor
     {
         var normalized = ExternalToolJsonHelpers.NormalizePath(entry).TrimStart('/');
         return normalized.Length == 0 ? null : normalized;
+    }
+
+    /// <summary>
+    /// The <see cref="ExternalToolAuditorOptions.ExcludePaths"/> entries in
+    /// normalized form (<see cref="NormalizeExcludePathEntry"/> output, blank
+    /// entries dropped). Hoist this once per audit run when matching many
+    /// paths — normalization is loop-invariant — then call the
+    /// list-taking <see cref="IsNormalizedPathExcluded(string, IReadOnlyList{string})"/>
+    /// overload.
+    /// </summary>
+    protected static IReadOnlyList<string> NormalizedExcludePaths(ExternalToolAuditorOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var entries = new List<string>(options.ExcludePaths.Count);
+        foreach (var entry in options.ExcludePaths)
+        {
+            var normalized = NormalizeExcludePathEntry(entry);
+            if (normalized is not null)
+                entries.Add(normalized);
+        }
+        return entries;
+    }
+
+    /// <summary>
+    /// The <see cref="ExternalToolAuditorOptions.ExcludePaths"/> matching
+    /// contract — the single source of truth for both the finding-level
+    /// filter below and auditors that must apply the same scope decision
+    /// BEFORE the scan runs (e.g. when narrowing which files are passed as
+    /// tool arguments). <paramref name="normalizedRepoRelativePath"/> must
+    /// already be in repo-relative normalized form (<c>\</c>→<c>/</c>, no
+    /// leading <c>/</c> or <c>./</c> — e.g.
+    /// <c>ExternalToolJsonHelpers.NormalizePath</c> output); a raw or
+    /// un-normalized path silently produces wrong decisions.
+    /// An entry ending in <c>/</c> is a directory-prefix exclusion;
+    /// any other entry excludes exactly that path.
+    /// </summary>
+    protected static bool IsNormalizedPathExcluded(
+        string normalizedRepoRelativePath,
+        ExternalToolAuditorOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return IsNormalizedPathExcluded(normalizedRepoRelativePath, NormalizedExcludePaths(options));
+    }
+
+    /// <summary>
+    /// <see cref="IsNormalizedPathExcluded(string, ExternalToolAuditorOptions)"/>
+    /// over a precomputed <see cref="NormalizedExcludePaths"/> list — for
+    /// callers matching many paths against one options snapshot.
+    /// </summary>
+    protected static bool IsNormalizedPathExcluded(
+        string normalizedRepoRelativePath,
+        IReadOnlyList<string> normalizedExcludeEntries)
+    {
+        ArgumentNullException.ThrowIfNull(normalizedRepoRelativePath);
+        ArgumentNullException.ThrowIfNull(normalizedExcludeEntries);
+        foreach (var normalized in normalizedExcludeEntries)
+        {
+            if (normalized.EndsWith("/", StringComparison.Ordinal))
+            {
+                if (normalizedRepoRelativePath.StartsWith(normalized, StringComparison.Ordinal))
+                    return true;
+            }
+            else if (normalizedRepoRelativePath.Equals(normalized, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
@@ -773,19 +1095,29 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var mapping = SeverityMapping ?? ExternalToolSeverityMapping.Default;
         var maxFindings = Math.Max(1, options.MaxFindings);
         var findings = new List<AuditFinding>(Math.Min(parsed.Count, maxFindings));
+        var excludedPaths = NormalizedExcludePaths(options);
 
         foreach (var item in parsed)
         {
-            if (findings.Count >= maxFindings)
-                break;
             if (item is null)
                 continue;
-            if (IsRuleFiltered(item, options) || IsPathExcluded(item, options))
+            if (IsRuleFiltered(item, options) || IsPathExcluded(item, excludedPaths))
                 continue;
 
             var severity = mapping.Map(item.SeverityLevel);
             if (severity < options.MinimumSeverity)
                 continue;
+
+            // The audit subject controls report order, so capping here would
+            // let a flood of low-severity entries evict a blocking one while
+            // the audit still passed on the survivors — an overflow is
+            // infrastructure, never a truncated report graded as a verdict.
+            if (findings.Count >= maxFindings)
+                throw new AuditUnavailableException(
+                    $"could-not-verify: audit tool '{tool}' reported more findings than the "
+                    + $"MaxFindings bound of {maxFindings} — a capped subset could hide "
+                    + "verdict-changing entries. Raise MaxFindings or narrow the audited scope "
+                    + "(ExcludedRules/ExcludePaths/MinimumSeverity).");
 
             findings.Add(new AuditFinding(
                 AuditorName: Name,
@@ -808,28 +1140,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
             && (string.IsNullOrWhiteSpace(item.RuleId) || !options.IncludedRules.Contains(item.RuleId));
     }
 
-    private static bool IsPathExcluded(ExternalToolFinding item, ExternalToolAuditorOptions options)
+    private static bool IsPathExcluded(
+        ExternalToolFinding item,
+        IReadOnlyList<string> normalizedExcludeEntries)
     {
-        if (options.ExcludePaths.Count == 0 || string.IsNullOrWhiteSpace(item.Path))
+        if (normalizedExcludeEntries.Count == 0 || string.IsNullOrWhiteSpace(item.Path))
             return false;
-        var path = NormalizeFindingPath(item.Path);
-        foreach (var entry in options.ExcludePaths)
-        {
-            var normalized = NormalizeExcludePathEntry(entry);
-            if (normalized is null)
-                continue;
-            if (normalized.EndsWith("/", StringComparison.Ordinal))
-            {
-                if (path.StartsWith(normalized, StringComparison.Ordinal))
-                    return true;
-            }
-            else if (path.Equals(normalized, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return IsNormalizedPathExcluded(NormalizeFindingPath(item.Path), normalizedExcludeEntries);
     }
 
     private static string BuildTitle(ExternalToolFinding item)
@@ -866,34 +1183,24 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private static string NormalizeFindingPath(string? path)
         => ExternalToolJsonHelpers.NormalizePath(path).TrimStart('/');
 
-    private static string BuildRawOutput(
-        SandboxExecResult result,
-        ExternalToolAuditorOptions options,
-        int droppedFindings,
-        bool findingsTruncated)
+    private static string BuildRawOutput(SandboxExecResult result, ExternalToolAuditorOptions options)
     {
         var maxBytes = Math.Clamp(
             options.MaxOutputBytesPerStream,
             ExternalToolAuditorOptions.MinCapturedOutputBytes,
             ExternalToolAuditorOptions.MaxCapturedOutputBytes);
+        // A truncated stdout never reaches this point — RunAsync fails
+        // closed on it above — so only the stderr marker can appear.
         var stdout = result.Stdout;
-        if (result.StdoutLimitExceeded)
-            stdout += $"\n[stdout truncated after {maxBytes} bytes]";
         var stderr = result.Stderr;
         if (result.StderrLimitExceeded)
             stderr += $"\n[stderr truncated after {maxBytes} bytes]";
 
-        string combined;
         if (string.IsNullOrEmpty(stderr))
-            combined = stdout;
-        else if (string.IsNullOrEmpty(stdout))
-            combined = stderr;
-        else
-            combined = stdout + "\n" + stderr;
-
-        if (findingsTruncated)
-            combined += $"\n[findings truncated: {droppedFindings} finding(s) beyond MaxFindings {Math.Max(1, options.MaxFindings)} were dropped]";
-        return combined;
+            return stdout;
+        if (string.IsNullOrEmpty(stdout))
+            return stderr;
+        return stdout + "\n" + stderr;
     }
 
     private static AuditUnavailableException Unavailable(string tool, string reason, SandboxExecResult result)
