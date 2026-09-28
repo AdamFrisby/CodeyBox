@@ -51,15 +51,22 @@ namespace CodeyBox.GraphqlInspectorAuditorPlugin;
 ///
 /// <para><b>Repository-controlled input.</b> <c>diff</c> reads no repository
 /// config file — its only inputs are the two schema pointers and the flags
-/// this auditor builds. The one code-loading surface is <c>--rule</c> with
+/// this auditor builds. The code-loading surfaces are <c>--rule</c> with
 /// a module path (plus <c>--onComplete</c>, <c>--onUsage</c> and
 /// <c>--require</c>, which load sandbox-side JavaScript and, for
 /// <c>--onComplete</c>, replace the exit-1-on-breaking contract the parser
 /// relies on). Operator <c>ExtraArguments</c> carrying any of those flags
 /// are a deterministic infrastructure failure; the side-effect-free builtin
 /// rules are offered instead through the scoped <c>DiffRules</c> key, which
-/// accepts only the exact allowlist below. The audit subject can therefore
-/// neither silence this auditor nor execute code through it.</para>
+/// accepts only the exact allowlist below. The allowlist alone is not
+/// sufficient: the tool resolves a <c>--rule</c> name against the sandbox
+/// working directory (the audited repository root) <em>before</em> its
+/// builtin table, so a repository-root file shadowing a configured builtin
+/// name would be <c>require</c>d as code in-process — able to silence
+/// findings. <see cref="VerifyToolAsync"/> therefore probes for such
+/// shadowing files and fails closed when any is present. The audit subject
+/// can therefore neither silence this auditor nor execute code through
+/// it.</para>
 ///
 /// <para><b>Scope and defaults.</b> The scan is
 /// <c>graphql-inspector diff &lt;OldSchema&gt; &lt;NewSchema&gt;</c> and
@@ -204,7 +211,7 @@ public sealed class GraphqlInspectorAuditor : ExternalToolAuditorBase, IPluginIn
     }
 
     /// <inheritdoc />
-    protected override Task VerifyToolAsync(
+    protected override async Task VerifyToolAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
@@ -224,7 +231,8 @@ public sealed class GraphqlInspectorAuditor : ExternalToolAuditorBase, IPluginIn
                 + $"schema pointer (file, git:ref:path, github: pointer, or URL) of at most {MaxPointerChars} "
                 + $"characters. Configure CodeyBox:Plugins:{PluginId}:{NewSchemaKey}.");
 
-        foreach (var rule in _diffRules())
+        var rules = _diffRules();
+        foreach (var rule in rules)
         {
             if (!AllowedDiffRules.Contains(rule))
                 throw new AuditUnavailableException(
@@ -232,6 +240,10 @@ public sealed class GraphqlInspectorAuditor : ExternalToolAuditorBase, IPluginIn
                     + $"a supported builtin diff rule (supported: {string.Join(", ", AllowedDiffRules.Order())}). "
                     + "Custom rule modules are not accepted because they load sandbox-side JavaScript.");
         }
+
+        if (rules.Count > 0)
+            await ThrowIfRuleShadowedByRepositoryFileAsync(
+                sandbox, workingDirectory, tool, rules, options, ct).ConfigureAwait(false);
 
         foreach (var extra in options.ExtraArguments)
         {
@@ -241,8 +253,40 @@ public sealed class GraphqlInspectorAuditor : ExternalToolAuditorBase, IPluginIn
                     + $"code or replaces the verified exit/output contract (--rule/--onComplete/--onUsage/--require). "
                     + $"Use scoped '{DiffRulesKey}' for builtin diff rules.");
         }
+    }
 
-        return Task.CompletedTask;
+    /// <summary>
+    /// Fails closed when a repository-controlled file shadows a configured
+    /// builtin <c>--rule</c> name. The tool resolves each rule name against
+    /// its working directory (the audited repository root) and
+    /// <c>require</c>s a hit <em>before</em> consulting its builtin rule
+    /// table, so a repository-root file named e.g.
+    /// <c>dangerousBreaking</c> would execute audit-subject code in-process
+    /// with the CLI — able to suppress breaking changes. A bounded sandbox
+    /// presence probe keeps this check at the sink: even a future caller
+    /// passing a new allowlisted name through <c>--rule</c> is covered,
+    /// because the probe runs over the entries actually emitted as argv.
+    /// </summary>
+    private static async Task ThrowIfRuleShadowedByRepositoryFileAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> rules,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var present = await ProbeRepositoryFilesPresentAsync(
+            sandbox, workingDirectory, tool, rules, options, ct).ConfigureAwait(false);
+        if (present.Count > 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' found repository-controlled file(s) "
+                + $"'{string.Join("', '", present)}' at the audited repository root shadowing configured "
+                + $"builtin diff rule(s) from scoped '{DiffRulesKey}' — graphql-inspector resolves '--rule' "
+                + "names against its working directory and loads a hit as code before its builtin rule "
+                + "table, so the audit subject could execute code with the scan and suppress findings. "
+                + "Remove the file(s) or drop the shadowed rule(s) from "
+                + $"CodeyBox:Plugins:{PluginId}:{DiffRulesKey}.")
+            { IsDeterministic = true };
     }
 
     /// <inheritdoc />
@@ -268,6 +312,13 @@ public sealed class GraphqlInspectorAuditor : ExternalToolAuditorBase, IPluginIn
         {
             if (value.Equals(flag, StringComparison.Ordinal)
                 || value.StartsWith(flag + "=", StringComparison.Ordinal))
+                return true;
+            // Joined short form (e.g. "-r<module>"): the base documents and
+            // handles this shape for single-dash value options, so the guard
+            // matches it too.
+            if (flag.Length == 2 && flag[0] == '-' && flag[1] != '-'
+                && value.Length > flag.Length
+                && value.StartsWith(flag, StringComparison.Ordinal))
                 return true;
         }
 

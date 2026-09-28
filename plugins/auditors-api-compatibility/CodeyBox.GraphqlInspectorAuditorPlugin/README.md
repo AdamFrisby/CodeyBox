@@ -137,17 +137,46 @@ run (hot-reloadable):
 |---|---|---|
 | `OldSchema` | — (required) | Baseline schema pointer: SDL file (`schema/old.graphql`), `git:<ref>:<path>`, `github:` pointer, or URL. Unset (or over 1024 chars) is a deterministic infrastructure failure. |
 | `NewSchema` | — (required) | Current schema pointer, same forms as `OldSchema`. Its repo-relative file form becomes each finding's location. |
-| `DiffRules` | — | Comma-separated builtin diff rules, appended as `--rule <name>` argv pairs: `dangerousBreaking`, `suppressRemovalOfDeprecatedField`, `ignoreDescriptionChanges`, `safeUnreachable`. Anything else is a deterministic configuration failure — custom rule modules load sandbox-side JavaScript and are not accepted. |
+| `DiffRules` | — | Comma-separated builtin diff rules, appended as `--rule <name>` argv pairs: `dangerousBreaking`, `suppressRemovalOfDeprecatedField`, `ignoreDescriptionChanges`, `safeUnreachable`. Anything else is a deterministic configuration failure — custom rule modules load sandbox-side JavaScript and are not accepted. A repository-root file shadowing a configured entry is likewise a failure (see *Repository-controlled input*). |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity — e.g. `error` keeps only breaking changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop (e.g. `FIELD_REMOVED`, `BREAKING_CHANGE`). |
 | `ExcludePaths` | — | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Applies to the `NewSchema` file location above. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--federation`, `--federationV2`, `--aws`, `--method`, `--header` / `--token` for URL schemas. Entries that load code or replace the verified contract (`--rule`, `--onComplete`, `--onUsage`, `-r` / `--require`, including `=` forms) are a deterministic configuration failure — use `DiffRules` for builtin rules. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--federation`, `--federationV2`, `--aws`, `--method`, `--header` / `--token` for URL schemas. Entries that load code or replace the verified contract (`--rule`, `--onComplete`, `--onUsage`, `-r` / `--require`, including `=` and joined-short `-r<module>` forms) are a deterministic configuration failure — use `DiffRules` for builtin rules. |
 | `TimeoutSeconds` | `300` | Per-run bound; exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 
 `graphql-inspector diff` reads **no standalone config file** and no
 repository config — its only inputs are the two pointers and the flags
-above, so there is no repository-controlled suppression surface to gate.
+above. The one repository-controlled surface is rule-name shadowing (see
+*Repository-controlled input* below): a repository-root file whose name
+matches a configured `DiffRules` entry fails the audit closed as
+infrastructure before the scan runs.
+
+## Repository-controlled input
+
+`diff` reads no repository config file. Its code-loading surfaces are
+`--rule` with a module path, `--onComplete` / `--onUsage` (JavaScript
+modules; `--onComplete` additionally replaces the exit-1-on-breaking
+contract the parser relies on), and `-r` / `--require`. Operator
+`ExtraArguments` carrying any of those flags — including the joined short
+form `-r<module>` — are a deterministic infrastructure failure; the
+side-effect-free builtin rules are offered instead through the scoped
+`DiffRules` key, which accepts only the exact allowlist
+(`dangerousBreaking`, `suppressRemovalOfDeprecatedField`,
+`ignoreDescriptionChanges`, `safeUnreachable`).
+
+The allowlist alone is not sufficient: `graphql-inspector` resolves each
+`--rule` name against its working directory (the audited repository root)
+and `require`s a hit as code *before* consulting its builtin rule table
+(verified against `@graphql-inspector/diff-command` 7.0.0). A
+repository-root file named e.g. `dangerousBreaking` would therefore execute
+audit-subject code in-process with the CLI — able to suppress breaking
+changes and read operator-supplied argv such as `--token`. Before every
+scan, the auditor probes the repository root for files shadowing the
+configured `DiffRules` entries and fails closed with an infrastructure
+error naming the file(s) when any is present. Either delete the file(s) or
+drop the shadowed rule(s) from `DiffRules`. With no `DiffRules` configured
+no `--rule` argv is emitted and no probe is needed.
 
 ## Default scope
 

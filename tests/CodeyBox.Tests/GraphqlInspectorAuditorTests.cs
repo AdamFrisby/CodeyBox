@@ -19,8 +19,9 @@ namespace CodeyBox.Tests;
 ///   empty output all fail closed as infrastructure.
 /// - Breaking/dangerous/safe lines map to findings with rule ids, the
 ///   audited schema file as location, and mapped (never raw) severities.
-/// - Unset schema pointers, unknown diff rules, and code-loading extra
-///   arguments are deterministic infrastructure failures.
+/// - Unset schema pointers, unknown diff rules, repository files shadowing
+///   a configured diff rule, and code-loading extra arguments are
+///   infrastructure failures (never a pass, never a scan).
 /// - Plugin is disabled by default, absent from baseline provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_graphql_inspector", "true")].
 /// </summary>
@@ -418,7 +419,7 @@ public sealed class GraphqlInspectorAuditorTests
     [Fact]
     public async Task CodeLoadingExtraArguments_AreRejected_BeforeExec()
     {
-        foreach (var extra in new[] { "--onComplete", "--onComplete=./handler.js", "--onUsage", "-r", "--require", "--rule", "--rule=dangerousBreaking" })
+        foreach (var extra in new[] { "--onComplete", "--onComplete=./handler.js", "--onUsage", "-r", "-r./preload.js", "--require", "--rule", "--rule=dangerousBreaking" })
         {
             var scanExecs = 0;
             var sandbox = new FakeSandbox((exec, _) =>
@@ -450,10 +451,18 @@ public sealed class GraphqlInspectorAuditorTests
     public async Task DiffRules_AppendAsRuleFlagPairs_AfterPointers()
     {
         SandboxExec? scanExec = null;
+        var shadowingProbes = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec))
                 return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+            {
+                // No repository-root file shadows the configured builtin
+                // rules: the probe echoes nothing back.
+                shadowingProbes++;
+                return Task.FromResult(Ok(exec));
+            }
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(0, ReportClean, ""));
         });
@@ -471,6 +480,7 @@ public sealed class GraphqlInspectorAuditorTests
         var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
 
         Assert.True(result.Passed);
+        Assert.Equal(1, shadowingProbes);
         Assert.NotNull(scanExec);
         var argv = scanExec!.Argv.ToList();
         Assert.Equal(
@@ -479,6 +489,70 @@ public sealed class GraphqlInspectorAuditorTests
         Assert.Contains("--rule", argv);
         Assert.Contains("suppressRemovalOfDeprecatedField", argv);
         Assert.Contains("safeUnreachable", argv);
+    }
+
+    [Fact]
+    public async Task DiffRuleShadowedByRepositoryFile_FailsClosed_BeforeExec()
+    {
+        // graphql-inspector resolves each --rule name against its working
+        // directory (the audited repository root) and require()s a hit as
+        // code before consulting its builtin rule table, so a
+        // repository-root file shadowing a configured builtin rule name
+        // must fail the audit closed — never reach the scan.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+            {
+                // The probe echoes each present path one per line: simulate
+                // a repository-root file shadowing the configured rule.
+                Assert.Contains("dangerousBreaking", exec.Argv);
+                return Task.FromResult(new SandboxExecResult(0, "dangerousBreaking\n", ""));
+            }
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, ReportClean, ""));
+        });
+
+        var auditor = new GraphqlInspectorAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:OldSchema"] = DefaultOldSchema,
+                ["Scoped:NewSchema"] = DefaultNewSchema,
+                ["Scoped:DiffRules"] = "dangerousBreaking",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+        Assert.Contains("dangerousBreaking", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(GraphqlInspectorAuditor.DiffRulesKey, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task NoDiffRules_Configured_SkipsShadowingProbe()
+    {
+        var sawRepoFileProbe = false;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+            {
+                sawRepoFileProbe = true;
+                return Task.FromResult(Ok(exec));
+            }
+            return Task.FromResult(new SandboxExecResult(0, ReportClean, ""));
+        });
+
+        var auditor = await CreateAuditorAsync();
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.False(sawRepoFileProbe);
     }
 
     [Fact]
@@ -787,6 +861,13 @@ public sealed class GraphqlInspectorAuditorTests
             && exec.Argv[1] == "-c"
             && exec.Argv[2].Contains("command -v", StringComparison.Ordinal)
             && exec.Argv.Contains("graphql-inspector", StringComparer.Ordinal);
+
+    private static bool IsRepoFileProbe(SandboxExec exec)
+        => exec.Argv.Count >= 3
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2].Contains("-e", StringComparison.Ordinal)
+            && !exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private static async Task<string> SeedGraphqlFixtureRepoAsync(bool breaking)
     {
