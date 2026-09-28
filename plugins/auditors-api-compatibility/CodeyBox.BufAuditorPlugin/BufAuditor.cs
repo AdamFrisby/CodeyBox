@@ -290,7 +290,7 @@ public sealed class BufAuditor : ExternalToolAuditorBase, IPluginInitializer
         _against = () => scoped[AgainstKey];
         _againstRegistry = () =>
             bool.TryParse(scoped[AgainstRegistryKey], out var registry) && registry;
-        _configPath = () => scoped[ConfigPathKey] ?? scoped["Config"];
+        _configPath = () => scoped[ConfigPathKey];
         context.Logger.LogInformation(
             "BufAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
@@ -375,37 +375,6 @@ public sealed class BufAuditor : ExternalToolAuditorBase, IPluginInitializer
         return mergeBaseSha;
     }
 
-    private async Task<SandboxExecResult> GitProbeAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        ExternalToolAuditorOptions options,
-        IReadOnlyList<string> args,
-        CancellationToken ct)
-    {
-        var argv = new List<string>(args.Count + 1) { "git" };
-        argv.AddRange(args);
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "baseline resolution",
-            new SandboxExec
-            {
-                Argv = argv,
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' baseline resolution could not run: "
-                + "the sandbox exec transport was unavailable.");
-        return result;
-    }
-
     /// <summary>
     /// The config file the scan will actually consult: the scoped
     /// <c>ConfigPath</c> value, or an operator-supplied <c>--config</c> in
@@ -441,80 +410,8 @@ public sealed class BufAuditor : ExternalToolAuditorBase, IPluginInitializer
         return ValidatedArgumentValue(extra, $"ExtraArguments '{ConfigFlag}'");
     }
 
-    /// <summary>
-    /// Extracts the value an operator's <c>ExtraArguments</c> supplies for a
-    /// long-form flag — the entry following a bare <c>--flag</c>, or the
-    /// text after <c>--flag=</c>, the same spellings
-    /// <see cref="ExtraArgumentsSupplyFlag"/> recognizes. The last
-    /// occurrence wins; a bare trailing flag yields a null value (the tool
-    /// would reject it — callers validate).
-    /// </summary>
-    private static bool TryGetExtraArgumentsFlagValue(
-        ExternalToolAuditorOptions options,
-        string flag,
-        out string? value)
-    {
-        value = null;
-        var supplied = false;
-        var attachedPrefix = flag + "=";
-        var extraArguments = options.ExtraArguments;
-        for (var i = 0; i < extraArguments.Count; i++)
-        {
-            var arg = extraArguments[i];
-            if (string.Equals(arg, flag, StringComparison.Ordinal))
-            {
-                supplied = true;
-                value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
-            }
-            else if (arg.StartsWith(attachedPrefix, StringComparison.Ordinal))
-            {
-                supplied = true;
-                value = arg[attachedPrefix.Length..];
-            }
-        }
-        return supplied;
-    }
-
     private static string BaselineConfigHint
         => $"Set CodeyBox:Plugins:{PluginId}:{AgainstKey} to a buf input (e.g. '.git#branch=main'), "
             + $"set {AgainstRegistryKey} to true for BSR comparison, or pass --against* via "
             + "ExtraArguments, to pin the baseline explicitly.";
-
-    private static string? ValidatedScopedValue(string? value, string key)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return null;
-        return ValidatedArgumentValue(value, key);
-    }
-
-    /// <summary>
-    /// Validates a configured value that travels to the tool as an argv
-    /// entry: bounded length, no leading dash (it would be read as another
-    /// flag), no control characters. <paramref name="source"/> names the
-    /// knob that supplied the value for the failure message. Values are
-    /// never concatenated into a shell string — this only guards the argv
-    /// contract.
-    /// </summary>
-    private static string ValidatedArgumentValue(string value, string source)
-    {
-        var trimmed = value.Trim();
-        const int maxChars = 1024;
-        if (trimmed.Length == 0 || trimmed.Length > maxChars
-            || trimmed[0] == '-'
-            || trimmed.Any(char.IsControl))
-            throw new AuditUnavailableException(
-                $"could-not-verify: configured '{source}' is not a usable argument value "
-                + "(empty, overlong, leading '-', or contains control characters).")
-            { IsDeterministic = true };
-        return trimmed;
-    }
-
-    private static string? ReadCommitSha(string stdout)
-    {
-        var token = stdout.Split(
-            [' ', '\n', '\r', '\t'],
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        return string.IsNullOrWhiteSpace(token) ? null : token.Trim();
-    }
 }

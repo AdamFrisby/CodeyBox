@@ -75,8 +75,11 @@ in your sandbox baseline from the upstream release tarball:
 
 ```sh
 # Baseline provisioning bake step (x86_64 example)
-curl -sSL -o /tmp/buf.tar.gz \
+curl -fsSL -o /tmp/buf.tar.gz \
   https://github.com/bufbuild/buf/releases/download/v1.73.0/buf-Linux-x86_64.tar.gz
+curl -fsSL -o /tmp/buf-sha256.txt \
+  https://github.com/bufbuild/buf/releases/download/v1.73.0/sha256.txt
+(cd /tmp && grep 'buf-Linux-x86_64.tar.gz' buf-sha256.txt | sha256sum -c -)
 tar -xzf /tmp/buf.tar.gz -C /tmp/bufstage
 install -m 0755 /tmp/bufstage/buf/bin/buf /usr/local/bin/buf
 buf --version   # must print 1.73.0
