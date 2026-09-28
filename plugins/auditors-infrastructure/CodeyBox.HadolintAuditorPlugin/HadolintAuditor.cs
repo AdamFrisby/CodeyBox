@@ -80,7 +80,12 @@ namespace CodeyBox.HadolintAuditorPlugin;
 /// <c>build</c>, <c>out</c> or <c>coverage</c> at any depth. Findings under
 /// the default <c>ExcludePaths</c> prefixes are additionally dropped
 /// post-scan, so an operator-supplied <c>Targets</c> entry under a vendored
-/// tree is still filtered unless <c>ExcludePaths</c> is overridden. More
+/// tree is still filtered unless <c>ExcludePaths</c> is overridden. Every
+/// target — discovered or configured — reaches hadolint as one argv entry
+/// with a <c>./</c> prefix, so a repository-controlled dash-leading filename
+/// (e.g. <c>--config=x.dockerfile</c>) is parsed as a path, never as a tool
+/// flag; a configured <c>Targets</c> entry with a leading dash fails closed
+/// instead. More
 /// than <c>MaxDiscoveredTargets</c> candidates is a deterministic
 /// infrastructure failure directing the operator to set <c>Targets</c> —
 /// the scan never silently covers a subset. A tree with no Dockerfiles is a
@@ -113,7 +118,10 @@ public sealed class HadolintAuditor : ExternalToolAuditorBase, IPluginInitialize
     /// Scoped-config key for explicit scan targets (comma-separated
     /// repository-relative Dockerfile paths, positional args). Unset →
     /// Dockerfile discovery (see the class documentation). Set → discovery
-    /// is skipped and the entries are passed verbatim.
+    /// is skipped and the entries are validated (repository-relative, no
+    /// <c>..</c> segments, never leading-dash — a leading-dash positional
+    /// would be option-parsed as a hadolint flag) and passed with a
+    /// <c>./</c> prefix that keeps them positional.
     /// </summary>
     public const string TargetsKey = "Targets";
 
@@ -156,6 +164,19 @@ public sealed class HadolintAuditor : ExternalToolAuditorBase, IPluginInitialize
     internal const int MaxDiscoveredTargets = 200;
 
     private const int DiscoveryProbeMaxStdoutBytes = 64 * 1024;
+
+    // Discovery is a liveness probe, not the scan: it shares the configured
+    // scan timeout below this cap so file enumeration on a huge tree cannot
+    // stall the audit. One named value feeds both the comparison and the
+    // clamp so the two cannot drift apart.
+    private static readonly TimeSpan DiscoveryProbeTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Upper bound on the length of one discovered Dockerfile path. Discovery
+    /// output lists repository file content (untrusted input), so a single
+    /// unbounded entry is rejected rather than carried into the scan argv.
+    /// </summary>
+    private const int MaxDiscoveredPathLength = 1024;
 
     // Fixed discovery probe: argv entries only, never a shell, and nothing
     // interpolated from configuration — operator input reaches hadolint as
@@ -300,12 +321,68 @@ public sealed class HadolintAuditor : ExternalToolAuditorBase, IPluginInitialize
             .Select(static t => t.Trim())
             .ToList();
         if (targets.Count > 0)
-            args.AddRange(targets);
+            args.AddRange(targets.Select(NormalizeTargetEntry));
         else
             args.AddRange(await DiscoverDockerfilesAsync(sandbox, workingDirectory, options, ct)
                 .ConfigureAwait(false));
 
         return args;
+    }
+
+    // A target — discovered or operator-configured — reaches hadolint as one
+    // argv entry (never through a shell), and the "./" prefix keeps a
+    // leading-dash name from being read as a tool flag: the option parser
+    // reads "--config=…" as a flag but "./--config=…" as a path.
+    private static string ToSafePositional(string relativePath)
+        => "./" + relativePath;
+
+    // Operator-configured Targets entries are positional arguments emitted
+    // after every flag, so a leading-dash entry would be parsed as a
+    // hadolint flag (e.g. "--config=…" silently replacing the auditor's own
+    // config selection and re-enabling repository-controlled gate
+    // configuration). Fail closed instead of scanning under foreign flags.
+    private static string NormalizeTargetEntry(string entry)
+    {
+        var normalized = entry.Replace('\\', '/').Trim();
+        var stripped = normalized.StartsWith("./", StringComparison.Ordinal) ? normalized[2..] : normalized;
+        if (stripped.Length == 0
+            || stripped.StartsWith("/", StringComparison.Ordinal)
+            || stripped.StartsWith("-", StringComparison.Ordinal)
+            || stripped.Contains('\n', StringComparison.Ordinal)
+            || stripped.Contains('\r', StringComparison.Ordinal)
+            || stripped.Split('/').Contains("..", StringComparer.Ordinal))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{PluginId}' was configured with an invalid {TargetsKey} entry "
+                + $"('{TruncateForMessage(entry)}'): expected a repository-relative Dockerfile path without "
+                + "'..' segments; entries starting with '-' are rejected because a leading-dash positional "
+                + "would be parsed as a hadolint flag.")
+            { IsDeterministic = true };
+        return ToSafePositional(stripped);
+    }
+
+    // Discovery output lists repository file content — untrusted. Every entry
+    // must be a repository-relative path, or the scan scope cannot be trusted
+    // and the run fails closed instead of scanning a narrowed set. The
+    // returned value keeps no "./" prefix; callers add it with
+    // <see cref="ToSafePositional"/> (never stripped: stripping it is what
+    // would expose a dash-leading name such as "--config=x.dockerfile" to
+    // the tool's option parser), so a dash-leading name stays an inert
+    // positional path.
+    private string ValidateDiscoveredEntry(string entry)
+    {
+        var stripped = entry.StartsWith("./", StringComparison.Ordinal) ? entry[2..] : entry;
+        if (stripped.Length == 0
+            || stripped.Length > MaxDiscoveredPathLength
+            || stripped.StartsWith("/", StringComparison.Ordinal)
+            || stripped.Contains('\n', StringComparison.Ordinal)
+            || stripped.Contains('\r', StringComparison.Ordinal)
+            || stripped.Split('/').Contains("..", StringComparer.Ordinal))
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' Dockerfile discovery returned an entry outside "
+                + $"the expected repository-relative shape ('{TruncateForMessage(entry)}'). The scan scope "
+                + "cannot be trusted, so this is infrastructure, not a verdict on the diff.")
+            { IsDeterministic = true };
+        return stripped;
     }
 
     private async Task<IReadOnlyList<string>> DiscoverDockerfilesAsync(
@@ -315,8 +392,8 @@ public sealed class HadolintAuditor : ExternalToolAuditorBase, IPluginInitialize
         CancellationToken ct)
     {
         var timeout = EffectiveTimeout(options);
-        if (timeout > TimeSpan.FromSeconds(30))
-            timeout = TimeSpan.FromSeconds(30);
+        if (timeout > DiscoveryProbeTimeout)
+            timeout = DiscoveryProbeTimeout;
         var probe = await ExecToolBoundedAsync(
             sandbox,
             ToolName,
@@ -354,12 +431,12 @@ public sealed class HadolintAuditor : ExternalToolAuditorBase, IPluginInitialize
 
         var discovered = probe.Stdout
             .Split('\n')
-            .Select(static line => line.Trim())
+            .Select(static line => line.Replace('\\', '/').Trim())
             .Where(static line => line.Length > 0)
-            .Select(static line => line.StartsWith("./", StringComparison.Ordinal) ? line[2..] : line)
-            .Where(static line => line.Length > 0)
+            .Select(ValidateDiscoveredEntry)
             .Distinct(StringComparer.Ordinal)
             .OrderBy(static line => line, StringComparer.Ordinal)
+            .Select(ToSafePositional)
             .ToList();
         if (discovered.Count > MaxDiscoveredTargets)
             throw new AuditUnavailableException(

@@ -35,10 +35,30 @@ internal sealed class HadolintSarifOutputParser : IExternalToolOutputParser
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
         ArgumentNullException.ThrowIfNull(input);
+        var stdout = input.Stdout ?? string.Empty;
         if (input.ExitCode == 1
-            && (input.Stdout ?? string.Empty).Contains(NoInputFilesSentinel, StringComparison.Ordinal)
-            && !(input.Stdout ?? string.Empty).Contains("\"runs\"", StringComparison.Ordinal))
+            && stdout.Contains(NoInputFilesSentinel, StringComparison.Ordinal)
+            && !stdout.Contains("\"runs\"", StringComparison.Ordinal))
             return [];
-        return _inner.Parse(input);
+        var findings = _inner.Parse(input);
+        if (findings.Count == 0)
+            return findings;
+        // The auditor passes scan targets with a "./" prefix so dash-leading
+        // names are never option-parsed; hadolint echoes that prefix back in
+        // artifact URIs. Strip it so finding locations and ExcludePaths match
+        // the repository-relative form every other auditor reports.
+        return findings
+            .Select(static finding => finding.Path is null
+                ? finding
+                : finding with { Path = StripDotSlashPrefix(finding.Path) })
+            .ToList();
+    }
+
+    private static string StripDotSlashPrefix(string path)
+    {
+        var stripped = path;
+        while (stripped.StartsWith("./", StringComparison.Ordinal))
+            stripped = stripped[2..];
+        return stripped.Length == 0 ? path : stripped;
     }
 }

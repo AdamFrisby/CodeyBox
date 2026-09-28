@@ -41,6 +41,11 @@ file/line location.
 - **More than 200 discovered Dockerfiles.** Discovery beyond the bound
   fails closed (infrastructure) instead of scanning a silent subset; scope
   the scan with `Targets`.
+- **Dash-leading filenames as flags.** Every scan target is passed as one
+  argv entry with a `./` prefix, so a repository-controlled file such as
+  `--config=x.dockerfile` is parsed as a path, never as a hadolint flag;
+  a `Targets` entry with a leading dash fails closed instead of scanning
+  under foreign flags.
 
 ## Exit codes and failure classification
 
@@ -135,7 +140,7 @@ Scoped under `CodeyBox:Plugins:codeybox.hadolint`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `2.15.1` | Pinned hadolint release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `Targets` | — (discovery) | Comma-separated repository-relative Dockerfile paths scanned positionally. Unset → fixed `find` discovery (see above). Set → discovery skipped, entries passed verbatim. |
+| `Targets` | — (discovery) | Comma-separated repository-relative Dockerfile paths scanned positionally. Unset → fixed `find` discovery (see above). Set → discovery skipped; entries are validated (no `..`, no leading dash — a leading-dash positional would be option-parsed as a flag) and passed with a `./` prefix that keeps them positional. |
 | `ConfigPath` | — | Operator-owned hadolint config file, passed as `--config` (replaces repository discovery). Should live outside the audited tree. |
 | `TrustRepositoryConfig` | `true` | Honour the repo's `.hadolint.yaml`/`.hadolint.yml`. `false` with no `ConfigPath` runs under hadolint defaults via `--config /dev/null`. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. `warning` keeps errors and warnings; `error` keeps only blocking findings. |

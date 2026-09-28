@@ -345,9 +345,10 @@ public sealed class HadolintAuditorTests
         Assert.Contains("-f", argv);
         var formatIndex = argv.ToList().IndexOf("-f");
         Assert.Equal("sarif", argv[formatIndex + 1]);
-        // Discovery contributed the positional targets.
-        Assert.Contains("Dockerfile", argv);
-        Assert.Contains("broken/Dockerfile", argv);
+        // Discovery contributed the positional targets, each as one argv
+        // entry with a ./ prefix so dash-leading names stay positional.
+        Assert.Contains("./Dockerfile", argv);
+        Assert.Contains("./broken/Dockerfile", argv);
     }
 
     [Fact]
@@ -548,9 +549,10 @@ public sealed class HadolintAuditorTests
         var argv = scanExec!.Argv;
         Assert.Equal("hadolint", argv[0]);
         // No shell: the discovery probe itself is argv, and its results are
-        // passed as positional args with the ./ prefix stripped, sorted.
+        // passed as positional args with a ./ prefix (so a dash-leading
+        // name is never option-parsed), sorted by repository-relative path.
         var targets = argv.Skip(3).ToList();
-        Assert.Equal(["Containerfile", "Dockerfile", "deploy/Dockerfile.api"], targets);
+        Assert.Equal(["./Containerfile", "./Dockerfile", "./deploy/Dockerfile.api"], targets);
     }
 
     [Fact]
@@ -600,6 +602,96 @@ public sealed class HadolintAuditorTests
 
         Assert.True(ex.IsDeterministic);
         Assert.Contains("hadolint", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(HadolintAuditor.TargetsKey, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task Discovery_DashLeadingFilename_StaysAPositionalPath_NeverAFlag()
+    {
+        // A repository-controlled file named like a hadolint flag (e.g.
+        // --config=x.dockerfile) must reach the tool as a path, not as an
+        // option that swaps the auditor's config selection.
+        const string dashLeadingSarif = """
+            {
+              "$schema": "http://json.schemastore.org/sarif-2.1.0",
+              "version": "2.1.0",
+              "runs": [
+                {
+                  "tool": { "driver": { "name": "Hadolint", "version": "2.15.1" } },
+                  "results": [
+                    {
+                      "ruleId": "DL3006",
+                      "level": "warning",
+                      "message": { "text": "Always tag the version of an image explicitly" },
+                      "locations": [
+                        {
+                          "physicalLocation": {
+                            "artifactLocation": { "uri": "./--config=x.dockerfile" },
+                            "region": { "startLine": 1 }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+            """;
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoConfigProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsDiscoveryProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "./--config=x.dockerfile\n./Dockerfile\n", ""));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(1, dashLeadingSarif, ""));
+        });
+
+        IAuditor auditor = new HadolintAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        var argv = scanExec!.Argv;
+        // One argv entry carrying the ./ prefix — the tool's option parser
+        // sees a path, and the entry is never split or reordered.
+        Assert.Contains("./--config=x.dockerfile", argv);
+        Assert.Contains("./Dockerfile", argv);
+        Assert.DoesNotContain("--config=x.dockerfile", argv);
+        Assert.DoesNotContain("--config", argv);
+        // hadolint echoes the ./ prefix in artifact URIs; the parser strips
+        // it so locations stay repository-relative.
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("--config=x.dockerfile:1", finding.Location);
+        Assert.True(result.Passed);
+    }
+
+    [Fact]
+    public async Task Targets_LeadingDashEntry_FailsClosedAsDeterministicInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsDiscoveryProbe(exec) || IsRepoConfigProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var auditor = new HadolintAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:Targets"] = "--config=/dev/null, Dockerfile",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
         Assert.Contains(HadolintAuditor.TargetsKey, ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
@@ -723,8 +815,8 @@ public sealed class HadolintAuditorTests
         Assert.Equal(0, discoveryExecs);
         Assert.NotNull(scanExec);
         var argv = scanExec!.Argv;
-        Assert.Contains("docker/web.Dockerfile", argv);
-        Assert.Contains("deploy/api.Dockerfile", argv);
+        Assert.Contains("./docker/web.Dockerfile", argv);
+        Assert.Contains("./deploy/api.Dockerfile", argv);
     }
 
     [Fact]
