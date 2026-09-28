@@ -53,6 +53,26 @@ public sealed class ExternalToolSeverityMapping
         },
         AuditSeverity.Warning);
 
+    /// <summary>
+    /// Returns a mapping with <paramref name="levels"/> layered over this
+    /// one — entries override same-named levels, everything else is
+    /// inherited. Auditors whose tool speaks extra dialect words extend
+    /// <see cref="Default"/> rather than restating it, so a re-tuned shared
+    /// vocabulary cannot silently drift from the entries every auditor
+    /// already shares. <paramref name="defaultSeverity"/> replaces the
+    /// fallback when set.
+    /// </summary>
+    public ExternalToolSeverityMapping Extend(
+        IReadOnlyDictionary<string, AuditSeverity> levels,
+        AuditSeverity? defaultSeverity = null)
+    {
+        ArgumentNullException.ThrowIfNull(levels);
+        var merged = new Dictionary<string, AuditSeverity>(_levels, StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in levels)
+            merged[pair.Key] = pair.Value;
+        return new ExternalToolSeverityMapping(merged, defaultSeverity ?? DefaultSeverity);
+    }
+
     /// <summary>Maps a tool-reported level to <see cref="AuditSeverity"/>.</summary>
     public AuditSeverity Map(string? level)
         => string.IsNullOrWhiteSpace(level) || !_levels.TryGetValue(level.Trim(), out var severity)

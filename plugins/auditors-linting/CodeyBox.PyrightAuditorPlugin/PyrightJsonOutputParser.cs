@@ -18,9 +18,11 @@ namespace CodeyBox.PyrightAuditorPlugin;
 /// carried on the parse input so this parser stays stateless and shared
 /// across concurrent audits. Diagnostics outside the scan root (e.g. a
 /// typeshed stub or an absolute path an operator added via
-/// <c>ExtraArguments</c>) are re-marked with an explicit <c>file://</c>
-/// scheme on their absolute path: the base's finding-path normalization
-/// trims a bare leading <c>/</c>, which would otherwise de-root
+/// <c>ExtraArguments</c>) go through the shared
+/// <see cref="ExternalToolJsonHelpers.RelativizeOrMarkFileUri"/>, which
+/// re-marks them with an explicit <c>file://</c> scheme on their absolute
+/// path: the base's finding-path normalization trims a bare leading
+/// <c>/</c>, which would otherwise de-root
 /// <c>/opt/typeshed/x.pyi</c> into <c>opt/typeshed/x.pyi</c> — a string that
 /// reads as a repository path and could accidentally match repo-relative
 /// <c>ExcludePaths</c> entries. The marker keeps out-of-tree evidence
@@ -43,8 +45,6 @@ internal sealed class PyrightJsonOutputParser : IExternalToolOutputParser
 {
     // Same per-document result bound the shared SARIF parser applies.
     private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
-
-    private const string FileSchemePrefix = "file://";
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
@@ -103,27 +103,7 @@ internal sealed class PyrightJsonOutputParser : IExternalToolOutputParser
             SeverityLevel: NullIfWhiteSpace(GetString(diagnostic, "severity"u8)),
             RuleId: NullIfWhiteSpace(GetString(diagnostic, "rule"u8)),
             Message: NullIfWhiteSpace(GetString(diagnostic, "message"u8)) ?? "(no message)",
-            Path: NormalizeFilePath(GetString(diagnostic, "file"u8), scanRoot),
+            Path: RelativizeOrMarkFileUri(GetString(diagnostic, "file"u8), scanRoot),
             Line: line);
-    }
-
-    private static string? NormalizeFilePath(string? raw, string? scanRoot)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return null;
-        var path = NormalizePath(raw);
-        if (path.StartsWith(FileSchemePrefix, StringComparison.OrdinalIgnoreCase))
-            path = path[FileSchemePrefix.Length..];
-
-        var relative = RelativizeToRoot(path, scanRoot);
-        if (!string.Equals(relative, path, StringComparison.Ordinal))
-            return relative;
-
-        // Out-of-root and absolute: re-mark with the file:// scheme so the
-        // reported location stays distinguishable from a repository-relative
-        // path — the base trims a bare leading '/' from finding paths.
-        if (path.StartsWith("/", StringComparison.Ordinal))
-            return FileSchemePrefix + path;
-        return path;
     }
 }
