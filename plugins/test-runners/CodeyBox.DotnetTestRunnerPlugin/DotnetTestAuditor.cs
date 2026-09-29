@@ -52,6 +52,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
     public BuildTestGateEvidence BuildTestGateEvidence => _opts.Role == AuditorRole.BuildTestGate
         ? _opts.BuildTestGateEvidence
         : BuildTestGateEvidence.None;
+    public BuildTestGateEvidence ConsumesGateEvidence => GateEvidenceConsumption.ForArgv(_opts.BaseArgv);
 
     public TestSuiteDescriptor TestSuite =>
         new(TestFramework.DotnetTest, [.. _opts.BaseArgv, "--list-tests"]);

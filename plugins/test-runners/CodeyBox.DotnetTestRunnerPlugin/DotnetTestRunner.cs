@@ -70,6 +70,8 @@ public sealed class DotnetTestRunner : ITestRunnerAuditor, IShellAuditorArgvProv
 
     public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.Test;
 
+    public BuildTestGateEvidence ConsumesGateEvidence => GateEvidenceConsumption.ForArgv(CanonicalBaseArgv);
+
     public TestSuiteDescriptor TestSuite =>
         new(TestFramework.DotnetTest, [.. CanonicalBaseArgv, "--list-tests"]);
 

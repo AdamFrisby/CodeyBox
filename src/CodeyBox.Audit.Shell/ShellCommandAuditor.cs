@@ -66,6 +66,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     public BuildTestGateEvidence BuildTestGateEvidence => _opts.Role == AuditorRole.BuildTestGate
         ? _opts.BuildTestGateEvidence
         : BuildTestGateEvidence.None;
+    public BuildTestGateEvidence ConsumesGateEvidence => GateEvidenceConsumption.ForArgv(_opts.Argv);
 
     /// <summary>
     /// The argv this auditor invokes. Exposed so the work-phase prompt builder

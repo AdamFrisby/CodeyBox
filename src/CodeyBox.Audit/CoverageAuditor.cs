@@ -163,6 +163,9 @@ public sealed class CoverageAuditor : IAuditor
     public string Kind => "tool";
     public AuditCapabilities Required => AuditCapabilities.None;
 
+    public BuildTestGateEvidence ConsumesGateEvidence
+        => GateEvidenceConsumption.ForArgv(_optsProvider().TestCommand);
+
     public async Task<AuditResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,

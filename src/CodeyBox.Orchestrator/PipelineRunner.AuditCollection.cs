@@ -45,6 +45,14 @@ public sealed partial class PipelineRunner
             ? auditors
             : auditors.Where(a => a.Role != AuditorRole.BuildTestGate).ToList();
 
+        // Evidence the panel's declared gates can produce at most: a consumer
+        // whose declared evidence is absent from this set has no provider to
+        // wait for and must still run (e.g. a test-only panel whose checkout
+        // was already built).
+        var declaredGateEvidence = auditors.Aggregate(
+            BuildTestGateEvidence.None,
+            (acc, auditor) => acc | auditor.BuildTestGateEvidence);
+
         var prefix = EmptyAuditorBatchResult(initialPassedBuildTestGateEvidence);
         if (buildTestGateAuditors.Count > 0)
         {
@@ -57,6 +65,8 @@ public sealed partial class PipelineRunner
                 ctx,
                 detectDeclaredShortCircuit: auditShortCircuitEnabled,
                 progressUpdate,
+                declaredGateEvidence,
+                initialPassedBuildTestGateEvidence,
                 ct);
 
             prefix = MergeAuditorBatchResults(prefix, gate);
@@ -124,6 +134,8 @@ public sealed partial class PipelineRunner
                 repoId,
                 ctx,
                 remainingProgressUpdate,
+                declaredGateEvidence,
+                prefix.PassedBuildTestGateEvidence,
                 ct)
             : (await CollectFindingsBatchAsync(
                 item,
@@ -134,6 +146,8 @@ public sealed partial class PipelineRunner
                 ctx,
                 detectDeclaredShortCircuit: false,
                 remainingProgressUpdate,
+                declaredGateEvidence,
+                prefix.PassedBuildTestGateEvidence,
                 ct)) with
             { DeclaredShortCircuitBlocking = false };
 
@@ -148,6 +162,8 @@ public sealed partial class PipelineRunner
         string repoId,
         AuditContext ctx,
         Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate,
+        BuildTestGateEvidence declaredGateEvidence,
+        BuildTestGateEvidence seedPassedGateEvidence,
         CancellationToken ct)
     {
         if (auditors.Count == 0)
@@ -167,6 +183,8 @@ public sealed partial class PipelineRunner
                 ctx,
                 detectDeclaredShortCircuit: false,
                 progressUpdate,
+                declaredGateEvidence,
+                seedPassedGateEvidence,
                 ct);
             return all with { DeclaredShortCircuitBlocking = false };
         }
@@ -180,6 +198,8 @@ public sealed partial class PipelineRunner
             ctx,
             detectDeclaredShortCircuit: true,
             progressUpdate,
+            declaredGateEvidence,
+            seedPassedGateEvidence,
             ct);
         if (gate.DeclaredShortCircuitBlocking)
             return gate with { DeclaredShortCircuitBlocking = true };
@@ -219,6 +239,8 @@ public sealed partial class PipelineRunner
             ctx,
             detectDeclaredShortCircuit: false,
             remainingProgressUpdate,
+            declaredGateEvidence,
+            seedPassedGateEvidence | gate.PassedBuildTestGateEvidence,
             ct);
 
         return MergeAuditorBatchResults(
@@ -404,6 +426,39 @@ public sealed partial class PipelineRunner
            && run.Result.BuildTestGateEvidenceVerified == false
            && run.Result.Findings.Count == 0;
 
+    /// <summary>
+    /// Synthesizes the explicit not-run result for an auditor whose invocation
+    /// consumes gate outputs that no declared build/test gate produced this
+    /// iteration (the gate failed, could not verify, or is scheduled later).
+    /// The Warning finding records the skip without adding a second blocking
+    /// finding on top of the failed gate's own verdict; the auditor is
+    /// counted as completed so the iteration's completeness accounting stays
+    /// whole.
+    /// </summary>
+    private static AuditResult SkippedGateConsumerResult(
+        IAuditor auditor,
+        BuildTestGateEvidence missingEvidence)
+    {
+        var description =
+            $"skipped: {missingEvidence} gate evidence was not produced this iteration, so the auditor was not run. " +
+            "The failing gate's own findings drive the rework verdict; running anyway could only surface a " +
+            "derived runner failure against absent build outputs.";
+        return new AuditResult(
+            Passed: false,
+            Findings:
+            [
+                new AuditFinding(
+                    auditor.Name,
+                    AuditSeverity.Warning,
+                    "skipped: build failed",
+                    description),
+            ],
+            RawOutput: description)
+        {
+            BuildTestGateEvidenceVerified = false,
+        };
+    }
+
     private async Task<AuditorBatchResult> CollectFindingsBatchAsync(
         WorkItem item,
         Project project,
@@ -413,6 +468,8 @@ public sealed partial class PipelineRunner
         AuditContext ctx,
         bool detectDeclaredShortCircuit,
         Func<AuditProgressUpdate, CancellationToken, Task>? progressUpdate,
+        BuildTestGateEvidence declaredGateEvidence,
+        BuildTestGateEvidence seedPassedGateEvidence,
         CancellationToken ct)
     {
         var findings = new List<AuditFinding>();
@@ -506,7 +563,7 @@ public sealed partial class PipelineRunner
         // suite with no failures") would be false, so we skip LLM auditors
         // entirely for this iteration. The build/test findings still flow to
         // rework as normal.
-        var passedBuildTestGateEvidence = BuildTestGateEvidence.None;
+        var passedBuildTestGateEvidence = seedPassedGateEvidence;
         var buildTestGateFailed = false;
 
         foreach (var group in byCaps)
@@ -615,6 +672,33 @@ public sealed partial class PipelineRunner
                 {
                     foreach (var (auditor, runner, member) in toolPairs)
                     {
+                        // Auditors whose invocation consumes gate-produced
+                        // build outputs (a `dotnet test --no-build` gate reuses
+                        // the compile gate's assemblies) depend on evidence a
+                        // declared gate must already have produced this
+                        // iteration. When it was not — the providing gate
+                        // failed or could not verify — the command can only
+                        // surface a derived runner refusal, so skip with an
+                        // explicit result and let the gate's own findings
+                        // drive the rework verdict.
+                        var missingConsumedEvidence = auditor.ConsumesGateEvidence
+                            & declaredGateEvidence
+                            & ~passedBuildTestGateEvidence;
+                        if (missingConsumedEvidence != BuildTestGateEvidence.None)
+                        {
+                            var skipped = SkippedGateConsumerResult(auditor, missingConsumedEvidence);
+                            buildTestGateFailed = true;
+                            findings.AddRange(skipped.Findings);
+                            completedAuditors.Add(auditor.Name);
+                            AuditLog.AuditorSkippedMissingGateEvidence(
+                                item.Id, auditor.Name, missingConsumedEvidence);
+                            await PersistAuditReportAsync(
+                                ctx, auditor, skipped, DateTimeOffset.UtcNow, TimeSpan.Zero, ct);
+                            await PublishPartialProgressAsync(
+                                findings.ToList(), completedAuditors.ToList(), ct);
+                            continue;
+                        }
+
                         AuditorRunRecord run;
                         if (auditor is IAuditSandboxIsolation { RequiresFreshSandbox: true })
                         {
