@@ -92,4 +92,27 @@ public sealed class DevinInVmSmokeProbeTests
 
         Assert.Contains("'--model' 'swe-2-high'", steps[3].Argv[2], StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void BuildSteps_WithToml_RealTurnStdin_IsWellFormedFrame()
+    {
+        // The probe's real-turn step must speak the exact framed-stdin
+        // contract the dispatch wrapper reads: base64 shim block, end
+        // marker, verbatim probe prompt. If the probe ever hand-rolls its
+        // stdin instead of sharing the builder, this split fails and the
+        // probe could pass while real dispatch fails.
+        var steps = Probe.BuildSteps(CredWithToml());
+        Assert.NotNull(steps[3].Stdin);
+        var stdin = steps[3].Stdin!;
+
+        var markerLine = "\n" + DevinAcpShim.StdinEndMarker + "\n";
+        var markerIndex = stdin.IndexOf(markerLine, StringComparison.Ordinal);
+        Assert.True(markerIndex >= 0, "probe stdin must carry the framed-stdin end marker");
+        Assert.Equal(
+            "Reply with the single word: OK",
+            stdin[(markerIndex + markerLine.Length)..]);
+
+        var block = stdin[..markerIndex].Replace("\n", string.Empty, StringComparison.Ordinal);
+        Assert.Equal(Convert.ToBase64String(DevinAcpShim.LoadScriptBytes().Span), block);
+    }
 }

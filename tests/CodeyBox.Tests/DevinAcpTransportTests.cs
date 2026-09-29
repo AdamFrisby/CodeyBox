@@ -475,6 +475,85 @@ public sealed class DevinAcpTransportTests
         Assert.Contains("fatal", result.TerminalDiagnostic, StringComparison.Ordinal);
     }
 
+    [SkippableFact]
+    public async Task RunAsync_FakeAcpPeer_LargePromptBeyondMaxArgStrlen_DeliveredIntact()
+    {
+        // MAX_ARG_STRLEN caps a single argv element (and the environment) at
+        // 128 KiB, which is why rework prompts travel on stdin instead. A
+        // ~200 KiB prompt must arrive byte-identical through the real bash
+        // wrapper + shim + ACP peer: any truncation, re-chunking loss, or
+        // encoding drift flips the equality below red.
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox ACP test requires Unix exec semantics.");
+        Skip.IfNot(HasCommand("python3"), "python3 is required for the devin acp shim.");
+
+        const int maxArgStrlen = 128 * 1024;
+        var chunk = "Rewrite the widget handler — it must cope with 'quotes', $vars, `ticks`, "
+            + "back\\slashes, emoji \u2603\U0001F680, CJK \u6C49\u5B57, and trailing spaces. \n";
+        var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+        var repeats = (200 * 1024 / chunkBytes) + 1;
+        var largePrompt = "Rework dispatch. Requirements:\n"
+            + DevinAcpShim.StdinEndMarker + "\n"
+            + "A line equal to the framing end marker is harmless inside the prompt body.\n"
+            + string.Concat(Enumerable.Repeat(chunk, repeats));
+        Assert.True(
+            Encoding.UTF8.GetByteCount(largePrompt) > maxArgStrlen,
+            "test prompt must exceed the per-element argv cap it is proving immunity to");
+
+        using var temp = new TemporaryDir("codeybox-devin-acp-");
+        var (binDir, recordPath) = WriteFakeDevin(temp.Path);
+        await using var sandbox = await CreateSandboxAsync(binDir, temp.Path, "complete");
+
+        var runner = new DevinAgentRunner();
+        var result = await runner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, largePrompt, credential: null,
+            modelId: ConfiguredModel);
+
+        Assert.True(result.Success, $"expected success; stderr={result.Stderr}");
+        var promptRecord = Assert.Single(ReadRecords(recordPath), r => r.Contains("\"prompt\""));
+        using var doc = JsonDocument.Parse(promptRecord);
+        var delivered = doc.RootElement.GetProperty("prompt").GetProperty("prompt")[0].GetProperty("text").GetString();
+        Assert.Equal(largePrompt, delivered);
+    }
+
+    [SkippableFact]
+    public async Task DispatchScript_MissingShimTerminator_FailsClosed()
+    {
+        // The dispatch wrapper (shared verbatim with DevinInVmSmokeProbe's
+        // real-turn step) must fail LOUD when the framed-stdin shim block
+        // never terminates — never decode garbage, never dispatch with an
+        // empty prompt, and never exit 0. A delivery break therefore fails
+        // the smoke probe exactly as it fails a real dispatch.
+        Skip.If(OperatingSystem.IsWindows(), "dispatch-script test requires Unix exec semantics.");
+        Skip.IfNot(HasCommand("bash"), "bash is required for the dispatch script.");
+
+        var script = DevinAgentRunner.BuildAcpDispatchScript(
+            DevinAgentRunner.AcpShimArgs("devin", ConfiguredModel, DevinAgentRunner.FullAutonomyAcpMode));
+
+        using var proc = new System.Diagnostics.Process
+        {
+            StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "bash",
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            },
+        };
+        proc.StartInfo.ArgumentList.Add("-c");
+        proc.StartInfo.ArgumentList.Add(script);
+        proc.Start();
+        await proc.StandardInput.WriteAsync("this frame carries no shim terminator\n");
+        proc.StandardInput.Close();
+        var stdout = await proc.StandardOutput.ReadToEndAsync();
+        var stderr = await proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+
+        Assert.NotEqual(0, proc.ExitCode);
+        Assert.Contains("missing devin acp shim terminator", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("devin.acp", stdout, StringComparison.Ordinal);
+    }
+
     private static (string BinDir, string RecordPath) WriteFakeDevin(string root)
     {
         var binDir = Path.Combine(root, "bin");
