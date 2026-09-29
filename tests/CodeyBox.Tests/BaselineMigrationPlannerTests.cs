@@ -43,6 +43,25 @@ public sealed class BaselineMigrationPlannerTests
 
         Assert.Empty(plan.ItemIdsToClear);
         Assert.Empty(plan.RecomputeTargets);
+        Assert.Equal(1, plan.AlreadyCurrentCount);
+    }
+
+    [Fact]
+    public void DistinguishesAlreadyCurrentFromMigrated()
+    {
+        // "Already current" and "skipped because terminal" are different
+        // dispositions; the plan must surface the former explicitly (terminal
+        // candidates are excluded upstream and counted by the store, but an
+        // already-current candidate is only visible to the planner).
+        var stale = Item("cb-baseline-old");
+        var current1 = Item("cb-baseline-new");
+        var current2 = Item("cb-baseline-new");
+        var map = new Dictionary<ProjectId, string?> { [ProjA] = "cb-baseline-new" };
+
+        var plan = BaselineMigrationPlanner.Plan([stale, current1, current2], default, map);
+
+        Assert.Equal([stale.Id], plan.ItemIdsToClear);
+        Assert.Equal(2, plan.AlreadyCurrentCount);
     }
 
     [Theory]
@@ -60,6 +79,7 @@ public sealed class BaselineMigrationPlannerTests
         var plan = BaselineMigrationPlanner.Plan([item], default, current);
 
         Assert.Empty(plan.ItemIdsToClear);
+        Assert.Equal(0, plan.AlreadyCurrentCount);
     }
 
     [Fact]

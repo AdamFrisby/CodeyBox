@@ -36,24 +36,40 @@ public sealed record BaselineRecomputeTarget(string? BaselineImageRef, int Count
 /// <summary>
 /// Pure result of <see cref="BaselineMigrationPlanner.Plan"/>:
 /// <see cref="ItemIdsToClear"/> is the exact set of work items whose pin should
-/// be cleared, and <see cref="RecomputeTargets"/> summarises what those items
-/// will recompute to. Contains no side effects; the caller performs the write.
+/// be cleared, <see cref="RecomputeTargets"/> summarises what those items
+/// will recompute to, and <see cref="AlreadyCurrentCount"/> is how many
+/// inspected candidates were skipped because their pin already equals the
+/// current-config ref — the legible counterpart to
+/// <see cref="ItemIdsToClear"/>'s "needed migrating". Contains no side
+/// effects; the caller performs the write.
 /// </summary>
 public sealed record BaselineMigrationPlan(
     IReadOnlyList<WorkItemId> ItemIdsToClear,
-    IReadOnlyList<BaselineRecomputeTarget> RecomputeTargets);
+    IReadOnlyList<BaselineRecomputeTarget> RecomputeTargets,
+    int AlreadyCurrentCount);
 
 /// <summary>
 /// Outcome of a baseline migration. <see cref="MigratedCount"/> is the number
 /// of pins actually cleared (authoritative — reflects rows the store wrote,
 /// after excluding any that raced to a terminal state).
 /// <see cref="ScannedCount"/> is how many pinned candidates were inspected.
+/// <see cref="AlreadyCurrentCount"/> is how many of those needed no write
+/// because their pin already matches the current-config ref, and
+/// <see cref="SkippedTerminalCount"/> is how many pinned items in the
+/// requested scope were excluded up front for sitting in a terminal state —
+/// terminal pins are historical record, not candidates, and the retry path
+/// re-validates them before re-queueing. An operator can therefore reconcile
+/// <c>scanned ≈ migrated + alreadyCurrent</c> (migrated can fall short when a
+/// row races to a terminal state before the write lands) without reading the
+/// log, and see the terminal backlog separately.
 /// <see cref="Truncated"/> is true when the per-scan cap limited the pass, in
 /// which case the operator can re-run (the operation is idempotent) to continue.
 /// </summary>
 public sealed record BaselineMigrationResult(
     int MigratedCount,
     int ScannedCount,
+    int AlreadyCurrentCount,
+    int SkippedTerminalCount,
     bool Truncated,
     IReadOnlyList<BaselineRecomputeTarget> RecomputeTargets);
 
@@ -90,6 +106,7 @@ public static class BaselineMigrationPlanner
 
         var idsToClear = new List<WorkItemId>();
         var targetCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var alreadyCurrent = 0;
 
         foreach (var candidate in candidates)
         {
@@ -105,7 +122,10 @@ public static class BaselineMigrationPlanner
 
             var current = currentRefByProject.GetValueOrDefault(candidate.ProjectId);
             if (string.Equals(candidate.BaselineImageRef, current, StringComparison.Ordinal))
-                continue; // already on the current-config baseline
+            {
+                alreadyCurrent++; // already on the current-config baseline
+                continue;
+            }
 
             idsToClear.Add(candidate.Id);
             var key = current ?? NoRecomputeTargetKey;
@@ -120,6 +140,6 @@ public static class BaselineMigrationPlanner
                 kv.Value))
             .ToList();
 
-        return new BaselineMigrationPlan(idsToClear, targets);
+        return new BaselineMigrationPlan(idsToClear, targets, alreadyCurrent);
     }
 }

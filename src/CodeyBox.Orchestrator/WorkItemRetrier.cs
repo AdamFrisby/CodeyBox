@@ -61,6 +61,7 @@ public sealed class WorkItemRetrier
     private readonly IProjectRepository? _projects;
     private readonly IReleaseStore? _releases;
     private readonly IWorkItemQuestionStore? _questions;
+    private readonly IBaselineImageResolver? _baselineResolver;
     private readonly ILogger<WorkItemRetrier> _log;
 
     public WorkItemRetrier(
@@ -72,7 +73,8 @@ public sealed class WorkItemRetrier
         IProjectRepository? projects = null,
         IReleaseStore? releases = null,
         IWorkItemQuestionStore? questions = null,
-        IAuditProgressStore? auditProgress = null)
+        IAuditProgressStore? auditProgress = null,
+        IBaselineImageResolver? baselineResolver = null)
     {
         _store = store;
         _queue = queue;
@@ -84,6 +86,10 @@ public sealed class WorkItemRetrier
         _projects = projects;
         _releases = releases;
         _questions = questions;
+        // Null disables baseline-pin revalidation on retry for narrow test
+        // fixtures; production DI always wires the resolver (null-object when
+        // the active provider does not model baselines).
+        _baselineResolver = baselineResolver;
         _log = log;
     }
 
@@ -438,6 +444,24 @@ public sealed class WorkItemRetrier
             };
         }
 
+        // A retry out of a terminal state starts a brand-new dispatch attempt,
+        // so the surviving baseline pin is re-validated against what the
+        // item's current route resolves to before it is carried into the new
+        // state. Baseline migration deliberately skips terminal items (their
+        // pin is the historical record of the attempt that finished), which
+        // makes this the only place a stale terminal pin can be repaired —
+        // restoring it unexamined re-arms the fail→retry→fail loop where the
+        // next pickup clones a baseline missing the current agent's binary.
+        // Parked-state resumes (WaitingForQuotaReset etc.) are the SAME
+        // in-flight attempt, not a new one: they keep their pin, which is
+        // exactly what holds an in-flight item on its original baseline when
+        // live config drifts underneath it.
+        if (WorkItemStates.IsTerminal(item.State))
+        {
+            resumed = await RevalidateBaselinePinForNewAttemptAsync(resumed, ct)
+                .ConfigureAwait(false);
+        }
+
         // Atomic conditional update to prevent race conditions.
         // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
         // Cancelled, AbandonedAfterRecoveryAttempts, NeedsOperatorInput, or
@@ -603,6 +627,76 @@ public sealed class WorkItemRetrier
                 "Failed to invalidate prior audit progress for retried work item {Id}; next audit proceeds against stale rows with supersede guards",
                 workItemId);
         }
+    }
+
+    /// <summary>
+    /// Re-validates <paramref name="item"/>'s baseline pin against the route the
+    /// retried item will dispatch on: the pin survives only when its ref still
+    /// equals what the provider resolves now for the project's work/headless
+    /// target AND it was attributed to the agent the new attempt will run as.
+    /// Otherwise both fields are cleared so the next pickup recomputes from
+    /// live config (mirroring <c>OrchestratorService.ResolveBaselineRefForPickup</c>
+    /// semantics: a resolver fault or a project that cannot be resolved maps to
+    /// "no current baseline", which makes any surviving pin stale). When the
+    /// project repository itself faults, the pin is kept — the route cannot be
+    /// determined, so there is no evidence the pin is wrong. Never throws:
+    /// revalidation is a repair optimisation, not a retry gate.
+    /// </summary>
+    private async Task<WorkItem> RevalidateBaselinePinForNewAttemptAsync(
+        WorkItem item,
+        CancellationToken ct)
+    {
+        if (item.BaselineImageRef is null || _baselineResolver is null)
+            return item;
+
+        Project? project = null;
+        if (_projects is not null)
+        {
+            try
+            {
+                project = await _projects.GetAsync(item.ProjectId, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Work item {Id}: could not load project {ProjectId} to re-validate its baseline pin; keeping the pin",
+                    item.Id,
+                    item.ProjectId.Value);
+                return item;
+            }
+        }
+
+        string? current;
+        try
+        {
+            current = _baselineResolver.ResolveBaselineRef(
+                project?.NetworkProfiles.Work, SandboxProfileFlavor.Headless);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(
+                ex,
+                "Baseline-ref resolver threw while re-validating the pin for work item {Id}; treating as no current baseline",
+                item.Id);
+            current = null;
+        }
+
+        var dispatchAgent = item.Agent ?? project?.DefaultAgent;
+        if (string.Equals(item.BaselineImageRef, current, StringComparison.Ordinal)
+            && item.BaselineImageAgent == dispatchAgent)
+        {
+            return item;
+        }
+
+        _log.LogInformation(
+            "Work item {Id}: baseline pin {OldRef} (resolved for agent {PinnedAgent}) no longer matches the current route ({NewRef} for agent {DispatchAgent}); cleared so the next pickup recomputes",
+            item.Id,
+            item.BaselineImageRef,
+            item.BaselineImageAgent?.Value ?? "(unattributed)",
+            current ?? "(unpinned)",
+            dispatchAgent?.Value ?? "(unset)");
+        return item with { BaselineImageRef = null, BaselineImageAgent = null };
     }
 
     private static bool TryGetUsableAgentTurnCheckpoint(

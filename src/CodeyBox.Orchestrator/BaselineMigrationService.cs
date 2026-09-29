@@ -30,8 +30,17 @@ public sealed class BaselineMigrationOptions
 ///
 /// <para>Actively-running items are unaffected until their next pickup: clearing
 /// the pin does not disturb the current run. Items already on the current-config
-/// baseline (and terminal items) are left untouched, making the operation
-/// idempotent.</para>
+/// baseline are left untouched, making the operation idempotent.</para>
+///
+/// <para>Terminal items are deliberately NOT migrated: a terminal pin is the
+/// historical record of the baseline the finished attempt ran on, and the
+/// retry path (<see cref="WorkItemRetrier"/>) re-validates the pin against the
+/// item's current route before re-queueing, so a stale terminal pin self-heals
+/// at exactly the moment it could do harm. Excluding them also keeps this
+/// scan proportional to the live backlog instead of every item that ever
+/// pinned. They are still counted and reported as
+/// <see cref="BaselineMigrationResult.SkippedTerminalCount"/> so the excluded
+/// set stays legible to the operator.</para>
 ///
 /// <para>The current-config ref is resolved exactly as
 /// <c>OrchestratorService</c> does at pickup — via
@@ -89,6 +98,14 @@ public sealed class BaselineMigrationService
         var currentRefByProject = await BuildCurrentRefMapAsync(candidates, ct).ConfigureAwait(false);
         var plan = BaselineMigrationPlanner.Plan(candidates, filter, currentRefByProject);
 
+        // Terminal pinned items are excluded from the candidate scan above by
+        // design (see class docstring), but they are exactly the delta an
+        // operator needs to explain "scanned" vs the visible backlog — count
+        // them under the same scope so the result can report why the
+        // difference exists.
+        var skippedTerminal = await _store.CountTerminalBaselinePinnedAsync(
+            filter.ProjectId, filter.BaselineImageRef, ct).ConfigureAwait(false);
+
         var migrated = plan.ItemIdsToClear.Count == 0
             ? 0
             : await _store.ClearBaselinePinsAsync(plan.ItemIdsToClear, _time.GetUtcNow(), ct).ConfigureAwait(false);
@@ -98,6 +115,8 @@ public sealed class BaselineMigrationService
             filter.BaselineImageRef,
             candidates.Count,
             migrated,
+            plan.AlreadyCurrentCount,
+            skippedTerminal,
             truncated);
 
         if (truncated)
@@ -107,7 +126,13 @@ public sealed class BaselineMigrationService
                 max, migrated);
         }
 
-        return new BaselineMigrationResult(migrated, candidates.Count, truncated, plan.RecomputeTargets);
+        return new BaselineMigrationResult(
+            migrated,
+            candidates.Count,
+            plan.AlreadyCurrentCount,
+            skippedTerminal,
+            truncated,
+            plan.RecomputeTargets);
     }
 
     private async Task<IReadOnlyDictionary<ProjectId, string?>> BuildCurrentRefMapAsync(
