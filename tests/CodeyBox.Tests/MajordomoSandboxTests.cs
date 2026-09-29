@@ -1,6 +1,7 @@
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -105,23 +106,31 @@ public sealed class MajordomoSandboxTests
     [Fact]
     public async Task Sandbox_DoesNotOccupyWorkDispatchSlot()
     {
-        var provider = new MajordomoFakeProvider("incus");
-        var options = Options();
+        var inner = new MajordomoFakeProvider("incus");
+        var gated = SandboxAdmissionControlledProvider.Wrap(
+            inner,
+            maxConcurrentSandboxes: 1,
+            NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(gated);
+
+        // Occupy the fleet's only dispatch slot with ordinary work.
+        await using var work = await gated.CreateAsync(
+            MajordomoSandboxSpecFactory.BuildSpec(Options(), McpUrl));
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+
+        // The majordomo sandbox must still come up immediately: it holds no
+        // admission permit, so a busy operator assistant never stops the fleet.
         await using var session = new MajordomoSandboxSession(
-            provider,
-            () => options,
+            gated,
+            () => Options(),
             () => ["majordomo"]);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var sandbox = await session.GetOrCreateAsync(McpUrl, cts.Token);
 
-        var gate = new ResizableConcurrencyGate(initialTarget: 1);
-        Assert.True(gate.TryEnter());
-        var inFlightBefore = gate.CurrentInFlight;
-
-        await session.GetOrCreateAsync(McpUrl);
-
-        Assert.Equal(inFlightBefore, gate.CurrentInFlight);
         Assert.True(session.IsAlive);
-        gate.Release();
-        gate.Dispose();
+        Assert.Equal(2, inner.Created);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        Assert.NotSame(work, sandbox);
     }
 
     [Fact]

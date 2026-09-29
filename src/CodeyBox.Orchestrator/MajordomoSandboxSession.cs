@@ -11,8 +11,9 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 /// <remarks>
 /// <para>By construction this session never touches the work-item dispatch
-/// path: it holds no <see cref="ResizableConcurrencyGate"/> permit and never
-/// mutates <see cref="IWorkerPoolOccupancy"/> — the fleet's concurrency
+/// path: when the provider gates fleet admission it creates through
+/// <see cref="IInfrastructureSandboxCreator"/> without holding a permit, and it
+/// never mutates <see cref="IWorkerPoolOccupancy"/> — the fleet's concurrency
 /// accounting is unchanged while the majordomo sandbox is alive.</para>
 /// <para>Creation fails closed: a blank profile, a profile the host does not
 /// accept, or a provider kind without host-enforced egress throws instead of
@@ -95,7 +96,9 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
             MajordomoSandboxSpecFactory.EnsureProviderEnforces(_provider.Name, profile);
 
             var spec = MajordomoSandboxSpecFactory.BuildSpec(options, mcpServerUrl);
-            var created = await _provider.CreateAsync(spec, ct).ConfigureAwait(false);
+            var created = _provider is IInfrastructureSandboxCreator exempt
+                ? await exempt.CreateInfrastructureAsync(spec, ct).ConfigureAwait(false)
+                : await _provider.CreateAsync(spec, ct).ConfigureAwait(false);
             _sandbox = created;
             _lastUsedAt = _clock.GetUtcNow();
             _log.LogInformation(
