@@ -116,6 +116,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return;
         }
 
+        // Durable-resume quota consult: before burning a bounded resume
+        // dispatch on the checkpoint's pinned agent, ask the quota router
+        // whether that route can run. A blocked pin either restarts fresh on
+        // an eligible class member (checkpoint discarded, branch preserved)
+        // or parks for quota reset without consuming an attempt; a lineage
+        // that already reached its dispatch limit restarts fresh instead of
+        // failing when a member is eligible. Null means the item was parked
+        // or failed inside and this pickup is done.
+        var prepared = await TryPrepareDurableResumeDispatchAsync(item, project, ct);
+        if (prepared is null)
+            return;
+        item = prepared;
+
         try
         {
             project = project with { Audit = ResolveAuditProfileForWorkItem(project, item) };
@@ -1064,6 +1077,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex,
                 "Skipping duplicate durable agent-turn dispatch for work item {Id} because another worker or state change owns the claim",
                 item.Id);
+        }
+        catch (AgentTurnResumeDispatchLimitException ex)
+        {
+            // TOCTOU backstop: the pickup-time guard reroutes limit-hit
+            // lineages before dispatch, so reaching the claim means the
+            // budget was consumed concurrently after the guard ran. Re-run
+            // the same reroute-or-fail decision against fresh store state;
+            // a reroute requeues the item for a fresh turn, otherwise the
+            // item fails with the limit message.
+            await HandleConcurrentResumeLimitHitAsync(item, project, ex.Message);
         }
         catch (InvalidAgentTurnResumeCheckpointException ex)
         {

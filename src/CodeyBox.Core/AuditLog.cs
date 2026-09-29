@@ -615,6 +615,54 @@ public static class AuditLog
                 reason);
 
     /// <summary>
+    /// Emitted when a durable agent-turn resume is re-dispatched to a class
+    /// member other than its pinned agent because the quota router blocked
+    /// the pinned route (exhausted, below floor, or circuit breaker open) or
+    /// the checkpoint lineage reached its dispatch limit. The durable
+    /// checkpoint is discarded and the turn restarts fresh from the pushed
+    /// work branch; the dispatch-limit counter is not consumed.
+    /// </summary>
+    public static void DurableResumeRerouted(
+        WorkItemId workItemId,
+        AgentKind fromAgent,
+        AgentKind toAgent,
+        string reason) =>
+        Audit("durable_resume.rerouted")
+            .Warning(
+                "Durable agent-turn resume for {WorkItemId} rerouted from '{RejectedAgent}' to class member '{ChosenAgent}' ({Reason}); checkpoint discarded, turn restarts from the pushed work branch",
+                workItemId.ToString(), fromAgent.Value, toAgent.Value, reason);
+
+    /// <summary>
+    /// Emitted when a durable agent-turn resume cannot be re-dispatched
+    /// because the quota router blocked its pinned agent and no other class
+    /// member is eligible. The item parks for quota reset with its checkpoint
+    /// and dispatch-limit counter intact.
+    /// </summary>
+    public static void DurableResumeDeferred(
+        WorkItemId workItemId,
+        AgentKind pinnedAgent,
+        string reason) =>
+        Audit("durable_resume.deferred")
+            .Warning(
+                "Durable agent-turn resume for {WorkItemId} deferred: pinned agent '{PinnedAgent}' is unavailable ({Reason}); parked for quota reset without consuming a dispatch attempt",
+                workItemId.ToString(), pinnedAgent.Value, reason);
+
+    /// <summary>
+    /// Emitted when a durable agent-turn resume dispatch ends in a provider
+    /// quota/rate-limit classification before the agent produced output or
+    /// left work behind. The optimistically-consumed dispatch attempt is
+    /// refunded so the phantom dispatch does not count toward the limit.
+    /// </summary>
+    public static void DurableResumeAttemptRefunded(
+        WorkItemId workItemId,
+        AgentKind agent,
+        string reason) =>
+        Audit("durable_resume.attempt_refunded")
+            .Information(
+                "Durable agent-turn resume dispatch for {WorkItemId} on '{Agent}' ended in quota failure without agent output ({Reason}); dispatch attempt refunded",
+                workItemId.ToString(), agent.Value, reason);
+
+    /// <summary>
     /// Emitted when a single agent attempt exceeds its per-attempt timeout and
     /// the pipeline retries the same iteration against the next class member.
     /// Distinct from <see cref="AgentQuotaFallback"/> so operational logs do

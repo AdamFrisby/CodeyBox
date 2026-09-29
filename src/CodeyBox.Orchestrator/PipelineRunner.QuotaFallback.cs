@@ -1180,6 +1180,21 @@ public sealed partial class PipelineRunner
         }
     }
 
+    /// <summary>
+    /// The durable agent-turn checkpoint lineage consumed its configured
+    /// dispatch budget. Typed (rather than a plain
+    /// <see cref="InvalidOperationException"/>) so the pipeline can fall back
+    /// to a fresh turn on an eligible class member instead of failing the
+    /// item when one exists.
+    /// </summary>
+    private sealed class AgentTurnResumeDispatchLimitException : Exception
+    {
+        public AgentTurnResumeDispatchLimitException(string message)
+            : base(message)
+        {
+        }
+    }
+
     internal static string? ResolveObservedModelId(IAgentRunner runner, string? modelId)
     {
         if (modelId is not null)
