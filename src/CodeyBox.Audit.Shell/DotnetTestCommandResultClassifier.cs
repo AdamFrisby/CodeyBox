@@ -66,6 +66,11 @@ public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
     /// identically), so the exception is marked
     /// <see cref="AuditUnavailableException.IsDeterministic"/> and the pipeline
     /// surfaces it immediately without consuming recovery-attempt budget.
+    /// A <c>--no-build</c> refusal against a <c>bin/</c> assembly is the
+    /// exception: the assemblies were never produced because the build gate
+    /// failed, so the refusal is derived from that failure. It is reported as
+    /// "build outputs missing" without the deterministic mark, keeping it on
+    /// the infrastructure path and never a terminal configuration fault.
     /// </summary>
     /// <exception cref="AuditUnavailableException">
     /// Thrown when the output shows the runner refused its invocation.
@@ -78,6 +83,15 @@ public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
             return;
 
         var signal = FirstSignalLine(context.CombinedOutput);
+        if (MissingBuildOutputs.IsMissingBuildOutputs(context.ExecutedArgv, context.CombinedOutput)
+            || MissingBuildOutputs.IsMissingBuildOutputs(context.Argv, context.CombinedOutput))
+        {
+            throw new AuditUnavailableException(
+                $"could-not-verify: build outputs missing for '{context.AuditorName}' (exit {context.Result.ExitCode}): {signal} (command: {string.Join(' ', context.ExecutedArgv)})",
+                context.Result.ExitCode,
+                context.CombinedOutput);
+        }
+
         throw new AuditUnavailableException(
             $"could-not-verify: test runner invocation failed for '{context.AuditorName}' (exit {context.Result.ExitCode}): {signal} (command: {string.Join(' ', context.ExecutedArgv)})",
             context.Result.ExitCode,
