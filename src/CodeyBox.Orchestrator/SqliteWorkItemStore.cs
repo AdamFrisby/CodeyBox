@@ -358,6 +358,13 @@ public sealed class SqliteWorkItemStore :
             // Partial index used by the BaselineImageReaper's live-ref query.
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_baseline_image_ref ON work_items(baseline_image_ref) WHERE baseline_image_ref IS NOT NULL;");
 
+            // Baseline-pin attribution: the agent kind the pinned ref was
+            // resolved for. The pin is only honoured while the item dispatches
+            // as that agent — a re-route to a different kind must drop or
+            // re-resolve the ref, which requires knowing who it belonged to.
+            // Null for legacy pins (they are re-resolved rather than trusted).
+            RunMigration("ALTER TABLE work_items ADD COLUMN baseline_image_agent TEXT;");
+
             // Required-capability eligibility gate. Composes (AND) with min_model_score
             // during the transition window; min_model_score is slated for removal once
             // legacy items have migrated. Stored as a JSON array; default '[]' = open
@@ -1440,7 +1447,7 @@ public sealed class SqliteWorkItemStore :
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
-                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
+                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref, baseline_image_agent,
                         required_capabilities_json,
                         job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
@@ -1461,7 +1468,7 @@ public sealed class SqliteWorkItemStore :
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
-                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
+                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref, $baseline_image_agent,
                         $required_capabilities,
                         $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
@@ -1819,6 +1826,7 @@ public sealed class SqliteWorkItemStore :
                     delegation_failed = $delegation_failed,
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
+                    baseline_image_agent = $baseline_image_agent,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -1922,6 +1930,7 @@ public sealed class SqliteWorkItemStore :
                     delegation_failed = $delegation_failed,
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
+                    baseline_image_agent = $baseline_image_agent,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -2027,6 +2036,7 @@ public sealed class SqliteWorkItemStore :
                     delegation_failed = $delegation_failed,
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
+                    baseline_image_agent = $baseline_image_agent,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -2501,6 +2511,7 @@ public sealed class SqliteWorkItemStore :
                     delegation_failed = $delegation_failed,
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
+                    baseline_image_agent = $baseline_image_agent,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -2942,6 +2953,7 @@ public sealed class SqliteWorkItemStore :
                         delegation_failed = $delegation_failed,
                         terminal_failure_count = $terminal_failure_count,
                         baseline_image_ref = $baseline_image_ref,
+                        baseline_image_agent = $baseline_image_agent,
                         required_capabilities_json = $required_capabilities,
                         job_type = $job_type,
                         check_spec_json = $check_spec,
@@ -3868,7 +3880,7 @@ public sealed class SqliteWorkItemStore :
                 // no-op (idempotent).
                 cmd.CommandText = $"""
                     UPDATE work_items
-                    SET baseline_image_ref = NULL, updated_at = $now
+                    SET baseline_image_ref = NULL, baseline_image_agent = NULL, updated_at = $now
                     WHERE baseline_image_ref IS NOT NULL
                       AND state NOT IN ({TerminalStatesSqlList})
                       AND id IN ({placeholders});
@@ -4550,6 +4562,7 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
         cmd.Parameters.AddWithValue("$conflict_rework_attempts", item.ConflictReworkAttempts);
         cmd.Parameters.AddWithValue("$baseline_image_ref", (object?)item.BaselineImageRef ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$baseline_image_agent", (object?)item.BaselineImageAgent?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$required_capabilities",
             JsonSerializer.Serialize(item.RequiredCapabilities));
         cmd.Parameters.AddWithValue("$job_type", item.JobType.ToString());
@@ -4692,6 +4705,7 @@ public sealed class SqliteWorkItemStore :
         PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),
         ConflictReworkAttempts = ReadInt32OrDefault(r, "conflict_rework_attempts", defaultValue: 0),
         BaselineImageRef = ReadNullableString(r, "baseline_image_ref"),
+        BaselineImageAgent = ReadNullableAgentKind(r, "baseline_image_agent"),
         RequiredCapabilities = ReadRequiredCapabilities(r),
         JobType = ReadJobType(r),
         Check = ReadCheckSpec(r),

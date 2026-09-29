@@ -256,7 +256,11 @@ public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
             router: router,
             baselineResolver: resolver);
 
-        var item = MakeItem() with { AgentClassId = "frontier" };
+        // Agent stamps the incumbent before routing so the freshly pinned ref
+        // is attributed to Claude — the only member the gate then probes
+        // against the pin (a pin is forwarded only to the agent kind it was
+        // resolved for).
+        var item = MakeItem() with { AgentClassId = "frontier", Agent = AgentKind.Claude };
         await _store.CreateAsync(item);
         await queue.EnqueueAsync(item.Id);
 

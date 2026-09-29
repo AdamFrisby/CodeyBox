@@ -104,6 +104,23 @@ public sealed class SqliteWorkItemStoreClearBaselinePinsTests : IDisposable
     }
 
     [Fact]
+    public async Task Clear_AlsoClearsPinAttribution()
+    {
+        var a = Sample("cb-baseline-a", WorkItemState.Working) with
+        {
+            BaselineImageAgent = AgentKind.Copilot,
+        };
+        await _store.CreateAsync(a);
+
+        var cleared = await _store.ClearBaselinePinsAsync([a.Id], DateTimeOffset.UtcNow);
+
+        Assert.Equal(1, cleared);
+        var read = await _store.GetAsync(a.Id);
+        Assert.Null(read!.BaselineImageRef);
+        Assert.Null(read.BaselineImageAgent);
+    }
+
+    [Fact]
     public async Task Clear_SkipsTerminalItems_LeavingPinIntact()
     {
         var done = Sample("cb-baseline-done", WorkItemState.Done);

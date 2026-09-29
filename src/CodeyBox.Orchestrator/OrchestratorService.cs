@@ -3068,7 +3068,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             {
                 var pinnedRef = ResolveBaselineRefForPickup(item, project);
                 if (pinnedRef is not null)
-                    item = item with { BaselineImageRef = pinnedRef };
+                {
+                    // The pin is nominally for the incumbent agent (the one the
+                    // item last dispatched as, or was configured with). Routing
+                    // below may still pick a different class member — the
+                    // post-routing reconcile re-resolves the pin when that
+                    // happens, so attributing it here cannot cement a stale
+                    // ref onto the wrong agent.
+                    item = item with
+                    {
+                        BaselineImageRef = pinnedRef,
+                        BaselineImageAgent = item.Agent,
+                    };
+                }
             }
 
             // Quota routing: resolve which agent to use, or decide to wait.
@@ -3258,6 +3270,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
             }
 
+            // A baseline pin is bound to the agent kind it was resolved under —
+            // the ref is content-addressed over what has to be provisioned,
+            // including which agent CLIs are baked in. Routing may have just
+            // replaced the dispatch agent (or the pin may carry no attribution
+            // at all): a pin surviving a re-route would launch the sandbox from
+            // a baseline that can lack the new agent's binary entirely, failing
+            // at clone/exec time on the missing guest link rather than on the
+            // stale pin. Re-resolve before any sandbox is created.
+            if (!isAgentControlItem)
+            {
+                var dispatchAgent = item.Agent ?? project?.DefaultAgent;
+                item = ReconcileBaselinePinForDispatchAgent(item, dispatchAgent, project);
+            }
+
             // Per-project pause gate: check before the budget lock so paused projects
             // don't consume a budget lock slot. Block is pickup-only; in-flight items
             // already running are not cancelled (same semantics as the global pause).
@@ -3321,13 +3347,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     var pipelineItem = item;
                     var baselineRef = ResolveBaselineRefForPickup(item, project);
+                    // A freshly filled pin is attributed to the agent this
+                    // dispatch is about to run; an existing pin keeps the
+                    // attribution the post-routing reconcile already settled.
+                    var stampedRef = item.BaselineImageRef ?? baselineRef;
+                    var stampedAgent = item.BaselineImageRef is not null
+                        ? item.BaselineImageAgent
+                        : (stampedRef is null ? null : item.Agent ?? project?.DefaultAgent);
                     item = item with
                     {
                         StartedAt = _time.GetUtcNow(),
-                        BaselineImageRef = item.BaselineImageRef ?? baselineRef,
+                        BaselineImageRef = stampedRef,
+                        BaselineImageAgent = stampedAgent,
                     };
                     await _store.UpdateAsync(item, ct);
-                    item = pipelineItem with { StartedAt = item.StartedAt, BaselineImageRef = item.BaselineImageRef };
+                    item = pipelineItem with
+                    {
+                        StartedAt = item.StartedAt,
+                        BaselineImageRef = item.BaselineImageRef,
+                        BaselineImageAgent = item.BaselineImageAgent,
+                    };
                     ClearRefactorDrainClaim(item.ProjectId, item.Id);
                 }
             }
@@ -4019,6 +4058,42 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _log.LogDebug(ex, "Baseline-ref resolver threw for work item {Id}; proceeding without pin", item.Id);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Re-resolves the work item's baseline pin when the agent this pickup will
+    /// dispatch differs from the one the pin was resolved under. The pinned ref
+    /// is content-addressed over what has to be provisioned — including the
+    /// agent CLI set — so a pin that survives a re-route launches the sandbox
+    /// from a baseline that can lack the new agent's binary (the failure then
+    /// names a missing guest link, not the stale pin). A pin with no recorded
+    /// attribution (rows predating the column) is unverifiable and re-resolved
+    /// rather than trusted. Never throws for resolver faults —
+    /// <see cref="ResolveBaselineRefForPickup"/> already fails open because
+    /// pinning is an optimisation, not a correctness primitive.
+    /// </summary>
+    private WorkItem ReconcileBaselinePinForDispatchAgent(WorkItem item, AgentKind? dispatchAgent, Project? project)
+    {
+        if (item.BaselineImageRef is null
+            || dispatchAgent is null
+            || item.BaselineImageAgent == dispatchAgent)
+        {
+            return item;
+        }
+
+        var repinned = ResolveBaselineRefForPickup(item, project);
+        _log.LogInformation(
+            "Work item {Id}: baseline pin {OldRef} was resolved for agent '{PinnedAgent}', dispatching as '{Agent}'; re-resolved to {NewRef}",
+            item.Id,
+            item.BaselineImageRef,
+            item.BaselineImageAgent?.Value ?? "(unattributed)",
+            dispatchAgent.Value,
+            repinned ?? "(unpinned)");
+        return item with
+        {
+            BaselineImageRef = repinned,
+            BaselineImageAgent = repinned is null ? null : dispatchAgent,
+        };
     }
 
     private async Task<WorkItem> ResetInfrastructureDeferredItemAsync(WorkItem item, CancellationToken ct)

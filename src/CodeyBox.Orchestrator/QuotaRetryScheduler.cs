@@ -357,7 +357,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         {
             var pinnedRef = ResolveBaselineRefForRetry(item, project);
             if (pinnedRef is not null)
-                item = item with { BaselineImageRef = pinnedRef };
+                item = item with { BaselineImageRef = pinnedRef, BaselineImageAgent = item.Agent };
         }
 
         var decision = await _router.ResolveQuotaRetryAsync(
@@ -766,7 +766,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         {
             var pinnedRef = ResolveBaselineRefForRetry(item, project);
             if (pinnedRef is not null)
-                item = item with { BaselineImageRef = pinnedRef };
+                item = item with { BaselineImageRef = pinnedRef, BaselineImageAgent = item.Agent };
         }
 
         var decision = await _router.ResolveQuotaRetryAsync(

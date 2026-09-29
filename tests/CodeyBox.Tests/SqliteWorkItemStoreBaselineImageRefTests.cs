@@ -71,6 +71,30 @@ public sealed class SqliteWorkItemStoreBaselineImageRefTests : IDisposable
     }
 
     [Fact]
+    public async Task RoundTrip_BaselineImageAgent_Preserved()
+    {
+        var item = Sample(baselineRef: "cb-baseline-abc123") with
+        {
+            BaselineImageAgent = AgentKind.Copilot,
+        };
+        await _store.CreateAsync(item);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal("cb-baseline-abc123", read!.BaselineImageRef);
+        Assert.Equal(AgentKind.Copilot, read.BaselineImageAgent);
+    }
+
+    [Fact]
+    public async Task LegacyRow_NullBaselineImageAgent_RoundTripsAsNull()
+    {
+        var item = Sample(baselineRef: "cb-baseline-abc123");
+        await _store.CreateAsync(item);
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Null(read!.BaselineImageAgent);
+    }
+
+    [Fact]
     public async Task GetActiveBaselineImageRefs_OnlyIncludesNonTerminal()
     {
         await _store.CreateAsync(Sample("cb-baseline-aaa", WorkItemState.Working));

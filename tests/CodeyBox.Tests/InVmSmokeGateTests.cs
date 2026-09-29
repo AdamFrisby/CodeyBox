@@ -69,7 +69,9 @@ public sealed class InVmSmokeGateTests
             dispatchAvailability: new AgentDispatchAvailability(registry, gate));
     }
 
-    private static WorkItem MakeItem(string? baselineImageRef = null) => new()
+    private static WorkItem MakeItem(
+        string? baselineImageRef = null,
+        AgentKind? baselineImageAgent = null) => new()
     {
         Id = WorkItemId.New(),
         ProjectId = new ProjectId("proj"),
@@ -77,6 +79,7 @@ public sealed class InVmSmokeGateTests
         Prompt = "p",
         AgentClassId = "frontier",
         BaselineImageRef = baselineImageRef,
+        BaselineImageAgent = baselineImageAgent,
     };
 
     private static Project MakeProject() => new()
@@ -94,10 +97,14 @@ public sealed class InVmSmokeGateTests
         // image (the one dispatch will clone), not the active baseline. Guards the
         // router→gate wiring: a regression passing null from ResolveAsync would
         // probe the wrong image yet still route, so assert the gate saw the ref.
+        // The pin is attributed to Cursor — the member actually being gated —
+        // since only the agent the pin was resolved for probes the pinned image.
         var gate = new RecordingGate();
         var router = BuildRouter(NewRegistry(), gate);
 
-        await router.ResolveAsync(MakeItem(baselineImageRef: "base-PINNED"), MakeProject(), CancellationToken.None);
+        await router.ResolveAsync(
+            MakeItem(baselineImageRef: "base-PINNED", baselineImageAgent: Cursor),
+            MakeProject(), CancellationToken.None);
 
         Assert.Contains("base-PINNED", gate.SeenBaselineRefs);
         var target = Assert.Single(gate.SeenTargets);
@@ -129,7 +136,8 @@ public sealed class InVmSmokeGateTests
         var project = MakeProject() with { GraphicalSandbox = true };
 
         await router.ResolveAsync(
-            MakeItem(baselineImageRef: "base-HEADLESS-WORK") with { JobType = JobType.CheckAndAct },
+            MakeItem(baselineImageRef: "base-HEADLESS-WORK", baselineImageAgent: Cursor)
+                with { JobType = JobType.CheckAndAct },
             project,
             CancellationToken.None);
 

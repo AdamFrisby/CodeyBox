@@ -406,7 +406,7 @@ public sealed partial class PipelineRunner
         }
         var initialItem = initialRunnerOverride is null
             ? item
-            : item with
+            : item.WithBaselinePinForAgent(initialAgent) with
             {
                 Agent = initialAgent,
                 AgentInstanceId = initialMemberOverride?.RouteKey ?? item.AgentInstanceId,
@@ -429,6 +429,14 @@ public sealed partial class PipelineRunner
 
         var fallbackSmokeTarget = smokeTarget ?? ResolvePhaseSmokeTarget(project, phase, item.BaselineImageRef);
 
+        // The smoke target's baseline ref came from the item's original pin.
+        // When the pin was dropped for the attempt's agent (a cross-kind swap
+        // clears it via WithBaselinePinForAgent), the probe must resolve the
+        // active baseline — the same image the fresh sandbox will clone.
+        InVmSmokeSandboxTarget SmokeTargetForAttempt(WorkItem attemptItem) =>
+            fallbackSmokeTarget.WithBaselineRef(
+                attemptItem.BaselineImageRef is null ? null : fallbackSmokeTarget.BaselineRef);
+
         // Single-attempt path when fallback is not wired (no class, no router).
         // The behaviour matches the legacy code: TerminalQuotaError bubbles out.
         if (_classRouter is null
@@ -436,7 +444,7 @@ public sealed partial class PipelineRunner
         {
             var smokeAvailability = skipInVmSmoke
                 ? await EnsureAgentPauseAllowsTextOnlyAsync(initialRunner.Kind, initialItem.AgentInstanceId, ct)
-                : await EnsureAgentSmokeAvailableAsync(initialRunner.Kind, fallbackSmokeTarget, ct);
+                : await EnsureAgentSmokeAvailableAsync(initialRunner.Kind, SmokeTargetForAttempt(initialItem), ct);
             if (!smokeAvailability.Available)
             {
                 if (IsOperatorPaused(smokeAvailability))
@@ -586,7 +594,12 @@ public sealed partial class PipelineRunner
             }
 
             // Find the next candidate that we haven't already tried this run.
-            var candidates = await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct, fallbackSmokeTarget);
+            // The candidates being enumerated would replace the item's dispatch
+            // agent, so the pin is scoped per candidate kind: a cross-kind pick
+            // drops the pin (see trialItem below) and must be gated on the
+            // active baseline, not the stale one.
+            var candidates = await _classRouter.OrderedFallbackCandidatesAsync(
+                item, project, ct, fallbackSmokeTarget, pinFollowsDispatchAgent: true);
             AgentMembership? nextMember = null;
             IAgentRunner? nextRunner = null;
             foreach (var candidate in candidates)
@@ -865,7 +878,11 @@ public sealed partial class PipelineRunner
             // reads the fallback history record we write below and asks the wired
             // ICrossAgentHandoffBriefBuilder for a fenced + sanitised brief. Keep
             // the prompt unchanged here.
-            var trialItem = item with
+            // A swap to a member of another agent kind invalidates the baseline
+            // pin: the pinned image encodes the previous agent's provisioning
+            // and can lack the incoming CLI entirely. WithBaselinePinForAgent
+            // drops it so the fresh sandbox clones the active baseline.
+            var trialItem = item.WithBaselinePinForAgent(nextMember.Agent) with
             {
                 Agent = nextMember.Agent,
                 AgentInstanceId = nextMember.RouteKey,
@@ -952,7 +969,7 @@ public sealed partial class PipelineRunner
 
             var smokeAvailability = skipInVmSmoke
                 ? await EnsureAgentPauseAllowsTextOnlyAsync(currentRunner.Kind, currentItem.AgentInstanceId, ct)
-                : await EnsureAgentSmokeAvailableAsync(currentRunner.Kind, fallbackSmokeTarget, ct);
+                : await EnsureAgentSmokeAvailableAsync(currentRunner.Kind, SmokeTargetForAttempt(currentItem), ct);
             if (!smokeAvailability.Available)
             {
                 if (IsOperatorPaused(smokeAvailability))
