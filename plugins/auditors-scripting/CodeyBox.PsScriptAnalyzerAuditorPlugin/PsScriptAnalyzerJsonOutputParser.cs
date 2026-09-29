@@ -113,13 +113,23 @@ internal sealed class PsScriptAnalyzerJsonOutputParser : IExternalToolOutputPars
             return null;
         if (path.StartsWith(FileSchemePrefix, StringComparison.OrdinalIgnoreCase))
             path = path[FileSchemePrefix.Length..];
-        // A tool-reported "./x" is the same location as "x" — collapse the
-        // prefix so ExcludePaths and finding locations stay repo-relative.
-        while (path.StartsWith("./", StringComparison.Ordinal))
-            path = path[2..];
+
+        // A tool-reported "./x" is the same location as "x", and a reported
+        // "a/../b" is "b" — dot segments are collapsed lexically BEFORE
+        // relativization, otherwise "/work/../outside.ps1" would strip the
+        // scan-root prefix and reach findings as the pseudo repo-relative
+        // "../outside.ps1".
+        path = CollapseDotSegments(path);
+        if (path.Length == 0)
+            return null;
 
         if (!path.StartsWith("/", StringComparison.Ordinal))
-            return path;
+        {
+            // A relative path still carrying '..' escapes its base — mark
+            // it out-of-tree like an unresolved absolute path rather than
+            // letting it reach finding locations as a repo-relative value.
+            return HasDotDotSegment(path) ? FileSchemePrefix + path : path;
+        }
 
         var relative = RelativizeToRoot(path, input.ScanRoot);
         if (!relative.StartsWith("/", StringComparison.Ordinal))
@@ -133,4 +143,32 @@ internal sealed class PsScriptAnalyzerJsonOutputParser : IExternalToolOutputPars
         // bare leading '/' from finding paths).
         return FileSchemePrefix + path;
     }
+
+    // Lexically resolves '.' and '..' segments on a '/'-separated path —
+    // '..' past the root clamps for absolute paths, and stays a leading
+    // segment for relative ones (a genuine escape the caller marks).
+    private static string CollapseDotSegments(string path)
+    {
+        var absolute = path.Length > 0 && path[0] == '/';
+        var segments = new List<string>();
+        foreach (var segment in path.Split('/'))
+        {
+            if (segment.Length == 0 || segment == ".")
+                continue;
+            if (segment == "..")
+            {
+                if (segments.Count > 0 && segments[^1] != "..")
+                    segments.RemoveAt(segments.Count - 1);
+                else if (!absolute)
+                    segments.Add(segment);
+                continue;
+            }
+            segments.Add(segment);
+        }
+        var joined = string.Join('/', segments);
+        return absolute ? "/" + joined : joined;
+    }
+
+    private static bool HasDotDotSegment(string path)
+        => path.Split('/').Contains("..", StringComparer.Ordinal);
 }

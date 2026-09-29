@@ -252,56 +252,20 @@ public sealed class PyrightAuditor : ExternalToolAuditorBase, IPluginInitializer
         return args;
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Pyright's report carries absolute <c>file</c> paths and no embedded
+    /// cwd, so the parser relativizes against the directory the tool
+    /// actually ran in — resolved through the shared <c>pwd</c> probe, since
+    /// sandbox providers may translate <paramref name="workingDirectory"/>.
+    /// </summary>
     protected override async Task<string?> ResolveScanRootAsync(
         ISandbox sandbox,
         string workingDirectory,
         AuditContext context,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
-    {
-        // Pyright's report carries absolute `file` paths and no embedded cwd,
-        // so the parser relativizes against the directory the tool actually
-        // ran in. That is not necessarily the `workingDirectory` string:
-        // sandbox providers may translate it (the process provider maps
-        // "/work" onto a host temp path), so it is resolved with a bounded
-        // `pwd` probe — the same cwd the scan will see. `pwd` is a shell
-        // builtin — the audited repository cannot shadow it via PATH — and
-        // it prints the process's own logical cwd, which is exactly the path
-        // prefix pyright embeds in its absolute `file` values.
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "scan-root probe",
-            new SandboxExec
-            {
-                Argv = ["sh", "-c", "pwd", "sh"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' scan-root probe could not run: the sandbox exec "
-                + "transport was unavailable.");
-
-        var root = result.Stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        if (result.ExitCode != 0 || string.IsNullOrEmpty(root))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not resolve the scan root (exit "
-                + $"{result.ExitCode}) — the worktree root must be resolvable for findings to be "
-                + "reported repository-relative.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-
-        return ExternalToolJsonHelpers.NormalizePath(root);
-    }
+        => await ProbeSandboxWorkingDirectoryAsync(sandbox, workingDirectory, options, ct)
+            .ConfigureAwait(false);
 
     /// <inheritdoc />
     public Task InitializeAsync(PluginContext context, CancellationToken ct = default)

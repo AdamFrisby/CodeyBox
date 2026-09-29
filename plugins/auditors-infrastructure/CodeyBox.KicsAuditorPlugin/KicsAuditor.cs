@@ -337,79 +337,13 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
         if (configured is null)
             return ["--config", Path.Combine(PerRunTempDirectoryPath, EmptyConfigFileName)];
 
+        // From inside the tree the diff author could bind flags absent from
+        // argv (exclude-queries, exclude-severities) and silently empty the
+        // report — the shared canonicalize-then-contain guard rejects any
+        // resolution into the worktree.
         var canonical = await CanonicalizeOutsideWorktreeAsync(
-            sandbox, workingDirectory, configured, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, configured, ConfigFileKey, options, ct).ConfigureAwait(false);
         return ["--config", canonical];
-    }
-
-    /// <summary>
-    /// Canonicalizes the operator's <c>ConfigFile</c> inside the sandbox and
-    /// fails closed when it resolves inside the audited worktree. KICS
-    /// resolves a relative <c>--config</c> against its cwd — the worktree —
-    /// so the probe canonicalizes the configured path and the probe cwd with
-    /// one <c>realpath -m</c> call: relative paths, <c>..</c> segments, and
-    /// symlinked components all collapse to the path KICS would actually
-    /// open, and containment is judged against the same canonicalized scan
-    /// root. From inside the tree the diff author could bind flags absent
-    /// from argv (exclude-queries, exclude-severities) and silently empty
-    /// the report.
-    /// </summary>
-    private async Task<string> CanonicalizeOutsideWorktreeAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string configured,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var probe = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "config-file check",
-            new SandboxExec
-            {
-                // Two operands, two output lines: the configured path and
-                // "." — the exec working directory canonicalized in the
-                // sandbox's own path space (providers may translate the
-                // host-side workingDirectory). realpath resolves through
-                // PATH like the other probe binaries (sh, cat) rather than
-                // an assumed FHS location; a missing realpath exits
-                // non-zero and fails closed as infrastructure below.
-                Argv = ["realpath", "-m", "--", configured, "."],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' {ConfigFileKey} canonicalization could "
-                + "not run: the sandbox exec transport was unavailable.");
-
-        var lines = probe.Stdout.Split(
-            '\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (probe.ExitCode != 0 || lines.Length != 2)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not canonicalize {ConfigFileKey} "
-                + $"'{TruncateForMessage(configured)}' (exit {probe.ExitCode}) — an unchecked config "
-                + "path is never trusted, so this is infrastructure, not a verdict on the diff.",
-                probe.ExitCode,
-                probe.Stderr);
-
-        var canonicalConfig = ValidatedArgumentValue(lines[0], ConfigFileKey);
-        var canonicalWorktree = lines[1];
-        if (HostPathPolicy.IsWithinDirectory(canonicalConfig, canonicalWorktree))
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor 'codeybox:kics' {ConfigFileKey} "
-                + $"'{TruncateForMessage(configured)}' resolves to '{TruncateForMessage(canonicalConfig)}' "
-                + "inside the audited worktree — a repository-controlled config can bind un-passed "
-                + "flags and empty the report. Set an absolute path outside the repository, or unset "
-                + "it to use the generated empty config.")
-            { IsDeterministic = true };
-
-        return canonicalConfig;
     }
 
     /// <inheritdoc />
@@ -540,7 +474,7 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// parser can relativize the absolute <c>file_name</c> values KICS emits
     /// when scan targets are not repo-relative. Sandbox providers may
     /// translate the audit's working directory, so it is probed rather than
-    /// assumed.
+    /// assumed — through the shared <c>pwd</c> probe.
     /// </summary>
     protected override async Task<string?> ResolveScanRootAsync(
         ISandbox sandbox,
@@ -548,39 +482,8 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
         AuditContext context,
         ExternalToolAuditorOptions options,
         CancellationToken ct)
-    {
-        var result = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "scan-root probe",
-            new SandboxExec
-            {
-                Argv = ["sh", "-c", "pwd", "sh"],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' scan-root probe could not run: the sandbox "
-                + "exec transport was unavailable.");
-
-        var root = result.Stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        if (result.ExitCode != 0 || string.IsNullOrEmpty(root))
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not resolve the scan root (exit "
-                + $"{result.ExitCode}) — reported paths could not be trusted relative to the worktree, "
-                + "so this is infrastructure, not a verdict on the diff.",
-                result.ExitCode,
-                result.Stdout + "\n" + result.Stderr);
-        return root;
-    }
+        => await ProbeSandboxWorkingDirectoryAsync(sandbox, workingDirectory, options, ct)
+            .ConfigureAwait(false);
 
     private static void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
     {

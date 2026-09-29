@@ -11,17 +11,22 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Covers the PSScriptAnalyzer auditor plugin:
-/// - A missing Invoke-ScriptAnalyzer shim or pwsh host is an infrastructure failure
-///   naming the tool (never a pass, never a finding).
+/// - A missing Invoke-ScriptAnalyzer shim — or a missing pwsh host, which fails
+///   the shim's --version probe — is an infrastructure failure naming the tool
+///   (never a pass, never a finding).
 /// - The shim-owned exit convention: 0 = ran clean, 2 = ran with diagnostics; every
 ///   other exit — including the common-convention 1 — is infrastructure.
 /// - The JSON report maps to findings with the rule id and file/line preserved;
 ///   severities go through the declared mapping (Information → Info, ParseError →
 ///   Error), never raw pass-through.
-/// - A SettingsPath resolving inside the audited worktree (including via canonicalized
-///   dot segments or symlinks) is rejected deterministically; preset names pass through.
+/// - -Settings is always emitted: unset SettingsPath → a generated empty settings
+///   file (defeating PSScriptAnalyzerSettings.psd1 auto-discovery); a preset name
+///   passes verbatim; a path resolving inside the audited worktree (including via
+///   canonicalized dot segments or symlinks) or carrying wildcard metacharacters
+///   is rejected deterministically.
 /// - Reserved ExtraArguments flags are rejected deterministically, including
-///   case-insensitive prefix spellings (-Set binds -Settings in PowerShell).
+///   case-insensitive prefix spellings (-Set binds -Settings), parameter aliases
+///   (-PSPath, -wi, -cf), and Unicode-dash spellings (U+2013–U+2015).
 /// - Plugin is disabled by default, and its tools are absent from baseline
 ///   provisioning until enabled.
 /// - Real binary execution tests under [Trait("requires_psscriptanalyzer", "true")]
@@ -30,6 +35,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class PsScriptAnalyzerAuditorTests
 {
+    // A parse-error record's RuleName is the parser's ErrorId
+    // (MissingEndCurlyBrace) — only its Severity is 'ParseError'.
     private const string JsonWithFindings = """
         [
           {
@@ -40,7 +47,7 @@ public sealed class PsScriptAnalyzerAuditorTests
             "Line": 2
           },
           {
-            "RuleName": "ParseError",
+            "RuleName": "MissingEndCurlyBrace",
             "Severity": "ParseError",
             "Message": "The script 'deploy.ps1' has a missing closing brace.",
             "File": "/work/deploy.ps1",
@@ -94,13 +101,17 @@ public sealed class PsScriptAnalyzerAuditorTests
     [Fact]
     public async Task MissingPwsh_IsInfrastructureFailure_NeverAPass()
     {
+        // pwsh is the shim's interpreter: when it is absent the shim itself
+        // cannot execute, so the --version probe fails as an exec error
+        // (127) and the run dies at the version check naming the declared
+        // tool — still infrastructure, still never a pass.
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPwshPresenceProbe(exec))
-                return Task.FromResult(new SandboxExecResult(1, "", ""));
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            if (IsVersionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(127, "", "/usr/bin/env: 'pwsh': No such file or directory"));
             if (IsScanExec(exec))
                 scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -110,7 +121,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
-        Assert.Contains("pwsh", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Invoke-ScriptAnalyzer", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -169,7 +180,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
             {
@@ -192,7 +203,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         Assert.Equal("build.ps1:2", warning.Location);
 
         var parseError = Assert.Single(
-            result.Findings, f => f.Title.Contains("ParseError", StringComparison.Ordinal));
+            result.Findings, f => f.Title.Contains("MissingEndCurlyBrace", StringComparison.Ordinal));
         Assert.Equal(AuditSeverity.Error, parseError.Severity);
         Assert.Equal("deploy.ps1:14", parseError.Location);
 
@@ -212,7 +223,7 @@ public sealed class PsScriptAnalyzerAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
@@ -236,7 +247,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         // ride stdout — the declared findings exits are exactly {0, 2}.
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(exitCode, JsonWithFindings, "The term 'Invoke-ScriptAnalyzer' is not recognized"));
@@ -258,7 +269,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         // broke — "could not confirm results" is infrastructure, never a pass.
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(2, "", ""));
@@ -280,7 +291,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         // not a clean tree.
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(2, "[]", ""));
@@ -299,7 +310,7 @@ public sealed class PsScriptAnalyzerAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(2, JsonWithSeverities, ""));
@@ -334,7 +345,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         {
             if (IsPwdProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
@@ -356,6 +367,11 @@ public sealed class PsScriptAnalyzerAuditorTests
     [InlineData("/work/../work/nested.psd1")]
     [InlineData("..pssa.psd1")]
     [InlineData("/work/..pssa.psd1")]
+    // A name-shaped value that is NOT a shipped preset resolves as a file
+    // path relative to the cmdlet's cwd — the worktree — so it must go
+    // through canonicalization like any other path.
+    [InlineData("MyCustomSettings")]
+    [InlineData("PSScriptAnalyzerSettings.psd1")]
     public async Task InTreeSettingsPath_IsRejectedDeterministically(string settingsPath)
     {
         // A settings file resolving inside the audited tree — however spelled —
@@ -366,7 +382,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         {
             if (IsSettingsProbe(exec))
                 return Task.FromResult(RealpathOk(exec));
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 scanExecs++;
@@ -399,7 +415,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         {
             if (IsSettingsProbe(exec))
                 return Task.FromResult(RealpathOk(exec, _ => "/work/policy-link.psd1"));
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
@@ -434,7 +450,7 @@ public sealed class PsScriptAnalyzerAuditorTests
                 settingsProbes++;
                 return Task.FromResult(RealpathOk(exec));
             }
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
             {
@@ -463,6 +479,112 @@ public sealed class PsScriptAnalyzerAuditorTests
     }
 
     [Fact]
+    public async Task SettingsPath_Unset_AlwaysEmitsGeneratedSettingsFile()
+    {
+        // With no -Settings the cmdlet auto-discovers
+        // PSScriptAnalyzerSettings.psd1 in the -Path directory — a file the
+        // diff author could commit to empty the report. The flag must
+        // therefore always be present: unset config names the generated
+        // empty settings file under the per-run scratch dir, prepared by
+        // VerifyToolAsync.
+        var prepExecs = 0;
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSettingsPrepProbe(exec))
+            {
+                prepExecs++;
+                return Task.FromResult(Ok(exec));
+            }
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+            {
+                scanExec = exec;
+                return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+            }
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        });
+
+        IAuditor auditor = new PsScriptAnalyzerAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(1, prepExecs);
+        Assert.NotNull(scanExec);
+        var settingsIndex = scanExec!.Argv.ToList().IndexOf("-Settings");
+        Assert.True(settingsIndex >= 0 && settingsIndex + 1 < scanExec.Argv.Count);
+        var settingsValue = scanExec.Argv[settingsIndex + 1];
+        Assert.EndsWith("/" + PsScriptAnalyzerAuditor.EmptySettingsFileName, settingsValue, StringComparison.Ordinal);
+        // The named file must live OUTSIDE the audited worktree.
+        Assert.DoesNotContain("/work", settingsValue, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SettingsPreparation_Failure_IsInfrastructureFailure()
+    {
+        // The generated -Settings file cannot be written → the flag would
+        // name a missing file; fail closed rather than scanning.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSettingsPrepProbe(exec))
+                return Task.FromResult(new SandboxExecResult(1, "", "mkdir: cannot create directory"));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        IAuditor auditor = new PsScriptAnalyzerAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("Invoke-ScriptAnalyzer", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("settings file", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Theory]
+    // The cmdlet resolves a non-preset -Settings through a globbing
+    // provider-path resolver — a wildcard could expand to an in-tree file
+    // the canonicalization check never sees, so metacharacters are rejected
+    // before any probe runs.
+    [InlineData("/opt/*.psd1")]
+    [InlineData("conf?g.psd1")]
+    [InlineData("/opt/pssa/settings[0-9].psd1")]
+    public async Task SettingsPath_Wildcards_AreRejectedDeterministically(string settingsPath)
+    {
+        var settingsProbes = 0;
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSettingsProbe(exec))
+                settingsProbes++;
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        });
+
+        var auditor = new PsScriptAnalyzerAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:SettingsPath"] = settingsPath,
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("wildcard", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, settingsProbes);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
     public async Task SettingsPath_OutsideWorktree_PassesCanonicalized()
     {
         SandboxExec? scanExec = null;
@@ -470,7 +592,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         {
             if (IsSettingsProbe(exec))
                 return Task.FromResult(RealpathOk(exec));
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
             {
@@ -505,7 +627,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
             {
@@ -569,16 +691,37 @@ public sealed class PsScriptAnalyzerAuditorTests
     [InlineData("-EnableExit")]
     [InlineData("-WhatIf")]
     [InlineData("-Confirm")]
+    // Parameter aliases bind exactly like the parameter name.
+    [InlineData("-PSPath")]
+    [InlineData("-wi")]
+    [InlineData("-cf")]
+    // Custom rule paths load repository-controlled module code resolved
+    // against the cmdlet's cwd — the same threat the SettingsPath
+    // containment guard exists for.
+    [InlineData("-CustomRulePath")]
+    [InlineData("-CustomizedRulePath")]
+    [InlineData("-RecurseCustomRulePath")]
+    [InlineData("-IncludeDefaultRules")]
+    // A cmdlet-level ErrorAction would override the shim's
+    // $ErrorActionPreference=Stop and turn mid-scan failures into a
+    // silently partial report.
+    [InlineData("-ErrorAction")]
+    [InlineData("-ea")]
     // PowerShell binds unambiguous parameter-name prefixes case-insensitively —
     // "-set" binds -Settings — so the rejection must see through both.
     [InlineData("-set")]
     [InlineData("-SET:/opt/x.psd1")]
+    // The parameter-token 'dash' production also accepts U+2013/U+2014/U+2015;
+    // '–Settings' binds -Settings.
+    [InlineData("–Settings")]
+    [InlineData("—WhatIf")]
+    [InlineData("―Recurse")]
     public async Task ReservedExtraArguments_AreRejectedDeterministically(string flag)
     {
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 scanExecs++;
@@ -609,7 +752,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
             {
@@ -642,7 +785,7 @@ public sealed class PsScriptAnalyzerAuditorTests
     {
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwshPresenceProbe(exec) || IsPwdProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsScanExec(exec))
                 return Task.FromResult(new SandboxExecResult(2, JsonWithFilteredPaths, ""));
@@ -654,6 +797,38 @@ public sealed class PsScriptAnalyzerAuditorTests
 
         var finding = Assert.Single(result.Findings);
         Assert.Equal("scripts/build.ps1:1", finding.Location);
+    }
+
+    [Fact]
+    public async Task ReportedPath_WithDotDotSegments_IsMarkedOutOfTree()
+    {
+        // "/work/../outside.ps1" collapses to "/outside.ps1" — above the
+        // scan root — so it must reach the finding with the out-of-tree
+        // file:// marker, not as the pseudo repo-relative "../outside.ps1".
+        const string json = """
+            [
+              { "RuleName": "R", "Severity": "Error", "Message": "x", "File": "/work/../outside.ps1", "Line": 7 },
+              { "RuleName": "R", "Severity": "Error", "Message": "x", "File": "../relative-escape.ps1", "Line": 8 },
+              { "RuleName": "R", "Severity": "Error", "Message": "x", "File": "a/../b.ps1", "Line": 9 }
+            ]
+            """;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(2, json, ""));
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        });
+
+        IAuditor auditor = new PsScriptAnalyzerAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.Equal(3, result.Findings.Count);
+        var locations = result.Findings.Select(f => f.Location).Order().ToList();
+        Assert.Equal(
+            ["b.ps1:9", "file://../relative-escape.ps1:8", "file:///outside.ps1:7"],
+            locations);
     }
 
     [Fact]
@@ -839,12 +1014,14 @@ public sealed class PsScriptAnalyzerAuditorTests
             && exec.Argv[2].Contains("command -v", StringComparison.Ordinal)
             && exec.Argv.Contains("Invoke-ScriptAnalyzer", StringComparer.Ordinal);
 
-    private static bool IsPwshPresenceProbe(SandboxExec exec)
+    // The VerifyToolAsync preparation exec: sh -c '<dir + empty settings
+    // file script>' sh <per-run dir>. Identified by the generated filename
+    // baked into the fixed script.
+    private static bool IsSettingsPrepProbe(SandboxExec exec)
         => exec.Argv.Count >= 3
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"
-            && exec.Argv[2].Contains("command -v", StringComparison.Ordinal)
-            && exec.Argv.Contains("pwsh", StringComparer.Ordinal);
+            && exec.Argv[2].Contains(PsScriptAnalyzerAuditor.EmptySettingsFileName, StringComparison.Ordinal);
 
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "Invoke-ScriptAnalyzer" && exec.Argv[1] == "--version";
