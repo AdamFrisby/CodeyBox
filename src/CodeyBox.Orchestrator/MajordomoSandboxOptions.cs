@@ -31,6 +31,15 @@ public sealed class MajordomoSandboxOptions
     /// <summary>Default restricted network profile for the majordomo sandbox.</summary>
     public const string DefaultNetworkProfile = "majordomo";
 
+    /// <summary>
+    /// Conventional host bridge for <see cref="DefaultNetworkProfile"/>, created
+    /// with <c>scripts/setup-host-networks.sh</c> (see docs/concepts/sandboxes.md).
+    /// </summary>
+    public const string DefaultBridgeName = "cb-majordomo";
+
+    /// <summary>Default sandbox image baked with the majordomo baseline.</summary>
+    public const string DefaultImageReference = "codeybox-majordomo";
+
     /// <summary>Default idle lifetime before the sandbox is torn down.</summary>
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromMinutes(10);
 
@@ -109,6 +118,12 @@ public sealed class MajordomoSandboxOptions
     /// </summary>
     public List<string> RepositoryPaths { get; set; } = [];
 
+    /// <summary>
+    /// Sandbox image reference for the majordomo VM. Hot-reloadable: the next
+    /// turn after an idle teardown boots this image.
+    /// </summary>
+    public string ImageReference { get; set; } = DefaultImageReference;
+
     /// <summary>Hot-reload validator: returns the failure message or null.</summary>
     public static string? Validate(MajordomoSandboxOptions opts)
     {
@@ -147,6 +162,8 @@ public sealed class MajordomoSandboxOptions
             if (string.IsNullOrWhiteSpace(repo))
                 return $"{SectionName}:RepositoryPaths must not contain blank entries";
         }
+        if (string.IsNullOrWhiteSpace(opts.ImageReference))
+            return $"{SectionName}:ImageReference must be a non-empty sandbox image reference";
         return null;
     }
 

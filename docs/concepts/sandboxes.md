@@ -474,7 +474,8 @@ Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
 
 ```json
 "SandboxNetworkProfiles": {
-  "graphical": "cb-graphical"
+  "graphical": "cb-graphical",
+  "majordomo": "cb-majordomo"
 }
 ```
 
@@ -498,6 +499,10 @@ only addition, never implied by the backend choice.
 majordomo         cb-majordomo    10.99.7.0/24   host.codeybox.internal
 ```
 
+The `majordomo` → `cb-majordomo` mapping ships in the default
+`SandboxNetworkProfiles`; overriding that map must keep the `majordomo` entry
+or creation fails closed rather than falling back to open egress.
+
 Project repositories are mounted read-only: the sandbox reads code to
 investigate and never writes there — writing code is what work items are for.
 The model is operator-configured (`CodeyBox:MajordomoSandbox:ModelBackend`):
@@ -507,8 +512,8 @@ subscription OAuth credential must not be used against a raw HTTP API. The
 sandbox's only route to mutation is the MCP tool server; it holds no
 orchestrator API key of its own beyond the majordomo identity, and no host
 credentials. An idle sandbox is torn down after
-`CodeyBox:MajordomoSandbox:IdleTimeout` (default 10 minutes) and
-transparently recreated on the next turn.
+`CodeyBox:MajordomoSandbox:IdleTimeout` (default 10 minutes) by
+`MajordomoSandboxIdleService` and transparently recreated on the next turn.
 
 With `MultipassUseBaselineImages=true`, the provider bakes
 `cb-baseline-graphical` the first time a graphical project runs. Delete that

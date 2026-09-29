@@ -304,7 +304,7 @@ startup); we add explicit guards as we tighten the contract.
 | `BuildScriptAudit.TimeoutSeconds` | int | `1800` | Hot-reloadable per-run timeout for the credential-free `process:build-script` auditor that executes repo-root `./build.sh`. |
 | `AuthFailurePatterns.<agent>[]` | object[] | `[]` | Extra runtime auth/login-prompt substrings for one agent kind. Each entry is `{ "pattern": "...", "stream": "stderr" }` by default; set `"stream": "stdout"` or `"stderrAndStdout"` only for tightly-formed CLI transcripts because stdout can contain model text. Built-in defaults already cover common OAuth/login prompts. |
 | `SandboxProvider` | string | — | One of `incus`, `multipass`, `multipass-remote`, `sprites`, `bubblewrap`, or `process`. Required in non-Development environments. Only a process started with `multipass` or `incus` can hot-switch, and only between those two. |
-| `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. |
+| `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. The default map also carries `SandboxNetworkProfiles.majordomo = cb-majordomo` for the majordomo sandbox — keep that entry when overriding the map. |
 | `MultipassSandbox.CloudInitReadyRetryAttempts` | int | `3` | Number of `cloud-init status --wait` attempts before probing VM readiness when cloud-init returns exit 1. |
 | `MultipassSandbox.VmStartTimeout` | TimeSpan | `00:03:00` | Deadline for the post-launch poll that waits for the VM to reach `Running`. Bump on hosts that observe boot contention under concurrent launches. |
 | `MultipassSandbox.VmStopTimeout` | TimeSpan | `00:02:00` | Deadline for the post-stop poll that waits for the VM to reach `Stopped`. |
@@ -1280,6 +1280,42 @@ hot-reloadable; the executor reads the current options on every call.
 | `ProposalTimeToLiveSeconds` | `86400` | How long a queued proposal stays approvable (24 hours). Approving past the deadline is refused and the proposal is marked expired. 60–2592000. |
 | `MaxPendingProposals` | `256` | Cap on proposals awaiting an operator decision (pending plus in-flight `applying` commits). Past the cap, new proposals are refused as `proposal_queue_full` until decisions drain the backlog. 1–4096. |
 | `DecidedProposalRetentionSeconds` | `604800` | How long a decided (approved/rejected/expired/superseded) proposal row is kept for review before an enqueue sweep removes it (7 days). Pending rows past their TTL are reaped by the same sweep; `applying` rows are never reaped. 60–7776000. |
+
+## `MajordomoSandbox`
+
+The operator's assistant runs in a long-lived sandbox (see
+`MajordomoSandboxSession`): created on demand, reused across turns, torn down
+after the idle bound by `MajordomoSandboxIdleService`, and transparently
+recreated on the next turn. It never consumes a work-item dispatch slot. All
+values are hot-reloadable; the session reads the current options on every
+turn. A bad value fails the host at startup (`ValidateOnStart`), not at the
+first majordomo turn.
+
+```json
+"MajordomoSandbox": {
+  "NetworkProfile": "majordomo",
+  "OrchestratorHost": "host.codeybox.internal",
+  "AdditionalAllowedHosts": [],
+  "IdleTimeout": "00:10:00",
+  "ModelBackend": "CodingAgentCli",
+  "AgentKind": "codex",
+  "HasMeteredApiKey": false,
+  "ImageReference": "codeybox-majordomo",
+  "RepositoryPaths": []
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `NetworkProfile` | `majordomo` | Host-side nftables profile the sandbox attaches to. Required and non-blank: creation fails closed instead of falling back to open egress, and a profile the host does not accept is refused. Define it in `/etc/codeybox/networks.conf` (see [sandboxes](../concepts/sandboxes.md#majordomo-sandbox)) and keep the `majordomo` entry in `SandboxNetworkProfiles`. |
+| `OrchestratorHost` | `host.codeybox.internal` | Bare hostname of the orchestrator API (MCP tool server) — the only egress member always present. No scheme, port, or path. |
+| `AdditionalAllowedHosts` | `[]` | Optional extra egress endpoints for an external model API (at most 4, each a bare hostname). Empty by default: no public internet. The only addition beyond `OrchestratorHost` — endpoints are named in configuration, never implied by the backend choice. |
+| `IdleTimeout` | `00:10:00` | Bounded idle lifetime after which the sandbox is torn down and recreated on the next turn. 1 minute – 8 hours. |
+| `ModelBackend` | `CodingAgentCli` | `CodingAgentCli` drives a coding-agent CLI already supported in the sandbox baseline; `ApiKey` calls a provider API with a genuine pay-per-use key. A subscription OAuth credential must never be used against a raw HTTP API. |
+| `AgentKind` | `codex` | Agent CLI driven when `ModelBackend` is `CodingAgentCli` (for example `codex`). Must name a CLI already supported in the sandbox baseline. |
+| `HasMeteredApiKey` | `false` | Must be true when `ModelBackend` is `ApiKey` — the key itself lives in the host environment, never in this file. A subscription OAuth bundle must not be substituted. |
+| `ImageReference` | `codeybox-majordomo` | Sandbox image the majordomo VM boots. Applies to the next turn after an idle teardown. |
+| `RepositoryPaths` | `[]` | Project repository host paths mounted read-only into the sandbox for investigation (at most 64, no blank entries). The sandbox never writes there — writing code is what work items are for. |
 
 Proposed-mode mutations are persisted as proposals (tool, arguments, the
 majordomo's reasoning, proposer, timestamp, state) in the state database, so

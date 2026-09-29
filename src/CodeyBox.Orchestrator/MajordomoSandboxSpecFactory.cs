@@ -31,11 +31,18 @@ public static class MajordomoSandboxSpecFactory
     public static SandboxSpec BuildSpec(
         MajordomoSandboxOptions options,
         string mcpServerUrl,
-        string imageReference = "codeybox-majordomo")
+        string? imageReference = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(mcpServerUrl);
-        ArgumentException.ThrowIfNullOrWhiteSpace(imageReference);
+
+        var image = string.IsNullOrWhiteSpace(imageReference)
+            ? options.ImageReference?.Trim() ?? string.Empty
+            : imageReference.Trim();
+        if (image.Length == 0)
+            throw new InvalidOperationException(
+                "Majordomo sandbox requires a sandbox image reference: " +
+                $"{MajordomoSandboxOptions.SectionName}:ImageReference is blank.");
 
         var profile = options.NetworkProfile?.Trim() ?? string.Empty;
         if (profile.Length == 0)
@@ -77,7 +84,7 @@ public static class MajordomoSandboxSpecFactory
 
         return new SandboxSpec
         {
-            ImageReference = imageReference,
+            ImageReference = image,
             Purpose = SandboxPurpose.WorkItem,
             Mounts = mounts,
             Environment = new Dictionary<string, string>
@@ -90,7 +97,7 @@ public static class MajordomoSandboxSpecFactory
                 AllowedHosts = allowedHosts,
             },
             Flavor = SandboxProfileFlavor.Headless,
-            WorkingDirectory = "/work",
+            WorkingDirectory = CodeyBox.Sandbox.SandboxConventions.WorkDir,
         };
     }
 

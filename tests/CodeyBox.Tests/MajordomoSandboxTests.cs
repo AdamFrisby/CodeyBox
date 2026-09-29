@@ -1,3 +1,4 @@
+using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -163,6 +164,81 @@ public sealed class MajordomoSandboxTests
 
         options.HasMeteredApiKey = true;
         Assert.Null(MajordomoSandboxOptions.Validate(options));
+    }
+
+    [Fact]
+    public void Spec_UsesConfiguredImageReference()
+    {
+        var spec = MajordomoSandboxSpecFactory.BuildSpec(Options(), McpUrl);
+        Assert.Equal(MajordomoSandboxOptions.DefaultImageReference, spec.ImageReference);
+
+        var custom = Options();
+        custom.ImageReference = "custom-majordomo-v2";
+        Assert.Equal("custom-majordomo-v2", MajordomoSandboxSpecFactory.BuildSpec(custom, McpUrl).ImageReference);
+
+        Assert.Equal(
+            "explicit-override",
+            MajordomoSandboxSpecFactory.BuildSpec(custom, McpUrl, "explicit-override").ImageReference);
+    }
+
+    [Fact]
+    public void Options_ImageReference_Required()
+    {
+        var options = Options();
+        options.ImageReference = "   ";
+        Assert.NotNull(MajordomoSandboxOptions.Validate(options));
+        Assert.Throws<InvalidOperationException>(
+            () => MajordomoSandboxSpecFactory.BuildSpec(options, McpUrl));
+    }
+
+    [Fact]
+    public void DefaultSandboxNetworkProfiles_IncludeMajordomoBridge()
+    {
+        var profiles = new CodeyBoxOptions().SandboxNetworkProfiles;
+        Assert.True(profiles.TryGetValue(MajordomoSandboxOptions.DefaultNetworkProfile, out var bridge));
+        Assert.Equal(MajordomoSandboxOptions.DefaultBridgeName, bridge);
+    }
+
+    [Fact]
+    public void IdleService_ComputePollInterval_DerivesFromBound()
+    {
+        Assert.Equal(
+            TimeSpan.FromMinutes(2.5),
+            MajordomoSandboxIdleService.ComputePollInterval(TimeSpan.FromMinutes(10)));
+        Assert.Equal(
+            TimeSpan.FromSeconds(15),
+            MajordomoSandboxIdleService.ComputePollInterval(TimeSpan.FromMinutes(1)));
+        Assert.Equal(
+            MajordomoSandboxIdleService.MaxPollInterval,
+            MajordomoSandboxIdleService.ComputePollInterval(TimeSpan.FromHours(8)));
+        Assert.Equal(
+            MajordomoSandboxIdleService.MaxPollInterval,
+            MajordomoSandboxIdleService.ComputePollInterval(TimeSpan.Zero));
+    }
+
+    [Fact]
+    public async Task IdleService_CheckOnce_TearsDownPastBound_AndNextTurnRecreates()
+    {
+        var provider = new MajordomoFakeProvider("incus");
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var options = Options();
+        await using var session = new MajordomoSandboxSession(
+            provider,
+            () => options,
+            () => ["majordomo"],
+            clock);
+        var service = new MajordomoSandboxIdleService(session, () => options, clock);
+
+        var first = Assert.IsType<MajordomoFakeSandbox>(await session.GetOrCreateAsync(McpUrl));
+        Assert.False(await service.CheckOnceAsync());
+
+        clock.Advance(TimeSpan.FromMinutes(11));
+        Assert.True(await service.CheckOnceAsync());
+        Assert.True(first.Disposed);
+
+        var second = await session.GetOrCreateAsync(McpUrl);
+        Assert.Equal(2, provider.Created);
+        Assert.NotSame(first, second);
     }
 
     private sealed class MajordomoFakeProvider(string kind) : ISandboxProvider
