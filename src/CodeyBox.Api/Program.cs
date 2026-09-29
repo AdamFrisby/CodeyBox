@@ -4328,6 +4328,14 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         cancellationRegistry: sp.GetRequiredService<CancellationRegistry>());
 });
 
+// --- Dispatcher evaluation record -------------------------------------------
+// Feeds the item-stale watchdog's dispatch-liveness guard (and queue
+// status): the orchestrator notes every deferral/pickup here so a frozen
+// UpdatedAt behind quota/cap reads as waiting, not wedged.
+builder.Services.AddSingleton<DispatchItemLivenessTracker>();
+builder.Services.AddSingleton<IItemDispatchLivenessSource>(
+    sp => sp.GetRequiredService<DispatchItemLivenessTracker>());
+
 // --- Per-item stale-updatedAt watchdog --------------------------------------
 // Item-centric counterpart to WorkerProgressWatchdog: walks items by state
 // (not by the worker registry) and treats an item as wedged when its
@@ -4355,7 +4363,12 @@ builder.Services.AddSingleton<ItemStaleProgressWatchdog>(sp =>
         // with a still-appending stream is a long turn, not a hang. Both are
         // optional — without them the detector falls back to UpdatedAt-only.
         streams: sp.GetService<IAgentStreamStore>(),
-        activitySource: sp.GetService<IWorkerProgressActivitySource>());
+        activitySource: sp.GetService<IWorkerProgressActivitySource>(),
+        // Dispatcher evaluations (quota / cap / budget deferrals, pickups):
+        // a frozen no-worker item the dispatcher is actively deferring is
+        // waiting, not stale. Optional — without it the detector falls back
+        // to UpdatedAt-only for no-worker items.
+        dispatchLiveness: sp.GetRequiredService<IItemDispatchLivenessSource>());
 });
 
 // --- Worker pool health watchdog --------------------------------------------
@@ -5282,7 +5295,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     repoReaper: sp.GetRequiredService<WorkItemRepoReaper>(),
     reservationLedger: sp.GetRequiredService<QuotaReservationLedger>(),
     costStore: sp.GetService<IWorkItemCostStore>(),
-    burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>()));
+    burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>(),
+    dispatchLiveness: sp.GetRequiredService<DispatchItemLivenessTracker>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(

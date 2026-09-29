@@ -558,7 +558,9 @@ CPU signal, and active sandbox ownership signal are all stale for
   "MaxRecoveryAttempts": 10,
   "ItemStaleTimeout": "02:30:00",
   "ItemStaleCheckInterval": "00:05:00",
-  "ItemStaleMaxRecoveryAttempts": 3
+  "ItemStaleMaxRecoveryAttempts": 3,
+  "ItemStaleDispatchQuietTimeout": "00:30:00",
+  "ItemQuotaWaitNoticeThreshold": "01:00:00"
 }
 ```
 
@@ -574,6 +576,8 @@ CPU signal, and active sandbox ownership signal are all stale for
 | `ItemStaleTimeout` | `02:30:00` | Window in which an active item's `UpdatedAt` must advance before the item-centric watchdog considers it wedged. A frozen `UpdatedAt` alone is not enough: an agent still appending stream output (or newly observed sandbox activity for its bound worker) is alive, not stale, and is skipped without consuming the recovery budget. Set `00:00:00` to disable this detector. Must stay above the per-iteration audit timeout (`Defaults:Audit:PerIterationTimeoutMinutes`, default 120 min) and below the sandbox wall clock; misordering fails startup validation (see `AuditBudgetOrdering`). |
 | `ItemStaleCheckInterval` | `00:05:00` | Item-centric stale sweep cadence. Sampled at startup; restart to change. |
 | `ItemStaleMaxRecoveryAttempts` | `3` | Bounded item-stale recoveries before parking at `NeedsOperatorInput`; `0` means unlimited. |
+| `ItemStaleDispatchQuietTimeout` | `00:30:00` | Dispatcher-quiet window for the item-stale detector. An item with no bound worker counts as stale only when the dispatcher has not evaluated it (any quota / cap / budget deferral or pickup) within this window and does not hold it deferred — i.e. it has fallen out of dispatch. A continuously-deferred item is waiting behind quota/cap, not wedged, and never consumes recovery attempts. Set `00:00:00` to disable the guard. Must comfortably exceed the longest routine deferral (quota recheck, default 5 min). |
+| `ItemQuotaWaitNoticeThreshold` | `01:00:00` | Continuous purely-quota-blocked wait after which the item-stale sweep emits one informational `item.waiting_on_quota` audit event plus a `work_item.waiting_on_quota` webhook per episode, and the item appears under `GET /queue/status` quota waits as `waiting on quota for {agent} since ...`. The item is never parked for this. Set `00:00:00` to disable the notice. |
 
 ## `Shutdown`
 

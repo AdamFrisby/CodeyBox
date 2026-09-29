@@ -1235,6 +1235,17 @@ public static class AuditLog
                 itemId.ToString(), workerId, fromState.ToString(), toState.ToString(), attempt, branchPreserved, trigger);
 
     /// <summary>
+    /// Emitted once per continuous quota-blocked episode when an item has
+    /// waited purely on quota past the notice threshold. Informational: the
+    /// item is waiting, not stale, and is never parked for this.
+    /// </summary>
+    public static void ItemWaitingOnQuota(WorkItemId itemId, string agent, DateTimeOffset since) =>
+        Audit("item.waiting_on_quota")
+            .Information(
+                "Item waiting on quota: work item {WorkItemId} waiting on quota for {Agent} since {Since}",
+                itemId.ToString(), agent, since);
+
+    /// <summary>
     /// Emitted when the watchdog restores a dependent that had been
     /// cascade-cancelled because <paramref name="parentId"/> was previously
     /// cancelled. Inverse of <see cref="WorkItemDependentCancelled"/>.

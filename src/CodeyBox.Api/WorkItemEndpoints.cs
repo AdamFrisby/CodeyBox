@@ -1306,14 +1306,40 @@ internal static class WorkItemEndpoints
     private static async Task<IResult> GetQueueStatusAsync(
         IQueueController queueController,
         IRefactorProjectGateStatusProvider refactorProjectGates,
+        HttpContext context,
         CancellationToken ct)
     {
         var refactorGates = await refactorProjectGates.GetRefactorProjectGateStatusAsync(ct);
+        // Optional: items that have waited purely on quota past the notice
+        // threshold surface as "waiting on quota for {agent} since ..." so a
+        // long quota stall reads as waiting — not wedged — in queue status.
+        // Threshold-gated like the watchdog's informational notice; when the
+        // notice is disabled (zero threshold) no reasons are reported.
+        var quotaThreshold = context.RequestServices
+            .GetService<IOptionsMonitor<CodeyBoxOptions>>()
+            ?.CurrentValue.WorkerProgressWatchdog.ItemQuotaWaitNoticeThreshold
+            ?? TimeSpan.Zero;
+        var quotaNow = DateTimeOffset.UtcNow;
+        var quotaWaiting = quotaThreshold > TimeSpan.Zero
+            ? context.RequestServices
+                .GetService<IItemDispatchLivenessSource>()
+                ?.GetQuotaWaits()
+                .Where(w => quotaNow - w.Since >= quotaThreshold)
+                .Select(w => new
+                {
+                    workItemId = w.WorkItemId.ToString(),
+                    agent = w.Agent,
+                    since = w.Since,
+                    reason = w.Reason,
+                })
+                .ToArray() ?? []
+            : [];
         return Results.Ok(new
         {
             state = queueController.State.ToString(),
             pausedAt = queueController.PausedAt,
             pausedReason = queueController.PausedReason,
+            quotaWaiting,
             refactorGates = refactorGates.Select(g => new
             {
                 projectId = g.ProjectId.Value,

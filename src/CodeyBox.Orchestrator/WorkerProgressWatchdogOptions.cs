@@ -142,6 +142,35 @@ public sealed class WorkerProgressWatchdogOptions
     public int ItemStaleMaxRecoveryAttempts { get; set; } = 3;
 
     /// <summary>
+    /// Dispatcher-quiet window for the per-item stale detector. An item with
+    /// no bound worker counts as stale only when the dispatcher has neither
+    /// evaluated it (any quota / cap / budget / infrastructure deferral, or
+    /// pickup) within this window nor holds it in the deferred-requeue set —
+    /// i.e. it has fallen out of dispatch. A continuously-deferred item is
+    /// waiting behind quota/cap, not wedged, and must not consume recovery
+    /// attempts or be parked. Must comfortably exceed the longest routine
+    /// deferral (quota recheck, default 5 min) so normal re-evaluation
+    /// cadence reads as alive. Default 30 min. Set to
+    /// <see cref="TimeSpan.Zero"/> to disable the guard (any frozen
+    /// no-worker item counts as stale, the pre-quota-awareness behaviour).
+    /// Hot-reloadable on the next sweep.
+    /// </summary>
+    public TimeSpan ItemStaleDispatchQuietTimeout { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Continuous quota-blocked wait after which the stale detector emits one
+    /// informational <c>item.waiting_on_quota</c> audit event plus a
+    /// <c>work_item.waiting_on_quota</c> webhook per episode (and the item
+    /// shows up under <c>GET /queue/status</c> quota waits). The item is never
+    /// parked for this — it is waiting, not stale. An episode starts on the
+    /// first quota-shaped deferral and ends on any non-quota evaluation or
+    /// pickup; each new episode notifies once. Default 60 min. Set to
+    /// <see cref="TimeSpan.Zero"/> to disable the notice. Hot-reloadable on
+    /// the next sweep.
+    /// </summary>
+    public TimeSpan ItemQuotaWaitNoticeThreshold { get; set; } = TimeSpan.FromHours(1);
+
+    /// <summary>
     /// Per-agent override map for <see cref="ProgressTimeout"/> and
     /// <see cref="ItemStaleTimeout"/>. Keyed on the lowercase
     /// <see cref="AgentKind.Value"/> (e.g. <c>"crock"</c>). When an in-flight
@@ -250,6 +279,14 @@ public sealed class WorkerProgressWatchdogOptions
         if (ItemStaleMaxRecoveryAttempts < 0)
             throw new InvalidOperationException(
                 $"CodeyBox:WorkerProgressWatchdog:ItemStaleMaxRecoveryAttempts ({ItemStaleMaxRecoveryAttempts}) must be >= 0 (0 = unlimited).");
+
+        if (ItemStaleDispatchQuietTimeout < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ItemStaleDispatchQuietTimeout ({ItemStaleDispatchQuietTimeout}) must be >= 0 (0 = disable the dispatch-liveness guard).");
+
+        if (ItemQuotaWaitNoticeThreshold < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ItemQuotaWaitNoticeThreshold ({ItemQuotaWaitNoticeThreshold}) must be >= 0 (0 = disable the quota-wait notice).");
 
         foreach (var (key, per) in PerAgent)
         {
