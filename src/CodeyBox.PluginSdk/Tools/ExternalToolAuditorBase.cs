@@ -568,7 +568,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         // The probe echoes each present path, one per line; intersect with
         // the requested set — output beyond it is not trusted.
         var present = new List<string>();
-        foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var line in SplitProbeLines(result.Stdout))
         {
             if (requested.Contains(line))
                 present.Add(line);
@@ -585,10 +585,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// value is probed rather than assumed: <c>pwd</c> is a shell builtin —
     /// the audited repository cannot shadow it via PATH — and prints the
     /// process's own logical cwd, exactly the prefix the tool embeds in its
-    /// absolute reported paths. Fails closed: an exec-transport failure, a
-    /// non-zero exit, or empty output throws
-    /// <see cref="AuditUnavailableException"/> — a null scan root would let
-    /// absolute paths survive normalization and silently defeat
+    /// absolute reported paths. The root is returned VERBATIM (no
+    /// whitespace trimming — a canonical directory name may legitimately
+    /// end in whitespace) so downstream relativization compares the same
+    /// bytes the tool reports. Fails closed: an exec-transport failure, a
+    /// non-zero exit, or empty/non-absolute output throws
+    /// <see cref="AuditUnavailableException"/> — a missing scan root would
+    /// let absolute paths survive normalization and silently defeat
     /// repo-relative exclusion filters.
     /// </summary>
     protected async Task<string> ProbeSandboxWorkingDirectoryAsync(
@@ -617,17 +620,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 $"could-not-verify: audit tool '{ToolName}' scan-root probe could not run: the sandbox exec "
                 + "transport was unavailable.");
 
-        var root = result.Stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        if (result.ExitCode != 0 || string.IsNullOrEmpty(root))
+        // The scan root is a path verbatim, not text: it is compared
+        // byte-for-byte against reported paths downstream, so it must not
+        // be trimmed — a canonical directory name may legitimately end in
+        // whitespace (a legal POSIX leaf).
+        var root = SplitProbeLines(result.Stdout).FirstOrDefault();
+        if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(root) || !Path.IsPathRooted(root))
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{ToolName}' could not resolve the scan root (exit "
                 + $"{result.ExitCode}) — reported paths could not be trusted relative to the worktree, "
                 + "so this is infrastructure, not a verdict on the diff.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
-        return ExternalToolJsonHelpers.NormalizePath(root);
+        return root;
     }
 
     /// <summary>
@@ -680,8 +685,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 $"could-not-verify: audit tool '{ToolName}' {configuredKey} canonicalization could "
                 + "not run: the sandbox exec transport was unavailable.");
 
-        var lines = probe.Stdout.Split(
-            '\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        // The canonical bytes realpath emitted are compared verbatim —
+        // trimming a path-bearing line would mis-derive a path or root
+        // whose name legitimately ends in whitespace and could judge an
+        // in-tree file "outside".
+        var lines = SplitProbeLines(probe.Stdout);
         // `realpath -m` always emits absolute paths; a non-rooted line means
         // the output is not a canonicalization at all — treat it as a probe
         // failure rather than letting a relative path slip past containment.
@@ -865,13 +873,17 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var trimmed = value.Trim();
         const int maxChars = 1024;
         if (trimmed.Length == 0 || trimmed.Length > maxChars
-            // A leading parameter dash would be read as another flag by a
-            // pwsh-bound tool.
+            // A leading parameter dash would be read as another flag. The
+            // check applies the full parameter-dash set (see IsParameterDash)
+            // rather than ASCII '-' alone: for tools that bind Unicode
+            // dashes it closes a bypass, and for every other tool a
+            // dash-led value is still an argument-shape mistake.
             || IsParameterDash(trimmed[0])
             || trimmed.Any(char.IsControl))
             throw new AuditUnavailableException(
                 $"could-not-verify: configured '{source}' is not a usable argument value "
-                + "(empty, overlong, leading '-', or contains control characters).")
+                + "(empty, overlong, has a leading parameter dash, or contains control "
+                + "characters).")
             { IsDeterministic = true };
         return trimmed;
     }
@@ -961,6 +973,20 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var version = match.Value.TrimEnd('.');
         return version.Length == 0 ? null : version;
     }
+
+    /// <summary>
+    /// Splits bounded probe stdout into lines for PATH comparison: entries
+    /// are kept verbatim — never whitespace-trimmed — because a canonical
+    /// path or worktree root may legitimately end in whitespace (a legal
+    /// POSIX leaf name). Trimming would compare a different string than the
+    /// one <c>realpath</c>/<c>pwd</c> emitted and could judge an in-tree
+    /// file "outside" the worktree. Only a CRLF carriage return is
+    /// stripped.
+    /// </summary>
+    private static string[] SplitProbeLines(string stdout)
+        => stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.TrimEnd('\r'))
+            .ToArray();
 
     private static string NormalizeProbePath(string? path)
     {

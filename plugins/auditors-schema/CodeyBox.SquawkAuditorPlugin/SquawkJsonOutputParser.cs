@@ -30,8 +30,10 @@ namespace CodeyBox.SquawkAuditorPlugin;
 /// the audit report expects. <c>column_end</c>/<c>line_end</c> add no
 /// information the finding needs and are ignored. <c>file</c> is the matched
 /// path as globbed — repo-relative for the default <c>**/*.sql</c> pattern;
-/// when an operator supplies absolute patterns the value is relativized
-/// against the working directory the scan ran in.</para>
+/// when an operator supplies absolute patterns the value runs through the
+/// shared <see cref="ExternalToolJsonHelpers.NormalizeReportedPath"/> policy:
+/// relativized against the scan root or working directory the scan ran in,
+/// or marked <c>file://</c> when it cannot be made repository-relative.</para>
 /// </summary>
 internal sealed class SquawkJsonOutputParser : IExternalToolOutputParser
 {
@@ -86,7 +88,8 @@ internal sealed class SquawkJsonOutputParser : IExternalToolOutputParser
         var help = ToolOutputText.NullIfWhiteSpace(GetString(violation, "help"u8));
         var path = NormalizeReportedPath(
             ToolOutputText.NullIfWhiteSpace(GetString(violation, "file"u8)),
-            input);
+            input.ScanRoot,
+            input.WorkingDirectory);
         var line = ParseLine(violation);
 
         return new ExternalToolFinding(
@@ -109,18 +112,5 @@ internal sealed class SquawkJsonOutputParser : IExternalToolOutputParser
             || line == int.MaxValue)
             return null;
         return line + 1;
-    }
-
-    private static string? NormalizeReportedPath(string? path, ExternalToolParseInput input)
-    {
-        if (path is null)
-            return null;
-        var relativized = RelativizeToRoot(path, input.ScanRoot ?? input.WorkingDirectory);
-        // A "./"-prefixed pattern yields "./"-prefixed paths; the finding
-        // path and ExcludePaths comparisons expect the repo-relative form.
-        const string currentDirPrefix = "./";
-        while (relativized.StartsWith(currentDirPrefix, StringComparison.Ordinal))
-            relativized = relativized[currentDirPrefix.Length..];
-        return relativized.Length == 0 ? null : relativized;
     }
 }

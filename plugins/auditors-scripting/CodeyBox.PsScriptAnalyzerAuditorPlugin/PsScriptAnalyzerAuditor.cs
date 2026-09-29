@@ -222,9 +222,12 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     private static readonly char[] WildcardMetacharacters = ['*', '?', '[', ']'];
 
     // Flags whose presence in ExtraArguments would retarget the scan
-    // (Path and its PSPath alias, ScriptDefinition), corrupt the JSON
-    // report contract (ReportSummary — host text on stdout), change the
-    // declared exit convention (EnableExit), mutate the audited tree
+    // (Path and its PSPath alias, ScriptDefinition) or narrow it
+    // (Recurse — an operator '-Recurse:$false' would shrink a directory
+    // -Path to top-level files and silently drop subdirectory findings),
+    // corrupt the JSON report contract (ReportSummary — host text on
+    // stdout), change the declared exit convention (EnableExit), mutate the
+    // audited tree
     // (Fix), invert the report vocabulary (SuppressedOnly, IncludeSuppressed),
     // fetch modules mid-scan (SaveDscDependency), load repository-controlled
     // module code or rule selections (CustomRulePath and its
@@ -376,41 +379,39 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
         if (configured is null)
             return ["-Settings",
                 RejectGlobExpandableSettingsValue(
-                    Path.Combine(PerRunTempDirectoryPath, EmptySettingsFileName))];
+                    Path.Combine(PerRunTempDirectoryPath, EmptySettingsFileName),
+                    "generated settings path")];
         if (BuiltinSettingsPresets.Contains(configured))
             return ["-Settings", configured];
-        if (configured.IndexOfAny(WildcardMetacharacters) >= 0)
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor '{Name}' {SettingsPathKey} "
-                + $"'{TruncateForMessage(configured)}' contains wildcard metacharacters — the cmdlet "
-                + "resolves -Settings through a globbing provider-path resolver, so a wildcard could "
-                + "expand to a repository-controlled file the canonicalization check never sees. "
-                + "Name an exact file path outside the worktree, or a built-in preset.")
-            { IsDeterministic = true };
+        var wildcardChecked = RejectGlobExpandableSettingsValue(configured, "configured value");
 
         var canonical = await CanonicalizeOutsideWorktreeAsync(
-            sandbox, workingDirectory, configured, SettingsPathKey, options, ct).ConfigureAwait(false);
-        return ["-Settings", RejectGlobExpandableSettingsValue(canonical)];
+            sandbox, workingDirectory, wildcardChecked, SettingsPathKey, options, ct).ConfigureAwait(false);
+        return ["-Settings", RejectGlobExpandableSettingsValue(canonical, "canonicalized path")];
     }
 
     // The -Settings value the argv actually carries is the string the
-    // cmdlet's globbing provider-path resolver expands — so the resolved
-    // value needs the same metacharacter rejection the configured one got:
-    // realpath resolves THROUGH symlinked directory components, and a
-    // component literally named like 'pol[ic]y' puts '[' ']' into the
-    // canonical string that the configured value never carried. Glob
-    // expansion of that argv value could then land on an in-tree file the
-    // containment check judged only by its literal spelling.
-    private string RejectGlobExpandableSettingsValue(string resolved)
+    // cmdlet's globbing provider-path resolver expands — so every spelling
+    // of it needs the metacharacter rejection, with 'origin' naming which
+    // one failed: the configured value (a wildcard could expand
+    // to an in-tree file the canonicalization check never sees), the
+    // canonicalized path (realpath resolves THROUGH symlinked components,
+    // and a component literally named like 'pol[ic]y' puts '[' ']' into the
+    // canonical string the configured value never carried), or the
+    // generated settings path (the host temp root itself could carry glob
+    // characters). Glob expansion of that argv value could land on an
+    // in-tree file the containment check judged only by its literal
+    // spelling.
+    private string RejectGlobExpandableSettingsValue(string value, string origin)
     {
-        if (resolved.IndexOfAny(WildcardMetacharacters) < 0)
-            return resolved;
+        if (value.IndexOfAny(WildcardMetacharacters) < 0)
+            return value;
         throw new AuditUnavailableException(
-            $"could-not-verify: auditor '{Name}' resolved -Settings path "
-            + $"'{TruncateForMessage(resolved)}' carries wildcard metacharacters — canonicalization "
-            + "resolved through a glob-named component, and the cmdlet's globbing provider-path "
-            + "resolver would expand the argv value to a file the containment check never judged. "
-            + "Point SettingsPath at a path whose canonical form has no '*', '?', '[', ']'.")
+            $"could-not-verify: auditor '{Name}' -Settings {origin} "
+            + $"'{TruncateForMessage(value)}' carries wildcard metacharacters — the cmdlet resolves "
+            + "-Settings through a globbing provider-path resolver, so the value argv carries could "
+            + "expand to a repository-controlled file the containment check never judged. The "
+            + "-Settings value's resolved form must contain no '*', '?', '[', ']'.")
         { IsDeterministic = true };
     }
 

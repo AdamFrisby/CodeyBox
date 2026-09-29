@@ -67,16 +67,19 @@ public static class ExternalToolJsonHelpers
 
     /// <summary>
     /// Strips the scan-root prefix from a tool-reported path so the finding
-    /// is repository-relative. Both inputs are normalized (forward slashes,
-    /// trimmed) before comparison and the root loses any trailing slash, so
-    /// raw tool output can be passed directly. A path not under the root —
-    /// or the root itself — is returned normalized but otherwise untouched;
-    /// nothing is silently rewritten.
+    /// is repository-relative. The reported path is normalized (forward
+    /// slashes, trimmed) so raw tool output can be passed directly, but the
+    /// root is compared VERBATIM (forward slashes, trailing slash dropped,
+    /// never whitespace-trimmed): a canonical root whose name legitimately
+    /// ends in whitespace must still relativize the paths under it rather
+    /// than silently diverging from what the probe emitted. A path not
+    /// under the root — or the root itself — is returned normalized but
+    /// otherwise untouched; nothing is silently rewritten.
     /// </summary>
     public static string RelativizeToRoot(string? path, string? root)
     {
         var normalized = NormalizePath(path);
-        var normalizedRoot = NormalizePath(root).TrimEnd('/');
+        var normalizedRoot = (root ?? string.Empty).Replace('\\', '/').TrimEnd('/');
         if (normalizedRoot.Length == 0
             || normalized.Length <= normalizedRoot.Length + 1
             || !normalized.StartsWith(normalizedRoot + "/", StringComparison.Ordinal))

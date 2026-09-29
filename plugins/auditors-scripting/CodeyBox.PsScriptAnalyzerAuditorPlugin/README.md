@@ -53,10 +53,13 @@ declared tool is therefore an operator-provisioned executable named
 (PowerShell 7). Its contract is owned by this auditor; provision it verbatim:
 
 ```powershell
-#!/usr/bin/env pwsh
+#!/usr/bin/env -S pwsh -NoProfile
 # Invoke-ScriptAnalyzer shim for the CodeyBox PSScriptAnalyzer auditor.
 # Forwards every argument to the Invoke-ScriptAnalyzer cmdlet and serializes
 # the diagnostics to a compact JSON array on stdout.
+# -NoProfile is part of the contract: a pwsh profile may run Set-Location,
+# which would move the cmdlet's cwd-relative -Path/-Settings resolution off
+# the audited tree.
 #   exit 0 = analysis ran, no diagnostics
 #   exit 2 = analysis ran, diagnostics emitted (report on stdout)
 #   exit 1 = the cmdlet could not run (module missing, bad arguments, or
@@ -176,7 +179,7 @@ Scoped under `CodeyBox:Plugins:codeybox.psscriptanalyzer`, resolved per run
 
 | Key | Default | Meaning |
 |---|---|---|
-| `ExpectedVersion` | `1.25.0` | Pinned PSScriptAnalyzer module release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. The `SettingsPath` built-in preset list above is the set shipped by the pinned release — a re-pin to a release shipping different presets needs the plugin's `BuiltinSettingsPresets` updated too (an unlisted preset fails closed, rejected as an in-tree path). |
+| `ExpectedVersion` | `1.25.0` | Pinned PSScriptAnalyzer module release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. The `SettingsPath` built-in preset list below is the set shipped by the pinned release — a re-pin to a release shipping different presets needs the plugin's `BuiltinSettingsPresets` updated too (an unlisted preset fails closed, rejected as an in-tree path). |
 | `TargetPath` | `.` | Single `-Path` value — a repo-relative path keeps finding locations repo-relative. |
 | `SettingsPath` | — | `-Settings` value: a built-in preset name shipped by the pinned module (`CmdletDesign`, `CodeFormatting`, `CodeFormattingAllman`, `CodeFormattingOTBS`, `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptFunctions`, `ScriptingStyle`, `ScriptSecurity` — exact names only; PSScriptAnalyzer 1.25.0 has no comma-list form), or a `.psd1` path that must resolve **outside** the audited worktree and contain no wildcard characters (in-tree paths and globs are rejected deterministically — see below). Unset → a generated empty settings file pinning the default rule set. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. |

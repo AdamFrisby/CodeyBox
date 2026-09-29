@@ -455,7 +455,7 @@ public sealed class PyrightAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec))
+            if (IsPresenceProbe(exec) || IsScanRootProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "pyright 1.1.99\n", ""));

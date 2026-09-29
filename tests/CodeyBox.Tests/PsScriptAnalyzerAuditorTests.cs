@@ -122,6 +122,9 @@ public sealed class PsScriptAnalyzerAuditorTests
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains("Invoke-ScriptAnalyzer", ex.Message, StringComparison.Ordinal);
+        // The failure must come from the version probe itself — not a later
+        // guard — so pin the reason, not just the tool name.
+        Assert.Contains("could not be determined", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -359,6 +362,42 @@ public sealed class PsScriptAnalyzerAuditorTests
         Assert.Contains("scan root", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task ScanRootProbe_WhitespaceEndingRoot_StillRelativizesFindings()
+    {
+        // A canonical worktree path may legitimately end in whitespace — a
+        // legal POSIX leaf name. The probed root must reach path
+        // relativization verbatim: trimming it would leave a finding's
+        // absolute path unrelativized (file://-marked) instead of
+        // repo-relative.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPwdProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "/work \n", ""));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(2, """
+                    [
+                      {
+                        "RuleName": "PSAvoidUsingWriteHost",
+                        "Severity": "Warning",
+                        "Message": "File 'build.ps1' uses Write-Host.",
+                        "File": "/work /build.ps1",
+                        "Line": 2
+                      }
+                    ]
+                    """, ""));
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        });
+
+        IAuditor auditor = new PsScriptAnalyzerAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("build.ps1:2", finding.Location);
+    }
+
     [Theory]
     [InlineData("settings.psd1")]
     [InlineData("./config/pssa.psd1")]
@@ -436,6 +475,45 @@ public sealed class PsScriptAnalyzerAuditorTests
         Assert.True(ex.IsDeterministic);
         Assert.Contains("SettingsPath", ex.Message, StringComparison.Ordinal);
         Assert.Contains("/work/policy-link.psd1", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task InTreeSettingsPath_UnderWhitespaceEndingRoot_IsRejectedDeterministically()
+    {
+        // The canonical worktree root itself ends in whitespace (a legal
+        // POSIX leaf name) — "realpath -m" emits '/work ' for the cwd. If
+        // the probe output were trimmed, the root would mis-derive as
+        // '/work' and an in-tree '/work /settings.psd1' would be judged
+        // OUTSIDE the tree, slipping repository-controlled gate
+        // configuration past containment. The canonical bytes must be
+        // compared verbatim.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSettingsProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "/work /settings.psd1\n/work \n", ""));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new PsScriptAnalyzerAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:SettingsPath"] = "/opt/pssa-policy/settings.psd1",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("SettingsPath", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("inside the audited worktree", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
     }
 
     [Theory]
@@ -943,7 +1021,7 @@ public sealed class PsScriptAnalyzerAuditorTests
     [Trait("requires_psscriptanalyzer", "true")]
     public async Task RealInvokeScriptAnalyzer_BadScriptFixture_ProducesFinding()
     {
-        var installed = ProbeInstalledModuleVersion();
+        var installed = await ProbeInstalledModuleVersionAsync();
         if (installed is null)
             return;
 
@@ -991,7 +1069,7 @@ public sealed class PsScriptAnalyzerAuditorTests
     [Trait("requires_psscriptanalyzer", "true")]
     public async Task RealInvokeScriptAnalyzer_CleanFixture_Passes()
     {
-        var installed = ProbeInstalledModuleVersion();
+        var installed = await ProbeInstalledModuleVersionAsync();
         if (installed is null)
             return;
 
@@ -1144,7 +1222,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         return dir;
     }
 
-    private static string? ProbeInstalledModuleVersion()
+    private static async Task<string?> ProbeInstalledModuleVersionAsync()
     {
         try
         {
@@ -1158,14 +1236,19 @@ public sealed class PsScriptAnalyzerAuditorTests
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
             var stderr = process.StandardError.ReadToEndAsync();
-            var stdout = process.StandardOutput.ReadToEnd();
-            if (!process.WaitForExit(milliseconds: 10_000))
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
-            stderr.GetAwaiter().GetResult();
-            var version = stdout.Trim();
+            await stderr;
+            var version = (await stdout).Trim();
             return process.ExitCode == 0 && version.Length > 0 ? version : null;
         }
         catch
