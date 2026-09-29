@@ -21,7 +21,10 @@ namespace CodeyBox.Tests;
 ///   Error), never raw pass-through.
 /// - -Settings is always emitted: unset SettingsPath → a generated empty settings
 ///   file (defeating PSScriptAnalyzerSettings.psd1 auto-discovery); a preset name
-///   passes verbatim; a path resolving inside the audited worktree (including via
+///   passes verbatim only when no same-named file sits at the worktree root (the
+///   installed module resolves presets dynamically, so a name it lacks would fall
+///   through to cwd-relative file resolution onto that file); a path resolving
+///   inside the audited worktree (including via
 ///   canonicalized dot segments or symlinks) or carrying wildcard metacharacters
 ///   is rejected deterministically.
 /// - Reserved ExtraArguments flags are rejected deterministically, including
@@ -529,12 +532,23 @@ public sealed class PsScriptAnalyzerAuditorTests
     [InlineData("ScriptFunctions")]
     [InlineData("ScriptingStyle")]
     [InlineData("ScriptSecurity")]
-    public async Task SettingsPath_PresetName_PassesThroughWithoutProbe(string preset)
+    public async Task SettingsPath_PresetName_PassesThrough_WhenNoShadowingFile(string preset)
     {
+        // A preset name skips canonicalization but NOT the shadow probe: the
+        // module resolves presets against its own shipped list at run time,
+        // so a same-named repository file could still be reached when the
+        // module lacks the preset. The repo-file probe must run (reporting
+        // nothing here) while the realpath canonicalization probe must not.
         var settingsProbes = 0;
+        var repoFileProbes = 0;
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
+            if (IsRepoFileProbe(exec))
+            {
+                repoFileProbes++;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
             if (IsSettingsProbe(exec))
             {
                 settingsProbes++;
@@ -562,10 +576,124 @@ public sealed class PsScriptAnalyzerAuditorTests
 
         Assert.True(result.Passed);
         Assert.Equal(0, settingsProbes);
+        Assert.Equal(1, repoFileProbes);
         Assert.NotNull(scanExec);
         var settingsIndex = scanExec!.Argv.ToList().IndexOf("-Settings");
         Assert.True(settingsIndex >= 0 && settingsIndex + 1 < scanExec.Argv.Count);
         Assert.Equal(preset, scanExec.Argv[settingsIndex + 1]);
+    }
+
+    [Theory]
+    // A committed file sharing the preset's name reaches the gate when the
+    // installed module cannot resolve the name as a preset (its Settings/
+    // tree missing, or a re-pinned release shipping a different preset
+    // set): the cmdlet falls back to cwd-relative file resolution and would
+    // parse the in-tree file as settings. The probe checks both the
+    // configured spelling and the canonical preset spelling — they may
+    // differ in case.
+    [InlineData("ScriptSecurity", "ScriptSecurity")]
+    [InlineData("scriptsecurity", "ScriptSecurity")]
+    [InlineData("CodeFormatting", "CodeFormatting")]
+    public async Task SettingsPath_PresetName_ShadowedByInTreeFile_IsRejectedDeterministically(
+        string configured, string presentFile)
+    {
+        var settingsProbes = 0;
+        var scanExecs = 0;
+        SandboxExec? repoFileProbe = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsRepoFileProbe(exec))
+            {
+                repoFileProbe = exec;
+                return Task.FromResult(new SandboxExecResult(0, presentFile + "\n", ""));
+            }
+            if (IsSettingsProbe(exec))
+            {
+                settingsProbes++;
+                return Task.FromResult(RealpathOk(exec));
+            }
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new PsScriptAnalyzerAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:SettingsPath"] = configured,
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("SettingsPath", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(presentFile, ex.Message, StringComparison.Ordinal);
+        Assert.NotNull(repoFileProbe);
+        Assert.Equal(0, settingsProbes);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task SettingsPath_PresetName_ProbeFailure_IsInfrastructureFailure()
+    {
+        // The shadow probe failing closed is infrastructure, never a
+        // presumed-absent file: "could not confirm absence" is not "absent".
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsRepoFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(1, "", "sh: boom"));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new PsScriptAnalyzerAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:SettingsPath"] = "ScriptSecurity",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("Invoke-ScriptAnalyzer", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task ScanRootProbe_MultiLineOutput_IsInfrastructureFailure()
+    {
+        // pwd must emit exactly one line: extra output means the exec
+        // transport prepended chatter (or the cwd name itself carries a
+        // newline), and taking the first line would mis-derive the
+        // relativization root — paths under the true root would survive as
+        // file://-marked absolutes, defeating repo-relative exclusions.
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPwdProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "/work\n/extra\n", ""));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        });
+
+        IAuditor auditor = new PsScriptAnalyzerAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("scan root", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1166,6 +1294,14 @@ public sealed class PsScriptAnalyzerAuditorTests
         => exec.Argv.Count >= 4
             && exec.Argv[0] == "realpath"
             && exec.Argv[1] == "-m";
+
+    // The repository-file presence probe (preset shadow check):
+    // sh -c 'for f in "$@"; ...' sh <names...>
+    private static bool IsRepoFileProbe(SandboxExec exec)
+        => exec.Argv.Count >= 4
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2].Contains("for f in", StringComparison.Ordinal);
 
     // Emulates the realpath probe: canonicalizes the configured path like
     // realpath -m (relative input resolved against the /work cwd, dot

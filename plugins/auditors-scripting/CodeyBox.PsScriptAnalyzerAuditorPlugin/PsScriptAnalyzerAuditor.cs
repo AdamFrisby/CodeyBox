@@ -74,7 +74,12 @@ namespace CodeyBox.PsScriptAnalyzerAuditorPlugin;
 /// with <c>realpath -m</c> before containment, so a relative path, a
 /// <c>..</c> segment, or a symlinked component cannot smuggle an in-tree
 /// file past the guard. Name-shaped values are accepted only when they
-/// exactly match a preset shipped by the pinned module — every other
+/// exactly match a preset shipped by the pinned module AND no same-named
+/// file sits at the worktree root — the cmdlet's preset check enumerates
+/// the INSTALLED module's shipped presets at run time, so a compiled-in
+/// list cannot prove the name resolves inside the module, and a name it
+/// lacks falls through to cwd-relative file resolution where a committed
+/// same-named file would be parsed as settings. Every other
 /// string resolves through the cmdlet's provider-path resolver (cwd-
 /// relative, with wildcard expansion), so wildcards are rejected and all
 /// remaining values go through the containment check. Because the resolver
@@ -156,7 +161,10 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     /// Scoped-config key for a PSScriptAnalyzer settings source passed
     /// verbatim to <c>-Settings</c>: a built-in preset name (one of
     /// <see cref="BuiltinSettingsPresets"/> — exact match, the pinned
-    /// module's own check; there is no comma-list form at this version) or
+    /// module's own check; there is no comma-list form at this version —
+    /// rejected deterministically when a same-named file sits at the
+    /// worktree root, since the cmdlet falls back to cwd-relative file
+    /// resolution whenever the installed module lacks the preset) or
     /// a path to a <c>.psd1</c> settings file. A path must resolve OUTSIDE
     /// the audited worktree — settings carry rule selection, severity
     /// filtering, and custom rule paths, and take precedence over
@@ -194,11 +202,17 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     /// directory. The cmdlet's own preset check is exact ordinal-ignore-case
     /// membership in this list; anything else name-shaped resolves as a
     /// provider path (cwd-relative, with wildcard expansion) rather than as
-    /// a preset, so only exact matches may skip canonicalization. The list
-    /// travels with <see cref="DefaultExpectedVersion"/> — an operator who
-    /// re-pins <c>ExpectedVersion</c> to a release shipping a different
-    /// preset set must update it here too (a missing entry fails closed:
-    /// the name resolves as an in-tree path and is rejected).
+    /// a preset, so only exact matches may skip canonicalization — and even
+    /// those only after
+    /// <see cref="ThrowIfPresetShadowedByRepositoryFileAsync"/> clears the
+    /// worktree of a same-named file: the installed module decides
+    /// preset-vs-path against its OWN shipped list, not this snapshot, and a
+    /// name it lacks resolves cwd-relative where a committed file would be
+    /// parsed as settings. The list travels with
+    /// <see cref="DefaultExpectedVersion"/> — an operator who re-pins
+    /// <c>ExpectedVersion</c> to a release shipping a different preset set
+    /// must update it here too (a missing entry fails closed: the name
+    /// resolves as an in-tree path and is rejected).
     /// </summary>
     private static readonly HashSet<string> BuiltinSettingsPresets = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -354,10 +368,17 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     /// commit. Unset <c>SettingsPath</c> → the generated empty settings
     /// file (<c>@{}</c> → default rule set), prepared by
     /// <see cref="VerifyToolAsync"/> in the per-run scratch directory. A
-    /// configured built-in preset name passes verbatim — the pinned
-    /// module's own preset check is exact-match
-    /// (<see cref="BuiltinSettingsPresets"/>), and a preset resolves inside
-    /// the module, not the tree. Every other value is a file path the
+    /// configured built-in preset name passes verbatim only after a bounded
+    /// probe confirms no same-named file sits at the worktree root: the
+    /// cmdlet's preset check is dynamic — it enumerates the INSTALLED
+    /// module's shipped <c>Settings/*.psd1</c> at run time, and a name that
+    /// list does not carry (a module provisioned without its Settings tree,
+    /// or an <c>ExpectedVersion</c> re-pin to a release shipping a
+    /// different preset set) falls through to cwd-relative FILE
+    /// resolution — so <see cref="BuiltinSettingsPresets"/> being a
+    /// compiled-in snapshot can never prove the name resolves inside the
+    /// module, and a committed same-named file would be parsed as the
+    /// settings file. Every other value is a file path the
     /// cmdlet resolves through a globbing, cwd-relative provider-path
     /// resolver: wildcard metacharacters are rejected outright (a wildcard
     /// could expand to an in-tree file the canonicalization check never
@@ -381,13 +402,59 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
                 RejectGlobExpandableSettingsValue(
                     Path.Combine(PerRunTempDirectoryPath, EmptySettingsFileName),
                     "generated settings path")];
-        if (BuiltinSettingsPresets.Contains(configured))
+        if (BuiltinSettingsPresets.TryGetValue(configured, out var preset))
+        {
+            await ThrowIfPresetShadowedByRepositoryFileAsync(
+                sandbox, workingDirectory, configured, preset, options, ct).ConfigureAwait(false);
             return ["-Settings", configured];
+        }
         var wildcardChecked = RejectGlobExpandableSettingsValue(configured, "configured value");
 
         var canonical = await CanonicalizeOutsideWorktreeAsync(
             sandbox, workingDirectory, wildcardChecked, SettingsPathKey, options, ct).ConfigureAwait(false);
         return ["-Settings", RejectGlobExpandableSettingsValue(canonical, "canonicalized path")];
+    }
+
+    // A preset name may pass verbatim only when it cannot resolve to a
+    // repository file: the cmdlet's own preset check is dynamic — it
+    // enumerates the INSTALLED module's Settings/*.psd1 at run time, and
+    // when the name is absent there (a module provisioned without its
+    // Settings tree, or an ExpectedVersion re-pin to a release shipping a
+    // different preset set — the --version pin sees only the module's
+    // self-reported version string, not its preset fileset) the cmdlet
+    // enters file mode and resolves the name cwd-relative, parsing a
+    // same-named committed file as settings — ExcludeRules/Severity
+    // filters or a CustomRulePath module in the diff author's hands. Both
+    // spellings are probed (the configured value and the canonical preset
+    // name differ only in case): the cmdlet prefers a real preset over a
+    // same-named file, so rejecting on presence is conservative and loses
+    // nothing; a name the module lacks with no shadowing file still fails
+    // closed — the cmdlet errors on the missing settings file, surfacing
+    // as infrastructure.
+    private async Task ThrowIfPresetShadowedByRepositoryFileAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string configured,
+        string preset,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        string[] candidates = string.Equals(configured, preset, StringComparison.Ordinal)
+            ? [configured]
+            : [configured, preset];
+        var present = await ProbeRepositoryFilesPresentAsync(
+            sandbox, workingDirectory, ToolName, candidates, options, ct).ConfigureAwait(false);
+        if (present.Count == 0)
+            return;
+        throw new AuditUnavailableException(
+            $"could-not-verify: auditor '{Name}' {SettingsPathKey} preset "
+            + $"'{TruncateForMessage(configured)}' is shadowed by repository file(s) "
+            + $"'{string.Join("', '", present)}' — when the installed module does not ship a preset "
+            + "under that name the cmdlet resolves it as a cwd-relative settings file, so a "
+            + "same-named committed file would be parsed as gate configuration. Remove or rename "
+            + $"the file, or point CodeyBox:Plugins:{PluginId}:{SettingsPathKey} at a .psd1 outside "
+            + "the worktree.")
+        { IsDeterministic = true };
     }
 
     // The -Settings value the argv actually carries is the string the

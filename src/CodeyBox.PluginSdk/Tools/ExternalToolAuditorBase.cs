@@ -589,10 +589,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// whitespace trimming — a canonical directory name may legitimately
     /// end in whitespace) so downstream relativization compares the same
     /// bytes the tool reports. Fails closed: an exec-transport failure, a
-    /// non-zero exit, or empty/non-absolute output throws
-    /// <see cref="AuditUnavailableException"/> — a missing scan root would
-    /// let absolute paths survive normalization and silently defeat
-    /// repo-relative exclusion filters.
+    /// non-zero exit, or output that is not exactly one absolute path line
+    /// throws <see cref="AuditUnavailableException"/> — a missing or
+    /// mis-derived scan root would let absolute paths survive normalization
+    /// and silently defeat repo-relative exclusion filters.
     /// </summary>
     protected async Task<string> ProbeSandboxWorkingDirectoryAsync(
         ISandbox sandbox,
@@ -623,16 +623,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
         // The scan root is a path verbatim, not text: it is compared
         // byte-for-byte against reported paths downstream, so it must not
         // be trimmed — a canonical directory name may legitimately end in
-        // whitespace (a legal POSIX leaf).
-        var root = SplitProbeLines(result.Stdout).FirstOrDefault();
-        if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(root) || !Path.IsPathRooted(root))
+        // whitespace (a legal POSIX leaf). Exactly one line is required:
+        // extra output means the transport prepended chatter or the cwd
+        // name itself carries a newline, and taking the first line would
+        // mis-derive the relativization prefix rather than fail closed.
+        var lines = SplitProbeLines(result.Stdout);
+        if (result.ExitCode != 0 || lines.Length != 1 || !Path.IsPathRooted(lines[0]))
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{ToolName}' could not resolve the scan root (exit "
                 + $"{result.ExitCode}) — reported paths could not be trusted relative to the worktree, "
                 + "so this is infrastructure, not a verdict on the diff.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
-        return root;
+        return lines[0];
     }
 
     /// <summary>
@@ -976,17 +979,16 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
     /// <summary>
     /// Splits bounded probe stdout into lines for PATH comparison: entries
-    /// are kept verbatim — never whitespace-trimmed — because a canonical
-    /// path or worktree root may legitimately end in whitespace (a legal
-    /// POSIX leaf name). Trimming would compare a different string than the
-    /// one <c>realpath</c>/<c>pwd</c> emitted and could judge an in-tree
-    /// file "outside" the worktree. Only a CRLF carriage return is
-    /// stripped.
+    /// are kept VERBATIM — never whitespace-trimmed, no carriage-return
+    /// stripping — because a canonical path or worktree root may
+    /// legitimately end in whitespace or a '\r' (legal POSIX leaf bytes).
+    /// Rewriting any byte would compare a different string than the one
+    /// <c>realpath</c>/<c>pwd</c>/<c>printf</c> emitted and could judge an
+    /// in-tree file "outside" the worktree. Those emitters terminate lines
+    /// with LF only; a '\r' in the output is data, not a line ending.
     /// </summary>
     private static string[] SplitProbeLines(string stdout)
-        => stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(line => line.TrimEnd('\r'))
-            .ToArray();
+        => stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
     private static string NormalizeProbePath(string? path)
     {

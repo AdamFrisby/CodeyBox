@@ -181,7 +181,7 @@ Scoped under `CodeyBox:Plugins:codeybox.psscriptanalyzer`, resolved per run
 |---|---|---|
 | `ExpectedVersion` | `1.25.0` | Pinned PSScriptAnalyzer module release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. The `SettingsPath` built-in preset list below is the set shipped by the pinned release — a re-pin to a release shipping different presets needs the plugin's `BuiltinSettingsPresets` updated too (an unlisted preset fails closed, rejected as an in-tree path). |
 | `TargetPath` | `.` | Single `-Path` value — a repo-relative path keeps finding locations repo-relative. |
-| `SettingsPath` | — | `-Settings` value: a built-in preset name shipped by the pinned module (`CmdletDesign`, `CodeFormatting`, `CodeFormattingAllman`, `CodeFormattingOTBS`, `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptFunctions`, `ScriptingStyle`, `ScriptSecurity` — exact names only; PSScriptAnalyzer 1.25.0 has no comma-list form), or a `.psd1` path that must resolve **outside** the audited worktree and contain no wildcard characters (in-tree paths and globs are rejected deterministically — see below). Unset → a generated empty settings file pinning the default rule set. |
+| `SettingsPath` | — | `-Settings` value: a built-in preset name shipped by the pinned module (`CmdletDesign`, `CodeFormatting`, `CodeFormattingAllman`, `CodeFormattingOTBS`, `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptFunctions`, `ScriptingStyle`, `ScriptSecurity` — exact names only; PSScriptAnalyzer 1.25.0 has no comma-list form; rejected deterministically when a same-named file sits at the worktree root — see below), or a `.psd1` path that must resolve **outside** the audited worktree and contain no wildcard characters (in-tree paths and globs are rejected deterministically — see below). Unset → a generated empty settings file pinning the default rule set. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. |
 | `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop (e.g. `PSAvoidUsingWriteHost`). Post-scan filtering. |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Post-scan filter; setting it replaces the default list. |
@@ -207,12 +207,23 @@ The auditor therefore **always** passes `-Settings`:
 - `SettingsPath` unset → a generated empty settings file (`@{}`, the
   default rule set) written into the per-run scratch directory before the
   scan. Auto-discovery can never engage.
-- `SettingsPath` = a built-in preset name → passed verbatim. Preset names
-  are validated against the pinned module's shipped list (`CmdletDesign`,
-  `CodeFormatting`, `CodeFormattingAllman`, `CodeFormattingOTBS`,
-  `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptFunctions`,
-  `ScriptingStyle`, `ScriptSecurity`) because any other name-shaped value is
-  treated by the cmdlet as a file path, not a preset.
+- `SettingsPath` = a built-in preset name → passed verbatim, but only after
+  a bounded probe confirms **no same-named file sits at the worktree root**.
+  Preset names are validated against the pinned module's shipped list
+  (`CmdletDesign`, `CodeFormatting`, `CodeFormattingAllman`,
+  `CodeFormattingOTBS`, `CodeFormattingStroustrup`, `DSC`, `PSGallery`,
+  `ScriptFunctions`, `ScriptingStyle`, `ScriptSecurity`) because any other
+  name-shaped value is treated by the cmdlet as a file path, not a preset.
+  That check alone is not sufficient: the cmdlet decides preset-vs-path
+  against the *installed* module's shipped `Settings/*.psd1` at run time —
+  a module provisioned without its Settings tree, or an `ExpectedVersion`
+  re-pin to a release shipping a different preset set, makes the name fall
+  through to cwd-relative file resolution, and a committed same-named file
+  (e.g. `ScriptSecurity`) would be parsed as the settings file. The cmdlet
+  prefers a real preset over a same-named file, so rejecting the shadowed
+  name is conservative and loses nothing; when the module lacks the preset
+  and no shadowing file exists, the cmdlet still errors on the missing
+  settings file — infrastructure, never a pass.
 - `SettingsPath` = any other value → treated as a file path. Wildcard
   characters (`*`, `?`, `[`, `]`) are rejected — the cmdlet resolves the
   value through a globbing provider-path resolver, so a glob could expand

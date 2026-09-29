@@ -97,7 +97,9 @@ public static class ExternalToolJsonHelpers
     /// <paramref name="workingDirectory"/>; a path that stays absolute — and
     /// a relative path still carrying '..' — is re-marked with
     /// <see cref="FileSchemePrefix"/> so it stays distinguishable from a
-    /// repository-relative location. Returns null for empty input.
+    /// repository-relative location. Returns null for empty or
+    /// whitespace-only input, and for input that collapses to nothing after
+    /// dot-segment removal (<c>.</c>, <c>./</c>).
     /// </summary>
     public static string? NormalizeReportedPath(string? raw, string? scanRoot, string? workingDirectory)
     {
