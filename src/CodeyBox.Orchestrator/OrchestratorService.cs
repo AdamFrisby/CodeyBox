@@ -469,8 +469,61 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     {
         ArgumentNullException.ThrowIfNull(next);
         AgentConcurrencyOptions.ValidateAndThrow(next);
+        var previous = _concurrencySnapshot.Current;
         _concurrencySnapshot.Replace(next);
         LogResolvedAgentCaps(next, reason: "hot-reload");
+        WakeCapDeferredItemsOnRelaxedCaps(previous, next);
+    }
+
+    /// <summary>
+    /// A cap that was raised (or removed — which relaxes the agent to
+    /// uncapped) may already have headroom for items deferred against it:
+    /// the freed capacity did not come from a slot release, so no
+    /// <see cref="WakeAgentCapWaitersForRouteRelease"/> signal exists and the
+    /// deferred item would otherwise sleep out its whole cap-retry interval.
+    /// Wake the waiters whose governing cap keys relaxed so the raised cap
+    /// takes effect at the next dispatch decision, then kick the dispatcher
+    /// so the scan runs immediately — the same contract
+    /// <see cref="ApplyWorkerPoolReload"/>'s grow path provides for the
+    /// global ceiling. Tightened or newly-added caps need no wake: they only
+    /// gate future reservations, which the next pickup already reads from
+    /// the swapped snapshot.
+    /// </summary>
+    private void WakeCapDeferredItemsOnRelaxedCaps(AgentConcurrencyOptions before, AgentConcurrencyOptions after)
+    {
+        var relaxed = RelaxedCapKeys(before, after);
+        if (relaxed.Count == 0)
+            return;
+
+        var woken = _deferredItems.WakeAgentCapWaitersForCapKeys(relaxed);
+        if (woken == 0)
+            return;
+
+        _log.LogInformation(
+            "AgentConcurrency reload relaxed cap(s) [{Keys}]: woke {Count} cap-deferred work item(s) back into dispatch ordering",
+            string.Join(", ", relaxed.OrderBy(static k => k, StringComparer.OrdinalIgnoreCase)), woken);
+        KickDispatchWakeUnobserved("Agent-cap reload relax");
+    }
+
+    /// <summary>
+    /// Member keys whose effective cap grew between the two snapshots.
+    /// A missing entry means uncapped, which reads as unbounded headroom —
+    /// so removing an entry relaxes it and adding one does not.
+    /// </summary>
+    private static HashSet<string> RelaxedCapKeys(AgentConcurrencyOptions before, AgentConcurrencyOptions after)
+    {
+        var relaxed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var key in before.Members.Keys.Concat(after.Members.Keys))
+        {
+            if (CapOrUncapped(after, key) > CapOrUncapped(before, key))
+                relaxed.Add(key);
+        }
+        return relaxed;
+
+        static int CapOrUncapped(AgentConcurrencyOptions opts, string key) =>
+            opts.Members.TryGetValue(key, out var entry) && entry is { MaxConcurrent: > 0 }
+                ? entry.MaxConcurrent
+                : int.MaxValue;
     }
 
     /// <summary>
@@ -3938,6 +3991,47 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     }
                 }
                 if (!waitsOnRoute)
+                    continue;
+
+                if (Remove(id, lease))
+                    woken++;
+            }
+            return woken;
+        }
+
+        /// <summary>
+        /// Clears every <see cref="DeferredItemKind.AgentCap"/> deferral whose
+        /// wait routes are governed by a key in <paramref name="capKeys"/> and
+        /// returns how many items were woken. A waiting route is governed by
+        /// a cap key when it equals the key or its agent-kind prefix does —
+        /// the same exact-route-then-kind lookup
+        /// <see cref="OrchestratorService.GetAgentCapForRoute"/> uses. Used on
+        /// hot-reload when a cap is raised or removed: the relaxation is not
+        /// a slot release, so without this the deferred items would sleep out
+        /// their recheck timers against a cap that no longer binds them.
+        /// </summary>
+        public int WakeAgentCapWaitersForCapKeys(IReadOnlySet<string> capKeys)
+        {
+            if (_items.IsEmpty || capKeys.Count == 0)
+                return 0;
+
+            var woken = 0;
+            foreach (var (id, lease) in _items)
+            {
+                if (lease.Kind != DeferredItemKind.AgentCap || lease.WaitingOnRoutes is null)
+                    continue;
+
+                var governedByRelaxedKey = false;
+                foreach (var route in lease.WaitingOnRoutes)
+                {
+                    if (capKeys.Contains(route)
+                        || capKeys.Contains(AgentInstanceIds.KindFromRouteKey(route)))
+                    {
+                        governedByRelaxedKey = true;
+                        break;
+                    }
+                }
+                if (!governedByRelaxedKey)
                     continue;
 
                 if (Remove(id, lease))

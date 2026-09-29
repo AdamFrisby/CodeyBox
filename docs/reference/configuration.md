@@ -38,6 +38,10 @@ Hot-reloadable today:
   Keys may be either bare agent kinds (`claude`) or instance route keys
   (`claude/acct-a`) when `AgentClasses` uses multiple credentials for the same
   kind. Route-key caps are applied before bare-kind fallback caps.
+  Raising or removing a cap immediately wakes work items deferred on that
+  cap so the new headroom is used at the next dispatch decision; lowering a
+  cap never interrupts in-flight items — new dispatch for the agent waits
+  until its running count drops below the new cap.
   To stop dispatch to an agent, remove it from `AgentClasses[*].Members` or
   pause the queue. The resolved caps are logged at orchestrator startup and on
   every successful hot-reload so the effective value is visible to operators.

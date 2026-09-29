@@ -688,6 +688,114 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal(0, fixture.Orchestrator.GetRunning(Claude));
     }
 
+    [Fact]
+    public void Orchestrator_ApplyAgentConcurrencyReload_LoweredCap_BlocksNewDispatch_KeepsInFlight()
+    {
+        // The operator relief lever mid-incident: lower a cap below the live
+        // in-flight count. The reservations already past the gate must keep
+        // their slots (nothing is cancelled or failed), while new dispatch for
+        // that agent waits until running drops below the new cap.
+        using var fixture = OrchestratorFixture.Build(new AgentConcurrencyOptions
+        {
+            Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 2 } },
+        });
+        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+        Assert.Equal(2, fixture.Orchestrator.GetRunning(Claude));
+
+        fixture.Orchestrator.ApplyAgentConcurrencyReload(new AgentConcurrencyOptions
+        {
+            Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } },
+        });
+
+        // In-flight work is untouched — running stays above the new cap.
+        Assert.Equal(2, fixture.Orchestrator.GetRunning(Claude));
+        Assert.Equal(1, fixture.Orchestrator.GetConcurrencyState().PerAgentCaps["claude"]);
+        // New dispatch for the agent is refused while over the new cap.
+        Assert.False(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+
+        // Still at ceiling after one release; admits again once under the cap.
+        fixture.Orchestrator.ReleaseAgentSlotForTest(Claude);
+        Assert.False(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+        fixture.Orchestrator.ReleaseAgentSlotForTest(Claude);
+        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+        fixture.Orchestrator.ReleaseAgentSlotForTest(Claude);
+    }
+
+    [Fact]
+    public void Orchestrator_ApplyAgentConcurrencyReload_RaisedCap_AdmitsMoreWorkAtNextDecision()
+    {
+        using var fixture = OrchestratorFixture.Build(new AgentConcurrencyOptions
+        {
+            Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } },
+        });
+        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+        Assert.False(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude)); // cap=1 hit
+
+        fixture.Orchestrator.ApplyAgentConcurrencyReload(new AgentConcurrencyOptions
+        {
+            Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 3 } },
+        });
+
+        // The very next reservation decision observes the raised cap.
+        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+        Assert.True(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude));
+        Assert.False(fixture.Orchestrator.TryReserveAgentSlotForTest(Claude)); // cap=3 hit
+        Assert.Equal(3, fixture.Orchestrator.GetConcurrencyState().PerAgentCaps["claude"]);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_CapAddedForUncappedAgent_GatesDispatchLive()
+    {
+        // The full config-edit path: an agent with no entry is uncapped; the
+        // operator adds one via a live reload and the next reservation
+        // decision for that agent is gated — no restart.
+        var initial = new CodeyBoxOptions { AgentConcurrency = new AgentConcurrencyOptions() };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance);
+        await coordinator.StartAsync(CancellationToken.None);
+        try
+        {
+            // Uncapped baseline: reservations for codex are unbounded and the
+            // /concurrency surface lists no entry for it.
+            Assert.True(orchFixture.Orchestrator.TryReserveAgentSlotForTest(Codex));
+            Assert.True(orchFixture.Orchestrator.TryReserveAgentSlotForTest(Codex));
+            Assert.DoesNotContain("codex", orchFixture.Orchestrator.GetConcurrencyState().PerAgentCaps);
+
+            monitor.Fire(new CodeyBoxOptions
+            {
+                AgentConcurrency = new AgentConcurrencyOptions
+                {
+                    Members = { ["codex"] = new AgentConcurrencyEntry { MaxConcurrent = 2 } },
+                },
+            });
+
+            // The new cap applies without a restart: the running count is at
+            // the ceiling, so the next reservation is refused — and
+            // /concurrency (backed by GetConcurrencyState) shows the new cap.
+            Assert.Equal(2, orchFixture.Orchestrator.GetConcurrencyState().PerAgentCaps["codex"]);
+            Assert.False(orchFixture.Orchestrator.TryReserveAgentSlotForTest(Codex));
+
+            orchFixture.Orchestrator.ReleaseAgentSlotForTest(Codex);
+            Assert.True(orchFixture.Orchestrator.TryReserveAgentSlotForTest(Codex));
+        }
+        finally
+        {
+            await coordinator.StopAsync(CancellationToken.None);
+        }
+    }
+
     // ── AgentBurnEstimator.ApplyConfigReload ────────────────────────────────
 
     [Fact]
