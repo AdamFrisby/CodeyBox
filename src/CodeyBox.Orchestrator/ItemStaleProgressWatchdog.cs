@@ -43,6 +43,17 @@ namespace CodeyBox.Orchestrator;
 /// </para>
 ///
 /// <para>
+/// An item with no bound worker that the dispatcher evaluated recently (any
+/// quota / cap / budget deferral or pickup inside
+/// <c>ItemStaleDispatchQuietTimeout</c>, or still held deferred) is waiting
+/// behind quota/cap — not wedged — and never consumes recovery attempts.
+/// Only a no-worker item the dispatcher has stopped evaluating has fallen
+/// out of dispatch; that is the real wedge case. A continuous quota-blocked
+/// wait past <c>ItemQuotaWaitNoticeThreshold</c> emits one informational
+/// notice per episode instead of a recovery.
+/// </para>
+///
+/// <para>
 /// Triggered by the periodic background sweep (after the startup recovery
 /// barrier) and by the operator endpoint <c>POST /workitems/{id}/recover</c>
 /// — both call <see cref="RecoverItemAsync"/> with a trigger label. Bounded
@@ -64,6 +75,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     private readonly CancellationRegistry? _cancellations;
     private readonly IAgentStreamStore? _streams;
     private readonly IWorkerProgressActivitySource? _activitySource;
+    private readonly IItemDispatchLivenessSource? _dispatchLiveness;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // In-process record of items already recovered, keyed on the UpdatedAt
@@ -76,6 +88,12 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     // orchestrator process and the bounded-then-escalate contract would
     // never fire on it.
     private readonly ConcurrentDictionary<WorkItemId, DateTimeOffset> _recoveredItemsThisProcess = new();
+
+    // Quota-wait episodes already notified, keyed by the episode's Since
+    // stamp. A repeat sweep for the same episode is a no-op (once per
+    // threshold crossing); when the episode ends the entry is cleared so a
+    // later episode notifies fresh.
+    private readonly ConcurrentDictionary<WorkItemId, DateTimeOffset> _quotaWaitNotified = new();
 
     private WorkerProgressWatchdogOptions _opts => _optsAccessor();
 
@@ -91,7 +109,8 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         CancellationRegistry? cancellations = null,
         TimeProvider? timeProvider = null,
         IAgentStreamStore? streams = null,
-        IWorkerProgressActivitySource? activitySource = null)
+        IWorkerProgressActivitySource? activitySource = null,
+        IItemDispatchLivenessSource? dispatchLiveness = null)
     {
         _store = store;
         _queue = queue;
@@ -105,6 +124,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         _time = timeProvider ?? TimeProvider.System;
         _streams = streams;
         _activitySource = activitySource;
+        _dispatchLiveness = dispatchLiveness;
     }
 
     public ItemStaleProgressWatchdog(
@@ -119,8 +139,9 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         CancellationRegistry? cancellations = null,
         TimeProvider? timeProvider = null,
         IAgentStreamStore? streams = null,
-        IWorkerProgressActivitySource? activitySource = null)
-        : this(store, queue, registry, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier, cancellations, timeProvider, streams, activitySource) { }
+        IWorkerProgressActivitySource? activitySource = null,
+        IItemDispatchLivenessSource? dispatchLiveness = null)
+        : this(store, queue, registry, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier, cancellations, timeProvider, streams, activitySource, dispatchLiveness) { }
 
     /// <summary>
     /// Mirrors the per-worker watchdog's late-attach pattern: the DI graph
@@ -203,13 +224,23 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         var opts = _opts;
         // Per-agent overrides may keep some kinds active even when the global
         // ItemStaleTimeout is disabled, so the global short-circuit is
-        // conditional on no opt-in overrides existing either.
-        if (opts.ItemStaleTimeout <= TimeSpan.Zero && !HasPerAgentItemStaleOverride(opts))
-            return;
+        // conditional on no opt-in overrides existing either. The quota-wait
+        // notice below is independent of this gate: it has its own threshold
+        // and sentinel, so disabling the stale detector does not silence it.
+        var staleSweepEnabled =
+            opts.ItemStaleTimeout > TimeSpan.Zero || HasPerAgentItemStaleOverride(opts);
 
         try
         {
             var now = _time.GetUtcNow();
+
+            if (!staleSweepEnabled)
+            {
+                // Stale detector disabled, but the quota-wait notice has its
+                // own threshold and sentinel — it still runs.
+                await EmitQuotaWaitNoticesAsync(opts, now, ct);
+                return;
+            }
 
             foreach (var state in Enum.GetValues<WorkItemState>())
             {
@@ -234,6 +265,10 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                     if (item.UpdatedAt > cutoff)
                         continue;
 
+                    // Resolve the bound worker once: both the sandbox
+                    // liveness probe and the dispatch-liveness guard need it.
+                    var boundWorker = await FindBoundWorkerAsync(item.Id, ct);
+
                     // UpdatedAt is frozen past the threshold, but that alone
                     // does not prove the agent is hung: a long turn may never
                     // stamp UpdatedAt mid-turn while still appending stream
@@ -241,12 +276,30 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                     // other liveness either. Skipping here leaves
                     // RecoveryAttempts untouched — a live run must not consume
                     // the recovery budget.
-                    var liveness = await ObserveLivenessAsync(item, opts, cutoff, ct);
+                    var liveness = await ObserveLivenessAsync(item, opts, cutoff, boundWorker, ct);
                     if (liveness.IsAlive)
                     {
                         _log.LogDebug(
                             "Item-stale sweep: work item {ItemId} UpdatedAt frozen for {SinceUpdated}s but agent is alive ({AliveReason}); not stale",
                             item.Id, (long)(now - item.UpdatedAt).TotalSeconds, liveness.AliveReason);
+                        continue;
+                    }
+
+                    // Dispatch-liveness guard: an item with no bound worker
+                    // that the dispatcher evaluated recently (any quota / cap /
+                    // budget deferral or pickup inside
+                    // ItemStaleDispatchQuietTimeout) or still holds deferred
+                    // is waiting behind quota/cap — not wedged. Skipping here
+                    // leaves RecoveryAttempts untouched so a long quota stall
+                    // can never consume the recovery budget or park the item.
+                    // Only an item the dispatcher has stopped evaluating has
+                    // fallen out of dispatch: that is the real wedge case.
+                    if (boundWorker is null
+                        && IsDispatchAlive(item.Id, opts, now, out var dispatchReason))
+                    {
+                        _log.LogDebug(
+                            "Item-stale sweep: work item {ItemId} UpdatedAt frozen for {SinceUpdated}s but dispatcher is active ({DispatchReason}); waiting, not stale",
+                            item.Id, (long)(now - item.UpdatedAt).TotalSeconds, dispatchReason);
                         continue;
                     }
 
@@ -261,6 +314,14 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                         ct);
                 }
             }
+
+            // Long quota waits surface an informational notice on their own
+            // threshold, independent of the UpdatedAt cutoff above — a quota
+            // wait typically outlasts the notice threshold (default 1 h) well
+            // before it could look stale (default 2.5 h). Driven by the
+            // dispatch record (not the watched-state walk) so Queued items —
+            // which the stale detector never watches — are covered too.
+            await EmitQuotaWaitNoticesAsync(opts, now, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex)
@@ -561,6 +622,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         WorkItem item,
         WorkerProgressWatchdogOptions opts,
         DateTimeOffset cutoff,
+        WorkerRegistration? boundWorker,
         CancellationToken ct)
     {
         var lastStreamAt = await GetLastStreamActivityAsync(item.Id, ct);
@@ -576,7 +638,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                 SandboxEvidence: "not-consulted");
         }
 
-        var (sandboxAlive, sandboxEvidence) = await ObserveSandboxLivenessAsync(item, opts, ct);
+        var (sandboxAlive, sandboxEvidence) = await ObserveSandboxLivenessAsync(item, opts, boundWorker, ct);
         if (sandboxAlive)
         {
             return new ItemLiveness(
@@ -596,6 +658,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     private async Task<(bool Alive, string Evidence)> ObserveSandboxLivenessAsync(
         WorkItem item,
         WorkerProgressWatchdogOptions opts,
+        WorkerRegistration? boundWorker,
         CancellationToken ct)
     {
         if (_activitySource is null)
@@ -603,7 +666,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         if (!opts.ActiveSandboxProgressSignalEnabled)
             return (false, "sandbox-signal-disabled");
 
-        var worker = await FindBoundWorkerAsync(item.Id, ct);
+        var worker = boundWorker ?? await FindBoundWorkerAsync(item.Id, ct);
         if (worker is null)
             return (false, "no-bound-worker");
 
@@ -628,6 +691,142 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             ? (true, activity.Reason)
             : (false, "no-sandbox-activity");
     }
+
+    /// <summary>
+    /// Dispatch-liveness guard for items with no bound worker. Returns true
+    /// when the dispatcher is actively handling the item: it still holds the
+    /// item deferred, or it evaluated the item inside
+    /// <see cref="WorkerProgressWatchdogOptions.ItemStaleDispatchQuietTimeout"/>.
+    /// Such an item is waiting behind quota/cap/budget — not wedged. A
+    /// missing dispatch record (or a record older than the quiet window with
+    /// no live deferral) means the item has fallen out of dispatch: the real
+    /// wedge case, and the caller may treat it as stale.
+    /// </summary>
+    private bool IsDispatchAlive(
+        WorkItemId itemId,
+        WorkerProgressWatchdogOptions opts,
+        DateTimeOffset now,
+        out string reason)
+    {
+        reason = "";
+        if (_dispatchLiveness is null)
+            return false;
+        if (!_dispatchLiveness.TryGetLiveness(itemId, out var liveness))
+            return false;
+        if (liveness.IsDeferred)
+        {
+            reason = "dispatcher holds it deferred";
+            return true;
+        }
+        var quietTimeout = opts.ItemStaleDispatchQuietTimeout;
+        if (quietTimeout > TimeSpan.Zero
+            && now - liveness.LastEvaluatedAt <= quietTimeout)
+        {
+            reason =
+                $"dispatcher evaluated it {(long)(now - liveness.LastEvaluatedAt).TotalSeconds}s ago " +
+                $"(quiet window {(long)quietTimeout.TotalSeconds}s)";
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Emits one informational quota-wait notice per continuous quota-blocked
+    /// episode once the episode outlasts
+    /// <see cref="WorkerProgressWatchdogOptions.ItemQuotaWaitNoticeThreshold"/>.
+    /// The item is never parked for this — the notice (audit event + webhook,
+    /// mirrored in queue status) exists so a long quota stall is visible as
+    /// waiting rather than mistaken for a wedge. Repeat sweeps inside the
+    /// same episode are no-ops; when the episode ends the marker is cleared
+    /// so a later episode notifies fresh. Only items still in a
+    /// dispatch-awaiting state (Queued or an item-stale watched state) with
+    /// no bound worker notify — a picked-up, parked, or terminal item with a
+    /// leftover record must not page the operator.
+    /// </summary>
+    private async Task EmitQuotaWaitNoticesAsync(
+        WorkerProgressWatchdogOptions opts,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        var threshold = opts.ItemQuotaWaitNoticeThreshold;
+        if (threshold <= TimeSpan.Zero || _dispatchLiveness is null)
+            return;
+
+        var waits = _dispatchLiveness.GetQuotaWaits();
+        var liveIds = new HashSet<WorkItemId>();
+        foreach (var wait in waits)
+        {
+            liveIds.Add(wait.WorkItemId);
+            if (_quotaWaitNotified.TryGetValue(wait.WorkItemId, out var notified)
+                && notified == wait.Since)
+                continue;
+            if (now - wait.Since < threshold)
+                continue;
+
+            var item = await _store.GetAsync(wait.WorkItemId, ct);
+            if (item is null)
+            {
+                _dispatchLiveness.NoteRemoved(wait.WorkItemId);
+                continue;
+            }
+            if (!IsQuotaWaitNotifiableState(item.State))
+                continue;
+
+            // A worker may have picked the item up since the episode stamp;
+            // the bound-worker path owns it from there, so only notify for
+            // items that are still waiting. The re-check is cheap and runs at
+            // most once per threshold crossing per episode.
+            if (await FindBoundWorkerAsync(item.Id, ct) is not null)
+                continue;
+
+            var agent = wait.Agent;
+            if (string.IsNullOrWhiteSpace(agent) || agent == "eligible agents")
+                agent = item.Agent?.Value ?? agent;
+
+            AuditLog.ItemWaitingOnQuota(item.Id, agent, wait.Since);
+            _log.LogInformation(
+                "Item-stale sweep: work item {ItemId} waiting on quota for {Agent} since {Since:O} ({WaitSeconds}s >= {ThresholdSeconds}s); waiting, not stale",
+                item.Id, agent, wait.Since,
+                (long)(now - wait.Since).TotalSeconds, (long)threshold.TotalSeconds);
+
+            if (_webhooks is not null)
+            {
+                try
+                {
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.waiting_on_quota",
+                        WorkItem = item,
+                        Details = new
+                        {
+                            workItemId = item.Id.ToString(),
+                            agent,
+                            since = wait.Since,
+                            waitSeconds = (long)(now - wait.Since).TotalSeconds,
+                            thresholdSeconds = (long)threshold.TotalSeconds,
+                            reason = $"waiting on quota for {agent} since {wait.Since:O}",
+                        },
+                    }, CancellationToken.None);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Item-stale sweep: failed to publish work_item.waiting_on_quota for {ItemId}", item.Id);
+                }
+            }
+
+            _quotaWaitNotified[item.Id] = wait.Since;
+        }
+
+        foreach (var id in _quotaWaitNotified.Keys)
+        {
+            if (!liveIds.Contains(id))
+                _quotaWaitNotified.TryRemove(id, out _);
+        }
+    }
+
+    private static bool IsQuotaWaitNotifiableState(WorkItemState state)
+        => state == WorkItemState.Queued || WorkItemRecoveryPolicy.IsItemStaleWatchedState(state);
 
     private async Task<WorkerRegistration?> FindBoundWorkerAsync(WorkItemId itemId, CancellationToken ct)
     {

@@ -166,6 +166,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // store; the pickup query skips them until the delay fires and removes them.
     private readonly DeferredItemRegistry _deferredItems = new();
 
+    // In-process dispatcher-evaluation record feeding the item-stale
+    // watchdog's dispatch-liveness guard (and queue status): every deferral
+    // notes an evaluation, every pickup clears the quota episode. Deferred
+    // membership is answered live from _deferredItems so the two cannot drift.
+    private readonly DispatchItemLivenessTracker? _dispatchLiveness;
+
+    /// <summary>Test/diagnostic hook for the dispatch-liveness record.</summary>
+    internal DispatchItemLivenessTracker? DispatchLiveness => _dispatchLiveness;
+
     // Project-scoped drain claims created when a queued Refactor reaches its
     // normal dispatch turn but the project still has in-flight work. While the
     // claim is active, fresh same-project non-refactor starts are held so the
@@ -313,7 +322,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         WorkItemRepoReaper? repoReaper = null,
         QuotaReservationLedger? reservationLedger = null,
         IWorkItemCostStore? costStore = null,
-        AgentBurnEstimatorOptions? burnEstimatorOptions = null)
+        AgentBurnEstimatorOptions? burnEstimatorOptions = null,
+        DispatchItemLivenessTracker? dispatchLiveness = null)
     {
         _queue = queue;
         _store = store;
@@ -344,6 +354,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _costStore = costStore;
         _burnEstimatorOptions = burnEstimatorOptions;
         _time = timeProvider ?? TimeProvider.System;
+        _dispatchLiveness = dispatchLiveness;
+        if (_dispatchLiveness is not null)
+            _dispatchLiveness.IsDeferredProvider = id => _deferredItems.Contains(id);
         _activeSandboxCountProvider = activeSandboxCountProvider ?? (static () => SandboxLiveCounter.Active);
         _repoReaper = repoReaper;
         _repoReaper?.RegisterActiveItemCheck(id => _activeItems.ContainsKey(id));
@@ -3212,7 +3225,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         ct,
                         capWaitRoutes is { Count: > 0 }
                             ? DeferredWait.AgentCap(capWaitRoutes)
-                            : DeferredWait.None);
+                            : DeferredWait.None,
+                        // Pure-quota stalls continue the quota-wait episode
+                        // the stale watchdog and queue status report on. Any
+                        // cap involvement (or none) means the wait is not
+                        // purely quota-blocked, so the episode ends.
+                        // Unpinned class items carry no agent yet — record the
+                        // episode under a generic label rather than dropping it.
+                        quotaBlockedAgent: decision.AnyMemberAtCap
+                            ? null
+                            : item.Agent?.Value ?? "eligible agents");
                     return;
                 }
                 if (decision.Chosen is { } chosen)
@@ -3430,6 +3452,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             using var registration = _cancellations.Register(item.Id);
             AuditLog.WorkItemPickedUp(workerIndex, item.Id);
+            _dispatchLiveness?.NotePickedUp(item.Id);
             try
             {
                 await _pipeline.RunAsync(item, registration.Token, ct);
@@ -4530,8 +4553,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         WorkItemId id,
         TimeSpan delay,
         CancellationToken stoppingToken,
-        DeferredWait wait = default)
+        DeferredWait wait = default,
+        string? quotaBlockedAgent = null)
     {
+        // Every deferral is a dispatcher evaluation: record it so the
+        // item-stale watchdog can tell "waiting behind quota/cap/budget" from
+        // "fallen out of dispatch". A non-null quotaBlockedAgent marks a
+        // quota-shaped deferral (every eligible agent quota-blocked) and
+        // continues the quota-wait episode; any other deferral ends it.
+        // Recorded even on duplicate-deferral races below — the dispatcher
+        // did evaluate the item.
+        _dispatchLiveness?.NoteDispatchEvaluated(id, quotaBlockedAgent);
+
         // A concurrent pickup race can try to defer the same queued item from
         // more than one worker. Keep one timer owner per item so stale duplicate
         // retries do not amplify dispatcher wakeups or deferral backlog.
