@@ -45,6 +45,12 @@ internal static class QuotaRouterConfigMapper
             DrainAggressiveness = qr.DrainAggressiveness,
             DispatchReservationEstimatePct = qr.DispatchReservationEstimatePct,
             DispatchReservationEstimatePctByAgent = new Dictionary<string, double>(qr.DispatchReservationEstimatePctByAgent, StringComparer.OrdinalIgnoreCase),
+            DispatchReservationEstimateItems = Positive(qr.DispatchReservationEstimateItems),
+            DispatchReservationEstimateItemsByAgent = BuildPositiveDoubleMap(
+                qr.DispatchReservationEstimateItemsByAgent, "DispatchReservationEstimateItemsByAgent"),
+            DispatchReservationBurnMultiplier = qr.DispatchReservationBurnMultiplier,
+            DispatchReservationBurnMinSamples = qr.DispatchReservationBurnMinSamples,
+            MinQuotaItems = Positive(qr.MinQuotaItems),
             DispatchReservationMinPct = qr.DispatchReservationMinPct,
             DispatchReservationMaxPct = qr.DispatchReservationMaxPct,
             QuotaReservationMaxAge = BuildPositiveDuration(
@@ -94,6 +100,12 @@ internal static class QuotaRouterConfigMapper
         dst.DrainAggressiveness = src.DrainAggressiveness;
         dst.DispatchReservationEstimatePct = src.DispatchReservationEstimatePct;
         dst.DispatchReservationEstimatePctByAgent = new Dictionary<string, double>(src.DispatchReservationEstimatePctByAgent, StringComparer.OrdinalIgnoreCase);
+        dst.DispatchReservationEstimateItems = Positive(src.DispatchReservationEstimateItems);
+        dst.DispatchReservationEstimateItemsByAgent = BuildPositiveDoubleMap(
+            src.DispatchReservationEstimateItemsByAgent, "DispatchReservationEstimateItemsByAgent");
+        dst.DispatchReservationBurnMultiplier = src.DispatchReservationBurnMultiplier;
+        dst.DispatchReservationBurnMinSamples = src.DispatchReservationBurnMinSamples;
+        dst.MinQuotaItems = Positive(src.MinQuotaItems);
         dst.DispatchReservationMinPct = src.DispatchReservationMinPct;
         dst.DispatchReservationMaxPct = src.DispatchReservationMaxPct;
         if (src.QuotaReservationMaxAgeSeconds > 0)
@@ -168,11 +180,13 @@ internal static class QuotaRouterConfigMapper
                 RampWindow = kv.Value.RampWindowSeconds is { } seconds && seconds > 0
                     ? TimeSpan.FromSeconds(seconds)
                     : null,
+                MinQuotaItems = Positive(kv.Value.MinQuotaItems),
             };
             if (entry.MinQuotaPct is null
                 && entry.StartFloorPct is null
                 && entry.EndFloorPct is null
-                && entry.RampWindow is null)
+                && entry.RampWindow is null
+                && entry.MinQuotaItems is null)
             {
                 continue;
             }
@@ -196,6 +210,25 @@ internal static class QuotaRouterConfigMapper
     private static double? NonNegative(double? value) =>
         value is { } v && v >= 0 ? v : null;
 
+    private static double? Positive(double? value) =>
+        value is { } v && double.IsFinite(v) && v > 0 ? v : null;
+
+    private static Dictionary<string, double> BuildPositiveDoubleMap(
+        IDictionary<string, double>? src, string field)
+    {
+        var dst = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        if (src is null) return dst;
+        foreach (var kv in src)
+        {
+            if (string.IsNullOrWhiteSpace(kv.Key)) continue;
+            if (!double.IsFinite(kv.Value) || kv.Value <= 0)
+                throw new InvalidOperationException(
+                    $"CodeyBox:QuotaRouter:{field}['{kv.Key}'] must be a positive finite number.");
+            dst[kv.Key] = kv.Value;
+        }
+        return dst;
+    }
+
     private static Dictionary<string, QuotaPoolOptions> BuildPoolOptions(
         IDictionary<string, QuotaPoolConfig>? src)
     {
@@ -214,12 +247,21 @@ internal static class QuotaRouterConfigMapper
                         $"Quota pool '{name}': ReservationEstimate must be a positive finite number.");
                 estimate = raw;
             }
+            double? estimateItems = null;
+            if (kv.Value.ReservationEstimateItems is { } rawItems)
+            {
+                if (!(rawItems > 0) || !double.IsFinite(rawItems))
+                    throw new InvalidOperationException(
+                        $"Quota pool '{name}': ReservationEstimateItems must be a positive finite number of dispatches.");
+                estimateItems = rawItems;
+            }
             dst[name] = new QuotaPoolOptions
             {
                 Name = name,
                 Kind = kind,
                 BalanceUnit = string.IsNullOrWhiteSpace(kv.Value.BalanceUnit) ? null : kv.Value.BalanceUnit.Trim(),
                 ReservationEstimate = estimate,
+                ReservationEstimateItems = estimateItems,
                 ProbeSource = ParseProbeSource(name, kv.Value.ProbeSource),
                 ReportedReadingMaxAge = kv.Value.ReportedReadingMaxAgeSeconds > 0
                     ? TimeSpan.FromSeconds(kv.Value.ReportedReadingMaxAgeSeconds)
@@ -302,17 +344,20 @@ internal static class QuotaRouterConfigMapper
                     ? TimeSpan.FromSeconds(seconds)
                     : null,
                 MinBalance = kv.Value.MinBalance,
+                MinQuotaItems = Positive(kv.Value.MinQuotaItems),
             };
             if (poolKind == QuotaPoolKind.DepletingBalance)
             {
                 if (entry.MinQuotaPct is not null
                     || entry.StartFloorPct is not null
                     || entry.EndFloorPct is not null
-                    || entry.RampWindow is not null)
+                    || entry.RampWindow is not null
+                    || entry.MinQuotaItems is not null)
                     throw new InvalidOperationException(
                         $"Quota pool '{name}' is a depleting-balance pool; express its floor " +
                         $"in absolute balance units via MinBalance, not in percent " +
-                        $"(MinQuotaPct/StartFloorPct/EndFloorPct/RampWindowSeconds).");
+                        $"(MinQuotaPct/StartFloorPct/EndFloorPct/RampWindowSeconds) " +
+                        $"or dispatches (MinQuotaItems).");
                 if (entry.MinBalance is { } min && (!(min >= 0) || !double.IsFinite(min)))
                     throw new InvalidOperationException(
                         $"Quota pool '{name}' is a depleting-balance pool; MinBalance must be " +
@@ -329,7 +374,8 @@ internal static class QuotaRouterConfigMapper
                 && entry.StartFloorPct is null
                 && entry.EndFloorPct is null
                 && entry.RampWindow is null
-                && entry.MinBalance is null)
+                && entry.MinBalance is null
+                && entry.MinQuotaItems is null)
             {
                 continue;
             }

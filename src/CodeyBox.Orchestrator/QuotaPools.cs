@@ -94,6 +94,21 @@ public sealed class QuotaPoolOptions
     public double? ReservationEstimate { get; set; }
 
     /// <summary>
+    /// Work-denominated alternative to <see cref="ReservationEstimate"/> for
+    /// resetting-window pools: how many dispatches' worth of quota one
+    /// reservation escrows, converted through the member's measured per-item
+    /// burn. Lets an operator say "reserve one item's worth" instead of naming
+    /// a percentage. Within the pool tier an explicit
+    /// <see cref="ReservationEstimate"/> percentage wins; across tiers the
+    /// pool entry wins over explicit, agent, derived, and global estimates.
+    /// Null (the default) keeps the percentage chain. A non-positive value is
+    /// ignored. Requires measured burn — without enough samples the percentage
+    /// chain applies unchanged. Rejected on depleting-balance pools (their
+    /// <see cref="ReservationEstimate"/> is already absolute). Hot-reloadable.
+    /// </summary>
+    public double? ReservationEstimateItems { get; set; }
+
+    /// <summary>
     /// Where this pool's probe runs. <see cref="QuotaProbeSource.OrchestratorDirect"/>
     /// (the default) probes in-process against orchestrator-held credentials,
     /// exactly as today. <see cref="QuotaProbeSource.ExecutorReported"/> meters
@@ -153,6 +168,16 @@ public sealed class QuotaPoolFloorOptions
     /// this value. Defaults to <c>0</c> when unset (refuse only when empty).
     /// </summary>
     public double? MinBalance { get; set; }
+
+    /// <summary>
+    /// Work-denominated floor for resetting-window pools, in dispatches' worth
+    /// of quota, converted through the member's measured per-item burn (e.g. a
+    /// floor of one item keeps headroom for one more dispatch however large the
+    /// plan). Competes with the percentage floor via maximum so neither reserve
+    /// can be undercut. Requires measured burn — without enough samples the
+    /// percentage floor applies unchanged. Rejected on depleting-balance pools.
+    /// </summary>
+    public double? MinQuotaItems { get; set; }
 }
 
 /// <summary>
@@ -304,6 +329,11 @@ public static class QuotaPoolValidation
                     throw new InvalidOperationException(
                         $"Quota pool '{key}' must have a positive ReportedReadingMaxAge; " +
                         $"staleness without a bound would present silence as headroom.");
+                if (pool.Kind == QuotaPoolKind.DepletingBalance && pool.ReservationEstimateItems is not null)
+                    throw new InvalidOperationException(
+                        $"Quota pool '{key}' is a depleting-balance pool; express its reservation " +
+                        $"in absolute '{pool.BalanceUnit ?? "balance"}' units via ReservationEstimate, " +
+                        $"not in dispatches (ReservationEstimateItems).");
                 ValidateHolderHostIds(key, pool);
             }
         }
@@ -322,11 +352,13 @@ public static class QuotaPoolValidation
                 if (floor.MinQuotaPct is not null
                     || floor.StartFloorPct is not null
                     || floor.EndFloorPct is not null
-                    || floor.RampWindow is not null)
+                    || floor.RampWindow is not null
+                    || floor.MinQuotaItems is not null)
                     throw new InvalidOperationException(
                         $"Quota pool '{key}' is a depleting-balance pool; express its floor " +
                         $"in absolute '{pool.BalanceUnit ?? "balance"}' units via MinBalance, " +
-                        $"not in percent (MinQuotaPct/StartFloorPct/EndFloorPct/RampWindow).");
+                        $"not in percent (MinQuotaPct/StartFloorPct/EndFloorPct/RampWindow) " +
+                        $"or dispatches (MinQuotaItems).");
                 if (floor.MinBalance is < 0)
                     throw new InvalidOperationException(
                         $"Quota pool '{key}' is a depleting-balance pool; MinBalance must be " +

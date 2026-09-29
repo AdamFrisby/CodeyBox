@@ -1427,6 +1427,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                         RampWindowSeconds = kv.Value.RampWindow is { } rampWindow
                             ? checked((int)rampWindow.TotalSeconds)
                             : (int?)null,
+                        kv.Value.MinQuotaItems,
                     }),
                 Pools = mapped.Pools
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
@@ -1435,6 +1436,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                         Kind = kv.Value.Kind.ToString(),
                         kv.Value.BalanceUnit,
                         kv.Value.ReservationEstimate,
+                        kv.Value.ReservationEstimateItems,
                         ProbeSource = kv.Value.ProbeSource.ToString(),
                         ReportedReadingMaxAgeSeconds = checked((int)kv.Value.ReportedReadingMaxAge.TotalSeconds),
                         HolderHostIds = kv.Value.HolderHostIds
@@ -1452,7 +1454,22 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                             ? checked((int)poolRamp.TotalSeconds)
                             : (int?)null,
                         kv.Value.MinBalance,
+                        kv.Value.MinQuotaItems,
                     }),
+                opts.MinQuotaItems,
+                opts.DispatchReservationEstimatePct,
+                DispatchReservationEstimatePctByAgent = mapped.DispatchReservationEstimatePctByAgent
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => kv.Value),
+                opts.DispatchReservationEstimateItems,
+                DispatchReservationEstimateItemsByAgent = mapped.DispatchReservationEstimateItemsByAgent
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => kv.Value),
+                opts.DispatchReservationBurnMultiplier,
+                opts.DispatchReservationBurnMinSamples,
+                opts.DispatchReservationMinPct,
+                opts.DispatchReservationMaxPct,
+                QuotaReservationMaxAgeSeconds = checked((int)mapped.QuotaReservationMaxAge.TotalSeconds),
                 opts.QuotaRecheckIntervalSeconds,
                 opts.QuotaRecoveryProbeIntervalSeconds,
                 opts.MaxQuotaRecoveryProbeEligibilityScan,

@@ -216,6 +216,15 @@ public sealed record AgentQuotaSnapshot
     public IReadOnlyList<WindowQuota> Windows { get; init; } = Array.Empty<WindowQuota>();
 
     /// <summary>
+    /// Name of the binding window: the known window with the least remaining
+    /// availability, i.e. the window that produced <see cref="AvailablePct"/>.
+    /// Null for unknown snapshots and for probes with no window concept.
+    /// Computed from <see cref="Windows"/> on read, so it is always consistent
+    /// with the per-window readings carried in the payload. Pure.
+    /// </summary>
+    public string? BindingWindow => QuotaWindowBinding.ResolveBindingWindow(Windows);
+
+    /// <summary>
     /// Absolute remaining prepaid balance in the provider's native unit (e.g.
     /// credits), for accounts metered as a depleting balance rather than a
     /// resetting window. Null for resetting-window providers. Probes for

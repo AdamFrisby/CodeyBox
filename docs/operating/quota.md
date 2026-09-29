@@ -275,6 +275,64 @@ cold-start default. The `/concurrency` surface reports the sample count with
 status `NoWindowBudget` so operators can tell this apart from true no-history
 cold start.
 
+## Work-denominated floors and reservations
+
+Every quota reserve in the router used to be denominated in percentage points
+of a provider reading (`DispatchReservationEstimatePct`, default 5.0, and the
+`MinQuotaPct` / `StartFloorPct` / `EndFloorPct` floor triple). A percentage
+says nothing about how much work a point actually buys, so the same number
+behaves completely differently on plans of different absolute size — on a
+large plan a 5-point floor strands far more absolute capacity than intended,
+and a 5-point per-dispatch reservation can exceed the real cost of a dispatch
+by 5-10x, leaving the tail of the plan unspendable.
+
+Two mechanisms address this, both reusing the measured per-item burn above:
+
+- **Burn-derived reservations.** When the burn estimator reports a `Measured`
+  estimate with at least `DispatchReservationBurnMinSamples` samples (default
+  3), the per-dispatch reservation is the measured burn times
+  `DispatchReservationBurnMultiplier` (default 1.5), clamped to
+  `DispatchReservationMinPct` / `DispatchReservationMaxPct` like every other
+  estimate. The derived value displaces only the unconfigured global default:
+  any pool, explicit, per-agent, or items-denominated tier still wins, and a
+  non-positive multiplier disables derivation. With no samples the behaviour
+  is identical to the fixed constant. This needs the same prerequisite as the
+  rate-aware gate: `CodeyBox:AgentBurnEstimator:WindowTokenBudget:<agent>`
+  must be positive, otherwise the estimator cannot convert token samples into
+  a percentage and there is no measured burn to derive from.
+- **Items-denominated floors and reservations.** As an alternative to naming a
+  percentage, resetting-window pools and agents can name dispatches' worth of
+  quota: `Pools:<name>:ReservationEstimateItems` ("reserve one item's worth"),
+  `FloorByPool:<name>:MinQuotaItems`, `FloorByAgent:<agent>:MinQuotaItems`,
+  the global `MinQuotaItems`, and the global/per-agent
+  `DispatchReservationEstimateItems( ByAgent)`. Each converts through the
+  member's measured burn at evaluation time (2 items at 0.6% burn = a 1.2-point
+  reservation). Within one tier an explicit percentage beats an items quantity;
+  across tiers the order is unchanged — pool override, explicit override,
+  per-agent, then global — with the derived burn value sitting just above the
+  global percentage fallback. Items quantities need measured burn: without
+  enough samples that tier is skipped and the percentage chain applies. Items
+  floors compete with the percentage floor via maximum, so neither reserve can
+  be undercut. Depleting-balance pools keep their absolute `MinBalance` /
+  `ReservationEstimate` semantics; items quantities are rejected on them at
+  configuration load.
+
+All knobs are hot-reloadable via the `CodeyBox:QuotaRouter` config block.
+
+## Binding window
+
+`AvailablePct` is the minimum across the provider's windows, and the window
+that produced it is the **binding window**. The probe payload names it
+(`AgentQuotaSnapshot.BindingWindow`, also serialized into the `/quota`
+`latestSnapshot` and as top-level `bindingWindow` / `windowSummary` fields),
+and dispatch-refusal reasons name it too — e.g.
+`quota below floor (4.0% < 5.0%; monthly 4.0% (binding), weekly 98.0%, rolling 100.0%)`
+and `quota reservation of 5.0% would breach floor (...; binding window 'monthly')` —
+so a plan with 98% of its weekly budget untouched reads as
+constrained-by-monthly instead of generically out of quota. Refused members
+also carry the reason in the `/quota` `dispatchReason` field; allowed members
+keep a null reason.
+
 ## Observed-failure breaker
 
 When an agent exits unsuccessfully and stderr **or** stdout contains one of
@@ -495,6 +553,9 @@ operator asserted that text means auth failure for the agent.
 - per-model quota breakdowns
 - observed failure counters from the last 60 minutes
 - overall and per-model `wouldAllow` decisions
+- `bindingWindow` / `windowSummary` naming the scarcest window, and
+  `dispatchReason` carrying the gate's refusal reason (including the binding
+  window) for refused members; allowed members keep a null reason
 - paused-agent status. Paused agents are reported distinctly from quota
   exhaustion with `dispatchStatus: "paused"` and reason text of the form
   `paused by operator: <reason>`.

@@ -31,4 +31,19 @@ public interface IAgentQuotaGate
         AgentQuotaSnapshot snapshot,
         DateTimeOffset nowUtc,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Refusal reason for the same decision <see cref="Allows"/> reports, or
+    /// null when the gate allows. Lets status surfaces (e.g. <c>/quota</c>
+    /// <c>dispatchReason</c>) show WHY a member is refused — including which
+    /// quota window binds — without re-implementing the gate. The default
+    /// implementation returns null so existing probes keep compiling; the
+    /// router's gate override reports the real reason.
+    /// </summary>
+    string? GetRefusalReason(
+        AgentMembership member,
+        AgentQuotaSnapshot snapshot,
+        DateTimeOffset nowUtc,
+        bool recentObservedFailure = false,
+        string? observedFailureReason = null) => null;
 }
