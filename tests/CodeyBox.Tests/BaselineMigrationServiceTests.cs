@@ -98,6 +98,11 @@ public sealed class BaselineMigrationServiceTests : IDisposable
         var result = await _service.MigrateAsync(default);
 
         Assert.Equal(1, result.MigratedCount);
+        // The scanned−migrated delta is legible: the already-current item and
+        // the two terminal items are reported under their own skip reasons.
+        Assert.Equal(2, result.ScannedCount);
+        Assert.Equal(1, result.AlreadyCurrentCount);
+        Assert.Equal(2, result.SkippedTerminalCount);
         Assert.Null((await _store.GetAsync(stale.Id))!.BaselineImageRef);
         Assert.Equal("cb-baseline-old", (await _store.GetAsync(done.Id))!.BaselineImageRef);
         Assert.Equal("cb-baseline-old", (await _store.GetAsync(cancelled.Id))!.BaselineImageRef);
@@ -167,6 +172,22 @@ public sealed class BaselineMigrationServiceTests : IDisposable
         var third = await cappedService.MigrateAsync(default);
         Assert.Equal(1, third.MigratedCount);
         Assert.False(third.Truncated);
+    }
+
+    [Fact]
+    public async Task SkippedTerminalCount_RespectsScopeFilters()
+    {
+        _resolver.Current = "cb-baseline-new";
+        await _store.CreateAsync(Sample("cb-baseline-old", WorkItemState.Failed));
+        await _store.CreateAsync(Sample("cb-baseline-old", WorkItemState.Done));
+        await _store.CreateAsync(Sample("cb-baseline-other", WorkItemState.Failed));
+
+        var result = await _service.MigrateAsync(
+            new BaselineMigrationFilter(BaselineImageRef: "cb-baseline-old"));
+
+        Assert.Equal(0, result.MigratedCount);
+        Assert.Equal(0, result.ScannedCount);
+        Assert.Equal(2, result.SkippedTerminalCount);
     }
 
     [Fact]

@@ -47,7 +47,13 @@ public sealed class BaselineMigrateEndpointTests : IDisposable
         return item;
     }
 
-    private sealed record MigrateResponse(int Migrated, int Scanned, bool Truncated, RecomputeTarget[] RecomputeTargets);
+    private sealed record MigrateResponse(
+        int Migrated,
+        int Scanned,
+        int AlreadyCurrent,
+        int SkippedTerminal,
+        bool Truncated,
+        RecomputeTarget[] RecomputeTargets);
     private sealed record RecomputeTarget(string? BaselineImageRef, int Count);
 
     [Fact]
@@ -64,6 +70,30 @@ public sealed class BaselineMigrateEndpointTests : IDisposable
         Assert.Equal(1, body!.Migrated);
         Assert.Null((await _factory.Store.GetAsync(working.Id))!.BaselineImageRef);
         Assert.Equal("cb-baseline-old", (await _factory.Store.GetAsync(done.Id))!.BaselineImageRef);
+    }
+
+    [Fact]
+    public async Task Migrate_ReportsSkipReasons_NotJustNetDelta()
+    {
+        // The scanned−migrated delta must decompose into named skip reasons so
+        // an operator can tell "already current" apart from "skipped because
+        // terminal" without a log dig (the incident that motivated this).
+        // The test host's provider has no baseline resolver, so the
+        // current-config ref is null: a non-null pin migrates, and an
+        // already-current pin is impossible here — assert it reports 0 rather
+        // than being silently absorbed.
+        await SeedAsync("cb-baseline-old", WorkItemState.Working);
+        await SeedAsync("cb-baseline-old", WorkItemState.Failed);
+        await SeedAsync("cb-baseline-old", WorkItemState.Done);
+
+        var body = await (await _client.PostAsJsonAsync("/baselines/migrate", new { }))
+            .Content.ReadFromJsonAsync<MigrateResponse>();
+
+        Assert.NotNull(body);
+        Assert.Equal(1, body!.Migrated);
+        Assert.Equal(1, body.Scanned);
+        Assert.Equal(0, body.AlreadyCurrent);
+        Assert.Equal(2, body.SkippedTerminal);
     }
 
     [Fact]

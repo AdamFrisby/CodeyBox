@@ -41,10 +41,18 @@ internal static class BaselineEndpoints
     /// <summary>
     /// Clears the baseline pin for non-terminal work items matching the optional
     /// filter (excluding items already on the current-config baseline), through
-    /// the store's shared write gate. Returns the migrated count and the refs
-    /// the cleared items will recompute to. Returned shape:
+    /// the store's shared write gate. Returns the migrated count, the refs the
+    /// cleared items will recompute to, and a skip breakdown so the operator can
+    /// reconcile <c>scanned</c> against <c>migrated</c> without digging through
+    /// the log: <c>alreadyCurrent</c> counts inspected items already on the
+    /// current-config ref; <c>skippedTerminal</c> counts pinned items in scope
+    /// excluded because they sit in a terminal state — their pins are the
+    /// historical record of the finished attempt and the retry path
+    /// re-validates them before re-queueing, so migration deliberately leaves
+    /// them alone. Returned shape:
     /// <code>
-    /// { "migrated": 3, "scanned": 5, "truncated": false,
+    /// { "migrated": 3, "scanned": 5, "alreadyCurrent": 2, "skippedTerminal": 1,
+    ///   "truncated": false,
     ///   "recomputeTargets": [ { "baselineImageRef": "cb-baseline-abc123", "count": 3 } ] }
     /// </code>
     /// </summary>
@@ -68,6 +76,8 @@ internal static class BaselineEndpoints
         {
             migrated = result.MigratedCount,
             scanned = result.ScannedCount,
+            alreadyCurrent = result.AlreadyCurrentCount,
+            skippedTerminal = result.SkippedTerminalCount,
             truncated = result.Truncated,
             recomputeTargets = result.RecomputeTargets.Select(t => new
             {

@@ -774,6 +774,40 @@ public interface IWorkItemStore
     }
 
     /// <summary>
+    /// Counts work items that pin a baseline image ref AND are in a terminal
+    /// state, under the same optional project/ref scope as
+    /// <see cref="ListNonTerminalBaselinePinnedAsync"/>. Baseline migration
+    /// deliberately skips terminal items — a terminal pin is the historical
+    /// record of the baseline the finished attempt ran on, and the retry path
+    /// re-validates the pin against the item's current route before
+    /// re-queueing — but operators still need the excluded set legible in the
+    /// migrate result. This is a count, not a list: terminal pins never become
+    /// migration candidates, so they are tallied without consuming the
+    /// per-scan candidate cap. The default implementation streams
+    /// <see cref="ListAsync"/> so in-memory stores work without modification.
+    /// </summary>
+    async Task<int> CountTerminalBaselinePinnedAsync(
+        ProjectId? projectId,
+        string? baselineImageRef,
+        CancellationToken ct = default)
+    {
+        var count = 0;
+        await foreach (var item in ListAsync(ct).ConfigureAwait(false))
+        {
+            if (item.BaselineImageRef is not { Length: > 0 } pin)
+                continue;
+            if (!WorkItemStates.IsTerminal(item.State))
+                continue;
+            if (projectId is { } pid && item.ProjectId != pid)
+                continue;
+            if (baselineImageRef is { } oldRef && !string.Equals(pin, oldRef, StringComparison.Ordinal))
+                continue;
+            count++;
+        }
+        return count;
+    }
+
+    /// <summary>
     /// Clears (sets null) <see cref="WorkItem.BaselineImageRef"/> for the listed
     /// items in a single bounded transaction, skipping any row that is in a
     /// terminal state or whose pin is already null. Returns the number of rows

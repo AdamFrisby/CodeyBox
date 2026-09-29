@@ -4883,7 +4883,8 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IReleaseStore>(),
     sp.GetService<IWorkItemQuestionStore>(),
-    sp.GetRequiredService<IAuditProgressStore>()));
+    sp.GetRequiredService<IAuditProgressStore>(),
+    sp.GetRequiredService<IBaselineImageResolver>()));
 
 // Shared stale-base remediation router used by both the pipeline's
 // upstream-push path and the out-of-band StalePullRequestSweeper. Reads the

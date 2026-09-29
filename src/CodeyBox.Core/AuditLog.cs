@@ -1743,17 +1743,25 @@ public static class AuditLog
     /// Emitted when an operator triggers a baseline migration
     /// (<c>POST /baselines/migrate</c>). Records the scope filter, how many
     /// pinned items were inspected, how many had their pin cleared (and will
-    /// recompute onto the current-config baseline at next pickup), and whether
-    /// the per-scan cap truncated the pass. <paramref name="projectFilter"/> and
+    /// recompute onto the current-config baseline at next pickup), the two
+    /// skip reasons that explain the scanned−migrated delta (already on the
+    /// current-config ref; pinned but terminal), and whether the per-scan cap
+    /// truncated the pass. <paramref name="projectFilter"/> and
     /// <paramref name="baselineFilter"/> are forced through an empty-string
     /// sentinel because Serilog drops null properties.
     /// </summary>
     public static void BaselineMigrated(
-        string? projectFilter, string? baselineFilter, int scanned, int migrated, bool truncated) =>
+        string? projectFilter,
+        string? baselineFilter,
+        int scanned,
+        int migrated,
+        int alreadyCurrent,
+        int skippedTerminal,
+        bool truncated) =>
         Audit("baseline.migrated")
             .Information(
-                "Operator baseline migration: scanned={Scanned} migrated={Migrated} truncated={Truncated} projectFilter={ProjectFilter} baselineFilter={BaselineFilter}",
-                scanned, migrated, truncated, projectFilter ?? "", baselineFilter ?? "");
+                "Operator baseline migration: scanned={Scanned} migrated={Migrated} alreadyCurrent={AlreadyCurrent} skippedTerminal={SkippedTerminal} truncated={Truncated} projectFilter={ProjectFilter} baselineFilter={BaselineFilter}",
+                scanned, migrated, alreadyCurrent, skippedTerminal, truncated, projectFilter ?? "", baselineFilter ?? "");
 
     /// <summary>
     /// Emitted by <c>PipelineRunner</c> when a durable agent-turn checkpoint

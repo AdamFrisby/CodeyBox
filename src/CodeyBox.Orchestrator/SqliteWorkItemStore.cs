@@ -3852,6 +3852,29 @@ public sealed class SqliteWorkItemStore :
         return result;
     }
 
+    public async Task<int> CountTerminalBaselinePinnedAsync(
+        ProjectId? projectId,
+        string? baselineImageRef,
+        CancellationToken ct = default)
+    {
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct).ConfigureAwait(false);
+        using var cmd = readConn.CreateCommand();
+        // Same index + scope predicates as ListNonTerminalBaselinePinnedAsync,
+        // inverted on the terminal predicate.
+        cmd.CommandText = $"""
+            SELECT COUNT(*) FROM work_items
+            WHERE baseline_image_ref IS NOT NULL
+              AND state IN ({TerminalStatesSqlList})
+              AND ($pid IS NULL OR project_id = $pid)
+              AND ($ref IS NULL OR baseline_image_ref = $ref);
+            """;
+        cmd.Parameters.AddWithValue("$pid", (object?)projectId?.Value ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$ref", (object?)baselineImageRef ?? DBNull.Value);
+        var result = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return result is long l ? (int)l : 0;
+    }
+
     public async Task<int> ClearBaselinePinsAsync(
         IReadOnlyCollection<WorkItemId> ids,
         DateTimeOffset updatedAt,
