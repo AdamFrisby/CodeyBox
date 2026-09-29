@@ -529,6 +529,9 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.EmptyReworkEscalationRetries):
                 opts.EmptyReworkEscalationRetries += 100;
                 break;
+            case nameof(PipelineTuningOptions.EarlyEndedTurnMaxNudges):
+                opts.EarlyEndedTurnMaxNudges += 100;
+                break;
             case nameof(PipelineTuningOptions.AuditorIdleTimeout):
                 opts.AuditorIdleTimeout += TimeSpan.FromHours(1);
                 break;
