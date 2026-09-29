@@ -478,6 +478,38 @@ Map it in CodeyBox config if you override `SandboxNetworkProfiles`:
 }
 ```
 
+### Majordomo sandbox
+
+The operator's assistant runs in a long-lived sandbox that is created on
+demand and reused across turns (see `MajordomoSandboxSession`), rather than
+one VM per message. It never consumes a work-item dispatch slot: it holds no
+worker-pool permit, so the fleet's concurrency accounting is unchanged while
+it is alive.
+
+Egress is restricted to the orchestrator API through the existing nftables
+path: the sandbox attaches to the dedicated `majordomo` profile, whose bridge
+allowlist covers only the orchestrator host. It has no public internet by
+default; when the configured model needs an external endpoint, name that
+endpoint in `CodeyBox:MajordomoSandbox:AdditionalAllowedHosts` — it is the
+only addition, never implied by the backend choice.
+
+```text
+# /etc/codeybox/networks.conf
+majordomo         cb-majordomo    10.99.7.0/24   host.codeybox.internal
+```
+
+Project repositories are mounted read-only: the sandbox reads code to
+investigate and never writes there — writing code is what work items are for.
+The model is operator-configured (`CodeyBox:MajordomoSandbox:ModelBackend`):
+drive a coding-agent CLI already supported in the sandbox baseline
+(`CodingAgentCli`), or use a genuine pay-per-use API key (`ApiKey`). A
+subscription OAuth credential must not be used against a raw HTTP API. The
+sandbox's only route to mutation is the MCP tool server; it holds no
+orchestrator API key of its own beyond the majordomo identity, and no host
+credentials. An idle sandbox is torn down after
+`CodeyBox:MajordomoSandbox:IdleTimeout` (default 10 minutes) and
+transparently recreated on the next turn.
+
 With `MultipassUseBaselineImages=true`, the provider bakes
 `cb-baseline-graphical` the first time a graphical project runs. Delete that
 baseline to force a rebuild after changing graphical tooling or

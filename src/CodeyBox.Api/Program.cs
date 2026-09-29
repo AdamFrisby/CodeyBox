@@ -335,6 +335,14 @@ builder.Services.AddOptions<MajordomoServerOptions>()
     .Bind(builder.Configuration.GetSection(MajordomoServerOptions.SectionName))
     .ValidateOnStart();
 builder.Services.AddMajordomoMcp();
+// Majordomo sandbox: long-lived, reusable-across-turns sandbox for the
+// operator's assistant. Hot-reloadable options (network profile, idle bound,
+// model backend) mirroring MajordomoSandboxOptions. Validation fails fast at
+// host start rather than silently weakening the egress or credential posture.
+builder.Services.AddSingleton<IValidateOptions<MajordomoSandboxOptions>, MajordomoSandboxOptionsValidator>();
+builder.Services.AddOptions<MajordomoSandboxOptions>()
+    .Bind(builder.Configuration.GetSection(MajordomoSandboxOptions.SectionName))
+    .ValidateOnStart();
 
 builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
