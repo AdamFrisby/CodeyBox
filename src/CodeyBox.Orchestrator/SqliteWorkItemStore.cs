@@ -2553,7 +2553,7 @@ public sealed class SqliteWorkItemStore :
         var rows = new List<WorkItem>();
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
+        using var tx = SqliteDefaults.BeginDeferredTransaction(readConn);
         using (var cmd = readConn.CreateCommand())
         {
             cmd.Transaction = tx;
@@ -2572,7 +2572,7 @@ public sealed class SqliteWorkItemStore :
         var rows = new List<WorkItem>();
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
+        using var tx = SqliteDefaults.BeginDeferredTransaction(readConn);
         using (var cmd = readConn.CreateCommand())
         {
             cmd.Transaction = tx;
@@ -2614,7 +2614,7 @@ public sealed class SqliteWorkItemStore :
         var rows = new List<WorkItem>();
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
+        using var tx = SqliteDefaults.BeginDeferredTransaction(readConn);
         using (var cmd = readConn.CreateCommand())
         {
             cmd.Transaction = tx;
@@ -3318,8 +3318,13 @@ public sealed class SqliteWorkItemStore :
         IReadOnlySet<WorkItemId> skipIds,
         CancellationToken ct)
     {
+        // TEMP tables live in a per-connection schema and need no main-db
+        // write lock. A deferred transaction keeps staging off RESERVED so
+        // this read path does not contend with real writers.
+        using var tx = SqliteDefaults.BeginDeferredTransaction(connection);
         using (var reset = connection.CreateCommand())
         {
+            reset.Transaction = tx;
             reset.CommandText = """
                 DROP TABLE IF EXISTS temp.codeybox_dispatch_skip_ids;
                 CREATE TEMP TABLE codeybox_dispatch_skip_ids (
@@ -3329,20 +3334,19 @@ public sealed class SqliteWorkItemStore :
             await reset.ExecuteNonQueryAsync(ct);
         }
 
-        if (skipIds.Count == 0)
-            return;
-
-        using var tx = connection.BeginTransaction();
-        using var insert = connection.CreateCommand();
-        insert.Transaction = tx;
-        insert.CommandText = "INSERT INTO temp.codeybox_dispatch_skip_ids (id) VALUES ($id);";
-        var idParameter = insert.CreateParameter();
-        idParameter.ParameterName = "$id";
-        insert.Parameters.Add(idParameter);
-        foreach (var id in skipIds)
+        if (skipIds.Count > 0)
         {
-            idParameter.Value = id.ToString();
-            await insert.ExecuteNonQueryAsync(ct);
+            using var insert = connection.CreateCommand();
+            insert.Transaction = tx;
+            insert.CommandText = "INSERT INTO temp.codeybox_dispatch_skip_ids (id) VALUES ($id);";
+            var idParameter = insert.CreateParameter();
+            idParameter.ParameterName = "$id";
+            insert.Parameters.Add(idParameter);
+            foreach (var id in skipIds)
+            {
+                idParameter.Value = id.ToString();
+                await insert.ExecuteNonQueryAsync(ct);
+            }
         }
 
         tx.Commit();
@@ -3746,7 +3750,7 @@ public sealed class SqliteWorkItemStore :
         var rows = new List<WorkItem>();
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
+        using var tx = SqliteDefaults.BeginDeferredTransaction(readConn);
         using (var cmd = readConn.CreateCommand())
         {
             cmd.Transaction = tx;
@@ -3932,7 +3936,7 @@ public sealed class SqliteWorkItemStore :
         var rows = new List<WorkItem>();
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
+        using var tx = SqliteDefaults.BeginDeferredTransaction(readConn);
         using (var cmd = readConn.CreateCommand())
         {
             cmd.Transaction = tx;
@@ -3980,7 +3984,7 @@ public sealed class SqliteWorkItemStore :
         var rows = new List<WorkItem>();
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
+        using var tx = SqliteDefaults.BeginDeferredTransaction(readConn);
         using (var cmd = readConn.CreateCommand())
         {
             cmd.Transaction = tx;
