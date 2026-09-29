@@ -1,0 +1,31 @@
+{
+  "pagelen": 50,
+  "page": 1,
+  "size": 3,
+  "values": [
+    {
+      "key": "ci/build",
+      "name": "build",
+      "state": "SUCCESSFUL",
+      "url": "https://ci.example.com/builds/1",
+      "description": "Build passed",
+      "created_on": "2026-03-02T10:00:00.000+00:00"
+    },
+    {
+      "key": "ci/lint",
+      "name": "lint",
+      "state": "FAILED",
+      "url": "https://ci.example.com/builds/2",
+      "description": "Lint failed",
+      "created_on": "2026-03-02T10:05:00.000+00:00"
+    },
+    {
+      "key": "ci/e2e",
+      "name": "e2e",
+      "state": "INPROGRESS",
+      "url": "https://ci.example.com/builds/3",
+      "description": "Running",
+      "created_on": "2026-03-02T10:06:00.000+00:00"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "pagelen": 50,
+  "page": 1,
+  "size": 2,
+  "values": [
+    {
+      "id": 501,
+      "content": { "raw": "First comment" },
+      "user": { "display_name": "alice", "nickname": "alice" },
+      "created_on": "2026-03-02T10:00:00.000+00:00",
+      "parent": null,
+      "inline": null
+    },
+    {
+      "id": 502,
+      "content": { "raw": "Inline note" },
+      "user": { "display_name": "bob", "nickname": "bob" },
+      "created_on": "2026-03-02T11:00:00.000+00:00",
+      "parent": null,
+      "inline": { "path": "src/app.cs", "to": 42, "from": null }
+    }
+  ]
+}

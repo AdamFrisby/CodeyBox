@@ -1,0 +1,9 @@
+{
+  "type": "repository",
+  "full_name": "myteam/myproject",
+  "is_private": true,
+  "mainbranch": { "name": "main", "type": "branch" },
+  "links": {
+    "html": { "href": "https://bitbucket.org/myteam/myproject" }
+  }
+}

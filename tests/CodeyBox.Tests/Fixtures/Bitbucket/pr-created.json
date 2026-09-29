@@ -1,0 +1,23 @@
+{
+  "id": 12,
+  "title": "Add feature Z",
+  "description": "Automated via CodeyBox",
+  "state": "OPEN",
+  "links": {
+    "html": {
+      "href": "https://bitbucket.org/myteam/myproject/pull-requests/12"
+    }
+  },
+  "source": {
+    "branch": { "name": "codeybox/abc123" },
+    "commit": { "hash": "4b5d3f4b0c1a2b3c4d5e6f708192a3b4c5d6e7f" }
+  },
+  "destination": {
+    "branch": { "name": "main" },
+    "commit": { "hash": "0be8717da52d7b24b5dd3586c8c4b7c8d0dcf0d" }
+  },
+  "merge_commit": null,
+  "author": { "display_name": "codeybox-bot", "nickname": "codeybox-bot" },
+  "participants": [],
+  "comment_count": 0
+}
