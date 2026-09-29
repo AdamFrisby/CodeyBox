@@ -299,7 +299,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
         }
-        catch (Exception ex) when (ex is not OperationCanceledException && !SandboxDeferralGuard.IsDeferral(ex))
+        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
             return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
@@ -325,7 +325,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 MaxDotnetMarkerPathsPerBranch,
                 ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException && ex is not NotSupportedException && !SandboxDeferralGuard.IsDeferral(ex))
+        catch (Exception ex) when (ex is not NotSupportedException && SandboxDeferralGuard.ShouldWrap(ex))
         {
             throw new InvalidOperationException(
                 $"failed to inspect branch '{branch}' for .NET build markers: {SingleLineSummary(ex.Message)}",
@@ -414,6 +414,11 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     BuildTimeoutExceededOutput());
             }
 
+            // A dead exec transport is infrastructure, not a build result:
+            // propagate so the item parks for retry instead of terminal-failing.
+            if (build.ExecutionUnavailable)
+                throw new SandboxExecutionUnavailableException(build.ExitCode);
+
             var rawOutput = CombinedOutput(build);
             var redactedOutput = TruncateOutput(rawOutput);
 
@@ -475,7 +480,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             // repository setup boundary in PipelineRunner.
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
             return RequiredBuildVerificationResult.Unavailable(
                 $"could not verify required build: {SingleLineSummary(ex.Message)}",
@@ -502,7 +507,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             return await _gitHost.CreateIsolatedRepositoryCloneAsync(repositoryId, workItemId, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException && !SandboxDeferralGuard.IsDeferral(ex))
+        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
             throw new InvalidOperationException(
                 $"could not create isolated build repository: {SingleLineSummary(ex.Message)}",
@@ -551,6 +556,11 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         params string[] argv)
     {
         var result = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
+        // Transport loss (reaped VM, dead exec channel) must reach the
+        // pipeline's recoverable-infrastructure park — not the terminal
+        // Unavailable mapping below.
+        if (result.ExecutionUnavailable)
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
         if (!result.Success)
         {
             throw new InvalidOperationException(

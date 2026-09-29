@@ -110,6 +110,13 @@ internal sealed class MultipassRemoteSandbox :
     // active tracking is released so the leak reaper can reclaim any remaining
     // remote VM/staging state when the host is reachable.
     internal bool IsTrackedActive => Volatile.Read(ref _activeTrackingReleased) == 0;
+    /// <summary>
+    /// True once <see cref="DisposeAsync"/> has claimed the handle. A
+    /// tracked-active entry whose dispose already ran is a zombie no live
+    /// phase owns (e.g. deferred at sync-back, tracking left held); a
+    /// tracked-active entry with dispose never started is live work.
+    /// </summary>
+    internal bool DisposalStarted => Volatile.Read(ref _disposed) != 0;
     public bool ReleaseAdmissionAfterHostLoss => Volatile.Read(ref _releaseAdmissionAfterHostLoss) != 0;
 
     public WorkItemId? OwningWorkItemId => _spec.TimingWorkItemId;
@@ -525,6 +532,14 @@ internal sealed class MultipassRemoteSandbox :
         }
     }
 
+    /// <summary>
+    /// Reclaims a handle no live phase owns: the VM delete + staging cleanup
+    /// + tracking release performed directly, skipping the fallible sync-back
+    /// (which may already have failed and is exactly what stranded the
+    /// tracking). Serialized with <see cref="DisposeAsync"/> via
+    /// <see cref="_disposeLock"/>; a concurrent dispose that wins the lock
+    /// and releases tracking makes this a no-op.
+    /// </summary>
     internal async Task ForceDisposeLeakedAsync(CancellationToken ct)
     {
         if (Volatile.Read(ref _activeTrackingReleased) != 0)

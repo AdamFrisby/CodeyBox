@@ -6,7 +6,7 @@ namespace CodeyBox.Core;
 /// sandbox execution transport. The durable dispatch claim may be released
 /// without consuming an attempt because no agent process was started.
 /// </summary>
-public sealed class AgentResumePreparationUnavailableException : Exception
+public sealed class AgentResumePreparationUnavailableException : Exception, IExecutionTransportLoss
 {
     public AgentResumePreparationUnavailableException(int? exitCode, Exception? innerException = null)
         : base(
@@ -19,4 +19,7 @@ public sealed class AgentResumePreparationUnavailableException : Exception
     }
 
     public int? ExitCode { get; }
+
+    /// <inheritdoc/>
+    public bool ExecutionUnavailable => true;
 }

@@ -27,13 +27,19 @@ A provider-owned sandbox is classified as leaked when these conditions hold:
    suspended-sandbox mappings are also exempt while startup recovery owns them.
 3. Its creation timestamp — derived from provider metadata or provider-owned
    staging metadata where available — is **older than
-   `LeakAgeThreshold`** (default 30 minutes), or its creation timestamp cannot be
+   `LeakAgeThreshold`** (default 1.00:30:00), or its creation timestamp cannot be
    determined.
 
-A sandbox that is mid-way through the VM-launch → clone → mount → start sequence
-is typically less than 10 minutes old. The 30-minute threshold is a conservative
-safety margin: it is unlikely that a legitimately active sandbox would be both
-untracked *and* over 30 minutes old.
+The default is derived — not picked: it equals the longest legitimate phase
+duration (the `WorkTimeoutPolicy.MaxMinutes` ceiling × the phase
+absolute-timeout multiplier) plus a provisioning margin (currently 1.00:30:00,
+i.e. 24:30:00 wall-clock), so a mid-phase sandbox
+can never out-age the threshold while its worker is still legitimately running.
+Operators who lower it must keep it at or above the bound
+`SandboxLeakOptions.MinimumLeakAgeThreshold` computes for their configured
+`PhaseAbsoluteTimeoutMultiplier` — the reaper logs a warning on its next sweep
+when that coupling is violated — or tracking drift (an untracked entry that
+should be tracked) can cost a live VM.
 
 Sandboxes for which the creation time still cannot be determined are declared
 leaked once they are untracked by the current provider snapshot. Their age is
@@ -62,7 +68,7 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
     "SandboxLeak": {
       "Enabled": true,
       "CheckInterval": "00:15:00",
-      "LeakAgeThreshold": "00:30:00",
+      "LeakAgeThreshold": "1.00:30:00",
       "AutoDispose": true
     }
   }
@@ -73,7 +79,7 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
 |---|---|---|---|
 | `Enabled` | `true` | startup only | Enable or disable the sweep entirely. |
 | `CheckInterval` | `00:15:00` | startup only | How often the scan runs; sampled when the timer is constructed. |
-| `LeakAgeThreshold` | `00:30:00` | hot | Minimum age before an untracked sandbox is declared leaked. |
+| `LeakAgeThreshold` | `1.00:30:00` | hot | Minimum age before an untracked sandbox is declared leaked. Sized above the maximum legitimate phase duration; keep it that way. |
 | `AutoDispose` | `true` | hot | Purge each detected leak automatically. |
 | `MaxConcurrentAutoDispose` | `4` | hot | Parallel disposals, capped to limit pressure on the provider during restart cleanup. |
 

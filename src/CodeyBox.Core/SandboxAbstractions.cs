@@ -8,7 +8,7 @@ namespace CodeyBox.Core;
 /// non-zero command result, callers may safely classify this as infrastructure
 /// failure and retain durable recovery state.
 /// </summary>
-public sealed class SandboxExecutionUnavailableException : Exception
+public sealed class SandboxExecutionUnavailableException : Exception, IExecutionTransportLoss
 {
     public SandboxExecutionUnavailableException(int exitCode)
         : base($"Sandbox execution was unavailable (exit {exitCode}).")
@@ -17,6 +17,9 @@ public sealed class SandboxExecutionUnavailableException : Exception
     }
 
     public int ExitCode { get; }
+
+    /// <inheritdoc/>
+    public bool ExecutionUnavailable => true;
 }
 
 /// <summary>
@@ -808,6 +811,11 @@ public interface IActiveSandboxProvider
     /// sandbox is disposed. Implementations that cannot
     /// determine the owner (e.g. an in-process <c>CreateAsync</c> that did not
     /// pass <see cref="SandboxSpec.TimingWorkItemId"/>) omit those entries.
+    /// <para>Identifier invariant: each entry's <c>Sandbox.Id</c> must equal the
+    /// <see cref="ManagedSandboxInfo.Name"/> the provider's managed inventory
+    /// reports for the same sandbox — composite lifecycle consumers compare
+    /// the two ordinally to re-verify live ownership before destructive
+    /// disposal.</para>
     /// </summary>
     IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes();
 }
@@ -819,7 +827,10 @@ public interface IActiveSandboxProvider
 /// richer reason when providers can expose changing activity.
 /// </summary>
 /// <param name="WorkItemId">Work item that owns the sandbox.</param>
-/// <param name="SandboxId">Provider-side sandbox identifier.</param>
+/// <param name="SandboxId">Provider-side sandbox identifier. Must equal the
+/// <see cref="ManagedSandboxInfo.Name"/> the provider's managed inventory
+/// reports for the same sandbox — composite lifecycle consumers compare the
+/// two ordinally to re-verify live ownership before destructive disposal.</param>
 /// <param name="Status">Provider-defined activity marker. Watchdog signature
 /// tracking treats a changed value as progress, so a provider that emits a
 /// live signal must keep it stable while the sandbox is idle.</param>

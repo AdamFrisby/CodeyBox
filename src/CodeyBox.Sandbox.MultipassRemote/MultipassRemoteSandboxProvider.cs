@@ -556,6 +556,21 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             .Where(kv => string.Equals(kv.Key.Name, name, StringComparison.Ordinal))
             .Select(kv => kv.Value)
             .ToArray();
+        // An entry still tracked-active whose DisposeAsync never started
+        // belongs to a live work phase, not a leak: refuse the destructive
+        // delete — matching the Incus/local providers' refuse-when-active
+        // semantics. A tracked entry whose dispose already ran is a zombie
+        // no phase owns (e.g. deferred at sync-back, tracking left held)
+        // and is reclaimed below.
+        var liveMatches = activeMatches
+            .Where(static sb => sb.IsTrackedActive && !sb.DisposalStarted)
+            .ToArray();
+        if (liveMatches.Length == 1)
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' because it is still tracked as active on executor host '{liveMatches[0].HostId}'.");
+        if (liveMatches.Length > 1)
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' by bare name because it is active on multiple executor hosts.");
         if (activeMatches.Length == 1)
         {
             await activeMatches[0].ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
@@ -622,6 +637,14 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         if (!string.IsNullOrWhiteSpace(sandbox.HostId)
             && _active.TryGetValue(new RemoteSandboxIdentity(sandbox.HostId!, sandbox.Name), out var active))
         {
+            // Still owned by a live work phase (dispose never started) —
+            // refuse the destructive delete rather than killing the VM the
+            // phase is running on. A handle whose DisposeAsync already ran
+            // is a zombie no phase owns: reclaim it, skipping the fallible
+            // sync-back that stranded the tracking in the first place.
+            if (active.IsTrackedActive && !active.DisposalStarted)
+                throw new InvalidOperationException(
+                    $"Refusing to dispose remote VM '{sandbox.Name}' on host '{sandbox.HostId}' because it is still tracked as active.");
             await active.ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
             return;
         }
@@ -660,6 +683,12 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         var snap = new List<(WorkItemId, IShutdownTeardownSandbox)>(_active.Count);
         foreach (var (_, sb) in _active)
         {
+            // A handle whose DisposeAsync already claimed it is a zombie no
+            // live phase owns — reporting it as live would veto the provider's
+            // own zombie-reclaim path in DisposeLeakedAsync. The reclaim is
+            // serialized with the in-flight dispose via the handle's lock.
+            if (sb.DisposalStarted)
+                continue;
             if (sb.OwningWorkItemId is { } id)
                 snap.Add((id, sb));
         }
@@ -671,6 +700,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         var snap = new List<ActiveSandboxProgress>(_active.Count);
         foreach (var (_, sb) in _active)
         {
+            if (sb.DisposalStarted)
+                continue;
             if (sb.OwningWorkItemId is { } id)
                 snap.Add(new ActiveSandboxProgress(id, sb.Id, Status: $"running host={sb.HostId}"));
         }
@@ -1688,7 +1719,13 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             if (string.IsNullOrEmpty(name)) continue;
             if (!RemoteMultipassVmNames.IsManagedVmNameForPrefix(name, opts.VmNamePrefix)) continue;
 
-            var isTrackedActive = _active.TryGetValue(new RemoteSandboxIdentity(opts.HostId, name), out var active) && active.IsTrackedActive;
+            // A tracked entry whose DisposeAsync already claimed the handle is
+            // a zombie (e.g. deferred at sync-back, tracking left held), not
+            // live work — report it untracked so the sweep can route it to the
+            // provider's zombie-reclaim path instead of vetoing it forever.
+            var isTrackedActive = _active.TryGetValue(new RemoteSandboxIdentity(opts.HostId, name), out var active)
+                && active.IsTrackedActive
+                && !active.DisposalStarted;
             var state = entry.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null;
             var isSuspendOrFreezing = state is "Suspended" or "Suspending" or "Freezing";
             createdAtByName.TryGetValue(name, out var createdAt);

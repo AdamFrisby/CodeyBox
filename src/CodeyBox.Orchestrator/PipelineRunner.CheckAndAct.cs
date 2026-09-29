@@ -143,6 +143,20 @@ public sealed partial class PipelineRunner
         }
         catch (AgentInfrastructureFailureException infraEx)
         {
+            // A severed execution transport means the sandbox itself is gone
+            // (leak reaper, host crash, dead exec channel): the work is not
+            // at fault and a fresh sandbox reproduces a working environment,
+            // so park for bounded transient retry under an infrastructure
+            // classification — same as RunAsync's catch. Failing terminal
+            // would hand the clone to the repo reaper immediately, destroying
+            // the agent's working tree.
+            if (infraEx.ExecutionUnavailable)
+            {
+                await ParkForExecutionTransportLossAsync(
+                    item, infraEx.Message, project, infraEx.Phase, infraEx.Agent, "check-and-act");
+                return;
+            }
+
             _log.LogWarning(
                 "Work item {Id} check-and-act failed because agent {Agent} hit infrastructure failure in phase {Phase}: {Reason}",
                 item.Id, infraEx.Agent.Value, infraEx.Phase, infraEx.Message);
@@ -169,6 +183,15 @@ public sealed partial class PipelineRunner
                 CancellationToken.None,
                 project,
                 failureKind: WorkItemFailureKinds.Infrastructure);
+        }
+        catch (Exception ex) when (SandboxDeferralGuard.IsExecutionTransportLoss(ex))
+        {
+            // Raw transport-loss shapes that never got wrapped into an
+            // AgentInfrastructureFailureException — e.g. a
+            // SandboxExecutionUnavailableException from the git-clone exec —
+            // carry the same recoverable meaning: park, do not fail terminal.
+            await ParkForExecutionTransportLossAsync(
+                item, ex.Message, project, "check", agentRunner.Kind, "check-and-act");
         }
         catch (Exception ex)
         {

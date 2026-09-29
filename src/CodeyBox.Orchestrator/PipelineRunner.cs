@@ -1144,6 +1144,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (AgentInfrastructureFailureException ex)
         {
+            // A severed execution transport means the sandbox itself is gone
+            // (leak reaper, host crash, dead exec channel): the work is not
+            // at fault and a fresh sandbox reproduces a working environment,
+            // so park for bounded transient retry under an infrastructure
+            // classification. Deterministically failing terminal would also
+            // hand the clone to the repo reaper immediately (grace applies
+            // only to terminal rows), destroying the agent's working tree —
+            // the exact follow-on damage observed when live VMs were deleted.
+            if (ex.ExecutionUnavailable)
+            {
+                await ParkForExecutionTransportLossAsync(
+                    item, ex.Message, project, ex.Phase, ex.Agent, "run");
+                return;
+            }
+
             _log.LogWarning(
                 "Work item {Id} failed because agent {Agent} hit infrastructure failure in phase {Phase}: {Reason}",
                 item.Id, ex.Agent.Value, ex.Phase, ex.Message);
@@ -1413,6 +1428,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Work item {Id} resolved as no action required by agent {Agent}: {Reason}",
                 item.Id, ex.Agent.Value, SanitizedAgentDetail.FromRaw(ex.Reason).Value);
             await TransitionNoActionRequiredAsync(item, project, ex, CancellationToken.None);
+        }
+        catch (Exception ex) when (SandboxDeferralGuard.IsExecutionTransportLoss(ex))
+        {
+            // Transport-loss shapes that escaped a phase's own conversion —
+            // a raw SandboxExecutionUnavailableException from an audit/verification
+            // exec path, a flagged credential-file write, etc. The sandbox itself
+            // is gone, not the work: park for bounded transient retry under an
+            // infrastructure classification instead of writing a terminal
+            // failure and handing the clone to the repo reaper. The
+            // AgentInfrastructureFailureException catch above owns the wrapped
+            // variant; this clause is the backstop for unwrapped shapes.
+            await ParkForExecutionTransportLossAsync(
+                item, ex.Message, project, phase: null, item.Agent, "run");
         }
         catch (Exception ex)
         {

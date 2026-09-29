@@ -306,8 +306,32 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         _disposedSandboxAdmissions.Release(identity);
     }
 
-    public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
-        (_active ?? throw new NotSupportedException("The wrapped sandbox provider does not expose active sandboxes.")).Snapshot();
+    public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
+    {
+        var own = (_active ?? throw new NotSupportedException("The wrapped sandbox provider does not expose active sandboxes.")).Snapshot();
+        if (_inner is not IActiveSandboxProvider innerActive)
+            return own;
+
+        // A snapshot limited to this wrapper's own tracker under-reports live
+        // ownership whenever sandboxes were admitted through a sibling wrapper
+        // over the same inner provider — e.g. the placement path creating
+        // through a registry provider the reloadable router fronts. Shutdown
+        // teardown and leak-disposal re-verification consult this set to find
+        // every live work-phase binding, so union in the inner view, deduped
+        // by sandbox name.
+        var inner = innerActive.SnapshotActiveSandboxes();
+        if (inner.Count == 0)
+            return own;
+
+        var merged = new List<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)>(own.Count + inner.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in own.Concat(inner))
+        {
+            if (seen.Add(entry.Sandbox.Id))
+                merged.Add(entry);
+        }
+        return merged;
+    }
 
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() =>
         _progressProvider?.SnapshotActiveSandboxProgress() ?? [];

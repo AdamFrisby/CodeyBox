@@ -107,11 +107,9 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
-        ProviderEntry[] candidates;
-        lock (_lastListLock)
-        {
-            _lastReportedByName.TryGetValue(name, out candidates!);
-        }
+        var reporters = await RequireNotOwnedByLiveWorkAsync(name, hostId: null, ct).ConfigureAwait(false);
+
+        ProviderEntry[]? candidates = reporters.Length > 0 ? reporters : LastReportedCandidates(name);
 
         if (candidates is not { Length: > 0 })
         {
@@ -139,6 +137,8 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
             return;
         }
 
+        _ = await RequireNotOwnedByLiveWorkAsync(sandbox.Name, sandbox.HostId, ct).ConfigureAwait(false);
+
         var outerProviderId = sandbox.LifecycleProviderId;
         string? innerProviderId = null;
         if (TryDecodeNestedProviderId(
@@ -160,6 +160,87 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
         await provider.Lifecycle.DisposeLeakedAsync(
             sandbox with { LifecycleProviderId = innerProviderId },
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Destructive-disposal guard. The leak sweep's <c>IsTrackedActive</c> flag
+    /// is a snapshot of a per-provider in-memory registry that can silently
+    /// lose (or never gain) an entry, so it must not be the only thing
+    /// standing between a running agent and VM deletion. Before routing any
+    /// disposal this re-verifies the name against live phase/worker state:
+    /// every constituent lifecycle's active-work snapshot, plus a fresh
+    /// managed inventory where ANY provider reporting the name as
+    /// tracked-active vetoes the delete. Verification failures fail closed —
+    /// a provider that could not fully enumerate its inventory (e.g. an
+    /// unreachable executor host on a multi-host backend) also vetoes the
+    /// delete, since a partial view can hide the tracked-active entry that
+    /// proves the VM live. The sweep retries on its next pass rather than
+    /// deleting an unverifiable VM.
+    /// </summary>
+    /// <returns>
+    /// The lifecycles whose fresh inventory reported <paramref name="name"/> —
+    /// the same evidence the last sweep's reported-by-name map holds, but
+    /// current, so a caller that has not swept recently can still route.
+    /// </returns>
+    private async Task<ProviderEntry[]> RequireNotOwnedByLiveWorkAsync(string name, string? hostId, CancellationToken ct)
+    {
+        var liveNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var provider in _providers)
+        {
+            if (provider.Lifecycle is IActiveSandboxProvider active)
+            {
+                foreach (var entry in active.SnapshotActiveSandboxes())
+                    liveNames.Add(entry.Sandbox.Id);
+            }
+            if (provider.Lifecycle is IActiveSandboxProgressProvider progress)
+            {
+                foreach (var entry in progress.SnapshotActiveSandboxProgress())
+                    liveNames.Add(entry.SandboxId);
+            }
+        }
+        if (liveNames.Contains(name))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to dispose managed sandbox '{name}': a live work phase still owns it.");
+        }
+
+        var reporters = new List<ProviderEntry>();
+        foreach (var provider in _providers)
+        {
+            var inventory = await provider.Lifecycle.ListManagedInventoryAsync(ct).ConfigureAwait(false);
+            if (!inventory.IsComplete
+                && (hostId is null || !inventory.InventoriedHostIds.Contains(hostId)))
+            {
+                throw new InvalidOperationException(
+                    $"Refusing to dispose managed sandbox '{name}': provider '{provider.Id}' could not verify its full inventory.");
+            }
+            foreach (var info in inventory)
+            {
+                if (!string.Equals(info.Name, name, StringComparison.Ordinal))
+                    continue;
+                // One provider can legitimately list the same name more than
+                // once (e.g. the remote multipass provider keys active entries
+                // by (host, name)); dedupe so a single reporter cannot later
+                // read as "multiple providers" to the routing ambiguity check.
+                if (!reporters.Contains(provider))
+                    reporters.Add(provider);
+                if (info.IsTrackedActive
+                    && (hostId is null || string.Equals(info.HostId, hostId, StringComparison.Ordinal)))
+                {
+                    throw new InvalidOperationException(
+                        $"Refusing to dispose managed sandbox '{name}': provider '{provider.Id}' reports it tracked-active.");
+                }
+            }
+        }
+        return reporters.ToArray();
+    }
+
+    private ProviderEntry[]? LastReportedCandidates(string name)
+    {
+        lock (_lastListLock)
+        {
+            return _lastReportedByName.TryGetValue(name, out var candidates) ? candidates : null;
+        }
     }
 
     private static string EncodeNestedProviderId(string outerProviderId, string innerProviderId) =>

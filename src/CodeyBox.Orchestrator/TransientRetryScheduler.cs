@@ -630,8 +630,14 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
     }
 
     private static bool IsTransientRetryPending(WorkItem item) =>
-        string.Equals(item.FailureKind, "transient", StringComparison.OrdinalIgnoreCase)
-        && item.State is WorkItemState.WaitingForTransientRetry or WorkItemState.Failed;
+        item.State is WorkItemState.WaitingForTransientRetry or WorkItemState.Failed
+        && (string.Equals(item.FailureKind, "transient", StringComparison.OrdinalIgnoreCase)
+            // An infrastructure-classified park (severed sandbox execution
+            // transport) retries through the same bounded path. The state
+            // guard keeps terminal Failed+infrastructure rows — legacy or
+            // exhaustion-finalised — from re-entering the retry machinery.
+            || item.State == WorkItemState.WaitingForTransientRetry
+                && string.Equals(item.FailureKind, WorkItemFailureKinds.Infrastructure, StringComparison.OrdinalIgnoreCase));
 
     private TimeSpan ComputeTransientRetryDelay(
         int attemptOrdinal,

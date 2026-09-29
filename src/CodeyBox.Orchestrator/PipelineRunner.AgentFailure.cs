@@ -16,6 +16,43 @@ namespace CodeyBox.Orchestrator;
 // PipelineRunner.AgentFailure.cs — Agent-failure classification: transient/infrastructure/auth failure mapping and follow-up enqueue.
 public sealed partial class PipelineRunner
 {
+    /// <summary>
+    /// Parks an item whose sandbox execution transport was lost underneath
+    /// running work — the VM was destroyed (e.g. by the leak reaper), the host
+    /// crashed, or the exec channel died — for bounded transient retry under
+    /// an infrastructure classification. The work is not at fault and a fresh
+    /// sandbox reproduces a working environment; a terminal transition would
+    /// also hand the clone to the repo reaper immediately (grace applies only
+    /// to terminal rows), destroying the agent's working tree — the follow-on
+    /// damage observed when live VMs were deleted. Single decision+action
+    /// used by every catch boundary that recognizes the loss.
+    /// </summary>
+    /// <param name="operation">Dispatch-loop context label for the warning
+    /// log (e.g. "run", "check-and-act").</param>
+    private Task ParkForExecutionTransportLossAsync(
+        WorkItem item,
+        string error,
+        Project? project,
+        string? phase,
+        AgentKind? agent,
+        string operation)
+    {
+        _log.LogWarning(
+            "Work item {Id} {Operation} parking for retry because its sandbox execution transport was lost (agent {Agent}, phase {Phase}): {Reason}",
+            item.Id,
+            operation,
+            agent?.Value ?? "unknown",
+            phase ?? "unknown",
+            error);
+        return TransitionWaitingForTransientRetryAsync(
+            item,
+            error,
+            project,
+            phase,
+            agent,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+    }
+
     private void ThrowIfTransientAgentFailure(
         IAgentRunner runner,
         AgentResult result,
@@ -37,7 +74,11 @@ public sealed partial class PipelineRunner
             return;
 
         var detail = BuildAgentFailureDetail(messagePrefix, result, _opts.MaxFailureDetailBytes);
-        throw new AgentInfrastructureFailureException(runner.Kind, phase, detail);
+        throw new AgentInfrastructureFailureException(
+            runner.Kind,
+            phase,
+            detail,
+            executionUnavailable: result.ExecutionUnavailable);
     }
 
     private async Task ThrowIfAuthErrorAgentFailureAsync(

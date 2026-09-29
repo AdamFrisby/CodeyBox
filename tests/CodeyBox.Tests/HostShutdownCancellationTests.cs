@@ -196,7 +196,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
         var failed = await harness.Store.GetAsync(item.Id);
         Assert.NotNull(failed);
-        Assert.Equal(WorkItemState.Failed, failed.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, failed.State);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
         var durableRef = AssertDurableCheckpointRef(item.Id, failed.PreemptCheckpoint);
         var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(failed.AgentTurnResumeCheckpoint);
@@ -278,7 +278,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
         var failedRestore = await harness.Store.GetAsync(item.Id);
         Assert.NotNull(failedRestore);
-        Assert.Equal(WorkItemState.Failed, failedRestore!.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, failedRestore!.State);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, failedRestore.FailureKind);
         Assert.Equal(checkpointRef.Value, failedRestore.PreemptCheckpoint);
         var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(failedRestore.AgentTurnResumeCheckpoint);
@@ -417,7 +417,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
         var failed = await harness.Store.GetAsync(item.Id);
         Assert.NotNull(failed);
-        Assert.Equal(WorkItemState.Failed, failed.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, failed.State);
         var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(failed.AgentTurnResumeCheckpoint);
         Assert.Null(checkpoint.NativeSessionId);
 
@@ -456,7 +456,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
         var interrupted = await harness.Store.GetAsync(item.Id);
         Assert.NotNull(interrupted);
-        Assert.Equal(WorkItemState.Failed, interrupted!.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, interrupted!.State);
         Assert.False(string.IsNullOrWhiteSpace(interrupted.PreemptCheckpoint), interrupted.LastError);
         var checkpointRef = AssertDurableCheckpointRef(item.Id, interrupted.PreemptCheckpoint);
         Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
@@ -502,7 +502,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
         var interrupted = await harness.Store.GetAsync(item.Id);
         Assert.NotNull(interrupted);
-        Assert.Equal(WorkItemState.Failed, interrupted!.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, interrupted!.State);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, interrupted.FailureKind);
         Assert.False(string.IsNullOrWhiteSpace(interrupted.PreemptCheckpoint), interrupted.LastError);
         Assert.Equal(
@@ -597,7 +597,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
         var failed = await harness.Store.GetAsync(item.Id);
         Assert.NotNull(failed);
-        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, failed!.State);
         Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
         var checkpointRef = AssertDurableCheckpointRef(item.Id, failed.PreemptCheckpoint);
         Assert.NotNull(failed.AgentTurnResumeCheckpoint);

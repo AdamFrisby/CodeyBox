@@ -145,7 +145,18 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
         if (!IsValidManagedName(name, opts.NamePrefix))
             throw new ArgumentException($"Sprites sandbox name '{name}' is not a managed codeybox sandbox name.", nameof(name));
 
+        // Destructive sink guard, mirroring the Incus/Multipass providers: a
+        // name still tracked-active here belongs to a live phase in this
+        // process — never delete it, even if the sweep's inventory view
+        // disagreed. Rechecked after the delete so a name that became active
+        // mid-delete does not have its fresh tracking entry released.
+        if (_activeSandboxes.ContainsKey(name))
+            throw new InvalidOperationException($"Refusing to dispose Sprites sandbox '{name}' because it is tracked as active.");
+
         await _client.DeleteSpriteAsync(opts, name, ct).ConfigureAwait(false);
+
+        if (_activeSandboxes.ContainsKey(name))
+            throw new InvalidOperationException($"Refusing to release tracking for Sprites sandbox '{name}' because it became active during delete.");
         MarkNoLongerActive(name);
     }
 

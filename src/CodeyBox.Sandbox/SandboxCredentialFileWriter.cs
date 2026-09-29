@@ -594,7 +594,7 @@ public sealed record SandboxCredentialFileMaterialization(
     SandboxCredentialFileTarget Target,
     string? Contents);
 
-public sealed class SandboxCredentialFileWriteException : Exception
+public sealed class SandboxCredentialFileWriteException : Exception, IExecutionTransportLoss
 {
     public SandboxCredentialFileWriteException(
         string relativePath,

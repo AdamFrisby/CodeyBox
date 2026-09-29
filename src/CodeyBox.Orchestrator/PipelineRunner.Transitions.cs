@@ -615,7 +615,8 @@ public sealed partial class PipelineRunner
         string error,
         Project? project,
         string? phase,
-        AgentKind? agent)
+        AgentKind? agent,
+        string failureKind = "transient")
     {
         var ct = CancellationToken.None;
         var safeError = RedactAndTruncateAgentDetail(error);
@@ -653,7 +654,7 @@ public sealed partial class PipelineRunner
                 current.With(
                     WorkItemState.WaitingForTransientRetry,
                     safeError,
-                    failureKind: "transient")) with
+                    failureKind: failureKind)) with
             {
                 TransientRetryFrom = RetryFromForAgentTurnCheckpoint(current)
                     ?? RetryFromForTransientPhase(phase, current.State),

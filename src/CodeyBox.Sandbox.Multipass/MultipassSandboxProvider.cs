@@ -991,6 +991,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         // would escape _stagingRoot once Path.Combine resolves them.
         if (!IsValidSandboxName(name))
             throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
+        // Destructive sink guard, mirroring the Incus provider: the active
+        // registry is written before a VM becomes host-visible and multipass
+        // rejects duplicate names, so a name still tracked-active here belongs
+        // to a live phase in this process — never purge it. Rechecked adjacent
+        // to each destructive op so an inactive-to-active transition landing
+        // between the entry check and the delete still vetoes.
+        if (_activeSandboxNames.ContainsKey(name))
+            throw new InvalidOperationException("Refusing to dispose a Multipass sandbox tracked as active.");
 
         _log.LogInformation("SandboxLeakReaper: purging leaked VM {Name}", name);
 
@@ -1022,9 +1030,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             }
         }
 
+        if (_activeSandboxNames.ContainsKey(name))
+            throw new InvalidOperationException("Refusing to dispose a Multipass sandbox that became active.");
         var run = await RunAsync(opts, [opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: ct);
         if (run.ExitCode != 0)
             throw new InvalidOperationException($"multipass delete --purge {name} failed (exit {run.ExitCode}): {run.Stderr}");
+        if (_activeSandboxNames.ContainsKey(name))
+            throw new InvalidOperationException($"Multipass sandbox '{name}' became active after delete --purge; refusing to remove its staging directory.");
         // Clean up staging dir if it still exists.
         var stagingDir = Path.Combine(_stagingRoot, name);
         try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, recursive: true); }
@@ -1084,6 +1096,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             // A still-tracked-active VM means this very process created it during
             // the current boot — leave it alone, it is not stale.
             if (info.IsTrackedActive) continue;
+            // The list above is a snapshot: a VM that became active since it was
+            // taken is live work, not an orphan — skip rather than reporting it
+            // unrecoverable when DisposeLeakedAsync's sink guard refuses.
+            if (_activeSandboxNames.ContainsKey(info.Name)) continue;
 
             // Sample the VM state once so the audit event reports what actually
             // ran. ManagedSandboxInfo.IsSuspendLifecycleOrFrozen is true for

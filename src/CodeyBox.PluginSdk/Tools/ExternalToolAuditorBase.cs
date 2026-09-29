@@ -257,15 +257,18 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 .ConfigureAwait(false);
             var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
 
-            if (result.ExecutionUnavailable)
-                throw Unavailable(tool, "could not execute: the sandbox exec transport was unavailable", result);
-            if (result.ExitCode is CommandCannotExecuteExitCode or CommandNotFoundExitCode)
-                throw Unavailable(tool, "could not execute (exit 127/126 — binary missing or not executable in the sandbox)", result);
-            if (!options.FindingsExitCodes.Contains(result.ExitCode))
-                throw Unavailable(
-                    tool,
-                    $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
-                    result);
+        // A dead exec transport is infrastructure loss, not audit
+        // unavailability: propagate so the pipeline parks the item for retry
+        // instead of terminal-failing it.
+        if (result.ExecutionUnavailable)
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
+        if (result.ExitCode is CommandCannotExecuteExitCode or CommandNotFoundExitCode)
+            throw Unavailable(tool, "could not execute (exit 127/126 — binary missing or not executable in the sandbox)", result);
+        if (!options.FindingsExitCodes.Contains(result.ExitCode))
+            throw Unavailable(
+                tool,
+                $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
+                result);
 
             var parseInput = await ResolveParserInputAsync(
                     sandbox, workingDirectory, tool, options, result, scanRoot, ct)
@@ -343,9 +346,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
         var reason = purpose is null ? string.Empty : $" ({SingleLine(purpose)})";
         if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: binary '{binary}' presence check could not run: the sandbox exec "
-                + $"transport was unavailable.{reason}");
+            throw new SandboxExecutionUnavailableException(probe.ExitCode);
         if (probe.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: required binary '{binary}' is not installed in the audit sandbox."
@@ -482,8 +483,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
             ct).ConfigureAwait(false);
 
         var reported = (pin.VersionExtractor ?? ExtractToolVersion)(result.Stdout);
-        if (result.ExecutionUnavailable
-            || result.ExitCode != 0
+        if (result.ExecutionUnavailable)
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
+        if (result.ExitCode != 0
             || reported is null)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' version could not be determined "
@@ -554,9 +556,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             ct).ConfigureAwait(false);
 
         if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not run: the sandbox exec "
-                + "transport was unavailable.");
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-file "

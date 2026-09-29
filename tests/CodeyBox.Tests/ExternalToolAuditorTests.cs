@@ -290,9 +290,12 @@ public sealed class ExternalToolAuditorTests
         await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.ProbeAsync(failing, [".hiddenrc"], CancellationToken.None));
 
+        // A dead exec transport is infrastructure loss that must propagate to
+        // the pipeline's recoverable-retry park — not a terminal
+        // could-not-verify that hands the item's clone to the repo reaper.
         var unavailable = new FakeSandbox((exec, _) =>
             Task.FromResult(new SandboxExecResult(0, "", "", ExecutionUnavailable: true)));
-        await Assert.ThrowsAsync<AuditUnavailableException>(
+        await Assert.ThrowsAsync<SandboxExecutionUnavailableException>(
             () => auditor.ProbeAsync(unavailable, [".hiddenrc"], CancellationToken.None));
     }
 

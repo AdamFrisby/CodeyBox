@@ -198,7 +198,8 @@ public sealed partial class PipelineRunner
                         BuildAgentFailureDetail(
                             $"Agent {runner.Kind} exhausted native session recovery after sandbox execution became unavailable",
                             ex.LastResult,
-                            _opts.MaxFailureDetailBytes));
+                            _opts.MaxFailureDetailBytes),
+                        executionUnavailable: true);
                 }
 
                 var exitCode = AgentSuspendResilience.ParseAgentExitCode(ex.LastResult.Summary);

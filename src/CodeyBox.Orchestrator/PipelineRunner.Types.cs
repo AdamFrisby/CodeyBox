@@ -246,6 +246,17 @@ internal sealed record SuggestionWebhookDetails(
 
 public sealed record PipelineOptions
 {
+    /// <summary>
+    /// Shipped default for <see cref="PhaseAbsoluteTimeoutMultiplier"/>: each
+    /// phase's absolute wall-clock cap is its per-attempt timeout times this
+    /// multiplier. Shared with <see cref="SandboxLeakOptions.DefaultLeakAgeThreshold"/>:
+    /// the leak threshold must stay above the maximum legitimate phase
+    /// duration, so raising this default (or
+    /// <see cref="CodeyBox.Core.WorkTimeoutPolicy.MaxMinutes"/>) requires
+    /// re-checking that bound.
+    /// </summary>
+    public const double DefaultPhaseAbsoluteTimeoutMultiplier = 3.0;
+
     public required string SandboxImageReference { get; init; }
     public IReadOnlyList<string> AgentAllowedHosts { get; init; } = [];
     public IReadOnlyList<string> AuditToolAllowedHosts { get; init; } = [];
@@ -253,7 +264,7 @@ public sealed record PipelineOptions
     public TimeSpan UpstreamPushBackoff { get; init; } = TimeSpan.FromSeconds(15);
     public HostGitIdentity? HostGitIdentity { get; init; }
     public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
-    public double PhaseAbsoluteTimeoutMultiplier { get; init; } = 3.0;
+    public double PhaseAbsoluteTimeoutMultiplier { get; init; } = DefaultPhaseAbsoluteTimeoutMultiplier;
     /// <summary>
     /// Ceiling for the in-sandbox required-build work after the verifier
     /// sandbox has been created: repository clone, checkout, and build script.

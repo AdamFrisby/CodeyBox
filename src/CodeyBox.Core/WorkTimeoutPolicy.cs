@@ -41,7 +41,11 @@ public static class WorkTimeoutPolicy
     /// <summary>Lower bound in minutes for every configuration surface.</summary>
     public const int MinMinutes = 1;
 
-    /// <summary>Upper bound in minutes for every configuration surface.</summary>
+    /// <summary>Upper bound in minutes for every configuration surface. This also
+    /// bounds the longest legitimate phase duration (times the phase absolute-timeout
+    /// multiplier), from which the orchestrator's SandboxLeakOptions leak-age
+    /// threshold derives — raising this requires re-checking that threshold so a
+    /// mid-phase sandbox can never be declared abandoned.</summary>
     public const int MaxMinutes = 480;
 
     /// <summary>Clamps a configured minute value to <see cref="MinMinutes"/>..<see cref="MaxMinutes"/>.</summary>
