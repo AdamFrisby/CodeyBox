@@ -72,13 +72,36 @@ artifact `codeybox-test-selection-baseline/1`:
 }
 ```
 
-**Producer (operational):** the mandatory full-suite-on-`main` run — after
-every merge — collects per-test XPlat/Cobertura coverage, parses it with the
-same `CoberturaParser` executable-line semantics as the diff-scoped coverage
-gate (`tests:coverage`), normalises paths with `ToRepositoryRelative`, joins
-`dotnet sln` / project-reference graph data and `dotnet test --list-tests`
-enumeration (including each test's defining file), and writes this file. This
-ticket ships the CONSUMER only; it builds no new coverage tooling.
+**Producer (operational):** `tools/CodeyBox.TestSelectionBaseline` is the
+CLI an orchestrator job (and a human) runs against a checkout after every
+merge to `main`. It builds the tree, enumerates tests with `dotnet test
+--list-tests`, walks `dotnet sln` / `ProjectReference` edges, resolves each
+test's defining file from the portable PDB, then collects **per-test**
+coverage by running each listed test in isolation through the same
+coverlet collector the coverage gate uses:
+
+```
+dotnet test <project> --no-build --filter FullyQualifiedName=<test> \
+  --collect "XPlat Code Coverage" --results-directory <per-test-dir>
+```
+
+Each Cobertura document is parsed with `CoberturaParser` (executable-line
+semantics) and keyed with `CoberturaParser.ToRepositoryRelative` — the
+producer does not re-implement those. Only lines with a positive hit count
+enter that test's `covers` map; a listed test with no coverage record is
+still emitted, with an empty map, so the selector must-include it. Size
+caps (`MaxBaselineBytes`, `MaxBaselineTests`, `MaxBaselineCoveredLines`)
+are enforced on the fully assembled document; a cap miss fails loudly and
+never writes a truncated file.
+
+```bash
+dotnet run --project tools/CodeyBox.TestSelectionBaseline -- produce \
+  --repo /path/to/checkout \
+  --output /opt/codeybox/test-selection/baseline.json
+```
+
+Mechanism, licences, measured cost, and rejected alternatives:
+`tools/CodeyBox.TestSelectionBaseline/README.md`.
 
 **Distribution:** bake the file into the audit baseline image at the path
 above, OR fetch the CI artifact to that sandbox path at sandbox setup.

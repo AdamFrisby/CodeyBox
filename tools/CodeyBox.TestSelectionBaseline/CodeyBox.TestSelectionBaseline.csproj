@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CodeyBox.TestSelectionProducer</RootNamespace>
+    <AssemblyName>codeybox-test-selection-baseline</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeyBox.Audit\CodeyBox.Audit.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodeyBox.Tests" />
+  </ItemGroup>
+
+</Project>

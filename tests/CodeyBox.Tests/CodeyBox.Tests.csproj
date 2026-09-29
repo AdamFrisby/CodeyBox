@@ -179,6 +179,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.AdminSeed\CodeyBox.AdminSeed.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.ExploratoryTesting\CodeyBox.ExploratoryTesting.csproj" />
     <ProjectReference Include="..\..\tools\CodeyBox.Harness\CodeyBox.Harness.csproj" />
+    <ProjectReference Include="..\..\tools\CodeyBox.TestSelectionBaseline\CodeyBox.TestSelectionBaseline.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Notifications\CodeyBox.Notifications.csproj" />
     <ProjectReference Include="..\..\tools\CodeyBox.Admin\src\CodeyBox.Admin.Web\CodeyBox.Admin.Web.csproj" Aliases="CodeyBoxAdminWeb" />

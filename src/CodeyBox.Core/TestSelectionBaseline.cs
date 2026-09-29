@@ -24,15 +24,17 @@ public sealed record BaselineProjectGraph(
 
 /// <summary>
 /// Test-selection baseline consumed by the project-graph and coverage
-/// selectors. Produced from the mandatory full-suite-on-main run (per-test
-/// XPlat/Cobertura collection parsed with the same executable-line semantics
-/// as the diff-scoped coverage gate, plus <c>dotnet sln/project-reference</c>
-/// graph data and <c>dotnet test --list-tests</c> enumeration), stored as one
-/// JSON artifact.
+/// selectors. Produced by <c>tools/CodeyBox.TestSelectionBaseline</c> from a
+/// checkout (isolated per-test XPlat/Cobertura collection parsed with the
+/// same executable-line semantics as the diff-scoped coverage gate, plus
+/// <c>dotnet sln/project-reference</c> graph data and
+/// <c>dotnet test --list-tests</c> enumeration), stored as one JSON artifact.
 ///
-/// <para>DISTRIBUTION (see <c>docs/quality/test-selection.md</c>): the CI job
-/// that runs the full suite on <c>main</c> after every merge writes this file;
-/// operators EITHER bake it into the audit baseline image at
+/// <para>DISTRIBUTION (see <c>docs/quality/test-selection.md</c>): the
+/// <c>codeybox-test-selection-baseline</c> producer
+/// (<c>tools/CodeyBox.TestSelectionBaseline</c>) writes this file from a
+/// checkout after every merge to <c>main</c>; operators EITHER bake it into
+/// the audit baseline image at
 /// <c>/opt/codeybox/test-selection/baseline.json</c> OR fetch the artifact to
 /// that sandbox path at sandbox setup. The per-item shadow hook reads it from
 /// the sandbox. STALENESS BOUND: regeneration on every merge to main means the
