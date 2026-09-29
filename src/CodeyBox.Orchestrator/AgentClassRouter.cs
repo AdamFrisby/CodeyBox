@@ -2345,7 +2345,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, poolSnapshots, includeSingleMemberGroups: true, ct);
 
         if (policy == IntraKindRoutingPolicy.DeadlineAwareDrain)
-            return OrderDeadlineAwareDrain(sorted, precomputedQuotas, _time.GetUtcNow());
+            return OrderDeadlineAwareDrain(
+                sorted, precomputedQuotas, _time.GetUtcNow(),
+                await PrefetchMeasuredBurnsAsync(sorted, ct));
 
         var buckets = sorted
             .GroupBy(x => x.Member.Agent)
@@ -2399,15 +2401,39 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
     }
 
+    /// <summary>
+    /// Fetches the measured burn for each distinct subscription agent in
+    /// <paramref name="sorted"/> so the synchronous drain ordering can gate on
+    /// the same work-denominated floors dispatch applies. Empty when no
+    /// estimator is wired. The estimator caches per agent, so repeat passes
+    /// stay cheap.
+    /// </summary>
+    private async Task<Dictionary<AgentKind, AgentBurnEstimate>> PrefetchMeasuredBurnsAsync(
+        List<ScoredMember> sorted, CancellationToken ct)
+    {
+        var burns = new Dictionary<AgentKind, AgentBurnEstimate>();
+        if (_burnEstimator is null) return burns;
+        foreach (var entry in sorted)
+        {
+            var member = entry.Member;
+            if (member.Billing != AgentBilling.Subscription || burns.ContainsKey(member.Agent))
+                continue;
+            if (await GetMeasuredBurnAsync(member, ct) is { } burn)
+                burns[member.Agent] = burn;
+        }
+        return burns;
+    }
+
     private List<ScoredMember> OrderDeadlineAwareDrain(
         List<ScoredMember> sorted,
         Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
-        DateTimeOffset nowUtc)
+        DateTimeOffset nowUtc,
+        IReadOnlyDictionary<AgentKind, AgentBurnEstimate> measuredBurns)
     {
         var ranked = sorted
             .Select(entry =>
             {
-                var signal = ComputeDeadlineDrainSignal(entry.Member, precomputedQuotas, nowUtc);
+                var signal = ComputeDeadlineDrainSignal(entry.Member, precomputedQuotas, nowUtc, measuredBurns);
                 return new
                 {
                     Entry = entry,
@@ -2581,10 +2607,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // Skip unknown (probe failed / no data) and members above their
             // effective floor (they would be routable, so they don't need to
             // gate park-time). Use the same per-agent/window policy as dispatch
+            // — including measured burn so work-denominated floors compete —
             // so reset hints don't drift from the router's actual availability
             // decision.
             if (!quota.IsKnown) continue;
-            var gate = _quotaGatePolicy.Evaluate(member, quota, nowUtc);
+            var gate = _quotaGatePolicy.Evaluate(
+                member, quota, nowUtc, measuredBurn: await GetMeasuredBurnAsync(member, ct));
             if (gate.Allow) continue;
             var resetAt = QuotaGatePolicy.ResolveResetHint(quota, gate);
             if (string.IsNullOrEmpty(gate.WindowName)
@@ -2763,7 +2791,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private DeadlineDrainSignal ComputeDeadlineDrainSignal(
         AgentMembership member,
         Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
-        DateTimeOffset nowUtc)
+        DateTimeOffset nowUtc,
+        IReadOnlyDictionary<AgentKind, AgentBurnEstimate> measuredBurns)
     {
         if (member.Billing != AgentBilling.Subscription)
             return DeadlineDrainSignal.None;
@@ -2790,7 +2819,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (hoursToReset <= 0 || double.IsNaN(hoursToReset) || double.IsInfinity(hoursToReset))
             return DeadlineDrainSignal.None;
 
-        var floor = QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc);
+        // Same work-denominated floors as dispatch: an items floor must shrink
+        // the drainable headroom exactly as it does the commit-time gate.
+        var floor = QuotaGatePolicy.ComputeFloorPct(
+            _opts, member, quota, nowUtc,
+            measuredBurns.TryGetValue(member.Agent, out var burn) ? burn : null);
         var headroom = Math.Max(0.0, quota.AvailablePct - floor);
         if (headroom <= 0)
             return DeadlineDrainSignal.None;
@@ -3030,7 +3063,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         {
             return await _burnEstimator.GetEstimateAsync(member.Agent, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogDebug(ex,
                 "Quota burn: estimator threw for {Agent}; using configured estimates",
@@ -3064,7 +3097,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         AgentBurnEstimate estimate;
         try { estimate = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(ex,
                 "Rate-aware gate: burn estimator threw for {Agent}; treating as no-data fallback",
@@ -3132,7 +3165,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
             AgentBurnEstimate est;
             try { est = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
-            catch
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 est = new AgentBurnEstimate
                 {
@@ -3403,10 +3436,14 @@ public sealed record EffectiveQuota(
 
     /// <summary>
     /// Name of the binding window: the known window with the least remaining
-    /// availability, i.e. the window that produced <see cref="AvailablePct"/>.
-    /// Null when the quota carries no per-window readings. Pure.
+    /// availability, reported only when that window's reading equals
+    /// <see cref="AvailablePct"/>. Null when the quota carries no per-window
+    /// readings or when the aggregate came from a non-window source (a
+    /// per-model fallback to account windows, the "auto" best-model pick, or a
+    /// budget composite) — naming a window that did not produce the reading
+    /// would misreport the constraint. Pure.
     /// </summary>
-    public string? BindingWindow => QuotaWindowBinding.ResolveBindingWindow(Windows);
+    public string? BindingWindow => QuotaWindowBinding.ResolveBindingWindow(Windows, AvailablePct);
 }
 
 /// <summary>
@@ -3804,8 +3841,8 @@ public sealed class QuotaRouterOptions
 
     /// <summary>
     /// Per-agent override for <see cref="DispatchReservationEstimateItems"/>,
-    /// keyed by <see cref="AgentKind.Value"/>. Non-positive entries are ignored.
-    /// Hot-reloadable.
+    /// keyed by <see cref="AgentKind.Value"/>. Non-positive or non-finite
+    /// entries are rejected at load. Hot-reloadable.
     /// </summary>
     public Dictionary<string, double> DispatchReservationEstimateItemsByAgent { get; set; }
         = new(StringComparer.OrdinalIgnoreCase);

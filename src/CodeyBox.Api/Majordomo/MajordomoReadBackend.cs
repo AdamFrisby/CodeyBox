@@ -236,7 +236,12 @@ internal sealed class MajordomoReadBackend
             var recentFailure = _quotaFailures is not null
                 && await _quotaFailures.HasRecentAsync(
                     member.Agent, member.ModelId, _quotaOptions.ObservedFailureWindow, now, ct).ConfigureAwait(false);
-            if (_quotaGate.Allows(member, snapshot, now, recentFailure))
+            var gateVerdict = await _quotaGate.EvaluateAsync(
+                    member, snapshot, now,
+                    recentObservedFailure: recentFailure,
+                    observedFailureReason: null, ct)
+                .ConfigureAwait(false);
+            if (gateVerdict.Allow)
             {
                 allBlocked = false;
                 break;

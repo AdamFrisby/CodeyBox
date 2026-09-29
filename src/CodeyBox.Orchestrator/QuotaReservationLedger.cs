@@ -184,18 +184,19 @@ public sealed class QuotaReservationLedger
 
     /// <summary>
     /// Resolves the reservation estimate for one dispatch, in quota-percentage
-    /// points, honouring the same tier order as the legacy percentage chain —
-    /// pool override &gt; explicit override &gt; per-agent &gt; global — with
-    /// two work-denominated additions: within the pool, agent, and global
-    /// tiers an items quantity (converted through measured burn) applies when
-    /// no percentage is configured at that tier, and the measured burn (with
-    /// the safety multiplier) displaces only the unconfigured global default.
-    /// Any explicitly configured tier therefore still wins over the derived
-    /// value, and with no measured history the result is identical to the
-    /// legacy chain. The winning estimate is clamped to
-    /// [<c>DispatchReservationMinPct</c>, <c>DispatchReservationMaxPct</c>].
-    /// Depleting-balance pools resolve exactly as before (their estimate is
-    /// already absolute; items quantities never apply to them). Pure.
+    /// points, honouring the configured tier order — pool override &gt;
+    /// explicit override &gt; per-agent &gt; global — with two
+    /// work-denominated additions: within the pool, agent, and global tiers an
+    /// items quantity (converted through measured burn) applies when no
+    /// percentage is configured at that tier, and the measured burn (with the
+    /// safety multiplier) displaces only the unconfigured global default. Any
+    /// explicitly configured tier therefore still wins over the derived value,
+    /// and with no measured history the result is identical to a plain
+    /// percentage chain. The winning estimate is clamped to
+    /// [<c>DispatchReservationMinPct</c>, <c>DispatchReservationMaxPct</c>]
+    /// via <see cref="ResolveEstimatePct"/>. Depleting-balance pools resolve
+    /// exactly as before (their estimate is already absolute; items
+    /// quantities never apply to them). Pure.
     /// </summary>
     public static QuotaReservationResolution ResolveEstimate(
         QuotaRouterOptions options,
@@ -217,6 +218,12 @@ public sealed class QuotaReservationLedger
                     && poolOverride > 0
                     ? poolOverride
                     : pool.ReservationEstimate;
+                // Absolute balance scales vary per provider, so the
+                // percentage-denominated min/max clamps are meaningless here:
+                // enforce positivity only. A missing/non-positive estimate
+                // falls back to the global estimate interpreted in the pool's
+                // native unit — balance pools should set ReservationEstimate
+                // explicitly in absolute units.
                 var candidate = poolRaw is { } r && double.IsFinite(r) && r > 0
                     ? r
                     : options.DispatchReservationEstimatePct;
@@ -269,32 +276,23 @@ public sealed class QuotaReservationLedger
             options.DispatchReservationEstimatePct,
             QuotaReservationEstimateSource.GlobalEstimate,
             options,
-            measuredBurn,
-            fallbackToBounds: true);
+            measuredBurn);
     }
 
     private static QuotaReservationResolution ClampResolution(
         double candidate,
         QuotaReservationEstimateSource source,
         QuotaRouterOptions options,
-        AgentBurnEstimate? measuredBurn,
-        bool fallbackToBounds = false)
-    {
-        var lo = Math.Min(options.DispatchReservationMinPct, options.DispatchReservationMaxPct);
-        var hi = Math.Max(options.DispatchReservationMinPct, options.DispatchReservationMaxPct);
-        var value = candidate;
-        if (!double.IsFinite(value) || value <= 0)
-        {
-            if (!fallbackToBounds)
-                value = options.DispatchReservationEstimatePct;
-            if (!double.IsFinite(value) || value <= 0)
-                value = lo > 0 ? lo : hi;
-        }
-        if (!double.IsFinite(value) || value <= 0)
-            return new QuotaReservationResolution(0, source, measuredBurn?.AvgBurnPctPerItem, measuredBurn?.SampleCount ?? 0);
-        return new QuotaReservationResolution(
-            Math.Clamp(value, lo, hi), source, measuredBurn?.AvgBurnPctPerItem, measuredBurn?.SampleCount ?? 0);
-    }
+        AgentBurnEstimate? measuredBurn) =>
+        new(
+            ResolveEstimatePct(
+                candidate,
+                options.DispatchReservationEstimatePct,
+                options.DispatchReservationMinPct,
+                options.DispatchReservationMaxPct),
+            source,
+            measuredBurn?.AvgBurnPctPerItem,
+            measuredBurn?.SampleCount ?? 0);
 
     /// <summary>
     /// Converts persisted per-item usage into quota-percentage points against
@@ -351,8 +349,6 @@ public sealed class QuotaReservationLedger
         var key = ResolveKey(member);
         var resolution = ResolveEstimate(_options, member, estimatePctOverride, measuredBurn);
         var estimate = resolution.EstimatePct;
-        var bindingSuffix = FormatBindingSuffix(bindingWindow);
-        var estimateDetail = FormatEstimateDetail(resolution, _options);
         QuotaReservationAttempt attempt;
         var reserved = false;
         lock (_sync)
@@ -361,6 +357,10 @@ public sealed class QuotaReservationLedger
             var effective = EffectiveAvailablePct(availablePct, outstanding);
             if (!MeetsFloor(effective - estimate, floorPct))
             {
+                // Refusal-only detail strings (sanitised window name, estimate
+                // provenance) stay off the allowed hot path.
+                var estimateDetail = FormatEstimateDetail(resolution, _options);
+                var bindingSuffix = FormatBindingSuffix(bindingWindow);
                 attempt = new QuotaReservationAttempt(
                     false, null, outstanding, effective,
                     $"quota reservation of {estimate:F1}%{estimateDetail} would breach floor ({effective - estimate:F1}% < {floorPct:F1}%; {outstanding:F1}% already escrowed{bindingSuffix})");
@@ -389,12 +389,22 @@ public sealed class QuotaReservationLedger
     private static string FormatEstimateDetail(
         QuotaReservationResolution resolution, QuotaRouterOptions options)
     {
-        if (resolution.Source == QuotaReservationEstimateSource.MeasuredBurn
-            && resolution.MeasuredBurnPctPerItem is { } burn
-            && double.IsFinite(burn)
-            && burn > 0)
-            return $" (measured burn {burn:F1}% x{options.DispatchReservationBurnMultiplier:F1}, {resolution.MeasuredSamples} samples)";
-        return string.Empty;
+        // Surface the estimate's provenance so a denial that came from
+        // measured history is distinguishable from a hand-tuned constant.
+        if (resolution.MeasuredBurnPctPerItem is not { } burn
+            || !double.IsFinite(burn)
+            || burn <= 0)
+            return string.Empty;
+        return resolution.Source switch
+        {
+            QuotaReservationEstimateSource.MeasuredBurn =>
+                $" (measured burn {burn:F1}% x{options.DispatchReservationBurnMultiplier:F1}, {resolution.MeasuredSamples} samples)",
+            QuotaReservationEstimateSource.PoolItemsEstimate
+                or QuotaReservationEstimateSource.AgentItemsEstimate
+                or QuotaReservationEstimateSource.GlobalItemsEstimate =>
+                $" (items estimate via measured burn {burn:F1}%/item, {resolution.MeasuredSamples} samples)",
+            _ => string.Empty,
+        };
     }
 
     private static string FormatBindingSuffix(string? bindingWindow)

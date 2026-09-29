@@ -156,7 +156,7 @@ stats workload never competes for the orchestrator's hot-path write gate.
 | `agent` | TEXT | Probe `Kind` value (e.g. `claude`). |
 | `model_id` | TEXT NULL | Set when the row is a per-model expansion. |
 | `overall_pct` | REAL | Either the snapshot's aggregated `AvailablePct`, or the per-model `AvailablePct` for model rows. |
-| `would_allow` | INTEGER | Result of `IAgentQuotaGate.Allows` at sample time. |
+| `would_allow` | INTEGER | `IAgentQuotaGate.EvaluateAsync`'s `Allow` verdict at sample time. |
 | `notes` | TEXT NULL | Mirrors `AgentQuotaSnapshot.Notes`. |
 | `window_name` | TEXT NULL | NULL for the aggregated row; provider window name (e.g. `five_hour`) otherwise. |
 | `window_pct` | REAL NULL | Per-window `AvailablePct`. |

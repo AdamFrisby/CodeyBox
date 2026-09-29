@@ -142,7 +142,8 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
                 continue;
             }
 
-            if (!await _quotaGate.AllowsAsync(member, snapshot, nowUtc, ct).ConfigureAwait(false))
+            var gateVerdict = await _quotaGate.EvaluateAsync(member, snapshot, nowUtc, ct).ConfigureAwait(false);
+            if (!gateVerdict.Allow)
             {
                 var resetAt = ResolveResetHint(snapshot, member);
                 _publisher.RecordQuotaUsability(

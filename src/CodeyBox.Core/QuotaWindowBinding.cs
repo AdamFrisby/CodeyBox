@@ -16,6 +16,9 @@ public static class QuotaWindowBinding
     /// <summary>Maximum characters of a window name rendered into a summary.</summary>
     public const int MaxWindowNameLength = 64;
 
+    /// <summary>Window name rendered when the provider's name sanitizes to nothing usable.</summary>
+    public const string FallbackWindowName = "window";
+
     /// <summary>
     /// Sanitizes a provider-derived window name for safe rendering into log
     /// lines and DTO text. Provider tokens are untrusted input: a hostile or
@@ -26,14 +29,13 @@ public static class QuotaWindowBinding
     /// are ASCII letters, digits, <c>_</c>, and <c>-</c>; anything else becomes
     /// <c>_</c>. The result is then truncated to
     /// <see cref="MaxWindowNameLength"/> characters. Names that sanitize to
-    /// empty fall back to <c>window</c> so callers never render empty quotes.
-    /// Pure.
+    /// empty fall back to <see cref="FallbackWindowName"/> so callers never
+    /// render empty quotes. Pure.
     /// </summary>
     public static string SanitizeWindowName(string? name)
     {
-        if (string.IsNullOrWhiteSpace(name)) return "window";
+        if (string.IsNullOrWhiteSpace(name)) return FallbackWindowName;
         var trimmed = name.Trim();
-        if (trimmed.Length == 0) return "window";
         var chars = new char[trimmed.Length];
         for (var i = 0; i < trimmed.Length; i++)
         {
@@ -46,22 +48,47 @@ public static class QuotaWindowBinding
         }
         var sanitized = new string(chars);
         if (sanitized.Length > MaxWindowNameLength) sanitized = sanitized[..MaxWindowNameLength];
-        return sanitized.Length == 0 ? "window" : sanitized;
+        return sanitized;
     }
 
     /// <summary>
-    /// Returns the name of the known window with the least remaining
+    /// Returns the sanitized name of the known window with the least remaining
     /// availability, or null when no window carries a usable reading.
     /// Windows with unknown readings (negative) never bind. Ties resolve to
     /// the first scarcest window in probe order so the answer is
-    /// deterministic for a given snapshot. The returned name is sanitized via
-    /// <see cref="SanitizeWindowName"/> so it is safe to render into log lines
-    /// and DTO text. Pure.
+    /// deterministic for a given snapshot. Pure.
     /// </summary>
-    public static string? ResolveBindingWindow(IReadOnlyList<WindowQuota>? windows)
+    public static string? ResolveBindingWindow(IReadOnlyList<WindowQuota>? windows) =>
+        FindBindingWindow(windows) is { } binding
+            ? SanitizeWindowName(binding.Name)
+            : null;
+
+    /// <summary>
+    /// Returns the sanitized name of the binding window, but only when that
+    /// window's reading IS <paramref name="producedPct"/>: the aggregate
+    /// reading. Probes aggregate via the minimum, so equality pins which
+    /// window produced the aggregate; when the aggregate came from elsewhere
+    /// (a per-model fallback, a budget composite) the result is null rather
+    /// than a name that did not gate it. Pure.
+    /// </summary>
+    public static string? ResolveBindingWindow(
+        IReadOnlyList<WindowQuota>? windows, double producedPct)
     {
-        if (windows is null || windows.Count == 0) return null;
-        string? binding = null;
+        var binding = FindBindingWindow(windows);
+        return binding is not null && binding.AvailablePct == producedPct
+            ? SanitizeWindowName(binding.Name)
+            : null;
+    }
+
+    /// <summary>
+    /// The known window with the least remaining availability, or null when no
+    /// window carries a usable reading. Ties resolve to the first scarcest
+    /// window in probe order. Pure.
+    /// </summary>
+    private static WindowQuota? FindBindingWindow(IReadOnlyList<WindowQuota>? windows)
+    {
+        if (windows is null) return null;
+        WindowQuota? binding = null;
         var best = double.PositiveInfinity;
         foreach (var window in windows)
         {
@@ -71,10 +98,10 @@ public static class QuotaWindowBinding
             if (available < best)
             {
                 best = available;
-                binding = window.Name;
+                binding = window;
             }
         }
-        return binding is null ? null : SanitizeWindowName(binding);
+        return binding;
     }
 
     /// <summary>
@@ -90,6 +117,11 @@ public static class QuotaWindowBinding
     {
         if (windows is null || windows.Count == 0) return null;
         var known = new List<WindowQuota>(windows.Count);
+        // Resolve the binding window BEFORE sorting: the probe-ordered list
+        // keeps the deterministic first-scarcest tie-break, and marking by
+        // reference avoids double-marking when two raw names sanitize to the
+        // same string.
+        var binding = FindBindingWindow(windows);
         foreach (var window in windows)
         {
             if (window is null || string.IsNullOrWhiteSpace(window.Name)) continue;
@@ -98,13 +130,12 @@ public static class QuotaWindowBinding
         }
         if (known.Count == 0) return null;
         known.Sort(static (a, b) => a.AvailablePct.CompareTo(b.AvailablePct));
-        var binding = ResolveBindingWindow(known);
         var parts = new List<string>(Math.Min(known.Count, MaxSummaryWindows));
         foreach (var window in known)
         {
             if (parts.Count >= MaxSummaryWindows) break;
             var name = SanitizeWindowName(window.Name);
-            var marker = string.Equals(name, binding, StringComparison.Ordinal) ? " (binding)" : string.Empty;
+            var marker = ReferenceEquals(window, binding) ? " (binding)" : string.Empty;
             parts.Add($"{name} {window.AvailablePct:F1}%{marker}");
         }
         return string.Join(", ", parts);

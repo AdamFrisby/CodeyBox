@@ -1664,7 +1664,9 @@ builder.Services.AddSingleton<QuotaGatePolicy>(sp =>
 builder.Services.AddSingleton<IAgentQuotaGate>(sp => new QuotaGateAvailability(
     sp.GetRequiredService<QuotaGatePolicy>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRouterOptions>().ObservedFailureWindow));
+    sp.GetRequiredService<QuotaRouterOptions>().ObservedFailureWindow,
+    sp.GetService<IAgentBurnEstimator>(),
+    sp.GetRequiredService<ILogger<QuotaGateAvailability>>()));
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -4914,28 +4916,41 @@ app.MapGet("/quota", async (
             .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        bool WouldAllow(AgentMembership gateMember, bool hasRecentFailure) =>
-            quotaGate.Allows(
+        Task<AgentQuotaGateVerdict> EvaluateGateAsync(
+            AgentMembership gateMember, bool hasRecentFailure) =>
+            quotaGate.EvaluateAsync(
                 gateMember,
                 snapshot,
                 now,
                 hasRecentFailure,
-                "recent observed quota failure");
-        string? RefusalReason(AgentMembership gateMember, bool hasRecentFailure) =>
-            quotaGate.GetRefusalReason(
-                gateMember,
-                snapshot,
-                now,
-                hasRecentFailure,
-                "recent observed quota failure");
+                "recent observed quota failure",
+                ct);
         var defaultMember = member with { ModelId = null };
         // Refused members surface WHY, including which quota window binds, so
         // a plan with weekly headroom but an exhausted monthly window reads as
         // constrained-by-monthly instead of generically out of quota. Allowed
-        // members keep a null reason, as before.
+        // members keep a null reason, as before. The allow bit and the reason
+        // come from ONE verdict so they cannot diverge.
+        var defaultVerdict = paused ? null : await EvaluateGateAsync(defaultMember, recentFailure);
+        var defaultModelVerdict = paused ? null : await EvaluateGateAsync(defaultMember, recentDefaultFailure);
         var dispatchReason = paused
             ? $"paused by operator: {pause?.PausedReason}"
-            : RefusalReason(defaultMember, recentFailure);
+            : defaultVerdict?.RefusalReason;
+        var perModelWouldAllow = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var modelId in modelKeys)
+        {
+            if (paused)
+            {
+                perModelWouldAllow[modelId] = false;
+                continue;
+            }
+            var modelMember = member with { ModelId = modelId };
+            var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
+                f.Agent == member.Agent &&
+                string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
+            perModelWouldAllow[modelId] =
+                (await EvaluateGateAsync(modelMember, modelHasRecentFailure)).Allow;
+        }
         snapshots.Add(new
         {
             agent = member.Agent.Value,
@@ -4969,20 +4984,9 @@ app.MapGet("/quota", async (
             dispatchReason,
             bindingWindow = snapshot.BindingWindow,
             windowSummary = QuotaWindowBinding.FormatWindowSummary(snapshot.Windows),
-            wouldAllow = dispatchReason is null,
-            defaultModelWouldAllow = paused ? false : RefusalReason(defaultMember, recentDefaultFailure) is null,
-            perModelWouldAllow = modelKeys.ToDictionary(
-                modelId => modelId,
-                modelId =>
-                {
-                    if (paused) return false;
-                    var modelMember = member with { ModelId = modelId };
-                    var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
-                        f.Agent == member.Agent &&
-                        string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
-                    return WouldAllow(modelMember, modelHasRecentFailure);
-                },
-                StringComparer.OrdinalIgnoreCase),
+            wouldAllow = defaultVerdict?.Allow ?? false,
+            defaultModelWouldAllow = defaultModelVerdict?.Allow ?? false,
+            perModelWouldAllow,
         });
         kindAggregateCounts[member.Agent.Value] =
             kindAggregateCounts.TryGetValue(member.Agent.Value, out var count) ? count + 1 : 1;
@@ -7894,8 +7898,8 @@ namespace CodeyBox.Api
         public double? DispatchReservationEstimateItems { get; set; }
         /// <summary>
         /// Per-agent override for <see cref="DispatchReservationEstimateItems"/>,
-        /// keyed by agent kind value. Non-positive entries are ignored.
-        /// Hot-reloadable.
+        /// keyed by agent kind value. Non-positive or non-finite entries are
+        /// rejected at load. Hot-reloadable.
         /// </summary>
         public Dictionary<string, double> DispatchReservationEstimateItemsByAgent { get; set; }
             = new(StringComparer.OrdinalIgnoreCase);

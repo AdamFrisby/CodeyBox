@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
@@ -29,8 +30,9 @@ public sealed class QuotaGatePolicy
         EffectiveQuota quota,
         DateTimeOffset nowUtc,
         bool recentObservedFailure = false,
-        string? observedFailureReason = null) =>
-        Evaluate(_options, member, quota, nowUtc, recentObservedFailure, observedFailureReason);
+        string? observedFailureReason = null,
+        AgentBurnEstimate? measuredBurn = null) =>
+        Evaluate(_options, member, quota, nowUtc, 0, recentObservedFailure, observedFailureReason, measuredBurn);
 
     /// <summary>
     /// Escrow-aware evaluation: gates on
@@ -75,8 +77,9 @@ public sealed class QuotaGatePolicy
         EffectiveQuota quota,
         DateTimeOffset nowUtc,
         bool recentObservedFailure = false,
-        string? observedFailureReason = null) =>
-        Evaluate(options, member, quota, nowUtc, 0, recentObservedFailure, observedFailureReason);
+        string? observedFailureReason = null,
+        AgentBurnEstimate? measuredBurn = null) =>
+        Evaluate(options, member, quota, nowUtc, 0, recentObservedFailure, observedFailureReason, measuredBurn);
 
     /// <summary>
     /// Escrow-aware static evaluation; see the instance overload for the
@@ -187,20 +190,20 @@ public sealed class QuotaGatePolicy
         string? poolName,
         AgentBurnEstimate? measuredBurn = null)
     {
+        var bindingWindow = quota.BindingWindow;
         if (recentObservedFailure)
         {
             return new QuotaGateDecision(
                 false,
                 observedFailureReason ?? "recent observed quota failure",
                 PoolId: poolName,
-                BindingWindow: quota.BindingWindow);
+                BindingWindow: bindingWindow);
         }
 
         var floor = ComputeFloorPct(options, member, quota, nowUtc, measuredBurn);
         var availablePct = quota.AvailablePct;
         var escrowed = Math.Max(0, outstandingPct);
         var effectivePct = availablePct - escrowed;
-        var bindingWindow = quota.BindingWindow;
         // The floor comparison only admits real readings: an unknown snapshot
         // (AvailablePct < 0) must always fall through to the unknown branch
         // below, even if a misconfigured floor sits below zero.
@@ -222,7 +225,7 @@ public sealed class QuotaGatePolicy
                             windowFloor,
                             safeWindowName,
                             PoolId: poolName,
-                            BindingWindow: quota.BindingWindow);
+                            BindingWindow: bindingWindow);
                     }
                 }
             }
@@ -267,9 +270,13 @@ public sealed class QuotaGatePolicy
     /// <summary>
     /// Renders the binding-window suffix for aggregate-floor refusals from the
     /// quota's per-window readings, e.g.
-    /// <c>; monthly 6.0% (binding), weekly 98.0%, rolling 100.0%</c>. Empty
-    /// when the quota carries no binding window, so single-window providers
-    /// keep today's reason text byte-for-byte. Pure.
+    /// <c>; monthly 6.0% (binding), weekly 98.0%, rolling 100.0%</c>.
+    /// <paramref name="bindingWindow"/> is the provenance-checked name (null
+    /// when the aggregate reading did not come from a window), so the guard
+    /// also suppresses the summary when no window produced the reading —
+    /// claiming a binding window there would misname the constraint. Empty
+    /// too when the quota carries no usable window readings, so single-window
+    /// providers keep today's reason text byte-for-byte. Pure.
     /// </summary>
     private static string FormatBindingSuffix(
         IReadOnlyList<WindowQuota>? windows, string? bindingWindow)
@@ -656,6 +663,8 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
     private readonly QuotaGatePolicy _policy;
     private readonly IQuotaFailureStore? _failureStore;
     private readonly TimeSpan _observedFailureWindow;
+    private readonly IAgentBurnEstimator? _burnEstimator;
+    private readonly ILogger<QuotaGateAvailability>? _log;
 
     public QuotaGateAvailability(QuotaGatePolicy policy)
         : this(policy, failureStore: null, observedFailureWindow: TimeSpan.Zero) { }
@@ -663,54 +672,32 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
     public QuotaGateAvailability(
         QuotaGatePolicy policy,
         IQuotaFailureStore? failureStore,
-        TimeSpan observedFailureWindow)
+        TimeSpan observedFailureWindow,
+        IAgentBurnEstimator? burnEstimator = null,
+        ILogger<QuotaGateAvailability>? log = null)
     {
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _failureStore = failureStore;
         _observedFailureWindow = observedFailureWindow;
+        _burnEstimator = burnEstimator;
+        _log = log;
     }
 
-    public bool Allows(
-        AgentMembership member,
-        AgentQuotaSnapshot snapshot,
-        DateTimeOffset nowUtc,
-        bool recentObservedFailure = false,
-        string? observedFailureReason = null) =>
-        GetDecision(member, snapshot, nowUtc, recentObservedFailure, observedFailureReason).Allow;
-
-    /// <summary>
-    /// Refusal reason for the same decision <see cref="Allows"/> reports, or
-    /// null when the gate allows. Backs the <c>/quota</c> status surface so a
-    /// refused member's <c>dispatchReason</c> names the binding window.
-    /// </summary>
-    public string? GetRefusalReason(
-        AgentMembership member,
-        AgentQuotaSnapshot snapshot,
-        DateTimeOffset nowUtc,
-        bool recentObservedFailure = false,
-        string? observedFailureReason = null)
-    {
-        var decision = GetDecision(member, snapshot, nowUtc, recentObservedFailure, observedFailureReason);
-        return decision.Allow ? null : decision.Reason;
-    }
-
-    private QuotaGateDecision GetDecision(
+    /// <inheritdoc cref="IAgentQuotaGate.EvaluateAsync(AgentMembership, AgentQuotaSnapshot, DateTimeOffset, bool, string?, CancellationToken)"/>
+    public Task<AgentQuotaGateVerdict> EvaluateAsync(
         AgentMembership member,
         AgentQuotaSnapshot snapshot,
         DateTimeOffset nowUtc,
         bool recentObservedFailure,
-        string? observedFailureReason)
+        string? observedFailureReason,
+        CancellationToken ct = default)
     {
         var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
-        return _policy.Evaluate(
-            member,
-            quota,
-            nowUtc,
-            recentObservedFailure,
-            observedFailureReason);
+        return EvaluateCoreAsync(member, quota, nowUtc, recentObservedFailure, observedFailureReason, ct);
     }
 
-    public async Task<bool> AllowsAsync(
+    /// <inheritdoc cref="IAgentQuotaGate.EvaluateAsync(AgentMembership, AgentQuotaSnapshot, DateTimeOffset, CancellationToken)"/>
+    public async Task<AgentQuotaGateVerdict> EvaluateAsync(
         AgentMembership member,
         AgentQuotaSnapshot snapshot,
         DateTimeOffset nowUtc,
@@ -727,10 +714,11 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
         if (_failureStore is not null
             && _observedFailureWindow > TimeSpan.Zero
             && !quota.IsKnown
+            && !quota.IsBalanceKnown
             && _policy.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures)
         {
             var observedAt = await _failureStore.GetMostRecentAsync(
-                member.Agent, member.ModelId, _observedFailureWindow, nowUtc, ct);
+                member.Agent, member.ModelId, _observedFailureWindow, nowUtc, ct).ConfigureAwait(false);
             if (observedAt is { } seenAt)
             {
                 recentObservedFailure = true;
@@ -738,7 +726,58 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
             }
         }
 
-        return _policy.Evaluate(member, quota, nowUtc, recentObservedFailure, observedFailureReason).Allow;
+        return await EvaluateCoreAsync(
+            member, quota, nowUtc, recentObservedFailure, observedFailureReason, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Single evaluation producing the allow bit and refusal reason together.
+    /// The member's measured burn is fetched so work-denominated floors
+    /// (items) compete with the percentage floor on this advisory surface
+    /// exactly as they do on the dispatch path — without history the
+    /// percentage floor applies unchanged.
+    /// </summary>
+    private async Task<AgentQuotaGateVerdict> EvaluateCoreAsync(
+        AgentMembership member,
+        EffectiveQuota quota,
+        DateTimeOffset nowUtc,
+        bool recentObservedFailure,
+        string? observedFailureReason,
+        CancellationToken ct)
+    {
+        var measuredBurn = await GetMeasuredBurnAsync(member, ct).ConfigureAwait(false);
+        var decision = _policy.Evaluate(
+            member,
+            quota,
+            nowUtc,
+            recentObservedFailure,
+            observedFailureReason,
+            measuredBurn);
+        return new AgentQuotaGateVerdict(decision.Allow, decision.Allow ? null : decision.Reason);
+    }
+
+    /// <summary>
+    /// Same estimator fetch the dispatch router's GetMeasuredBurnAsync does:
+    /// null when no estimator is wired or it throws (the percentage chain then
+    /// applies unchanged), cancellation propagates. The estimator caches per
+    /// agent, so repeated status calls stay cheap.
+    /// </summary>
+    private async Task<AgentBurnEstimate?> GetMeasuredBurnAsync(
+        AgentMembership member, CancellationToken ct)
+    {
+        if (_burnEstimator is null) return null;
+        try
+        {
+            return await _burnEstimator.GetEstimateAsync(member.Agent, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log?.LogDebug(ex,
+                "Quota burn: estimator threw for {Agent}; status gate falls back to configured estimates",
+                member.Agent.Value);
+            return null;
+        }
     }
 }
 

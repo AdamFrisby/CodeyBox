@@ -217,12 +217,15 @@ public sealed record AgentQuotaSnapshot
 
     /// <summary>
     /// Name of the binding window: the known window with the least remaining
-    /// availability, i.e. the window that produced <see cref="AvailablePct"/>.
-    /// Null for unknown snapshots and for probes with no window concept.
-    /// Computed from <see cref="Windows"/> on read, so it is always consistent
-    /// with the per-window readings carried in the payload. Pure.
+    /// availability, reported only when that window's reading equals
+    /// <see cref="AvailablePct"/> (probes aggregate via the minimum, so
+    /// equality pins which window produced the aggregate). Null for unknown
+    /// snapshots, for probes with no window concept, and when the aggregate
+    /// did not come from a window. Computed from <see cref="Windows"/> on
+    /// read, so it is always consistent with the per-window readings carried
+    /// in the payload. Pure.
     /// </summary>
-    public string? BindingWindow => QuotaWindowBinding.ResolveBindingWindow(Windows);
+    public string? BindingWindow => QuotaWindowBinding.ResolveBindingWindow(Windows, AvailablePct);
 
     /// <summary>
     /// Absolute remaining prepaid balance in the provider's native unit (e.g.

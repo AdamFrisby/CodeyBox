@@ -210,6 +210,12 @@ internal static class QuotaRouterConfigMapper
     private static double? NonNegative(double? value) =>
         value is { } v && v >= 0 ? v : null;
 
+    // Scalar items knobs and per-floor items entries drop silently when
+    // non-positive: an absent items tier just defers to the percentage chain,
+    // so ignoring fails safe. Map entries and pool estimates take the
+    // opposite choice — BuildPositiveDoubleMap and BuildPoolOptions reject at
+    // load because a typo'd entry would otherwise read as configured while
+    // never applying.
     private static double? Positive(double? value) =>
         value is { } v && double.IsFinite(v) && v > 0 ? v : null;
 

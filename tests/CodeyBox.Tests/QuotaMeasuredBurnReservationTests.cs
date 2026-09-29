@@ -91,6 +91,23 @@ public sealed class QuotaMeasuredBurnReservationTests
     }
 
     [Fact]
+    public void BindingWindow_NullWhenAggregateCameFromNonWindowSource()
+    {
+        // A per-model fallback or budget composite can leave AvailablePct
+        // lower than every window's own reading — the scarcest window did not
+        // produce the aggregate, so no window is named binding.
+        var windows = new List<WindowQuota>
+        {
+            new() { Name = "weekly", AvailablePct = 60 },
+            new() { Name = "monthly", AvailablePct = 30 },
+        };
+        Assert.Null(new EffectiveQuota(2.0, null, null, windows).BindingWindow);
+        Assert.Null(new AgentQuotaSnapshot { AvailablePct = 2.0, Windows = windows }.BindingWindow);
+        // Equal readings still resolve normally.
+        Assert.Equal("monthly", new EffectiveQuota(30, null, null, windows).BindingWindow);
+    }
+
+    [Fact]
     public void BindingWindow_NullWithoutUsableReadings()
     {
         Assert.Null(QuotaWindowBinding.ResolveBindingWindow(null));
@@ -341,9 +358,12 @@ public sealed class QuotaMeasuredBurnReservationTests
             precision: 9);
 
         var globalOpts = BaseOptions();
-        globalOpts.MinQuotaItems = 1.0;
+        // 10 items x 0.6%/item = 6.0 points — deliberately above the 5.0 pct
+        // floor so the assertion cannot pass unless the global items tier is
+        // consulted.
+        globalOpts.MinQuotaItems = 10.0;
         Assert.Equal(
-            5.0,
+            6.0,
             QuotaGatePolicy.ComputeFloorPct(globalOpts, Sub(AgentKind.Copilot), quota, Now, Measured(0.6)),
             precision: 9);
     }

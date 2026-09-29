@@ -8,42 +8,39 @@ namespace CodeyBox.Core;
 public interface IAgentQuotaGate
 {
     /// <summary>
-    /// Synchronous gate check. The caller is responsible for supplying any
-    /// recent-observed-failure context — used by the /quota status endpoint
-    /// which already has per-(agent, model) failure context in hand.
+    /// Gate check with caller-supplied recent-observed-failure context — used
+    /// by status surfaces (e.g. <c>/quota</c>) that already hold per-(agent,
+    /// model) failure state. The returned <see cref="AgentQuotaGateVerdict"/>
+    /// bundles the allow bit with the refusal reason (which names the binding
+    /// quota window) so a caller cannot pair a reason with a stale verdict or
+    /// infer allowedness from the reason's nullness.
     /// </summary>
-    bool Allows(
+    Task<AgentQuotaGateVerdict> EvaluateAsync(
         AgentMembership member,
         AgentQuotaSnapshot snapshot,
         DateTimeOffset nowUtc,
-        bool recentObservedFailure = false,
-        string? observedFailureReason = null);
+        bool recentObservedFailure,
+        string? observedFailureReason,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Gate check that resolves recent-observed-failure context internally —
     /// for callers (notifications, watchdogs) that should see the same decision
     /// the dispatch router applies but lack the failure-store dependency.
-    /// Implementations consult the failure store when wired; otherwise behave
-    /// as <see cref="Allows"/> with no observed failure.
+    /// Implementations consult the failure store when wired; otherwise evaluate
+    /// with no observed failure.
     /// </summary>
-    Task<bool> AllowsAsync(
+    Task<AgentQuotaGateVerdict> EvaluateAsync(
         AgentMembership member,
         AgentQuotaSnapshot snapshot,
         DateTimeOffset nowUtc,
         CancellationToken ct = default);
-
-    /// <summary>
-    /// Refusal reason for the same decision <see cref="Allows"/> reports, or
-    /// null when the gate allows. Lets status surfaces (e.g. <c>/quota</c>
-    /// <c>dispatchReason</c>) show WHY a member is refused — including which
-    /// quota window binds — without re-implementing the gate. The default
-    /// implementation returns null so existing probes keep compiling; the
-    /// router's gate override reports the real reason.
-    /// </summary>
-    string? GetRefusalReason(
-        AgentMembership member,
-        AgentQuotaSnapshot snapshot,
-        DateTimeOffset nowUtc,
-        bool recentObservedFailure = false,
-        string? observedFailureReason = null) => null;
 }
+
+/// <summary>
+/// The quota gate's verdict for one member: whether a dispatch may proceed
+/// and, when refused, the human-readable reason — including which quota window
+/// binds. Bundled so the allow bit and its explanation are produced by the
+/// same evaluation and can never diverge.
+/// </summary>
+public sealed record AgentQuotaGateVerdict(bool Allow, string? RefusalReason);

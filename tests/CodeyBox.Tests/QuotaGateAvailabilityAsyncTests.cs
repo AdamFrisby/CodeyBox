@@ -4,7 +4,7 @@ using CodeyBox.Orchestrator;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Pins QuotaGateAvailability.AllowsAsync's failure-store branch to the same
+/// Pins QuotaGateAvailability.EvaluateAsync's failure-store branch to the same
 /// semantics AgentClassRouter.EvaluateGateAsync uses: observed failures gate
 /// only when the current quota is unknown AND UnknownPolicy is
 /// UseObservedFailures. A previous version always consulted the failure store,
@@ -53,7 +53,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
         var gate = Build(QuotaUnknownPolicy.UseObservedFailures, failures);
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = 50 };
-        Assert.True(await gate.AllowsAsync(Member(), snapshot, now));
+        Assert.True((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
     }
 
     [Fact]
@@ -67,7 +67,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
         var gate = Build(QuotaUnknownPolicy.UseObservedFailures, failures);
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = -1 };
-        Assert.False(await gate.AllowsAsync(Member(), snapshot, now));
+        Assert.False((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
     }
 
     [Fact]
@@ -79,7 +79,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
         var gate = Build(QuotaUnknownPolicy.UseObservedFailures, failures);
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = -1 };
-        Assert.True(await gate.AllowsAsync(Member(), snapshot, now));
+        Assert.True((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
     }
 
     [Fact]
@@ -93,7 +93,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
         var gate = Build(QuotaUnknownPolicy.FailOpen, failures);
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = -1 };
-        Assert.True(await gate.AllowsAsync(Member(), snapshot, now));
+        Assert.True((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
     }
 
     [Fact]
@@ -107,7 +107,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = -1 };
         // ThrowingFailureStore would throw if AllowsAsync touched it.
-        Assert.False(await gate.AllowsAsync(Member(), snapshot, now));
+        Assert.False((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
     }
 
     [Fact]
@@ -127,7 +127,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
         }));
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = -1 };
-        Assert.True(await gate.AllowsAsync(Member(), snapshot, now));
+        Assert.True((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
     }
 
     [Fact]
@@ -149,7 +149,68 @@ public sealed class QuotaGateAvailabilityAsyncTests
             observedFailureWindow: TimeSpan.Zero);
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = -1 };
-        Assert.True(await gate.AllowsAsync(Member(), snapshot, now));
+        Assert.True((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
+    }
+
+    [Fact]
+    public async Task EvaluateAsync_ItemsFloorSeesMeasuredBurn()
+    {
+        // With a work-denominated floor configured, the advisory gate must see
+        // the same measured burn the dispatch path supplies — otherwise it
+        // reports allowed for a member commit-time dispatch refuses.
+        var now = DateTimeOffset.UtcNow;
+        var options = new QuotaRouterOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 1.0,
+            MinQuotaItems = 10.0,
+            DispatchReservationBurnMinSamples = 3,
+        };
+        var burn = new AgentBurnEstimate
+        {
+            AvgBurnPctPerItem = 0.6,
+            SampleCount = 8,
+            Status = AgentBurnEstimateStatus.Measured,
+        };
+        var snapshot = new AgentQuotaSnapshot { AvailablePct = 3 };
+
+        var noEstimator = new QuotaGateAvailability(new QuotaGatePolicy(options));
+        Assert.True((await noEstimator.EvaluateAsync(Member(), snapshot, now, false, null)).Allow);
+
+        var withEstimator = new QuotaGateAvailability(
+            new QuotaGatePolicy(options), failureStore: null, TimeSpan.Zero,
+            burnEstimator: new StubBurnEstimator(burn));
+        var verdict = await withEstimator.EvaluateAsync(Member(), snapshot, now, false, null);
+        Assert.False(verdict.Allow);
+        // 10 items x 0.6%/item = 6.0-point floor vs 3.0% available.
+        var refusalReason = Assert.IsType<string>(verdict.RefusalReason);
+        Assert.Contains("3.0% < 6.0%", refusalReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EvaluateAsync_CancellationPropagatesFromBurnEstimator()
+    {
+        var gate = new QuotaGateAvailability(
+            new QuotaGatePolicy(new QuotaRouterOptions()),
+            failureStore: null, TimeSpan.Zero,
+            burnEstimator: new CancellingBurnEstimator());
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            gate.EvaluateAsync(Member(), new AgentQuotaSnapshot { AvailablePct = 50 }, DateTimeOffset.UtcNow, false, null, cts.Token));
+    }
+
+    private sealed class StubBurnEstimator(AgentBurnEstimate estimate) : IAgentBurnEstimator
+    {
+        public Task<AgentBurnEstimate> GetEstimateAsync(AgentKind agent, CancellationToken ct = default) =>
+            Task.FromResult(estimate);
+    }
+
+    private sealed class CancellingBurnEstimator : IAgentBurnEstimator
+    {
+        public Task<AgentBurnEstimate> GetEstimateAsync(AgentKind agent, CancellationToken ct = default) =>
+            Task.FromCanceled<AgentBurnEstimate>(ct);
     }
 
     private sealed class InMemoryQuotaFailureStore : IQuotaFailureStore
