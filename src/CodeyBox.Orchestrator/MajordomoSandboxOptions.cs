@@ -174,16 +174,11 @@ public sealed class MajordomoSandboxOptions
         var v = value.Trim();
         if (v.Contains("://", StringComparison.Ordinal) || v.Contains('/', StringComparison.Ordinal))
             return false;
-        var host = v.Split(':')[0];
-        if (host.Length == 0 || host.Length > 253)
-            return false;
         if (v.Contains(':'))
-        {
-            var port = v[(v.IndexOf(':') + 1)..];
-            if (port.Length == 0 || port.Any(static c => !char.IsAsciiDigit(c)))
-                return false;
             return false;
-        }
+        var host = v;
+        if (host.Length > 253)
+            return false;
         foreach (var c in host)
         {
             if (char.IsAsciiLetterOrDigit(c) || c == '-' || c == '.')

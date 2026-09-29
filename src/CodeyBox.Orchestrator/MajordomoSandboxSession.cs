@@ -19,8 +19,10 @@ namespace CodeyBox.Orchestrator;
 /// accept, or a provider kind without host-enforced egress throws instead of
 /// falling back to open egress.</para>
 /// <para>Thread-safe. Concurrent <see cref="GetOrCreateAsync"/> calls share one
-/// creation; <see cref="NotifyIdleExpired"/> / <see cref="DisposeAsync"/> win
-/// over in-flight creations by disposing the loser.</para>
+/// creation; <see cref="NotifyIdleExpiredAsync"/> and <see cref="DisposeAsync"/>
+/// serialize behind an in-flight creation through the same gate — an idle check
+/// arriving mid-boot finds the fresh sandbox and declines to reap, while
+/// dispose tears the completed sandbox down rather than leaking it.</para>
 /// </remarks>
 public sealed class MajordomoSandboxSession : IAsyncDisposable
 {
@@ -31,7 +33,7 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
     private readonly ILogger _log;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private ISandbox? _sandbox;
-    private DateTimeOffset _lastUsedAt;
+    private long _lastUsedAtUtcTicks;
     private bool _disposed;
 
     public MajordomoSandboxSession(
@@ -48,26 +50,15 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
         _allowedProfilesAccessor = allowedProfilesAccessor ?? (static () => (IReadOnlyList<string>)[]);
         _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger.Instance;
-        _lastUsedAt = _clock.GetUtcNow();
+        _lastUsedAtUtcTicks = _clock.GetUtcNow().UtcTicks;
     }
 
     /// <summary>True while the reusable sandbox is alive.</summary>
-    public bool IsAlive
-    {
-        get
-        {
-            lock (_gate) { return _sandbox is not null && !_disposed; }
-        }
-    }
+    public bool IsAlive => Volatile.Read(ref _sandbox) is not null && !Volatile.Read(ref _disposed);
 
     /// <summary>Last turn that used (or created) the sandbox, in UTC.</summary>
-    public DateTimeOffset LastUsedAt
-    {
-        get
-        {
-            lock (_gate) { return _lastUsedAt; }
-        }
-    }
+    public DateTimeOffset LastUsedAt =>
+        new(Interlocked.Read(ref _lastUsedAtUtcTicks), TimeSpan.Zero);
 
     /// <summary>
     /// Returns the live sandbox, creating it on demand. Marks the turn active
@@ -83,7 +74,7 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
                 throw new ObjectDisposedException(nameof(MajordomoSandboxSession));
             if (_sandbox is not null)
             {
-                _lastUsedAt = _clock.GetUtcNow();
+                Interlocked.Exchange(ref _lastUsedAtUtcTicks, _clock.GetUtcNow().UtcTicks);
                 return _sandbox;
             }
             var options = _optionsAccessor();
@@ -99,8 +90,8 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
             var created = _provider is IInfrastructureSandboxCreator exempt
                 ? await exempt.CreateInfrastructureAsync(spec, ct).ConfigureAwait(false)
                 : await _provider.CreateAsync(spec, ct).ConfigureAwait(false);
-            _sandbox = created;
-            _lastUsedAt = _clock.GetUtcNow();
+            Volatile.Write(ref _sandbox, created);
+            Interlocked.Exchange(ref _lastUsedAtUtcTicks, _clock.GetUtcNow().UtcTicks);
             _log.LogInformation(
                 "Majordomo sandbox created on provider '{Provider}' with network profile '{Profile}'.",
                 _provider.Name, profile);
@@ -120,17 +111,18 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
     public async Task<bool> NotifyIdleExpiredAsync(CancellationToken ct = default)
     {
         ISandbox? victim = null;
+        var idleFor = TimeSpan.Zero;
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             if (_sandbox is null || _disposed)
                 return false;
-            var idleFor = _clock.GetUtcNow() - _lastUsedAt;
+            idleFor = _clock.GetUtcNow() - LastUsedAt;
             var bound = _optionsAccessor().IdleTimeout;
             if (idleFor < bound)
                 return false;
             victim = _sandbox;
-            _sandbox = null;
+            Volatile.Write(ref _sandbox, null);
         }
         finally
         {
@@ -139,7 +131,7 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
 
         if (victim is not null)
         {
-            _log.LogInformation("Majordomo sandbox idle-torn-down after {Idle}.", _clock.GetUtcNow() - _lastUsedAt);
+            _log.LogInformation("Majordomo sandbox idle-torn-down after {Idle}.", idleFor);
             await victim.DisposeAsync().ConfigureAwait(false);
             return true;
         }
@@ -155,9 +147,9 @@ public sealed class MajordomoSandboxSession : IAsyncDisposable
         {
             if (_disposed)
                 return;
-            _disposed = true;
+            Volatile.Write(ref _disposed, true);
             victim = _sandbox;
-            _sandbox = null;
+            Volatile.Write(ref _sandbox, null);
         }
         finally
         {

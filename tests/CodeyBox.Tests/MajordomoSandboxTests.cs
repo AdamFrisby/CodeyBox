@@ -164,6 +164,36 @@ public sealed class MajordomoSandboxTests
     }
 
     [Fact]
+    public void Options_EgressHosts_MustBeBareHostnames()
+    {
+        var options = Options();
+        Assert.Null(MajordomoSandboxOptions.Validate(options));
+
+        foreach (var bad in new[] { "host:5000", "https://host", "host/path", ".bad.", "a..b", " " })
+        {
+            options.OrchestratorHost = bad;
+            Assert.NotNull(MajordomoSandboxOptions.Validate(options));
+        }
+        options.OrchestratorHost = "orchestrator.internal";
+
+        // The external model endpoint is the only allowed addition — and it is
+        // a bare hostname too: the host-side nftables allowlist matches names,
+        // not URLs, so a scheme or port here would silently grant nothing while
+        // claiming egress was configured.
+        options.AdditionalAllowedHosts = ["api.example.com:443"];
+        Assert.NotNull(MajordomoSandboxOptions.Validate(options));
+    }
+
+    [Fact]
+    public void Spec_EgressAllowlist_IsOrchestratorPlusNamedHostsOnly()
+    {
+        var options = Options();
+        options.AdditionalAllowedHosts = ["api.example.com", "API.EXAMPLE.COM", "  "];
+        var spec = MajordomoSandboxSpecFactory.BuildSpec(options, McpUrl);
+        Assert.Equal(["orchestrator.internal", "api.example.com"], spec.Network.AllowedHosts);
+    }
+
+    [Fact]
     public void Options_ApiKeyBackend_RequiresMeteredKey()
     {
         var options = Options();
