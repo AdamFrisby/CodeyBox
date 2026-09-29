@@ -1,0 +1,26 @@
+{
+  "id": "ddd444",
+  "individual_note": false,
+  "notes": [
+    {
+      "id": 305,
+      "body": "Consider a guard clause here.",
+      "author": {
+        "id": 10,
+        "username": "codeybox-bot",
+        "name": "CodeyBox"
+      },
+      "system": false,
+      "created_at": "2026-09-10T12:00:00.000Z",
+      "discussion_id": "ddd444",
+      "position": {
+        "position_type": "text",
+        "old_path": null,
+        "new_path": "src/widget.cs",
+        "old_line": null,
+        "new_line": 7
+      },
+      "resolvable": true
+    }
+  ]
+}
