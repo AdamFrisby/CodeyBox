@@ -744,6 +744,28 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// Validates a configured scan-target entry that must stay inside the
+    /// audited worktree: the argv guard of <see cref="ValidatedArgumentValue"/>
+    /// plus containment — a rooted path or a <c>..</c> segment would point the
+    /// tool at files outside the tree under audit and produce report paths the
+    /// repo-relative finding-location contract (and the <c>ExcludePaths</c>
+    /// prefix filter) cannot express. <paramref name="source"/> names the knob
+    /// that supplied the value for the failure message.
+    /// </summary>
+    protected static string ValidatedRepoRelativeTarget(string value, string source)
+    {
+        var validated = ValidatedArgumentValue(value, source);
+        var normalized = validated.Replace('\\', '/');
+        if (normalized.StartsWith("/", StringComparison.Ordinal)
+            || normalized.Split('/').Contains("..", StringComparer.Ordinal))
+            throw new AuditUnavailableException(
+                $"could-not-verify: configured '{source}' entry ('{TruncateForMessage(validated)}') "
+                + "must be a repo-relative path inside the worktree.")
+            { IsDeterministic = true };
+        return validated;
+    }
+
+    /// <summary>
     /// Extracts the value an operator's <c>ExtraArguments</c> supplies for a
     /// long-form flag — the entry following a bare <c>--flag</c>, or the
     /// text after <c>--flag=</c>, the same spellings
