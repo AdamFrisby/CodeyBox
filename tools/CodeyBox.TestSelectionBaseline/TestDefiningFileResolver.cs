@@ -35,6 +35,23 @@ public static class TestDefiningFileResolver
         if (methodName.Length == 0 || typeSuffix.Length == 0)
             return "";
 
+        try
+        {
+            return ResolveFromPdb(fullAssembly, methodName, typeSuffix, repoRoot);
+        }
+        catch (BadImageFormatException ex)
+        {
+            throw new TestSelectionBaselineProduceException(
+                $"Test assembly '{fullAssembly}' is not a readable managed PE.", ex);
+        }
+    }
+
+    private static string ResolveFromPdb(
+        string fullAssembly,
+        string methodName,
+        string typeSuffix,
+        string repoRoot)
+    {
         using var peStream = File.OpenRead(fullAssembly);
         using var peReader = new PEReader(peStream);
         if (!peReader.HasMetadata)

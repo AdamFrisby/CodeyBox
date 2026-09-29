@@ -420,6 +420,19 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
             return new HostCommandResult(0, dll + "\n", "");
         }
 
+        if (argv.Contains("-getItem:Compile", StringComparer.Ordinal))
+        {
+            var files = argv.Any(a => a.EndsWith("Lib.Tests.csproj", StringComparison.Ordinal))
+                ? new[] { "tests/Lib.Tests/AdderTests.cs", "tests/Lib.Tests/UntouchedTests.cs" }
+                : new[] { "src/Lib/Adder.cs" };
+            var items = string.Join(",", files.Select(f => JsonSerializer.Serialize(new
+            {
+                Identity = f,
+                FullPath = Path.Combine(repo, f.Replace('/', Path.DirectorySeparatorChar)),
+            })));
+            return new HostCommandResult(0, "{\"Items\":{\"Compile\":[" + items + "]}}", "");
+        }
+
         if (argv.Contains("build", StringComparer.Ordinal))
             return new HostCommandResult(0, "", "");
         if (argv.Contains("rev-parse", StringComparer.Ordinal))

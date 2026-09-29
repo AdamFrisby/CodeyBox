@@ -128,6 +128,11 @@ public static class Program
             error.WriteLine("Cancelled.");
             return ExitFailed;
         }
+        catch (Exception ex)
+        {
+            error.WriteLine($"Unexpected failure ({ex.GetType().Name}): {ex.Message}");
+            return ExitFailed;
+        }
     }
 
     internal static TestSelectionProducerOptions ParseArgs(string[] args)
@@ -145,6 +150,7 @@ public static class Program
         var maxLines = defaults.MaxBaselineCoveredLines;
         var maxParallelism = defaults.MaxParallelism;
         var skipBuild = false;
+        string? resultsDirectory = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -168,6 +174,9 @@ public static class Program
                     break;
                 case "--git" when i + 1 < args.Length:
                     git = args[++i];
+                    break;
+                case "--results-directory" when i + 1 < args.Length:
+                    resultsDirectory = args[++i];
                     break;
                 case "--collector" when i + 1 < args.Length:
                     collector = args[++i];
@@ -209,6 +218,7 @@ public static class Program
             MaxBaselineCoveredLines = maxLines,
             MaxParallelism = maxParallelism,
             SkipBuild = skipBuild,
+            ResultsDirectory = resultsDirectory,
         };
     }
 
@@ -250,7 +260,10 @@ public static class Program
               --commit SHA             Recorded commit (default: git rev-parse HEAD)
               --solution PATH          Solution file (default: repo-root *.slnx / *.sln)
               --dotnet PATH            dotnet executable (default: dotnet)
+              --git PATH               git executable (default: git)
               --collector NAME         Coverlet collector (default: XPlat Code Coverage)
+              --results-directory DIR  Keep per-test coverage reports under DIR
+                                       (default: ephemeral temp directory)
               --max-bytes N            JSON character cap (default: consumer MaxBaselineBytes)
               --max-tests N            Test-entry cap (default: consumer MaxBaselineTests)
               --max-covered-lines N    Covered-line cap (default: consumer MaxBaselineCoveredLines)

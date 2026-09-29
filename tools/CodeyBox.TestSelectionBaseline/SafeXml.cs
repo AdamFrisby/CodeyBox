@@ -45,6 +45,14 @@ internal static class SafeXml
                 $"XML file '{path}' exceeds the {maxBytes}-byte cap.");
         }
 
-        return Load(xml);
+        try
+        {
+            return Load(xml);
+        }
+        catch (XmlException ex)
+        {
+            throw new TestSelectionBaselineProduceException(
+                $"XML file '{path}' is malformed: {ex.Message}", ex);
+        }
     }
 }

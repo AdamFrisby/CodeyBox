@@ -29,6 +29,18 @@ public interface IHostCommandRunner
 
 internal static class HostCommandRun
 {
+    /// <summary>
+    /// The last 2000 characters of process output, for error messages.
+    /// Untrusted output is never logged wholesale.
+    /// </summary>
+    public static string Tail(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "";
+        var trimmed = value.Trim();
+        return trimmed.Length <= 2000 ? trimmed : trimmed[^2000..];
+    }
+
     public static async Task<HostCommandResult> CappedAsync(
         IHostCommandRunner runner,
         IReadOnlyList<string> argv,

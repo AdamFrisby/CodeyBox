@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Xml.Linq;
 using CodeyBox.Core;
 
@@ -5,8 +6,12 @@ namespace CodeyBox.TestSelectionProducer;
 
 /// <summary>
 /// Walks a checkout's solution / project-reference graph and the files each
-/// MSBuild project owns. Untrusted repo XML is loaded with DTD prohibited.
-/// Paths are canonicalized and must stay inside the repository root.
+/// MSBuild project compiles. File ownership comes from
+/// <c>dotnet msbuild -getItem:Compile</c> — the evaluated truth, so default
+/// globs, <c>&lt;Compile Remove&gt;</c> and explicit includes are honoured
+/// exactly rather than re-implemented. Untrusted repo XML is loaded with DTD
+/// prohibited. Paths are canonicalized and must stay inside the repository
+/// root.
 /// </summary>
 public static class MsBuildProjectGraph
 {
@@ -55,7 +60,8 @@ public static class MsBuildProjectGraph
                 testProjects.Add(project);
 
             references[project] = ReadProjectReferences(document, root, fullProject);
-            foreach (var file in EnumerateOwnedSources(fullProject, root))
+            foreach (var file in await ReadCompileItemsAsync(
+                         root, project, options, runner, ct).ConfigureAwait(false))
             {
                 sourceFiles++;
                 if (sourceFiles > options.MaxSourceFiles)
@@ -64,11 +70,14 @@ public static class MsBuildProjectGraph
                         $"Checkout exceeds the {options.MaxSourceFiles} source-file cap.");
                 }
 
+                // The baseline format maps one file to one project; a file
+                // genuinely compiled into two projects has no honest answer —
+                // fail loudly rather than silently under-attribute it.
                 if (fileProject.TryGetValue(file, out var existing)
                     && !string.Equals(existing, project, StringComparison.Ordinal))
                 {
                     throw new TestSelectionBaselineProduceException(
-                        $"Source file '{file}' is owned by both '{existing}' and '{project}'.");
+                        $"Source file '{file}' is compiled by both '{existing}' and '{project}'.");
                 }
 
                 fileProject[file] = project;
@@ -286,51 +295,74 @@ public static class MsBuildProjectGraph
         return [.. refs];
     }
 
-    private static IEnumerable<string> EnumerateOwnedSources(string projectFullPath, string repoRoot)
+    /// <summary>
+    /// The repository-relative paths of a project's evaluated
+    /// <c>Compile</c> items, per <c>dotnet msbuild -getItem:Compile</c> JSON.
+    /// Items outside the repository (e.g. sources linked from elsewhere) are
+    /// skipped — a repo diff can never reference them.
+    /// </summary>
+    private static async Task<IReadOnlyList<string>> ReadCompileItemsAsync(
+        string repoRoot,
+        string projectRelative,
+        TestSelectionProducerOptions options,
+        IHostCommandRunner runner,
+        CancellationToken ct)
     {
-        var projectDir = Path.GetDirectoryName(projectFullPath)
-            ?? throw new TestSelectionBaselineProduceException($"Project '{projectFullPath}' has no directory.");
-        if (!Directory.Exists(projectDir))
-            yield break;
-
-        var stack = new Stack<(string Path, int Depth)>();
-        stack.Push((projectDir, 0));
-        while (stack.Count > 0)
+        var label = $"dotnet msbuild -getItem:Compile {projectRelative}";
+        var result = await HostCommandRun.CappedAsync(
+            runner,
+            [options.DotnetExecutable, "msbuild", projectRelative, "-nologo", "-getItem:Compile"],
+            repoRoot,
+            options.MaxCommandStdoutChars,
+            options.MaxCommandStdoutChars,
+            options.CommandTimeout,
+            label,
+            ct).ConfigureAwait(false);
+        if (result.StdoutLimitExceeded || result.StderrLimitExceeded)
+            throw new TestSelectionBaselineProduceException($"{label} exceeded an output cap.");
+        if (!result.Success)
         {
-            var (dir, depth) = stack.Pop();
-            if (depth > MaxWalkDepth)
-                continue;
+            throw new TestSelectionBaselineProduceException(
+                $"{label} exited {result.ExitCode}: {HostCommandRun.Tail(result.Stderr)}");
+        }
 
-            string[] files;
-            string[] children;
-            try
-            {
-                files = Directory.GetFiles(dir, "*.cs");
-                children = Directory.GetDirectories(dir);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                continue;
-            }
-            catch (DirectoryNotFoundException)
-            {
-                continue;
-            }
+        using var document = ParseJson(result.Stdout, label);
+        var files = new SortedSet<string>(StringComparer.Ordinal);
+        if (!document.RootElement.TryGetProperty("Items", out var items)
+            || items.ValueKind != JsonValueKind.Object
+            || !items.TryGetProperty("Compile", out var compile)
+            || compile.ValueKind != JsonValueKind.Array)
+        {
+            return files;
+        }
 
-            foreach (var file in files)
+        foreach (var item in compile.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object
+                || !item.TryGetProperty("FullPath", out var fullPath)
+                || fullPath.ValueKind != JsonValueKind.String)
             {
-                var relative = ToRepoRelativeOrNull(repoRoot, file);
-                if (relative is not null)
-                    yield return relative;
+                continue;
             }
 
-            foreach (var child in children)
-            {
-                var name = Path.GetFileName(child);
-                if (name is "bin" or "obj" or ".git")
-                    continue;
-                stack.Push((child, depth + 1));
-            }
+            var relative = ToRepoRelativeOrNull(repoRoot, fullPath.GetString() ?? "");
+            if (relative is not null)
+                files.Add(relative);
+        }
+
+        return files;
+    }
+
+    private static JsonDocument ParseJson(string stdout, string label)
+    {
+        try
+        {
+            return JsonDocument.Parse(stdout);
+        }
+        catch (JsonException ex)
+        {
+            throw new TestSelectionBaselineProduceException(
+                $"{label} returned malformed JSON.", ex);
         }
     }
 

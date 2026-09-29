@@ -143,7 +143,7 @@ public sealed class TestSelectionBaselineProducer
             if (!result.Success)
             {
                 throw new TestSelectionBaselineProduceException(
-                    $"dotnet test --list-tests on '{target}' exited {result.ExitCode}: {Trim(result.Stderr)}");
+                    $"dotnet test --list-tests on '{target}' exited {result.ExitCode}: {HostCommandRun.Tail(result.Stderr)}");
             }
 
             var names = DotnetTestListParser.Parse(
@@ -251,7 +251,7 @@ public sealed class TestSelectionBaselineProducer
         if (!result.Success)
         {
             throw new TestSelectionBaselineProduceException(
-                $"git rev-parse HEAD failed (exit {result.ExitCode}): {Trim(result.Stderr)}");
+                $"git rev-parse HEAD failed (exit {result.ExitCode}): {HostCommandRun.Tail(result.Stderr)}");
         }
 
         var sha = result.Stdout.Trim();
@@ -285,7 +285,7 @@ public sealed class TestSelectionBaselineProducer
         if (!result.Success)
         {
             throw new TestSelectionBaselineProduceException(
-                $"{label} exited {result.ExitCode}: {Trim(result.Stderr)}{Trim(result.Stdout)}");
+                $"{label} exited {result.ExitCode}: {HostCommandRun.Tail(result.Stderr)}{HostCommandRun.Tail(result.Stdout)}");
         }
     }
 
@@ -341,14 +341,6 @@ public sealed class TestSelectionBaselineProducer
         }
 
         return true;
-    }
-
-    private static string Trim(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "";
-        var trimmed = value.Trim();
-        return trimmed.Length <= 2000 ? trimmed : trimmed[^2000..];
     }
 
     private sealed record ListedTests(
