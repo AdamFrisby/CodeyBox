@@ -30,6 +30,7 @@ internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvide
     public string? SelfReviewGuidance => _inner.SelfReviewGuidance;
     public AuditorRole Role => _inner.Role;
     public BuildTestGateEvidence BuildTestGateEvidence => _inner.BuildTestGateEvidence;
+    public BuildTestGateEvidence ConsumesGateEvidence => _inner.ConsumesGateEvidence;
     public IReadOnlyList<string> Argv => _inner is IShellAuditorArgvProvider provider ? provider.Argv : [];
 
     /// <summary>

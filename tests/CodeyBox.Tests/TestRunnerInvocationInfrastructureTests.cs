@@ -84,6 +84,9 @@ public sealed class TestRunnerInvocationInfrastructureTests : IDisposable
     /// provisioning fault: it must fail as <c>configuration</c> so the
     /// terminal classifier parks it immediately, without consuming rework
     /// iterations or recovery-attempt budget on identical retries.
+    /// Uses a genuine configuration refusal (unknown MSBuild switch, no
+    /// <c>bin/</c> assembly involved) so the missing-build-outputs guard does
+    /// not apply — see <see cref="DeterministicMissingBuildOutputs_FailsAsInfrastructure"/>.
     /// </summary>
     [Fact]
     public async Task DeterministicTestGateInvocationError_FailsAsConfigurationWithoutRecoveryBudget()
@@ -170,9 +173,96 @@ public sealed class TestRunnerInvocationInfrastructureTests : IDisposable
     /// Stands in for the <c>csharp:test-pass</c> gate after its classifier
     /// proves a runner argument-validation refusal and marks it deterministic.
     /// The pipeline must route it as a configuration error (immediate,
-    /// non-retryable) rather than transient infrastructure.
+    /// non-retryable) rather than transient infrastructure. Uses an unknown
+    /// MSBuild switch — a genuine invocation fault with no <c>bin/</c>
+    /// assembly — so the missing-build-outputs guard stays out of scope.
     /// </summary>
     private sealed class DeterministicInvocationFailingTestGateAuditor : IAuditor
+    {
+        public string Name => "csharp:test-pass";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public bool CanShortCircuitOnBlockingFinding => true;
+        public AuditorRole Role => AuditorRole.BuildTestGate;
+        public BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.Test;
+        public int Calls { get; private set; }
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            Calls++;
+            throw new AuditUnavailableException(
+                "could-not-verify: test runner invocation failed for 'csharp:test-pass' (exit 1): "
+                + "MSB1001: Unknown switch. (command: dotnet test --unknown-switch)",
+                1,
+                "MSB1001: Unknown switch.")
+            {
+                IsDeterministic = true,
+            };
+        }
+    }
+
+    /// <summary>
+    /// Defence in depth: even a <see cref="AuditUnavailableException"/> marked
+    /// deterministic must NOT fail as <c>configuration</c> when it is really a
+    /// <c>--no-build</c> refusal against a <c>bin/</c> test assembly — the
+    /// assemblies are absent because the build gate never produced them, so
+    /// the refusal derives from that failure. The pipeline downgrades it to
+    /// <c>infrastructure</c> (operator attention, never a terminal
+    /// configuration fault), matching the classifier's "build outputs
+    /// missing" outcome for the same transcript.
+    /// </summary>
+    [Fact]
+    public async Task DeterministicMissingBuildOutputs_FailsAsInfrastructure()
+    {
+        using var _ = TestSupport.AmbientGitConfigScope.Clear();
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new DeterministicMissingBuildOutputsAuditor();
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 3,
+            involvement: involvement);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "deterministic missing build outputs",
+            Prompt = "change the repo",
+            WorkBranch = "feature/testgate-missing-outputs",
+            BaseBranch = "main",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Contains("could-not-verify", final.LastError ?? string.Empty, StringComparison.Ordinal);
+
+        Assert.Equal(1, auditor.Calls);
+        Assert.Single(tp.Agent.WorkPrompts);
+    }
+
+    /// <summary>
+    /// Throws the incident-shaped fault with the deterministic mark set, as
+    /// if a classifier (or a future caller) stamped a missing-assembly
+    /// refusal deterministic. The pipeline's message-based guard must still
+    /// route it to infrastructure.
+    /// </summary>
+    private sealed class DeterministicMissingBuildOutputsAuditor : IAuditor
     {
         public string Name => "csharp:test-pass";
         public string Kind => "tool";

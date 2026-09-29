@@ -153,6 +153,13 @@ review. In trusted config, set `role: build-test-gate` plus explicit
 `gateEvidence` for any custom step (e.g. a separate `tsc`/`cargo check`/
 cross-compile) whose successful run should contribute to the LLM panel gate.
 If `gateEvidence` is omitted, the gate contributes no build/test evidence.
+A gate whose command reuses a prior gate's outputs (a `dotnet test
+--no-build` gate executes the compile gate's assemblies) additionally
+declares that consumed evidence: when no declared gate produced it in the
+same iteration — the producing gate failed or could not verify — the
+consumer is skipped with an explicit "skipped: build failed" result instead
+of running against absent outputs. The producing gate's own findings then
+drive the normal rework (or base-broken) verdict.
 The built-in `process:build-script` auditor runs a repository-owned
 `build.sh` as an ordinary tool audit only; it is not trusted build evidence
 and cannot unlock LLM review.
@@ -209,9 +216,16 @@ that hands the build user a root-owned `~/.nuget` therefore aborts
 `csharp:build-WaE`, `csharp:test-pass`, and the non-skippable
 `process:required-build` with `Failed to read NuGet.Config due to unauthorized
 access`. The `csharp:test-pass` "argument …dll is invalid" message is the same
-failure downstream: nothing built, so there is no test assembly. It surfaces
-as a deterministic configuration error (`could-not-verify`), not as a code
-finding — see `DotnetTestAuditor` below.
+failure downstream: nothing built, so there is no test assembly. When the
+build gate failed earlier in the same iteration, the `--no-build` test gate
+is skipped outright with an explicit "skipped: build failed" result so the
+build gate's own findings drive the rework verdict. If the refusal still
+reaches the runner (for example, no build gate ran in the iteration), it
+surfaces as "build outputs missing" on the infrastructure path
+(`could-not-verify`), never as a terminal configuration fault and not as a
+code finding — see `DotnetTestAuditor` below. Other invocation refusals with
+no `bin/` assembly involved (unknown switches, undiscoverable projects) stay
+deterministic configuration errors.
 
 No committed repository file can redirect that read — NuGet resolves the path
 from process environment. CodeyBox works around it in three places instead: the

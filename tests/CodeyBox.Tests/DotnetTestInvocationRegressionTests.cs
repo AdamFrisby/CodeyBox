@@ -149,8 +149,12 @@ public sealed class DotnetTestInvocationRegressionTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task RunnerRefusal_ReportsExecutedCommand_AndIsDeterministic(bool selfHeal)
+    public async Task RunnerRefusal_ReportsExecutedCommand_AsMissingBuildOutputs(bool selfHeal)
     {
+        // A `--no-build` refusal against a `bin/` assembly means the build
+        // gate never produced the assemblies: the refusal derives from that
+        // failure, so it is reported as "build outputs missing" on the
+        // infrastructure path (never deterministic/terminal configuration).
         var auditor = GateAuditor(selfHeal);
         const string output = """
             The following arguments have been ignored : "--no-build"
@@ -166,7 +170,8 @@ public sealed class DotnetTestInvocationRegressionTests
 
         var executed = string.Join(' ', sandbox.Captured.Single().Argv);
         Assert.EndsWith($"(command: {executed})", ex.Message, StringComparison.Ordinal);
-        Assert.True(ex.IsDeterministic);
+        Assert.Contains("build outputs missing", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(ex.IsDeterministic);
         if (!selfHeal)
             Assert.EndsWith("(command: dotnet test --no-build)", ex.Message, StringComparison.Ordinal);
     }

@@ -733,6 +733,21 @@ public static class AuditLog
                 workItemId.ToString(), skippedAuditorCount);
 
     /// <summary>
+    /// Emitted when an auditor is skipped because its command consumes
+    /// build/test-gate outputs (e.g. a <c>dotnet test --no-build</c> gate
+    /// executes the compile gate's assemblies) that no build/test gate
+    /// produced in this iteration — the providing gate failed or could not
+    /// verify. Running anyway could only surface a derived runner refusal,
+    /// so the gate's own findings drive the rework verdict instead.
+    /// </summary>
+    public static void AuditorSkippedMissingGateEvidence(
+        WorkItemId workItemId, string auditorName, BuildTestGateEvidence missingEvidence) =>
+        Audit("audit.auditor_skipped_missing_gate_evidence")
+            .Information(
+                "Auditor '{AuditorName}' skipped for {WorkItemId}: consumes {MissingEvidence} gate evidence that no build/test gate produced this iteration",
+                auditorName, workItemId.ToString(), missingEvidence.ToString());
+
+    /// <summary>
     /// Emitted when the pickup-time rebase resolver routed past a candidate
     /// whose non-cap pre-dispatch gate rejected it. <paramref name="rejectedAgent"/>
     /// is the resolver's primary candidate: the configured

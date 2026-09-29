@@ -82,6 +82,23 @@ public interface IAuditor
     BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.None;
 
     /// <summary>
+    /// Build/test-gate evidence this auditor's command CONSUMES: outputs a
+    /// <see cref="AuditorRole.BuildTestGate"/> producer must have verified in
+    /// the same iteration for this invocation to be meaningful. A
+    /// <c>dotnet test --no-build</c> gate declares
+    /// <see cref="BuildTestGateEvidence.Build"/>: it executes the compile
+    /// gate's assemblies, so when that evidence was declared but never
+    /// produced the run can only surface a derived "missing build outputs"
+    /// runner refusal. The pipeline skips such a consumer with an explicit
+    /// "skipped: build failed" result so the producing gate's own findings
+    /// drive the rework verdict. The default
+    /// <see cref="BuildTestGateEvidence.None"/> fits auditors that build
+    /// their own inputs (<c>go test</c>, <c>cargo test</c>, plain
+    /// <c>dotnet test</c>) or consume none.
+    /// </summary>
+    BuildTestGateEvidence ConsumesGateEvidence => BuildTestGateEvidence.None;
+
+    /// <summary>
     /// Runs the auditor for the target described by <paramref name="context"/>.
     /// Code-target auditors inspect the working tree at
     /// <paramref name="workingDirectory"/>. Plan-target auditors receive the

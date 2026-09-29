@@ -1255,7 +1255,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // transient provisioning fault: stamping the configuration kind
             // classifies it Deterministic downstream, so it surfaces immediately
             // instead of burning the recovery-attempt budget on identical retries.
-            var failureKind = ex.IsDeterministic
+            // A --no-build refusal against a bin/ assembly is the exception: the
+            // assemblies are absent because the build gate never produced them,
+            // so the refusal derives from that failure and must stay on the
+            // infrastructure path, never a terminal configuration fault.
+            var missingBuildOutputs = MissingBuildOutputs.IsMissingBuildOutputsMessage(ex.Message, ex.Output);
+            var failureKind = ex.IsDeterministic && !missingBuildOutputs
                 ? WorkItemFailureKinds.Configuration
                 : WorkItemFailureKinds.Infrastructure;
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: failureKind);
