@@ -438,8 +438,20 @@ public sealed class PsScriptAnalyzerAuditorTests
         Assert.Contains("/work/policy-link.psd1", ex.Message, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task SettingsPath_PresetName_PassesThroughWithoutProbe()
+    [Theory]
+    // Every preset name the pinned module ships must pass verbatim —
+    // a missing entry would fail closed as an in-tree path rejection.
+    [InlineData("CmdletDesign")]
+    [InlineData("CodeFormatting")]
+    [InlineData("CodeFormattingAllman")]
+    [InlineData("CodeFormattingOTBS")]
+    [InlineData("CodeFormattingStroustrup")]
+    [InlineData("DSC")]
+    [InlineData("PSGallery")]
+    [InlineData("ScriptFunctions")]
+    [InlineData("ScriptingStyle")]
+    [InlineData("ScriptSecurity")]
+    public async Task SettingsPath_PresetName_PassesThroughWithoutProbe(string preset)
     {
         var settingsProbes = 0;
         SandboxExec? scanExec = null;
@@ -464,7 +476,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         await auditor.InitializeAsync(
             BuildPluginContext(new Dictionary<string, string?>
             {
-                ["Scoped:SettingsPath"] = "CodeFormattingOTBS",
+                ["Scoped:SettingsPath"] = preset,
             }),
             CancellationToken.None);
 
@@ -475,7 +487,7 @@ public sealed class PsScriptAnalyzerAuditorTests
         Assert.NotNull(scanExec);
         var settingsIndex = scanExec!.Argv.ToList().IndexOf("-Settings");
         Assert.True(settingsIndex >= 0 && settingsIndex + 1 < scanExec.Argv.Count);
-        Assert.Equal("CodeFormattingOTBS", scanExec.Argv[settingsIndex + 1]);
+        Assert.Equal(preset, scanExec.Argv[settingsIndex + 1]);
     }
 
     [Fact]
@@ -581,6 +593,42 @@ public sealed class PsScriptAnalyzerAuditorTests
         Assert.True(ex.IsDeterministic);
         Assert.Contains("wildcard", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(0, settingsProbes);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task SettingsPath_CanonicalizedToGlobCharacters_IsRejectedDeterministically()
+    {
+        // The configured value carries no metacharacters, but realpath
+        // resolves through a symlinked directory literally named "pol[ic]y" —
+        // the canonical string argv hands the cmdlet now carries glob
+        // characters the cmdlet's provider-path resolver would expand to a
+        // file the containment check never judged.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsSettingsProbe(exec))
+                return Task.FromResult(RealpathOk(exec, _ => "/data/pol[ic]y/settings.psd1"));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsPwdProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsScanExec(exec))
+                scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new PsScriptAnalyzerAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:SettingsPath"] = "/opt/pssa-policy/settings.psd1",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("wildcard", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(0, scanExecs);
     }
 

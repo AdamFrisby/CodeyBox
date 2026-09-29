@@ -844,6 +844,15 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// The characters that open a PowerShell parameter token: ASCII '-'
+    /// plus the Unicode dashes U+2013/U+2014/U+2015 pwsh's binder also
+    /// accepts as parameter markers. Shared so every guard that recognizes
+    /// parameter-shaped tokens applies the same dash set.
+    /// </summary>
+    protected static bool IsParameterDash(char c)
+        => c is '-' or '\u2013' or '\u2014' or '\u2015';
+
+    /// <summary>
     /// Validates a configured value that travels to the tool as an argv
     /// entry: bounded length, no leading dash (it would be read as another
     /// flag), no control characters. <paramref name="source"/> names the
@@ -856,10 +865,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var trimmed = value.Trim();
         const int maxChars = 1024;
         if (trimmed.Length == 0 || trimmed.Length > maxChars
-            // A leading dash — including the U+2013/U+2014/U+2015 Unicode
-            // dashes PowerShell accepts as parameter markers — would be
-            // read as another flag by a pwsh-bound tool.
-            || trimmed[0] is '-' or '\u2013' or '\u2014' or '\u2015'
+            // A leading parameter dash would be read as another flag by a
+            // pwsh-bound tool.
+            || IsParameterDash(trimmed[0])
             || trimmed.Any(char.IsControl))
             throw new AuditUnavailableException(
                 $"could-not-verify: configured '{source}' is not a usable argument value "

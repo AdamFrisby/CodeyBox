@@ -13,6 +13,16 @@ namespace CodeyBox.PluginSdk.Tools;
 public static class ExternalToolJsonHelpers
 {
     /// <summary>
+    /// Scheme prefix parsers re-apply to a reported path that cannot be made
+    /// repository-relative: the base trims a bare leading '/' from finding
+    /// paths, so an unmarked out-of-root absolute path — or a relative path
+    /// still carrying '..' — would read as repository-relative and could
+    /// accidentally match repo-relative
+    /// <see cref="ExternalToolAuditorOptions.ExcludePaths"/> entries.
+    /// </summary>
+    public const string FileSchemePrefix = "file://";
+
+    /// <summary>
     /// Reads a string-valued property; null when the property is absent or is
     /// not a JSON string. <paramref name="utf8Name"/> is the UTF-8 property
     /// name (e.g. <c>"rule"u8</c>).
@@ -73,4 +83,72 @@ public static class ExternalToolJsonHelpers
             return normalized;
         return normalized[(normalizedRoot.Length + 1)..];
     }
+
+    /// <summary>
+    /// The shared reported-path policy for tool JSON reports: forward-slash
+    /// normalization, an incoming <see cref="FileSchemePrefix"/> prefix
+    /// stripped, and dot segments collapsed lexically BEFORE relativization —
+    /// otherwise "/root/../outside" would strip the root prefix and reach
+    /// findings as the pseudo repo-relative "../outside". Absolute paths are
+    /// relativized against <paramref name="scanRoot"/> first, then the exec
+    /// <paramref name="workingDirectory"/>; a path that stays absolute — and
+    /// a relative path still carrying '..' — is re-marked with
+    /// <see cref="FileSchemePrefix"/> so it stays distinguishable from a
+    /// repository-relative location. Returns null for empty input.
+    /// </summary>
+    public static string? NormalizeReportedPath(string? raw, string? scanRoot, string? workingDirectory)
+    {
+        var path = NormalizePath(raw);
+        if (path.Length == 0)
+            return null;
+        if (path.StartsWith(FileSchemePrefix, StringComparison.OrdinalIgnoreCase))
+            path = path[FileSchemePrefix.Length..];
+
+        path = CollapseDotSegments(path);
+        if (path.Length == 0)
+            return null;
+
+        if (!path.StartsWith("/", StringComparison.Ordinal))
+            return HasDotDotSegment(path) ? FileSchemePrefix + path : path;
+
+        var relative = RelativizeToRoot(path, scanRoot);
+        if (!relative.StartsWith("/", StringComparison.Ordinal))
+            return relative;
+        relative = RelativizeToRoot(path, workingDirectory);
+        return relative.StartsWith("/", StringComparison.Ordinal)
+            ? FileSchemePrefix + path
+            : relative;
+    }
+
+    /// <summary>
+    /// Lexically resolves '.' and '..' segments on a '/'-separated path —
+    /// '..' past the root clamps for absolute paths, and stays a leading
+    /// segment for relative ones (a genuine escape the caller marks). Tool
+    /// report paths are untrusted text: collapsing here keeps a report from
+    /// smuggling traversal segments into finding locations.
+    /// </summary>
+    public static string CollapseDotSegments(string path)
+    {
+        var absolute = path.Length > 0 && path[0] == '/';
+        var segments = new List<string>();
+        foreach (var segment in path.Split('/'))
+        {
+            if (segment.Length == 0 || segment == ".")
+                continue;
+            if (segment == "..")
+            {
+                if (segments.Count > 0 && segments[^1] != "..")
+                    segments.RemoveAt(segments.Count - 1);
+                else if (!absolute)
+                    segments.Add(segment);
+                continue;
+            }
+            segments.Add(segment);
+        }
+        var joined = string.Join('/', segments);
+        return absolute ? "/" + joined : joined;
+    }
+
+    private static bool HasDotDotSegment(string path)
+        => path.Split('/').Contains("..", StringComparer.Ordinal);
 }

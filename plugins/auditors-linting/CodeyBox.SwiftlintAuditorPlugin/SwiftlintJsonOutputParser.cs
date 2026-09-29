@@ -42,8 +42,6 @@ internal sealed class SwiftlintJsonOutputParser : IExternalToolOutputParser
     private const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
     private const int MessageMaxChars = 512;
 
-    private const string FileSchemePrefix = "file://";
-
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -75,7 +73,7 @@ internal sealed class SwiftlintJsonOutputParser : IExternalToolOutputParser
                 if (findings.Count >= MaxResults)
                     break;
                 if (violation.ValueKind == JsonValueKind.Object)
-                    findings.Add(ParseViolation(violation, input.ScanRoot));
+                    findings.Add(ParseViolation(violation, input));
             }
 
             // SwiftLint exits non-zero from a completed scan only when it
@@ -90,7 +88,7 @@ internal sealed class SwiftlintJsonOutputParser : IExternalToolOutputParser
         }
     }
 
-    private static ExternalToolFinding ParseViolation(JsonElement violation, string? scanRoot)
+    private static ExternalToolFinding ParseViolation(JsonElement violation, ExternalToolParseInput input)
     {
         var message = NullIfWhiteSpace(GetString(violation, "reason"u8)) ?? "(no message)";
 
@@ -105,27 +103,8 @@ internal sealed class SwiftlintJsonOutputParser : IExternalToolOutputParser
             SeverityLevel: NullIfWhiteSpace(GetString(violation, "severity"u8)),
             RuleId: NullIfWhiteSpace(GetString(violation, "rule_id"u8)),
             Message: Truncate(SingleLine(message), MessageMaxChars),
-            Path: NormalizeFilePath(GetString(violation, "file"u8), scanRoot),
+            Path: NormalizeReportedPath(
+                GetString(violation, "file"u8), input.ScanRoot, input.WorkingDirectory),
             Line: line);
-    }
-
-    private static string? NormalizeFilePath(string? raw, string? scanRoot)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return null;
-        var path = NormalizePath(raw);
-        if (path.StartsWith(FileSchemePrefix, StringComparison.OrdinalIgnoreCase))
-            path = path[FileSchemePrefix.Length..];
-
-        var relative = RelativizeToRoot(path, scanRoot);
-        if (!string.Equals(relative, path, StringComparison.Ordinal))
-            return relative;
-
-        // Out-of-root and absolute: re-mark with the file:// scheme so the
-        // reported location stays distinguishable from a repository-relative
-        // path — the base trims a bare leading '/' from finding paths.
-        if (path.StartsWith("/", StringComparison.Ordinal))
-            return FileSchemePrefix + path;
-        return path;
     }
 }

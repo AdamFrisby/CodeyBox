@@ -77,7 +77,11 @@ namespace CodeyBox.PsScriptAnalyzerAuditorPlugin;
 /// exactly match a preset shipped by the pinned module — every other
 /// string resolves through the cmdlet's provider-path resolver (cwd-
 /// relative, with wildcard expansion), so wildcards are rejected and all
-/// remaining values go through the containment check.</para>
+/// remaining values go through the containment check. Because the resolver
+/// globs the argv value it is handed, the metacharacter rejection applies
+/// to the canonicalized string too: realpath resolves through symlinked
+/// components whose literal names can introduce <c>[</c> <c>]</c> <c>*</c>
+/// <c>?</c> the configured path never carried.</para>
 ///
 /// <para><b>Version pin.</b> The rule corpus changes between module
 /// releases, so findings are only meaningful from the build the auditor
@@ -190,7 +194,11 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     /// directory. The cmdlet's own preset check is exact ordinal-ignore-case
     /// membership in this list; anything else name-shaped resolves as a
     /// provider path (cwd-relative, with wildcard expansion) rather than as
-    /// a preset, so only exact matches may skip canonicalization.
+    /// a preset, so only exact matches may skip canonicalization. The list
+    /// travels with <see cref="DefaultExpectedVersion"/> — an operator who
+    /// re-pins <c>ExpectedVersion</c> to a release shipping a different
+    /// preset set must update it here too (a missing entry fails closed:
+    /// the name resolves as an in-tree path and is rejected).
     /// </summary>
     private static readonly HashSet<string> BuiltinSettingsPresets = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -201,6 +209,7 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
         "CodeFormattingStroustrup",
         "DSC",
         "PSGallery",
+        "ScriptFunctions",
         "ScriptingStyle",
         "ScriptSecurity",
     };
@@ -349,9 +358,12 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     /// cmdlet resolves through a globbing, cwd-relative provider-path
     /// resolver: wildcard metacharacters are rejected outright (a wildcard
     /// could expand to an in-tree file the canonicalization check never
-    /// sees), and the surviving path must canonicalize outside the
-    /// worktree. The value validated is exactly the value argv carries — a
-    /// mid-run scoped-config reload cannot split the guard from the flag.
+    /// sees), the surviving path must canonicalize outside the worktree,
+    /// and the canonical result is metacharacter-checked again — realpath
+    /// can introduce <c>[</c>/<c>]</c>/<c>*</c>/<c>?</c> through a glob-named
+    /// symlinked component the configured spelling lacked. The value
+    /// validated is exactly the value argv carries — a mid-run
+    /// scoped-config reload cannot split the guard from the flag.
     /// </summary>
     protected override async Task<IReadOnlyList<string>> ResolveContextArgumentsAsync(
         ISandbox sandbox,
@@ -362,7 +374,9 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     {
         var configured = ValidatedScopedValue(_settingsPath(), SettingsPathKey);
         if (configured is null)
-            return ["-Settings", Path.Combine(PerRunTempDirectoryPath, EmptySettingsFileName)];
+            return ["-Settings",
+                RejectGlobExpandableSettingsValue(
+                    Path.Combine(PerRunTempDirectoryPath, EmptySettingsFileName))];
         if (BuiltinSettingsPresets.Contains(configured))
             return ["-Settings", configured];
         if (configured.IndexOfAny(WildcardMetacharacters) >= 0)
@@ -376,7 +390,28 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
 
         var canonical = await CanonicalizeOutsideWorktreeAsync(
             sandbox, workingDirectory, configured, SettingsPathKey, options, ct).ConfigureAwait(false);
-        return ["-Settings", canonical];
+        return ["-Settings", RejectGlobExpandableSettingsValue(canonical)];
+    }
+
+    // The -Settings value the argv actually carries is the string the
+    // cmdlet's globbing provider-path resolver expands — so the resolved
+    // value needs the same metacharacter rejection the configured one got:
+    // realpath resolves THROUGH symlinked directory components, and a
+    // component literally named like 'pol[ic]y' puts '[' ']' into the
+    // canonical string that the configured value never carried. Glob
+    // expansion of that argv value could then land on an in-tree file the
+    // containment check judged only by its literal spelling.
+    private string RejectGlobExpandableSettingsValue(string resolved)
+    {
+        if (resolved.IndexOfAny(WildcardMetacharacters) < 0)
+            return resolved;
+        throw new AuditUnavailableException(
+            $"could-not-verify: auditor '{Name}' resolved -Settings path "
+            + $"'{TruncateForMessage(resolved)}' carries wildcard metacharacters — canonicalization "
+            + "resolved through a glob-named component, and the cmdlet's globbing provider-path "
+            + "resolver would expand the argv value to a file the containment check never judged. "
+            + "Point SettingsPath at a path whose canonical form has no '*', '?', '[', ']'.")
+        { IsDeterministic = true };
     }
 
     /// <summary>
@@ -454,7 +489,7 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
         return Task.CompletedTask;
     }
 
-    private static void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
+    private void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
     {
         var offenders = new List<string>();
         foreach (var arg in options.ExtraArguments)
@@ -470,7 +505,7 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
                 // -Settings just as "-Settings" does.
                 if (reserved.StartsWith(token, StringComparison.OrdinalIgnoreCase))
                 {
-                    offenders.Add(arg.Trim());
+                    offenders.Add(TruncateForMessage(arg));
                     break;
                 }
             }
@@ -478,8 +513,8 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
         if (offenders.Count == 0)
             return;
         throw new AuditUnavailableException(
-            $"could-not-verify: auditor 'codeybox:psscriptanalyzer' was configured with ExtraArguments carrying "
-            + $"reserved flag(s) '{string.Join("', '", offenders)}' — they would retarget the scan, "
+            $"could-not-verify: auditor '{Name}' was configured with ExtraArguments carrying "
+            + $"reserved flag(s) '{string.Join("', '", offenders.Distinct(StringComparer.Ordinal))}' — they would retarget the scan, "
             + "corrupt the JSON report on stdout, change the declared exit convention, mutate the "
             + "audited tree, fetch modules mid-scan, load in-tree rule modules, or re-open the "
             + $"scoped-config surface. Use the scoped keys under CodeyBox:Plugins:{PluginId} "
@@ -499,8 +534,7 @@ public sealed class PsScriptAnalyzerAuditor : ExternalToolAuditorBase, IPluginIn
     private static string? ExtraArgumentFlagToken(string arg)
     {
         var trimmed = arg.Trim();
-        if (trimmed.Length == 0
-            || trimmed[0] is not ('-' or '\u2013' or '\u2014' or '\u2015'))
+        if (trimmed.Length == 0 || !IsParameterDash(trimmed[0]))
             return null;
         var normalized = '-' + trimmed[1..];
         var stop = normalized.IndexOfAny(FlagValueSeparators);

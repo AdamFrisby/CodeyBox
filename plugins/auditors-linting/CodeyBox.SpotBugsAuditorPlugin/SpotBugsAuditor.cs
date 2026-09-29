@@ -277,28 +277,28 @@ public sealed class SpotBugsAuditor : ExternalToolAuditorBase, IPluginInitialize
         return Task.CompletedTask;
     }
 
-    private static string ResolveConfidenceLevel(string? configured)
+    private string ResolveConfidenceLevel(string? configured)
     {
         var level = configured?.Trim().ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(level))
             return DefaultConfidenceLevel;
         if (!KnownConfidenceLevels.Contains(level))
             throw new AuditUnavailableException(
-                $"could-not-verify: auditor 'codeybox:spotbugs' was configured with unknown {ConfidenceLevelKey} "
+                $"could-not-verify: auditor '{Name}' was configured with unknown {ConfidenceLevelKey} "
                 + $"'{TruncateForMessage(configured)}'. Set CodeyBox:Plugins:{PluginId}:{ConfidenceLevelKey} "
                 + "to high, medium, or low.")
             { IsDeterministic = true };
         return level;
     }
 
-    private static string ResolveEffortLevel(string? configured)
+    private string ResolveEffortLevel(string? configured)
     {
         var level = configured?.Trim().ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(level))
             return DefaultEffortLevel;
         if (!KnownEffortLevels.Contains(level))
             throw new AuditUnavailableException(
-                $"could-not-verify: auditor 'codeybox:spotbugs' was configured with unknown {EffortLevelKey} "
+                $"could-not-verify: auditor '{Name}' was configured with unknown {EffortLevelKey} "
                 + $"'{TruncateForMessage(configured)}'. Set CodeyBox:Plugins:{PluginId}:{EffortLevelKey} "
                 + "to min, less, default, more, or max.")
             { IsDeterministic = true };

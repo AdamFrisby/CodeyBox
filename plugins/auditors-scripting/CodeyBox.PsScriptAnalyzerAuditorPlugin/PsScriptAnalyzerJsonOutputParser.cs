@@ -16,11 +16,14 @@ namespace CodeyBox.PsScriptAnalyzerAuditorPlugin;
 /// findings — and the file/line the record supplies is preserved.
 ///
 /// <para><c>File</c> is the path the analyzer resolved: relative to the scan
-/// target when it can be, absolute otherwise. Absolute paths are relativized
-/// against <see cref="ExternalToolParseInput.ScanRoot"/> (probed per run,
-/// since sandbox providers may translate the working directory) or the exec
-/// working directory; a path that stays absolute is re-marked with a
-/// <c>file://</c> prefix so it cannot accidentally match repo-relative
+/// target when it can be, absolute otherwise. Reported paths go through the
+/// shared <see cref="ExternalToolJsonHelpers.NormalizeReportedPath"/> policy:
+/// dot segments collapsed, absolute paths relativized against
+/// <see cref="ExternalToolParseInput.ScanRoot"/> (probed per run, since
+/// sandbox providers may translate the working directory) or the exec
+/// working directory, and a path that stays absolute — or a relative path
+/// still carrying '..' — re-marked with a <c>file://</c> prefix so it cannot
+/// accidentally match repo-relative
 /// <see cref="ExternalToolAuditorOptions.ExcludePaths"/> entries.</para>
 ///
 /// <para>Malformed output — empty stdout, non-JSON, or a JSON document that
@@ -37,7 +40,6 @@ internal sealed class PsScriptAnalyzerJsonOutputParser : IExternalToolOutputPars
     internal const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
 
     private const int MessageMaxChars = 2000;
-    private const string FileSchemePrefix = "file://";
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
@@ -94,7 +96,8 @@ internal sealed class PsScriptAnalyzerJsonOutputParser : IExternalToolOutputPars
             SeverityLevel: NullIfWhiteSpace(GetString(record, "Severity"u8)),
             RuleId: NullIfWhiteSpace(GetString(record, "RuleName"u8)),
             Message: Truncate(SingleLine(message), MessageMaxChars),
-            Path: NormalizeReportedPath(GetString(record, "File"u8), input),
+            Path: NormalizeReportedPath(
+                GetString(record, "File"u8), input.ScanRoot, input.WorkingDirectory),
             Line: ReadPositiveInt(record, "Line"u8));
     }
 
@@ -105,70 +108,4 @@ internal sealed class PsScriptAnalyzerJsonOutputParser : IExternalToolOutputPars
             && value > 0
             ? value
             : null;
-
-    private static string? NormalizeReportedPath(string? raw, ExternalToolParseInput input)
-    {
-        var path = NormalizePath(raw);
-        if (path.Length == 0)
-            return null;
-        if (path.StartsWith(FileSchemePrefix, StringComparison.OrdinalIgnoreCase))
-            path = path[FileSchemePrefix.Length..];
-
-        // A tool-reported "./x" is the same location as "x", and a reported
-        // "a/../b" is "b" — dot segments are collapsed lexically BEFORE
-        // relativization, otherwise "/work/../outside.ps1" would strip the
-        // scan-root prefix and reach findings as the pseudo repo-relative
-        // "../outside.ps1".
-        path = CollapseDotSegments(path);
-        if (path.Length == 0)
-            return null;
-
-        if (!path.StartsWith("/", StringComparison.Ordinal))
-        {
-            // A relative path still carrying '..' escapes its base — mark
-            // it out-of-tree like an unresolved absolute path rather than
-            // letting it reach finding locations as a repo-relative value.
-            return HasDotDotSegment(path) ? FileSchemePrefix + path : path;
-        }
-
-        var relative = RelativizeToRoot(path, input.ScanRoot);
-        if (!relative.StartsWith("/", StringComparison.Ordinal))
-            return relative;
-        relative = RelativizeToRoot(path, input.WorkingDirectory);
-        if (!relative.StartsWith("/", StringComparison.Ordinal))
-            return relative;
-
-        // Out-of-root absolute path: re-mark with the file:// scheme so it
-        // stays distinguishable from a repo-relative path (the base trims a
-        // bare leading '/' from finding paths).
-        return FileSchemePrefix + path;
-    }
-
-    // Lexically resolves '.' and '..' segments on a '/'-separated path —
-    // '..' past the root clamps for absolute paths, and stays a leading
-    // segment for relative ones (a genuine escape the caller marks).
-    private static string CollapseDotSegments(string path)
-    {
-        var absolute = path.Length > 0 && path[0] == '/';
-        var segments = new List<string>();
-        foreach (var segment in path.Split('/'))
-        {
-            if (segment.Length == 0 || segment == ".")
-                continue;
-            if (segment == "..")
-            {
-                if (segments.Count > 0 && segments[^1] != "..")
-                    segments.RemoveAt(segments.Count - 1);
-                else if (!absolute)
-                    segments.Add(segment);
-                continue;
-            }
-            segments.Add(segment);
-        }
-        var joined = string.Join('/', segments);
-        return absolute ? "/" + joined : joined;
-    }
-
-    private static bool HasDotDotSegment(string path)
-        => path.Split('/').Contains("..", StringComparer.Ordinal);
 }

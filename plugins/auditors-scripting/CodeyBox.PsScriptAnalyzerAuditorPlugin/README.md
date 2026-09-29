@@ -176,9 +176,9 @@ Scoped under `CodeyBox:Plugins:codeybox.psscriptanalyzer`, resolved per run
 
 | Key | Default | Meaning |
 |---|---|---|
-| `ExpectedVersion` | `1.25.0` | Pinned PSScriptAnalyzer module release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. |
+| `ExpectedVersion` | `1.25.0` | Pinned PSScriptAnalyzer module release; any other installed version fails closed as infrastructure. Set this to the release you provisioned. The `SettingsPath` built-in preset list above is the set shipped by the pinned release — a re-pin to a release shipping different presets needs the plugin's `BuiltinSettingsPresets` updated too (an unlisted preset fails closed, rejected as an in-tree path). |
 | `TargetPath` | `.` | Single `-Path` value — a repo-relative path keeps finding locations repo-relative. |
-| `SettingsPath` | — | `-Settings` value: a built-in preset name shipped by the pinned module (`CmdletDesign`, `CodeFormatting`, `CodeFormattingAllman`, `CodeFormattingOTBS`, `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptingStyle`, `ScriptSecurity` — exact names only; PSScriptAnalyzer 1.25.0 has no comma-list form), or a `.psd1` path that must resolve **outside** the audited worktree and contain no wildcard characters (in-tree paths and globs are rejected deterministically — see below). Unset → a generated empty settings file pinning the default rule set. |
+| `SettingsPath` | — | `-Settings` value: a built-in preset name shipped by the pinned module (`CmdletDesign`, `CodeFormatting`, `CodeFormattingAllman`, `CodeFormattingOTBS`, `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptFunctions`, `ScriptingStyle`, `ScriptSecurity` — exact names only; PSScriptAnalyzer 1.25.0 has no comma-list form), or a `.psd1` path that must resolve **outside** the audited worktree and contain no wildcard characters (in-tree paths and globs are rejected deterministically — see below). Unset → a generated empty settings file pinning the default rule set. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. |
 | `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop (e.g. `PSAvoidUsingWriteHost`). Post-scan filtering. |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Post-scan filter; setting it replaces the default list. |
@@ -207,9 +207,9 @@ The auditor therefore **always** passes `-Settings`:
 - `SettingsPath` = a built-in preset name → passed verbatim. Preset names
   are validated against the pinned module's shipped list (`CmdletDesign`,
   `CodeFormatting`, `CodeFormattingAllman`, `CodeFormattingOTBS`,
-  `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptingStyle`,
-  `ScriptSecurity`) because any other name-shaped value is treated by the
-  cmdlet as a file path, not a preset.
+  `CodeFormattingStroustrup`, `DSC`, `PSGallery`, `ScriptFunctions`,
+  `ScriptingStyle`, `ScriptSecurity`) because any other name-shaped value is
+  treated by the cmdlet as a file path, not a preset.
 - `SettingsPath` = any other value → treated as a file path. Wildcard
   characters (`*`, `?`, `[`, `]`) are rejected — the cmdlet resolves the
   value through a globbing provider-path resolver, so a glob could expand
@@ -219,7 +219,11 @@ The auditor therefore **always** passes `-Settings`:
   canonical path lands inside the tree — relative paths (the cmdlet
   resolves them against its cwd — the worktree), `..` segments, and
   symlinked components all collapse to the path the cmdlet would actually
-  open.
+  open. The canonical string is wildcard-checked again before it reaches
+  argv: `realpath` resolves through symlinked components whose literal
+  names can introduce `*`/`?`/`[`/`]` the configured value never carried,
+  and the cmdlet would glob-expand them to a file the containment check
+  never judged.
 
 Custom rule modules are reachable only through an operator's
 outside-worktree settings file: `-CustomRulePath` and friends are reserved

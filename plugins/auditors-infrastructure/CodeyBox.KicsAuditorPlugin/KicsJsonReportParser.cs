@@ -125,7 +125,8 @@ internal sealed class KicsJsonReportParser : IExternalToolOutputParser
         var severity = GetString(query, "severity"u8);
         var queryName = GetString(query, "query_name"u8);
 
-        var path = NormalizeReportedPath(GetString(file, "file_name"u8), input);
+        var path = NormalizeReportedPath(
+            GetString(file, "file_name"u8), input.ScanRoot, input.WorkingDirectory);
         var line = ReadPositiveInt(file, "line"u8);
 
         return new ExternalToolFinding(
@@ -171,54 +172,6 @@ internal sealed class KicsJsonReportParser : IExternalToolOutputParser
         if (string.IsNullOrWhiteSpace(value))
             return;
         details.Add($"{label}={Truncate(SingleLine(value.Trim()), MessageDetailMaxChars)}");
-    }
-
-    /// <summary>
-    /// Normalizes a KICS-reported <c>file_name</c> to a repository-relative
-    /// path: dot segments are collapsed (<c>./</c> dropped, <c>a/../b</c> →
-    /// <c>b</c>), and absolute paths are relativized against the scan root
-    /// (resolved per run from the sandbox, since sandbox providers may
-    /// translate the working directory) or the exec working directory. An
-    /// absolute path outside the root is kept absolute rather than
-    /// rewritten.
-    /// </summary>
-    private static string? NormalizeReportedPath(string? reported, ExternalToolParseInput input)
-    {
-        var normalized = CollapseDotSegments(NormalizePath(reported));
-        if (normalized.Length == 0 || !normalized.StartsWith("/", StringComparison.Ordinal))
-            return normalized.Length == 0 ? null : normalized;
-
-        var relative = RelativizeToRoot(normalized, input.ScanRoot);
-        if (!relative.StartsWith("/", StringComparison.Ordinal))
-            return relative;
-        relative = RelativizeToRoot(normalized, input.WorkingDirectory);
-        return relative;
-    }
-
-    // Tool-reported paths are untrusted text: resolve "." and ".." lexically
-    // so a report cannot smuggle traversal segments into finding locations.
-    // A leading ".." on a relative path is kept — it cannot be resolved
-    // without a base and dropping it would silently rewrite the location.
-    private static string CollapseDotSegments(string path)
-    {
-        var rooted = path.StartsWith("/", StringComparison.Ordinal);
-        var segments = new List<string>();
-        foreach (var segment in path.Split('/'))
-        {
-            if (segment.Length == 0 || segment == ".")
-                continue;
-            if (segment == "..")
-            {
-                if (segments.Count > 0 && segments[^1] != "..")
-                    segments.RemoveAt(segments.Count - 1);
-                else if (!rooted)
-                    segments.Add(segment);
-                continue;
-            }
-            segments.Add(segment);
-        }
-        var joined = string.Join('/', segments);
-        return rooted ? "/" + joined : joined;
     }
 
     private static int ReadCounter(JsonElement root, ReadOnlySpan<byte> name)

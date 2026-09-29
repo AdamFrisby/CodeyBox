@@ -485,7 +485,7 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
         => await ProbeSandboxWorkingDirectoryAsync(sandbox, workingDirectory, options, ct)
             .ConfigureAwait(false);
 
-    private static void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
+    private void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
     {
         var offenders = new List<string>();
         foreach (var (longFlag, shortFlag) in ReservedFlags)
@@ -497,7 +497,7 @@ public sealed class KicsAuditor : ExternalToolAuditorBase, IPluginInitializer
         if (offenders.Count == 0)
             return;
         throw new AuditUnavailableException(
-            $"could-not-verify: auditor 'codeybox:kics' was configured with ExtraArguments carrying "
+            $"could-not-verify: auditor '{Name}' was configured with ExtraArguments carrying "
             + $"reserved flag(s) '{string.Join("', '", offenders)}' — they would redirect the report "
             + "sink, re-open the repository-controlled config surface, fight the pinned --silent, or "
             + "change the declared exit-code contract. Use the scoped keys under "
