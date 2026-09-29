@@ -293,6 +293,142 @@ public sealed class DeferredCapWaiterDispatchTests : IDisposable
     }
 
     [Fact]
+    public async Task CapRaiseHotReload_WakesCapDeferredItem_WithoutRecheckWait()
+    {
+        // Raising a cap frees headroom without a slot release, so the release
+        // wake never fires for it — without a reload wake the deferred item
+        // would sleep out the whole cap-retry interval (here pinned at 1h on
+        // the fake clock) against a cap that no longer binds it. The reload
+        // must admit it at the next dispatch decision.
+        var time = new ControllableTimeProvider();
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new ItemGatedPipeline(_store);
+        var counters = new LateBoundRunningCounters();
+        var caps = new AgentConcurrencySnapshot(Caps(codexMax: 1));
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 2 },
+            NullLogger<OrchestratorService>.Instance,
+            router: BuildRouter(codexAvailablePct: 100.0,
+                runningCounters: counters, concurrencySnapshot: caps),
+            agentConcurrencySnapshot: caps,
+            timeProvider: time);
+        counters.Inner = svc;
+
+        // Pin the only codex slot with a real running item.
+        var occupant = Item();
+        var a = Item(WorkItemState.WorkComplete, priority: 0, queuePosition: 1);
+        await _store.CreateAsync(occupant);
+        await queue.EnqueueAsync(occupant.Id);
+        await svc.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await pipeline.WaitForEnteredAsync(occupant.Id, DispatchWaitTimeout));
+            Assert.Equal(1, svc.GetRunning(Codex));
+
+            await _store.CreateAsync(a);
+            await queue.EnqueueAsync(a.Id);
+            Assert.True(await WaitUntilAsync(() => svc.IsDeferredForTest(a.Id), DeferralWaitTimeout));
+
+            // Raising the cap via hot-reload admits the deferred item at the
+            // next dispatch decision — the fake clock never advances, so the
+            // 1h recheck timer cannot be what dispatched it.
+            svc.ApplyAgentConcurrencyReload(Caps(codexMax: 2));
+
+            Assert.True(await pipeline.WaitForEnteredAsync(a.Id, DispatchWaitTimeout));
+            // The occupant kept its slot — raising adds headroom, it never
+            // touches in-flight work.
+            Assert.Equal(2, svc.GetRunning(Codex));
+        }
+        finally
+        {
+            pipeline.Release(occupant.Id);
+            pipeline.Release(a.Id);
+            await svc.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task CapLowerHotReload_DeferredItemStaysParked_UntilRunningDropsBelowCap()
+    {
+        // Lowering a cap below the live in-flight count must not cancel or
+        // fail running items, and must not admit the cap-deferred item until
+        // running drops below the new cap.
+        var time = new ControllableTimeProvider();
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new ItemGatedPipeline(_store);
+        var counters = new LateBoundRunningCounters();
+        var caps = new AgentConcurrencySnapshot(Caps(codexMax: 2));
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 3 },
+            NullLogger<OrchestratorService>.Instance,
+            router: BuildRouter(codexAvailablePct: 100.0,
+                runningCounters: counters, concurrencySnapshot: caps),
+            agentConcurrencySnapshot: caps,
+            timeProvider: time);
+        counters.Inner = svc;
+
+        var occupant1 = Item();
+        var occupant2 = Item();
+        foreach (var item in new[] { occupant1, occupant2 })
+        {
+            await _store.CreateAsync(item);
+            await queue.EnqueueAsync(item.Id);
+        }
+        await svc.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await pipeline.WaitForEnteredAsync(occupant1.Id, DispatchWaitTimeout));
+            Assert.True(await pipeline.WaitForEnteredAsync(occupant2.Id, DispatchWaitTimeout));
+            Assert.Equal(2, svc.GetRunning(Codex));
+
+            var waiting = Item(WorkItemState.WorkComplete, priority: 0, queuePosition: 5);
+            await _store.CreateAsync(waiting);
+            await queue.EnqueueAsync(waiting.Id);
+            Assert.True(await WaitUntilAsync(() => svc.IsDeferredForTest(waiting.Id), DeferralWaitTimeout));
+
+            // Lower codex 2 → 1 while both items run. The deferred item must
+            // not be woken into a cap that still binds it.
+            svc.ApplyAgentConcurrencyReload(Caps(codexMax: 1));
+            await Task.Delay(500);
+            Assert.True(svc.IsDeferredForTest(waiting.Id));
+            Assert.False(pipeline.HasEntered(waiting.Id));
+
+            // In-flight work is untouched: both occupants still hold slots,
+            // neither was failed, and /concurrency already reports the new cap.
+            Assert.Equal(2, svc.GetRunning(Codex));
+            Assert.Equal(1, svc.GetConcurrencyState().PerAgentCaps["codex"]);
+            var o1 = await _store.GetAsync(occupant1.Id, CancellationToken.None);
+            var o2 = await _store.GetAsync(occupant2.Id, CancellationToken.None);
+            Assert.NotEqual(WorkItemState.Failed, o1!.State);
+            Assert.NotEqual(WorkItemState.Failed, o2!.State);
+
+            // First release drops running to the new cap: the release wakes
+            // the deferred item, but its re-pickup still cannot reserve, so
+            // it re-defers without dispatching.
+            pipeline.Release(occupant1.Id);
+            Assert.True(await WaitUntilAsync(() => svc.GetRunning(Codex) <= 1, DeferralWaitTimeout));
+            await Task.Delay(500);
+            Assert.False(pipeline.HasEntered(waiting.Id));
+
+            // Second release drops running below the cap — the release wake
+            // admits the deferred item.
+            pipeline.Release(occupant2.Id);
+            Assert.True(await pipeline.WaitForEnteredAsync(waiting.Id, DispatchWaitTimeout));
+            pipeline.Release(waiting.Id);
+        }
+        finally
+        {
+            pipeline.Release(occupant1.Id);
+            pipeline.Release(occupant2.Id);
+            await svc.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task QuotaOnlyDeferral_StillRechecksOnInterval_NotOnSlotRelease()
     {
         // Regression guard: only cap deferrals ride the release signal. A
