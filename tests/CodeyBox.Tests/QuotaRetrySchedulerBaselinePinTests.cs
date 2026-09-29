@@ -127,6 +127,9 @@ public sealed class QuotaRetrySchedulerBaselinePinTests : IDisposable
             State = WorkItemState.WaitingForQuotaReset,
             FailureKind = "quota",
             AgentClassId = "frontier",
+            // The incumbent agent: the retry-path pin is attributed to it, so
+            // the class's Claude member is gated on the pinned ref.
+            Agent = AgentKind.Claude,
             NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-2),
         };
 

@@ -680,7 +680,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // (when wired) also probes an apparently-Available-but-never-probed
             // agent here so the exit-127 / auth cascade is caught on the FIRST
             // dispatch, not on first run; a cache hit is free.
-            var availability = await GetGatedAvailabilityAsync(member, smokeTarget, ct);
+            var availability = await GetGatedAvailabilityAsync(
+                member, SmokeTargetForMember(smokeTarget, item, member), ct);
             if (availability is { Available: false })
             {
                 if (IsOperatorPaused(availability))
@@ -1481,13 +1482,25 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// receive the ordered smoke-checked candidates and apply their own quota
     /// policy.
     /// </para>
+    /// <para>
+    /// <paramref name="pinFollowsDispatchAgent"/> controls how the work item's
+    /// baseline pin reaches the smoke gate. Pass true when picking a candidate
+    /// replaces the item's dispatch agent (the mid-iteration work-agent
+    /// fallback): a cross-kind member would dispatch with the pin dropped, so
+    /// it must be gated on the active baseline its sandbox would actually
+    /// clone, and only a member matching the pin's attributed agent may be
+    /// probed against it. Pass false (the default) when candidates merely run
+    /// inside a sandbox already derived from the pin (audit / merge-conflict
+    /// resolver enumeration) — every candidate then gates on the pinned image.
+    /// </para>
     /// </summary>
     public async Task<IReadOnlyList<AgentMembership>> OrderedFallbackCandidatesAsync(
         WorkItem item,
         Project? project,
         CancellationToken ct,
         InVmSmokeSandboxTarget? smokeTarget = null,
-        bool requireQuota = true)
+        bool requireQuota = true,
+        bool pinFollowsDispatchAgent = false)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -1536,7 +1549,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var result = new List<AgentMembership>(ordered.Count);
         foreach (var member in ordered)
         {
-            var av = await GetGatedAvailabilityAsync(member, target, ct);
+            var memberTarget = pinFollowsDispatchAgent
+                ? SmokeTargetForMember(target, item, member)
+                : target;
+            var av = await GetGatedAvailabilityAsync(member, memberTarget, ct);
             if (av is { Available: false })
                 continue;
 
@@ -1639,6 +1655,24 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         return SandboxTargetResolver.ToInVmSmokeTarget(project, target, item.BaselineImageRef);
     }
+
+    /// <summary>
+    /// Narrows <paramref name="target"/>'s pinned baseline ref to the members
+    /// the pin was actually resolved for. The pin encodes the provisioning set
+    /// of the agent kind recorded on <see cref="WorkItem.BaselineImageAgent"/>,
+    /// so probing a different kind against it would measure an image that
+    /// kind can never run on — and a member of another kind that does get
+    /// picked dispatches with the pin dropped, i.e. against the active
+    /// baseline the probe resolves here. Keeping probed image and cloned image
+    /// equal is the AC#1 invariant this narrowing preserves.
+    /// </summary>
+    private static InVmSmokeSandboxTarget SmokeTargetForMember(
+        InVmSmokeSandboxTarget target,
+        WorkItem item,
+        AgentMembership member) =>
+        item.BaselineImageAgent == member.Agent
+            ? target
+            : target.WithBaselineRef(null);
 
     private async Task<AgentAvailability?> GetGatedAvailabilityAsync(
         AgentKind kind,

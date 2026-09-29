@@ -839,8 +839,49 @@ public sealed record WorkItem
     /// expose a baseline-ref resolver (process / bubblewrap). When null, the
     /// provider falls back to computing the ref from live config — backward-
     /// compatible behaviour for the migration window.
+    /// <para>
+    /// The ref is content-addressed over what has to be provisioned — including
+    /// the agent CLI set — so a pin is only valid for the agent kind it was
+    /// resolved under, recorded on <see cref="BaselineImageAgent"/>. When routing
+    /// (or a mid-iteration runner swap) replaces the dispatch agent with a
+    /// different kind, the pin is dropped and re-resolved so the item does not
+    /// launch into a baseline that lacks the new agent's binary. A pin with no
+    /// recorded agent (rows predating the attribution column) cannot be matched
+    /// to a dispatch agent, so it is re-resolved at the next dispatch rather
+    /// than trusted blindly.
+    /// </para>
     /// </summary>
     public string? BaselineImageRef { get; init; }
+
+    /// <summary>
+    /// The agent kind <see cref="BaselineImageRef"/> was resolved for. Persisted
+    /// alongside the pin so a later pickup can tell a still-valid pin from a
+    /// stale one after re-routing — the comparison must NOT be made against
+    /// <see cref="Agent"/>, which the router rewrites at pickup and which
+    /// recovery paths persist without touching the pin. Null when no pin is
+    /// set or when the pin predates attribution.
+    /// </summary>
+    public AgentKind? BaselineImageAgent { get; init; }
+
+    /// <summary>
+    /// Returns the baseline pin usable for a sandbox dispatched as
+    /// <paramref name="agent"/>: the pinned ref when it was resolved for that
+    /// agent kind, otherwise null so the provider resolves the baseline the
+    /// new agent actually needs.
+    /// </summary>
+    public string? BaselineRefForAgent(AgentKind agent) =>
+        BaselineImageAgent == agent ? BaselineImageRef : null;
+
+    /// <summary>
+    /// Returns a copy with the baseline pin dropped when it was not resolved
+    /// for <paramref name="agent"/>. Identity-preserving when the pin already
+    /// serves <paramref name="agent"/> (or there is no pin), so callers may
+    /// apply it unconditionally wherever the dispatch agent is swapped.
+    /// </summary>
+    public WorkItem WithBaselinePinForAgent(AgentKind agent) =>
+        BaselineImageRef is null || BaselineImageAgent == agent
+            ? this
+            : this with { BaselineImageRef = null, BaselineImageAgent = null };
 
     public WorkItem With(
         WorkItemState state,

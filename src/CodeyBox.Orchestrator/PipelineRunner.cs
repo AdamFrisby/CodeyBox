@@ -83,7 +83,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // lookup so saved provider state cannot cross an account route.
             if (item.AgentTurnResumeCheckpoint is { } durableTurnResume)
             {
-                item = item with
+                // The pin travels with the agent it was resolved for: when the
+                // checkpoint restores a different kind, a stale pin would
+                // clone a baseline lacking that agent's CLI on a fresh
+                // (non-adopted) sandbox.
+                item = item.WithBaselinePinForAgent(durableTurnResume.Agent) with
                 {
                     Agent = durableTurnResume.Agent,
                     AgentInstanceId = durableTurnResume.AgentInstanceRoute,
