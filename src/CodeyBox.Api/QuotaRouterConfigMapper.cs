@@ -354,11 +354,15 @@ internal static class QuotaRouterConfigMapper
             };
             if (poolKind == QuotaPoolKind.DepletingBalance)
             {
-                if (entry.MinQuotaPct is not null
-                    || entry.StartFloorPct is not null
-                    || entry.EndFloorPct is not null
-                    || entry.RampWindow is not null
-                    || entry.MinQuotaItems is not null)
+                // Test the raw config values, not the sanitised entry fields:
+                // a non-positive/non-finite value nulls out in the mapping
+                // above, and a sanitised-null check would silently keep the
+                // entry instead of rejecting the unit mixing it was set to flag.
+                if (kv.Value.MinQuotaPct is not null
+                    || kv.Value.StartFloorPct is not null
+                    || kv.Value.EndFloorPct is not null
+                    || kv.Value.RampWindowSeconds is not null
+                    || kv.Value.MinQuotaItems is not null)
                     throw new InvalidOperationException(
                         $"Quota pool '{name}' is a depleting-balance pool; express its floor " +
                         $"in absolute balance units via MinBalance, not in percent " +

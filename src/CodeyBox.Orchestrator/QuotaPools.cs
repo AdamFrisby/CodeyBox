@@ -101,9 +101,10 @@ public sealed class QuotaPoolOptions
     /// a percentage. Within the pool tier an explicit
     /// <see cref="ReservationEstimate"/> percentage wins; across tiers the
     /// pool entry wins over explicit, agent, derived, and global estimates.
-    /// Null (the default) keeps the percentage chain. A non-positive value is
-    /// ignored. Requires measured burn — without enough samples the percentage
-    /// chain applies unchanged. Rejected on depleting-balance pools (their
+    /// Null (the default) keeps the percentage chain. Non-positive or
+    /// non-finite values are rejected at load. Requires measured burn —
+    /// without enough samples the percentage chain applies unchanged.
+    /// Rejected on depleting-balance pools (their
     /// <see cref="ReservationEstimate"/> is already absolute). Hot-reloadable.
     /// </summary>
     public double? ReservationEstimateItems { get; set; }
@@ -175,7 +176,8 @@ public sealed class QuotaPoolFloorOptions
     /// floor of one item keeps headroom for one more dispatch however large the
     /// plan). Competes with the percentage floor via maximum so neither reserve
     /// can be undercut. Requires measured burn — without enough samples the
-    /// percentage floor applies unchanged. Rejected on depleting-balance pools.
+    /// percentage floor applies unchanged. Applies only to subscription-billed
+    /// members. Rejected on depleting-balance pools.
     /// </summary>
     public double? MinQuotaItems { get; set; }
 }

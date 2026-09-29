@@ -4983,7 +4983,8 @@ app.MapGet("/quota", async (
             dispatchStatus = paused ? "paused" : "quota",
             dispatchReason,
             bindingWindow = snapshot.BindingWindow,
-            windowSummary = QuotaWindowBinding.FormatWindowSummary(snapshot.Windows),
+            windowSummary = QuotaWindowBinding.FormatWindowSummary(
+                snapshot.Windows, snapshot.AvailablePct),
             wouldAllow = defaultVerdict?.Allow ?? false,
             defaultModelWouldAllow = defaultModelVerdict?.Allow ?? false,
             perModelWouldAllow,

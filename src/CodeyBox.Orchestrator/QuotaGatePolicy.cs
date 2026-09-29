@@ -235,7 +235,7 @@ public sealed class QuotaGatePolicy
 
         if (availablePct >= 0)
         {
-            var windowSuffix = FormatBindingSuffix(quota.Windows, bindingWindow);
+            var windowSuffix = FormatBindingSuffix(quota.Windows, bindingWindow, availablePct);
             var reason = escrowed > 0
                 ? $"quota below floor after outstanding reservations ({effectivePct:F1}% < {floor:F1}%; {escrowed:F1}% escrowed{windowSuffix})"
                 : $"quota below floor ({availablePct:F1}% < {floor:F1}%{windowSuffix})";
@@ -279,10 +279,10 @@ public sealed class QuotaGatePolicy
     /// providers keep today's reason text byte-for-byte. Pure.
     /// </summary>
     private static string FormatBindingSuffix(
-        IReadOnlyList<WindowQuota>? windows, string? bindingWindow)
+        IReadOnlyList<WindowQuota>? windows, string? bindingWindow, double producedPct)
     {
         if (bindingWindow is null) return string.Empty;
-        return QuotaWindowBinding.FormatWindowSummary(windows) is { } summary
+        return QuotaWindowBinding.FormatWindowSummary(windows, producedPct) is { } summary
             ? $"; {summary}"
             : string.Empty;
     }
@@ -754,31 +754,20 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
             recentObservedFailure,
             observedFailureReason,
             measuredBurn);
-        return new AgentQuotaGateVerdict(decision.Allow, decision.Allow ? null : decision.Reason);
+        return decision.Allow
+            ? AgentQuotaGateVerdict.Allowed()
+            : AgentQuotaGateVerdict.Denied(decision.Reason);
     }
 
     /// <summary>
-    /// Same estimator fetch the dispatch router's GetMeasuredBurnAsync does:
-    /// null when no estimator is wired or it throws (the percentage chain then
-    /// applies unchanged), cancellation propagates. The estimator caches per
-    /// agent, so repeated status calls stay cheap.
+    /// Same estimator fetch the dispatch router applies
+    /// (<see cref="AgentBurnEstimatorExtensions.GetEstimateOrNullAsync"/>):
+    /// null when no estimator is wired or it throws — the percentage chain
+    /// then applies unchanged — and cancellation propagates.
     /// </summary>
-    private async Task<AgentBurnEstimate?> GetMeasuredBurnAsync(
-        AgentMembership member, CancellationToken ct)
-    {
-        if (_burnEstimator is null) return null;
-        try
-        {
-            return await _burnEstimator.GetEstimateAsync(member.Agent, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _log?.LogDebug(ex,
-                "Quota burn: estimator threw for {Agent}; status gate falls back to configured estimates",
-                member.Agent.Value);
-            return null;
-        }
-    }
+    private Task<AgentBurnEstimate?> GetMeasuredBurnAsync(
+        AgentMembership member, CancellationToken ct) =>
+        _burnEstimator.GetEstimateOrNullAsync(member.Agent, _log, ct);
 }
 
 /// <summary>

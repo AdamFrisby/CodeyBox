@@ -123,7 +123,7 @@ public sealed class QuotaMeasuredBurnReservationTests
         var quota = ThreeWindowQuota(rolling: 100, weekly: 98, monthly: 6);
         Assert.Equal(
             "monthly 6.0% (binding), weekly 98.0%, rolling 100.0%",
-            QuotaWindowBinding.FormatWindowSummary(quota.Windows));
+            QuotaWindowBinding.FormatWindowSummary(quota.Windows, quota.AvailablePct));
     }
 
     // ── Measured-burn helpers ─────────────────────────────────────────────
@@ -419,7 +419,7 @@ public sealed class QuotaMeasuredBurnReservationTests
         var ledger = new QuotaReservationLedger(opts);
         var attempt = ledger.TryReserve(
             member, availablePct: 6.0, floorPct: floor,
-            measuredBurn: burn, bindingWindow: quota.BindingWindow);
+            measuredBurn: burn, windows: quota.Windows);
         Assert.True(attempt.Allowed);
         Assert.NotNull(attempt.Lease);
         Assert.Equal(0.9, ledger.GetOutstandingPct(member), precision: 9);
@@ -469,9 +469,57 @@ public sealed class QuotaMeasuredBurnReservationTests
         var opts = BaseOptions();
         var member = Sub(AgentKind.Copilot);
         var ledger = new QuotaReservationLedger(opts);
-        var attempt = ledger.TryReserve(member, availablePct: 6.0, floorPct: 5.0, bindingWindow: "monthly");
+        var attempt = ledger.TryReserve(
+            member, availablePct: 6.0, floorPct: 5.0,
+            windows: new List<WindowQuota>
+            {
+                new() { Name = "monthly", AvailablePct = 6.0 },
+                new() { Name = "weekly", AvailablePct = 98.0 },
+            });
         Assert.False(attempt.Allowed);
         Assert.EndsWith("; binding window 'monthly')", attempt.DenyReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReservationRefusal_WindowThatDidNotProduceReading_IsNotNamed()
+    {
+        var opts = BaseOptions();
+        var member = Sub(AgentKind.Copilot);
+        var ledger = new QuotaReservationLedger(opts);
+        // The aggregate 6.0 came from a non-window source: monthly's 4.0 is the
+        // scarcest window but did not produce the gated reading, so no window
+        // is named rather than misreporting the constraint.
+        var attempt = ledger.TryReserve(
+            member, availablePct: 6.0, floorPct: 5.0,
+            windows: new List<WindowQuota>
+            {
+                new() { Name = "monthly", AvailablePct = 4.0 },
+                new() { Name = "weekly", AvailablePct = 98.0 },
+            });
+        Assert.False(attempt.Allowed);
+        Assert.DoesNotContain("binding window", attempt.DenyReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReservationRefusal_BalancePool_NeverNamesWindow()
+    {
+        var opts = BaseOptions();
+        opts.Pools["prepaid"] = new QuotaPoolOptions
+        {
+            Name = "prepaid",
+            Kind = QuotaPoolKind.DepletingBalance,
+            BalanceUnit = "credits",
+            ReservationEstimate = 10,
+        };
+        var member = Sub(AgentKind.Copilot, pool: "prepaid");
+        var ledger = new QuotaReservationLedger(opts);
+        // availablePct is the absolute balance here; even a window whose
+        // reading coincidentally equals it did not gate the dispatch.
+        var attempt = ledger.TryReserve(
+            member, availablePct: 6.0, floorPct: 20.0,
+            windows: new List<WindowQuota> { new() { Name = "monthly", AvailablePct = 6.0 } });
+        Assert.False(attempt.Allowed);
+        Assert.DoesNotContain("binding window", attempt.DenyReason, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -499,7 +547,7 @@ public sealed class QuotaMeasuredBurnReservationTests
         Assert.Equal("weekly__forged_line___31m", binding);
         Assert.DoesNotContain("\n", binding, StringComparison.Ordinal);
         Assert.DoesNotContain("\u001b", binding, StringComparison.Ordinal);
-        var summary = QuotaWindowBinding.FormatWindowSummary(windows);
+        var summary = QuotaWindowBinding.FormatWindowSummary(windows, producedPct: 4);
         Assert.NotNull(summary);
         Assert.DoesNotContain("\n", summary, StringComparison.Ordinal);
         Assert.DoesNotContain("\u001b", summary, StringComparison.Ordinal);
@@ -513,7 +561,11 @@ public sealed class QuotaMeasuredBurnReservationTests
         var member = Sub(AgentKind.Copilot);
         var ledger = new QuotaReservationLedger(opts);
         var attempt = ledger.TryReserve(
-            member, availablePct: 6.0, floorPct: 5.0, bindingWindow: "weekly\n[forged]\u001b[0m");
+            member, availablePct: 6.0, floorPct: 5.0,
+            windows: new List<WindowQuota>
+            {
+                new() { Name = "weekly\n[forged]\u001b[0m", AvailablePct = 6.0 },
+            });
         Assert.False(attempt.Allowed);
         Assert.DoesNotContain("\n", attempt.DenyReason, StringComparison.Ordinal);
         Assert.DoesNotContain("\u001b", attempt.DenyReason, StringComparison.Ordinal);

@@ -418,6 +418,29 @@ public sealed class QuotaPoolTests
     }
 
     [Fact]
+    public void NonPositiveItemsFloorOnBalancePool_StillRejectedAtLoad()
+    {
+        // A non-positive MinQuotaItems would sanitize to null during mapping —
+        // the depleting-balance rejection must inspect the raw configured
+        // value so the unit mixing is still rejected rather than dropped.
+        var qr = new QuotaRouterConfig
+        {
+            Pools =
+            {
+                ["b"] = new QuotaPoolConfig { Kind = "DepletingBalance", BalanceUnit = "credits" },
+            },
+            FloorByPool =
+            {
+                ["b"] = new QuotaPoolFloorConfig { MinQuotaItems = -1 },
+            },
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => QuotaRouterConfigMapper.ToOptions(qr));
+        Assert.Contains("'b'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("MinQuotaItems", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void AbsoluteFloorOnResettingPool_RejectedAtLoadNamingPoolAndUnit()
     {
         var qr = new QuotaRouterConfig

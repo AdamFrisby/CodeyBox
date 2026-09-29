@@ -188,9 +188,10 @@ public sealed class QuotaReservationLedger
     /// explicit override &gt; per-agent &gt; global — with two
     /// work-denominated additions: within the pool, agent, and global tiers an
     /// items quantity (converted through measured burn) applies when no
-    /// percentage is configured at that tier, and the measured burn (with the
-    /// safety multiplier) displaces only the unconfigured global default. Any
-    /// explicitly configured tier therefore still wins over the derived value,
+    /// percentage override is configured at that tier, and the measured burn
+    /// (with the safety multiplier) displaces only the unconfigured global
+    /// default. Any explicitly configured tier therefore still wins over the
+    /// derived value,
     /// and with no measured history the result is identical to a plain
     /// percentage chain. The winning estimate is clamped to
     /// [<c>DispatchReservationMinPct</c>, <c>DispatchReservationMaxPct</c>]
@@ -324,8 +325,9 @@ public sealed class QuotaReservationLedger
     /// The estimate resolves through <see cref="ResolveEstimate"/>: pass the
     /// member's measured burn in <paramref name="measuredBurn"/> to let history
     /// displace the configured default (explicit overrides still win), and the
-    /// binding window name in <paramref name="bindingWindow"/> so the refusal
-    /// names the constraint instead of reading as generic exhaustion.
+    /// probe's per-window readings in <paramref name="windows"/> so the refusal
+    /// names the window that produced <paramref name="availablePct"/> instead
+    /// of reading as generic exhaustion.
     /// </para>
     ///
     /// <para>
@@ -340,7 +342,7 @@ public sealed class QuotaReservationLedger
         double floorPct,
         double? estimatePctOverride = null,
         AgentBurnEstimate? measuredBurn = null,
-        string? bindingWindow = null)
+        IReadOnlyList<WindowQuota>? windows = null)
     {
         ArgumentNullException.ThrowIfNull(member);
         if (availablePct < 0)
@@ -360,7 +362,8 @@ public sealed class QuotaReservationLedger
                 // Refusal-only detail strings (sanitised window name, estimate
                 // provenance) stay off the allowed hot path.
                 var estimateDetail = FormatEstimateDetail(resolution, _options);
-                var bindingSuffix = FormatBindingSuffix(bindingWindow);
+                var bindingSuffix = FormatBindingSuffix(
+                    ResolveGatedWindow(member, windows, availablePct));
                 attempt = new QuotaReservationAttempt(
                     false, null, outstanding, effective,
                     $"quota reservation of {estimate:F1}%{estimateDetail} would breach floor ({effective - estimate:F1}% < {floorPct:F1}%; {outstanding:F1}% already escrowed{bindingSuffix})");
@@ -405,6 +408,24 @@ public sealed class QuotaReservationLedger
                 $" (items estimate via measured burn {burn:F1}%/item, {resolution.MeasuredSamples} samples)",
             _ => string.Empty,
         };
+    }
+
+    /// <summary>
+    /// Names the window that produced <paramref name="gatedReading"/> — the
+    /// scarcest known window whose reading equals the value the reserve gated
+    /// on — or null when no window did. Depleting-balance pools never resolve
+    /// a name: their gated reading is the absolute balance, so even a window
+    /// coincidentally equal to it did not gate the dispatch. Pure apart from
+    /// the options read.
+    /// </summary>
+    private string? ResolveGatedWindow(
+        AgentMembership member, IReadOnlyList<WindowQuota>? windows, double gatedReading)
+    {
+        if (windows is null || windows.Count == 0) return null;
+        if (QuotaPoolResolver.TryResolvePool(_options, member, out _, out var pool, out _)
+            && pool?.Kind == QuotaPoolKind.DepletingBalance)
+            return null;
+        return QuotaWindowBinding.ResolveBindingWindow(windows, gatedReading);
     }
 
     private static string FormatBindingSuffix(string? bindingWindow)

@@ -212,6 +212,10 @@ public sealed class StatisticsQuotaPlugin
                         ? snapshot.AvailablePct > 0
                         : (await _quotaGate.EvaluateAsync(member, snapshot, sampledAt, ct)).Allow;
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
                 catch (Exception ex)
                 {
                     _logger.LogDebug(

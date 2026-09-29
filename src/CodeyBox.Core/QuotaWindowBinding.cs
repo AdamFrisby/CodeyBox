@@ -56,7 +56,9 @@ public static class QuotaWindowBinding
     /// availability, or null when no window carries a usable reading.
     /// Windows with unknown readings (negative) never bind. Ties resolve to
     /// the first scarcest window in probe order so the answer is
-    /// deterministic for a given snapshot. Pure.
+    /// deterministic for a given snapshot. For gating/dispatch decisions use
+    /// the two-arg overload — this one names the scarcest window even when it
+    /// did not produce the reading being gated on. Pure.
     /// </summary>
     public static string? ResolveBindingWindow(IReadOnlyList<WindowQuota>? windows) =>
         FindBindingWindow(windows) is { } binding
@@ -107,13 +109,19 @@ public static class QuotaWindowBinding
     /// <summary>
     /// Renders the known windows scarcest-first, marking the binding window,
     /// e.g. <c>monthly 6.0% (binding), weekly 98.0%, rolling 100.0%</c>.
-    /// Returns null when no window carries a usable reading. Bounded to
+    /// <paramref name="producedPct"/> is the aggregate reading the summary
+    /// accompanies: the "(binding)" marker appears only when the scarcest
+    /// window's reading equals it, so a summary shown next to an aggregate
+    /// that came from a non-window source (a per-model fallback, a budget
+    /// composite) does not misname the constraint. Returns null when no
+    /// window carries a usable reading. Bounded to
     /// <see cref="MaxSummaryWindows"/> entries with window names sanitized via
     /// <see cref="SanitizeWindowName"/> (allowlisted, then truncated), so a
     /// hostile probe payload can inject neither log lines nor terminal escapes
     /// nor unbounded text into a log line or DTO field. Pure.
     /// </summary>
-    public static string? FormatWindowSummary(IReadOnlyList<WindowQuota>? windows)
+    public static string? FormatWindowSummary(
+        IReadOnlyList<WindowQuota>? windows, double producedPct)
     {
         if (windows is null || windows.Count == 0) return null;
         var known = new List<WindowQuota>(windows.Count);
@@ -122,6 +130,7 @@ public static class QuotaWindowBinding
         // reference avoids double-marking when two raw names sanitize to the
         // same string.
         var binding = FindBindingWindow(windows);
+        var producedByWindow = binding is not null && binding.AvailablePct == producedPct;
         foreach (var window in windows)
         {
             if (window is null || string.IsNullOrWhiteSpace(window.Name)) continue;
@@ -135,7 +144,9 @@ public static class QuotaWindowBinding
         {
             if (parts.Count >= MaxSummaryWindows) break;
             var name = SanitizeWindowName(window.Name);
-            var marker = ReferenceEquals(window, binding) ? " (binding)" : string.Empty;
+            var marker = producedByWindow && ReferenceEquals(window, binding)
+                ? " (binding)"
+                : string.Empty;
             parts.Add($"{name} {window.AvailablePct:F1}%{marker}");
         }
         return string.Join(", ", parts);

@@ -11,9 +11,10 @@ public interface IAgentQuotaGate
     /// Gate check with caller-supplied recent-observed-failure context — used
     /// by status surfaces (e.g. <c>/quota</c>) that already hold per-(agent,
     /// model) failure state. The returned <see cref="AgentQuotaGateVerdict"/>
-    /// bundles the allow bit with the refusal reason (which names the binding
-    /// quota window) so a caller cannot pair a reason with a stale verdict or
-    /// infer allowedness from the reason's nullness.
+    /// bundles the allow bit with the refusal reason (for quota-floor
+    /// refusals, naming the binding quota window when the aggregate reading
+    /// came from a window) so a caller cannot pair a reason with a stale
+    /// verdict or infer allowedness from the reason's nullness.
     /// </summary>
     Task<AgentQuotaGateVerdict> EvaluateAsync(
         AgentMembership member,
@@ -40,7 +41,35 @@ public interface IAgentQuotaGate
 /// <summary>
 /// The quota gate's verdict for one member: whether a dispatch may proceed
 /// and, when refused, the human-readable reason — including which quota window
-/// binds. Bundled so the allow bit and its explanation are produced by the
-/// same evaluation and can never diverge.
+/// binds for window-gated refusals. Constructed only via
+/// <see cref="Allowed"/>/<see cref="Denied"/>, so a refusal always carries its
+/// reason and an allow never carries a stale one.
 /// </summary>
-public sealed record AgentQuotaGateVerdict(bool Allow, string? RefusalReason);
+public sealed record AgentQuotaGateVerdict
+{
+    private AgentQuotaGateVerdict(bool allow, string? refusalReason)
+    {
+        Allow = allow;
+        RefusalReason = refusalReason;
+    }
+
+    /// <summary>True when the gate lets the dispatch proceed.</summary>
+    public bool Allow { get; }
+
+    /// <summary>
+    /// Human-readable refusal reason; null iff <see cref="Allow"/> is true.
+    /// </summary>
+    public string? RefusalReason { get; }
+
+    /// <summary>A verdict letting the dispatch proceed.</summary>
+    public static AgentQuotaGateVerdict Allowed() => new(true, null);
+
+    /// <summary>
+    /// A verdict refusing the dispatch; <paramref name="reason"/> explains why.
+    /// </summary>
+    public static AgentQuotaGateVerdict Denied(string reason)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+        return new(false, reason);
+    }
+}

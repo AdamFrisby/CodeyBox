@@ -868,7 +868,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     {
                         var attempt = _reservationLedger.TryReserve(
                             member, baseline.Available, baseline.Floor,
-                            measuredBurn: measuredBurn, bindingWindow: quota.BindingWindow);
+                            measuredBurn: measuredBurn, windows: quota.Windows);
                         if (!attempt.Allowed)
                         {
                             slotGate?.Release(member);
@@ -3052,25 +3052,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// null when no estimator is wired or it throws — the percentage chain
     /// then applies unchanged. Validity (enough samples, positive burn) is
     /// decided by the pure consumers (<see cref="AgentBurnEstimate.HasMeasuredBurn"/>),
-    /// not here, so every caller shares one threshold. The estimator caches
-    /// per agent, so one fetch per member per dispatch pass is cheap.
+    /// not here, so every caller shares one threshold. The fetch policy lives
+    /// in <see cref="AgentBurnEstimatorExtensions.GetEstimateOrNullAsync"/> so
+    /// the dispatch path and advisory surfaces cannot drift.
     /// </summary>
-    private async Task<AgentBurnEstimate?> GetMeasuredBurnAsync(
-        AgentMembership member, CancellationToken ct)
-    {
-        if (_burnEstimator is null) return null;
-        try
-        {
-            return await _burnEstimator.GetEstimateAsync(member.Agent, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _log.LogDebug(ex,
-                "Quota burn: estimator threw for {Agent}; using configured estimates",
-                member.Agent.Value);
-            return null;
-        }
-    }
+    private Task<AgentBurnEstimate?> GetMeasuredBurnAsync(
+        AgentMembership member, CancellationToken ct) =>
+        _burnEstimator.GetEstimateOrNullAsync(member.Agent, _log, ct);
 
     /// <summary>
     /// Rate-aware gate: returns a denying <see cref="QuotaGateDecision"/> when
@@ -3873,7 +3861,8 @@ public sealed class QuotaRouterOptions
     /// floor expressed in dispatches' worth of quota, converted through the
     /// member's measured per-item burn. Null (the default) keeps the percentage
     /// floor. Requires measured burn — without enough samples the percentage
-    /// floor applies unchanged. Hot-reloadable.
+    /// floor applies unchanged. Applies only to subscription-billed members,
+    /// like the ramped and per-member floors it competes with. Hot-reloadable.
     /// </summary>
     public double? MinQuotaItems { get; set; }
 
@@ -3965,7 +3954,8 @@ public sealed class QuotaFloorOverrideOptions
     /// quota, converted through the member's measured per-item burn. Competes
     /// with the percentage floor via maximum (neither reserve can be
     /// undercut). Requires measured burn — without enough samples the
-    /// percentage floor applies unchanged.
+    /// percentage floor applies unchanged. Applies only to subscription-billed
+    /// members.
     /// </summary>
     public double? MinQuotaItems { get; set; }
 }

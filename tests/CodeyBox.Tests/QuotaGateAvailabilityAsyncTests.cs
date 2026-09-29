@@ -42,7 +42,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
             observedFailureWindow ?? TimeSpan.FromMinutes(10));
 
     [Fact]
-    public async Task AllowsAsync_KnownHealthyQuota_IgnoresRecentObservedFailure()
+    public async Task EvaluateAsync_KnownHealthyQuota_IgnoresRecentObservedFailure()
     {
         // A recent observed failure exists for the member, BUT the live snapshot
         // shows a known-healthy 50% available. The dispatch path doesn't consult
@@ -57,7 +57,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
     }
 
     [Fact]
-    public async Task AllowsAsync_UnknownQuota_RecentFailureUnderUseObservedFailures_Denies()
+    public async Task EvaluateAsync_UnknownQuota_RecentFailureUnderUseObservedFailures_Denies()
     {
         // Live snapshot is unknown (-1) AND UnknownPolicy=UseObservedFailures AND
         // a recent failure exists — dispatch denies, so the gate must too.
@@ -71,7 +71,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
     }
 
     [Fact]
-    public async Task AllowsAsync_UnknownQuota_NoRecentFailure_AllowsUnderUseObservedFailures()
+    public async Task EvaluateAsync_UnknownQuota_NoRecentFailure_AllowsUnderUseObservedFailures()
     {
         // No recent failure recorded — UseObservedFailures falls through to allow.
         var now = DateTimeOffset.UtcNow;
@@ -83,7 +83,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
     }
 
     [Fact]
-    public async Task AllowsAsync_FailOpenPolicy_RecentFailureNotConsultedEvenWhenUnknown()
+    public async Task EvaluateAsync_FailOpenPolicy_RecentFailureNotConsultedEvenWhenUnknown()
     {
         // UnknownPolicy=FailOpen means dispatch never consults the failure store.
         // A recent failure must NOT change the outcome — fail-open allows.
@@ -97,7 +97,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
     }
 
     [Fact]
-    public async Task AllowsAsync_FailCautiousPolicy_DeniesWithoutConsultingStore()
+    public async Task EvaluateAsync_FailCautiousPolicy_DeniesWithoutConsultingStore()
     {
         // UnknownPolicy=FailCautious denies unknown regardless of failure store —
         // the store branch is not taken because the policy isn't UseObservedFailures.
@@ -106,12 +106,12 @@ public sealed class QuotaGateAvailabilityAsyncTests
         var gate = Build(QuotaUnknownPolicy.FailCautious, failures);
 
         var snapshot = new AgentQuotaSnapshot { AvailablePct = -1 };
-        // ThrowingFailureStore would throw if AllowsAsync touched it.
+        // ThrowingFailureStore would throw if EvaluateAsync touched it.
         Assert.False((await gate.EvaluateAsync(Member(), snapshot, now)).Allow);
     }
 
     [Fact]
-    public async Task AllowsAsync_NoFailureStoreWired_FallsBackToPolicyOnly()
+    public async Task EvaluateAsync_NoFailureStoreWired_FallsBackToPolicyOnly()
     {
         // The default constructor (no failure store) should never deny on
         // observed failures — it has nothing to consult. Unknown + UseObservedFailures
@@ -131,7 +131,7 @@ public sealed class QuotaGateAvailabilityAsyncTests
     }
 
     [Fact]
-    public async Task AllowsAsync_ZeroWindow_SkipsFailureStoreConsult()
+    public async Task EvaluateAsync_ZeroWindow_SkipsFailureStoreConsult()
     {
         // An observedFailureWindow of zero is the disable signal — the gate must
         // not even consult the store. ThrowingFailureStore proves it's untouched.
