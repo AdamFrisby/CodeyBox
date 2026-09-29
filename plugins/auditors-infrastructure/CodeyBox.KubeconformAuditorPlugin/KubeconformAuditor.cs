@@ -268,7 +268,7 @@ public sealed class KubeconformAuditor : ExternalToolAuditorBase, IPluginInitial
 
         var targets = _targets()
             .Where(static t => !string.IsNullOrWhiteSpace(t))
-            .Select(static t => t.Trim())
+            .Select(t => ValidatedRepoRelativeTarget(t, $"{PluginId}:{TargetsKey}"))
             .ToList();
         if (targets.Count == 0)
             args.Add(".");

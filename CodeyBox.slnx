@@ -73,6 +73,7 @@
     <Project Path="plugins/auditors-infrastructure/CodeyBox.KicsAuditorPlugin/CodeyBox.KicsAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.KubeconformAuditorPlugin/CodeyBox.KubeconformAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.HadolintAuditorPlugin/CodeyBox.HadolintAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-infrastructure/CodeyBox.KubeLinterAuditorPlugin/CodeyBox.KubeLinterAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.TflintAuditorPlugin/CodeyBox.TflintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.CfnlintAuditorPlugin/CodeyBox.CfnlintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.ConftestAuditorPlugin/CodeyBox.ConftestAuditorPlugin.csproj" />

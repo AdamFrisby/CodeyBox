@@ -255,7 +255,7 @@ public sealed class ActionlintAuditor : ExternalToolAuditorBase, IPluginInitiali
         {
             if (string.IsNullOrWhiteSpace(target))
                 continue;
-            args.Add(ValidatedTarget(target));
+            args.Add(ValidatedRepoRelativeTarget(target, $"{PluginId}:{TargetsKey}"));
         }
 
         return args;
@@ -273,18 +273,5 @@ public sealed class ActionlintAuditor : ExternalToolAuditorBase, IPluginInitiali
         context.Logger.LogInformation(
             "ActionlintAuditor initialized: pluginId={PluginId}", context.PluginId);
         return Task.CompletedTask;
-    }
-
-    private static string ValidatedTarget(string value)
-    {
-        var validated = ValidatedArgumentValue(value, $"{PluginId}:{TargetsKey}");
-        var normalized = validated.Replace('\\', '/').Trim();
-        if (normalized.StartsWith("/", StringComparison.Ordinal)
-            || normalized.Split('/').Contains("..", StringComparer.Ordinal))
-            throw new AuditUnavailableException(
-                $"could-not-verify: configured '{PluginId}:{TargetsKey}' entry ('{TruncateForMessage(validated)}') "
-                + "must be a repo-relative path inside the worktree.")
-            { IsDeterministic = true };
-        return validated;
     }
 }
