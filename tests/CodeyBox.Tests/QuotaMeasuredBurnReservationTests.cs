@@ -466,6 +466,40 @@ public sealed class QuotaMeasuredBurnReservationTests
         Assert.Equal("quota below floor (4.0% < 5.0%)", decision.Reason);
     }
 
+    [Fact]
+    public void BindingWindow_MaliciousName_IsSanitizedForLogsAndDto()
+    {
+        var hostile = "weekly\n[forged line]\u001b[31m";
+        var windows = new List<WindowQuota>
+        {
+            new() { Name = "monthly", AvailablePct = 50 },
+            new() { Name = hostile, AvailablePct = 4 },
+        };
+        var binding = QuotaWindowBinding.ResolveBindingWindow(windows);
+        Assert.Equal("weekly__forged_line___31m", binding);
+        Assert.DoesNotContain("\n", binding, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", binding, StringComparison.Ordinal);
+        var summary = QuotaWindowBinding.FormatWindowSummary(windows);
+        Assert.NotNull(summary);
+        Assert.DoesNotContain("\n", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", summary, StringComparison.Ordinal);
+        Assert.Contains("weekly__forged_line___31m 4.0% (binding)", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReservationRefusal_MaliciousBindingWindow_IsSanitized()
+    {
+        var opts = BaseOptions();
+        var member = Sub(AgentKind.Copilot);
+        var ledger = new QuotaReservationLedger(opts);
+        var attempt = ledger.TryReserve(
+            member, availablePct: 6.0, floorPct: 5.0, bindingWindow: "weekly\n[forged]\u001b[0m");
+        Assert.False(attempt.Allowed);
+        Assert.DoesNotContain("\n", attempt.DenyReason, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", attempt.DenyReason, StringComparison.Ordinal);
+        Assert.EndsWith("; binding window 'weekly__forged___0m')", attempt.DenyReason, StringComparison.Ordinal);
+    }
+
     // ── Validation ────────────────────────────────────────────────────────
 
     [Fact]

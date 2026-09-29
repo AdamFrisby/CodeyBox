@@ -215,11 +215,12 @@ public sealed class QuotaGatePolicy
                     var windowFloor = ResolveWindowFloorPct(options, member.Agent, window.Name);
                     if (window.AvailablePct < windowFloor)
                     {
+                        var safeWindowName = QuotaWindowBinding.SanitizeWindowName(window.Name);
                         return new QuotaGateDecision(
                             false,
-                            $"quota below window floor ({window.Name}: {window.AvailablePct:F1}% < {windowFloor:F1}%)",
+                            $"quota below window floor ({safeWindowName}: {window.AvailablePct:F1}% < {windowFloor:F1}%)",
                             windowFloor,
-                            window.Name,
+                            safeWindowName,
                             PoolId: poolName,
                             BindingWindow: quota.BindingWindow);
                     }
@@ -433,7 +434,7 @@ public sealed class QuotaGatePolicy
         {
             foreach (var window in windows)
             {
-                if (string.Equals(window.Name, decision.WindowName, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(QuotaWindowBinding.SanitizeWindowName(window.Name), decision.WindowName, StringComparison.OrdinalIgnoreCase))
                     return window.ResetAt ?? quota.ResetAt;
             }
         }

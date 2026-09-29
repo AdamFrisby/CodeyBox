@@ -400,9 +400,7 @@ public sealed class QuotaReservationLedger
     private static string FormatBindingSuffix(string? bindingWindow)
     {
         if (string.IsNullOrWhiteSpace(bindingWindow)) return string.Empty;
-        var name = bindingWindow.Trim();
-        if (name.Length > QuotaWindowBinding.MaxWindowNameLength)
-            name = name[..QuotaWindowBinding.MaxWindowNameLength];
+        var name = QuotaWindowBinding.SanitizeWindowName(bindingWindow);
         return $"; binding window '{name}'";
     }
 
