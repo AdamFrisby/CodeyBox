@@ -62,6 +62,7 @@
     <Project Path="plugins/auditors-api-compatibility/CodeyBox.BufAuditorPlugin/CodeyBox.BufAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-api-compatibility/CodeyBox.CargoSemverChecksAuditorPlugin/CodeyBox.CargoSemverChecksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-api-compatibility/CodeyBox.GraphqlInspectorAuditorPlugin/CodeyBox.GraphqlInspectorAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-architecture/CodeyBox.DepcruiseAuditorPlugin/CodeyBox.DepcruiseAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-architecture/CodeyBox.FileSizeLimitsAuditorPlugin/CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-architecture/CodeyBox.ImportLinterAuditorPlugin/CodeyBox.ImportLinterAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-dependency-vulnerabilities/CodeyBox.CargoAuditAuditorPlugin/CodeyBox.CargoAuditAuditorPlugin.csproj" />
