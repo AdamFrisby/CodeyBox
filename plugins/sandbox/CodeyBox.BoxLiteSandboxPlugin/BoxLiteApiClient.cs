@@ -99,8 +99,7 @@ internal sealed class BoxLiteApiClient
             return false;
         return uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
             || uri.Host.Equals("127.0.0.1", StringComparison.Ordinal)
-            || uri.Host.Equals("::1", StringComparison.Ordinal)
-            || uri.Host.Equals("[::1]", StringComparison.Ordinal);
+            || uri.Host.Equals("::1", StringComparison.Ordinal);
     }
 
     public async Task<BoxLiteVmDto> CreateVmAsync(

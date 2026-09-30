@@ -428,6 +428,31 @@ internal sealed class BoxLiteSandbox :
         return text;
     }
 
+    /// <summary>
+    /// Streams a host file up to <paramref name="maxBytes"/> plus one probe
+    /// byte, so the read never buffers past the ceiling even if the file
+    /// grows after the pre-read length guard. Callers treat a past-ceiling
+    /// result as over the file bound.
+    /// </summary>
+    private static async Task<byte[]> ReadHostFileBoundedAsync(string path, long maxBytes, CancellationToken ct)
+    {
+        await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, CopyBufferBytes, useAsync: true);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[CopyBufferBytes];
+        int read;
+        while ((read = await input.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
+        {
+            var room = maxBytes + 1 - buffer.Length;
+            if (read >= room)
+            {
+                buffer.Write(chunk, 0, (int)room);
+                break;
+            }
+            buffer.Write(chunk, 0, read);
+        }
+        return buffer.ToArray();
+    }
+
     private static string TruncateToBytes(string text, int maxBytes)
     {
         if (Utf8.GetByteCount(text) <= maxBytes)
@@ -557,8 +582,17 @@ internal sealed class BoxLiteSandbox :
                 continue;
             if (File.Exists(mount.HostPath))
             {
-                var bytes = await File.ReadAllBytesAsync(mount.HostPath, ct).ConfigureAwait(false);
                 var opts = _readOptions();
+                // Pre-read length guard: stat before buffering so a large
+                // mount source is refused without growing host memory to the
+                // full file size.
+                if (new FileInfo(mount.HostPath).Length > opts.MaxFileSyncBytes)
+                    throw new InvalidOperationException($"Mount source '{mount.HostPath}' exceeds the file bound.");
+                // Streamed read with an incremental ceiling: closes the
+                // stat-then-read race if the file grows between the guard
+                // above and the copy, mirroring the pre-buffer guards used
+                // for guest data (CopyBoundedAsync/DecodeBounded).
+                var bytes = await ReadHostFileBoundedAsync(mount.HostPath, opts.MaxFileSyncBytes, ct).ConfigureAwait(false);
                 if (bytes.Length > opts.MaxFileSyncBytes)
                     throw new InvalidOperationException($"Mount source '{mount.HostPath}' exceeds the file bound.");
                 await WriteGuestFileAsync(mount.SandboxPath, Utf8.GetString(bytes), mode: null, ct).ConfigureAwait(false);
