@@ -16,6 +16,9 @@ namespace CodeyBox.Orchestrator;
 /// ownership snapshot (meaning the creating process crashed, or normal phase
 /// disposal failed and released ownership), and whose creation timestamp is
 /// either older than <see cref="SandboxLeakOptions.LeakAgeThreshold"/> or missing.
+/// Prior-process orphans — untracked sandboxes created before this process
+/// started — are reaped once <see cref="SandboxLeakOptions.PriorProcessOrphanGrace"/>
+/// has elapsed since process start, without waiting for the age threshold.
 /// Each provider enforces its own ownership metadata and configurable namespace;
 /// the age threshold guards against mistaking an in-progress provision for a
 /// genuine leak.</para>
@@ -38,6 +41,8 @@ public sealed class SandboxLeakReaper : BackgroundService
     private readonly ILogger<SandboxLeakReaper> _log;
     private readonly IWorkItemStore? _store;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly TimeProvider _time;
+    private readonly DateTimeOffset _processStartUtc;
     private readonly LeakDetectionSink? _leakSink;
 
     // Latch for the threshold/multiplier shortfall warning: warns once per
@@ -63,11 +68,20 @@ public sealed class SandboxLeakReaper : BackgroundService
 
     // Resolves the current SandboxLeakOptions on every read so threshold/policy
     // edits applied via IOptionsMonitor (LeakAgeThreshold, PreemptRetention,
-    // AutoDispose, MaxConcurrentAutoDispose) take effect on the next sweep
-    // without restarting CodeyBox. CheckInterval and Enabled are sampled at
-    // PeriodicTimer construction so changes to those fields require a restart —
-    // limitation documented on the fields themselves.
+    // PriorProcessOrphanGrace, AutoDispose, MaxConcurrentAutoDispose) take effect
+    // on the next sweep without restarting CodeyBox. CheckInterval and Enabled
+    // are sampled at PeriodicTimer construction so changes to those fields require
+    // a restart — limitation documented on the fields themselves.
     private SandboxLeakOptions _opts => _optsAccessor();
+
+    /// <summary>
+    /// The instant this orchestrator process started, captured from the injected
+    /// <see cref="TimeProvider"/> when the reaper (a startup-constructed singleton)
+    /// was created. Untracked sandboxes created before this instant belong to a
+    /// dead process and qualify for the <see cref="SandboxLeakOptions.PriorProcessOrphanGrace"/>
+    /// fast path. Exposed for diagnostics and tests.
+    /// </summary>
+    internal DateTimeOffset ProcessStartUtc => _processStartUtc;
 
     public SandboxLeakReaper(
         IManagedSandboxLifecycle provider,
@@ -91,7 +105,9 @@ public sealed class SandboxLeakReaper : BackgroundService
         IWorkItemStore? store,
         Func<DateTimeOffset>? clock = null,
         LeakDetectionSink? leakSink = null,
-        Func<double>? phaseAbsoluteTimeoutMultiplierAccessor = null)
+        Func<double>? phaseAbsoluteTimeoutMultiplierAccessor = null,
+        TimeProvider? timeProvider = null,
+        DateTimeOffset? processStartUtc = null)
     {
         _provider = provider;
         _webhooks = webhooks;
@@ -99,7 +115,9 @@ public sealed class SandboxLeakReaper : BackgroundService
         _phaseAbsoluteTimeoutMultiplierAccessor = phaseAbsoluteTimeoutMultiplierAccessor;
         _log = log;
         _store = store;
-        _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _time = timeProvider ?? TimeProvider.System;
+        _clock = clock ?? (() => _time.GetUtcNow());
+        _processStartUtc = processStartUtc ?? _time.GetUtcNow();
         _leakSink = leakSink;
     }
 
@@ -260,6 +278,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                 // depend on any backend's state strings.
                 var isSuspendOrphan = info.IsSuspendLifecycleOrFrozen;
                 var leakIdentity = LeakIdentity.From(info);
+                var isPriorProcessOrphan = false;
 
                 if (isSuspendOrphan)
                 {
@@ -282,7 +301,21 @@ public sealed class SandboxLeakReaper : BackgroundService
                         continue;
 
                     if (age < _opts.LeakAgeThreshold)
-                        continue;
+                    {
+                        // Fast path for restart orphans: an untracked managed
+                        // sandbox created BEFORE this process started belongs to
+                        // a dead process — no live agent/worker will ever reclaim
+                        // it — so reap it once PriorProcessOrphanGrace has elapsed
+                        // since process start instead of burning host resources
+                        // until the (possibly hours-long) LeakAgeThreshold. All
+                        // protections above still apply (Deployment purpose,
+                        // suspend-mapping/recovery-lease guards, preempt
+                        // retention, duplicate-with-active-snapshot), and missing
+                        // CreatedAt keeps the conservative age-threshold path.
+                        if (!IsPriorProcessOrphan(info, now))
+                            continue;
+                        isPriorProcessOrphan = true;
+                    }
                 }
 
                 var diskMb = info.DiskBytes.HasValue ? info.DiskBytes.Value / (1024 * 1024) : (long?)null;
@@ -292,11 +325,13 @@ public sealed class SandboxLeakReaper : BackgroundService
                 // missing-metadata leak.
                 var reason = isSuspendOrphan
                     ? SandboxLeakReasons.OrphanedSuspendingVm
-                    : (missingCreationMetadata
-                        ? SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata
-                        : (info.HasPreemptMarker
-                            ? SandboxLeakReasons.ExpiredPreemptRetention
-                            : SandboxLeakReasons.UntrackedSandbox));
+                    : (isPriorProcessOrphan
+                        ? SandboxLeakReasons.PriorProcessOrphan
+                        : (missingCreationMetadata
+                            ? SandboxLeakReasons.UntrackedSandboxMissingCreationMetadata
+                            : (info.HasPreemptMarker
+                                ? SandboxLeakReasons.ExpiredPreemptRetention
+                                : SandboxLeakReasons.UntrackedSandbox)));
                 leaks.Add(new LeakedSandboxInfo(
                     info.Name,
                     createdAt,
@@ -306,6 +341,14 @@ public sealed class SandboxLeakReaper : BackgroundService
                     info.LifecycleProviderId,
                     info.HostId));
                 AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
+                if (isPriorProcessOrphan)
+                    _log.LogWarning(
+                        "SandboxLeakReaper: reaping prior-process orphan {Name} createdAt={CreatedAt:o} processStart={ProcessStart:o} age={AgeMinutes:F1}min (prior-process grace {Grace} elapsed; not waiting for LeakAgeThreshold)",
+                        info.Name,
+                        createdAt,
+                        _processStartUtc,
+                        age.TotalMinutes,
+                        _opts.PriorProcessOrphanGrace);
                 _ = _webhooks.PublishAsync(new WebhookEvent
                 {
                     Event = "sandbox.leak_detected",
@@ -367,6 +410,25 @@ public sealed class SandboxLeakReaper : BackgroundService
         {
             _log.LogWarning(ex, "SandboxLeakReaper: sweep failed");
         }
+    }
+
+    /// <summary>
+    /// True when <paramref name="info"/> is an orphan of a dead orchestrator process:
+    /// untracked, with a known creation instant strictly before this process started,
+    /// and the <see cref="SandboxLeakOptions.PriorProcessOrphanGrace"/> has elapsed
+    /// since process start. Missing CreatedAt is never a prior-process orphan —
+    /// it keeps the conservative age-threshold path. Callers must apply the
+    /// existing protections (preempt retention, suspend-mapping/recovery-lease
+    /// guards, duplicate-with-active-snapshot) before consulting this helper.
+    /// </summary>
+    private bool IsPriorProcessOrphan(ManagedSandboxInfo info, DateTimeOffset now)
+    {
+        if (!info.CreatedAt.HasValue || info.CreatedAt.Value >= _processStartUtc)
+            return false;
+        var grace = _opts.PriorProcessOrphanGrace;
+        if (grace < TimeSpan.Zero)
+            grace = TimeSpan.Zero;
+        return now - _processStartUtc >= grace;
     }
 
     private async Task<ProtectedSandboxSet> BuildProtectedSandboxSetAsync(CancellationToken ct)
@@ -437,7 +499,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         try
         {
             await _provider.DisposeLeakedAsync(ToManagedSandboxInfo(leak), linkedCts.Token);
-            var disposedAt = DateTimeOffset.UtcNow;
+            var disposedAt = _clock();
             AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes, diskMb, disposedAt, leak.Reason);
             _ = _webhooks.PublishAsync(new WebhookEvent
             {
@@ -604,6 +666,21 @@ public sealed class SandboxLeakOptions
     /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public TimeSpan LeakAgeThreshold { get; set; } = DefaultLeakAgeThreshold;
+
+    /// <summary>
+    /// Grace after process start before an untracked managed sandbox created by a
+    /// previous orchestrator process (CreatedAt strictly before this process started)
+    /// is reaped without waiting for <see cref="LeakAgeThreshold"/>. After any
+    /// restart the in-memory tracked set is empty, so every surviving VM looks
+    /// untracked; without this fast path those orphans burn host RAM/CPU until the
+    /// (possibly hours-long) age threshold expires. Sandboxes created by THIS process
+    /// always wait for <see cref="LeakAgeThreshold"/>, and the existing protections
+    /// still apply (Deployment purpose, live suspend-mapping/recovery-lease guards,
+    /// preempt retention, duplicate-name-with-active-snapshot). Missing CreatedAt
+    /// keeps the conservative age-threshold behaviour. Default 2 minutes.
+    /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
+    /// </summary>
+    public TimeSpan PriorProcessOrphanGrace { get; set; } = TimeSpan.FromMinutes(2);
 
     /// <summary>
     /// Maximum time to exempt gracefully preempted sandboxes from leak reporting

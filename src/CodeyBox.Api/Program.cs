@@ -5508,11 +5508,11 @@ builder.Services.AddSingleton<CompositeManagedSandboxProvider>(BuildManagedSandb
 builder.Services.AddSingleton<IManagedSandboxLifecycle>(sp => sp.GetRequiredService<CompositeManagedSandboxProvider>());
 builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 {
-    // Live accessor: thresholds and policy fields (LeakAgeThreshold, AutoDispose,
-    // MaxConcurrentAutoDispose, PreemptRetention) are re-read on every sweep so
-    // operator edits take effect without restart. CheckInterval and Enabled are
-    // sampled once at PeriodicTimer construction — limitation documented on the
-    // fields themselves.
+    // Live accessor: thresholds and policy fields (LeakAgeThreshold,
+    // PriorProcessOrphanGrace, AutoDispose, MaxConcurrentAutoDispose,
+    // PreemptRetention) are re-read on every sweep so operator edits take
+    // effect without restart. CheckInterval and Enabled are sampled once at
+    // PeriodicTimer construction — limitation documented on the fields themselves.
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     return new SandboxLeakReaper(
         sp.GetRequiredService<IManagedSandboxLifecycle>(),
@@ -5521,7 +5521,8 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
         sp.GetRequiredService<ILogger<SandboxLeakReaper>>(),
         sp.GetRequiredService<IWorkItemStore>(),
         leakSink: sp.GetRequiredService<LeakDetectionSink>(),
-        phaseAbsoluteTimeoutMultiplierAccessor: () => monitor.CurrentValue.PhaseAbsoluteTimeoutMultiplier);
+        phaseAbsoluteTimeoutMultiplierAccessor: () => monitor.CurrentValue.PhaseAbsoluteTimeoutMultiplier,
+        timeProvider: TimeProvider.System);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 

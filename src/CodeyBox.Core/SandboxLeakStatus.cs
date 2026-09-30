@@ -12,6 +12,7 @@ public static class SandboxLeakReasons
     public const string UntrackedSandboxMissingCreationMetadata = "untracked_sandbox_missing_creation_metadata";
     public const string ExpiredPreemptRetention = "expired_preempt_retention_age_threshold_exceeded";
     public const string OrphanedSuspendingVm = "orphaned_suspending_vm_no_live_mapping";
+    public const string PriorProcessOrphan = "prior_process_orphan";
 }
 
 /// <summary>
