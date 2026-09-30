@@ -295,11 +295,11 @@ public sealed class BoxLiteSandboxProvider :
         var items = await Api.ListManagedVmsAsync(endpoint, opts.NamePrefix, opts.MaxListPages, ct).ConfigureAwait(false);
         return items
             .Where(static i => i.Name is not null)
-            .Select(static i => new ManagedSandboxInfo(
+            .Select(i => new ManagedSandboxInfo(
                 i.Name!,
                 null,
                 null,
-                IsTrackedActive: false,
+                IsTrackedActive: _activeSandboxes.ContainsKey(i.Name!),
                 IsSuspendLifecycleOrFrozen: string.Equals(i.State, "paused", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(i.State, "pausing", StringComparison.OrdinalIgnoreCase)))
             .ToList();

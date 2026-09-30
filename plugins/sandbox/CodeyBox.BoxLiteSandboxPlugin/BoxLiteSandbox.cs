@@ -129,7 +129,29 @@ internal sealed class BoxLiteSandbox :
 
     public long? MemoryBytes => _spec.Limits.MemoryBytes;
 
-    public void ReleaseActiveTracking() => Interlocked.Exchange(ref _activeTrackingReleased, 1);
+    /// <summary>
+    /// Releases provider-side active tracking without claiming the sandbox
+    /// was successfully disposed, so leak reapers can retry in-process (see
+    /// <see cref="IActiveSandboxLease"/>). Invokes the provider removal
+    /// callback exactly once; the callback is idempotent with
+    /// <see cref="DisposeAsync"/>'s, so a later dispose still completes cleanly.
+    /// </summary>
+    public void ReleaseActiveTracking()
+    {
+        if (Interlocked.Exchange(ref _activeTrackingReleased, 1) != 0)
+            return;
+        try
+        {
+            _onDisposed(this);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "BoxLite VM {Name} release-tracking callback failed", _name);
+        }
+    }
+
+    /// <summary>True while the provider still counts this handle as live.</summary>
+    internal bool IsTrackedActive => Volatile.Read(ref _activeTrackingReleased) == 0;
 
     public void DisablePreserveOnDispose() => Interlocked.Exchange(ref _preserveOnDispose, 0);
 
@@ -276,8 +298,14 @@ internal sealed class BoxLiteSandbox :
                 await TryKillExecAsync(endpoint, execId).ConfigureAwait(false);
                 return Unavailable("exec stream regressed or exceeded the snapshot ceiling");
             }
-            AppendDelta(stdout, stdoutText, ref stdoutDelivered, exec.StdoutChunkCallback, _log);
-            AppendDelta(stderr, stderrText, ref stderrDelivered, exec.StderrChunkCallback, _log);
+            // Once a stream is over cap with KillOnOutputLimit off, the buffered
+            // result freezes: later deltas still reach the live chunk callback
+            // and still advance the delivered cursor (so a regressed stream is
+            // still detected), but they are not accumulated — otherwise a
+            // chatty guest grows host memory without bound. The frozen prefix
+            // is byte-identical to what an unbounded buffer would truncate to.
+            AppendDelta(stdout, stdoutText, ref stdoutDelivered, exec.StdoutChunkCallback, stdoutLimitExceeded && !exec.KillOnOutputLimit, _log);
+            AppendDelta(stderr, stderrText, ref stderrDelivered, exec.StderrChunkCallback, stderrLimitExceeded && !exec.KillOnOutputLimit, _log);
             stdoutBytes = Utf8.GetByteCount(stdoutText);
             stderrBytes = Utf8.GetByteCount(stderrText);
 
@@ -330,13 +358,14 @@ internal sealed class BoxLiteSandbox :
         }
     }
 
-    private static void AppendDelta(StringBuilder sink, string full, ref int delivered, Action<string>? callback, ILogger log)
+    private static void AppendDelta(StringBuilder sink, string full, ref int delivered, Action<string>? callback, bool freeze, ILogger log)
     {
         if (full.Length <= delivered)
             return;
         var delta = full[delivered..];
-        sink.Append(delta);
         delivered = full.Length;
+        if (!freeze)
+            sink.Append(delta);
         try
         {
             callback?.Invoke(delta);
@@ -347,11 +376,29 @@ internal sealed class BoxLiteSandbox :
         }
     }
 
-    private static string DecodeBounded(string? base64, int maxChars, out bool truncated, ILogger log)
+    /// <summary>
+    /// Decodes one guest-controlled exec snapshot with the ceiling enforced
+    /// BEFORE the host buffers it: a base64-length guard runs before
+    /// <c>Convert.FromBase64String</c> and a decoded-byte guard runs before
+    /// UTF-8 decoding, so each poll tick allocates at most O(ceiling) no
+    /// matter how much the guest has written. A snapshot past the ceiling
+    /// reports <c>overCap</c> and decodes to empty — the caller kills the
+    /// guest process and classifies the exec as infrastructure, never a diff
+    /// verdict.
+    /// </summary>
+    private static string DecodeBounded(string? base64, int maxChars, out bool overCap, ILogger log)
     {
-        truncated = false;
+        overCap = false;
         if (string.IsNullOrEmpty(base64))
             return string.Empty;
+        // Base64 carries 3 raw bytes per 4 chars; the 4-char tolerance covers
+        // padding, so this only fires when the payload must decode past the
+        // ceiling even in the most padding-favourable reading.
+        if ((base64.Length - 4) * 3L / 4 > maxChars)
+        {
+            overCap = true;
+            return string.Empty;
+        }
         byte[] bytes;
         try
         {
@@ -362,10 +409,18 @@ internal sealed class BoxLiteSandbox :
             log.LogDebug("BoxLite daemon returned malformed base64; treating as empty output");
             return string.Empty;
         }
+        if (bytes.Length > maxChars)
+        {
+            overCap = true;
+            return string.Empty;
+        }
         var text = Utf8.GetString(bytes);
         if (text.Length > maxChars)
         {
-            truncated = true;
+            // Unreachable with standard UTF-8 (every character decodes from
+            // at least one byte, so the byte guard above already fired);
+            // retained as the ceiling if the decoder ever changes.
+            overCap = true;
             return text[..maxChars];
         }
         return text;

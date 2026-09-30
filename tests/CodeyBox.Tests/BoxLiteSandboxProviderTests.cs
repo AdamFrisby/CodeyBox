@@ -510,6 +510,55 @@ public sealed class BoxLiteSandboxProviderTests
     }
 
     [Fact]
+    public async Task Exec_SnapshotPastByteCeiling_KillsAndClassifiesInfra()
+    {
+        // 'é' is 2 bytes in UTF-8: 600K chars decode to ~1.2 MiB, past the
+        // cap+slack byte ceiling while staying under it in chars. The byte
+        // guard must kill the guest process and classify the exec as
+        // infrastructure before the host buffers the snapshot — never a
+        // verdict on the completed command.
+        var server = new FakeBoxLiteServer();
+        server.ScriptExec(stdoutChunks: [new string('é', 600_000)], stderrChunks: [], exitCode: 0);
+        var provider = NewProvider(server);
+        var sandbox = await provider.CreateAsync(WorkSpec(), CancellationToken.None);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["yes"],
+            MaxStdoutBytes = 64,
+            KillOnOutputLimit = false,
+        }, CancellationToken.None);
+
+        Assert.True(result.ExecutionUnavailable);
+        Assert.Equal(1, server.Requests.Count(r => r.Method == "DELETE" && r.Path.Contains("/exec/", StringComparison.Ordinal)));
+        await sandbox.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ReleaseActiveTracking_RemovesProviderTracking_AndDisposeStillCompletes()
+    {
+        var server = new FakeBoxLiteServer();
+        var provider = NewProvider(server);
+        var sandbox = await provider.CreateAsync(WorkSpec(WorkItemId.New()), CancellationToken.None);
+        var lease = Assert.IsAssignableFrom<IActiveSandboxLease>(sandbox);
+
+        Assert.Single(provider.SnapshotActiveSandboxes());
+        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+        Assert.Contains(managed, m => m.Name == sandbox.Id && m.IsTrackedActive);
+
+        lease.ReleaseActiveTracking();
+
+        Assert.Empty(provider.SnapshotActiveSandboxes());
+        managed = await provider.ListAllManagedAsync(CancellationToken.None);
+        Assert.Contains(managed, m => m.Name == sandbox.Id && !m.IsTrackedActive);
+
+        // A second release is a no-op, and dispose still completes exactly once.
+        lease.ReleaseActiveTracking();
+        await sandbox.DisposeAsync();
+        Assert.Empty(provider.SnapshotActiveSandboxes());
+    }
+
+    [Fact]
     public async Task Exec_ServiceFailure_IsExecutionUnavailable_NotDiffFailure()
     {
         var server = new FakeBoxLiteServer { ExecStartStatusOverride = HttpStatusCode.ServiceUnavailable };
