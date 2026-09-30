@@ -295,6 +295,32 @@ public sealed class PipelineTuningOptions
     public IList<string> PlannedItemAdvisoryAuditors { get; set; } =
         new List<string> { DefaultPlannedItemAdvisoryAuditor };
 
+    /// <summary>
+    /// Minimum Jaccard similarity over a suggestion's normalized token
+    /// signature (lower-cased, punctuation- and stop-word-stripped title
+    /// tokens plus normalized file paths) for a new agent-filed suggestion to
+    /// merge into an existing open or recently-dismissed row instead of
+    /// creating a duplicate. Applied by
+    /// <see cref="Core.ISuggestionStore.CreateOrMergeAsync"/> at pickup.
+    /// Default 0.6. Hot-reloaded with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public double SuggestionDedupeSimilarityThreshold { get; set; } = 0.6;
+
+    /// <summary>
+    /// How far back a dismissed suggestion still attracts repeats: a matching
+    /// suggestion dismissed within this window bumps its occurrence count
+    /// rather than spawning a new row (the dismissal sticks — repeats do not
+    /// resurrect it). Open suggestions always match. Default 30 days.
+    /// </summary>
+    public TimeSpan SuggestionDedupeDismissedMatchWindow { get; set; } = TimeSpan.FromDays(30);
+
+    /// <summary>
+    /// Cap on the source work-item id list recorded on a merged suggestion.
+    /// Once full, repeats still bump the occurrence count but stop appending
+    /// ids, bounding row growth. Default 25.
+    /// </summary>
+    public int SuggestionDedupeMaxRecordedSources { get; set; } = 25;
+
     public void Validate()
     {
         _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
@@ -380,6 +406,12 @@ public sealed class PipelineTuningOptions
                 nameof(SandboxPermitWaitWarningThreshold),
                 "SandboxPermitWaitWarningThreshold must be non-negative (zero disables the slow-permit warning)");
         }
+        new Core.SuggestionDedupePolicy
+        {
+            SimilarityThreshold = SuggestionDedupeSimilarityThreshold,
+            DismissedMatchWindow = SuggestionDedupeDismissedMatchWindow,
+            MaxRecordedSourceIds = SuggestionDedupeMaxRecordedSources,
+        }.Validate();
     }
 }
 

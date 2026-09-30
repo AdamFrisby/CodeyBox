@@ -559,6 +559,15 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.PlannedItemAdvisoryAuditors):
                 opts.PlannedItemAdvisoryAuditors = new List<string> { "other-auditor" };
                 break;
+            case nameof(PipelineTuningOptions.SuggestionDedupeSimilarityThreshold):
+                opts.SuggestionDedupeSimilarityThreshold = 0.95;
+                break;
+            case nameof(PipelineTuningOptions.SuggestionDedupeDismissedMatchWindow):
+                opts.SuggestionDedupeDismissedMatchWindow += TimeSpan.FromDays(1);
+                break;
+            case nameof(PipelineTuningOptions.SuggestionDedupeMaxRecordedSources):
+                opts.SuggestionDedupeMaxRecordedSources += 10;
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(field), field, "No mutator for this PipelineTuning field.");
         }

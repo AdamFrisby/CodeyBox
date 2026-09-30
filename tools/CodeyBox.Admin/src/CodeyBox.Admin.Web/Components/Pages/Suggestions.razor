@@ -64,6 +64,7 @@ else
                 <th>Title</th>
                 <th>Category</th>
                 <th>Severity</th>
+                <th>Raised</th>
                 <th>Source item</th>
                 <th>Age</th>
                 <th>Actions</th>
@@ -78,6 +79,16 @@ else
                     <td><a href="/suggestions/@s.Id">@s.Title</a></td>
                     <td><span class="category-badge">@s.Category</span></td>
                     <td><StatusChip Info="@StatusVocabulary.ForSeverity(s.Severity)" /></td>
+                    <td>
+                        @if (s.OccurrenceCount > 1)
+                        {
+                            <span class="category-badge" title="Re-raised by @s.OccurrenceCount work items">×@s.OccurrenceCount</span>
+                        }
+                        else
+                        {
+                            @s.OccurrenceCount
+                        }
+                    </td>
                     <td><a href="/work-items/@s.SourceWorkItemId">@s.ShortWorkItemId</a> <CopyableId Value="@s.SourceWorkItemId" CopyButtonOnly="true" /></td>
                     <td class="col-age" title="@AdminFormat.FormatRelative(s.CreatedAt, DateTimeOffset.UtcNow)">@s.Age</td>
                     <td class="col-actions">

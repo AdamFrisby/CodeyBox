@@ -58,6 +58,9 @@ public static class PipelineTuningHotReloadPolicy
         nameof(PipelineTuningOptions.SelfReviewChecklistEnabled),
         nameof(PipelineTuningOptions.PlannedItemAuditRebalanceEnabled),
         nameof(PipelineTuningOptions.PlannedItemAdvisoryAuditors),
+        nameof(PipelineTuningOptions.SuggestionDedupeSimilarityThreshold),
+        nameof(PipelineTuningOptions.SuggestionDedupeDismissedMatchWindow),
+        nameof(PipelineTuningOptions.SuggestionDedupeMaxRecordedSources),
     ];
 
     /// <summary>
