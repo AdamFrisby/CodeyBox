@@ -123,3 +123,6 @@ not; `NotEnforced` providers are logged as a warning stating the restriction.
 - [`daytona-sandbox-plugin.md`](daytona-sandbox-plugin.md) — hosted Daytona
   sandboxes (`ProviderKind: daytona`; `NotEnforced` classification, baseline
   snapshots, suspend/resume, retain/adopt).
+- [`boxlite-sandbox-plugin.md`](boxlite-sandbox-plugin.md) — embedded/local
+  BoxLite microVMs (`ProviderKind: boxlite`; `NotEnforced` classification,
+  OCI images, baseline snapshots, suspend/resume, retain/adopt).

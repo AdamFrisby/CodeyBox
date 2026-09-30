@@ -112,6 +112,7 @@
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.GotifyPlugin\CodeyBox.GotifyPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.NtfyPlugin\CodeyBox.NtfyPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.DaytonaSandboxPlugin\CodeyBox.DaytonaSandboxPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.BoxLiteSandboxPlugin\CodeyBox.BoxLiteSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Majordomo\CodeyBox.Majordomo.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--
