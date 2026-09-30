@@ -4,19 +4,26 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-internal enum WorkItemRetryFailureKind
+public enum WorkItemRetryFailureKind
 {
     None,
     StateChangedConcurrently,
 }
 
-internal readonly record struct WorkItemRetryResult(
+/// <param name="FreshCloneRetryAvailable">
+/// True only when the failure is one a <c>from="work"</c> retry can clear: the
+/// bare repo is gone but nothing (e.g. a retained-sandbox recovery lease)
+/// blocks a fresh-clone restart. API callers may safely offer the
+/// <c>from="work"</c> recovery hint only when this is set.
+/// </param>
+public readonly record struct WorkItemRetryResult(
     bool Success,
     string? Error,
     WorkItemState? ResumeState,
     string? ActualFrom,
     IReadOnlyList<string>? OpenQuestions,
-    WorkItemRetryFailureKind FailureKind = WorkItemRetryFailureKind.None)
+    WorkItemRetryFailureKind FailureKind = WorkItemRetryFailureKind.None,
+    bool FreshCloneRetryAvailable = false)
 {
     public void Deconstruct(
         out bool success,
@@ -93,45 +100,29 @@ public sealed class WorkItemRetrier
         _log = log;
     }
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAsync(
+    public async Task<WorkItemRetryResult> RetryAsync(
         WorkItem item,
         string? from = null,
         string trigger = "manual",
         CancellationToken ct = default,
         int? workTimeoutMinutes = null)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.None, agentRestoreClaim: null, ct, workTimeoutMinutes));
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.None, agentRestoreClaim: null, ct, workTimeoutMinutes);
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryQuotaAutoAsync(
+    public async Task<WorkItemRetryResult> RetryQuotaAutoAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, agentRestoreClaim: null, ct));
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, agentRestoreClaim: null, ct);
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryTransientAutoAsync(
+    public async Task<WorkItemRetryResult> RetryTransientAutoAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, agentRestoreClaim: null, ct));
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, agentRestoreClaim: null, ct);
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAgentRestoreAsync(
-        WorkItem item,
-        string? from,
-        string trigger,
-        AgentKind restoredAgent,
-        DateTimeOffset outageStartedAt,
-        DateTimeOffset restoredAt,
-        CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(
-            item,
-            from,
-            trigger,
-            RetryAccounting.AgentRestoreAutoRetry,
-            new AgentRestoreRetryClaim(restoredAgent, outageStartedAt, restoredAt),
-            ct));
-
-    internal async Task<WorkItemRetryResult> RetryAgentRestoreDetailedAsync(
+    public async Task<WorkItemRetryResult> RetryAgentRestoreAsync(
         WorkItem item,
         string? from,
         string trigger,
@@ -146,22 +137,6 @@ public sealed class WorkItemRetrier
             RetryAccounting.AgentRestoreAutoRetry,
             new AgentRestoreRetryClaim(restoredAgent, outageStartedAt, restoredAt),
             ct);
-
-    internal async Task<WorkItemRetryResult> RetryQuotaAutoDetailedAsync(
-        WorkItem item,
-        string? from,
-        string trigger,
-        CancellationToken ct = default)
-        => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, agentRestoreClaim: null, ct);
-
-    private static (bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions) ToPublicResult(
-        WorkItemRetryResult result) =>
-        (
-            result.Success,
-            result.Error,
-            result.ResumeState,
-            result.ActualFrom,
-            result.OpenQuestions);
 
     private async Task<WorkItemRetryResult> RetryCoreAsync(
         WorkItem item,
@@ -218,8 +193,9 @@ public sealed class WorkItemRetrier
         // agent-turn checkpoint is the strongest available boundary because it
         // preserves the interrupted conversation; otherwise retain the legacy
         // branch/audit-history auto-pick policy. Explicit phases always win.
+        var callerSpecifiedFrom = !string.IsNullOrWhiteSpace(from);
         string? autoPickReason = null;
-        if (string.IsNullOrWhiteSpace(from))
+        if (!callerSpecifiedFrom)
         {
             if (hasUsableAgentTurnCheckpoint)
             {
@@ -289,6 +265,7 @@ public sealed class WorkItemRetrier
             : requestedFrom;
         var retryingBeforeWork = resumeState is WorkItemState.PlanReview or WorkItemState.PlanApproved;
         var fellBackForMissingWorkBranch = false;
+        var fellBackForMissingBareRepo = false;
 
         if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
             return new WorkItemRetryResult(false, planningBoundaryError, null, null, null);
@@ -299,23 +276,63 @@ public sealed class WorkItemRetrier
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
             {
-                return new WorkItemRetryResult(
-                    false,
-                    $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists",
-                    null,
-                    null,
-                    null);
-            }
+                // A git-backed turn checkpoint restores its dirty tree from a
+                // ref inside this bare repo, so a reaped repo makes it
+                // unrecoverable — but a retained-sandbox lease survives in the
+                // provider and must never be silently discarded. Refuse so the
+                // operator cancels the item and provider cleanup stays
+                // authoritative.
+                if (resumingAgentTurn && item.AgentTurnRecoveryLease is not null)
+                {
+                    return new WorkItemRetryResult(
+                        false,
+                        "cannot discard a retained-sandbox recovery lease after the bare repo was reaped; cancel the item so provider cleanup remains authoritative",
+                        null,
+                        null,
+                        null);
+                }
 
-            // A durable turn resume restores from the pushed preempt ref; the
-            // ordinary work-branch ref may not exist when an initial turn died
-            // before publishing it. Non-checkpoint post-work retries still need
-            // the ordinary branch and retain the legacy fallback below.
-            if (!resumingAgentTurn)
+                // A "work" retry — or an auto-picked boundary the caller never
+                // pinned — can always restart from a fresh clone, so discard
+                // the dead checkpoint and fall through to Queued. Only an
+                // explicitly requested post-work phase (audit, rework, …) has
+                // no way forward without the repo.
+                var restartFromFreshClone = resumingAgentTurn
+                    && (!callerSpecifiedFrom
+                        || string.Equals(requestedFrom, RetryFromPolicy.Work, StringComparison.Ordinal));
+                if (!restartFromFreshClone)
+                {
+                    return new WorkItemRetryResult(
+                        false,
+                        $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists",
+                        null,
+                        null,
+                        null,
+                        FreshCloneRetryAvailable: true);
+                }
+
+                checkpointDiscardReason = $"bare repo for work item {item.Id} no longer exists";
+                hasUsableAgentTurnCheckpoint = false;
+                agentTurnCheckpoint = null;
+                resumingAgentTurn = false;
+                resumeState = WorkItemState.Queued;
+                fellBackForMissingBareRepo = !string.Equals(
+                    requestedFrom, RetryFromPolicy.Work, StringComparison.Ordinal);
+                actualFrom = RetryFromPolicy.Work;
+                _log.LogInformation(
+                    "Discarding durable agent-turn resume checkpoint for work item {Id}: {Reason}",
+                    item.Id,
+                    checkpointDiscardReason);
+            }
+            else if (!resumingAgentTurn)
             {
-                // Earlier work-phase failures can leave the item in Failed
-                // without ever producing a commit, in which case a requested
-                // post-work resume would crash on the missing branch.
+                // A durable turn resume restores from the pushed preempt ref;
+                // the ordinary work-branch ref may not exist when an initial
+                // turn died before publishing it. Non-checkpoint post-work
+                // retries still need the ordinary branch: earlier work-phase
+                // failures can leave the item in Failed without ever producing
+                // a commit, in which case a requested post-work resume would
+                // crash on the missing branch.
                 var workBranch = item.WorkBranch;
                 var branchPresent = !string.IsNullOrEmpty(workBranch)
                     && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
@@ -505,7 +522,9 @@ public sealed class WorkItemRetrier
 
         var auditFrom = fellBackForMissingWorkBranch
             ? $"{actualFrom} (fallback from '{requestedFrom}': work branch missing)"
-            : actualFrom;
+            : fellBackForMissingBareRepo
+                ? $"{actualFrom} (fallback from '{requestedFrom}': bare repo missing)"
+                : actualFrom;
         if (!hasUsableAgentTurnCheckpoint && checkpointDiscardReason is not null)
             auditFrom = $"{auditFrom} (agent-turn checkpoint discarded: {checkpointDiscardReason})";
         if (autoPickReason is not null)

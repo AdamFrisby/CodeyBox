@@ -420,7 +420,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 WorkItemRetryResult retry;
                 try
                 {
-                    retry = await _retrier.RetryAgentRestoreDetailedAsync(
+                    retry = await _retrier.RetryAgentRestoreAsync(
                         item,
                         from: null,
                         trigger: "agent-restore",

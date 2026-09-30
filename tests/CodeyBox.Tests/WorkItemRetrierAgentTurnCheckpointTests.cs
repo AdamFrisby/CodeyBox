@@ -123,6 +123,180 @@ public sealed class WorkItemRetrierAgentTurnCheckpointTests : IDisposable
         Assert.Equal(0, queue.Count);
     }
 
+    [Theory]
+    [InlineData(RetryFromPolicy.Work)]
+    [InlineData(null)]
+    public async Task MissingBareRepo_DiscardsDeadGitCheckpointAndRestartsFromFreshClone(string? requestedFrom)
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = NewRecoverableItem(
+            WorkItemState.Failed,
+            AgentTurnResumePhase.Work,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+        await store.CreateAsync(item);
+        // No CreateRepositoryAsync: the bare repo was reaped, so the preempt
+        // ref the checkpoint restores from no longer exists.
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: requestedFrom);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal(RetryFromPolicy.Work, result.ActualFrom);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(WorkItemState.Queued, persisted!.State);
+        Assert.Null(persisted.PreemptedAt);
+        Assert.Null(persisted.PreemptCheckpoint);
+        Assert.Null(persisted.AgentTurnResumeCheckpoint);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MissingBareRepo_AutoPickedReworkCheckpointFallsBackToFreshClone()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = NewRecoverableItem(
+            WorkItemState.Failed,
+            AgentTurnResumePhase.Rework,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+        await store.CreateAsync(item);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Queued, result.ResumeState);
+        Assert.Equal(RetryFromPolicy.Work, result.ActualFrom);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(WorkItemState.Queued, persisted!.State);
+        Assert.Null(persisted.AgentTurnResumeCheckpoint);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MissingBareRepo_ExplicitPostWorkPhaseStillConflictsButOffersFreshClone()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = NewRecoverableItem(
+            WorkItemState.Failed,
+            AgentTurnResumePhase.Work,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+        await store.CreateAsync(item);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: RetryFromPolicy.Audit);
+
+        Assert.False(result.Success);
+        Assert.Contains("no longer exists", result.Error, StringComparison.Ordinal);
+        Assert.True(result.FreshCloneRetryAvailable);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(item.State, persisted!.State);
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task MissingBareRepo_ExplicitMatchingReworkCheckpointStillConflictsButOffersFreshClone()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = NewRecoverableItem(
+            WorkItemState.Failed,
+            AgentTurnResumePhase.Rework,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+        await store.CreateAsync(item);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: RetryFromPolicy.Rework);
+
+        Assert.False(result.Success);
+        Assert.Contains("no longer exists", result.Error, StringComparison.Ordinal);
+        Assert.True(result.FreshCloneRetryAvailable);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(item.State, persisted!.State);
+        Assert.Equal(item.AgentTurnResumeCheckpoint, persisted.AgentTurnResumeCheckpoint);
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task MissingBareRepo_RetainedSandboxLeaseIsRefusedNotDiscarded()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var lease = new SandboxRecoveryLease(
+            "incus",
+            "codeybox-retained-reaped",
+            "retained-reaped-token");
+        var item = NewRecoverableItem(
+            WorkItemState.Failed,
+            AgentTurnResumePhase.Work,
+            failureKind: WorkItemFailureKinds.Infrastructure) with
+        {
+            PreemptCheckpoint = null,
+            AgentTurnRecoveryLease = lease,
+        };
+        await store.CreateAsync(item);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: RetryFromPolicy.Work);
+
+        Assert.False(result.Success);
+        Assert.Contains("cannot discard a retained-sandbox recovery lease", result.Error, StringComparison.Ordinal);
+        // A from="work" retry would hit this same refusal, so no fresh-clone
+        // hint may be advertised for this failure.
+        Assert.False(result.FreshCloneRetryAvailable);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(item.State, persisted!.State);
+        Assert.Equal(lease, persisted.AgentTurnRecoveryLease);
+        Assert.Equal(item.AgentTurnResumeCheckpoint, persisted.AgentTurnResumeCheckpoint);
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task FromWork_ValidCheckpointWithRepoPresent_StillResumesExactTurn()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = NewRecoverableItem(
+            WorkItemState.Failed,
+            AgentTurnResumePhase.Work,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+        await store.CreateAsync(item);
+        await CreateRepositoryAsync(gitHost, item, createWorkBranch: false);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: RetryFromPolicy.Work);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal(WorkItemState.Working, result.ResumeState);
+        Assert.Equal(RetryFromPolicy.Work, result.ActualFrom);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(WorkItemState.Working, persisted!.State);
+        Assert.Equal(item.PreemptCheckpoint, persisted.PreemptCheckpoint);
+        Assert.Equal(item.AgentTurnResumeCheckpoint, persisted.AgentTurnResumeCheckpoint);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
     [Fact]
     public async Task QueueFailureAfterDanglingLeaseDiscard_DoesNotResurrectMalformedRecoveryMetadata()
     {
