@@ -690,6 +690,45 @@ public sealed class BoxLiteSandboxProviderTests
         await sandbox.DisposeAsync();
     }
 
+    [Fact]
+    public async Task WaitForAdoptedAgentCompletion_SkipsOverCapLog_StillReturnsExitCode()
+    {
+        // Regression: guest-controlled adopt logs are bounded per read, so a
+        // log past the cap is skipped for the tick instead of buffered.
+        var server = new FakeBoxLiteServer();
+        var provider = NewProvider(server, TestOptions() with { MaxFileSyncBase64Bytes = 64 });
+        var sandbox = await provider.CreateAsync(WorkSpec(), CancellationToken.None);
+        var logPath = "/work/.codeybox/agent-logs/agent.jsonl";
+        server.Files[$"{sandbox.Id}:{logPath}"] =
+            Convert.ToBase64String(Encoding.UTF8.GetBytes(new string('x', 1024)));
+        server.Files[$"{sandbox.Id}:{logPath}.exit"] = Convert.ToBase64String(Encoding.UTF8.GetBytes("3"));
+
+        var tail = new StringBuilder();
+        var exit = await ((ISuspendingSandboxProvider)provider).WaitForAdoptedAgentCompletionAsync(
+            sandbox.Id, logPath, s => tail.Append(s), deadline: TimeSpan.FromMinutes(5), CancellationToken.None);
+        Assert.Equal(3, exit);
+        Assert.Equal(string.Empty, tail.ToString());
+        await sandbox.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task WaitForAdoptedAgentCompletion_SkipsMalformedLog_StillReturnsExitCode()
+    {
+        var server = new FakeBoxLiteServer();
+        var provider = NewProvider(server);
+        var sandbox = await provider.CreateAsync(WorkSpec(), CancellationToken.None);
+        var logPath = "/work/.codeybox/agent-logs/agent.jsonl";
+        server.Files[$"{sandbox.Id}:{logPath}"] = "!!!not-base64!!!";
+        server.Files[$"{sandbox.Id}:{logPath}.exit"] = Convert.ToBase64String(Encoding.UTF8.GetBytes("0"));
+
+        var tail = new StringBuilder();
+        var exit = await ((ISuspendingSandboxProvider)provider).WaitForAdoptedAgentCompletionAsync(
+            sandbox.Id, logPath, s => tail.Append(s), deadline: TimeSpan.FromMinutes(5), CancellationToken.None);
+        Assert.Equal(0, exit);
+        Assert.Equal(string.Empty, tail.ToString());
+        await sandbox.DisposeAsync();
+    }
+
     // ------------------------------------------------------------------
     // Baselines
     // ------------------------------------------------------------------

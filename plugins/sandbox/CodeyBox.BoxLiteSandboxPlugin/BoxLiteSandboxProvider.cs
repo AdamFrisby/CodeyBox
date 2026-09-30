@@ -42,6 +42,13 @@ public sealed class BoxLiteSandboxProvider :
     // path is provider-constructed but its bytes are guest-influenced output.
     private const long ExitMarkerMaxBytes = 256;
 
+    // Bounds on operator/pipeline-supplied image references and resource floors
+    // when a spec limit is absent; the floors match the option validators so a
+    // limit-less spec still yields a bootable VM.
+    private const int MaxImageRefLength = 512;
+    private const int MinMemoryMiB = 256;
+    private const int MinDiskGiB = 4;
+
     private readonly Func<BoxLiteSandboxOptions> _readOptions;
     private readonly Func<string, string?> _environment;
     private readonly TimeProvider _clock;
@@ -341,11 +348,13 @@ public sealed class BoxLiteSandboxProvider :
         TimeSpan? deadline,
         CancellationToken ct)
     {
-        if (!IsValidManagedName(vmName, ReadValidatedOptions().NamePrefix))
+        var opts = ReadValidatedOptions();
+        if (!IsValidManagedName(vmName, opts.NamePrefix))
             return null;
         if (!IsValidAgentLogPath(agentLogPath))
             return null;
-        var endpoint = ResolveEndpoint(ReadValidatedOptions());
+        var endpoint = ResolveEndpoint(opts);
+        var pollDelay = TimeSpan.FromMilliseconds(Math.Clamp(opts.PollIntervalMilliseconds, 100, 60_000));
         var stopAt = deadline is { } d && d > TimeSpan.Zero ? _clock.GetUtcNow() + d : (DateTimeOffset?)null;
         var delivered = 0;
         while (!ct.IsCancellationRequested)
@@ -357,8 +366,9 @@ public sealed class BoxLiteSandboxProvider :
             {
                 exit = await Api.ReadFileAsync(endpoint, vmName, agentLogPath + ".exit", ct).ConfigureAwait(false);
             }
-            catch (BoxLiteApiException)
+            catch (BoxLiteApiException ex)
             {
+                _log.LogDebug(ex, "BoxLite adopt exit-marker read for {Name} failed", vmName);
                 return null;
             }
             if (exit?.ContentBase64 is not null)
@@ -370,16 +380,18 @@ public sealed class BoxLiteSandboxProvider :
                 }
                 catch (FormatException)
                 {
+                    _log.LogDebug("BoxLite adopt exit marker for {Name} is not valid base64", vmName);
                     return null;
                 }
                 if (bytes.Length > ExitMarkerMaxBytes)
                     return null;
                 try
                 {
-                    await TailLogAsync(endpoint, vmName, agentLogPath, logSink, ct).ConfigureAwait(false);
+                    delivered = await TailLogRemainderAsync(endpoint, vmName, agentLogPath, logSink, delivered, opts, ct).ConfigureAwait(false);
                 }
-                catch (BoxLiteApiException)
+                catch (BoxLiteApiException ex)
                 {
+                    _log.LogDebug(ex, "BoxLite final adopt-log tail for {Name} failed", vmName);
                 }
                 var text = Encoding.UTF8.GetString(bytes).Trim();
                 return int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var code) ? code : null;
@@ -387,30 +399,15 @@ public sealed class BoxLiteSandboxProvider :
             try
             {
                 var log = await Api.ReadFileAsync(endpoint, vmName, agentLogPath, ct).ConfigureAwait(false);
-                if (log?.ContentBase64 is not null)
-                {
-                    string text;
-                    try
-                    {
-                        text = Encoding.UTF8.GetString(Convert.FromBase64String(log.ContentBase64));
-                    }
-                    catch (FormatException)
-                    {
-                        text = string.Empty;
-                    }
-                    if (text.Length > delivered)
-                    {
-                        logSink?.Invoke(text[delivered..]);
-                        delivered = text.Length;
-                    }
-                }
+                delivered = TryDeliverLogDelta(log?.ContentBase64, logSink, delivered, opts, vmName);
             }
-            catch (BoxLiteApiException)
+            catch (BoxLiteApiException ex)
             {
+                _log.LogDebug(ex, "BoxLite adopt-log poll for {Name} failed", vmName);
             }
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(5), _clock, ct).ConfigureAwait(false);
+                await Task.Delay(pollDelay, _clock, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -420,21 +417,68 @@ public sealed class BoxLiteSandboxProvider :
         return null;
     }
 
-    private async Task TailLogAsync(
-        BoxLiteEndpoint endpoint, string vmName, string agentLogPath, Action<string>? logSink, CancellationToken ct)
+    /// <summary>
+    /// Delivers only the undelivered suffix of one guest-written log read.
+    /// The read is bounded before it is buffered: a per-read base64-length
+    /// guard runs before <c>Convert.FromBase64String</c> and a decoded-byte
+    /// guard before UTF-8 decoding, so a guest appending to the log cannot
+    /// grow host memory without bound and each tick stays O(cap). Over-cap or
+    /// malformed reads are skipped for this tick (the exit-marker poll still
+    /// completes) and retried next tick. Total delivered output never exceeds
+    /// <c>MaxFileSyncBytes</c> because decoded UTF-8 text holds at most one
+    /// character per byte.
+    /// </summary>
+    private int TryDeliverLogDelta(
+        string? contentBase64, Action<string>? logSink, int delivered, BoxLiteSandboxOptions opts, string vmName)
     {
-        if (logSink is null)
-            return;
-        var log = await Api.ReadFileAsync(endpoint, vmName, agentLogPath, ct).ConfigureAwait(false);
-        if (log?.ContentBase64 is null)
-            return;
+        if (logSink is null || contentBase64 is null)
+            return delivered;
+        if (contentBase64.Length > opts.MaxFileSyncBase64Bytes)
+        {
+            _log.LogDebug(
+                "BoxLite adopt log for {Name} exceeds the per-read bound ({Length} > {Max}); skipping this tick",
+                vmName, contentBase64.Length, opts.MaxFileSyncBase64Bytes);
+            return delivered;
+        }
+        byte[] raw;
         try
         {
-            logSink(Encoding.UTF8.GetString(Convert.FromBase64String(log.ContentBase64)));
+            raw = Convert.FromBase64String(contentBase64);
         }
         catch (FormatException)
         {
+            _log.LogDebug("BoxLite adopt log for {Name} is not valid base64; skipping this tick", vmName);
+            return delivered;
         }
+        if (raw.Length > opts.MaxFileSyncBytes)
+        {
+            _log.LogDebug(
+                "BoxLite adopt log for {Name} exceeds the decoded bound ({Length} > {Max}); skipping this tick",
+                vmName, raw.Length, opts.MaxFileSyncBytes);
+            return delivered;
+        }
+        var text = Encoding.UTF8.GetString(raw);
+        if (text.Length > delivered)
+        {
+            logSink(text[delivered..]);
+            return text.Length;
+        }
+        return delivered;
+    }
+
+    private async Task<int> TailLogRemainderAsync(
+        BoxLiteEndpoint endpoint,
+        string vmName,
+        string agentLogPath,
+        Action<string>? logSink,
+        int delivered,
+        BoxLiteSandboxOptions opts,
+        CancellationToken ct)
+    {
+        if (logSink is null)
+            return delivered;
+        var log = await Api.ReadFileAsync(endpoint, vmName, agentLogPath, ct).ConfigureAwait(false);
+        return TryDeliverLogDelta(log?.ContentBase64, logSink, delivered, opts, vmName);
     }
 
     public async Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
@@ -615,7 +659,7 @@ public sealed class BoxLiteSandboxProvider :
                 : opts.DefaultImage.Trim();
         if (string.IsNullOrWhiteSpace(image))
             throw new InvalidOperationException("BoxLite create requires SandboxSpec.ImageReference (or DefaultImage); no image was named.");
-        if (image.Length > 512 || image.Any(char.IsControl) || image.Contains(' ', StringComparison.Ordinal))
+        if (image.Length > MaxImageRefLength || image.Any(char.IsControl) || image.Contains(' ', StringComparison.Ordinal))
             throw new InvalidOperationException($"BoxLite image reference '{image}' is not a valid OCI reference.");
 
         var network = BuildNetworkRequest(spec.Network);
@@ -631,10 +675,10 @@ public sealed class BoxLiteSandboxProvider :
             image,
             Cpu: spec.Limits.CpuCount ?? opts.DefaultCpuCount,
             MemoryMib: spec.Limits.MemoryBytes is { } bytes && bytes > 0
-                ? Math.Max(256, (int)Math.Ceiling(bytes / (double)(1024 * 1024)))
+                ? Math.Max(MinMemoryMiB, (int)Math.Ceiling(bytes / (double)(1024 * 1024)))
                 : opts.DefaultMemoryMiB,
             DiskGib: spec.Limits.DiskBytes is { } disk && disk > 0
-                ? Math.Max(4, (int)Math.Ceiling(disk / (double)(1024L * 1024 * 1024)))
+                ? Math.Max(MinDiskGiB, (int)Math.Ceiling(disk / (double)(1024L * 1024 * 1024)))
                 : opts.DefaultDiskGiB,
             Persistent: opts.PersistentDisks,
             Network: network,
@@ -684,11 +728,6 @@ public sealed class BoxLiteSandboxProvider :
                 throw new ArgumentException("Sandbox mounts must not contain null entries.", nameof(spec));
             if (!BoxLiteSandbox.IsValidAbsolutePath(mount.SandboxPath))
                 throw new ArgumentException($"Mount sandbox path '{mount.SandboxPath}' is not an absolute contained path.", nameof(spec));
-            if (mount.Tmpfs && mount.HostPath is null)
-            {
-                plans.Add(new BoxLiteMountPlan(mount.SandboxPath, null, mount.ReadOnly, IsGuestDir: true));
-                continue;
-            }
             if (mount.HostPath is null)
             {
                 plans.Add(new BoxLiteMountPlan(mount.SandboxPath, null, mount.ReadOnly, IsGuestDir: true));

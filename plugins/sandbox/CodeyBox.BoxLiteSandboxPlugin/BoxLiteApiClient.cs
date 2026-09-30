@@ -13,7 +13,13 @@ namespace CodeyBox.BoxLiteSandboxPlugin;
 /// every request; it is never stored on the options record (and never logged
 /// — error bodies are scrubbed before they surface in exceptions).
 /// </summary>
-internal sealed record BoxLiteEndpoint(Uri DaemonBaseUri, string ApiToken, bool AllowUnsafeHttp = false);
+internal sealed record BoxLiteEndpoint(Uri DaemonBaseUri, string ApiToken, bool AllowUnsafeHttp = false)
+{
+    // The compiler-generated record ToString would render the live API token;
+    // redact it so a future log interpolation of the endpoint cannot leak it.
+    public override string ToString() =>
+        $"{nameof(BoxLiteEndpoint)} {{ {nameof(DaemonBaseUri)} = {DaemonBaseUri}, {nameof(ApiToken)} = **redacted**, {nameof(AllowUnsafeHttp)} = {AllowUnsafeHttp} }}";
+}
 
 /// <summary>
 /// Thin REST client for the BoxLite embedded-microVM daemon (<c>{DaemonUrl}/v1</c>).
@@ -42,9 +48,10 @@ internal sealed class BoxLiteApiClient
     }
 
     /// <summary>
-    /// True only for loopback http URLs when the operator explicitly opted in.
-    /// Remote cleartext is refused unconditionally so the API token can never
-    /// ride a cleartext request to a remote host because of one config edit.
+    /// True for non-http schemes (https included); for http, only loopback
+    /// hosts when the operator explicitly opted in. Remote cleartext is
+    /// refused unconditionally so the API token can never ride a cleartext
+    /// request to a remote host because of one config edit.
     /// </summary>
     public static bool IsCleartextHttpPermitted(Uri uri, bool allowUnsafeHttp)
     {

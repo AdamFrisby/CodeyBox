@@ -53,6 +53,19 @@ internal sealed class BoxLiteSandbox :
     // failed helper without letting a noisy daemon blow the cap.
     private const int SyncHelperStderrCapBytes = 64 * 1024;
 
+    // Bounds on exec argv: entries are individually capped so one huge
+    // argument cannot blow the daemon request, and the count is capped so
+    // request construction stays O(cap).
+    private const int MaxArgvEntryBytes = 32 * 1024;
+    private const int MaxArgvEntries = 512;
+
+    // Copy buffer for host-side tar extraction.
+    private const int CopyBufferBytes = 64 * 1024;
+
+    // Interval at which a second concurrent disposer polls for the first
+    // disposer to finish.
+    private static readonly TimeSpan DisposeGatePollInterval = TimeSpan.FromMilliseconds(10);
+
     // Exit code reported when the spec's wall-clock limit fires; matches the
     // conventional timeout(1) 124 so orchestrator tooling reads it as timeout.
     private const int WallClockTimeoutExitCode = 124;
@@ -134,10 +147,10 @@ internal sealed class BoxLiteSandbox :
         {
             if (arg is null)
                 throw new ArgumentException("Exec argv must not contain null entries.", nameof(exec));
-            if (arg.Length > 32 * 1024)
+            if (arg.Length > MaxArgvEntryBytes)
                 throw new ArgumentException("Exec argv entries are bounded to 32 KiB each.", nameof(exec));
         }
-        if (exec.Argv.Count > 512)
+        if (exec.Argv.Count > MaxArgvEntries)
             throw new ArgumentException("Exec argv is bounded to 512 entries.", nameof(exec));
 
         var opts = _readOptions();
@@ -256,15 +269,15 @@ internal sealed class BoxLiteSandbox :
                 return Unavailable($"poll exec failed: {ex.Message}");
             }
 
-            var stdoutText = DecodeBounded(status.StdoutBase64, stdoutCap + SnapshotSlackChars, out var stdoutHuge);
-            var stderrText = DecodeBounded(status.StderrBase64, stderrCap + SnapshotSlackChars, out var stderrHuge);
+            var stdoutText = DecodeBounded(status.StdoutBase64, stdoutCap + SnapshotSlackChars, out var stdoutHuge, _log);
+            var stderrText = DecodeBounded(status.StderrBase64, stderrCap + SnapshotSlackChars, out var stderrHuge, _log);
             if (stdoutHuge || stderrHuge || stdoutText.Length < stdoutDelivered || stderrText.Length < stderrDelivered)
             {
                 await TryKillExecAsync(endpoint, execId).ConfigureAwait(false);
                 return Unavailable("exec stream regressed or exceeded the snapshot ceiling");
             }
-            AppendDelta(stdout, stdoutText, ref stdoutDelivered, exec.StdoutChunkCallback);
-            AppendDelta(stderr, stderrText, ref stderrDelivered, exec.StderrChunkCallback);
+            AppendDelta(stdout, stdoutText, ref stdoutDelivered, exec.StdoutChunkCallback, _log);
+            AppendDelta(stderr, stderrText, ref stderrDelivered, exec.StderrChunkCallback, _log);
             stdoutBytes = Utf8.GetByteCount(stdoutText);
             stderrBytes = Utf8.GetByteCount(stderrText);
 
@@ -317,7 +330,7 @@ internal sealed class BoxLiteSandbox :
         }
     }
 
-    private static void AppendDelta(StringBuilder sink, string full, ref int delivered, Action<string>? callback)
+    private static void AppendDelta(StringBuilder sink, string full, ref int delivered, Action<string>? callback, ILogger log)
     {
         if (full.Length <= delivered)
             return;
@@ -328,12 +341,13 @@ internal sealed class BoxLiteSandbox :
         {
             callback?.Invoke(delta);
         }
-        catch
+        catch (Exception ex)
         {
+            log.LogDebug(ex, "BoxLite exec chunk callback failed; continuing with buffered output");
         }
     }
 
-    private static string DecodeBounded(string? base64, int maxChars, out bool truncated)
+    private static string DecodeBounded(string? base64, int maxChars, out bool truncated, ILogger log)
     {
         truncated = false;
         if (string.IsNullOrEmpty(base64))
@@ -345,6 +359,7 @@ internal sealed class BoxLiteSandbox :
         }
         catch (FormatException)
         {
+            log.LogDebug("BoxLite daemon returned malformed base64; treating as empty output");
             return string.Empty;
         }
         var text = Utf8.GetString(bytes);
@@ -390,8 +405,9 @@ internal sealed class BoxLiteSandbox :
         {
             await _api.KillExecAsync(endpoint, _name, execId, CancellationToken.None).ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
+            _log.LogDebug(ex, "Kill of BoxLite exec {ExecId} on {Name} failed", execId, _name);
         }
     }
 
@@ -404,8 +420,9 @@ internal sealed class BoxLiteSandbox :
             {
                 await _api.KillExecAsync(endpoint, _name, execId, ct).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
+                _log.LogDebug(ex, "Kill of BoxLite exec {ExecId} on {Name} failed", execId, _name);
             }
         }
     }
@@ -721,7 +738,7 @@ internal sealed class BoxLiteSandbox :
             if (entry.DataStream is null)
                 continue;
             using var output = File.Create(full);
-            var buffer = new byte[64 * 1024];
+            var buffer = new byte[CopyBufferBytes];
             int read;
             while ((read = entry.DataStream.Read(buffer, 0, buffer.Length)) > 0)
             {
@@ -811,10 +828,9 @@ internal sealed class BoxLiteSandbox :
     {
         if (Interlocked.Exchange(ref _disposing, 1) == 1)
         {
-            using var waitGate = new SemaphoreSlim(0, 1);
             var start = _clock.GetUtcNow();
             while (Volatile.Read(ref _disposed) == 0 && _clock.GetUtcNow() - start < DisposeGateWaitTimeout)
-                await Task.Delay(TimeSpan.FromMilliseconds(10), _clock).ConfigureAwait(false);
+                await Task.Delay(DisposeGatePollInterval, _clock).ConfigureAwait(false);
             return;
         }
         try
@@ -825,8 +841,9 @@ internal sealed class BoxLiteSandbox :
                 {
                     await SyncStateToHostAsync(CancellationToken.None).ConfigureAwait(false);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    _log.LogDebug(ex, "BoxLite VM {Name} state sync during dispose failed", _name);
                 }
                 try
                 {
@@ -847,8 +864,9 @@ internal sealed class BoxLiteSandbox :
             {
                 _onDisposed(this);
             }
-            catch
+            catch (Exception ex)
             {
+                _log.LogDebug(ex, "BoxLite VM {Name} dispose callback failed", _name);
             }
         }
     }
