@@ -34,6 +34,25 @@ internal sealed class BoxLiteApiClient
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
+    // Transport-level ceilings, enforced BEFORE the client buffers a body.
+    // Guest-influenced JSON (exec snapshots, file/archive reads) arrives as
+    // one HTTP body per poll tick, so per-call caps derived from the matching
+    // option bound host memory to O(cap) no matter how much the guest wrote.
+    // A body past the ceiling throws BoxLiteApiException (Unexpected —
+    // infrastructure, never a diff verdict) before deserialization runs.
+    internal const long DefaultMaxResponseBytes = 8L * 1024 * 1024;
+
+    // Slack on top of each exec-stream cap when bounding one poll's snapshot,
+    // covering multi-byte decoding growth. Shared with the snapshot decoder
+    // so the transport ceiling always covers what the decoder accepts.
+    internal const int ExecSnapshotSlackBytes = 1024 * 1024;
+
+    internal const long MaxErrorBodyBytes = 8192;
+
+    private const long GuestJsonOverheadBytes = 64L * 1024;
+
+    private const int CopyBufferBytes = 8192;
+
     // Error bodies are untrusted remote text: bounded before they are folded
     // into exception messages and logs.
     private const int MaxErrorBodyChars = 2048;
@@ -46,6 +65,24 @@ internal sealed class BoxLiteApiClient
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
     }
+
+    /// <summary>
+    /// Bounds one exec-poll body: both base64 snapshots at their accepted
+    /// ceiling (cap plus snapshot slack, inflated for base64) plus JSON
+    /// framing. A guest emitting past this is unbounded output: the poll
+    /// throws and the caller kills the guest process.
+    /// </summary>
+    internal static long BoundExecPollResponseBytes(int stdoutCap, int stderrCap) =>
+        ((long)stdoutCap + ExecSnapshotSlackBytes) * 4 / 3
+        + ((long)stderrCap + ExecSnapshotSlackBytes) * 4 / 3
+        + GuestJsonOverheadBytes;
+
+    /// <summary>
+    /// Bounds one file/archive body: the accepted base64 length plus JSON
+    /// framing (base64 is ASCII, so body bytes track base64 chars 1:1).
+    /// </summary>
+    internal static long BoundPayloadResponseBytes(long maxBase64Chars) =>
+        maxBase64Chars + GuestJsonOverheadBytes;
 
     /// <summary>
     /// True for non-http schemes (https included); for http, only loopback
@@ -156,11 +193,12 @@ internal sealed class BoxLiteApiClient
     }
 
     public async Task<BoxLiteExecStatusDto> GetExecAsync(
-        BoxLiteEndpoint endpoint, string vmId, string execId, CancellationToken ct)
+        BoxLiteEndpoint endpoint, string vmId, string execId, CancellationToken ct,
+        long maxResponseBytes = DefaultMaxResponseBytes)
     {
         using var response = await SendAsync(
             endpoint, HttpMethod.Get, $"vms/{Uri.EscapeDataString(vmId)}/exec/{Uri.EscapeDataString(execId)}", null, ct).ConfigureAwait(false);
-        var dto = await ReadJsonAsync<BoxLiteExecStatusDto>(response, "poll exec", ct).ConfigureAwait(false);
+        var dto = await ReadJsonAsync<BoxLiteExecStatusDto>(response, "poll exec", ct, maxResponseBytes).ConfigureAwait(false);
         return dto ?? throw new BoxLiteApiException(BoxLiteFailureKind.Unexpected, "poll exec", "empty response body");
     }
 
@@ -187,13 +225,14 @@ internal sealed class BoxLiteApiClient
 
     /// <summary>GET a single file from the guest. Returns null when absent (404).</summary>
     public async Task<BoxLiteFileDto?> ReadFileAsync(
-        BoxLiteEndpoint endpoint, string vmId, string guestPath, CancellationToken ct)
+        BoxLiteEndpoint endpoint, string vmId, string guestPath, CancellationToken ct,
+        long maxResponseBytes = DefaultMaxResponseBytes)
     {
         using var response = await SendAsync(
             endpoint, HttpMethod.Get, $"vms/{Uri.EscapeDataString(vmId)}/files?path={Uri.EscapeDataString(guestPath)}", null, ct).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
             return null;
-        return await ReadJsonAsync<BoxLiteFileDto>(response, "read file", ct).ConfigureAwait(false);
+        return await ReadJsonAsync<BoxLiteFileDto>(response, "read file", ct, maxResponseBytes).ConfigureAwait(false);
     }
 
     /// <summary>POST a base64 tar.gz the daemon extracts at <paramref name="guestPath"/>.</summary>
@@ -209,13 +248,14 @@ internal sealed class BoxLiteApiClient
 
     /// <summary>GET a base64 tar.gz of <paramref name="guestPath"/>.</summary>
     public async Task<BoxLiteArchiveResult?> CreateArchiveAsync(
-        BoxLiteEndpoint endpoint, string vmId, string guestPath, CancellationToken ct)
+        BoxLiteEndpoint endpoint, string vmId, string guestPath, CancellationToken ct,
+        long maxResponseBytes = DefaultMaxResponseBytes)
     {
         using var response = await SendAsync(
             endpoint, HttpMethod.Get, $"vms/{Uri.EscapeDataString(vmId)}/archive?path={Uri.EscapeDataString(guestPath)}", null, ct).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
             return null;
-        return await ReadJsonAsync<BoxLiteArchiveResult>(response, "create archive", ct).ConfigureAwait(false);
+        return await ReadJsonAsync<BoxLiteArchiveResult>(response, "create archive", ct, maxResponseBytes).ConfigureAwait(false);
     }
 
     /// <summary>POST /vms/{id}/network: replaces the VM network restriction after setup (bake-then-lock).</summary>
@@ -311,16 +351,19 @@ internal sealed class BoxLiteApiClient
         return response;
     }
 
-    private static async Task<T?> ReadJsonAsync<T>(HttpResponseMessage response, string operation, CancellationToken ct)
+    private static async Task<T?> ReadJsonAsync<T>(
+        HttpResponseMessage response, string operation, CancellationToken ct,
+        long maxResponseBytes = DefaultMaxResponseBytes)
     {
         await EnsureSuccessStaticAsync(response, operation, ct).ConfigureAwait(false);
         try
         {
-            var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            await using (stream.ConfigureAwait(false))
-            {
-                return await JsonSerializer.DeserializeAsync<T>(stream, Json, ct).ConfigureAwait(false);
-            }
+            // Fast path: a declared length past the ceiling is unbounded
+            // guest output without reading a single body byte.
+            if (response.Content.Headers.ContentLength is { } declared && declared > maxResponseBytes)
+                throw OverCap(operation, maxResponseBytes);
+            var body = await CopyBoundedAsync(response, maxResponseBytes, operation, ct).ConfigureAwait(false);
+            return JsonSerializer.Deserialize<T>(body.AsSpan(), Json);
         }
         catch (OperationCanceledException)
         {
@@ -333,6 +376,41 @@ internal sealed class BoxLiteApiClient
                 $"unreadable BoxLite response: {Trim(ex.Message)}", response.StatusCode, innerException: ex);
         }
     }
+
+    /// <summary>
+    /// Copies the response body up to <paramref name="maxBytes"/> plus one
+    /// probe byte: the probe distinguishes "exactly at the ceiling" (kept)
+    /// from "past it" (over cap) without buffering the excess.
+    /// </summary>
+    private static async Task<byte[]> CopyBoundedAsync(
+        HttpResponseMessage response, long maxBytes, string operation, CancellationToken ct)
+    {
+        var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        await using (stream.ConfigureAwait(false))
+        {
+            using var buffer = new MemoryStream();
+            var chunk = new byte[CopyBufferBytes];
+            int read;
+            while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
+            {
+                var room = maxBytes + 1 - buffer.Length;
+                if (read >= room)
+                {
+                    buffer.Write(chunk, 0, (int)room);
+                    break;
+                }
+                buffer.Write(chunk, 0, read);
+            }
+            if (buffer.Length > maxBytes)
+                throw OverCap(operation, maxBytes);
+            return buffer.ToArray();
+        }
+    }
+
+    private static BoxLiteApiException OverCap(string operation, long maxBytes) =>
+        new(BoxLiteFailureKind.Unexpected, operation,
+            $"daemon response exceeded the {maxBytes.ToString(CultureInfo.InvariantCulture)}-byte transport bound; " +
+            "treating unbounded daemon output as infrastructure");
 
     private async Task EnsureSuccessAsync(HttpResponseMessage response, string operation, CancellationToken ct)
     {
@@ -352,10 +430,25 @@ internal sealed class BoxLiteApiClient
     {
         try
         {
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            return string.IsNullOrWhiteSpace(body)
-                ? $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}"
-                : Scrub(body);
+            // Error bodies are diagnostics, not data: truncate past the
+            // ceiling (rather than failing) so a chatty error page can never
+            // grow host memory, while the status that matters still throws.
+            var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            await using (stream.ConfigureAwait(false))
+            {
+                using var buffer = new MemoryStream();
+                var chunk = new byte[CopyBufferBytes];
+                int read;
+                while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0
+                    && buffer.Length < MaxErrorBodyBytes)
+                {
+                    buffer.Write(chunk, 0, (int)Math.Min(read, MaxErrorBodyBytes - buffer.Length));
+                }
+                var body = Encoding.UTF8.GetString(buffer.ToArray());
+                return string.IsNullOrWhiteSpace(body)
+                    ? $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}"
+                    : Scrub(body);
+            }
         }
         catch (OperationCanceledException)
         {

@@ -193,6 +193,12 @@ Daemon-side refusals are never reported as verdicts on a work item's diff:
   can fix credentials or capacity.
 - Mid-exec transport failures return `ExecutionUnavailable` (infra), not a
   non-zero exit that could be mistaken for a work failure.
+- Guest-influenced response bodies (exec snapshots, file/archive reads,
+  adopt-log tails) are capped on the wire at the matching option-derived
+  ceiling before the client buffers them; a body past the ceiling throws as
+  infrastructure (the guest process is killed on the exec path), and daemon
+  error bodies are truncated before they reach exception messages. Host
+  memory per read stays O(cap) no matter how much the guest wrote.
 - Setup-command non-zero exits are deterministic `InvalidOperationException`s —
   they are provisioning defects in the configured commands, not daemon
   outages.

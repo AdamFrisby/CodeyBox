@@ -1034,6 +1034,155 @@ public sealed class BoxLiteSandboxProviderTests
     }
 
     // ------------------------------------------------------------------
+    // Transport ceilings (audit regression): guest-influenced bodies must
+    // throw past an option-derived ceiling before the client buffers them.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task ApiClient_ExecPollBodyPastCeiling_ThrowsWithoutDrainingGuestOutput()
+    {
+        // Valid JSON framing around a 1 MiB guest payload: a buffering reader
+        // must consume it all before parsing, so served bytes prove whether
+        // the ceiling stopped the read early.
+        var wire = new CountingStream(
+            Encoding.UTF8.GetBytes("{\"execId\":\"e\",\"running\":true,\"stdoutBase64\":\""),
+            totalBytes: 1024 * 1024,
+            fill: (byte)'A');
+        var server = new InlineHandler(_ => StreamJsonResponse(wire));
+        var client = new BoxLiteApiClient(new HttpClient(server));
+
+        var ex = await Assert.ThrowsAsync<BoxLiteApiException>(() =>
+            client.GetExecAsync(TestEndpoint(), "vm", "exec", CancellationToken.None, maxResponseBytes: 1024));
+        // Unexpected is an infrastructure signal, never a diff verdict.
+        Assert.Equal(BoxLiteFailureKind.Unexpected, ex.Kind);
+        // The client stopped at the ceiling instead of draining the 1 MiB
+        // body: host memory stays O(cap) no matter how much the guest wrote.
+        Assert.True(wire.BytesRead <= 1024 + 16384, $"read {wire.BytesRead} bytes past a 1 KiB ceiling");
+    }
+
+    [Fact]
+    public async Task ApiClient_DeclaredLengthPastCeiling_ThrowsBeforeTouchingBody()
+    {
+        var wire = new CountingStream([], totalBytes: 1024 * 1024);
+        var server = new InlineHandler(_ => StreamJsonResponse(wire,
+            declaredLength: BoxLiteApiClient.DefaultMaxResponseBytes + 1));
+        var client = new BoxLiteApiClient(new HttpClient(server));
+
+        var ex = await Assert.ThrowsAsync<BoxLiteApiException>(() =>
+            client.GetExecAsync(TestEndpoint(), "vm", "exec", CancellationToken.None));
+        Assert.Equal(BoxLiteFailureKind.Unexpected, ex.Kind);
+        Assert.Equal(0, wire.BytesRead);
+    }
+
+    [Fact]
+    public async Task ApiClient_ResponseAtCeiling_IsAccepted_OneByteOverIsRefused()
+    {
+        var json = """{"execId":"e","running":false,"exitCode":0}""";
+        var body = Encoding.UTF8.GetBytes(json);
+        var server = new InlineHandler(_ => BufferedJsonResponse(body));
+        var client = new BoxLiteApiClient(new HttpClient(server));
+
+        var dto = await client.GetExecAsync(
+            TestEndpoint(), "vm", "exec", CancellationToken.None, maxResponseBytes: body.Length);
+        Assert.Equal("e", dto.ExecId);
+        Assert.Equal(0, dto.ExitCode);
+
+        var ex = await Assert.ThrowsAsync<BoxLiteApiException>(() =>
+            client.GetExecAsync(
+                TestEndpoint(), "vm", "exec", CancellationToken.None, maxResponseBytes: body.Length - 1));
+        Assert.Equal(BoxLiteFailureKind.Unexpected, ex.Kind);
+    }
+
+    [Fact]
+    public async Task ApiClient_OversizedErrorBody_IsTruncatedBeforeBuffering()
+    {
+        var wire = new CountingStream([], totalBytes: 1024 * 1024, fill: (byte)'e');
+        var server = new InlineHandler(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.BadGateway);
+            response.Content = new StreamContent(wire);
+            return response;
+        });
+        var client = new BoxLiteApiClient(new HttpClient(server));
+
+        var ex = await Assert.ThrowsAsync<BoxLiteApiException>(() =>
+            client.CreateVmAsync(
+                TestEndpoint(),
+                new BoxLiteCreateVmRequest("x", "i", null, null, null, false, null, null, null),
+                CancellationToken.None));
+        Assert.Equal(BoxLiteFailureKind.ServerError, ex.Kind);
+        // Diagnostics stay bounded and the 1 MiB error page is never drained.
+        Assert.True(ex.Message.Length < 8192, $"error message runs {ex.Message.Length} chars");
+        Assert.True(wire.BytesRead <= BoxLiteApiClient.MaxErrorBodyBytes + 8192,
+            $"read {wire.BytesRead} error bytes past the truncate ceiling");
+    }
+
+    private static BoxLiteEndpoint TestEndpoint() =>
+        new(new Uri("http://localhost/"), TestToken, AllowUnsafeHttp: true);
+
+    private static HttpResponseMessage StreamJsonResponse(Stream wire, long? declaredLength = null)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK);
+        response.Content = new StreamContent(wire);
+        if (declaredLength is { } length)
+            response.Content.Headers.ContentLength = length;
+        return response;
+    }
+
+    private static HttpResponseMessage BufferedJsonResponse(byte[] body)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK);
+        response.Content = new ByteArrayContent(body);
+        return response;
+    }
+
+    private sealed class InlineHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(respond(request));
+    }
+
+    /// <summary>
+    /// A finite stream serving a valid prefix followed by fill bytes that
+    /// counts what the client actually pulled, so ceiling tests prove the
+    /// client stopped reading early instead of draining guest-controlled
+    /// output. The prefix lets tests serve parseable framing a buffering
+    /// reader would have to consume in full.
+    /// </summary>
+    private sealed class CountingStream(byte[] prefix, long totalBytes, byte fill = 0) : Stream
+    {
+        public long BytesRead { get; private set; }
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => BytesRead;
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var remaining = totalBytes - BytesRead;
+            if (remaining <= 0)
+                return 0;
+            var n = (int)Math.Min(count, remaining);
+            var fromPrefix = (int)Math.Min(n, Math.Max(0L, prefix.Length - BytesRead));
+            if (fromPrefix > 0)
+                Array.Copy(prefix, BytesRead, buffer, offset, fromPrefix);
+            if (fromPrefix < n)
+                Array.Fill(buffer, fill, offset + fromPrefix, n - fromPrefix);
+            BytesRead += n;
+            return n;
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    // ------------------------------------------------------------------
     // Fake BoxLite daemon (recorded shapes)
     // ------------------------------------------------------------------
 

@@ -261,8 +261,10 @@ internal sealed class BoxLiteSandbox :
         // Slack on top of the configured output cap when bounding one poll's
         // snapshot, covering multi-byte decoding growth. A snapshot past
         // cap + slack is unbounded guest output: kill and classify as infra
-        // rather than buffering it into the host.
-        const int SnapshotSlackChars = 1024 * 1024;
+        // rather than buffering it into the host. The transport ceiling
+        // covers the same snapshots on the wire, so it is derived from the
+        // same caps — the wire can never reject what the decoder accepts.
+        var pollResponseCap = BoxLiteApiClient.BoundExecPollResponseBytes(stdoutCap, stderrCap);
 
         while (true)
         {
@@ -278,7 +280,7 @@ internal sealed class BoxLiteSandbox :
             BoxLiteExecStatusDto status;
             try
             {
-                status = await _api.GetExecAsync(endpoint, _name, execId, ct).ConfigureAwait(false);
+                status = await _api.GetExecAsync(endpoint, _name, execId, ct, pollResponseCap).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -291,8 +293,8 @@ internal sealed class BoxLiteSandbox :
                 return Unavailable($"poll exec failed: {ex.Message}");
             }
 
-            var stdoutText = DecodeBounded(status.StdoutBase64, stdoutCap + SnapshotSlackChars, out var stdoutHuge, _log);
-            var stderrText = DecodeBounded(status.StderrBase64, stderrCap + SnapshotSlackChars, out var stderrHuge, _log);
+            var stdoutText = DecodeBounded(status.StdoutBase64, stdoutCap + BoxLiteApiClient.ExecSnapshotSlackBytes, out var stdoutHuge, _log);
+            var stderrText = DecodeBounded(status.StderrBase64, stderrCap + BoxLiteApiClient.ExecSnapshotSlackBytes, out var stderrHuge, _log);
             if (stdoutHuge || stderrHuge || stdoutText.Length < stdoutDelivered || stderrText.Length < stderrDelivered)
             {
                 await TryKillExecAsync(endpoint, execId).ConfigureAwait(false);
@@ -386,7 +388,7 @@ internal sealed class BoxLiteSandbox :
     /// guest process and classifies the exec as infrastructure, never a diff
     /// verdict.
     /// </summary>
-    private static string DecodeBounded(string? base64, int maxChars, out bool overCap, ILogger log)
+    private static string DecodeBounded(string? base64, int maxDecodedBytes, out bool overCap, ILogger log)
     {
         overCap = false;
         if (string.IsNullOrEmpty(base64))
@@ -394,7 +396,7 @@ internal sealed class BoxLiteSandbox :
         // Base64 carries 3 raw bytes per 4 chars; the 4-char tolerance covers
         // padding, so this only fires when the payload must decode past the
         // ceiling even in the most padding-favourable reading.
-        if ((base64.Length - 4) * 3L / 4 > maxChars)
+        if ((base64.Length - 4) * 3L / 4 > maxDecodedBytes)
         {
             overCap = true;
             return string.Empty;
@@ -409,19 +411,19 @@ internal sealed class BoxLiteSandbox :
             log.LogDebug("BoxLite daemon returned malformed base64; treating as empty output");
             return string.Empty;
         }
-        if (bytes.Length > maxChars)
+        if (bytes.Length > maxDecodedBytes)
         {
             overCap = true;
             return string.Empty;
         }
         var text = Utf8.GetString(bytes);
-        if (text.Length > maxChars)
+        if (text.Length > maxDecodedBytes)
         {
             // Unreachable with standard UTF-8 (every character decodes from
             // at least one byte, so the byte guard above already fired);
             // retained as the ceiling if the decoder ever changes.
             overCap = true;
-            return text[..maxChars];
+            return text[..maxDecodedBytes];
         }
         return text;
     }
@@ -492,7 +494,9 @@ internal sealed class BoxLiteSandbox :
         if (!IsValidAbsolutePath(guestPath))
             throw new ArgumentException($"Guest path '{guestPath}' is not an absolute contained path.", nameof(guestPath));
         var opts = _readOptions();
-        var dto = await _api.ReadFileAsync(_endpointFactory(), _name, guestPath, ct).ConfigureAwait(false);
+        var dto = await _api.ReadFileAsync(
+            _endpointFactory(), _name, guestPath, ct,
+            BoxLiteApiClient.BoundPayloadResponseBytes(opts.MaxFileSyncBase64Bytes)).ConfigureAwait(false);
         if (dto?.ContentBase64 is null)
             return null;
         if (dto.ContentBase64.Length > opts.MaxFileSyncBase64Bytes)
@@ -603,7 +607,9 @@ internal sealed class BoxLiteSandbox :
         BoxLiteArchiveResult? archive;
         try
         {
-            archive = await _api.CreateArchiveAsync(_endpointFactory(), _name, mount.SandboxPath, ct).ConfigureAwait(false);
+            archive = await _api.CreateArchiveAsync(
+                _endpointFactory(), _name, mount.SandboxPath, ct,
+                BoxLiteApiClient.BoundPayloadResponseBytes(opts.MaxSyncArchiveBase64Bytes)).ConfigureAwait(false);
         }
         catch (BoxLiteApiException ex)
         {
@@ -778,7 +784,10 @@ internal sealed class BoxLiteSandbox :
             {
                 if (entry.EntryType is TarEntryType.Directory)
                 {
-                    Directory.CreateDirectory(Path.Combine(targetDir, name));
+                    var dirFull = Path.GetFullPath(Path.Combine(targetDir, name));
+                    if (!dirFull.StartsWith(Path.GetFullPath(targetDir) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                        throw new InvalidOperationException("Archive entry escapes the target directory.");
+                    Directory.CreateDirectory(dirFull);
                     continue;
                 }
                 throw new InvalidOperationException("Archive links are refused.");

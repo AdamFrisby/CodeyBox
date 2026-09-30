@@ -238,20 +238,20 @@ public sealed record BoxLiteSandboxOptions
             MaxSyncArchiveBytes = Math.Clamp(
                 PluginConfigReaders.ReadInt(section, "MaxSyncArchiveBytes", defaults.MaxSyncArchiveBytes), 1024, 512 * 1024 * 1024),
             MaxSyncArchiveExpandedBytes = Math.Clamp(
-                ReadLongClamped(section, "MaxSyncArchiveExpandedBytes", defaults.MaxSyncArchiveExpandedBytes), 1024, 8L * 1024 * 1024 * 1024),
+                ReadLongOrFallback(section, "MaxSyncArchiveExpandedBytes", defaults.MaxSyncArchiveExpandedBytes), 1024, 8L * 1024 * 1024 * 1024),
             MaxSyncArchiveEntries = Math.Clamp(
                 PluginConfigReaders.ReadInt(section, "MaxSyncArchiveEntries", defaults.MaxSyncArchiveEntries), 1, 1_000_000),
             MaxFileSyncBase64Bytes = Math.Clamp(
                 PluginConfigReaders.ReadInt(section, "MaxFileSyncBase64Bytes", defaults.MaxFileSyncBase64Bytes), 1024, 512 * 1024 * 1024),
             MaxFileSyncBytes = Math.Clamp(
-                ReadLongClamped(section, "MaxFileSyncBytes", defaults.MaxFileSyncBytes), 1024, 512L * 1024 * 1024),
+                ReadLongOrFallback(section, "MaxFileSyncBytes", defaults.MaxFileSyncBytes), 1024, 512L * 1024 * 1024),
             ProvisioningRecheckSeconds = Math.Clamp(
                 PluginConfigReaders.ReadInt(section, "ProvisioningRecheckSeconds", defaults.ProvisioningRecheckSeconds), 5, 3600),
             AllowUnsafeHttp = PluginConfigReaders.ReadBool(section, "AllowUnsafeHttp", defaults.AllowUnsafeHttp),
         };
     }
 
-    private static long ReadLongClamped(IConfigurationSection section, string key, long fallback)
+    private static long ReadLongOrFallback(IConfigurationSection section, string key, long fallback)
     {
         var raw = section[key];
         if (string.IsNullOrWhiteSpace(raw)

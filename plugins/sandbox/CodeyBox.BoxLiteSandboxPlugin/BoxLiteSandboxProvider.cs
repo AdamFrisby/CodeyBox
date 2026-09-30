@@ -48,6 +48,8 @@ public sealed class BoxLiteSandboxProvider :
     private const int MaxImageRefLength = 512;
     private const int MinMemoryMiB = 256;
     private const int MinDiskGiB = 4;
+    private const double BytesPerMiB = 1024 * 1024;
+    private const double BytesPerGiB = 1024d * 1024 * 1024;
 
     private readonly Func<BoxLiteSandboxOptions> _readOptions;
     private readonly Func<string, string?> _environment;
@@ -364,7 +366,9 @@ public sealed class BoxLiteSandboxProvider :
             BoxLiteFileDto? exit;
             try
             {
-                exit = await Api.ReadFileAsync(endpoint, vmName, agentLogPath + ".exit", ct).ConfigureAwait(false);
+                exit = await Api.ReadFileAsync(
+                    endpoint, vmName, agentLogPath + ".exit", ct,
+                    BoxLiteApiClient.BoundPayloadResponseBytes(opts.MaxFileSyncBase64Bytes)).ConfigureAwait(false);
             }
             catch (BoxLiteApiException ex)
             {
@@ -398,7 +402,9 @@ public sealed class BoxLiteSandboxProvider :
             }
             try
             {
-                var log = await Api.ReadFileAsync(endpoint, vmName, agentLogPath, ct).ConfigureAwait(false);
+                var log = await Api.ReadFileAsync(
+                    endpoint, vmName, agentLogPath, ct,
+                    BoxLiteApiClient.BoundPayloadResponseBytes(opts.MaxFileSyncBase64Bytes)).ConfigureAwait(false);
                 delivered = TryDeliverLogDelta(log?.ContentBase64, logSink, delivered, opts, vmName);
             }
             catch (BoxLiteApiException ex)
@@ -477,7 +483,9 @@ public sealed class BoxLiteSandboxProvider :
     {
         if (logSink is null)
             return delivered;
-        var log = await Api.ReadFileAsync(endpoint, vmName, agentLogPath, ct).ConfigureAwait(false);
+        var log = await Api.ReadFileAsync(
+            endpoint, vmName, agentLogPath, ct,
+            BoxLiteApiClient.BoundPayloadResponseBytes(opts.MaxFileSyncBase64Bytes)).ConfigureAwait(false);
         return TryDeliverLogDelta(log?.ContentBase64, logSink, delivered, opts, vmName);
     }
 
@@ -590,6 +598,7 @@ public sealed class BoxLiteSandboxProvider :
             }
             catch (BoxLiteApiException ex) when (ex.Kind == BoxLiteFailureKind.Conflict)
             {
+                // Already stopped/stopping — the snapshot below may proceed.
             }
             await Api.CreateSnapshotAsync(endpoint, name, bakeName, ct).ConfigureAwait(false);
             return name;
@@ -675,10 +684,10 @@ public sealed class BoxLiteSandboxProvider :
             image,
             Cpu: spec.Limits.CpuCount ?? opts.DefaultCpuCount,
             MemoryMib: spec.Limits.MemoryBytes is { } bytes && bytes > 0
-                ? Math.Max(MinMemoryMiB, (int)Math.Ceiling(bytes / (double)(1024 * 1024)))
+                ? Math.Max(MinMemoryMiB, (int)Math.Ceiling(bytes / BytesPerMiB))
                 : opts.DefaultMemoryMiB,
             DiskGib: spec.Limits.DiskBytes is { } disk && disk > 0
-                ? Math.Max(MinDiskGiB, (int)Math.Ceiling(disk / (double)(1024L * 1024 * 1024)))
+                ? Math.Max(MinDiskGiB, (int)Math.Ceiling(disk / BytesPerGiB))
                 : opts.DefaultDiskGiB,
             Persistent: opts.PersistentDisks,
             Network: network,
