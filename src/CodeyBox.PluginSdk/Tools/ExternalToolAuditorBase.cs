@@ -568,12 +568,157 @@ public abstract class ExternalToolAuditorBase : IAuditor
         // The probe echoes each present path, one per line; intersect with
         // the requested set — output beyond it is not trusted.
         var present = new List<string>();
-        foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var line in SplitProbeLines(result.Stdout))
         {
             if (requested.Contains(line))
                 present.Add(line);
         }
         return present;
+    }
+
+    /// <summary>
+    /// Bounded <c>pwd</c> probe resolving the directory the tool will
+    /// actually run in — the single implementation of the scan-root probe
+    /// for auditors whose reports carry absolute paths but no embedded cwd
+    /// (override <see cref="ResolveScanRootAsync"/> to call it). Sandbox
+    /// providers may translate <paramref name="workingDirectory"/>, so the
+    /// value is probed rather than assumed: <c>pwd</c> is a shell builtin —
+    /// the audited repository cannot shadow it via PATH — and prints the
+    /// process's own logical cwd, exactly the prefix the tool embeds in its
+    /// absolute reported paths. The root is returned VERBATIM (no
+    /// whitespace trimming — a canonical directory name may legitimately
+    /// end in whitespace) so downstream relativization compares the same
+    /// bytes the tool reports. Fails closed: an exec-transport failure, a
+    /// non-zero exit, or output that is not exactly one absolute path line
+    /// throws <see cref="AuditUnavailableException"/> — a missing or
+    /// mis-derived scan root would let absolute paths survive normalization
+    /// and silently defeat repo-relative exclusion filters.
+    /// </summary>
+    protected async Task<string> ProbeSandboxWorkingDirectoryAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            ToolName,
+            "scan-root probe",
+            new SandboxExec
+            {
+                Argv = ["sh", "-c", "pwd", "sh"],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' scan-root probe could not run: the sandbox exec "
+                + "transport was unavailable.");
+
+        // The scan root is a path verbatim, not text: it is compared
+        // byte-for-byte against reported paths downstream, so it must not
+        // be trimmed — a canonical directory name may legitimately end in
+        // whitespace (a legal POSIX leaf). Exactly one line is required:
+        // extra output means the transport prepended chatter or the cwd
+        // name itself carries a newline, and taking the first line would
+        // mis-derive the relativization prefix rather than fail closed.
+        var lines = SplitProbeLines(result.Stdout);
+        if (result.ExitCode != 0 || lines.Length != 1 || !Path.IsPathRooted(lines[0]))
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' could not resolve the scan root (exit "
+                + $"{result.ExitCode}) — reported paths could not be trusted relative to the worktree, "
+                + "so this is infrastructure, not a verdict on the diff.",
+                result.ExitCode,
+                result.Stdout + "\n" + result.Stderr);
+        return lines[0];
+    }
+
+    /// <summary>
+    /// Canonicalizes an operator-configured file path inside the sandbox and
+    /// fails closed when it resolves inside the audited worktree — the
+    /// shared policy for scoped-config file knobs (tool config, settings
+    /// files) whose content steers what the gate measures. A tool resolves
+    /// a relative configured path against its cwd — the worktree — so the
+    /// probe canonicalizes <paramref name="configuredPath"/> and the probe
+    /// cwd with one <c>realpath -m</c> call: relative paths, <c>..</c>
+    /// segments, and symlinked components all collapse to the path the tool
+    /// would actually open, and containment is judged against the same
+    /// canonicalized scan root. Fails closed on a transport failure, a
+    /// probe error, or a non-absolute (non-canonical) result — an
+    /// unchecked configured path is never trusted.
+    /// </summary>
+    /// <param name="configuredKey">Scoped-config key that supplied the value; named in failure messages.</param>
+    protected async Task<string> CanonicalizeOutsideWorktreeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string configuredPath,
+        string configuredKey,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        var probe = await ExecToolBoundedAsync(
+            sandbox,
+            ToolName,
+            "out-of-worktree path check",
+            new SandboxExec
+            {
+                // Two operands, two output lines: the configured path and
+                // "." — the exec working directory canonicalized in the
+                // sandbox's own path space (providers may translate the
+                // host-side workingDirectory). realpath resolves through
+                // PATH like the other probe binaries (sh, cat) rather than
+                // an assumed FHS location; a missing realpath exits
+                // non-zero and fails closed as infrastructure below.
+                Argv = ["realpath", "-m", "--", configuredPath, "."],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (probe.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' {configuredKey} canonicalization could "
+                + "not run: the sandbox exec transport was unavailable.");
+
+        // The canonical bytes realpath emitted are compared verbatim —
+        // trimming a path-bearing line would mis-derive a path or root
+        // whose name legitimately ends in whitespace and could judge an
+        // in-tree file "outside".
+        var lines = SplitProbeLines(probe.Stdout);
+        // `realpath -m` always emits absolute paths; a non-rooted line means
+        // the output is not a canonicalization at all — treat it as a probe
+        // failure rather than letting a relative path slip past containment.
+        if (probe.ExitCode != 0 || lines.Length != 2
+            || !Path.IsPathRooted(lines[0]) || !Path.IsPathRooted(lines[1]))
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' could not canonicalize {configuredKey} "
+                + $"'{TruncateForMessage(configuredPath)}' (exit {probe.ExitCode}) — an unchecked "
+                + "configured path is never trusted, so this is infrastructure, not a verdict on the "
+                + "diff.",
+                probe.ExitCode,
+                probe.Stderr);
+
+        var canonicalPath = ValidatedArgumentValue(lines[0], configuredKey);
+        var canonicalWorktree = lines[1];
+        if (HostPathPolicy.IsWithinDirectory(canonicalPath, canonicalWorktree))
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' {configuredKey} "
+                + $"'{TruncateForMessage(configuredPath)}' resolves to "
+                + $"'{TruncateForMessage(canonicalPath)}' inside the audited worktree — a "
+                + "repository-controlled file handed to the tool through operator configuration "
+                + "would let the diff author reshape the gate. Set an absolute path outside the "
+                + "repository, or unset the key for the auditor's default.")
+            { IsDeterministic = true };
+
+        return canonicalPath;
     }
 
     /// <summary>
@@ -710,6 +855,15 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// The characters that open a PowerShell parameter token: ASCII '-'
+    /// plus the Unicode dashes U+2013/U+2014/U+2015 pwsh's binder also
+    /// accepts as parameter markers. Shared so every guard that recognizes
+    /// parameter-shaped tokens applies the same dash set.
+    /// </summary>
+    protected static bool IsParameterDash(char c)
+        => c is '-' or '\u2013' or '\u2014' or '\u2015';
+
+    /// <summary>
     /// Validates a configured value that travels to the tool as an argv
     /// entry: bounded length, no leading dash (it would be read as another
     /// flag), no control characters. <paramref name="source"/> names the
@@ -722,11 +876,17 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var trimmed = value.Trim();
         const int maxChars = 1024;
         if (trimmed.Length == 0 || trimmed.Length > maxChars
-            || trimmed[0] == '-'
+            // A leading parameter dash would be read as another flag. The
+            // check applies the full parameter-dash set (see IsParameterDash)
+            // rather than ASCII '-' alone: for tools that bind Unicode
+            // dashes it closes a bypass, and for every other tool a
+            // dash-led value is still an argument-shape mistake.
+            || IsParameterDash(trimmed[0])
             || trimmed.Any(char.IsControl))
             throw new AuditUnavailableException(
                 $"could-not-verify: configured '{source}' is not a usable argument value "
-                + "(empty, overlong, leading '-', or contains control characters).")
+                + "(empty, overlong, has a leading parameter dash, or contains control "
+                + "characters).")
             { IsDeterministic = true };
         return trimmed;
     }
@@ -816,6 +976,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var version = match.Value.TrimEnd('.');
         return version.Length == 0 ? null : version;
     }
+
+    /// <summary>
+    /// Splits bounded probe stdout into lines for PATH comparison: entries
+    /// are kept VERBATIM — never whitespace-trimmed, no carriage-return
+    /// stripping — because a canonical path or worktree root may
+    /// legitimately end in whitespace or a '\r' (legal POSIX leaf bytes).
+    /// Rewriting any byte would compare a different string than the one
+    /// <c>realpath</c>/<c>pwd</c>/<c>printf</c> emitted and could judge an
+    /// in-tree file "outside" the worktree. Those emitters terminate lines
+    /// with LF only; a '\r' in the output is data, not a line ending.
+    /// </summary>
+    private static string[] SplitProbeLines(string stdout)
+        => stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
     private static string NormalizeProbePath(string? path)
     {
