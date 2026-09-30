@@ -915,10 +915,12 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
-        // An ambient framed-stdout marker (set on every agent CLI invocation
-        // inside a CodeyBox sandbox) would flip the wrapper under test to the
-        // envelope-framed path, splitting stderr out of the merged log these
-        // tests assert on.
+        // Envelope-framing is a transport selector too: an ambient framed-stdout
+        // marker (e.g. CODEYBOX_STDOUT_ENVELOPE_FRAMED=1 when the suite runs inside
+        // a devin ACP agent session, set on every agent CLI invocation inside a
+        // CodeyBox sandbox) would flip the wrapper under test to the
+        // envelope-framed path, routing stderr to the .stderr sidecar instead of
+        // the merged log these tests assert on.
         psi.Environment.Remove(SandboxConventions.EnvelopeFramedStdoutEnv);
     }
 
