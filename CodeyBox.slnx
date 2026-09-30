@@ -70,6 +70,7 @@
     <Project Path="plugins/auditors-dependency-vulnerabilities/CodeyBox.GovulncheckAuditorPlugin/CodeyBox.GovulncheckAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-dependency-vulnerabilities/CodeyBox.GrypeAuditorPlugin/CodeyBox.GrypeAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-documentation/CodeyBox.LycheeAuditorPlugin/CodeyBox.LycheeAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-documentation/CodeyBox.MarkdownlintAuditorPlugin/CodeyBox.MarkdownlintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.ActionlintAuditorPlugin/CodeyBox.ActionlintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.KicsAuditorPlugin/CodeyBox.KicsAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-infrastructure/CodeyBox.KubeconformAuditorPlugin/CodeyBox.KubeconformAuditorPlugin.csproj" />
