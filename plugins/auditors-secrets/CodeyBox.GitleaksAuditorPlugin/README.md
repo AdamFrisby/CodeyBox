@@ -35,14 +35,29 @@ finding with the gitleaks rule id and `file:line` location.
   text fragments to scan and archives are never unpacked
   (`--max-archive-depth` stays at gitleaks's default `0`). A secret
   committed inside a `.zip` or any other binary blob is never reported.
-- **A repo-root `.gitleaks.toml`'s own contents.** gitleaks exempts its
-  config path from the scan in every commit, so a secret committed inside
-  that file is invisible to it. The plugin therefore fails closed when the
-  file exists — see *Repository-controlled suppression* below.
+- **Any path containing `gitleaks.toml`.** The stock ruleset's
+  `[allowlist] paths` — inherited by the pinned `[extend] useDefault`
+  config — leads with the unanchored `gitleaks\.toml` pattern, so any
+  matching path (a repo-root `.gitleaks.toml`, `docs/gitleaks.toml`,
+  `x-gitleaks.toml.bak`, even a deleted historical copy) is dropped on path
+  alone, before any rule runs; gitleaks also exempts its own loaded config
+  path in every commit. A secret inside such a path is invisible to the
+  scanner, so the plugin **fails closed** when a `*gitleaks.toml*` path
+  exists anywhere in the worktree or in git history — see
+  *Repository-controlled suppression* below.
+- **Paths the stock allowlist skips outright.** Beyond the `gitleaks.toml`
+  family, the same inherited allowlist drops image/font/office/binary
+  extensions (`.png`, `.woff2`, `.pdf`, `.exe`, …), lockfiles (`go.sum`,
+  `package-lock.json`, `yarn.lock`, `poetry.lock`, …), vendored trees
+  (`vendor/…`, `node_modules/`, `bower_components/`, Python `dist-info`/
+  site-packages trees), and `.git` — upstream's noise bound; even text
+  content in a file with one of those names is never scanned.
 - **Secrets committed under an `ExcludePaths` prefix.** `vendor/`,
-  `third_party/`, and `node_modules/` are finding filters: gitleaks still
-  scans them, but findings there are dropped — so a leak committed under an
-  excluded prefix never surfaces. Re-include by overriding `ExcludePaths`.
+  `third_party/`, and `node_modules/` are finding filters: findings there
+  are dropped — so a leak committed under an excluded prefix never
+  surfaces. (Parts of that space — `node_modules/`, the major
+  package-host `vendor/` trees — are also allowlist-skipped at scan time,
+  per above.) Re-include by overriding `ExcludePaths`.
 - **Runtime provenance of a finding.** `git`-mode SARIF locations point at the
   file path and line; the originating commit is in the finding description,
   not the location.
@@ -121,7 +136,7 @@ Scoped under `CodeyBox:Plugins:codeybox.gitleaks`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `8.30.1` | Pinned gitleaks release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `TrustRepositorySuppression` | `false` | When `true`, the audited repository's own suppression surfaces are honored: `.gitleaks.toml` config, `.gitleaksignore` fingerprints, and `gitleaks:allow` comments. When `false`, a repo-root `.gitleaksignore` or `.gitleaks.toml` (worktree or git history) fails the run closed as infrastructure. See below — off by default because the audit subject authors those files. |
+| `TrustRepositorySuppression` | `false` | When `true`, the audited repository's own suppression surfaces are honored: `.gitleaks.toml` config, `.gitleaksignore` fingerprints, and `gitleaks:allow` comments. When `false`, a repo-root `.gitleaksignore` or `.gitleaks.toml` — or any path matching `*gitleaks.toml*` anywhere in the worktree or git history — fails the run closed as infrastructure. See below — off by default because the audit subject authors those files. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact gitleaks rule ids to keep/drop (e.g. `generic-api-key`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
@@ -142,16 +157,21 @@ write all three, the plugin neutralizes them unless the operator opts in:
 - the scan exports `GITLEAKS_CONFIG_TOML` pinning gitleaks's built-in
   ruleset, which outranks `<repo>/.gitleaks.toml` as *config* (gitleaks
   config precedence: `--config` → `GITLEAKS_CONFIG` →
-  `GITLEAKS_CONFIG_TOML` → repo `.gitleaks.toml` → built-in default — so an
-  operator `--config` in `ExtraArguments` or a baseline `GITLEAKS_CONFIG`
-  still wins);
+  `GITLEAKS_CONFIG_TOML` → repo `.gitleaks.toml` → built-in default). The
+  precedence-2 `GITLEAKS_CONFIG` **path** env var is explicitly unset on
+  the scan: a baseline-exported value would silently outrank the pin with
+  a file path the `ExtraArguments` canonicalization guard never sees. The
+  sanctioned operator override is `--config` in `ExtraArguments`
+  (canonicalized outside the worktree), which still wins;
 - `--ignore-gitleaks-allow` disables `gitleaks:allow` comments;
 - `--gitleaks-ignore-path` points at an inert path, and pre-scan checks
   **fail closed as infrastructure** when `<repo>/.gitleaksignore` or
-  `<repo>/.gitleaks.toml` exists in the worktree, or when `.gitleaks.toml`
-  appears anywhere in git history (a committed-then-deleted copy would
-  still exempt that path from the scan). The gate applies regardless of an
-  operator `--config` — remove the file(s), or set
+  `<repo>/.gitleaks.toml` exists in the worktree, or when a
+  `*gitleaks.toml*` path appears anywhere in git history or the worktree
+  (the stock allowlist exempts matching paths from the scan in every
+  commit — a committed-then-deleted copy would still hide a secret
+  committed inside it). The gate applies regardless of an operator
+  `--config` — remove the file(s), or set
   `TrustRepositorySuppression=true` to trust repository-controlled
   suppression.
 
@@ -164,12 +184,14 @@ files differ".
 Set `TrustRepositorySuppression: true` under
 `CodeyBox:Plugins:codeybox.gitleaks` when the audited repositories
 legitimately carry `.gitleaks.toml` detectors or `.gitleaksignore`
-fingerprints. Understand the trade-off below before enabling it.
+fingerprints. Understand the trade-off below before enabling it — and note
+that trust mode also skips the `*gitleaks.toml*` path-family gate, so those
+paths return to being silently exempted by the stock allowlist.
 
 The alternative to trusting repo files is operator-controlled config: pin a
 ruleset outside the repo via `ExtraArguments` (`--config
-/abs/path/in/sandbox.toml`) or a baseline `GITLEAKS_CONFIG`, and manage
-suppression through `ExcludedRules`/`ExcludePaths`.
+/abs/path/in/sandbox.toml`) and manage suppression through
+`ExcludedRules`/`ExcludePaths`.
 
 ## Default scope
 

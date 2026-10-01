@@ -141,6 +141,14 @@ public sealed class BetterleaksAuditorTests
             Assert.Contains("BETTERLEAKS_CONFIG_TOML", scanExec.ExtraEnvironment),
             StringComparison.Ordinal);
 
+        // The precedence-2 config-PATH env vars are unset on the scan: a
+        // baseline-exported BETTERLEAKS_CONFIG — or GITLEAKS_CONFIG, which
+        // betterleaks reads as a fallback spelling — would otherwise outrank
+        // the pinned ruleset with a path the canonicalization guard never
+        // sees.
+        Assert.Contains("BETTERLEAKS_CONFIG", scanExec.EnvironmentVariablesToUnset);
+        Assert.Contains("GITLEAKS_CONFIG", scanExec.EnvironmentVariablesToUnset);
+
         // .gitattributes countermeasure: the pinned log opts re-state the
         // tool's default rev args (--log-opts replaces them wholesale) and
         // add --text, so a committed `path -diff`/`binary` attribute cannot
@@ -178,6 +186,98 @@ public sealed class BetterleaksAuditorTests
         Assert.Equal(0, scanExecs);
     }
 
+    // betterleaks's stock prefilter drops every fragment whose path contains
+    // the literal "gitleaks.toml" — at any depth, under any affixed spelling —
+    // before any rule runs, so a secret in such a file is never reported. The
+    // gate fails closed on a match in the worktree rather than passing over a
+    // path the scanner cannot see.
+    [Theory]
+    [InlineData("./docs/gitleaks.toml\n")]
+    [InlineData("./x-gitleaks.toml.bak\n")]
+    [InlineData("./deep/nested/gitleaks.toml\n./other.png\n")] // non-matching chatter is ignored
+    public async Task RulesetExemptedPath_InWorktree_FailsClosed_ScanNeverRuns(string probeOutput)
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec)
+                || IsWorktreeSuppressionProbe(exec) || IsHistorySuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsPathGlobProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, probeOutput, ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new BetterleaksAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("*gitleaks.toml*", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            BetterleaksAuditor.TrustRepositorySuppressionKey, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    // The exemption covers every commit, not just the worktree: a matching
+    // path committed and then deleted still hides any secret it contained.
+    [Fact]
+    public async Task RulesetExemptedPath_InGitHistory_FailsClosed_ScanNeverRuns()
+    {
+        var scanExecs = 0;
+        SandboxExec? historyProbe = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec)
+                || IsWorktreeSuppressionProbe(exec) || IsPathGlobProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsHistorySuppressionProbe(exec))
+            {
+                historyProbe = exec;
+                return Task.FromResult(
+                    new SandboxExecResult(0, "0123456789abcdef0123456789abcdef01234567\n", ""));
+            }
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new BetterleaksAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("*gitleaks.toml*", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+        // The history probe anchors at the repository root with glob
+        // semantics so a nested or affixed path cannot slip past.
+        Assert.Contains(
+            ":(top,glob)*gitleaks.toml*",
+            historyProbe!.Argv[^1],
+            StringComparison.Ordinal);
+    }
+
+    // A failed history probe can never substitute for the gate: a non-zero
+    // git log exit is infrastructure, not evidence the family is absent.
+    [Fact]
+    public async Task RulesetExemptedPath_HistoryProbeError_IsInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec)
+                || IsWorktreeSuppressionProbe(exec) || IsPathGlobProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsHistorySuppressionProbe(exec))
+                return Task.FromResult(new SandboxExecResult(128, "", "fatal: not a git repo"));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new BetterleaksAuditor();
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+        Assert.Equal(0, scanExecs);
+    }
+
     [Fact]
     public async Task TrustedRepositorySuppression_OptsIn_ScanRunsWithoutGuards()
     {
@@ -212,6 +312,11 @@ public sealed class BetterleaksAuditorTests
         Assert.Equal(0, suppressionProbes);
         Assert.DoesNotContain("--ignore-gitleaks-allow", scanExec!.Argv);
         Assert.False(scanExec.ExtraEnvironment?.ContainsKey("BETTERLEAKS_CONFIG_TOML") ?? false);
+        // The config-path env removals apply in trust mode too: a baseline
+        // *_CONFIG would otherwise outrank the very repo config trust mode
+        // exists to honor.
+        Assert.Contains("BETTERLEAKS_CONFIG", scanExec.EnvironmentVariablesToUnset);
+        Assert.Contains("GITLEAKS_CONFIG", scanExec.EnvironmentVariablesToUnset);
     }
 
     [Fact]
@@ -405,6 +510,10 @@ public sealed class BetterleaksAuditorTests
     [InlineData("--config,ops/rules.toml")]
     [InlineData("--config=ops/rules.toml")]
     [InlineData("-cops/rules.toml")]
+    // pflag shorthand bundling: "-vc" binds the NEXT token to -c, so the
+    // guard must see through the cluster or "ops/rules.toml" escapes the
+    // canonicalization check.
+    [InlineData("-vc,ops/rules.toml")]
     [InlineData("--baseline-path,ops/baseline.json")]
     [InlineData("--gitleaks-ignore-path,ops/ignore.txt")]
     public async Task ExtraArgumentsFileFlag_ResolvingInsideWorktree_FailsClosed(string extraArguments)
@@ -467,6 +576,38 @@ public sealed class BetterleaksAuditorTests
         var configFlag = scanExec!.Argv.ToList().IndexOf("--config");
         Assert.True(configFlag >= 0 && configFlag + 1 < scanExec.Argv.Count);
         Assert.Equal("/etc/betterleaks/rules.toml", scanExec.Argv[configFlag + 1]);
+    }
+
+    // The same cluster, resolving outside the worktree: the guard extracts
+    // the value and lets the scan run — it contains, it does not strip.
+    [Fact]
+    public async Task ExtraArgumentsFileFlag_ClusteredShortForm_ResolvingOutside_ScanRuns()
+    {
+        var auditor = new BetterleaksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "-vc,/etc/betterleaks/rules.toml",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRealpathProbe(exec))
+                return Task.FromResult(RealpathResult(exec, insideWorktree: false));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        Assert.Contains("-vc", scanExec!.Argv);
     }
 
     [Fact]
@@ -724,6 +865,77 @@ public sealed class BetterleaksAuditorTests
         }
     }
 
+    /// <summary>
+    /// Real-binary regression for the stock-prefilter exemption: a secret
+    /// committed inside <c>docs/gitleaks.toml</c> — a path the ruleset
+    /// drops on name alone — can never be reported, so the default gate
+    /// fails closed on the exempted-path family, and with the operator
+    /// opt-in the scan runs and reports nothing, proving the exemption is
+    /// real.
+    /// </summary>
+    [SkippableFact]
+    [Trait("requires_betterleaks", "true")]
+    public async Task RealBetterleaks_NestedGitleaksTomlPath_EvadesScan_GateFailsClosed()
+    {
+        var installed = _installedBetterleaksVersion;
+        Skip.If(installed is null, "betterleaks binary not on PATH");
+
+        var repo = await SeedFixtureRepoAsync(null);
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(repo, "docs"));
+            await File.WriteAllTextAsync(
+                Path.Combine(repo, "docs", "gitleaks.toml"),
+                "# example config\n" + _fixtureSecretLine + "\n");
+            await TestSupport.RunGit(repo, "add", "-A");
+            await TestSupport.RunGit(repo, "commit", "-m", "add nested gitleaks-named file");
+
+            var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+            await using var sandbox = await provider.CreateAsync(
+                new SandboxSpec
+                {
+                    ImageReference = "ignored",
+                    WorkingDirectory = "/work",
+                    Mounts = [new SandboxMount { SandboxPath = "/work", HostPath = repo }],
+                },
+                CancellationToken.None);
+
+            var auditor = new BetterleaksAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                }),
+                CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+                () => ((IAuditor)auditor).RunAsync(
+                    sandbox, "/work", FakeContext(), CancellationToken.None));
+            Assert.Contains("docs/gitleaks.toml", ex.Message, StringComparison.Ordinal);
+
+            var trusting = new BetterleaksAuditor();
+            await trusting.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                    ["Scoped:" + BetterleaksAuditor.TrustRepositorySuppressionKey] = "true",
+                }),
+                CancellationToken.None);
+            var trusted = await ((IAuditor)trusting).RunAsync(
+                sandbox, "/work", FakeContext(), CancellationToken.None);
+
+            // The trusted scan runs clean and reports nothing — the file
+            // was skipped on its name alone, proving the blind spot the
+            // gate guards is real.
+            Assert.True(trusted.Passed);
+            Assert.Empty(trusted.Findings);
+        }
+        finally
+        {
+            TryDeleteDirectory(repo);
+        }
+    }
+
     [Fact]
     public void DisabledPlugin_IsNotLoaded_AndToolAbsentFromBaselineProvisioning()
     {
@@ -821,10 +1033,28 @@ public sealed class BetterleaksAuditorTests
             && exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private static bool IsSuppressionProbe(SandboxExec exec)
+        => IsWorktreeSuppressionProbe(exec)
+            || IsPathGlobProbe(exec)
+            || IsHistorySuppressionProbe(exec);
+
+    private static bool IsWorktreeSuppressionProbe(SandboxExec exec)
         => exec.Argv.Count >= 3
             && exec.Argv[0] == "sh"
             && exec.Argv[1] == "-c"
             && exec.Argv.Contains(".betterleaks.toml", StringComparer.Ordinal);
+
+    // The any-depth worktree probe rides a find -path script with the
+    // declared glob as its only operand.
+    private static bool IsPathGlobProbe(SandboxExec exec)
+        => exec.Argv.Count >= 3
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv.Contains("*gitleaks.toml*", StringComparer.Ordinal);
+
+    private static bool IsHistorySuppressionProbe(SandboxExec exec)
+        => exec.Argv.Count >= 2
+            && exec.Argv[0] == "git"
+            && exec.Argv.Any(static a => a.Contains("gitleaks.toml", StringComparison.Ordinal));
 
     private static bool IsRealpathProbe(SandboxExec exec)
         => exec.Argv.Count == 5

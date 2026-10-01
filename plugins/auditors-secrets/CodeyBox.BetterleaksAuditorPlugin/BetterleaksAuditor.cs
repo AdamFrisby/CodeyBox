@@ -52,9 +52,12 @@ namespace CodeyBox.BetterleaksAuditorPlugin;
 /// <c>betterleaks:allow</c>/<c>gitleaks:allow</c> comments — and the audit
 /// subject is the repository's author. An auditor its subject can silence is
 /// not a gate, so by default the shared base pins the built-in ruleset via
-/// <c>BETTERLEAKS_CONFIG_TOML</c>, passes <c>--ignore-gitleaks-allow</c>,
-/// points <c>--gitleaks-ignore-path</c> at an inert path, and fails closed
-/// when any of the four files exists at the worktree root. An operator that
+/// <c>BETTERLEAKS_CONFIG_TOML</c>, unsets the higher-precedence
+/// <c>BETTERLEAKS_CONFIG</c>/<c>GITLEAKS_CONFIG</c> path env vars so a
+/// baseline export cannot re-point the ruleset outside the
+/// canonicalization guard, passes <c>--ignore-gitleaks-allow</c>, points
+/// <c>--gitleaks-ignore-path</c> at an inert path, and fails closed when
+/// any of the four files exists at the worktree root. An operator that
 /// deliberately trusts repo-authored suppression — or relies on a repo
 /// <c>.betterleaks.toml</c> for custom detectors — sets
 /// <see cref="GitleaksCompatibleSecretsAuditorBase.TrustRepositorySuppressionKey"/>
@@ -62,20 +65,32 @@ namespace CodeyBox.BetterleaksAuditorPlugin;
 /// <c>ExtraArguments</c> still outranks the pinned env config but is
 /// canonicalized outside the worktree by the shared base.</para>
 ///
+/// <para><b>Ruleset-exempted paths.</b> The stock ruleset the pin extends
+/// carries a global <c>prefilter</c> that drops a fragment on path alone,
+/// before any rule runs — its first pattern is the UNANCHORED
+/// <c>gitleaks\.toml</c>, so any path containing that literal
+/// (<c>docs/gitleaks.toml</c>, <c>x-gitleaks.toml.bak</c>, a deleted
+/// historical <c>.gitleaks.toml</c>) is never scanned while the audit
+/// still passes. The profile therefore gates the whole
+/// <c>*gitleaks.toml*</c> family: any match in the worktree at any depth
+/// or anywhere in git history fails closed as infrastructure. The
+/// prefilter's remaining entries — image/font/binary extensions,
+/// lockfiles, vendored trees, <c>.git</c> — are scan scope, documented in
+/// the README's "cannot see" section.</para>
+///
 /// <para><b>Config-path self-exemption.</b> Whether betterleaks exempts its
-/// own config path from the scan is keyed on the loaded <c>Config.Path</c>:
-/// it stays empty while the config comes from the pinned inline
-/// <c>BETTERLEAKS_CONFIG_TOML</c>, so nothing is exempted by default and no
-/// git-history gate is needed — a deleted historical config cannot shape
-/// the scan. Under <c>TrustRepositorySuppression</c> a loaded repo
-/// <c>.betterleaks.toml</c>/<c>.gitleaks.toml</c> DOES set
+/// own config path from the scan is keyed on the loaded
+/// <c>Config.Path</c>: it stays empty while the config comes from the
+/// pinned inline <c>BETTERLEAKS_CONFIG_TOML</c>, so no loaded-config path
+/// is exempted by default. Under <c>TrustRepositorySuppression</c> a
+/// loaded repo <c>.betterleaks.toml</c>/<c>.gitleaks.toml</c> DOES set
 /// <c>Config.Path</c> and is exempted in every commit — a secret committed
 /// inside that file is then never reported. That is moot in trust mode,
 /// which already accepts repo-authored suppression; it is stated here so
 /// the trade-off is explicit.</para>
 /// </summary>
 [CodeyBoxPlugin(
-    id: "codeybox.betterleaks",
+    id: PluginId,
     displayName: "CodeyBox: Betterleaks Secrets",
     minHostApiVersion: "1.0")]
 [CodeyBoxPluginRequiresTool(
@@ -104,10 +119,9 @@ public sealed class BetterleaksAuditor : GitleaksCompatibleSecretsAuditorBase
         PluginId: PluginId,
         DefaultExpectedVersion: DefaultExpectedVersion,
         // Precedence 3 of 4 (above the repo's .betterleaks.toml/.gitleaks.toml,
-        // below --config and BETTERLEAKS_CONFIG): pins the built-in ruleset so
-        // the audited repo cannot add filters or rewrite rules.
-        // BETTERLEAKS_CONFIG stays available to the operator via the sandbox
-        // baseline environment.
+        // below --config and BETTERLEAKS_CONFIG/GITLEAKS_CONFIG): pins the
+        // built-in ruleset so the audited repo cannot add filters or rewrite
+        // rules.
         ConfigTomlEnvVar: "BETTERLEAKS_CONFIG_TOML",
         RepositorySuppressionFiles:
         [
@@ -119,11 +133,21 @@ public sealed class BetterleaksAuditor : GitleaksCompatibleSecretsAuditorBase
         SuppressionGateRationale:
             "betterleaks loads repo-root ignore files unconditionally and applies repo-root "
             + "config filter/prefilter expressions, so any of these files lets the audit "
-            + "subject hide a leak.");
-    // No HistoryGatedPaths: under the pinned inline BETTERLEAKS_CONFIG_TOML
-    // the loaded Config.Path stays empty, so no path is exempted from the
-    // scan and a deleted historical config cannot shape it. (In trust mode a
-    // loaded repo config IS self-exempted — see the class docstring.)
+            + "subject hide a leak.",
+        // Precedence-2 config-PATH env vars (both spellings — betterleaks's
+        // getEnvWithFallback honors the gitleaks name too): each would outrank
+        // the pinned ruleset and take its file path from the baseline
+        // environment outside the canonicalization guard, so the scan exec
+        // unsets them. The guarded operator channel is --config.
+        ConfigPathEnvVars: ["BETTERLEAKS_CONFIG", "GITLEAKS_CONFIG"])
+    {
+        // betterleaks 1.8.1's stock prefilter — inherited by the pinned
+        // `[extend] useDefault` config — drops every fragment whose path
+        // contains the literal "gitleaks.toml" (unanchored regex), in the
+        // worktree AND in every historical commit. Gate the whole family:
+        // the scan can never see such a path, so one may not exist.
+        ScanExemptedPathGlobs = ["*gitleaks.toml*"],
+    };
 
     /// <summary>Declares the shared betterleaks policy.</summary>
     public BetterleaksAuditor()

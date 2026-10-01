@@ -300,6 +300,62 @@ public sealed class ExternalToolAuditorTests
     }
 
     [Fact]
+    public async Task RepositoryPathGlobProbe_MatchesAtAnyDepth_AndFiltersUntrustedLines()
+    {
+        var auditor = new ProbeExposingAuditor();
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++;
+            // find emits "./"-prefixed matches; a line matching no declared
+            // glob is chatter (a repo filename can inject it), not evidence.
+            return Task.FromResult(new SandboxExecResult(
+                0,
+                "./docs/gitleaks.toml\n./x-gitleaks.toml.bak\n./plain.txt\n./docs/gitleaks.toml\n",
+                ""));
+        });
+
+        var present = await auditor.ProbeGlobsAsync(
+            sandbox, ["*gitleaks.toml*"], CancellationToken.None);
+
+        Assert.Equal(["docs/gitleaks.toml", "x-gitleaks.toml.bak"], present);
+        Assert.Equal(1, execs);
+
+        // Same failure contract as the exact-name probe: non-zero exit is
+        // infrastructure, transport loss parks for retry.
+        var failing = new FakeSandbox((exec, _) =>
+            Task.FromResult(new SandboxExecResult(1, "", "find: boom")));
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.ProbeGlobsAsync(failing, ["*gitleaks.toml*"], CancellationToken.None));
+
+        var unavailable = new FakeSandbox((exec, _) =>
+            Task.FromResult(new SandboxExecResult(0, "", "", ExecutionUnavailable: true)));
+        await Assert.ThrowsAsync<SandboxExecutionUnavailableException>(
+            () => auditor.ProbeGlobsAsync(unavailable, ["*gitleaks.toml*"], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RepositoryPathGlobProbe_RejectsNonPatternAndMetasyntaxGlobs()
+    {
+        var auditor = new ProbeExposingAuditor();
+        var noop = new FakeSandbox((exec, _) =>
+            Task.FromResult(new SandboxExecResult(0, "", "")));
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeGlobsAsync(noop, [""], CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeGlobsAsync(noop, ["-name"], CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeGlobsAsync(noop, [":(top)*x*"], CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeGlobsAsync(noop, ["a\nb"], CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => auditor.ProbeGlobsAsync(noop, ["[ab]*"], CancellationToken.None));
+        // No globs means no probe at all.
+        Assert.Empty(await auditor.ProbeGlobsAsync(noop, [], CancellationToken.None));
+    }
+
+    [Fact]
     public async Task RepositoryFileProbe_RejectsPathsOutsideTheWorktree()
     {
         var auditor = new ProbeExposingAuditor();
@@ -395,6 +451,11 @@ public sealed class ExternalToolAuditorTests
             ISandbox sandbox, IReadOnlyList<string> paths, CancellationToken ct)
             => ProbeRepositoryFilesPresentAsync(
                 sandbox, "/work", ToolName, paths, new ExternalToolAuditorOptions(), ct);
+
+        public Task<IReadOnlyList<string>> ProbeGlobsAsync(
+            ISandbox sandbox, IReadOnlyList<string> globs, CancellationToken ct)
+            => ProbeRepositoryPathGlobsPresentAsync(
+                sandbox, "/work", ToolName, globs, new ExternalToolAuditorOptions(), ct);
 
         public static bool SuppliesFlag(ExternalToolAuditorOptions options, params string[] flags)
             => ExtraArgumentsSupplyFlag(options, flags);

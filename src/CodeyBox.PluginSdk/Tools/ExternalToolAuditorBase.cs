@@ -55,6 +55,17 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private const string RepositoryFilePresenceScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then printf '%s\\n' \"$f\"; fi; done; exit 0";
 
+    // Each glob is a `find -path` operand matched against the whole
+    // "./"-relative worktree path — `*`/`?` there match '/' too, so
+    // "*gitleaks.toml*" covers the name at any depth. The "./" prefix keeps
+    // a non-wildcard-led glob anchored the same way the C#-side re-filter
+    // sees it (it strips "./" before matching). `.git` is pruned: object
+    // storage is transport metadata, not audited source. The script always
+    // exits 0 once it completes — exit code carries probe health, stdout
+    // the matched paths.
+    private const string RepositoryPathGlobPresenceScript =
+        "for g in \"$@\"; do find . -name .git -prune -o -path \"./$g\" -print; done; exit 0";
+
     /// <summary>Stable name for logs and findings.</summary>
     public abstract string Name { get; }
 
@@ -96,6 +107,18 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// </summary>
     protected virtual IReadOnlyDictionary<string, string>? BuildToolEnvironment(ExternalToolAuditorOptions options)
         => null;
+
+    /// <summary>
+    /// Environment variable names that must not reach the tool process even
+    /// when the sandbox baseline exports them — e.g. variables carrying a
+    /// config file path the tool would honor above the auditor's own pinned
+    /// configuration, bypassing whatever guard covers the equivalent argv
+    /// flag. Providers apply removals after the baseline and
+    /// <see cref="BuildToolEnvironment"/> merges, so a removal wins over
+    /// both. Author-chosen constants only. Default: none.
+    /// </summary>
+    protected virtual IReadOnlyList<string> BuildToolEnvironmentRemovals(ExternalToolAuditorOptions options)
+        => [];
 
     /// <summary>
     /// Optional pinned-version declaration. Non-null makes
@@ -375,6 +398,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 MaxStderrBytes = maxBytes,
                 KillOnOutputLimit = false,
                 ExtraEnvironment = BuildToolEnvironment(options),
+                EnvironmentVariablesToUnset = BuildToolEnvironmentRemovals(options) ?? [],
             },
             EffectiveTimeout(options),
             ct);
@@ -577,6 +601,94 @@ public abstract class ExternalToolAuditorBase : IAuditor
     }
 
     /// <summary>
+    /// Bounded probe for repository-controlled paths matching an
+    /// author-declared glob at ANY worktree depth — e.g. a filename family
+    /// the audited tool exempts from its scan wherever it appears
+    /// (<c>*gitleaks.toml*</c>), which the root-only
+    /// <see cref="ProbeRepositoryFilesPresentAsync"/> cannot see. Globs are
+    /// author-declared constants in <c>find -path</c>/git-pathspec syntax —
+    /// <c>*</c> and <c>?</c> match across directory separators — validated
+    /// by <see cref="NormalizeProbePathGlob"/>. The repository's
+    /// <c>.git</c> storage is pruned: it is transport metadata, not audited
+    /// source. Returns the deduplicated repository-relative paths that
+    /// matched; each returned line is re-verified against the declared
+    /// globs because the output bytes are repository filenames — a line
+    /// that matches no glob is chatter, not evidence. Fails closed like
+    /// the sibling probe: an exec-transport failure or non-zero exit is
+    /// infrastructure, never "absent".
+    /// </summary>
+    protected static async Task<IReadOnlyList<string>> ProbeRepositoryPathGlobsPresentAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> pathGlobs,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentNullException.ThrowIfNull(pathGlobs);
+
+        var requested = new HashSet<string>(StringComparer.Ordinal);
+        var argv = new List<string>(pathGlobs.Count + 4)
+        {
+            "sh", "-c", RepositoryPathGlobPresenceScript, "sh",
+        };
+        foreach (var glob in pathGlobs)
+        {
+            var normalized = NormalizeProbePathGlob(glob);
+            if (requested.Add(normalized))
+                argv.Add(normalized);
+        }
+        if (requested.Count == 0)
+            return [];
+
+        var result = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "suppression check",
+            new SandboxExec
+            {
+                Argv = argv,
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = ProbeMaxOutputBytes,
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (result.ExecutionUnavailable)
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
+        if (result.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-path "
+                + $"absence (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
+                + "that the paths are absent.",
+                result.ExitCode,
+                result.Stdout + "\n" + result.Stderr);
+
+        var present = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var line in SplitProbeLines(result.Stdout))
+        {
+            // find emits "./"-prefixed paths; the declared globs are written
+            // against plain repository-relative paths.
+            var path = line.StartsWith("./", StringComparison.Ordinal) ? line[2..] : line;
+            if (path.Length == 0 || !seen.Add(path))
+                continue;
+            foreach (var glob in requested)
+            {
+                if (PathGlobMatches(glob, path))
+                {
+                    present.Add(path);
+                    break;
+                }
+            }
+        }
+        return present;
+    }
+
+    /// <summary>
     /// Bounded <c>pwd</c> probe resolving the directory the tool will
     /// actually run in — the single implementation of the scan-root probe
     /// for auditors whose reports carry absolute paths but no embedded cwd
@@ -684,9 +796,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             ct).ConfigureAwait(false);
 
         if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' {configuredKey} canonicalization could "
-                + "not run: the sandbox exec transport was unavailable.");
+            throw new SandboxExecutionUnavailableException(probe.ExitCode);
 
         // The canonical bytes realpath emitted are compared verbatim —
         // trimming a path-bearing line would mis-derive a path or root
@@ -938,15 +1048,41 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ExternalToolAuditorOptions options,
         string flag,
         out string? value)
+        => TryGetExtraArgumentsFlagValue(options, flag, shortFlag: null, out value);
+
+    /// <summary>
+    /// <see cref="TryGetExtraArgumentsFlagValue(ExternalToolAuditorOptions, string, out string?)"/>
+    /// extended with a pflag-style shorthand: <paramref name="shortFlag"/>
+    /// (<c>-f</c>, exactly one dash and one letter) additionally matches a
+    /// bare <c>-f</c>, the attached <c>-f=value</c>, the joined
+    /// <c>-fvalue</c>, and the shorthand inside a single-dash cluster —
+    /// pflag reads a value-taking shorthand's value as the rest of its
+    /// token (<c>-fcfg.toml</c>) or, when the shorthand is the cluster's
+    /// last letter, the NEXT argv entry (<c>-vc cfg.toml</c> binds
+    /// <c>cfg.toml</c> to <c>-c</c>). A cluster letter that was really part
+    /// of an earlier shorthand's value over-matches into a conservative
+    /// extra check — harmless for callers guarding a path value, since the
+    /// checked value only ever fails closed.
+    /// </summary>
+    protected static bool TryGetExtraArgumentsFlagValue(
+        ExternalToolAuditorOptions options,
+        string flag,
+        string? shortFlag,
+        out string? value)
     {
         value = null;
         var supplied = false;
         var attachedPrefix = flag + "=";
+        var shortChar = shortFlag is { Length: 2 } && shortFlag[0] == '-' && shortFlag[1] != '-'
+            ? shortFlag[1]
+            : (char?)null;
         var extraArguments = options.ExtraArguments;
         for (var i = 0; i < extraArguments.Count; i++)
         {
             var arg = extraArguments[i];
-            if (string.Equals(arg, flag, StringComparison.Ordinal))
+            if (string.Equals(arg, flag, StringComparison.Ordinal)
+                || (shortFlag is not null
+                    && string.Equals(arg, shortFlag, StringComparison.Ordinal)))
             {
                 supplied = true;
                 value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
@@ -955,6 +1091,25 @@ public abstract class ExternalToolAuditorBase : IAuditor
             {
                 supplied = true;
                 value = arg[attachedPrefix.Length..];
+            }
+            else if (shortChar is { } shorthand
+                && arg.Length > 2
+                && arg[0] == '-'
+                && arg[1] != '-')
+            {
+                // A single-dash multi-letter token is a joined "-fvalue" or
+                // a pflag cluster ("-vc"): the shorthand's value is the rest
+                // of the token — or, when the letter ends the cluster, the
+                // next argv entry.
+                var index = arg.IndexOf(shorthand, 1);
+                if (index < 0)
+                    continue;
+                var rest = arg[(index + 1)..];
+                supplied = true;
+                if (rest.Length == 0)
+                    value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
+                else
+                    value = rest.StartsWith("=", StringComparison.Ordinal) ? rest[1..] : rest;
             }
         }
         return supplied;
@@ -1004,6 +1159,37 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 "Repository probe paths must be relative paths inside the worktree.",
                 nameof(path));
         return normalized;
+    }
+
+    // Probe globs become `find -path` operands and git pathspec argv:
+    // refuse bytes that would corrupt the one-name-per-line protocol or
+    // turn into find predicates / git pathspec magic instead of a pattern.
+    // Only `*` and `?` wildcards are supported — bracket classes would
+    // need a second matcher in PathGlobMatches for no author-facing gain.
+    private static string NormalizeProbePathGlob(string? glob)
+    {
+        var normalized = ExternalToolJsonHelpers.NormalizePath(glob);
+        if (normalized.Length == 0
+            || normalized[0] is '-' or '!' or ':' or '/'
+            || normalized.Any(c => c is '\n' or '[' or ']'))
+            throw new ArgumentException(
+                "Repository probe globs must be non-empty relative `*`/`?` patterns.",
+                nameof(glob));
+        return normalized;
+    }
+
+    // Matches a repository-relative path against a declared probe glob with
+    // the same semantics the sandbox-side tools apply: `*` and `?` cross
+    // directory separators (find -path, git's default pathspec matching),
+    // everything else is literal and case-sensitive.
+    private static bool PathGlobMatches(string glob, string path)
+    {
+        var pattern = "^"
+            + Regex.Escape(glob)
+                .Replace("\\*", ".*", StringComparison.Ordinal)
+                .Replace("\\?", ".", StringComparison.Ordinal)
+            + "$";
+        return Regex.IsMatch(path, pattern, RegexOptions.CultureInvariant);
     }
 
     /// <summary>

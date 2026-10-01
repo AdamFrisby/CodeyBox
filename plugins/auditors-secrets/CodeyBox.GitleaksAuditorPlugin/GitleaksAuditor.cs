@@ -45,25 +45,30 @@ namespace CodeyBox.GitleaksAuditorPlugin;
 /// <c>.gitleaks.toml</c> (rule/allowlist edits), a <c>.gitleaksignore</c>
 /// (fingerprint suppression, loaded unconditionally; no flag disables it),
 /// and inline <c>gitleaks:allow</c> comments — and the audit subject is the
-/// repository's author. <c>.gitleaks.toml</c> is worse than a config
-/// override: gitleaks unconditionally exempts its own config path from the
-/// scan in every commit, so a secret committed inside that file — even one
-/// deleted before the audit — is never reported. An auditor its subject can
-/// silence is not a gate, so by default the shared base pins gitleaks's
-/// built-in ruleset via <c>GITLEAKS_CONFIG_TOML</c>, passes
-/// <c>--ignore-gitleaks-allow</c>, points <c>--gitleaks-ignore-path</c> at an
-/// inert path, and fails closed when a repo-root <c>.gitleaksignore</c>
-/// exists in the worktree or a <c>.gitleaks.toml</c> exists anywhere in the
-/// worktree or git history. An operator that deliberately trusts
-/// repo-authored suppression — or relies on a repo <c>.gitleaks.toml</c> for
-/// custom detectors — sets
+/// repository's author. Worse, gitleaks's stock <c>[allowlist] paths</c> —
+/// inherited by the pinned <c>[extend] useDefault</c> config — leads with
+/// the UNANCHORED <c>gitleaks\.toml</c>: any path merely containing that
+/// literal (<c>docs/gitleaks.toml</c>, <c>x-gitleaks.toml.bak</c>, a
+/// deleted historical <c>.gitleaks.toml</c>) is dropped on path alone,
+/// before any rule runs, and gitleaks also exempts its own loaded config
+/// path in every commit. An auditor its subject can silence is not a gate,
+/// so by default the shared base pins gitleaks's built-in ruleset via
+/// <c>GITLEAKS_CONFIG_TOML</c>, unsets the higher-precedence
+/// <c>GITLEAKS_CONFIG</c> path env var so a baseline export cannot re-point
+/// the ruleset outside the canonicalization guard, passes
+/// <c>--ignore-gitleaks-allow</c>, points <c>--gitleaks-ignore-path</c> at
+/// an inert path, and fails closed when a repo-root <c>.gitleaksignore</c>
+/// exists in the worktree or a <c>*gitleaks.toml*</c> path exists anywhere
+/// in the worktree or git history. An operator that deliberately trusts
+/// repo-authored suppression — or relies on a repo <c>.gitleaks.toml</c>
+/// for custom detectors — sets
 /// <see cref="GitleaksCompatibleSecretsAuditorBase.TrustRepositorySuppressionKey"/>
 /// in scoped config; an operator-supplied <c>--config</c> via
 /// <c>ExtraArguments</c> still outranks the pinned env config but is
 /// canonicalized outside the worktree by the shared base.</para>
 /// </summary>
 [CodeyBoxPlugin(
-    id: "codeybox.gitleaks",
+    id: PluginId,
     displayName: "CodeyBox: Gitleaks Secrets",
     minHostApiVersion: "1.0")]
 [CodeyBoxPluginRequiresTool(
@@ -94,21 +99,28 @@ public sealed class GitleaksAuditor : GitleaksCompatibleSecretsAuditorBase
         DefaultExpectedVersion: DefaultExpectedVersion,
         // Precedence 3 of 4 (above the repo's .gitleaks.toml, below --config
         // and GITLEAKS_CONFIG): pins the built-in ruleset so the audited repo
-        // cannot extend rules or add allowlists. GITLEAKS_CONFIG stays
-        // available to the operator via the sandbox baseline environment.
+        // cannot extend rules or add allowlists.
         ConfigTomlEnvVar: "GITLEAKS_CONFIG_TOML",
         RepositorySuppressionFiles: [".gitleaksignore", ".gitleaks.toml"],
         SuppressionGateRationale:
             "gitleaks loads the repo-root ignore file unconditionally and exempts its own "
-            + "config path from the scan, so either file lets the audit subject hide a leak.")
+            + "config path from the scan, so either file lets the audit subject hide a leak.",
+        // The precedence-2 config-PATH env var: it would outrank the pinned
+        // ruleset and take its file path from the baseline environment
+        // outside the canonicalization guard, so the scan exec unsets it.
+        // The guarded operator channel is --config.
+        ConfigPathEnvVars: ["GITLEAKS_CONFIG"])
     {
-        // gitleaks sets Config.Path to <source>/.gitleaks.toml whenever
-        // --config is unset — regardless of where the config actually came
-        // from — and skips every fragment at that path. The file is
-        // therefore never scanned in ANY commit: a secret committed inside
-        // it (including one later deleted) evades the audit, so its presence
-        // in git history is gated, not just in the worktree.
-        HistoryGatedPaths = [".gitleaks.toml"],
+        // Two distinct exemptions cover this family: gitleaks sets
+        // Config.Path to <source>/.gitleaks.toml whenever --config is unset
+        // — regardless of where the config actually came from — and skips
+        // every fragment at that path; AND the stock allowlist's unanchored
+        // `gitleaks\.toml` path pattern skips any matching path in every
+        // commit. A secret committed inside ANY such path (nested,
+        // affixed, or deleted before the audit) evades the scan, so the
+        // whole `*gitleaks.toml*` family is gated in the worktree and in
+        // git history.
+        ScanExemptedPathGlobs = ["*gitleaks.toml*"],
     };
 
     /// <summary>Declares the shared gitleaks policy.</summary>

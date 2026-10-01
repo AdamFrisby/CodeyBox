@@ -140,6 +140,11 @@ public sealed class GitleaksAuditorTests
             Assert.Contains("GITLEAKS_CONFIG_TOML", scanExec.ExtraEnvironment),
             StringComparison.Ordinal);
 
+        // The precedence-2 config-PATH env var is unset on the scan: a
+        // baseline-exported GITLEAKS_CONFIG would otherwise outrank the
+        // pinned ruleset with a path the canonicalization guard never sees.
+        Assert.Contains("GITLEAKS_CONFIG", scanExec.EnvironmentVariablesToUnset);
+
         // .gitattributes countermeasure: the pinned log opts re-state
         // gitleaks's default rev args (--log-opts replaces them wholesale)
         // and add --text, so a committed `path -diff`/`binary` attribute
@@ -206,13 +211,14 @@ public sealed class GitleaksAuditorTests
     [Fact]
     public async Task RepoGitleaksTomlInHistory_FailsClosed_ScanNeverRuns()
     {
-        // The config-path exemption covers every commit: a .gitleaks.toml
-        // committed and then deleted still hides any secret it contained, so
-        // the gate checks git history, not just the worktree.
+        // The exemption covers every commit: a *gitleaks.toml* path
+        // committed and then deleted still hides any secret it contained,
+        // so the gate checks git history, not just the worktree.
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsWorktreeSuppressionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsWorktreeSuppressionProbe(exec)
+                || IsPathGlobProbe(exec))
                 return Task.FromResult(Ok(exec));
             if (IsHistorySuppressionProbe(exec))
                 return Task.FromResult(
@@ -225,9 +231,35 @@ public sealed class GitleaksAuditorTests
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
-        Assert.Contains(".gitleaks.toml", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("*gitleaks.toml*", ex.Message, StringComparison.Ordinal);
         Assert.Contains(
             GitleaksAuditor.TrustRepositorySuppressionKey, ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    // The exemption is keyed on the NAME, not the location: a nested
+    // docs/gitleaks.toml is just as invisible to the scanner as the root
+    // file, so the worktree gate must catch it at any depth.
+    [Fact]
+    public async Task NestedGitleaksTomlPath_InWorktree_FailsClosed_ScanNeverRuns()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec)
+                || IsWorktreeSuppressionProbe(exec) || IsHistorySuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsPathGlobProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "./docs/gitleaks.toml\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new GitleaksAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("docs/gitleaks.toml", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -568,7 +600,7 @@ public sealed class GitleaksAuditorTests
             var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
                 () => ((IAuditor)auditor).RunAsync(
                     sandbox, "/work", FakeContext(), CancellationToken.None));
-            Assert.Contains(".gitleaks.toml", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("*gitleaks.toml*", ex.Message, StringComparison.Ordinal);
 
             var trusting = new GitleaksAuditor();
             await trusting.InitializeAsync(
@@ -650,6 +682,10 @@ public sealed class GitleaksAuditorTests
     [Theory]
     [InlineData("--config,ops/rules.toml")]
     [InlineData("--config=ops/rules.toml")]
+    // pflag shorthand bundling: "-vc" binds the NEXT token to -c, so the
+    // guard must see through the cluster or "ops/rules.toml" escapes the
+    // canonicalization check.
+    [InlineData("-vc,ops/rules.toml")]
     [InlineData("--baseline-path,ops/baseline.json")]
     public async Task ExtraArgumentsFileFlag_ResolvingInsideWorktree_FailsClosed(string extraArguments)
     {
@@ -775,7 +811,9 @@ public sealed class GitleaksAuditorTests
             && exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private static bool IsSuppressionProbe(SandboxExec exec)
-        => IsWorktreeSuppressionProbe(exec) || IsHistorySuppressionProbe(exec);
+        => IsWorktreeSuppressionProbe(exec)
+            || IsPathGlobProbe(exec)
+            || IsHistorySuppressionProbe(exec);
 
     private static bool IsWorktreeSuppressionProbe(SandboxExec exec)
         => exec.Argv.Count >= 3
@@ -784,10 +822,18 @@ public sealed class GitleaksAuditorTests
             && exec.Argv.Contains(".gitleaksignore", StringComparer.Ordinal)
             && exec.Argv.Contains(".gitleaks.toml", StringComparer.Ordinal);
 
+    // The any-depth worktree probe rides a find -path script with the
+    // declared glob as its only operand.
+    private static bool IsPathGlobProbe(SandboxExec exec)
+        => exec.Argv.Count >= 3
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv.Contains("*gitleaks.toml*", StringComparer.Ordinal);
+
     private static bool IsHistorySuppressionProbe(SandboxExec exec)
         => exec.Argv.Count >= 2
             && exec.Argv[0] == "git"
-            && exec.Argv.Contains(".gitleaks.toml", StringComparer.Ordinal);
+            && exec.Argv.Any(static a => a.Contains("gitleaks.toml", StringComparison.Ordinal));
 
     private static bool IsRealpathProbe(SandboxExec exec)
         => exec.Argv.Count == 5

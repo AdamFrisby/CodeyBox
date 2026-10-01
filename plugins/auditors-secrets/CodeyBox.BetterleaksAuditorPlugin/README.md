@@ -43,10 +43,27 @@ alternative for operators that standardise on it.
   binary files produce no text fragments to scan; archives are unpacked up to
   `--max-archive-depth` (default `8`). A secret committed inside an archive
   nested deeper than that is never reported.
+- **Paths the stock ruleset skips outright.** The pinned ruleset extends
+  betterleaks's built-in config, whose global `prefilter` drops a fragment on
+  path alone before any rule runs: image/font/office/binary extensions
+  (`.png`, `.woff2`, `.pdf`, `.exe`, …), lockfiles (`go.sum`,
+  `package-lock.json`, `yarn.lock`, `poetry.lock`, …), vendored trees
+  (`vendor/…`, `node_modules/`, `bower_components/`, Python `dist-info`/
+  site-packages trees), and `.git` — upstream's noise bound, meaning even
+  text content in a file with one of those names is never scanned. One
+  prefilter entry is treated differently: the unanchored `gitleaks\.toml`
+  pattern exempts ANY path containing that literal (`docs/gitleaks.toml`,
+  `x-gitleaks.toml.bak`, a deleted historical `.gitleaks.toml`) — it names
+  the tool's own config surface, so instead of staying a silent blind spot
+  the auditor **fails closed** when a `*gitleaks.toml*` path exists anywhere
+  in the worktree or in git history (unless `TrustRepositorySuppression` is
+  set).
 - **Secrets committed under an `ExcludePaths` prefix.** `vendor/`,
-  `third_party/`, and `node_modules/` are finding filters: betterleaks still
-  scans them, but findings there are dropped — so a leak committed under an
-  excluded prefix never surfaces. Re-include by overriding `ExcludePaths`.
+  `third_party/`, and `node_modules/` are finding filters: findings there
+  are dropped — so a leak committed under an excluded prefix never
+  surfaces. (Parts of that space — `node_modules/`, the major
+  package-host `vendor/` trees — are also prefilter-skipped at scan time,
+  per above.) Re-include by overriding `ExcludePaths`.
 - **Runtime provenance of a finding.** `git`-mode SARIF locations point at the
   file path and line; the originating commit is in the finding description,
   not the location.
@@ -126,7 +143,7 @@ Scoped under `CodeyBox:Plugins:codeybox.betterleaks`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `1.8.1` | Pinned betterleaks release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `TrustRepositorySuppression` | `false` | When `true`, the audited repository's own suppression surfaces are honored: `.betterleaks.toml`/`.gitleaks.toml` config, `.betterleaksignore`/`.gitleaksignore` fingerprints, and `betterleaks:allow`/`gitleaks:allow` comments. When `false`, any of those four files at the repo root fails the run closed as infrastructure. See below — off by default because the audit subject authors those files. |
+| `TrustRepositorySuppression` | `false` | When `true`, the audited repository's own suppression surfaces are honored: `.betterleaks.toml`/`.gitleaks.toml` config, `.betterleaksignore`/`.gitleaksignore` fingerprints, and `betterleaks:allow`/`gitleaks:allow` comments. When `false`, any of those four files at the repo root — or any path matching `*gitleaks.toml*` anywhere in the worktree or git history — fails the run closed as infrastructure. See below — off by default because the audit subject authors those files. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact betterleaks rule ids to keep/drop (e.g. `slack-bot-token`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
@@ -147,16 +164,24 @@ unless the operator opts in:
   which outranks the repo config files as *config* (betterleaks config
   precedence: `--config` → `BETTERLEAKS_CONFIG`/`GITLEAKS_CONFIG` →
   `BETTERLEAKS_CONFIG_TOML`/`GITLEAKS_CONFIG_TOML` → repo
-  `.betterleaks.toml`/`.gitleaks.toml` → built-in default — so an operator
-  `--config` in `ExtraArguments` or a baseline `BETTERLEAKS_CONFIG` still
-  wins);
+  `.betterleaks.toml`/`.gitleaks.toml` → built-in default). The two
+  precedence-2 **path** env vars are explicitly unset on the scan: a
+  baseline-exported `BETTERLEAKS_CONFIG` — or even `GITLEAKS_CONFIG`, which
+  betterleaks honors as a fallback spelling — would silently outrank the
+  pin with a file path the `ExtraArguments` canonicalization guard never
+  sees. The sanctioned operator override is `--config` in `ExtraArguments`
+  (canonicalized outside the worktree), which still wins;
 - `--ignore-gitleaks-allow` disables both `betterleaks:allow` and
   `gitleaks:allow` comments;
 - `--gitleaks-ignore-path` points at an inert path, and pre-scan checks
-  **fail closed as infrastructure** when any of the four files exists at the
-  worktree root. The gate applies regardless of an operator `--config` —
-  remove the file(s), or set `TrustRepositorySuppression=true` to trust
-  repository-controlled suppression.
+  **fail closed as infrastructure** when any of the four files exists at
+  the worktree root, or when a `*gitleaks.toml*` path exists anywhere in
+  the worktree or git history (the stock ruleset's prefilter exempts
+  matching paths from the scan in every commit — a committed-then-deleted
+  copy would still hide a secret committed inside it). The gate applies
+  regardless of an operator `--config` — remove the file(s), or set
+  `TrustRepositorySuppression=true` to trust repository-controlled
+  suppression surfaces.
 
 A fifth suppression channel — a committed `.gitattributes` marking a
 secret-bearing path `-diff`/`binary` — is neutralized at the scan layer:
@@ -166,20 +191,21 @@ files differ".
 
 Set `TrustRepositorySuppression: true` under
 `CodeyBox:Plugins:codeybox.betterleaks` when the audited repositories
-legitimately carry detector configs or ignore fingerprints. One caveat to
-understand: betterleaks exempts its *loaded* config path (`Config.Path`)
-from the scan in every commit — that path stays empty while the config
-comes from the pinned inline `BETTERLEAKS_CONFIG_TOML`, so nothing is
-exempted by default and the gate covers the worktree only, but under
-`TrustRepositorySuppression` a loaded repo `.betterleaks.toml`/`.gitleaks.toml`
-IS self-exempted: a secret committed inside that file is then never
-reported (moot in that mode — the repo can already discard findings via
-`filter`, but know that the config file's own contents are never scanned).
+legitimately carry detector configs or ignore fingerprints. Two caveats to
+understand in that mode: the `*gitleaks.toml*` family gate is skipped, so
+those paths return to being silently exempted; and betterleaks exempts its
+*loaded* config path (`Config.Path`) from the scan in every commit — that
+path stays empty while the config comes from the pinned inline
+`BETTERLEAKS_CONFIG_TOML`, but under `TrustRepositorySuppression` a loaded
+repo `.betterleaks.toml`/`.gitleaks.toml` IS self-exempted: a secret
+committed inside that file is then never reported (moot in that mode — the
+repo can already discard findings via `filter`, but know that the config
+file's own contents are never scanned).
 
 The alternative to trusting repo files is operator-controlled config: pin a
 ruleset outside the repo via `ExtraArguments` (`--config
-/abs/path/in/sandbox.toml`) or a baseline `BETTERLEAKS_CONFIG`, and manage
-suppression through `ExcludedRules`/`ExcludePaths`.
+/abs/path/in/sandbox.toml`) and manage suppression through
+`ExcludedRules`/`ExcludePaths`.
 
 ## Default scope
 
