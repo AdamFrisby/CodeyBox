@@ -144,7 +144,7 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
             if (await ReadFreelistCountAsync(ct).ConfigureAwait(false) < options.FreelistPageThreshold)
                 return MaintenanceOutcome.NoAction;
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode is SqliteDefaults.SqliteBusy or SqliteDefaults.SqliteLocked)
+        catch (Exception ex) when (SqliteDefaults.IsLockContention(ex))
         {
         }
 
@@ -204,7 +204,7 @@ public sealed class SqliteDatabaseMaintenanceService : BackgroundService
                 pageCountAfter);
             return MaintenanceOutcome.Vacuumed;
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode is SqliteDefaults.SqliteBusy or SqliteDefaults.SqliteLocked)
+        catch (Exception ex) when (SqliteDefaults.IsLockContention(ex))
         {
             _log.LogWarning(ex, "SQLite maintenance deferred: database is locked; retrying at the next check");
             return MaintenanceOutcome.DeferredContention;

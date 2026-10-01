@@ -1591,6 +1591,13 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                     stopDispatchLoop = true;
                     break;
                 }
+                catch (Exception ex) when (SqliteDefaults.IsLockContention(ex))
+                {
+                    _log.LogWarning(
+                        ex,
+                        "Worker pool: pickup deferred because the state database is locked; slot released, retrying on the next dispatch signal");
+                    break;
+                }
                 catch (Exception ex) when (ex is not SqliteWriteGatePersistentlyUnavailableException)
                 {
                     _log.LogError(
@@ -1890,6 +1897,9 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     /// escalation, so a VACUUM cannot stop the host no matter how long the
     /// configured window is. A maintenance hold past its budget — or any other
     /// holder — still counts and escalates normally.
+    /// SQLite lock contention (<c>SQLITE_BUSY</c>/<c>SQLITE_LOCKED</c>) on the
+    /// dispatch read path is the same class of transient: log Warning and
+    /// retry on the next turn. It is not a process-ending fault.
     /// </summary>
     internal async Task<WorkItemId?> PickNextEligibleResilientAsync(CancellationToken ct)
     {
@@ -1898,6 +1908,13 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
             var id = await PickNextEligibleAsync(ct).ConfigureAwait(false);
             Volatile.Write(ref _consecutiveDispatchGateTimeouts, 0);
             return id;
+        }
+        catch (Exception ex) when (SqliteDefaults.IsLockContention(ex))
+        {
+            _log.LogWarning(
+                ex,
+                "Dispatch pickup deferred because the state database is locked; retrying on the next dispatch turn.");
+            return null;
         }
         catch (Exception ex) when (ex is SqliteWriteGateAcquisitionTimeoutException
             or SqliteWriteGateWaitQueueFullException
