@@ -1982,7 +1982,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning,
-            pipelineTimeProvider: idleClock);
+            pipelineTimeProvider: idleClock,
+            // Exact attempt counts asserted below: heartbeat execs keep
+            // provisioning quiet-gaps under the fake idle window.
+            sandboxProvider: HeartbeatSandboxes());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
 
@@ -2041,7 +2044,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 3,
             pipelineTuning: tuning,
-            pipelineTimeProvider: idleClock);
+            pipelineTimeProvider: idleClock,
+            // Heartbeat execs keep provisioning quiet-gaps under the fake idle
+            // window so the iteration outcome doesn't hinge on setup timing.
+            sandboxProvider: HeartbeatSandboxes());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-rework"));
 
@@ -2139,7 +2145,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             maxAuditIterations: 2,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning,
-            pipelineTimeProvider: idleClock);
+            pipelineTimeProvider: idleClock,
+            // Exact attempt counts asserted below: heartbeat execs keep
+            // provisioning quiet-gaps under the fake idle window.
+            sandboxProvider: HeartbeatSandboxes());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-warning-rework"));
 
@@ -2195,7 +2204,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             maxAuditIterations: 1,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning,
-            pipelineTimeProvider: idleClock);
+            pipelineTimeProvider: idleClock,
+            // Exact attempt counts asserted below: heartbeat execs keep
+            // provisioning quiet-gaps under the fake idle window.
+            sandboxProvider: HeartbeatSandboxes());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-final-incomplete-rework"));
 
@@ -2237,6 +2249,9 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         {
             AuditorIdleTimeout = TimeSpan.FromMilliseconds(100),
         });
+        // Exact attempt counts are asserted below, so every audit attempt must
+        // reach the auditor's RunAsync — heartbeat execs keep provisioning
+        // quiet-gaps under the fake idle window (see HeartbeatSandboxes).
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
@@ -2244,7 +2259,8 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             maxAuditIterations: 1,
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning,
-            pipelineTimeProvider: idleClock);
+            pipelineTimeProvider: idleClock,
+            sandboxProvider: HeartbeatSandboxes());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-one-extra-rework"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "unexpected-second-extra-rework"));
@@ -2306,6 +2322,9 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             maxLlmAuditorParallelism: 2,
             pipelineTuning: tuning,
             pipelineTimeProvider: idleClock,
+            // Exact attempt counts asserted below: heartbeat execs keep
+            // provisioning quiet-gaps under the fake idle window.
+            sandboxProvider: HeartbeatSandboxes(),
             requiredBuildVerifier: requiredBuild);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
@@ -2836,7 +2855,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             auditors: [blocker, sometimesHangs],
             maxAuditIterations: 2,
             pipelineTuning: tuning,
-            pipelineTimeProvider: idleClock);
+            pipelineTimeProvider: idleClock,
+            // Exact attempt counts asserted below: heartbeat execs keep
+            // provisioning quiet-gaps under the fake idle window.
+            sandboxProvider: HeartbeatSandboxes());
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-tool-rework"));
 
@@ -3210,6 +3232,105 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 AgentStdout: "stream-json marker: Reconnecting... recovered"));
         }
     }
+
+    /// <summary>
+    /// Provider wrapper whose sandboxes emit an empty stdout heartbeat chunk
+    /// on an interval while each exec is in flight. Tests that assert exact
+    /// auditor invocation counts under a sub-second fake-clock
+    /// <c>AuditorIdleTimeout</c> use this to keep provisioning execs (audit
+    /// sandbox <c>git clone</c>/<c>checkout</c>, shim install, credential
+    /// materialisation) from out-quieting the idle window under suite load —
+    /// the guard measures elapsed-since-last-output, and a healthy but silent
+    /// exec that overruns the budget gets killed before the auditor is ever
+    /// invoked, leaving call-count assertions short. The heartbeat narrows the
+    /// remaining exposure to an individual scheduling stall inside one
+    /// heartbeat gap.
+    /// <para>
+    /// Because the heartbeat keeps a wedged exec "chatty", it suppresses the
+    /// idle kill for execs that never return — do NOT use it in the tests that
+    /// deliberately hang a sandbox exec to prove kill/retry semantics.
+    /// </para>
+    /// </summary>
+    private sealed class ActivityHeartbeatSandboxProvider(ISandboxProvider inner) : ISandboxProvider
+    {
+        private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromMilliseconds(25);
+
+        public string Name => inner.Name;
+        public IReadOnlyList<string> DeclaredCapabilities => inner.DeclaredCapabilities;
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            inner.ListAllManagedAsync(ct);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            inner.DisposeLeakedAsync(name, ct);
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var sandbox = await inner.CreateAsync(spec, ct).ConfigureAwait(false);
+            // Only audit sandboxes carry the orchestrator-added /audit mount;
+            // work/merge sandboxes keep their normal exec behaviour.
+            return spec.Mounts.Any(m => string.Equals(
+                    m.SandboxPath.TrimEnd('/'), "/audit", StringComparison.Ordinal))
+                ? new ActivityHeartbeatSandbox(sandbox, HeartbeatInterval)
+                : sandbox;
+        }
+
+        private sealed class ActivityHeartbeatSandbox(ISandbox inner, TimeSpan interval)
+            : ISandbox, ISandboxDecorator
+        {
+            public ISandbox InnerSandbox => inner;
+            public string Id => inner.Id;
+            public SandboxAgentOutputTransportKind AgentOutputTransportKind => inner.AgentOutputTransportKind;
+            public SandboxBatchLaunchMode BatchLaunchMode => inner.BatchLaunchMode;
+            public SandboxResourceMetrics? ResourceMetrics => inner.ResourceMetrics;
+
+            public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            {
+                var execTask = inner.ExecAsync(exec, ct);
+                try
+                {
+                    while (true)
+                    {
+                        var completed = await Task.WhenAny(execTask, Task.Delay(interval, ct))
+                            .ConfigureAwait(false);
+                        if (completed == execTask)
+                            return await execTask.ConfigureAwait(false);
+                        exec.StdoutChunkCallback?.Invoke(string.Empty);
+                    }
+                }
+                catch
+                {
+                    // The delay raced exec cancellation — the exec may still be
+                    // winding down; observe it so its failure can't go unseen.
+                    _ = execTask.ContinueWith(
+                        t => _ = t.Exception,
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                    throw;
+                }
+            }
+
+            public Task SyncStateToHostAsync(CancellationToken ct = default) => inner.SyncStateToHostAsync(ct);
+            public Task KillActiveExecsAsync(CancellationToken ct = default) => inner.KillActiveExecsAsync(ct);
+            public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default) => inner.GetScreenshotAsync(ct);
+            public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default) =>
+                inner.SynthesizeInputAsync(events, ct);
+            public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default) =>
+                inner.GetAccessibilityAtPointAsync(x, y, ct);
+            public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
+                inner.GetAccessibilityTreeJsonAsync(ct);
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Wraps the process sandbox so audit-sandbox execs emit heartbeat output
+    /// while in flight. Used by idle-clock tests that assert exact auditor
+    /// invocation counts: without it, a healthy but silent provisioning exec
+    /// can overrun the 100 ms fake idle window under suite load and be killed
+    /// before the auditor's RunAsync is ever invoked.
+    /// </summary>
+    private static ActivityHeartbeatSandboxProvider HeartbeatSandboxes() =>
+        new(new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
 
     private sealed class DelegateAuditor : IAuditor
     {
