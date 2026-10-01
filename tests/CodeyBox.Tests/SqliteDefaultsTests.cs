@@ -82,6 +82,20 @@ public sealed class SqliteDefaultsTests : IDisposable
             await insert.ExecuteNonQueryAsync();
         }
 
+        using (var countCmd = reader.CreateCommand())
+        {
+            countCmd.Transaction = deferred;
+            countCmd.CommandText = "SELECT COUNT(*) FROM temp.codeybox_dispatch_skip_ids;";
+            Assert.Equal(1, Convert.ToInt32(await countCmd.ExecuteScalarAsync()));
+        }
+
+        using (var idCmd = reader.CreateCommand())
+        {
+            idCmd.Transaction = deferred;
+            idCmd.CommandText = "SELECT id FROM temp.codeybox_dispatch_skip_ids;";
+            Assert.Equal("skip-1", await idCmd.ExecuteScalarAsync());
+        }
+
         deferred.Commit();
     }
 

@@ -491,5 +491,5 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     private static bool IsTransientHeartbeatStorageFailure(Exception ex) =>
         ex is SqliteWriteGateAcquisitionTimeoutException
-        || ex is SqliteException { SqliteErrorCode: SqliteDefaults.SqliteBusy or SqliteDefaults.SqliteLocked };
+        || SqliteDefaults.IsLockContention(ex);
 }
