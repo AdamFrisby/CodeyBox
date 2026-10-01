@@ -33,14 +33,12 @@ namespace CodeyBox.DetectSecretsAuditorPlugin;
 internal sealed class DetectSecretsBaselineParser : IExternalToolOutputParser
 {
     /// <summary>
-    /// Upper bound on results consumed from one document — aliases the
-    /// shared <see cref="SarifToolOutputParser"/> bound so the two cannot
-    /// drift and one pathological report cannot grow findings without
-    /// limit. The base still applies its own <c>MaxFindings</c> cap on top.
+    /// Upper bound on results consumed from one document — the shared
+    /// format-neutral report bound, so one pathological report cannot grow
+    /// findings without limit. The base still applies its own
+    /// <c>MaxFindings</c> cap on top.
     /// </summary>
-    internal const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
-
-    private const int MessageValueMaxChars = 64;
+    internal const int MaxResults = ExternalToolReportLimits.DefaultMaxResults;
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
@@ -141,5 +139,5 @@ internal sealed class DetectSecretsBaselineParser : IExternalToolOutputParser
 
     private static string BoundedName(string name)
         => ExternalToolJsonHelpers.Truncate(
-            ExternalToolJsonHelpers.SingleLine(name), MessageValueMaxChars);
+            ExternalToolJsonHelpers.SingleLine(name), ToolOutputText.MessageValueMaxChars);
 }

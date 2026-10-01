@@ -567,18 +567,28 @@ public sealed class DetectSecretsAuditorTests
     [Theory]
     // argparse resolves unambiguous long-option prefixes by default — these
     // abbreviations reach the tool as the reserved flag itself.
-    [InlineData("--bas")]              // abbreviation of --baseline
-    [InlineData("--bas=x.json")]       // attached-value abbreviation
-    [InlineData("--plug")]             // abbreviation of --plugin
-    // File-loading flags resolved inside the worktree.
-    [InlineData("--word-list")]
-    [InlineData("--gibberish-model,./model.bin")]
+    [InlineData("--bas", "--baseline")]              // abbreviation of --baseline
+    [InlineData("--bas=x.json", "--baseline")]       // attached-value abbreviation
+    [InlineData("--plug", "--plugin")]               // abbreviation of --plugin
+    // File-loading flags resolved inside the worktree — short forms,
+    // the joined '-fvalue' spelling, and bundled clusters: '-np' parses as
+    // -n then -p because -n takes no value, so the reserved letter is
+    // rejected wherever it appears in a single-dash token.
+    [InlineData("-p,./detector.py", "--plugin")]
+    [InlineData("-np,./detector.py", "--plugin")]
+    [InlineData("-f./filters.py::fn", "--filter")]
+    [InlineData("-nf,./filters.py::fn", "--filter")]
+    [InlineData("-vf,./filters.py::fn", "--filter")]
+    [InlineData("--word-list", "--word-list")]
+    [InlineData("--gibberish-model,./model.bin", "--gibberish-model")]
     // Coverage-reshaping flags.
-    [InlineData("-C")]
-    [InlineData("-Csub/")]
-    [InlineData("--custom-root,sub/")]
-    [InlineData("--only-allowlisted")]
-    public async Task ReservedExtraArguments_FileLoadingAndCoverage_AreRejected(string extraArguments)
+    [InlineData("-C", "--custom-root")]
+    [InlineData("-Csub/", "--custom-root")]
+    [InlineData("-nC,sub/", "--custom-root")]
+    [InlineData("--custom-root,sub/", "--custom-root")]
+    [InlineData("--only-allowlisted", "--only-allowlisted")]
+    public async Task ReservedExtraArguments_FileLoadingAndCoverage_AreRejected(
+        string extraArguments, string expectedFlag)
     {
         var auditor = new DetectSecretsAuditor();
         await auditor.InitializeAsync(
@@ -599,7 +609,86 @@ public sealed class DetectSecretsAuditorTests
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains("reserved flag", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedFlag, ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task ReservedExtraArguments_RejectionPrecedesBaselineCopyExecs()
+    {
+        // The reserved-flag check is deterministic and must fire before any
+        // sandbox exec — including the realpath canonicalization probe and
+        // the baseline scratch copy a configured BaselineFile triggers.
+        var auditor = new DetectSecretsAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:" + DetectSecretsAuditor.BaselineFileKey] = "/opt/baseline.json",
+                ["Scoped:ExtraArguments"] = "-np,./detector.py",
+            }),
+            CancellationToken.None);
+
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++;
+            return Task.FromResult(Ok(exec));
+        });
+
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+        Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task QuotedNameCheckFailure_FailsClosed_ScanNeverRuns()
+    {
+        // The C-quote coverage check runs inside the probe; when the check
+        // itself cannot complete (the probe's fail-closed sentinel) coverage
+        // is unproven — infrastructure, never a pass.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsWorktreeProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    DetectSecretsAuditor.QuotedNameCheckFailedExit, "", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, BaselineClean, ""));
+        });
+
+        IAuditor auditor = new DetectSecretsAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("detect-secrets", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("C-quoted", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task WorktreeProbeUnexpectedExit_FailsClosed_ScanNeverRuns()
+    {
+        // An exit the probe contract does not define still fails closed on
+        // the generic branch — never a pass, never a scan.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsWorktreeProbe(exec))
+                return Task.FromResult(new SandboxExecResult(9, "", "probe exploded"));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, BaselineClean, ""));
+        });
+
+        IAuditor auditor = new DetectSecretsAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("exit 9", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
     }
 
     [Fact]
@@ -739,8 +828,6 @@ public sealed class DetectSecretsAuditorTests
     private static readonly string _fixtureSecretLine =
         "aws_access_key_id = \"AKIA" + "IOSFODNN7" + "EXAMPLE\"";
 
-    private static readonly string? _installedDetectSecretsVersion = ProbeInstalledDetectSecretsVersion();
-
     /// <summary>
     /// Real-binary end-to-end check: a fixture git repository with a
     /// committed secret-shaped string is scanned by the actual detect-secrets
@@ -755,7 +842,7 @@ public sealed class DetectSecretsAuditorTests
     [Trait("requires_detect_secrets", "true")]
     public async Task RealDetectSecrets_SecretInTrackedFile_YieldsFinding_WithRuleIdAndLocation()
     {
-        var installed = _installedDetectSecretsVersion;
+        var installed = await ProbeInstalledDetectSecretsVersionAsync();
         Skip.If(installed is null, "detect-secrets is not on PATH — provision it to run the real-binary coverage.");
 
         var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
@@ -802,7 +889,7 @@ public sealed class DetectSecretsAuditorTests
     [Trait("requires_detect_secrets", "true")]
     public async Task RealDetectSecrets_CleanFixtureRepo_Passes_WithNoFindings()
     {
-        var installed = _installedDetectSecretsVersion;
+        var installed = await ProbeInstalledDetectSecretsVersionAsync();
         Skip.If(installed is null, "detect-secrets is not on PATH — provision it to run the real-binary coverage.");
 
         var repo = await SeedFixtureRepoAsync(null);
@@ -950,7 +1037,7 @@ public sealed class DetectSecretsAuditorTests
             && exec.Argv[2].Contains(DetectSecretsAuditor.BaselineCopyFileName, StringComparison.Ordinal);
 
     private static bool IsReportRead(SandboxExec exec)
-        => exec.Argv.Count >= 1 && exec.Argv[0] == "cat";
+        => exec.Argv.Count == 3 && exec.Argv[0] == "cat" && exec.Argv[1] == "--";
 
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "detect-secrets" && exec.Argv[1] == "--version";
@@ -972,7 +1059,13 @@ public sealed class DetectSecretsAuditorTests
         return repo;
     }
 
-    private static string? ProbeInstalledDetectSecretsVersion()
+    // Probes the host's detect-secrets for its version so the real-binary
+    // tests can pin to whatever is installed. The 10s bound must actually
+    // fire: both streams drain on ReadToEndAsync BEFORE the bounded wait,
+    // so a child that fills a pipe cannot deadlock the probe, and a hung
+    // binary is killed at the deadline rather than blocking test setup
+    // indefinitely.
+    private static async Task<string?> ProbeInstalledDetectSecretsVersionAsync()
     {
         try
         {
@@ -985,14 +1078,33 @@ public sealed class DetectSecretsAuditorTests
             };
             psi.ArgumentList.Add("--version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
-            if (!process.WaitForExit(milliseconds: 10_000))
+            var stdoutRead = process.StandardOutput.ReadToEndAsync();
+            var stderrRead = process.StandardError.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var exited = true;
+            try
             {
-                try { process.Kill(); } catch { /* best-effort probe teardown */ }
+                await process.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                exited = false;
+                try { process.Kill(entireProcessTree: true); }
+                catch { /* best-effort probe teardown */ }
+            }
+            string version;
+            try
+            {
+                // Observe both reads so a failed/hung child cannot leave a
+                // faulted drain task unobserved.
+                version = (await stdoutRead).Trim();
+                await stderrRead;
+            }
+            catch
+            {
                 return null;
             }
-            var version = stdout.Trim();
-            return process.ExitCode == 0 && version.Length > 0 ? version : null;
+            return exited && process.ExitCode == 0 && version.Length > 0 ? version : null;
         }
         catch
         {

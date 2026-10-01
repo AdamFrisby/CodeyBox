@@ -73,6 +73,20 @@ public sealed class ExternalToolParseException : Exception
 }
 
 /// <summary>
+/// Bounds shared by every <see cref="IExternalToolOutputParser"/>
+/// implementation, independent of the tool's report format.
+/// </summary>
+public static class ExternalToolReportLimits
+{
+    /// <summary>
+    /// Default upper bound on results consumed from one report document —
+    /// the format-neutral cap every parser starts from so one pathological
+    /// report cannot grow findings without limit.
+    /// </summary>
+    public const int DefaultMaxResults = 10_000;
+}
+
+/// <summary>
 /// Parser adapter for tools with simple output: supply a function, get an
 /// <see cref="IExternalToolOutputParser"/>.
 /// </summary>
@@ -100,7 +114,7 @@ public sealed class DelegateToolOutputParser : IExternalToolOutputParser
 public sealed class SarifToolOutputParser : IExternalToolOutputParser
 {
     /// <summary>Upper bound on results consumed from one document.</summary>
-    public const int DefaultMaxResults = 10_000;
+    public const int DefaultMaxResults = ExternalToolReportLimits.DefaultMaxResults;
 
     private readonly int _maxResults;
 

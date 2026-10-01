@@ -24,7 +24,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private const int UnavailableOutputTailMaxChars = 4096;
     private const int TitleMaxChars = 200;
     private const int MaxBuiltArguments = 256;
-    private const int MessageValueMaxChars = 64;
+    private const int MessageValueMaxChars = ToolOutputText.MessageValueMaxChars;
 
     /// <summary>Per-stream capture cap for precondition probes (version checks, repository-suppression gates).</summary>
     protected const int ProbeMaxOutputBytes = 16 * 1024;
@@ -427,7 +427,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
             "report read",
             new SandboxExec
             {
-                Argv = ["cat", reportPath],
+                // '--' terminates option parsing so a dash-leading report
+                // path can never be read as a cat flag (and 'cat' alone can
+                // never fall back to stdin).
+                Argv = ["cat", "--", reportPath],
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = CapturedOutputLimit(options),
                 MaxStderrBytes = ProbeMaxOutputBytes,

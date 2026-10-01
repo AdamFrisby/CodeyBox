@@ -191,16 +191,28 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
     //       an exact detector, and the probe sees the same quoting the
     //       tool's own ls-files call produces (repository git config —
     //       core.quotePath — applies equally to both).
+    //   6 — the quoted-name check itself did not complete. The check is a
+    //       pure-shell read loop (no external matcher, so a stripped-down
+    //       baseline cannot turn it into a silent skip): the loop exits 5
+    //       on a match — which the pipeline then carries, whether the loop
+    //       ran in a subshell or the script's own — and 0 after a complete
+    //       pass, so any other status is captured and mapped here rather
+    //       than falling through to "coverage is provably complete".
     //   0 — coverage is provably complete.
     private const string GitWorktreeRootScript =
         "test \"$(git rev-parse --is-inside-work-tree 2>/dev/null)\" = true"
         + " && test -z \"$(git rev-parse --show-prefix 2>/dev/null)\" || exit 3;"
         + " listing=$(git ls-files) || exit 4;"
-        + " printf '%s\\n' \"$listing\" | grep -q '^\"' && exit 5;"
+        + " printf '%s\\n' \"$listing\" | while IFS= read -r line;"
+        + " do case $line in '\"'*) exit 5;; esac; done; s=$?;"
+        + " test \"$s\" -eq 5 && exit 5;"
+        + " test \"$s\" -eq 0 || exit 6;"
         + " exit 0";
 
-    private const int TrackedEnumerationFailedExit = 4;
+    internal const int NotAWorktreeRootExit = 3;
+    internal const int TrackedEnumerationFailedExit = 4;
     internal const int QuotedTrackedNamesExit = 5;
+    internal const int QuotedNameCheckFailedExit = 6;
 
     // Flags whose presence in ExtraArguments would redirect the report off
     // stdout, load executable/suppressing content from an unguarded path,
@@ -228,7 +240,10 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
     //                      findings.
     // Python argparse resolves unambiguous long-option prefixes by default
     // (allow_abbrev), so RejectReservedExtraArguments also rejects tokens
-    // that resolve to a reserved flag by abbreviation ('--bas', '--plug').
+    // that resolve to a reserved flag by abbreviation ('--bas', '--plug'),
+    // and bundles short flags in one dash token ('-np' parses as -n then
+    // -p), so a reserved letter is rejected wherever it appears in a
+    // single-dash cluster.
     private static readonly (string Long, string Short)[] ReservedFlags =
     [
         ("--baseline", ""),
@@ -347,7 +362,9 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
     /// tool rewrites the file it is given, and returns the flag pair plus
     /// <c>--force-use-all-plugins</c> so the detector set comes from the
     /// pinned tool rather than the baseline's recorded plugin list. The
-    /// value in argv is the canonicalized path the guard produced.
+    /// path argv names is the per-run scratch copy this hook stages —
+    /// never the configured or canonical path, which is only the copy's
+    /// source.
     /// </summary>
     protected override async Task<IReadOnlyList<string>> ResolveContextArgumentsAsync(
         ISandbox sandbox,
@@ -356,6 +373,11 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
+        // The deterministic rejection precedes every sandbox exec in this
+        // hook (the realpath canonicalization probe and the scratch copy) —
+        // a misconfigured ExtraArguments must not cost real work first.
+        RejectReservedExtraArguments(options);
+
         var configured = _baselineFile();
         if (string.IsNullOrWhiteSpace(configured))
             return [];
@@ -452,6 +474,13 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
                 + "pass --all-files in ExtraArguments to scan the filesystem instead.",
                 probe.ExitCode,
                 probe.Stdout + "\n" + probe.Stderr);
+        if (probe.ExitCode == QuotedNameCheckFailedExit)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' could not check the worktree's "
+                + "git-tracked listing for C-quoted names — coverage cannot be confirmed, so "
+                + "this is infrastructure, not a verdict on the diff.",
+                probe.ExitCode,
+                probe.Stdout + "\n" + probe.Stderr);
         if (probe.ExitCode == TrackedEnumerationFailedExit)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' could not enumerate the worktree's "
@@ -459,13 +488,20 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
                 + "not a verdict on the diff.",
                 probe.ExitCode,
                 probe.Stdout + "\n" + probe.Stderr);
-        if (probe.ExitCode != 0)
+        if (probe.ExitCode == NotAWorktreeRootExit)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' requires the audit working directory to be "
                 + "the root of a git worktree — outside one, detect-secrets scans no files but "
                 + "still exits 0 with an empty report, which would look like a clean pass for a "
                 + "scan that never ran. Provision a git worktree, or pass --all-files in "
                 + "ExtraArguments to scan the filesystem instead.",
+                probe.ExitCode,
+                probe.Stdout + "\n" + probe.Stderr);
+        if (probe.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' worktree precondition probe failed "
+                + $"(exit {probe.ExitCode}) — scan coverage could not be confirmed, so this is "
+                + "infrastructure, not a verdict on the diff.",
                 probe.ExitCode,
                 probe.Stdout + "\n" + probe.Stderr);
     }
@@ -549,17 +585,36 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
             && longOption.StartsWith(token, StringComparison.Ordinal);
     }
 
+    // Python argparse bundles short flags in one dash token: '-np' parses
+    // as -n (a zero-arg flag) then -p with the next argv entry as its
+    // value, while a value-taking flag absorbs the rest of its own token
+    // ('-fp' = -f 'p'). The scan subparser's only zero-arg shorts are -n
+    // and -h and its only value-taking shorts are the reserved -p and -f,
+    // so a reserved letter at ANY position after the dash means the flag
+    // is reachable: it heads the token, it follows zero-arg shorts, or it
+    // trails a letter that is itself a reserved value-taking flag — which
+    // already fired. Membership, not just the leading character, decides.
+    private static bool ShortFlagClusterReaches(string argument, char letter)
+        => argument.Length > 1
+            && argument[0] == '-'
+            && argument[1] != '-'
+            && argument.IndexOf(letter, 1) >= 0;
+
     private void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
     {
         var offenders = new List<string>();
         foreach (var (longFlag, shortFlag) in ReservedFlags)
         {
             // ResolvesToLongOption covers the separated and '--flag=value'
-            // forms AND argparse's prefix abbreviations; the shared matcher
-            // additionally covers a short flag's joined '-fvalue' form.
+            // forms AND argparse's prefix abbreviations; the bundle-aware
+            // short check covers the joined '-fvalue' form AND clustered
+            // spellings like '-np' (zero-arg -n, then -p) that a leading-
+            // character match would miss.
             var supplied =
                 options.ExtraArguments.Any(arg => ResolvesToLongOption(arg, longFlag))
-                || (shortFlag.Length > 0 && ExtraArgumentsSupplyFlag(options, shortFlag));
+                || (shortFlag.Length > 0
+                    && options.ExtraArguments.Any(
+                        arg => ShortFlagClusterReaches(arg, shortFlag[1])));
             if (supplied)
                 offenders.Add(longFlag);
         }

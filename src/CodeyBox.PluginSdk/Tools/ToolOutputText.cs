@@ -11,6 +11,14 @@ namespace CodeyBox.PluginSdk.Tools;
 /// </summary>
 public static class ToolOutputText
 {
+    /// <summary>
+    /// Bound on untrusted or operator-configured text embedded in failure
+    /// messages — the shared cap for every seam that single-lines and
+    /// truncates a message value, so the limit cannot drift between the
+    /// base and report parsers.
+    /// </summary>
+    public const int MessageValueMaxChars = 64;
+
     /// <summary>Returns null for null/whitespace input; the value otherwise.</summary>
     public static string? NullIfWhiteSpace(string? value)
         => string.IsNullOrWhiteSpace(value) ? null : value;

@@ -229,7 +229,8 @@ public sealed class DependencyCheckAuditorTests
         // write — never from captured stdout.
         Assert.NotNull(reportRead);
         Assert.Equal("cat", reportRead!.Argv[0]);
-        Assert.Equal(argv[outIndex + 1], reportRead.Argv[1]);
+        Assert.Equal("--", reportRead.Argv[1]);
+        Assert.Equal(argv[outIndex + 1], reportRead.Argv[2]);
     }
 
     [Fact]
@@ -862,7 +863,7 @@ public sealed class DependencyCheckAuditorTests
         => exec.Argv.Count >= 2 && exec.Argv[0] == "realpath";
 
     private static bool IsReportRead(SandboxExec exec)
-        => exec.Argv.Count == 2 && exec.Argv[0] == "cat";
+        => exec.Argv.Count == 3 && exec.Argv[0] == "cat" && exec.Argv[1] == "--";
 
     // Emulates `realpath -m -- <path> .` for the suppression-path guard:
     // absolute paths resolve verbatim, relative ones against the /work cwd.
