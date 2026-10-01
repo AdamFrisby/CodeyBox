@@ -139,6 +139,14 @@ public sealed class GitleaksAuditorTests
             "useDefault",
             Assert.Contains("GITLEAKS_CONFIG_TOML", scanExec.ExtraEnvironment),
             StringComparison.Ordinal);
+
+        // .gitattributes countermeasure: the pinned log opts re-state
+        // gitleaks's default rev args (--log-opts replaces them wholesale)
+        // and add --text, so a committed `path -diff`/`binary` attribute
+        // cannot blank the patch stream git log feeds the scanner.
+        var logOpts = argv.ToList().IndexOf("--log-opts");
+        Assert.True(logOpts >= 0 && logOpts + 1 < argv.Count);
+        Assert.Equal("--full-history --all --diff-filter=tuxdb --text", argv[logOpts + 1]);
     }
 
     [Fact]
@@ -425,13 +433,12 @@ public sealed class GitleaksAuditorTests
     /// where a gitleaks binary is on PATH; the auditor's version pin is set to
     /// the installed release.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_gitleaks", "true")]
     public async Task RealGitleaks_SecretInSourceAndHistory_YieldsFinding_WithRuleIdAndLocation()
     {
         var installed = _installedGitleaksVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "gitleaks binary not on PATH");
 
         var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
         try
@@ -474,13 +481,12 @@ public sealed class GitleaksAuditorTests
     /// Companion real-binary check: a fixture repository with no secrets
     /// passes with zero findings.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_gitleaks", "true")]
     public async Task RealGitleaks_CleanFixtureRepo_Passes_WithNoFindings()
     {
         var installed = _installedGitleaksVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "gitleaks binary not on PATH");
 
         var repo = await SeedFixtureRepoAsync(null);
         try
@@ -522,13 +528,12 @@ public sealed class GitleaksAuditorTests
     /// the operator opt-in the scan runs and reports nothing — proving the
     /// exemption is real — and by default the gate fails closed instead.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_gitleaks", "true")]
     public async Task RealGitleaks_GitleaksTomlDeletedFromHistory_EvadesScan_GateFailsClosed()
     {
         var installed = _installedGitleaksVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "gitleaks binary not on PATH");
 
         var repo = await SeedFixtureRepoAsync(null);
         try
@@ -583,6 +588,95 @@ public sealed class GitleaksAuditorTests
         {
             TryDeleteDirectory(repo);
         }
+    }
+
+    /// <summary>
+    /// Real-binary regression for the <c>.gitattributes</c> suppression
+    /// channel: marking a secret-bearing path <c>-diff</c> makes
+    /// <c>git log -p</c> emit "Binary files differ" with no patch content,
+    /// silently blanking the scanner's input. The pinned
+    /// <c>--log-opts … --text</c> must still surface the finding.
+    /// </summary>
+    [SkippableFact]
+    [Trait("requires_gitleaks", "true")]
+    public async Task RealGitleaks_SecretMarkedDiffSuppressed_StillYieldsFinding()
+    {
+        var installed = _installedGitleaksVersion;
+        Skip.If(installed is null, "gitleaks binary not on PATH");
+
+        var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(repo, ".gitattributes"), "secrets.txt -diff\n");
+            await TestSupport.RunGit(repo, "add", "-A");
+            await TestSupport.RunGit(repo, "commit", "-m", "mark secrets.txt -diff");
+
+            var auditor = new GitleaksAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                }),
+                CancellationToken.None);
+
+            var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+            await using var sandbox = await provider.CreateAsync(
+                new SandboxSpec
+                {
+                    ImageReference = "ignored",
+                    WorkingDirectory = "/work",
+                    Mounts = [new SandboxMount { SandboxPath = "/work", HostPath = repo }],
+                },
+                CancellationToken.None);
+
+            var result = await ((IAuditor)auditor).RunAsync(
+                sandbox, "/work", FakeContext(), CancellationToken.None);
+
+            Assert.False(result.Passed);
+            var finding = Assert.Single(result.Findings);
+            Assert.Equal("secrets.txt:1", finding.Location);
+        }
+        finally
+        {
+            TryDeleteDirectory(repo);
+        }
+    }
+
+    // An operator file flag whose value resolves inside the audited worktree
+    // hands gate-shaping content (config ruleset, baseline, ignore
+    // fingerprints) to repo-controlled bytes — the flag resolves against the
+    // tool's cwd — so it fails closed before the scan runs.
+    [Theory]
+    [InlineData("--config,ops/rules.toml")]
+    [InlineData("--config=ops/rules.toml")]
+    [InlineData("--baseline-path,ops/baseline.json")]
+    public async Task ExtraArgumentsFileFlag_ResolvingInsideWorktree_FailsClosed(string extraArguments)
+    {
+        var auditor = new GitleaksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = extraArguments,
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRealpathProbe(exec))
+                return Task.FromResult(RealpathResult(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("worktree", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
     }
 
     [Fact]
@@ -695,6 +789,17 @@ public sealed class GitleaksAuditorTests
             && exec.Argv[0] == "git"
             && exec.Argv.Contains(".gitleaks.toml", StringComparer.Ordinal);
 
+    private static bool IsRealpathProbe(SandboxExec exec)
+        => exec.Argv.Count == 5
+            && exec.Argv[0] == "realpath"
+            && exec.Argv[1] == "-m";
+
+    // Emulates `realpath -m -- <arg> .` for a relative operand: the
+    // canonicalized path lands under the /work scan root — inside the
+    // audited worktree.
+    private static SandboxExecResult RealpathResult(SandboxExec exec)
+        => new(0, "/work/" + exec.Argv[3] + "\n/work\n", "");
+
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "gitleaks" && exec.Argv[1] == "version";
 
@@ -728,19 +833,25 @@ public sealed class GitleaksAuditorTests
             };
             psi.ArgumentList.Add("version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain both pipes concurrently and bound the wait BEFORE reading
+            // the buffered output: a synchronous ReadToEnd blocks until the
+            // child closes the pipe, so a hung `gitleaks version` — or one
+            // blocked writing to a full stderr pipe — would never reach the
+            // timeout.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
-            var version = stdout.Trim();
+            var version = stdoutTask.GetAwaiter().GetResult().Trim();
             return process.ExitCode == 0 && version.Length > 0 ? version : null;
         }
         catch
         {
             // Any failure means no usable gitleaks on PATH — the gated tests
-            // return early rather than fail on a host without the tool.
+            // skip rather than fail on a host without the tool.
             return null;
         }
     }

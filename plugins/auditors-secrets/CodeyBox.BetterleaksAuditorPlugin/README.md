@@ -130,7 +130,7 @@ Scoped under `CodeyBox:Plugins:codeybox.betterleaks`, resolved per run
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact betterleaks rule ids to keep/drop (e.g. `slack-bot-token`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config <sandbox path>` to pin an operator-controlled ruleset, or `--confidence high` to drop low-confidence candidates at scan time. A repeated flag wins over the built-in default — so take care: `--log-opts` replaces the `git log` flags, silently dropping history coverage, and `--baseline-path`, `--config`, `--enable-rule`, or `--disable-rule` narrow or suppress findings by design. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config <sandbox path>` to pin an operator-controlled ruleset, or `--confidence high` to drop low-confidence candidates at scan time. Flags that name a file the tool loads — `--config`/`-c`, `--baseline-path`/`-b`, `--gitleaks-ignore-path`/`-i` — are canonicalized and **rejected when they resolve inside the audited worktree** (they resolve against the tool's cwd, so an in-tree path would hand gate-shaping content to repo-controlled bytes); point them at absolute paths outside the repo. A repeated flag wins over the built-in default — so take care: the auditor pins `--log-opts` (the stock rev args plus `--text`, the `.gitattributes` countermeasure) — overriding it must keep `--text` or a `-diff`/`binary` attribute silences the scan — and `--enable-rule`, `--disable-rule`, or the file flags above narrow or suppress findings by design. |
 | `TimeoutSeconds` | `300` | Per-run bound; also forwarded to betterleaks's own `--timeout`. Exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 
@@ -158,12 +158,23 @@ unless the operator opts in:
   remove the file(s), or set `TrustRepositorySuppression=true` to trust
   repository-controlled suppression.
 
+A fifth suppression channel — a committed `.gitattributes` marking a
+secret-bearing path `-diff`/`binary` — is neutralized at the scan layer:
+the auditor pins `--log-opts` to the stock rev args plus `--text`, so
+`git log -p` emits patch content for attributed files instead of "Binary
+files differ".
+
 Set `TrustRepositorySuppression: true` under
 `CodeyBox:Plugins:codeybox.betterleaks` when the audited repositories
-legitimately carry detector configs or ignore fingerprints. Unlike gitleaks,
-betterleaks scans its own config path normally — a secret committed inside
-`.betterleaks.toml` is reported, not exempted — so the gate covers the
-worktree only; a deleted historical config cannot suppress the current scan.
+legitimately carry detector configs or ignore fingerprints. One caveat to
+understand: betterleaks exempts its *loaded* config path (`Config.Path`)
+from the scan in every commit — that path stays empty while the config
+comes from the pinned inline `BETTERLEAKS_CONFIG_TOML`, so nothing is
+exempted by default and the gate covers the worktree only, but under
+`TrustRepositorySuppression` a loaded repo `.betterleaks.toml`/`.gitleaks.toml`
+IS self-exempted: a secret committed inside that file is then never
+reported (moot in that mode — the repo can already discard findings via
+`filter`, but know that the config file's own contents are never scanned).
 
 The alternative to trusting repo files is operator-controlled config: pin a
 ruleset outside the repo via `ExtraArguments` (`--config

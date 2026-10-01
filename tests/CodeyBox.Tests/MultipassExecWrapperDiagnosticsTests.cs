@@ -909,7 +909,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
 
     private static void ClearInheritedCodeyBoxTransportEnvironment(ProcessStartInfo psi)
     {
-        psi.Environment.Remove("CODEYBOX_AGENT_LOG_FILE");
+        psi.Environment.Remove(SandboxConventions.AgentLogFileEnv);
         psi.Environment.Remove("CODEYBOX_AGENT_EXIT_FILE");
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);

@@ -125,7 +125,7 @@ Scoped under `CodeyBox:Plugins:codeybox.gitleaks`, resolved per run
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact gitleaks rule ids to keep/drop (e.g. `generic-api-key`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config <sandbox path>` to pin an operator-controlled ruleset. A repeated flag wins over the built-in default — so take care: `--log-opts` replaces gitleaks's `git log` flags, silently dropping `--all`/`--full-history` history coverage, and `--baseline-path`, `--config`, or `--enable-rule` narrow or suppress findings by design. |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--config <sandbox path>` to pin an operator-controlled ruleset. Flags that name a file the tool loads — `--config`/`-c`, `--baseline-path`/`-b`, `--gitleaks-ignore-path`/`-i` — are canonicalized and **rejected when they resolve inside the audited worktree** (they resolve against the tool's cwd, so an in-tree path would hand gate-shaping content to repo-controlled bytes); point them at absolute paths outside the repo. A repeated flag wins over the built-in default — so take care: the auditor pins `--log-opts` (the stock rev args plus `--text`, the `.gitattributes` countermeasure) — overriding it must keep `--text` or a `-diff`/`binary` attribute silences the scan — and `--enable-rule`, `--disable-rule`, or the file flags above narrow or suppress findings by design. |
 | `TimeoutSeconds` | `300` | Per-run bound; also forwarded to gitleaks's own `--timeout`. Exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. |
 
@@ -154,6 +154,12 @@ write all three, the plugin neutralizes them unless the operator opts in:
   operator `--config` — remove the file(s), or set
   `TrustRepositorySuppression=true` to trust repository-controlled
   suppression.
+
+A fourth suppression channel — a committed `.gitattributes` marking a
+secret-bearing path `-diff`/`binary` — is neutralized at the scan layer:
+the auditor pins `--log-opts` to the stock rev args plus `--text`, so
+`git log -p` emits patch content for attributed files instead of "Binary
+files differ".
 
 Set `TrustRepositorySuppression: true` under
 `CodeyBox:Plugins:codeybox.gitleaks` when the audited repositories

@@ -140,6 +140,14 @@ public sealed class BetterleaksAuditorTests
             "useDefault",
             Assert.Contains("BETTERLEAKS_CONFIG_TOML", scanExec.ExtraEnvironment),
             StringComparison.Ordinal);
+
+        // .gitattributes countermeasure: the pinned log opts re-state the
+        // tool's default rev args (--log-opts replaces them wholesale) and
+        // add --text, so a committed `path -diff`/`binary` attribute cannot
+        // blank the patch stream git log feeds the scanner.
+        var logOpts = argv.ToList().IndexOf("--log-opts");
+        Assert.True(logOpts >= 0 && logOpts + 1 < argv.Count);
+        Assert.Equal("--full-history --all --diff-filter=tuxdb --text", argv[logOpts + 1]);
     }
 
     [Theory]
@@ -361,6 +369,133 @@ public sealed class BetterleaksAuditorTests
         Assert.Empty(dropped.Findings);
     }
 
+    [Fact]
+    public async Task MissingGitBinary_IsInfrastructure_NamingGit()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec))
+            {
+                // betterleaks itself exists; the git binary `git` mode shells
+                // out to does not — the failure names the missing piece.
+                var binary = exec.Argv[^1];
+                return Task.FromResult(new SandboxExecResult(
+                    string.Equals(binary, "git", StringComparison.Ordinal) ? 1 : 0, "", ""));
+            }
+            if (IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new BetterleaksAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("'git'", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    // An operator file flag whose value resolves inside the audited worktree
+    // hands gate-shaping content (config ruleset, baseline, ignore
+    // fingerprints) to repo-controlled bytes — the flag resolves against the
+    // tool's cwd — so it fails closed before the scan runs.
+    [Theory]
+    [InlineData("--config,ops/rules.toml")]
+    [InlineData("--config=ops/rules.toml")]
+    [InlineData("-cops/rules.toml")]
+    [InlineData("--baseline-path,ops/baseline.json")]
+    [InlineData("--gitleaks-ignore-path,ops/ignore.txt")]
+    public async Task ExtraArgumentsFileFlag_ResolvingInsideWorktree_FailsClosed(string extraArguments)
+    {
+        var auditor = new BetterleaksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = extraArguments,
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRealpathProbe(exec))
+                return Task.FromResult(RealpathResult(exec, insideWorktree: true));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("worktree", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task ExtraArgumentsFileFlag_ResolvingOutsideWorktree_ScanRuns()
+    {
+        var auditor = new BetterleaksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--config,/etc/betterleaks/rules.toml",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRealpathProbe(exec))
+                return Task.FromResult(RealpathResult(exec, insideWorktree: false));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        // The gate contains, it does not strip — the operator flag still
+        // reaches the scan argv verbatim.
+        var configFlag = scanExec!.Argv.ToList().IndexOf("--config");
+        Assert.True(configFlag >= 0 && configFlag + 1 < scanExec.Argv.Count);
+        Assert.Equal("/etc/betterleaks/rules.toml", scanExec.Argv[configFlag + 1]);
+    }
+
+    [Fact]
+    public async Task ExtraArgumentsFileFlag_WithoutValue_FailsClosed()
+    {
+        var auditor = new BetterleaksAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--config",
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("--config", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
     // Synthetic token in the slack-bot-token rule's shape — not a real
     // credential; it exists so the pinned default ruleset produces exactly
     // one finding at a known location. Assembled at runtime so this test file
@@ -379,13 +514,12 @@ public sealed class BetterleaksAuditorTests
     /// where a betterleaks binary is on PATH; the auditor's version pin is set to
     /// the installed release.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_betterleaks", "true")]
     public async Task RealBetterleaks_SecretInSourceAndHistory_YieldsFinding_WithRuleIdAndLocation()
     {
         var installed = _installedBetterleaksVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "betterleaks binary not on PATH");
 
         var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
         try
@@ -428,13 +562,12 @@ public sealed class BetterleaksAuditorTests
     /// Companion real-binary check: a fixture repository with no secrets
     /// passes with zero findings.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_betterleaks", "true")]
     public async Task RealBetterleaks_CleanFixtureRepo_Passes_WithNoFindings()
     {
         var installed = _installedBetterleaksVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "betterleaks binary not on PATH");
 
         var repo = await SeedFixtureRepoAsync(null);
         try
@@ -475,13 +608,12 @@ public sealed class BetterleaksAuditorTests
     /// finding silences the scan, so the default gate fails closed instead of
     /// reporting a pass — and with the operator opt-in the scan runs.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_betterleaks", "true")]
     public async Task RealBetterleaks_RepoConfigSuppressesEverything_GateFailsClosed()
     {
         var installed = _installedBetterleaksVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "betterleaks binary not on PATH");
 
         var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
         try
@@ -532,6 +664,59 @@ public sealed class BetterleaksAuditorTests
             // proving the suppression is real and the gate is load-bearing.
             Assert.True(trusted.Passed);
             Assert.Empty(trusted.Findings);
+        }
+        finally
+        {
+            TryDeleteDirectory(repo);
+        }
+    }
+
+    /// <summary>
+    /// Real-binary regression for the <c>.gitattributes</c> suppression
+    /// channel: marking a secret-bearing path <c>-diff</c> makes
+    /// <c>git log -p</c> emit "Binary files differ" with no patch content,
+    /// silently blanking the scanner's input. The pinned
+    /// <c>--log-opts … --text</c> must still surface the finding.
+    /// </summary>
+    [SkippableFact]
+    [Trait("requires_betterleaks", "true")]
+    public async Task RealBetterleaks_SecretMarkedDiffSuppressed_StillYieldsFinding()
+    {
+        var installed = _installedBetterleaksVersion;
+        Skip.If(installed is null, "betterleaks binary not on PATH");
+
+        var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(repo, ".gitattributes"), "secrets.txt -diff\n");
+            await TestSupport.RunGit(repo, "add", "-A");
+            await TestSupport.RunGit(repo, "commit", "-m", "mark secrets.txt -diff");
+
+            var auditor = new BetterleaksAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                }),
+                CancellationToken.None);
+
+            var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+            await using var sandbox = await provider.CreateAsync(
+                new SandboxSpec
+                {
+                    ImageReference = "ignored",
+                    WorkingDirectory = "/work",
+                    Mounts = [new SandboxMount { SandboxPath = "/work", HostPath = repo }],
+                },
+                CancellationToken.None);
+
+            var result = await ((IAuditor)auditor).RunAsync(
+                sandbox, "/work", FakeContext(), CancellationToken.None);
+
+            Assert.False(result.Passed);
+            var finding = Assert.Single(result.Findings);
+            Assert.Equal("secrets.txt:1", finding.Location);
         }
         finally
         {
@@ -641,6 +826,23 @@ public sealed class BetterleaksAuditorTests
             && exec.Argv[1] == "-c"
             && exec.Argv.Contains(".betterleaks.toml", StringComparer.Ordinal);
 
+    private static bool IsRealpathProbe(SandboxExec exec)
+        => exec.Argv.Count == 5
+            && exec.Argv[0] == "realpath"
+            && exec.Argv[1] == "-m";
+
+    // Emulates `realpath -m -- <arg> .`: one line for the canonicalized
+    // configured path, one for the canonicalized exec working directory.
+    // insideWorktree maps a relative operand under the /work scan root.
+    private static SandboxExecResult RealpathResult(SandboxExec exec, bool insideWorktree)
+    {
+        var arg = exec.Argv[3];
+        var canonical = insideWorktree && !arg.StartsWith("/", StringComparison.Ordinal)
+            ? "/work/" + arg
+            : arg;
+        return new SandboxExecResult(0, canonical + "\n/work\n", "");
+    }
+
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "betterleaks" && exec.Argv[1] == "version";
 
@@ -674,19 +876,25 @@ public sealed class BetterleaksAuditorTests
             };
             psi.ArgumentList.Add("version");
             using var process = Process.Start(psi)!;
-            var stdout = process.StandardOutput.ReadToEnd();
+            // Drain both pipes concurrently and bound the wait BEFORE reading
+            // the buffered output: a synchronous ReadToEnd blocks until the
+            // child closes the pipe, so a hung `betterleaks version` — or one
+            // blocked writing to a full stderr pipe — would never reach the
+            // timeout.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(milliseconds: 10_000))
             {
                 try { process.Kill(); } catch { /* best-effort probe teardown */ }
                 return null;
             }
-            var version = stdout.Trim();
+            var version = stdoutTask.GetAwaiter().GetResult().Trim();
             return process.ExitCode == 0 && version.Length > 0 ? version : null;
         }
         catch
         {
             // Any failure means no usable betterleaks on PATH — the gated tests
-            // return early rather than fail on a host without the tool.
+            // skip rather than fail on a host without the tool.
             return null;
         }
     }
