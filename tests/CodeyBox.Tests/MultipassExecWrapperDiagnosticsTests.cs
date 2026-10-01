@@ -910,10 +910,16 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     private static void ClearInheritedCodeyBoxTransportEnvironment(ProcessStartInfo psi)
     {
         psi.Environment.Remove("CODEYBOX_AGENT_LOG_FILE");
+        psi.Environment.Remove("CODEYBOX_AGENT_EXIT_FILE");
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.ExitTokenEnvironmentVariable);
         psi.Environment.Remove(MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable);
+        // An ambient framed-stdout marker (set on every agent CLI invocation
+        // inside a CodeyBox sandbox) would flip the wrapper under test to the
+        // envelope-framed path, splitting stderr out of the merged log these
+        // tests assert on.
+        psi.Environment.Remove(SandboxConventions.EnvelopeFramedStdoutEnv);
     }
 
     private static async Task ReadAllAsync(System.IO.StreamReader reader, StringBuilder sink)
