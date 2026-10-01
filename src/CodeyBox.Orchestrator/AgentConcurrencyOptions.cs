@@ -76,6 +76,13 @@ public sealed class AgentConcurrencyOptions
                     "'disabled' switch and is rejected to prevent the counter-intuitive " +
                     "'0 means unlimited' footgun.");
             }
+            if (kv.Value.MaxConcurrentAuditSessions is { } auditCap && auditCap <= 0)
+            {
+                failures.Add(
+                    $"CodeyBox:AgentConcurrency:Members:{kv.Key}:MaxConcurrentAuditSessions must be >= 1 " +
+                    $"(got {auditCap}). To default the audit sub-cap to MaxConcurrent, omit the " +
+                    "entry property entirely.");
+            }
         }
         return failures;
     }
@@ -106,6 +113,19 @@ public sealed class AgentConcurrencyEntry
     /// See <see cref="AgentConcurrencyOptions"/> for the rationale.
     /// </summary>
     public int MaxConcurrent { get; set; } = 0;
+
+    /// <summary>
+    /// Optional sub-cap on concurrent LLM auditor sessions for this agent
+    /// kind, so audits can't starve work turns under a tight
+    /// <see cref="MaxConcurrent"/>. Null (the default) means the audit
+    /// sub-cap equals <see cref="MaxConcurrent"/> — audits may use the full
+    /// cap but never exceed it. When set, must be &gt;= 1 (validated at load
+    /// and hot-reload). Hot-reloadable through the shared
+    /// <see cref="AgentConcurrencySnapshot"/>: the gate reads it live on
+    /// every acquire, so lowering it converges as in-flight audits finish
+    /// and raising it wakes queued audit waiters.
+    /// </summary>
+    public int? MaxConcurrentAuditSessions { get; set; }
 }
 
 /// <summary>
