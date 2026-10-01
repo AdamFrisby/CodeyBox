@@ -54,16 +54,18 @@ public sealed record GitleaksCompatibleSecretsProfile(
     IReadOnlyList<string> ConfigPathEnvVars)
 {
     /// <summary>
-    /// Repo-relative path globs (<c>find -path</c>/git-pathspec syntax;
-    /// <c>*</c>/<c>?</c> cross directory separators) matching the filename
-    /// family the tool's own ruleset exempts from the scan wherever it
-    /// appears — the stock <c>gitleaks\.toml</c> entry in the inherited
-    /// prefilter/allowlist. The tool drops a matching fragment on path
-    /// alone, before any rule runs, so a secret committed inside such a
-    /// path — nested, differently spelled (<c>x-gitleaks.toml.bak</c>), or
-    /// deleted before the audit — is never reported while the audit still
-    /// passes. Any match in the worktree or anywhere in git history
-    /// therefore fails closed. Default empty.
+    /// Repo-relative path globs matching the filename family the tool's own
+    /// ruleset exempts from the scan wherever it appears — the stock
+    /// <c>gitleaks\.toml</c> entry in the inherited prefilter/allowlist.
+    /// Globs use <c>find -path</c>/default git-pathspec semantics:
+    /// <c>*</c>/<c>?</c> cross directory separators (git's <c>glob</c>
+    /// pathspec magic, whose wildcards do not, is deliberately not used).
+    /// The tool drops a matching fragment on path alone, before any rule
+    /// runs, so a secret committed inside such a path — nested, differently
+    /// spelled (<c>x-gitleaks.toml.bak</c>), or deleted before the audit —
+    /// is never reported while the audit still passes. Any match in the
+    /// worktree or anywhere in git history therefore fails closed. Default
+    /// empty.
     /// </summary>
     public IReadOnlyList<string> ScanExemptedPathGlobs { get; init; } = [];
 }
@@ -95,7 +97,11 @@ public sealed record GitleaksCompatibleSecretsProfile(
 /// unset on every scan — they carry a config path at a precedence above
 /// the pinned ruleset (and above repo files in trust mode) while bypassing
 /// the out-of-worktree canonicalization guard that covers
-/// <c>--config</c>. Unless the operator sets
+/// <c>--config</c>. Ambient GIT_* variables
+/// (<see cref="ExternalToolAuditorBase.GitEnvironmentRemovals"/>) are
+/// unset on the scan and the gate's own <c>git log</c> probes alike — the
+/// baseline environment could otherwise redirect or re-configure every git
+/// the run spawns. Unless the operator sets
 /// <see cref="TrustRepositorySuppressionKey"/>: the built-in ruleset is
 /// pinned via the tool's <c>*_CONFIG_TOML</c> env var (inline content — an
 /// operator <c>--config</c> still outranks it),
@@ -201,6 +207,7 @@ public abstract class GitleaksCompatibleSecretsAuditorBase
                 + "inline-config env var.", nameof(profile));
         _profile = profile with
         {
+            RepositorySuppressionFiles = profile.RepositorySuppressionFiles ?? [],
             ConfigPathEnvVars = profile.ConfigPathEnvVars ?? [],
             ScanExemptedPathGlobs = profile.ScanExemptedPathGlobs ?? [],
         };
@@ -280,7 +287,7 @@ public abstract class GitleaksCompatibleSecretsAuditorBase
     /// <inheritdoc />
     protected override IReadOnlyList<string> BuildToolEnvironmentRemovals(
         ExternalToolAuditorOptions options)
-        => _profile.ConfigPathEnvVars;
+        => [.. _profile.ConfigPathEnvVars, .. GitEnvironmentRemovals];
 
     /// <summary>
     /// Binds the shared scoped-config knobs (operator options,
@@ -429,10 +436,29 @@ public abstract class GitleaksCompatibleSecretsAuditorBase
     /// when the tool's ruleset exempts it from the scan in every commit: a
     /// subject could commit a secret inside a matching file and delete it —
     /// the leak stays in history while the worktree check sees a clean
-    /// tree. The glob rides a <c>:(top,glob)</c> pathspec so matching is
-    /// anchored at the repository root and <c>*</c> crosses directories —
-    /// a nested or affixed spelling cannot slip past by leaving the
-    /// worktree root. Any commit touching a matching path fails closed. A
+    /// tree. Two probe details keep that honest:
+    ///
+    /// <para>- The glob rides a <c>:(top)</c> pathspec — anchored at the
+    /// repository root and matched with git's DEFAULT fnmatch semantics,
+    /// where <c>*</c>/<c>?</c> cross <c>/</c>, the same semantics
+    /// <c>find -path</c> and the worktree probe's re-filter apply. Git's
+    /// <c>glob</c> pathspec magic must NOT be used: it applies FNM_PATHNAME,
+    /// so <c>*</c> never crosses <c>/</c> and <c>*gitleaks.toml*</c> would
+    /// silently miss <c>docs/gitleaks.toml</c> — the nested path this gate
+    /// exists to catch.</para>
+    /// <para>- <c>--full-history</c> disables history simplification: a
+    /// matching path committed on a side branch and merged TREESAME to the
+    /// mainline (e.g. <c>git merge -s ours</c>) is otherwise pruned from
+    /// the walk even under <c>--all</c> — invisible to the gate while the
+    /// scanner's own <c>--full-history</c> log-opts still emits its
+    /// (ruleset-exempted) fragment.</para>
+    ///
+    /// Ambient GIT_* variables are unset
+    /// (<see cref="ExternalToolAuditorBase.GitEnvironmentRemovals"/>) so the
+    /// baseline environment can neither redirect the repository nor change
+    /// how the pathspec matches (<c>GIT_LITERAL_PATHSPECS</c> would read
+    /// <c>*</c> literally; <c>GIT_GLOB_PATHSPECS</c> would re-impose
+    /// FNM_PATHNAME). Any commit touching a matching path fails closed. A
     /// non-git working directory makes this probe fail, which is still
     /// infrastructure — the <c>git</c> scan would fail the same way.
     /// </summary>
@@ -444,17 +470,19 @@ public abstract class GitleaksCompatibleSecretsAuditorBase
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
+        var normalizedGlob = NormalizeProbePathGlob(pathGlob);
         var history = await ExecToolBoundedAsync(
             sandbox,
             tool,
             "suppression check",
             new SandboxExec
             {
-                Argv = ["git", "log", "--all", "-1", "--format=%H", "--", ":(top,glob)" + pathGlob],
+                Argv = ["git", "log", "--all", "--full-history", "-1", "--format=%H", "--", ":(top)" + normalizedGlob],
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
                 KillOnOutputLimit = true,
+                EnvironmentVariablesToUnset = GitEnvironmentRemovals,
             },
             ProbeTimeout(options),
             ct).ConfigureAwait(false);
@@ -464,17 +492,17 @@ public abstract class GitleaksCompatibleSecretsAuditorBase
         if (history.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' could not confirm the audited repository's git "
-                + $"history is free of paths matching '{pathGlob}' (exit {history.ExitCode}) — the "
+                + $"history is free of paths matching '{normalizedGlob}' (exit {history.ExitCode}) — the "
                 + "tool's ruleset exempts matching paths from the scan in every commit.",
                 history.ExitCode,
                 history.Stdout + "\n" + history.Stderr);
         var historyCommit = SingleLine(history.Stdout);
         if (historyCommit.Length > 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' found a path matching '{pathGlob}' in the "
-                + $"audited repository's git history (commit {historyCommit}) — the tool's ruleset "
-                + "exempts matching paths from the scan in every commit, so a secret committed "
-                + "inside such a file would never be reported. Purge it from history, or set "
+                $"could-not-verify: audit tool '{tool}' found a path matching '{normalizedGlob}' in the "
+                + $"audited repository's git history (commit {TruncateForMessage(historyCommit)}) — the "
+                + "tool's ruleset exempts matching paths from the scan in every commit, so a secret "
+                + "committed inside such a file would never be reported. Purge it from history, or set "
                 + $"CodeyBox:Plugins:{_profile.PluginId}:{TrustRepositorySuppressionKey} to true "
                 + "to trust repository-controlled suppression surfaces.",
                 history.ExitCode,
@@ -491,6 +519,6 @@ public abstract class GitleaksCompatibleSecretsAuditorBase
         var listed = string.Join("', '", paths.Take(maxListed).Select(TruncateForMessage));
         return paths.Count <= maxListed
             ? listed
-            : $"{listed}' … and {paths.Count - maxListed} more";
+            : $"{listed} … and {paths.Count - maxListed} more";
     }
 }

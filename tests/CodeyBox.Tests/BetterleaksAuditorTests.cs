@@ -1,11 +1,10 @@
-using System.Diagnostics;
 using CodeyBox.BetterleaksAuditorPlugin;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
-using CodeyBox.PluginSdk;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
+using static CodeyBox.Tests.SecretsAuditorTestSupport;
 
 namespace CodeyBox.Tests;
 
@@ -22,61 +21,44 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class BetterleaksAuditorTests
 {
-    // Mirrors what betterleaks v1.8.1 writes to stdout for `--report-format
-    // sarif --report-path -`: no per-result "level" (the shared parser
-    // supplies "warning"), ruleId, message text naming rule/file/commit, and
-    // the first physical location's artifact uri plus region.startLine. The
-    // driver semanticVersion is the hardcoded "v8.0.0" inherited from the
-    // gitleaks lineage — intentionally not the release version, which is why
-    // the plugin probes `betterleaks version`.
-    private const string SarifWithSecret = """
-        {
-          "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-          "version": "2.1.0",
-          "runs": [{
-            "tool": {
-              "driver": {
-                "name": "betterleaks",
-                "semanticVersion": "v8.0.0",
-                "informationUri": "https://github.com/betterleaks/betterleaks",
-                "rules": [{ "id": "slack-bot-token", "shortDescription": { "text": "Slack Bot token" } }]
-              }
-            },
-            "results": [{
-              "message": { "text": "slack-bot-token has detected secret for file secrets.txt at commit 0123456789abcdef." },
-              "ruleId": "slack-bot-token",
-              "locations": [{
-                "physicalLocation": {
-                  "artifactLocation": { "uri": "secrets.txt" },
-                  "region": { "startLine": 1, "startColumn": 10, "endLine": 1, "endColumn": 65, "snippet": { "text": "REDACTED" } }
-                }
-              }],
-              "partialFingerprints": { "commitSha": "0123456789abcdef", "email": "a@b.c", "author": "a", "date": "2026-01-01", "commitMessage": "x" },
-              "properties": { "tags": [] }
-            }]
-          }]
-        }
-        """;
+    // The per-tool constants the shared secrets-auditor scaffolding varies
+    // by — the probe classifiers key off these names.
+    private static readonly SecretsAuditorTestProfile Profile = new(
+        Tool: "betterleaks",
+        PluginId: BetterleaksAuditor.PluginId,
+        PluginDisplayName: "CodeyBox: Betterleaks Secrets",
+        PluginAssemblyFileName: "CodeyBox.BetterleaksAuditorPlugin.dll",
+        ExpectedVersion: BetterleaksAuditor.DefaultExpectedVersion,
+        WorktreeSuppressionFiles:
+        [
+            ".betterleaksignore",
+            ".gitleaksignore",
+            ".betterleaks.toml",
+            ".gitleaks.toml",
+        ]);
 
-    private const string SarifClean = """
-        {
-          "version": "2.1.0",
-          "runs": [{
-            "tool": { "driver": { "name": "betterleaks", "semanticVersion": "v8.0.0", "rules": [] } },
-            "results": []
-          }]
-        }
-        """;
+    // Mirrors what betterleaks v1.8.1 writes to stdout for `--report-format
+    // sarif --report-path -` — the shared builder emits the shape both
+    // tools stamp (see SecretsAuditorTestSupport.SarifWithFinding).
+    private static readonly string SarifWithSecret = SarifWithFinding(
+        toolName: "betterleaks",
+        informationUri: "https://github.com/betterleaks/betterleaks",
+        ruleId: "slack-bot-token",
+        ruleTitle: "Slack Bot token",
+        file: "secrets.txt",
+        startLine: 1);
+
+    private static readonly string SarifClean = SarifCleanReport("betterleaks");
 
     [Fact]
     public async Task MissingBinary_IsInfrastructureFailure_NamingBetterleaks_NeverAPass()
     {
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec))
                 return Task.FromResult(new SandboxExecResult(1, "", ""));
-            if (IsVersionProbe(exec))
+            if (IsVersionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(127, "", "betterleaks: command not found"));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -94,10 +76,10 @@ public sealed class BetterleaksAuditorTests
     public async Task SecretInSourceAndHistory_YieldsFinding_WithRuleIdAndLocation()
     {
         SandboxExec? scanExec = null;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile) || IsSuppressionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(BetterleaksAuditor.LeaksFoundExitCode, SarifWithSecret, ""));
         });
@@ -149,6 +131,13 @@ public sealed class BetterleaksAuditorTests
         Assert.Contains("BETTERLEAKS_CONFIG", scanExec.EnvironmentVariablesToUnset);
         Assert.Contains("GITLEAKS_CONFIG", scanExec.EnvironmentVariablesToUnset);
 
+        // Ambient GIT_* variables are unset on the scan too: they would
+        // redirect or re-configure the `git log` the tool spawns (and the
+        // gate's own history probe).
+        Assert.Contains("GIT_DIR", scanExec.EnvironmentVariablesToUnset);
+        Assert.Contains("GIT_CONFIG_PARAMETERS", scanExec.EnvironmentVariablesToUnset);
+        Assert.Contains("GIT_LITERAL_PATHSPECS", scanExec.EnvironmentVariablesToUnset);
+
         // .gitattributes countermeasure: the pinned log opts re-state the
         // tool's default rev args (--log-opts replaces them wholesale) and
         // add --text, so a committed `path -diff`/`binary` attribute cannot
@@ -166,11 +155,11 @@ public sealed class BetterleaksAuditorTests
     public async Task RepoSuppressionFile_FailsClosed_ScanNeverRuns(string suppressionFile)
     {
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
-            if (IsSuppressionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
+            if (IsSuppressionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(0, suppressionFile + "\n", ""));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -198,11 +187,11 @@ public sealed class BetterleaksAuditorTests
     public async Task RulesetExemptedPath_InWorktree_FailsClosed_ScanNeverRuns(string probeOutput)
     {
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec)
-                || IsWorktreeSuppressionProbe(exec) || IsHistorySuppressionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile)
+                || IsWorktreeSuppressionProbe(exec, Profile) || IsHistorySuppressionProbe(exec))
+                return Task.FromResult(Ok(exec, Profile));
             if (IsPathGlobProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, probeOutput, ""));
             scanExecs++;
@@ -226,11 +215,11 @@ public sealed class BetterleaksAuditorTests
     {
         var scanExecs = 0;
         SandboxExec? historyProbe = null;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec)
-                || IsWorktreeSuppressionProbe(exec) || IsPathGlobProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile)
+                || IsWorktreeSuppressionProbe(exec, Profile) || IsPathGlobProbe(exec))
+                return Task.FromResult(Ok(exec, Profile));
             if (IsHistorySuppressionProbe(exec))
             {
                 historyProbe = exec;
@@ -247,12 +236,21 @@ public sealed class BetterleaksAuditorTests
 
         Assert.Contains("*gitleaks.toml*", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
-        // The history probe anchors at the repository root with glob
-        // semantics so a nested or affixed path cannot slip past.
-        Assert.Contains(
-            ":(top,glob)*gitleaks.toml*",
-            historyProbe!.Argv[^1],
-            StringComparison.Ordinal);
+        // The history probe anchors at the repository root with git's
+        // DEFAULT pathspec semantics (`*`/`?` cross '/') — `glob` magic's
+        // FNM_PATHNAME matching would miss nested paths like
+        // docs/gitleaks.toml — and walks --full-history so a commit hidden
+        // behind a TREESAME merge still trips the gate.
+        Assert.Equal(
+            ":(top)*gitleaks.toml*",
+            historyProbe!.Argv[^1]);
+        Assert.Contains("--full-history", historyProbe.Argv);
+        Assert.Contains("--all", historyProbe.Argv);
+        // Ambient GIT_* variables are stripped from the probe — e.g.
+        // GIT_GLOB_PATHSPECS would re-impose FNM_PATHNAME semantics and
+        // GIT_DIR would redirect the repository.
+        Assert.Contains("GIT_DIR", historyProbe.EnvironmentVariablesToUnset);
+        Assert.Contains("GIT_GLOB_PATHSPECS", historyProbe.EnvironmentVariablesToUnset);
     }
 
     // A failed history probe can never substitute for the gate: a non-zero
@@ -261,11 +259,11 @@ public sealed class BetterleaksAuditorTests
     public async Task RulesetExemptedPath_HistoryProbeError_IsInfrastructure()
     {
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec)
-                || IsWorktreeSuppressionProbe(exec) || IsPathGlobProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile)
+                || IsWorktreeSuppressionProbe(exec, Profile) || IsPathGlobProbe(exec))
+                return Task.FromResult(Ok(exec, Profile));
             if (IsHistorySuppressionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(128, "", "fatal: not a git repo"));
             scanExecs++;
@@ -283,7 +281,7 @@ public sealed class BetterleaksAuditorTests
     {
         var auditor = new BetterleaksAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
+            BuildPluginContext(Profile, new Dictionary<string, string?>
             {
                 ["Scoped:" + BetterleaksAuditor.TrustRepositorySuppressionKey] = "true",
             }),
@@ -291,15 +289,15 @@ public sealed class BetterleaksAuditorTests
 
         var suppressionProbes = 0;
         SandboxExec? scanExec = null;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsSuppressionProbe(exec))
+            if (IsSuppressionProbe(exec, Profile))
             {
                 suppressionProbes++;
                 return Task.FromResult(new SandboxExecResult(0, ".betterleaksignore\n", ""));
             }
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(BetterleaksAuditor.LeaksFoundExitCode, SarifWithSecret, ""));
         });
@@ -322,7 +320,7 @@ public sealed class BetterleaksAuditorTests
     [Fact]
     public async Task CleanFixture_Passes_WithNoFindings()
     {
-        var sandbox = HealthyTool(scanExit: 0, scanStdout: SarifClean);
+        var sandbox = HealthyTool(Profile, scanExit: 0, scanStdout: SarifClean);
         IAuditor auditor = new BetterleaksAuditor();
         var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
 
@@ -336,7 +334,7 @@ public sealed class BetterleaksAuditorTests
         // The plugin-assigned findings exit produces a verdict.
         IAuditor auditor = new BetterleaksAuditor();
         var found = await auditor.RunAsync(
-            HealthyTool(BetterleaksAuditor.LeaksFoundExitCode, SarifWithSecret),
+            HealthyTool(Profile, BetterleaksAuditor.LeaksFoundExitCode, SarifWithSecret),
             "/work", FakeContext(), CancellationToken.None);
         Assert.False(found.Passed);
         Assert.Single(found.Findings);
@@ -346,13 +344,13 @@ public sealed class BetterleaksAuditorTests
         // Even with parseable SARIF on stdout, exit 1 means "could not run".
         var errorEx = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(
-                HealthyTool(1, SarifWithSecret), "/work", FakeContext(), CancellationToken.None));
+                HealthyTool(Profile, 1, SarifWithSecret), "/work", FakeContext(), CancellationToken.None));
         Assert.Contains("exit 1", errorEx.Message, StringComparison.Ordinal);
 
         // Any other undeclared convention is infrastructure too.
         await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(
-                HealthyTool(2, "usage: betterleaks ..."), "/work", FakeContext(), CancellationToken.None));
+                HealthyTool(Profile, 2, "usage: betterleaks ..."), "/work", FakeContext(), CancellationToken.None));
     }
 
     [Theory]
@@ -373,7 +371,7 @@ public sealed class BetterleaksAuditorTests
             StringComparison.Ordinal);
         IAuditor auditor = new BetterleaksAuditor();
         var result = await auditor.RunAsync(
-            HealthyTool(BetterleaksAuditor.LeaksFoundExitCode, leveledSarif),
+            HealthyTool(Profile, BetterleaksAuditor.LeaksFoundExitCode, leveledSarif),
             "/work", FakeContext(), CancellationToken.None);
 
         var finding = Assert.Single(result.Findings);
@@ -385,13 +383,13 @@ public sealed class BetterleaksAuditorTests
     public async Task WrongToolVersion_IsInfrastructure_ScanNeverRuns()
     {
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
-            if (IsVersionProbe(exec))
+            if (IsVersionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(0, "1.7.0\n", ""));
-            if (IsSuppressionProbe(exec))
+            if (IsSuppressionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -411,14 +409,14 @@ public sealed class BetterleaksAuditorTests
     {
         var auditor = new BetterleaksAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?> { ["Scoped:ExpectedVersion"] = "1.7.4" }),
+            BuildPluginContext(Profile, new Dictionary<string, string?> { ["Scoped:ExpectedVersion"] = "1.7.4" }),
             CancellationToken.None);
 
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsSuppressionProbe(exec))
+            if (IsPresenceProbe(exec) || IsSuppressionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
-            if (IsVersionProbe(exec))
+            if (IsVersionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(0, "1.7.4\n", ""));
             return Task.FromResult(new SandboxExecResult(BetterleaksAuditor.LeaksFoundExitCode, SarifWithSecret, ""));
         });
@@ -432,11 +430,11 @@ public sealed class BetterleaksAuditorTests
     [Fact]
     public async Task UnparseableVersionOutput_IsInfrastructure_NotAPass()
     {
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsSuppressionProbe(exec))
+            if (IsPresenceProbe(exec) || IsSuppressionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
-            if (IsVersionProbe(exec))
+            if (IsVersionProbe(exec, Profile))
                 return Task.FromResult(new SandboxExecResult(0, "dev-build\n", ""));
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
         });
@@ -451,7 +449,7 @@ public sealed class BetterleaksAuditorTests
     {
         var auditor = new BetterleaksAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
+            BuildPluginContext(Profile, new Dictionary<string, string?>
             {
                 ["Scoped:ExpectedVersion"] = BetterleaksAuditor.DefaultExpectedVersion,
                 // The operator restores vendored paths and narrows to one rule.
@@ -462,13 +460,13 @@ public sealed class BetterleaksAuditorTests
 
         var vendored = SarifWithSecret.Replace("secrets.txt", "vendor/pkg/secrets.txt");
         var kept = await ((IAuditor)auditor).RunAsync(
-            HealthyTool(BetterleaksAuditor.LeaksFoundExitCode, vendored),
+            HealthyTool(Profile, BetterleaksAuditor.LeaksFoundExitCode, vendored),
             "/work", FakeContext(), CancellationToken.None);
         Assert.Single(kept.Findings);
 
         var otherRule = vendored.Replace("slack-bot-token", "other-rule", StringComparison.Ordinal);
         var dropped = await ((IAuditor)auditor).RunAsync(
-            HealthyTool(BetterleaksAuditor.LeaksFoundExitCode, otherRule),
+            HealthyTool(Profile, BetterleaksAuditor.LeaksFoundExitCode, otherRule),
             "/work", FakeContext(), CancellationToken.None);
         Assert.True(dropped.Passed);
         Assert.Empty(dropped.Findings);
@@ -478,7 +476,7 @@ public sealed class BetterleaksAuditorTests
     public async Task MissingGitBinary_IsInfrastructure_NamingGit()
     {
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
             if (IsPresenceProbe(exec))
             {
@@ -488,8 +486,8 @@ public sealed class BetterleaksAuditorTests
                 return Task.FromResult(new SandboxExecResult(
                     string.Equals(binary, "git", StringComparison.Ordinal) ? 1 : 0, "", ""));
             }
-            if (IsVersionProbe(exec) || IsSuppressionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsVersionProbe(exec, Profile) || IsSuppressionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
         });
@@ -520,17 +518,17 @@ public sealed class BetterleaksAuditorTests
     {
         var auditor = new BetterleaksAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
+            BuildPluginContext(Profile, new Dictionary<string, string?>
             {
                 ["Scoped:ExtraArguments"] = extraArguments,
             }),
             CancellationToken.None);
 
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile) || IsSuppressionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
             if (IsRealpathProbe(exec))
                 return Task.FromResult(RealpathResult(exec, insideWorktree: true));
             scanExecs++;
@@ -549,17 +547,17 @@ public sealed class BetterleaksAuditorTests
     {
         var auditor = new BetterleaksAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
+            BuildPluginContext(Profile, new Dictionary<string, string?>
             {
                 ["Scoped:ExtraArguments"] = "--config,/etc/betterleaks/rules.toml",
             }),
             CancellationToken.None);
 
         SandboxExec? scanExec = null;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile) || IsSuppressionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
             if (IsRealpathProbe(exec))
                 return Task.FromResult(RealpathResult(exec, insideWorktree: false));
             scanExec = exec;
@@ -585,17 +583,17 @@ public sealed class BetterleaksAuditorTests
     {
         var auditor = new BetterleaksAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
+            BuildPluginContext(Profile, new Dictionary<string, string?>
             {
                 ["Scoped:ExtraArguments"] = "-vc,/etc/betterleaks/rules.toml",
             }),
             CancellationToken.None);
 
         SandboxExec? scanExec = null;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile) || IsSuppressionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
             if (IsRealpathProbe(exec))
                 return Task.FromResult(RealpathResult(exec, insideWorktree: false));
             scanExec = exec;
@@ -615,17 +613,17 @@ public sealed class BetterleaksAuditorTests
     {
         var auditor = new BetterleaksAuditor();
         await auditor.InitializeAsync(
-            BuildPluginContext(new Dictionary<string, string?>
+            BuildPluginContext(Profile, new Dictionary<string, string?>
             {
                 ["Scoped:ExtraArguments"] = "--config",
             }),
             CancellationToken.None);
 
         var scanExecs = 0;
-        var sandbox = new FakeSandbox((exec, _) =>
+        var sandbox = FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec))
-                return Task.FromResult(Ok(exec));
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec, Profile) || IsSuppressionProbe(exec, Profile))
+                return Task.FromResult(Ok(exec, Profile));
             scanExecs++;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
         });
@@ -644,7 +642,7 @@ public sealed class BetterleaksAuditorTests
     private static readonly string _fixtureSecretLine =
         "token = \"xoxb-" + "123456789012-1234567890123-abcdefghijklmnopqrstuvwx\"";
 
-    private static readonly string? _installedBetterleaksVersion = ProbeInstalledBetterleaksVersion();
+    private static readonly string? _installedBetterleaksVersion = ProbeInstalledToolVersion(Profile);
 
     /// <summary>
     /// Real-binary end-to-end check: a fixture git repository with a committed
@@ -662,12 +660,12 @@ public sealed class BetterleaksAuditorTests
         var installed = _installedBetterleaksVersion;
         Skip.If(installed is null, "betterleaks binary not on PATH");
 
-        var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
+        var repo = await SeedFixtureRepoAsync(Profile, _fixtureSecretLine);
         try
         {
             var auditor = new BetterleaksAuditor();
             await auditor.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(Profile, new Dictionary<string, string?>
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                 }),
@@ -710,12 +708,12 @@ public sealed class BetterleaksAuditorTests
         var installed = _installedBetterleaksVersion;
         Skip.If(installed is null, "betterleaks binary not on PATH");
 
-        var repo = await SeedFixtureRepoAsync(null);
+        var repo = await SeedFixtureRepoAsync(Profile, null);
         try
         {
             var auditor = new BetterleaksAuditor();
             await auditor.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(Profile, new Dictionary<string, string?>
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                 }),
@@ -756,7 +754,7 @@ public sealed class BetterleaksAuditorTests
         var installed = _installedBetterleaksVersion;
         Skip.If(installed is null, "betterleaks binary not on PATH");
 
-        var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
+        var repo = await SeedFixtureRepoAsync(Profile, _fixtureSecretLine);
         try
         {
             // Top-level keys must precede the [extend] table header — anything
@@ -779,7 +777,7 @@ public sealed class BetterleaksAuditorTests
 
             var auditor = new BetterleaksAuditor();
             await auditor.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(Profile, new Dictionary<string, string?>
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                 }),
@@ -792,7 +790,7 @@ public sealed class BetterleaksAuditorTests
 
             var trusting = new BetterleaksAuditor();
             await trusting.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(Profile, new Dictionary<string, string?>
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                     ["Scoped:" + BetterleaksAuditor.TrustRepositorySuppressionKey] = "true",
@@ -826,7 +824,7 @@ public sealed class BetterleaksAuditorTests
         var installed = _installedBetterleaksVersion;
         Skip.If(installed is null, "betterleaks binary not on PATH");
 
-        var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
+        var repo = await SeedFixtureRepoAsync(Profile, _fixtureSecretLine);
         try
         {
             await File.WriteAllTextAsync(
@@ -836,7 +834,7 @@ public sealed class BetterleaksAuditorTests
 
             var auditor = new BetterleaksAuditor();
             await auditor.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(Profile, new Dictionary<string, string?>
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                 }),
@@ -880,7 +878,7 @@ public sealed class BetterleaksAuditorTests
         var installed = _installedBetterleaksVersion;
         Skip.If(installed is null, "betterleaks binary not on PATH");
 
-        var repo = await SeedFixtureRepoAsync(null);
+        var repo = await SeedFixtureRepoAsync(Profile, null);
         try
         {
             Directory.CreateDirectory(Path.Combine(repo, "docs"));
@@ -902,7 +900,7 @@ public sealed class BetterleaksAuditorTests
 
             var auditor = new BetterleaksAuditor();
             await auditor.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(Profile, new Dictionary<string, string?>
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                 }),
@@ -915,7 +913,7 @@ public sealed class BetterleaksAuditorTests
 
             var trusting = new BetterleaksAuditor();
             await trusting.InitializeAsync(
-                BuildPluginContext(new Dictionary<string, string?>
+                BuildPluginContext(Profile, new Dictionary<string, string?>
                 {
                     ["Scoped:ExpectedVersion"] = installed,
                     ["Scoped:" + BetterleaksAuditor.TrustRepositorySuppressionKey] = "true",
@@ -936,10 +934,126 @@ public sealed class BetterleaksAuditorTests
         }
     }
 
+    /// <summary>
+    /// Real-binary regression for the history gate's pathspec: a secret
+    /// committed inside <c>docs/gitleaks.toml</c> and then DELETED exists
+    /// only in git history, so only the <c>git log</c> probe can catch it —
+    /// and only if the pathspec's <c>*</c> crosses directory separators.
+    /// With git's <c>glob</c> pathspec magic (FNM_PATHNAME) this fixture
+    /// would pass silently. The trusted opt-in scan still reports nothing,
+    /// proving the secret was skipped on its path, not absent.
+    /// </summary>
+    [SkippableFact]
+    [Trait("requires_betterleaks", "true")]
+    public async Task RealBetterleaks_NestedGitleaksTomlDeletedFromHistory_GateFailsClosed()
+    {
+        var installed = _installedBetterleaksVersion;
+        Skip.If(installed is null, "betterleaks binary not on PATH");
+
+        var repo = await SeedFixtureRepoAsync(Profile, null);
+        try
+        {
+            await CommitThenDeleteAsync(
+                repo, "docs/gitleaks.toml", "# example config\n" + _fixtureSecretLine + "\n");
+
+            var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+            await using var sandbox = await provider.CreateAsync(
+                new SandboxSpec
+                {
+                    ImageReference = "ignored",
+                    WorkingDirectory = "/work",
+                    Mounts = [new SandboxMount { SandboxPath = "/work", HostPath = repo }],
+                },
+                CancellationToken.None);
+
+            var auditor = new BetterleaksAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(Profile, new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                }),
+                CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+                () => ((IAuditor)auditor).RunAsync(
+                    sandbox, "/work", FakeContext(), CancellationToken.None));
+            Assert.Contains("*gitleaks.toml*", ex.Message, StringComparison.Ordinal);
+
+            var trusting = new BetterleaksAuditor();
+            await trusting.InitializeAsync(
+                BuildPluginContext(Profile, new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                    ["Scoped:" + BetterleaksAuditor.TrustRepositorySuppressionKey] = "true",
+                }),
+                CancellationToken.None);
+            var trusted = await ((IAuditor)trusting).RunAsync(
+                sandbox, "/work", FakeContext(), CancellationToken.None);
+
+            Assert.True(trusted.Passed);
+            Assert.Empty(trusted.Findings);
+        }
+        finally
+        {
+            TryDeleteDirectory(repo);
+        }
+    }
+
+    /// <summary>
+    /// Real-binary regression for the history gate's
+    /// <c>--full-history</c> traversal: a <c>.gitleaks.toml</c> carrying a
+    /// secret committed on a side branch and merged with <c>-s ours</c> is
+    /// TREESAME to the mainline parent for that path, so default history
+    /// simplification prunes it — the commit is invisible to
+    /// <c>git log --all</c> without <c>--full-history</c> while the
+    /// scanner's own pinned log-opts still walk it.
+    /// </summary>
+    [SkippableFact]
+    [Trait("requires_betterleaks", "true")]
+    public async Task RealBetterleaks_GitleaksTomlMergeHiddenInHistory_GateFailsClosed()
+    {
+        var installed = _installedBetterleaksVersion;
+        Skip.If(installed is null, "betterleaks binary not on PATH");
+
+        var repo = await SeedFixtureRepoAsync(Profile, null);
+        try
+        {
+            await CommitMergeHiddenAsync(
+                repo, ".gitleaks.toml", "# example config\n" + _fixtureSecretLine + "\n");
+
+            var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+            await using var sandbox = await provider.CreateAsync(
+                new SandboxSpec
+                {
+                    ImageReference = "ignored",
+                    WorkingDirectory = "/work",
+                    Mounts = [new SandboxMount { SandboxPath = "/work", HostPath = repo }],
+                },
+                CancellationToken.None);
+
+            var auditor = new BetterleaksAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(Profile, new Dictionary<string, string?>
+                {
+                    ["Scoped:ExpectedVersion"] = installed,
+                }),
+                CancellationToken.None);
+
+            var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+                () => ((IAuditor)auditor).RunAsync(
+                    sandbox, "/work", FakeContext(), CancellationToken.None));
+            Assert.Contains("*gitleaks.toml*", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            TryDeleteDirectory(repo);
+        }
+    }
+
     [Fact]
     public void DisabledPlugin_IsNotLoaded_AndToolAbsentFromBaselineProvisioning()
     {
-        var assemblyPath = PluginAssemblyPath();
+        var assemblyPath = PluginAssemblyPath(Profile);
         var loader = new PluginLoader(
             new PluginOptions
             {
@@ -968,7 +1082,7 @@ public sealed class BetterleaksAuditorTests
     [Fact]
     public void EnabledPlugin_DeclaresBetterleaksRequirement_VerifyOnly()
     {
-        var assemblyPath = PluginAssemblyPath();
+        var assemblyPath = PluginAssemblyPath(Profile);
         var loader = new PluginLoader(
             new PluginOptions
             {
@@ -994,168 +1108,5 @@ public sealed class BetterleaksAuditorTests
         var verification = Assert.Single(contributions.VerificationCommands);
         Assert.Contains("betterleaks", string.Join(" ", verification.Argv), StringComparison.Ordinal);
         Assert.Empty(contributions.InstallCommands);
-    }
-
-    private static string PluginAssemblyPath()
-    {
-        var path = Path.Combine(AppContext.BaseDirectory, "CodeyBox.BetterleaksAuditorPlugin.dll");
-        Assert.True(File.Exists(path), $"Plugin assembly not found at '{path}'.");
-        return path;
-    }
-
-    private static PluginContext BuildPluginContext(IReadOnlyDictionary<string, string?> scopedValues)
-    {
-        var config = new ConfigurationBuilder()
-            .AddInMemoryCollection(scopedValues)
-            .Build();
-        return new PluginContext(
-            HostApiVersion: "1.0",
-            PluginId: BetterleaksAuditor.PluginId,
-            PluginDisplayName: "CodeyBox: Betterleaks Secrets",
-            Host: new TestPluginHost(config.GetSection("Scoped")));
-    }
-
-    private static SandboxExecResult Ok(SandboxExec exec)
-        => IsVersionProbe(exec)
-            ? new SandboxExecResult(0, BetterleaksAuditor.DefaultExpectedVersion + "\n", "")
-            : new SandboxExecResult(0, "", "");
-
-    private static FakeSandbox HealthyTool(int scanExit, string scanStdout)
-        => new((exec, _) => Task.FromResult(
-            IsPresenceProbe(exec) || IsVersionProbe(exec) || IsSuppressionProbe(exec)
-                ? Ok(exec)
-                : new SandboxExecResult(scanExit, scanStdout, "")));
-
-    private static bool IsPresenceProbe(SandboxExec exec)
-        => exec.Argv.Count >= 3
-            && exec.Argv[0] == "sh"
-            && exec.Argv[1] == "-c"
-            && exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
-
-    private static bool IsSuppressionProbe(SandboxExec exec)
-        => IsWorktreeSuppressionProbe(exec)
-            || IsPathGlobProbe(exec)
-            || IsHistorySuppressionProbe(exec);
-
-    private static bool IsWorktreeSuppressionProbe(SandboxExec exec)
-        => exec.Argv.Count >= 3
-            && exec.Argv[0] == "sh"
-            && exec.Argv[1] == "-c"
-            && exec.Argv.Contains(".betterleaks.toml", StringComparer.Ordinal);
-
-    // The any-depth worktree probe rides a find -path script with the
-    // declared glob as its only operand.
-    private static bool IsPathGlobProbe(SandboxExec exec)
-        => exec.Argv.Count >= 3
-            && exec.Argv[0] == "sh"
-            && exec.Argv[1] == "-c"
-            && exec.Argv.Contains("*gitleaks.toml*", StringComparer.Ordinal);
-
-    private static bool IsHistorySuppressionProbe(SandboxExec exec)
-        => exec.Argv.Count >= 2
-            && exec.Argv[0] == "git"
-            && exec.Argv.Any(static a => a.Contains("gitleaks.toml", StringComparison.Ordinal));
-
-    private static bool IsRealpathProbe(SandboxExec exec)
-        => exec.Argv.Count == 5
-            && exec.Argv[0] == "realpath"
-            && exec.Argv[1] == "-m";
-
-    // Emulates `realpath -m -- <arg> .`: one line for the canonicalized
-    // configured path, one for the canonicalized exec working directory.
-    // insideWorktree maps a relative operand under the /work scan root.
-    private static SandboxExecResult RealpathResult(SandboxExec exec, bool insideWorktree)
-    {
-        var arg = exec.Argv[3];
-        var canonical = insideWorktree && !arg.StartsWith("/", StringComparison.Ordinal)
-            ? "/work/" + arg
-            : arg;
-        return new SandboxExecResult(0, canonical + "\n/work\n", "");
-    }
-
-    private static bool IsVersionProbe(SandboxExec exec)
-        => exec.Argv.Count == 2 && exec.Argv[0] == "betterleaks" && exec.Argv[1] == "version";
-
-    private static async Task<string> SeedFixtureRepoAsync(string? secretLine)
-    {
-        var repo = Path.Combine(
-            Path.GetTempPath(), "codeybox-betterleaks-fixture-" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(repo);
-        await TestSupport.RunGit(repo, "init", "-b", "main");
-        await TestSupport.RunGit(repo, "config", "user.email", "t@l");
-        await TestSupport.RunGit(repo, "config", "user.name", "T");
-        var (file, content) = secretLine is null
-            ? ("README.md", "clean\n")
-            : ("secrets.txt", secretLine + "\n");
-        await File.WriteAllTextAsync(Path.Combine(repo, file), content);
-        await TestSupport.RunGit(repo, "add", "-A");
-        await TestSupport.RunGit(repo, "commit", "-m", "seed");
-        return repo;
-    }
-
-    private static string? ProbeInstalledBetterleaksVersion()
-    {
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "betterleaks",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
-            psi.ArgumentList.Add("version");
-            using var process = Process.Start(psi)!;
-            // Drain both pipes concurrently and bound the wait BEFORE reading
-            // the buffered output: a synchronous ReadToEnd blocks until the
-            // child closes the pipe, so a hung `betterleaks version` — or one
-            // blocked writing to a full stderr pipe — would never reach the
-            // timeout.
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-            _ = process.StandardError.ReadToEndAsync();
-            if (!process.WaitForExit(milliseconds: 10_000))
-            {
-                try { process.Kill(); } catch { /* best-effort probe teardown */ }
-                return null;
-            }
-            var version = stdoutTask.GetAwaiter().GetResult().Trim();
-            return process.ExitCode == 0 && version.Length > 0 ? version : null;
-        }
-        catch
-        {
-            // Any failure means no usable betterleaks on PATH — the gated tests
-            // skip rather than fail on a host without the tool.
-            return null;
-        }
-    }
-
-    private static void TryDeleteDirectory(string path)
-    {
-        try { Directory.Delete(path, recursive: true); }
-        catch { /* best-effort fixture cleanup */ }
-    }
-
-    private static AuditContext FakeContext() =>
-        new(WorkItemId.New(), "feature", "main", 1, "do x");
-
-    private sealed class TestPluginHost(IConfigurationSection scoped) : IPluginHost
-    {
-        public Microsoft.Extensions.Logging.ILogger Logger { get; } = NullLogger.Instance;
-        public IConfigurationSection ScopedConfig { get; } = scoped;
-    }
-
-    private sealed class FakeSandbox(
-        Func<SandboxExec, CancellationToken, Task<SandboxExecResult>> onExec) : ISandbox
-    {
-        public string Id => "fake";
-
-        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
-        {
-            await Task.Yield();
-            ct.ThrowIfCancellationRequested();
-            return await onExec(exec, ct);
-        }
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
