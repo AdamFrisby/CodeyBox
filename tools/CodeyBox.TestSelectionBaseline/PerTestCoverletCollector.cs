@@ -154,6 +154,11 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
                     $"Coverage run for '{Sanitize(testName)}' exceeded an output cap.");
             }
 
+            // run.ExitCode is deliberately not fatal: a failing test still
+            // emits its coverage report, and a run that produced none yields
+            // an empty covers map — which the consumer treats as "no coverage
+            // record" and always selects (the fail-safe direction). A systemic
+            // failure is caught by the reportsFound check in CollectAsync.
             var reports = ReadReports(perTestDir, options);
             if (reports.Count > 0)
                 onReport();

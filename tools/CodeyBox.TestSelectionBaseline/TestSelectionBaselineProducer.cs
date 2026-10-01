@@ -174,28 +174,26 @@ public sealed class TestSelectionBaselineProducer
         CancellationToken ct)
     {
         var files = new Dictionary<string, string>(StringComparer.Ordinal);
-        var assemblies = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var indexes = new Dictionary<string, TestAssemblyIndex>(StringComparer.Ordinal);
         foreach (var project in graph.TestProjects)
         {
-            assemblies[project] = await TestDefiningFileResolver.ResolveTargetPathAsync(
+            var assembly = await TestDefiningFileResolver.ResolveTargetPathAsync(
                 repoRoot, project, options, _runner, ct).ConfigureAwait(false);
+            indexes[project] = assembly is null
+                ? TestAssemblyIndex.Empty
+                : TestDefiningFileResolver.LoadIndex(assembly, repoRoot);
         }
 
         foreach (var name in listed.All)
         {
-            if (!listed.OwningProject.TryGetValue(name, out var project))
+            if (!listed.OwningProject.TryGetValue(name, out var project)
+                || !indexes.TryGetValue(project, out var index))
             {
                 files[name] = "";
                 continue;
             }
 
-            if (!assemblies.TryGetValue(project, out var assembly) || assembly is null)
-            {
-                files[name] = "";
-                continue;
-            }
-
-            files[name] = TestDefiningFileResolver.Resolve(name, assembly, repoRoot);
+            files[name] = index.Resolve(name);
         }
 
         return files;

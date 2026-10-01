@@ -333,7 +333,7 @@ public static class MsBuildProjectGraph
             || !items.TryGetProperty("Compile", out var compile)
             || compile.ValueKind != JsonValueKind.Array)
         {
-            return files;
+            return [];
         }
 
         foreach (var item in compile.EnumerateArray())
@@ -350,7 +350,7 @@ public static class MsBuildProjectGraph
                 files.Add(relative);
         }
 
-        return files;
+        return [.. files];
     }
 
     private static JsonDocument ParseJson(string stdout, string label)

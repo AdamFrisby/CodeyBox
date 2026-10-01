@@ -285,7 +285,9 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
         Assert.False(File.Exists(output));
     }
 
-    [Fact(Timeout = 180_000)]
+    // Real restore + build + two isolated coverlet runs; ~15 s warm standalone
+    // but needs headroom under full-suite load (observed >180 s contended).
+    [Fact(Timeout = 600_000)]
     public async Task Producer_FixtureRoundTrip_ParsesWithStrictReader()
     {
         var repo = Path.Combine(_root, "live");

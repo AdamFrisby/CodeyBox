@@ -5,24 +5,79 @@ using CodeyBox.Core;
 namespace CodeyBox.TestSelectionProducer;
 
 /// <summary>
+/// Method → source-document index for one built test assembly, read from the
+/// portable PDB in a single pass. Built once per test project, then queried
+/// per listed test — a 16k-test suite must not rescan the PDB 16k times.
+/// Sequence-point documents are normalised with
+/// <see cref="TestSelectionCoverageMap.ToRepositoryRelative"/> at index build.
+/// </summary>
+public sealed class TestAssemblyIndex
+{
+    private static readonly IReadOnlyDictionary<string, IReadOnlyList<MethodDocument>> EmptyMap =
+        new Dictionary<string, IReadOnlyList<MethodDocument>>(StringComparer.Ordinal);
+
+    public static readonly TestAssemblyIndex Empty = new(EmptyMap);
+
+    private readonly IReadOnlyDictionary<string, IReadOnlyList<MethodDocument>> _byName;
+
+    private TestAssemblyIndex(IReadOnlyDictionary<string, IReadOnlyList<MethodDocument>> byName)
+        => _byName = byName;
+
+    /// <summary>
+    /// The repository-relative file defining <paramref name="testName"/>, or
+    /// "" when the name cannot be resolved (unlisted method, missing document).
+    /// </summary>
+    public string Resolve(string testName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(testName);
+        var methodName = TestDefiningFileResolver.MethodName(testName);
+        var typeSuffix = TestDefiningFileResolver.TypeName(testName);
+        if (methodName.Length == 0 || typeSuffix.Length == 0)
+            return "";
+        if (!_byName.TryGetValue(methodName, out var candidates))
+            return "";
+        foreach (var candidate in candidates)
+        {
+            if (TestDefiningFileResolver.TypeMatches(candidate.TypeName, typeSuffix))
+                return candidate.Document;
+        }
+
+        return "";
+    }
+
+    internal static TestAssemblyIndex Create(
+        IReadOnlyDictionary<string, IReadOnlyList<MethodDocument>> byName)
+        => new(byName);
+}
+
+/// <summary>One method's declaring type and first sequence-point document.</summary>
+internal sealed record MethodDocument(string TypeName, string Document);
+
+/// <summary>
 /// Resolves a listed test's defining source file from the portable PDB next
-/// to the test assembly. Sequence-point documents are normalised with
-/// <see cref="TestSelectionCoverageMap.ToRepositoryRelative"/>.
+/// to the test assembly. <see cref="LoadIndex"/> performs the (expensive)
+/// one-time PDB scan; <see cref="TestAssemblyIndex.Resolve"/> is a pure
+/// lookup over the result.
 /// </summary>
 public static class TestDefiningFileResolver
 {
     public const int MaxPdbBytes = 64 * 1024 * 1024;
     public const int MaxPeBytes = 256 * 1024 * 1024;
 
-    public static string Resolve(string testName, string assemblyPath, string repoRoot)
+    /// <summary>
+    /// Builds the method→document index for <paramref name="assemblyPath"/>.
+    /// Returns <see cref="TestAssemblyIndex.Empty"/> when the assembly is
+    /// missing, has no metadata, or has no readable portable PDB — every test
+    /// in it then resolves to "" (a defining-file miss, never an error).
+    /// </summary>
+    public static TestAssemblyIndex LoadIndex(string assemblyPath, string repoRoot)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(testName);
         ArgumentException.ThrowIfNullOrWhiteSpace(assemblyPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(repoRoot);
 
         var fullAssembly = Path.GetFullPath(assemblyPath);
         if (!File.Exists(fullAssembly))
-            return "";
+            return TestAssemblyIndex.Empty;
         var peInfo = new FileInfo(fullAssembly);
         if (peInfo.Length > MaxPeBytes)
         {
@@ -30,14 +85,9 @@ public static class TestDefiningFileResolver
                 $"Test assembly '{fullAssembly}' exceeds the {MaxPeBytes}-byte cap.");
         }
 
-        var methodName = MethodName(testName);
-        var typeSuffix = TypeName(testName);
-        if (methodName.Length == 0 || typeSuffix.Length == 0)
-            return "";
-
         try
         {
-            return ResolveFromPdb(fullAssembly, methodName, typeSuffix, repoRoot);
+            return BuildIndex(fullAssembly, repoRoot);
         }
         catch (BadImageFormatException ex)
         {
@@ -46,16 +96,12 @@ public static class TestDefiningFileResolver
         }
     }
 
-    private static string ResolveFromPdb(
-        string fullAssembly,
-        string methodName,
-        string typeSuffix,
-        string repoRoot)
+    private static TestAssemblyIndex BuildIndex(string fullAssembly, string repoRoot)
     {
         using var peStream = File.OpenRead(fullAssembly);
         using var peReader = new PEReader(peStream);
         if (!peReader.HasMetadata)
-            return "";
+            return TestAssemblyIndex.Empty;
 
         var metadata = peReader.GetMetadataReader();
         MetadataReader? pdbReader = null;
@@ -65,47 +111,57 @@ public static class TestDefiningFileResolver
             try
             {
                 if (!TryGetPdbReader(peReader, fullAssembly, out pdbReader, out pdbProvider))
-                    return "";
+                    return TestAssemblyIndex.Empty;
             }
             catch (InvalidOperationException)
             {
-                return "";
+                return TestAssemblyIndex.Empty;
             }
 
+            var byName = new Dictionary<string, List<MethodDocument>>(StringComparer.Ordinal);
+            var documents = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var handle in metadata.MethodDefinitions)
             {
-                var method = metadata.GetMethodDefinition(handle);
-                var name = metadata.GetString(method.Name);
-                if (!string.Equals(name, methodName, StringComparison.Ordinal))
-                    continue;
-
-                var declaring = metadata.GetTypeDefinition(method.GetDeclaringType());
-                var fullType = GetFullTypeName(metadata, declaring);
-                if (!TypeMatches(fullType, typeSuffix))
-                    continue;
-
                 var debugHandle = handle.ToDebugInformationHandle();
                 if (debugHandle.IsNil)
                     continue;
                 var debug = pdbReader.GetMethodDebugInformation(debugHandle);
+                string? documentPath = null;
                 foreach (var point in debug.GetSequencePoints())
                 {
                     if (point.IsHidden || point.Document.IsNil || point.StartLine <= 0)
                         continue;
                     var document = pdbReader.GetDocument(point.Document);
-                    var path = pdbReader.GetString(document.Name);
-                    if (string.IsNullOrWhiteSpace(path))
-                        continue;
-                    return TestSelectionCoverageMap.ToRepositoryRelative(path, repoRoot);
+                    documentPath = pdbReader.GetString(document.Name);
+                    break;
                 }
+
+                if (string.IsNullOrWhiteSpace(documentPath))
+                    continue;
+                if (!documents.TryGetValue(documentPath, out var relative))
+                {
+                    relative = TestSelectionCoverageMap.ToRepositoryRelative(documentPath, repoRoot);
+                    documents[documentPath] = relative;
+                }
+
+                var method = metadata.GetMethodDefinition(handle);
+                var declaring = metadata.GetTypeDefinition(method.GetDeclaringType());
+                var fullType = GetFullTypeName(metadata, declaring);
+                var name = metadata.GetString(method.Name);
+                if (!byName.TryGetValue(name, out var list))
+                    byName[name] = list = [];
+                list.Add(new MethodDocument(fullType, relative));
             }
+
+            var frozen = new Dictionary<string, IReadOnlyList<MethodDocument>>(StringComparer.Ordinal);
+            foreach (var (name, list) in byName)
+                frozen[name] = list;
+            return TestAssemblyIndex.Create(frozen);
         }
         finally
         {
             pdbProvider?.Dispose();
         }
-
-        return "";
     }
 
     public static async Task<string?> ResolveTargetPathAsync(
@@ -201,7 +257,7 @@ public static class TestDefiningFileResolver
         return paren < 0 ? testName : testName[..paren];
     }
 
-    private static bool TypeMatches(string metadataType, string listedType)
+    internal static bool TypeMatches(string metadataType, string listedType)
     {
         var left = metadataType.Replace('+', '.');
         var right = listedType.Replace('+', '.');
