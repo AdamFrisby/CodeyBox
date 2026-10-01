@@ -179,8 +179,10 @@ public static class TestDefiningFileResolver
         var result = await HostCommandRun.CappedAsync(
             runner,
             [
+                // -nr:false: never leave a node-reuse MSBuild server running
+                // after the property eval (it inherits the output pipes).
                 options.DotnetExecutable, "msbuild", projectRelative,
-                "-nologo", "-v:q", "-getProperty:TargetPath",
+                "-nologo", "-v:q", "-nr:false", "-getProperty:TargetPath",
             ],
             repoRoot,
             options.MaxCommandStdoutChars,

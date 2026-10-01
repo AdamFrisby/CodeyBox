@@ -300,7 +300,7 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
             RepoRoot = repo,
             OutputPath = output,
             Commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            MaxParallelism = 1,
+            MaxParallelism = 2,
             Clock = TimeProvider.System,
         };
 
@@ -338,6 +338,34 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
         }
 
         Assert.Equal(produced.Tests.Count, parsed.Tests.Count);
+    }
+
+    // Regression: 'sh -c "sleep &"' exits while the orphaned sleeper still
+    // holds the redirected pipes — the same shape as a detached MSBuild
+    // node-reuse server surviving 'dotnet msbuild'. The runner must return
+    // once the direct child exits plus a short drain grace, not wait for
+    // pipe EOF (pre-fix this blocked until the command timeout).
+    [SkippableFact]
+    public async Task Runner_DetachedGrandchildHoldingPipes_ReturnsAfterChildExit()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "fixture requires POSIX sh");
+        var runner = new HostCommandRunner();
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        var result = await runner.RunAsync(
+            ["sh", "-c", "sleep 45 & echo done"],
+            _root,
+            extraEnvironment: null,
+            maxStdoutChars: 16 * 1024,
+            maxStderrChars: 16 * 1024,
+            timeout: TimeSpan.FromSeconds(120),
+            CancellationToken.None);
+
+        stopwatch.Stop();
+        Assert.True(result.Success, result.Stderr);
+        Assert.Contains("done", result.Stdout, StringComparison.Ordinal);
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(30),
+            $"runner returned after {stopwatch.Elapsed} — it waited on the orphaned pipe writer");
     }
 
     [Fact]
@@ -485,6 +513,10 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
                 <Nullable>enable</Nullable>
                 <IsPackable>false</IsPackable>
                 <IsTestProject>true</IsTestProject>
+                <!-- No vulnerability-data fetch: every fixture package is
+                     already in the ambient NuGet caches, and a sandboxed run
+                     must not stall restore on a network round-trip. -->
+                <NuGetAudit>false</NuGetAudit>
               </PropertyGroup>
               <ItemGroup>
                 <PackageReference Include="coverlet.collector" Version="6.0.4" />

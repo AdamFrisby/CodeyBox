@@ -75,7 +75,8 @@ artifact `codeybox-test-selection-baseline/1`:
 **Producer (operational):** `tools/CodeyBox.TestSelectionBaseline` is the
 CLI an orchestrator job (and a human) runs against a checkout after every
 merge to `main`. It builds the tree, enumerates tests with `dotnet test
---list-tests`, walks `dotnet sln` / `ProjectReference` edges, maps each
+--list-tests`, walks the solution (`*.slnx` parsed directly, `*.sln` via
+`dotnet sln list`) / `ProjectReference` edges, maps each
 source file to its project via `dotnet msbuild -getItem:Compile` (the
 evaluated truth, so globs and `Compile Remove` are honoured), resolves each
 test's defining file from the portable PDB, then collects **per-test**

@@ -85,11 +85,14 @@ public sealed class TestSelectionBaselineProducer
         TestSelectionProducerOptions options,
         CancellationToken ct)
     {
+        // --disable-build-servers: the build must not leave MSBuild
+        // node-reuse / VBCSCompiler servers running — they inherit the
+        // redirected output pipes and outlive the CLI process.
         if (solutionRelative is not null)
         {
             await RunDotnetAsync(
                 repoRoot,
-                [options.DotnetExecutable, "build", solutionRelative, "--nologo"],
+                [options.DotnetExecutable, "build", solutionRelative, "--nologo", "--disable-build-servers"],
                 options,
                 "dotnet build",
                 ct).ConfigureAwait(false);
@@ -100,7 +103,7 @@ public sealed class TestSelectionBaselineProducer
         {
             await RunDotnetAsync(
                 repoRoot,
-                [options.DotnetExecutable, "build", project, "--nologo"],
+                [options.DotnetExecutable, "build", project, "--nologo", "--disable-build-servers"],
                 options,
                 $"dotnet build {project}",
                 ct).ConfigureAwait(false);
@@ -213,15 +216,32 @@ public sealed class TestSelectionBaselineProducer
             .GroupBy(name => listed.OwningProject.TryGetValue(name, out var project) ? project : "", StringComparer.Ordinal)
             .ToList();
 
-        foreach (var group in groups)
+        // --max-parallelism bounds runs across DISTINCT test projects — each
+        // has its own build output directory, so coverlet's per-module
+        // backup/restore cannot collide. Runs inside one project serialize
+        // inside the collector.
+        using var gate = new SemaphoreSlim(Math.Max(1, options.MaxParallelism));
+        var tasks = groups.Select(async group =>
         {
             var target = group.Key.Length > 0
                 ? group.Key
                 : solutionRelative ?? throw new TestSelectionBaselineProduceException(
                     "Cannot collect coverage: no test project or solution target.");
             var names = group.ToList();
-            var covers = await _coverage.CollectAsync(repoRoot, target, names, options, ct)
-                .ConfigureAwait(false);
+            await gate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                return await _coverage.CollectAsync(repoRoot, target, names, options, ct)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }).ToList();
+
+        foreach (var covers in await Task.WhenAll(tasks).ConfigureAwait(false))
+        {
             foreach (var (name, map) in covers)
                 merged[name] = map;
         }

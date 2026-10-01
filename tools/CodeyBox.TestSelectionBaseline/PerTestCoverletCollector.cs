@@ -16,6 +16,14 @@ public sealed record PerTestCoverage(
 /// isolation through <c>dotnet test --filter FullyQualifiedName=… --collect</c>
 /// and parsing the report with <see cref="CoberturaParser"/>.
 /// </summary>
+/// <remarks>
+/// Implementations may run collections for DIFFERENT test targets in
+/// parallel, but runs against one target's output directory must serialize:
+/// coverlet writes backup/hits files next to the instrumented assemblies and
+/// restores them at session end, so concurrent sessions on the same bin
+/// directory race (<c>BackupOriginalModule</c> throws, and a crashed session
+/// can leave the on-disk assembly instrumented).
+/// </remarks>
 public interface IPerTestCoverageCollector
 {
     Task<IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<int>>>> CollectAsync(
@@ -68,31 +76,35 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
         var runsettings = WriteRunsettings(resultsRoot, options.Collector);
         var collected = new Dictionary<string, IReadOnlyDictionary<string, IReadOnlyList<int>>>(
             StringComparer.Ordinal);
-        var reportsFound = new int[1];
-        var gate = new SemaphoreSlim(Math.Max(1, options.MaxParallelism));
-        var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+        var reportsFound = 0;
+        var errors = new List<Exception>();
         try
         {
-            var tasks = new List<Task>(testNames.Count);
+            // Serialized: every run instruments the same bin directory —
+            // coverlet's backup/restore is not safe against concurrent
+            // sessions (BackupOriginalModule throws IOException sharing the
+            // pdb). Parallelism across test projects happens in the
+            // producer's per-project fan-out instead.
             foreach (var testName in testNames)
             {
-                tasks.Add(CollectOneAsync(
-                    root, testTarget, testName, options, resultsRoot, runsettings, collected, gate,
-                    () => Interlocked.Increment(ref reportsFound[0]), errors, ct));
+                ct.ThrowIfCancellationRequested();
+                var found = await CollectOneAsync(
+                    root, testTarget, testName, options, resultsRoot, runsettings, collected,
+                    errors, ct).ConfigureAwait(false);
+                if (found)
+                    reportsFound++;
             }
 
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-            if (!errors.IsEmpty)
-                throw errors.ToArray()[0];
+            if (errors.Count > 0)
+                throw errors[0];
         }
         finally
         {
-            gate.Dispose();
             if (ephemeralResults)
                 TryDeleteDirectory(resultsRoot);
         }
 
-        if (testNames.Count > 0 && reportsFound[0] == 0)
+        if (testNames.Count > 0 && reportsFound == 0)
         {
             throw new TestSelectionBaselineProduceException(
                 "No Cobertura report was produced. Ensure test projects reference coverlet.collector " +
@@ -102,7 +114,7 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
         return collected;
     }
 
-    private async Task CollectOneAsync(
+    private async Task<bool> CollectOneAsync(
         string repoRoot,
         string testTarget,
         string testName,
@@ -110,15 +122,11 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
         string resultsRoot,
         string runsettings,
         Dictionary<string, IReadOnlyDictionary<string, IReadOnlyList<int>>> collected,
-        SemaphoreSlim gate,
-        Func<int> onReport,
-        System.Collections.Concurrent.ConcurrentBag<Exception> errors,
+        List<Exception> errors,
         CancellationToken ct)
     {
-        await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            ct.ThrowIfCancellationRequested();
             var perTestDir = Path.Combine(resultsRoot, Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(perTestDir);
             if (!HostPathPolicy.IsWithinDirectory(perTestDir, resultsRoot))
@@ -160,12 +168,9 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
             // record" and always selects (the fail-safe direction). A systemic
             // failure is caught by the reportsFound check in CollectAsync.
             var reports = ReadReports(perTestDir, options);
-            if (reports.Count > 0)
-                onReport();
-
             var covers = TestSelectionCoverageMap.FromReports(reports, repoRoot);
-            lock (collected)
-                collected[testName] = covers;
+            collected[testName] = covers;
+            return reports.Count > 0;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -173,10 +178,7 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
                 ? ex
                 : new TestSelectionBaselineProduceException(
                     $"Coverage run for '{Sanitize(testName)}' failed.", ex));
-        }
-        finally
-        {
-            gate.Release();
+            return false;
         }
     }
 

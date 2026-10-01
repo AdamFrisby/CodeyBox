@@ -267,7 +267,10 @@ public static class Program
               --max-bytes N            JSON character cap (default: consumer MaxBaselineBytes)
               --max-tests N            Test-entry cap (default: consumer MaxBaselineTests)
               --max-covered-lines N    Covered-line cap (default: consumer MaxBaselineCoveredLines)
-              --max-parallelism N      Isolated per-test coverage runs in parallel
+              --max-parallelism N      Test projects collected concurrently
+                                       (per-test runs inside one project are
+                                       serialized: coverlet races on its
+                                       per-module backup files)
               --skip-build             Assume the checkout is already built
             """);
     }

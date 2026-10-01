@@ -39,7 +39,11 @@ public sealed class TestSelectionProducerOptions
     public TimeProvider Clock { get; init; } = TimeProvider.System;
     public string? ResultsDirectory { get; init; }
 
-    /// <summary>Default isolated-run parallelism: one worker per host CPU.</summary>
+    /// <summary>
+    /// Default bound on concurrent test-project coverage collections: one
+    /// worker per host CPU. Runs within one project always serialize —
+    /// coverlet's per-module backup/restore is not concurrency-safe.
+    /// </summary>
     public static int DefaultMaxParallelism => Math.Max(1, Environment.ProcessorCount);
 
     /// <summary>Default timeout for one isolated per-test coverage run.</summary>

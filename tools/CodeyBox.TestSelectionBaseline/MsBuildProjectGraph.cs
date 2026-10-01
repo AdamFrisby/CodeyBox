@@ -146,6 +146,16 @@ public static class MsBuildProjectGraph
         IHostCommandRunner runner,
         CancellationToken ct)
     {
+        // A .slnx is plain XML listing every project — parse it locally and
+        // skip the 'dotnet sln' spawn entirely. The binary-era .sln format
+        // still goes through 'dotnet sln list'.
+        if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+        {
+            var fromSlnx = ParseSlnx(solutionPath, repoRoot, options.MaxProjectFiles);
+            if (fromSlnx.Count > 0)
+                return fromSlnx;
+        }
+
         var relativeSolution = ToRepoRelative(repoRoot, solutionPath);
         var result = await HostCommandRun.CappedAsync(
             runner,
@@ -163,9 +173,6 @@ public static class MsBuildProjectGraph
             if (fromDotnet.Count > 0)
                 return fromDotnet;
         }
-
-        if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
-            return ParseSlnx(solutionPath, repoRoot, options.MaxProjectFiles);
 
         return [];
     }
@@ -311,7 +318,10 @@ public static class MsBuildProjectGraph
         var label = $"dotnet msbuild -getItem:Compile {projectRelative}";
         var result = await HostCommandRun.CappedAsync(
             runner,
-            [options.DotnetExecutable, "msbuild", projectRelative, "-nologo", "-getItem:Compile"],
+            // -nr:false: never leave a node-reuse MSBuild server running —
+            // it outlives the CLI process while still holding the output
+            // pipes open.
+            [options.DotnetExecutable, "msbuild", projectRelative, "-nologo", "-nr:false", "-getItem:Compile"],
             repoRoot,
             options.MaxCommandStdoutChars,
             options.MaxCommandStdoutChars,

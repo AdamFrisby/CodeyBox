@@ -33,9 +33,14 @@ count enter that test's `covers` map — a session report also lists uncovered
 executable lines, and including those would make every test appear to cover
 every instrumented line.
 
-`--max-parallelism` (default: host CPU count) runs isolated collections
-concurrently. `--list-tests` still provides the universe, including tests
-that produce no coverage record (empty `covers`).
+`--max-parallelism` (default: host CPU count) bounds how many test
+**projects** are collected concurrently. Runs against one project's output
+directory always serialize: coverlet writes module backup files next to the
+instrumented assemblies and restores them at session end, so concurrent
+sessions on the same `bin/` race (`BackupOriginalModule` throws, or a
+crashed session leaves the assembly instrumented). `--list-tests` still
+provides the universe, including tests that produce no coverage record
+(empty `covers`).
 
 ### Measured wall-clock cost
 
@@ -49,14 +54,16 @@ startup, not by the test body:
 | `dotnet test --no-build --list-tests` on CodeyBox.Tests | **4.7 s** (15,950 names) |
 | One isolated `--filter FullyQualifiedName=… --collect "XPlat Code Coverage"` after a Debug build (test body 47 ms / 37 ms) | **29.485 s**, then **29.318 s** on a second test |
 | Tiny fixture used by `Producer_FixtureRoundTrip_ParsesWithStrictReader` (2 tests, restore + build + 2 isolated runs) | **~9 s** |
-| Extrapolated full CodeyBox.Tests map at default `--max-parallelism` (2) | 15,950 × 29.4 s / 2 ≈ **65 h** |
-| Same extrapolation on a 16-CPU orchestrator host | 15,950 × 29.4 s / 16 ≈ **8.1 h** |
+| Extrapolated full CodeyBox.Tests map | 15,950 × 29.4 s ≈ **130 h** |
+
+`--max-parallelism` does **not** shorten the single-test-project case: this
+repository has one test assembly, so its baseline runs serialize. The knob
+only helps a multi-test-project checkout.
 
 This producer is a **post-merge orchestrator-host job**, not part of the
 90-minute per-item `csharp:test-pass` budget. The isolated-run cost is the
 price of staying on MIT coverlet and `CoberturaParser` without a second
-coverage engine. Raise `--max-parallelism` to the host CPU count (the
-default) on the job runner.
+coverage engine.
 
 ### Why the alternatives were rejected
 

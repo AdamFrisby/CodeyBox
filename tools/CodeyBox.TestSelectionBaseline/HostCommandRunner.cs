@@ -13,6 +13,17 @@ public sealed class HostCommandRunner : IHostCommandRunner
 {
     private const int ReadBufferChars = 4096;
 
+    /// <summary>
+    /// Upper bound on draining redirected output AFTER the child process
+    /// exits. Everything the child itself wrote is already buffered in the
+    /// pipes and drains immediately, but a detached grandchild (e.g. an
+    /// MSBuild node-reuse server spawned by <c>dotnet build</c> /
+    /// <c>dotnet msbuild</c>) inherits the pipe write ends and can keep them
+    /// open for minutes. Waiting for plain EOF would hang until the command
+    /// timeout, so stragglers get this grace window and no more.
+    /// </summary>
+    private static readonly TimeSpan PostExitDrainGrace = TimeSpan.FromSeconds(5);
+
     public async Task<HostCommandResult> RunAsync(
         IReadOnlyList<string> argv,
         string workingDirectory,
@@ -88,8 +99,12 @@ public sealed class HostCommandRunner : IHostCommandRunner
         try
         {
             await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
+            // The child exited; bound the remaining drain (see
+            // PostExitDrainGrace) rather than blocking on pipe EOF forever.
+            timeoutCts.CancelAfter(PostExitDrainGrace);
             var stdout = await stdoutTask.ConfigureAwait(false);
             var stderr = await stderrTask.ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
             return new HostCommandResult(
                 process.ExitCode,
                 stdout.Text,
@@ -118,23 +133,33 @@ public sealed class HostCommandRunner : IHostCommandRunner
         var output = new StringBuilder();
         var buffer = new char[ReadBufferChars];
         var limitExceeded = false;
-        while (true)
+        try
         {
-            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
-            if (read == 0)
-                return new CappedRead(output.ToString(), limitExceeded);
-            if (limitExceeded)
-                continue;
-            var remaining = maxChars - output.Length;
-            if (read > remaining)
+            while (true)
             {
-                if (remaining > 0)
-                    output.Append(buffer, 0, remaining);
-                limitExceeded = true;
-                continue;
-            }
+                var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read == 0)
+                    return new CappedRead(output.ToString(), limitExceeded);
+                if (limitExceeded)
+                    continue;
+                var remaining = maxChars - output.Length;
+                if (read > remaining)
+                {
+                    if (remaining > 0)
+                        output.Append(buffer, 0, remaining);
+                    limitExceeded = true;
+                    continue;
+                }
 
-            output.Append(buffer, 0, read);
+                output.Append(buffer, 0, read);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Command timeout, caller cancellation, or the post-exit drain
+            // grace elapsed — keep whatever was already buffered. The caller
+            // distinguishes the cases at WaitForExitAsync.
+            return new CappedRead(output.ToString(), limitExceeded);
         }
     }
 
