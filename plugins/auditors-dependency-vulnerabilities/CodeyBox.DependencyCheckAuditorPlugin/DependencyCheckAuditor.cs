@@ -36,7 +36,7 @@ namespace CodeyBox.DependencyCheckAuditorPlugin;
 /// output is progress logging, not machine output. The scan writes
 /// <c>dependency-check-report.json</c> as a plain file inside the per-run
 /// scratch directory (<see cref="ExternalToolAuditorBase.PerRunTempDirectoryPath"/>),
-/// and <see cref="ResolveParserInputAsync(ISandbox, string, string, ExternalToolAuditorOptions, SandboxExecResult, string?, CancellationToken)"/>
+/// and <see cref="ResolveParserInputAsync(ISandbox, string, string, ExternalToolAuditorOptions, SandboxExecResult, IReadOnlyList{string}, string?, CancellationToken)"/>
 /// reads it back through the separate bounded read the base's parser-input
 /// seam exists for — the report reaches only the parser, never the persisted
 /// <see cref="AuditResult.RawOutput"/>. A missing, oversized, or
@@ -390,63 +390,29 @@ public sealed class DependencyCheckAuditor : ExternalToolAuditorBase, IPluginIni
     /// directory through a separate bounded sandbox read — the report never
     /// touches the captured scan streams (stdout is progress logging, and
     /// captured output is persisted as <see cref="AuditResult.RawOutput"/>).
-    /// The read shares the configured per-stream capture bound; a missing
-    /// or oversized report fails closed as infrastructure. The read's own
-    /// output is never copied into a failure message — only <c>cat</c>'s
-    /// stderr (provider error text) is carried.
+    /// The read is the shared
+    /// <see cref="ExternalToolAuditorBase.ReadReportFileParseInputAsync"/>:
+    /// it shares the configured per-stream capture bound and a missing or
+    /// oversized report fails closed as infrastructure.
     /// </summary>
-    protected override async Task<ExternalToolParseInput> ResolveParserInputAsync(
+    protected override Task<ExternalToolParseInput> ResolveParserInputAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
         SandboxExecResult result,
+        IReadOnlyList<string> argv,
         string? scanRoot,
         CancellationToken ct)
-    {
-        var reportPath = Path.Combine(PerRunTempDirectoryPath, ReportFileName);
-        var read = await ExecToolBoundedAsync(
+        => ReadReportFileParseInputAsync(
             sandbox,
+            workingDirectory,
             tool,
-            "report read",
-            new SandboxExec
-            {
-                Argv = ["cat", reportPath],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = CapturedOutputLimit(options),
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (read.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' report read could not run: the sandbox exec "
-                + "transport was unavailable.");
-        if (read.StdoutLimitExceeded)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' wrote a report exceeding the "
-                + $"{CapturedOutputLimit(options)}-byte capture bound — the report is fetched "
-                + "through a bounded read, so an oversized one is infrastructure, never a partial "
-                + "parse. Raise MaxOutputBytesPerStream or narrow the scan with ExcludePaths.")
-            { IsDeterministic = true };
-        if (read.ExitCode != 0)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' completed its scan but produced no readable "
-                + $"report file (exit {read.ExitCode}) — a completed scan must leave a report, so "
-                + "this is infrastructure, not a verdict on the diff.",
-                read.ExitCode,
-                read.Stderr);
-
-        return new ExternalToolParseInput(
-            tool,
-            read.Stdout,
-            result.Stderr,
-            result.ExitCode,
-            ScanRoot: scanRoot,
-            WorkingDirectory: workingDirectory);
-    }
+            options,
+            result,
+            Path.Combine(PerRunTempDirectoryPath, ReportFileName),
+            scanRoot,
+            ct);
 
     /// <summary>
     /// Resolves the absolute scan directory as the tool sees it, so the

@@ -170,12 +170,20 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// report bytes then reach only the parser, never the persisted raw
     /// output or failure text.
     /// </summary>
+    /// <param name="argv">
+    /// The argv the scan was actually invoked with (argv[0] is the tool
+    /// name) — hooks deciding where the report lives should read it from
+    /// here so the decision is exactly what the run produced, not a second
+    /// read of scoped config that a hot reload could have flipped since
+    /// <see cref="ResolveContextArgumentsAsync"/> built the arguments.
+    /// </param>
     protected virtual Task<ExternalToolParseInput> ResolveParserInputAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
         ExternalToolAuditorOptions options,
         SandboxExecResult result,
+        IReadOnlyList<string> argv,
         string? scanRoot,
         CancellationToken ct)
         => Task.FromResult(new ExternalToolParseInput(
@@ -271,7 +279,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 result);
 
             var parseInput = await ResolveParserInputAsync(
-                    sandbox, workingDirectory, tool, options, result, scanRoot, ct)
+                    sandbox, workingDirectory, tool, options, result, argv, scanRoot, ct)
                 .ConfigureAwait(false);
             var parsed = ParseOutput(tool, parseInput);
             var findings = ToFindings(tool, parsed, options);
@@ -378,6 +386,78 @@ public abstract class ExternalToolAuditorBase : IAuditor
             },
             EffectiveTimeout(options),
             ct);
+    }
+
+    /// <summary>
+    /// Reads a report file the tool wrote during its scan through a separate
+    /// bounded sandbox read — the single implementation of the read-back
+    /// <see cref="ResolveParserInputAsync"/> overrides perform for tools
+    /// whose report must not ride the captured scan streams (it may embed
+    /// matched source snippets, or the tool simply cannot stream it). The
+    /// path travels to <c>cat</c> as its own argv entry, never through a
+    /// shell; stdout is capped at the configured per-stream bound.
+    /// Fail-closed: a dead exec transport, an oversized report (a clipped
+    /// document is never parsed), or a missing/unreadable file is
+    /// infrastructure — never a pass. The read's stdout is never copied
+    /// into a failure message — only <c>cat</c>'s stderr is carried.
+    /// </summary>
+    /// <param name="reportPath">
+    /// Report path as the sandbox sees it — typically under
+    /// <see cref="PerRunTempDirectoryPath"/>.
+    /// </param>
+    /// <param name="oversizedScopeHint">
+    /// Clause appended to the oversized-report failure telling the operator
+    /// how to shrink the report — e.g. <c>"(Targets, Platforms)"</c>.
+    /// Defaults to the <c>ExcludePaths</c> wording.
+    /// </param>
+    protected static async Task<ExternalToolParseInput> ReadReportFileParseInputAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        SandboxExecResult result,
+        string reportPath,
+        string? scanRoot,
+        CancellationToken ct,
+        string oversizedScopeHint = "with ExcludePaths")
+    {
+        var read = await ExecToolBoundedAsync(
+            sandbox,
+            tool,
+            "report read",
+            new SandboxExec
+            {
+                Argv = ["cat", reportPath],
+                WorkingDirectory = workingDirectory,
+                MaxStdoutBytes = CapturedOutputLimit(options),
+                MaxStderrBytes = ProbeMaxOutputBytes,
+                KillOnOutputLimit = true,
+            },
+            ProbeTimeout(options),
+            ct).ConfigureAwait(false);
+
+        if (read.ExecutionUnavailable)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' report read could not run: the sandbox exec "
+                + "transport was unavailable.");
+        if (read.StdoutLimitExceeded)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' wrote a report exceeding the "
+                + $"{CapturedOutputLimit(options)}-byte capture bound — the report is fetched "
+                + "through a bounded read, so an oversized one is infrastructure, never a partial "
+                + $"parse. Raise MaxOutputBytesPerStream or narrow the scan {oversizedScopeHint}.")
+            { IsDeterministic = true };
+        if (read.ExitCode != 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' completed its scan but produced no readable "
+                + $"report file (exit {read.ExitCode}) — a completed scan must leave a report, so "
+                + "this is infrastructure, not a verdict on the diff.",
+                read.ExitCode,
+                read.Stderr);
+
+        return new ExternalToolParseInput(
+            tool, read.Stdout, result.Stderr, result.ExitCode,
+            ScanRoot: scanRoot, WorkingDirectory: workingDirectory);
     }
 
     /// <summary>

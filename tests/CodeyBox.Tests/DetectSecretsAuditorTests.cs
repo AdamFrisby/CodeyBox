@@ -463,6 +463,202 @@ public sealed class DetectSecretsAuditorTests
     }
 
     [Fact]
+    public async Task QuotedTrackedFileNames_FailClosed_ScanNeverRuns()
+    {
+        // git C-quotes tracked names containing '"', '\', control bytes, or
+        // bytes >= 0x80 (a tracked 'sëcrets.txt' is listed as
+        // "s\303\253crets.txt"); detect-secrets never unquotes the ls-files
+        // output, so such files are silently never scanned while the scan
+        // still exits 0 with an empty contribution — a clean pass for files
+        // never read. The precondition probe reports this as exit
+        // QuotedTrackedNamesExit and the auditor must fail closed.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsWorktreeProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    DetectSecretsAuditor.QuotedTrackedNamesExit, "", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, BaselineClean, ""));
+        });
+
+        IAuditor auditor = new DetectSecretsAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("detect-secrets", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("C-quote", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task AllFilesAfterOptionTerminator_DoesNotSkipWorktreeGate()
+    {
+        // argparse treats tokens after a bare `--` as positional paths, so
+        // a `--all-files` there is not the flag — all-files mode is not
+        // active and the worktree precondition must still run (and, on a
+        // non-git tree, still fail closed).
+        var auditor = new DetectSecretsAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--,--all-files",
+            }),
+            CancellationToken.None);
+
+        var worktreeProbes = 0;
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsWorktreeProbe(exec))
+            {
+                worktreeProbes++;
+                return Task.FromResult(new SandboxExecResult(128, "", "fatal: not a git repository"));
+            }
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, BaselineClean, ""));
+        });
+
+        await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Equal(1, worktreeProbes);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task AllFilesAbbreviation_SkipsWorktreePrecondition()
+    {
+        // Python argparse resolves unambiguous long-option prefixes
+        // (allow_abbrev): '--all' reaches the parser as '--all-files', so
+        // the gate is genuinely off and the worktree probe is skipped.
+        var auditor = new DetectSecretsAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--all",
+            }),
+            CancellationToken.None);
+
+        var worktreeProbes = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsWorktreeProbe(exec))
+            {
+                worktreeProbes++;
+                return Task.FromResult(new SandboxExecResult(128, "", "fatal: not a git repository"));
+            }
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            return Task.FromResult(new SandboxExecResult(0, BaselineClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(0, worktreeProbes);
+    }
+
+    [Theory]
+    // argparse resolves unambiguous long-option prefixes by default — these
+    // abbreviations reach the tool as the reserved flag itself.
+    [InlineData("--bas")]              // abbreviation of --baseline
+    [InlineData("--bas=x.json")]       // attached-value abbreviation
+    [InlineData("--plug")]             // abbreviation of --plugin
+    // File-loading flags resolved inside the worktree.
+    [InlineData("--word-list")]
+    [InlineData("--gibberish-model,./model.bin")]
+    // Coverage-reshaping flags.
+    [InlineData("-C")]
+    [InlineData("-Csub/")]
+    [InlineData("--custom-root,sub/")]
+    [InlineData("--only-allowlisted")]
+    public async Task ReservedExtraArguments_FileLoadingAndCoverage_AreRejected(string extraArguments)
+    {
+        var auditor = new DetectSecretsAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = extraArguments,
+            }),
+            CancellationToken.None);
+
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++;
+            return Task.FromResult(Ok(exec));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("reserved flag", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task BaselineFile_ResolvedOncePerRun_ConfigFlipMidRun_KeepsReportSource()
+    {
+        // Scoped config is hot-reloadable, but the baseline decision must be
+        // fixed for the duration of one run: if the configured key is unset
+        // between argv construction and report read-back, the report must
+        // still come from the staged copy argv names — not from (empty)
+        // stdout, which would misfire as an unparseable report.
+        const string canonicalBaseline = "/opt/codeybox-audit/known-secrets.json";
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Scoped:" + DetectSecretsAuditor.BaselineFileKey] = canonicalBaseline,
+            })
+            .Build();
+        var auditor = new DetectSecretsAuditor();
+        await auditor.InitializeAsync(
+            new PluginContext(
+                HostApiVersion: "1.0",
+                PluginId: DetectSecretsAuditor.PluginId,
+                PluginDisplayName: "CodeyBox: detect-secrets Secrets",
+                Host: new TestPluginHost(config.GetSection("Scoped"))),
+            CancellationToken.None);
+
+        var reportReads = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsCanonicalizeProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, canonicalBaseline + "\n/work\n", ""));
+            if (IsBaselineCopyProbe(exec))
+            {
+                // Mid-run config flip: the baseline knob disappears between
+                // ResolveContextArgumentsAsync and ResolveParserInputAsync.
+                config["Scoped:" + DetectSecretsAuditor.BaselineFileKey] = null;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+            if (IsReportRead(exec))
+            {
+                reportReads++;
+                return Task.FromResult(new SandboxExecResult(0, BaselineWithSecret, ""));
+            }
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsWorktreeProbe(exec))
+                return Task.FromResult(Ok(exec));
+            // Baseline mode redirects the report into the file: stdout empty.
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("src/config.py:12", finding.Location);
+        Assert.Equal(1, reportReads);
+    }
+
+    [Fact]
     public async Task WrongToolVersion_IsInfrastructure_ScanNeverRuns()
     {
         var scanExecs = 0;
@@ -555,13 +751,12 @@ public sealed class DetectSecretsAuditorTests
     /// binary is on PATH; the auditor's version pin is set to the installed
     /// release.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_detect_secrets", "true")]
     public async Task RealDetectSecrets_SecretInTrackedFile_YieldsFinding_WithRuleIdAndLocation()
     {
         var installed = _installedDetectSecretsVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "detect-secrets is not on PATH — provision it to run the real-binary coverage.");
 
         var repo = await SeedFixtureRepoAsync(_fixtureSecretLine);
         try
@@ -603,13 +798,12 @@ public sealed class DetectSecretsAuditorTests
     /// passes with zero findings — and proves the worktree precondition does
     /// not misfire on a healthy repo.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     [Trait("requires_detect_secrets", "true")]
     public async Task RealDetectSecrets_CleanFixtureRepo_Passes_WithNoFindings()
     {
         var installed = _installedDetectSecretsVersion;
-        if (installed is null)
-            return;
+        Skip.If(installed is null, "detect-secrets is not on PATH — provision it to run the real-binary coverage.");
 
         var repo = await SeedFixtureRepoAsync(null);
         try

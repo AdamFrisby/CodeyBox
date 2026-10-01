@@ -41,6 +41,13 @@ stdout.
   *nothing* and still exit `0` with an empty `results` — a false clean pass.
   The auditor instead fails closed as infrastructure unless the working
   directory is the root of a git worktree.
+- **File names git must C-quote.** detect-secrets enumerates tracked files
+  via `git ls-files` and never unquotes its output, so a tracked file whose
+  name contains a `"`, `\`, control byte, or byte ≥ 0x80 (e.g.
+  `sëcrets.txt`) is *silently never scanned* while the run still exits `0`.
+  The pre-scan probe fails closed with an infrastructure error naming the
+  constraint when the listing holds any quoted entry — rename the files, or
+  pass `--all-files` (filesystem walk, immune to the quoting mismatch).
 - **Binary files.** detect-secrets reads text lines and skips content that
   fails UTF-8 decoding; a secret inside a `.zip`, image, or compiled blob is
   never reported.
@@ -137,7 +144,7 @@ Scoped under `CodeyBox:Plugins:codeybox.detect-secrets`, resolved per run
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity. Everything maps to `error`, so this only matters if the mapping changes. |
 | `IncludedRules` / `ExcludedRules` | — | Exact `type` strings to keep/drop (e.g. `Secret Keyword`, `AWS Access Key`). |
 | `ExcludePaths` | `.secrets.baseline`, `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--all-files` (filesystem scan, disables the worktree gate), `--exclude-files <regex>`, `--base64-limit`, `--hex-limit`, `--cores`. Reserved and rejected: `--baseline` (use `BaselineFile`), `-p`/`--plugin` and `-f`/`--filter` (they load Python code from paths that could resolve inside the worktree — install custom detectors into the baseline image instead). |
+| `ExtraArguments` | — | Extra argv appended after the built-in args (never via a shell). Useful for `--all-files` (filesystem scan, disables the worktree gate), `--exclude-files <regex>`, `--base64-limit`, `--hex-limit`, `--cores`. Reserved and rejected, because they would redirect the report, load code or data files from worktree-resolvable paths, or silently reshape coverage: `--baseline` (use `BaselineFile`), `-p`/`--plugin`, `-f`/`--filter`, `--word-list`, `--gibberish-model` (file loads — install custom detectors into the baseline image instead), `-C`/`--custom-root` (retargets the scan root while the worktree gate probes the working directory), `--only-allowlisted` (repo-authored pragmas alone would decide findings). argparse's unambiguous-prefix abbreviations of a reserved flag (e.g. `--bas`, `--plug`) are rejected too. |
 | `TimeoutSeconds` | `300` | Per-run bound enforced by the host around the process. Exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation and an oversized report fails closed rather than parsing a clipped document. |
 

@@ -33,19 +33,19 @@ namespace CodeyBox.DetectSecretsAuditorPlugin;
 internal sealed class DetectSecretsBaselineParser : IExternalToolOutputParser
 {
     /// <summary>
-    /// Upper bound on results consumed from one document, mirroring the
-    /// shared <see cref="SarifToolOutputParser"/> bound so one pathological
-    /// report cannot grow findings without limit. The base still applies its
-    /// own <c>MaxFindings</c> cap on top.
+    /// Upper bound on results consumed from one document — aliases the
+    /// shared <see cref="SarifToolOutputParser"/> bound so the two cannot
+    /// drift and one pathological report cannot grow findings without
+    /// limit. The base still applies its own <c>MaxFindings</c> cap on top.
     /// </summary>
-    internal const int MaxResults = 10_000;
+    internal const int MaxResults = SarifToolOutputParser.DefaultMaxResults;
 
     private const int MessageValueMaxChars = 64;
 
     public IReadOnlyList<ExternalToolFinding> Parse(ExternalToolParseInput input)
     {
         ArgumentNullException.ThrowIfNull(input);
-        var stdout = input.Stdout ?? string.Empty;
+        var stdout = input.Stdout;
         if (string.IsNullOrWhiteSpace(stdout))
             throw new ExternalToolParseException(
                 $"Tool '{input.ToolName}' produced no baseline JSON on stdout.");

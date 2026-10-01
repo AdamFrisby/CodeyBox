@@ -39,14 +39,17 @@ namespace CodeyBox.DetectSecretsAuditorPlugin;
 /// <c>{0}</c>; everything else is infrastructure.</para>
 ///
 /// <para><b>The silent-empty trap.</b> Without <c>--all-files</c> the scan
-/// enumerates git-tracked files: on a non-git directory, or below the
-/// worktree root, detect-secrets logs a warning, scans nothing, and still
-/// exits <c>0</c> with an empty <c>results</c> — indistinguishable from a
-/// clean repo. <see cref="VerifyToolAsync"/> therefore fails closed unless
-/// the working directory is the root of a git worktree (one bounded probe:
-/// <c>git rev-parse --is-inside-work-tree</c> true and an empty
-/// <c>--show-prefix</c>). An operator-supplied <c>--all-files</c> disables
-/// the gate because that mode walks the filesystem and needs no git.</para>
+/// enumerates git-tracked files via <c>git ls-files</c>: on a non-git
+/// directory, or below the worktree root, detect-secrets logs a warning,
+/// scans nothing, and still exits <c>0</c> with an empty <c>results</c> —
+/// indistinguishable from a clean repo. The same silent-skip applies per
+/// file: the tool never unquotes git's C-quoted listing output, so a
+/// tracked file whose name needs quoting (non-ASCII, quote, backslash, or
+/// control bytes) is silently never scanned. <see cref="VerifyToolAsync"/>
+/// therefore fails closed unless the working directory is the root of a
+/// git worktree AND <c>git ls-files</c> emits no C-quoted entry (one
+/// bounded probe). An operator-supplied <c>--all-files</c> disables the
+/// gate because that mode walks the filesystem and needs no git.</para>
 ///
 /// <para><b>No verification calls.</b> The scan always passes
 /// <c>--no-verify</c>: without it detect-secrets would ship each found
@@ -168,29 +171,73 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
     private const string BaselineCopyScript =
         "d=\"$1\" && mkdir -m 700 -p \"$d\" && cp -- \"$2\" \"$d/" + BaselineCopyFileName + "\"";
 
-    // Working-directory precondition: `test` on the substituted outputs
-    // fails (non-zero) when git is missing, the cwd is outside a worktree,
-    // or --show-prefix reports a subdirectory — all collapse into one
-    // "could not confirm coverage" failure.
+    // Working-directory precondition, one bounded probe whose exit code
+    // names which gate failed:
+    //   3 — not a worktree root: $(…) empties on git failure, so a missing
+    //       git binary, a non-git directory, and a non-root subdirectory
+    //       (--show-prefix non-empty) all collapse into this failure.
+    //   4 — `git ls-files` itself failed inside a directory that claims to
+    //       be a worktree root; tracked-file coverage cannot be confirmed.
+    //   5 — the listing holds a C-quoted name. detect-secrets's
+    //       util/git.py::get_tracked_files inserts each raw `git ls-files`
+    //       output line into its scan set WITHOUT unquoting, while git
+    //       C-quotes any name containing '"', '\', a control byte, or a
+    //       byte >= 0x80 (core.quotePath default: a tracked 'sëcrets.txt'
+    //       is emitted as "s\303\253crets.txt"). The os.walk-derived real
+    //       path then fails the membership test and the file is silently
+    //       never scanned — exit 0, empty contribution to `results`, a
+    //       clean pass for files that were never read. Git wraps every
+    //       quoted entry in double quotes, so a line starting with '"' is
+    //       an exact detector, and the probe sees the same quoting the
+    //       tool's own ls-files call produces (repository git config —
+    //       core.quotePath — applies equally to both).
+    //   0 — coverage is provably complete.
     private const string GitWorktreeRootScript =
         "test \"$(git rev-parse --is-inside-work-tree 2>/dev/null)\" = true"
-        + " && test -z \"$(git rev-parse --show-prefix 2>/dev/null)\"";
+        + " && test -z \"$(git rev-parse --show-prefix 2>/dev/null)\" || exit 3;"
+        + " listing=$(git ls-files) || exit 4;"
+        + " printf '%s\\n' \"$listing\" | grep -q '^\"' && exit 5;"
+        + " exit 0";
+
+    private const int TrackedEnumerationFailedExit = 4;
+    internal const int QuotedTrackedNamesExit = 5;
 
     // Flags whose presence in ExtraArguments would redirect the report off
-    // stdout or load executable/suppressing content from an unguarded path.
-    // Rejected deterministically (naming the knob to use instead) rather than
-    // failing later as an opaque parse failure or silently reshaping the
-    // gate: --baseline redirects the report into the named file and loads
-    // plugin/filter settings from it (it must travel through the guarded,
-    // canonicalized BaselineFile knob); -p/--plugin and -f/--filter load
-    // Python code from paths that could resolve inside the audited worktree,
-    // letting the audit subject execute code in the scan process — install
-    // custom detectors/filters into the baseline image instead.
+    // stdout, load executable/suppressing content from an unguarded path,
+    // or silently reshape scan coverage. Rejected deterministically (naming
+    // the knob to use instead) rather than failing later as an opaque parse
+    // failure or silently weakening the gate:
+    //   --baseline         redirects the report into the named file and
+    //                      loads plugin/filter settings from it — it must
+    //                      travel through the guarded, canonicalized
+    //                      BaselineFile knob.
+    //   -p/--plugin, -f/--filter
+    //                      load Python code from paths that could resolve
+    //                      inside the audited worktree, letting the audit
+    //                      subject execute code in the scan process —
+    //                      install custom detectors/filters into the
+    //                      baseline image instead.
+    //   --word-list, --gibberish-model
+    //                      same unguarded-file-load class (feature-gated
+    //                      wordlist and gibberish-model files).
+    //   -C/--custom-root   retargets the scan at a different root while the
+    //                      worktree precondition probes the working
+    //                      directory — coverage would silently shrink.
+    //   --only-allowlisted flips the scan to pragma-only mode, so
+    //                      repo-authored allowlist comments alone decide
+    //                      findings.
+    // Python argparse resolves unambiguous long-option prefixes by default
+    // (allow_abbrev), so RejectReservedExtraArguments also rejects tokens
+    // that resolve to a reserved flag by abbreviation ('--bas', '--plug').
     private static readonly (string Long, string Short)[] ReservedFlags =
     [
         ("--baseline", ""),
         ("--plugin", "-p"),
         ("--filter", "-f"),
+        ("--word-list", ""),
+        ("--gibberish-model", ""),
+        ("--custom-root", "-C"),
+        ("--only-allowlisted", ""),
     ];
 
     private static readonly ExternalToolAuditorOptions AuditorDefaults = new()
@@ -353,14 +400,19 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
     }
 
     /// <summary>
-    /// detect-secrets-specific precondition beyond the base's presence and
-    /// version checks: unless the operator passed <c>--all-files</c>, the
-    /// scan enumerates git-tracked files — and outside a git worktree (or
-    /// below its root) it scans NOTHING and still exits 0 with an empty
-    /// <c>results</c>, which would read as a clean pass for a scan that
-    /// never ran. One bounded probe fails closed: <c>--is-inside-work-tree</c>
-    /// must say true and <c>--show-prefix</c> must be empty (subdir scans
-    /// silently cover only part of the tree).
+    /// detect-secrets-specific preconditions beyond the base's presence and
+    /// version checks: unless the operator's ExtraArguments genuinely put
+    /// the scan in <c>--all-files</c> mode (only tokens before a bare
+    /// <c>--</c> terminator count — argparse treats later ones as
+    /// positional paths), the scan enumerates git-tracked files — and
+    /// outside a git worktree (or below its root) it scans NOTHING and
+    /// still exits 0 with an empty <c>results</c>, which would read as a
+    /// clean pass for a scan that never ran. The same silent-skip applies
+    /// to tracked file names git must C-quote: detect-secrets compares the
+    /// raw <c>git ls-files</c> output line to walked paths and such files
+    /// never match, so one bounded probe also fails closed when the
+    /// listing emits any quoted entry (a leading <c>"</c> line is an exact
+    /// detector).
     /// </summary>
     protected override async Task VerifyToolAsync(
         ISandbox sandbox,
@@ -369,7 +421,7 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
         ExternalToolAuditorOptions options,
         CancellationToken ct)
     {
-        if (ExtraArgumentsSupplyFlag(options, "--all-files"))
+        if (AllFilesScanConfigured(options))
             return;
 
         var probe = await ExecToolBoundedAsync(
@@ -378,10 +430,6 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
             "worktree check",
             new SandboxExec
             {
-                // $(…) empties on git failure, so a missing git binary, a
-                // non-git directory, and a non-root subdirectory all end in
-                // the same non-zero exit — "could not confirm coverage" is
-                // never treated as coverage.
                 Argv = ["sh", "-c", GitWorktreeRootScript, "sh"],
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
@@ -394,6 +442,23 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' worktree check could not run: the sandbox "
                 + "exec transport was unavailable.");
+        if (probe.ExitCode == QuotedTrackedNamesExit)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' would silently skip tracked files whose "
+                + "names git must C-quote (a '\"', '\\', control byte, or byte >= 0x80 in the "
+                + "name — e.g. 'sëcrets.txt'): detect-secrets compares the quoted `git ls-files` "
+                + "entry verbatim against walked paths and never scans such files, yet still "
+                + "exits 0 — a clean pass for files never read. Rename the tracked files, or "
+                + "pass --all-files in ExtraArguments to scan the filesystem instead.",
+                probe.ExitCode,
+                probe.Stdout + "\n" + probe.Stderr);
+        if (probe.ExitCode == TrackedEnumerationFailedExit)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' could not enumerate the worktree's "
+                + "git-tracked files — coverage cannot be confirmed, so this is infrastructure, "
+                + "not a verdict on the diff.",
+                probe.ExitCode,
+                probe.Stdout + "\n" + probe.Stderr);
         if (probe.ExitCode != 0)
             throw new AuditUnavailableException(
                 $"could-not-verify: audit tool '{tool}' requires the audit working directory to be "
@@ -421,51 +486,67 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
         string tool,
         ExternalToolAuditorOptions options,
         SandboxExecResult result,
+        IReadOnlyList<string> argv,
         string? scanRoot,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(_baselineFile()))
+        // The baseline decision is read from the argv this run invoked — a
+        // hot config reload landing between ResolveContextArgumentsAsync
+        // and this hook cannot flip the report source mid-run. A bare
+        // "--baseline" token can only be the pair this auditor emitted:
+        // RejectReservedExtraArguments refuses it in ExtraArguments (even
+        // positionally, after a `--` terminator).
+        var reportPath = BaselineReportPath(argv);
+        if (reportPath is null)
             return await base.ResolveParserInputAsync(
-                sandbox, workingDirectory, tool, options, result, scanRoot, ct).ConfigureAwait(false);
+                sandbox, workingDirectory, tool, options, result, argv, scanRoot, ct)
+                .ConfigureAwait(false);
 
-        var reportPath = Path.Combine(PerRunTempDirectoryPath, BaselineCopyFileName);
-        var read = await ExecToolBoundedAsync(
-            sandbox,
-            tool,
-            "report read",
-            new SandboxExec
-            {
-                Argv = ["cat", reportPath],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = CapturedOutputLimit(options),
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
+        return await ReadReportFileParseInputAsync(
+            sandbox, workingDirectory, tool, options, result, reportPath, scanRoot, ct)
+            .ConfigureAwait(false);
+    }
 
-        if (read.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' report read could not run: the sandbox exec "
-                + "transport was unavailable.");
-        if (read.StdoutLimitExceeded)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' wrote a report exceeding the "
-                + $"{CapturedOutputLimit(options)}-byte capture bound — the report is fetched "
-                + "through a bounded read, so an oversized one is infrastructure, never a partial "
-                + "parse. Raise MaxOutputBytesPerStream or narrow the scan with ExcludePaths.")
-            { IsDeterministic = true };
-        if (read.ExitCode != 0)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' completed its scan but produced no readable "
-                + $"baseline report file (exit {read.ExitCode}) — a completed scan must leave a "
-                + "report, so this is infrastructure, not a verdict on the diff.",
-                read.ExitCode,
-                read.Stderr);
+    // The staged per-run baseline copy path when the run's argv carried a
+    // `--baseline <path>` pair; null otherwise.
+    private static string? BaselineReportPath(IReadOnlyList<string> argv)
+    {
+        for (var i = 0; i < argv.Count - 1; i++)
+        {
+            if (string.Equals(argv[i], "--baseline", StringComparison.Ordinal))
+                return argv[i + 1];
+        }
+        return null;
+    }
 
-        return new ExternalToolParseInput(
-            tool, read.Stdout, result.Stderr, result.ExitCode,
-            ScanRoot: scanRoot, WorkingDirectory: workingDirectory);
+    /// <summary>
+    /// True when the operator's ExtraArguments genuinely put the scan in
+    /// <c>--all-files</c> mode. argparse stops option parsing at a bare
+    /// <c>--</c> — a <c>--all-files</c> after it is a positional path, not
+    /// the flag, so it must not skip the worktree gate — and resolves
+    /// unambiguous long-option prefixes, so an abbreviation like
+    /// <c>--all</c> counts too.
+    /// </summary>
+    private static bool AllFilesScanConfigured(ExternalToolAuditorOptions options)
+    {
+        var optionTokens = options.ExtraArguments
+            .TakeWhile(static arg => arg != "--")
+            .ToArray();
+        return optionTokens.Any(static arg => ResolvesToLongOption(arg, "--all-files"));
+    }
+
+    // Python argparse resolves unambiguous long-option prefixes by default
+    // (allow_abbrev=True): '--bas=x' reaches the parser as '--baseline=x'.
+    // A token resolves to `longOption` when the part before any '=' is the
+    // option itself or a non-empty '--'-prefixed proper prefix of it; the
+    // bare '--' terminator (length 2) never matches.
+    private static bool ResolvesToLongOption(string argument, string longOption)
+    {
+        var eq = argument.IndexOf('=', StringComparison.Ordinal);
+        var token = eq >= 0 ? argument[..eq] : argument;
+        return token.Length > 2
+            && token.StartsWith("--", StringComparison.Ordinal)
+            && longOption.StartsWith(token, StringComparison.Ordinal);
     }
 
     private void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
@@ -473,20 +554,26 @@ public sealed class DetectSecretsAuditor : ExternalToolAuditorBase, IPluginIniti
         var offenders = new List<string>();
         foreach (var (longFlag, shortFlag) in ReservedFlags)
         {
-            var flags = shortFlag.Length == 0 ? new[] { longFlag } : new[] { longFlag, shortFlag };
-            if (ExtraArgumentsSupplyFlag(options, flags))
+            // ResolvesToLongOption covers the separated and '--flag=value'
+            // forms AND argparse's prefix abbreviations; the shared matcher
+            // additionally covers a short flag's joined '-fvalue' form.
+            var supplied =
+                options.ExtraArguments.Any(arg => ResolvesToLongOption(arg, longFlag))
+                || (shortFlag.Length > 0 && ExtraArgumentsSupplyFlag(options, shortFlag));
+            if (supplied)
                 offenders.Add(longFlag);
         }
         if (offenders.Count == 0)
             return;
         throw new AuditUnavailableException(
             $"could-not-verify: auditor '{Name}' was configured with ExtraArguments carrying "
-            + $"reserved flag(s) '{string.Join("', '", offenders)}' — they would redirect the report "
-            + "off stdout (--baseline goes through the guarded "
-            + $"CodeyBox:Plugins:{PluginId}:{BaselineFileKey} knob instead) or load Python "
-            + "plugin/filter code from a path that could resolve inside the audited worktree "
-            + "(-p/--plugin, -f/--filter) — custom detectors and filters must be installed into "
-            + "the sandbox baseline image, not fetched from repository content.")
+            + $"reserved flag(s) '{string.Join("', '", offenders)}' — they would redirect the "
+            + $"report off stdout (--baseline goes through the guarded CodeyBox:Plugins:{PluginId}:"
+            + $"{BaselineFileKey} knob instead), load code or data files from a path that could "
+            + "resolve inside the audited worktree (-p/--plugin, -f/--filter, --word-list, "
+            + "--gibberish-model — install custom detectors into the sandbox baseline image "
+            + "instead), or silently reshape scan coverage (-C/--custom-root, "
+            + "--only-allowlisted).")
         { IsDeterministic = true };
     }
 }
