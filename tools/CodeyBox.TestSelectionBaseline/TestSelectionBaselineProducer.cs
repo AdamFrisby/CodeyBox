@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 
 namespace CodeyBox.TestSelectionProducer;
 
@@ -9,16 +10,16 @@ namespace CodeyBox.TestSelectionProducer;
 /// </summary>
 public sealed class TestSelectionBaselineProducer
 {
-    private readonly IHostCommandRunner _runner;
+    private readonly HostCommands _commands;
     private readonly IPerTestCoverageCollector _coverage;
 
     public TestSelectionBaselineProducer(
-        IHostCommandRunner runner,
+        IProcessRunner runner,
         IPerTestCoverageCollector? coverage = null)
     {
         ArgumentNullException.ThrowIfNull(runner);
-        _runner = runner;
-        _coverage = coverage ?? new PerTestCoverletCollector(runner);
+        _commands = new HostCommands(runner);
+        _coverage = coverage ?? new PerTestCoverletCollector(_commands);
     }
 
     public async Task<TestSelectionBaseline> ProduceAsync(
@@ -26,6 +27,20 @@ public sealed class TestSelectionBaselineProducer
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(options);
+        try
+        {
+            return await ProduceCoreAsync(options, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _commands.Dispose();
+        }
+    }
+
+    private async Task<TestSelectionBaseline> ProduceCoreAsync(
+        TestSelectionProducerOptions options,
+        CancellationToken ct)
+    {
         ValidateOptions(options);
 
         var repoRoot = Path.GetFullPath(options.RepoRoot);
@@ -35,7 +50,7 @@ public sealed class TestSelectionBaselineProducer
         var outputPath = Path.GetFullPath(options.OutputPath);
         var commit = await ResolveCommitAsync(repoRoot, options, ct).ConfigureAwait(false);
         var graph = await MsBuildProjectGraph.LoadAsync(
-            repoRoot, options.SolutionPath, options, _runner, ct).ConfigureAwait(false);
+            repoRoot, options.SolutionPath, options, _commands, ct).ConfigureAwait(false);
 
         var buildTarget = options.SolutionPath is { Length: > 0 } sln
             ? MsBuildProjectGraph.ToRepoRelative(repoRoot, Path.GetFullPath(sln))
@@ -128,8 +143,7 @@ public sealed class TestSelectionBaselineProducer
 
         foreach (var target in targets)
         {
-            var result = await HostCommandRun.CappedAsync(
-                _runner,
+            var result = await _commands.CappedAsync(
                 [options.DotnetExecutable, "test", target, "--no-build", "--nologo", "--list-tests"],
                 repoRoot,
                 options.MaxListTestsChars,
@@ -146,7 +160,7 @@ public sealed class TestSelectionBaselineProducer
             if (!result.Success)
             {
                 throw new TestSelectionBaselineProduceException(
-                    $"dotnet test --list-tests on '{target}' exited {result.ExitCode}: {HostCommandRun.Tail(result.Stderr)}");
+                    $"dotnet test --list-tests on '{target}' exited {result.ExitCode}: {HostCommands.Tail(result.Stderr)}");
             }
 
             var names = DotnetTestListParser.Parse(
@@ -181,7 +195,7 @@ public sealed class TestSelectionBaselineProducer
         foreach (var project in graph.TestProjects)
         {
             var assembly = await TestDefiningFileResolver.ResolveTargetPathAsync(
-                repoRoot, project, options, _runner, ct).ConfigureAwait(false);
+                repoRoot, project, options, _commands, ct).ConfigureAwait(false);
             indexes[project] = assembly is null
                 ? TestAssemblyIndex.Empty
                 : TestDefiningFileResolver.LoadIndex(assembly, repoRoot);
@@ -257,8 +271,7 @@ public sealed class TestSelectionBaselineProducer
         if (!string.IsNullOrWhiteSpace(options.Commit))
             return options.Commit.Trim();
 
-        var result = await HostCommandRun.CappedAsync(
-            _runner,
+        var result = await _commands.CappedAsync(
             [options.GitExecutable, "-C", repoRoot, "rev-parse", "--verify", "HEAD"],
             repoRoot,
             maxStdoutChars: 256,
@@ -269,7 +282,7 @@ public sealed class TestSelectionBaselineProducer
         if (!result.Success)
         {
             throw new TestSelectionBaselineProduceException(
-                $"git rev-parse HEAD failed (exit {result.ExitCode}): {HostCommandRun.Tail(result.Stderr)}");
+                $"git rev-parse HEAD failed (exit {result.ExitCode}): {HostCommands.Tail(result.Stderr)}");
         }
 
         var sha = result.Stdout.Trim();
@@ -289,8 +302,7 @@ public sealed class TestSelectionBaselineProducer
         string label,
         CancellationToken ct)
     {
-        var result = await HostCommandRun.CappedAsync(
-            _runner,
+        var result = await _commands.CappedAsync(
             argv,
             repoRoot,
             options.MaxCommandStdoutChars,
@@ -303,7 +315,7 @@ public sealed class TestSelectionBaselineProducer
         if (!result.Success)
         {
             throw new TestSelectionBaselineProduceException(
-                $"{label} exited {result.ExitCode}: {HostCommandRun.Tail(result.Stderr)}{HostCommandRun.Tail(result.Stdout)}");
+                $"{label} exited {result.ExitCode}; stderr: {HostCommands.Tail(result.Stderr)}; stdout: {HostCommands.Tail(result.Stdout)}");
         }
     }
 

@@ -104,10 +104,10 @@ public static class TestDefiningFileResolver
             return TestAssemblyIndex.Empty;
 
         var metadata = peReader.GetMetadataReader();
-        MetadataReader? pdbReader = null;
         MetadataReaderProvider? pdbProvider = null;
         try
         {
+            MetadataReader? pdbReader;
             try
             {
                 if (!TryGetPdbReader(peReader, fullAssembly, out pdbReader, out pdbProvider))
@@ -117,6 +117,9 @@ public static class TestDefiningFileResolver
             {
                 return TestAssemblyIndex.Empty;
             }
+
+            if (pdbReader is null)
+                return TestAssemblyIndex.Empty;
 
             var byName = new Dictionary<string, List<MethodDocument>>(StringComparer.Ordinal);
             var documents = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -168,16 +171,16 @@ public static class TestDefiningFileResolver
         string repoRoot,
         string projectRelative,
         TestSelectionProducerOptions options,
-        IHostCommandRunner runner,
+        HostCommands commands,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(repoRoot);
         ArgumentException.ThrowIfNullOrWhiteSpace(projectRelative);
         ArgumentNullException.ThrowIfNull(options);
-        ArgumentNullException.ThrowIfNull(runner);
+        ArgumentNullException.ThrowIfNull(commands);
 
-        var result = await HostCommandRun.CappedAsync(
-            runner,
+        var label = $"dotnet msbuild -getProperty:TargetPath {projectRelative}";
+        var result = await commands.CappedAsync(
             [
                 // -nr:false: never leave a node-reuse MSBuild server running
                 // after the property eval (it inherits the output pipes).
@@ -188,8 +191,13 @@ public static class TestDefiningFileResolver
             options.MaxCommandStdoutChars,
             options.MaxCommandStdoutChars,
             options.CommandTimeout,
-            $"dotnet msbuild -getProperty:TargetPath {projectRelative}",
+            label,
             ct).ConfigureAwait(false);
+        // A cap breach means the evaluated value is truncated — fail loudly
+        // like every other command site rather than silently substituting
+        // the filesystem fallback.
+        if (result.StdoutLimitExceeded || result.StderrLimitExceeded)
+            throw new TestSelectionBaselineProduceException($"{label} exceeded an output cap.");
         if (!result.Success)
             return FindBuiltTestAssembly(repoRoot, projectRelative);
 
@@ -284,7 +292,7 @@ public static class TestDefiningFileResolver
     private static bool TryGetPdbReader(
         PEReader peReader,
         string assemblyPath,
-        out MetadataReader pdbReader,
+        out MetadataReader? pdbReader,
         out MetadataReaderProvider? provider)
     {
         foreach (var entry in peReader.ReadDebugDirectory())
@@ -314,7 +322,7 @@ public static class TestDefiningFileResolver
         }
 
         provider = null;
-        pdbReader = null!;
+        pdbReader = null;
         return false;
     }
 }

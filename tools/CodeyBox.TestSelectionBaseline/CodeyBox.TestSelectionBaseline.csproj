@@ -13,6 +13,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Audit\CodeyBox.Audit.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Audit.Shell\CodeyBox.Audit.Shell.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.HostProcess\CodeyBox.HostProcess.csproj" />
   </ItemGroup>
 
   <ItemGroup>

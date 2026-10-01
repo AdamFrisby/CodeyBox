@@ -278,7 +278,8 @@ public sealed class IncusGuestCpuActivityTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             Calls++;
             throw new InvalidOperationException("The Incus CLI must not run for rejected input.");
@@ -298,7 +299,8 @@ public sealed class IncusGuestCpuActivityTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             Arguments.Add(argv.ToArray());
             return Task.FromResult(stdout is null

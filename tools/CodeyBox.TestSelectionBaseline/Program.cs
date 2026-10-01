@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 
 namespace CodeyBox.TestSelectionProducer;
 
@@ -21,13 +22,13 @@ public static class Program
         TextWriter output,
         TextWriter error,
         CancellationToken ct)
-        => await RunAsync(args, output, error, new HostCommandRunner(), ct).ConfigureAwait(false);
+        => await RunAsync(args, output, error, new DefaultProcessRunner(), ct).ConfigureAwait(false);
 
     internal static async Task<int> RunAsync(
         string[] args,
         TextWriter output,
         TextWriter error,
-        IHostCommandRunner runner,
+        IProcessRunner runner,
         CancellationToken ct)
         => await RunAsync(args, output, error, runner, coverage: null, ct).ConfigureAwait(false);
 
@@ -35,7 +36,7 @@ public static class Program
         string[] args,
         TextWriter output,
         TextWriter error,
-        IHostCommandRunner runner,
+        IProcessRunner runner,
         IPerTestCoverageCollector? coverage,
         CancellationToken ct)
     {
@@ -88,37 +89,8 @@ public static class Program
                 $"Wrote {TestSelectionBaseline.FormatMarker} with {baseline.Tests.Count} tests to {options.OutputPath}");
             return ExitOk;
         }
-        catch (TestSelectionBaselineProduceException ex)
-        {
-            error.WriteLine(ex.Message);
-            return ExitFailed;
-        }
-        catch (FormatException ex)
-        {
-            error.WriteLine(ex.Message);
-            return ExitFailed;
-        }
-        catch (TimeoutException ex)
-        {
-            error.WriteLine(ex.Message);
-            return ExitFailed;
-        }
-        catch (DirectoryNotFoundException ex)
-        {
-            error.WriteLine(ex.Message);
-            return ExitFailed;
-        }
-        catch (FileNotFoundException ex)
-        {
-            error.WriteLine(ex.Message);
-            return ExitFailed;
-        }
-        catch (IOException ex)
-        {
-            error.WriteLine(ex.Message);
-            return ExitFailed;
-        }
-        catch (UnauthorizedAccessException ex)
+        catch (Exception ex) when (ex is TestSelectionBaselineProduceException
+            or FormatException or TimeoutException or IOException or UnauthorizedAccessException)
         {
             error.WriteLine(ex.Message);
             return ExitFailed;
@@ -197,7 +169,10 @@ public static class Program
                     skipBuild = true;
                     break;
                 default:
-                    throw new TestSelectionBaselineProduceException($"Unknown argument: {arg}");
+                    throw new TestSelectionBaselineProduceException(
+                        ValueFlags.Contains(arg)
+                            ? $"Missing value for {arg}."
+                            : $"Unknown argument: {arg}");
             }
         }
 
@@ -245,6 +220,22 @@ public static class Program
 
         return value;
     }
+
+    private static readonly HashSet<string> ValueFlags = new(StringComparer.Ordinal)
+    {
+        "--repo",
+        "--output",
+        "--commit",
+        "--solution",
+        "--dotnet",
+        "--git",
+        "--results-directory",
+        "--collector",
+        "--max-bytes",
+        "--max-tests",
+        "--max-covered-lines",
+        "--max-parallelism",
+    };
 
     private static bool IsHelp(string value)
         => value is "-h" or "--help" or "help";

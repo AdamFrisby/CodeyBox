@@ -1551,10 +1551,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             var dir = Path.GetDirectoryName(path)!;
             Directory.CreateDirectory(dir);
             TryChmod0700(dir);
-            var temp = Path.Combine(dir, "." + baselineName + "." + Guid.NewGuid().ToString("N") + ".tmp");
             var metadata = new BaselineTargetMetadata(profileName, flavor.ToString());
-            File.WriteAllText(temp, JsonSerializer.Serialize(metadata));
-            File.Move(temp, path, overwrite: true);
+            AtomicFile.WriteAllText(path, JsonSerializer.Serialize(metadata));
         }
         catch (Exception ex)
         {

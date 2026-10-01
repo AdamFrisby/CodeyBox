@@ -56,9 +56,12 @@ startup, not by the test body:
 | Tiny fixture used by `Producer_FixtureRoundTrip_ParsesWithStrictReader` (2 tests, restore + build + 2 isolated runs) | **~9 s** |
 | Extrapolated full CodeyBox.Tests map | 15,950 × 29.4 s ≈ **130 h** |
 
-`--max-parallelism` does **not** shorten the single-test-project case: this
-repository has one test assembly, so its baseline runs serialize. The knob
-only helps a multi-test-project checkout.
+`--max-parallelism` does **not** shorten the dominant cost: the audited
+suite is a single test project (tests/CodeyBox.Tests), and per-test runs
+inside one project serialize — coverlet races on its per-module backup
+files. The solution does contain other test projects
+(CodeyBox.Admin/.Admin.Model/.Cli tests); the producer discovers and
+collects those too, and the knob helps only across projects.
 
 This producer is a **post-merge orchestrator-host job**, not part of the
 90-minute per-item `csharp:test-pass` budget. The isolated-run cost is the

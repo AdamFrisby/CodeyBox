@@ -891,7 +891,8 @@ public sealed class IncusMountAndCloudInitTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             Called = true;
             throw new InvalidOperationException("Incus should not be called for invalid limits.");

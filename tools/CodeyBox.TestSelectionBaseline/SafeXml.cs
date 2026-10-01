@@ -1,26 +1,20 @@
 using System.Xml;
 using System.Xml.Linq;
+using CodeyBox.Core;
 
 namespace CodeyBox.TestSelectionProducer;
 
 /// <summary>
-/// XXE-safe XML load for untrusted repo files (csproj, slnx). DTD processing
-/// and external entities are disabled at the reader, matching
-/// <c>CoberturaParser</c>.
+/// XXE-safe XML load for untrusted repo files (csproj, slnx), hardened via
+/// the shared <see cref="SafeXmlSettings"/> policy.
 /// </summary>
 internal static class SafeXml
 {
     public static XDocument Load(string xml)
     {
         ArgumentNullException.ThrowIfNull(xml);
-        var settings = new XmlReaderSettings
-        {
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-            MaxCharactersFromEntities = 0,
-        };
         using var stringReader = new StringReader(xml);
-        using var reader = XmlReader.Create(stringReader, settings);
+        using var reader = XmlReader.Create(stringReader, SafeXmlSettings.Create());
         return XDocument.Load(reader);
     }
 

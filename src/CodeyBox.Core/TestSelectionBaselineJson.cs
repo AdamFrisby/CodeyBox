@@ -73,33 +73,16 @@ public static class TestSelectionBaselineJson
 
     /// <summary>
     /// Serialises under <paramref name="limits"/>, then replaces
-    /// <paramref name="path"/> via a same-directory temp file +
-    /// <see cref="File.Move(string, string, bool)"/>. On any cap miss or
-    /// serialisation failure the destination is left untouched (and is not
-    /// created if it did not exist).
+    /// <paramref name="path"/> via <see cref="AtomicFile"/>'s same-directory
+    /// temp file + move. On any cap miss or serialisation failure the
+    /// destination is left untouched (and is not created if it did not
+    /// exist).
     /// </summary>
     public static void WriteAtomic(string path, TestSelectionBaseline baseline, BaselineReadLimits limits)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         var json = Serialize(baseline, limits);
-
-        var fullPath = Path.GetFullPath(path);
-        var directory = Path.GetDirectoryName(fullPath);
-        if (string.IsNullOrEmpty(directory))
-            throw new InvalidOperationException($"Baseline output path '{path}' has no directory.");
-
-        Directory.CreateDirectory(directory);
-        var tmp = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.tmp.{Guid.NewGuid():N}");
-        try
-        {
-            File.WriteAllText(tmp, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            File.Move(tmp, fullPath, overwrite: true);
-        }
-        catch
-        {
-            TryDelete(tmp);
-            throw;
-        }
+        AtomicFile.WriteAllText(path, json);
     }
 
     private static void WriteDocument(Utf8JsonWriter writer, TestSelectionBaseline baseline)
@@ -188,20 +171,5 @@ public static class TestSelectionBaselineJson
                 set.Add(line);
         }
         return [.. set];
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            if (File.Exists(path))
-                File.Delete(path);
-        }
-        catch (IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
     }
 }

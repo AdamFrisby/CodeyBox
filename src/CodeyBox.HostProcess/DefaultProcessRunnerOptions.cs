@@ -10,8 +10,10 @@ public sealed record DefaultProcessRunnerOptions
 {
     public static readonly TimeSpan DefaultCleanupTimeout = TimeSpan.FromSeconds(5);
     public static readonly TimeSpan DefaultProcessGroupExitPollInterval = TimeSpan.FromMilliseconds(10);
+    public static readonly TimeSpan DefaultPostExitDrainGrace = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan MaximumCleanupTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MaximumProcessGroupExitPollInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan MaximumPostExitDrainGrace = TimeSpan.FromMinutes(1);
 
     /// <summary>
     /// Launch the command through <c>setsid</c> on Linux and terminate the
@@ -31,6 +33,19 @@ public sealed record DefaultProcessRunnerOptions
     /// <summary>Delay between Linux process-group absence probes during cleanup.</summary>
     public TimeSpan ProcessGroupExitPollInterval { get; init; } = DefaultProcessGroupExitPollInterval;
 
+    /// <summary>
+    /// Upper bound on draining redirected output AFTER the child exits.
+    /// Everything the child itself wrote is already buffered in the pipes
+    /// and drains immediately, but a detached grandchild that inherited the
+    /// pipe write ends (e.g. an MSBuild node-reuse server outliving
+    /// <c>dotnet msbuild</c>) can keep them open for minutes. Once this
+    /// grace elapses the affected output is flagged
+    /// <see cref="ProcessRunResult.StdoutLimitExceeded"/>/
+    /// <see cref="ProcessRunResult.StderrLimitExceeded"/> rather than
+    /// blocking the caller on pipe EOF.
+    /// </summary>
+    public TimeSpan PostExitDrainGrace { get; init; } = DefaultPostExitDrainGrace;
+
     /// <summary>Throws when cleanup timing values fall outside bounded safety ranges.</summary>
     public static void Validate(DefaultProcessRunnerOptions options)
     {
@@ -48,6 +63,13 @@ public sealed record DefaultProcessRunnerOptions
             throw new ArgumentOutOfRangeException(
                 nameof(options),
                 $"ProcessGroupExitPollInterval must be positive, no more than {MaximumProcessGroupExitPollInterval}, and no greater than CleanupTimeout.");
+        }
+        if (options.PostExitDrainGrace <= TimeSpan.Zero
+            || options.PostExitDrainGrace > MaximumPostExitDrainGrace)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                $"PostExitDrainGrace must be positive and no more than {MaximumPostExitDrainGrace}.");
         }
     }
 }

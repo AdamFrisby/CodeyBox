@@ -3975,7 +3975,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             Commands.Add(argv.ToArray());
@@ -4043,7 +4044,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             Commands.Add(argv.ToArray());
@@ -4113,7 +4115,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             if (argv.Contains("list", StringComparer.Ordinal))
@@ -4157,7 +4160,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             if (argv.Contains("list", StringComparer.Ordinal))
@@ -4195,7 +4199,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
@@ -4244,7 +4249,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
@@ -4327,7 +4333,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             Commands.Add(argv.ToArray());
@@ -4429,7 +4436,8 @@ public sealed class IncusSandboxLifecycleTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))

@@ -198,7 +198,8 @@ public sealed class DiskGuardPreflightTests : IDisposable
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true) =>
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null) =>
             throw new InvalidOperationException("preflight tests must not reach the multipass launch path");
     }
 }

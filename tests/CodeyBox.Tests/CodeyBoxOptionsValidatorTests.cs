@@ -1799,7 +1799,8 @@ public sealed class CodeyBoxOptionsValidatorTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             Calls.Add(new ProcessCall(argv.ToArray(), stdin, maxStdoutBytes, maxStderrBytes));
             return Task.FromResult(_result);
@@ -1823,7 +1824,8 @@ public sealed class CodeyBoxOptionsValidatorTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
             => Task.FromException<ProcessRunResult>(new InvalidOperationException("ssh -G launch failed"));
     }
 }

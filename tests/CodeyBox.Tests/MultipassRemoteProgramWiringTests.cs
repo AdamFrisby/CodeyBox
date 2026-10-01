@@ -279,7 +279,8 @@ public sealed class MultipassRemoteProgramWiringTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             _ = stdin;
             _ = ct;

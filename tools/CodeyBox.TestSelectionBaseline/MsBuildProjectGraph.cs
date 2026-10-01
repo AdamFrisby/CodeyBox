@@ -28,15 +28,15 @@ public static class MsBuildProjectGraph
         string repoRoot,
         string? solutionPath,
         TestSelectionProducerOptions options,
-        IHostCommandRunner runner,
+        HostCommands commands,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(repoRoot);
         ArgumentNullException.ThrowIfNull(options);
-        ArgumentNullException.ThrowIfNull(runner);
+        ArgumentNullException.ThrowIfNull(commands);
 
         var root = Path.GetFullPath(repoRoot);
-        var projects = await DiscoverProjectsAsync(root, solutionPath, options, runner, ct)
+        var projects = await DiscoverProjectsAsync(root, solutionPath, options, commands, ct)
             .ConfigureAwait(false);
         if (projects.Count == 0)
             throw new TestSelectionBaselineProduceException("No projects were found in the checkout.");
@@ -61,7 +61,7 @@ public static class MsBuildProjectGraph
 
             references[project] = ReadProjectReferences(document, root, fullProject);
             foreach (var file in await ReadCompileItemsAsync(
-                         root, project, options, runner, ct).ConfigureAwait(false))
+                         root, project, options, commands, ct).ConfigureAwait(false))
             {
                 sourceFiles++;
                 if (sourceFiles > options.MaxSourceFiles)
@@ -92,7 +92,7 @@ public static class MsBuildProjectGraph
         string repoRoot,
         string? solutionPath,
         TestSelectionProducerOptions options,
-        IHostCommandRunner runner,
+        HostCommands commands,
         CancellationToken ct)
     {
         var root = Path.GetFullPath(repoRoot);
@@ -102,7 +102,7 @@ public static class MsBuildProjectGraph
 
         if (solution is not null)
         {
-            var listed = await TryListSolutionAsync(root, solution, options, runner, ct)
+            var listed = await TryListSolutionAsync(root, solution, options, commands, ct)
                 .ConfigureAwait(false);
             if (listed.Count > 0)
                 return listed;
@@ -114,6 +114,10 @@ public static class MsBuildProjectGraph
     public static string? FindSolutionFile(string repoRoot)
     {
         var root = Path.GetFullPath(repoRoot);
+        // Prefer this repository's own solution name when present — the
+        // producer's primary job is CodeyBox itself. Only short-circuits
+        // when that exact file exists; foreign checkouts fall through to
+        // generic *.slnx/*.sln enumeration.
         var preferred = Path.Combine(root, "CodeyBox.slnx");
         if (File.Exists(preferred))
             return preferred;
@@ -143,7 +147,7 @@ public static class MsBuildProjectGraph
         string repoRoot,
         string solutionPath,
         TestSelectionProducerOptions options,
-        IHostCommandRunner runner,
+        HostCommands commands,
         CancellationToken ct)
     {
         // A .slnx is plain XML listing every project — parse it locally and
@@ -157,8 +161,7 @@ public static class MsBuildProjectGraph
         }
 
         var relativeSolution = ToRepoRelative(repoRoot, solutionPath);
-        var result = await HostCommandRun.CappedAsync(
-            runner,
+        var result = await commands.CappedAsync(
             [options.DotnetExecutable, "sln", relativeSolution, "list"],
             repoRoot,
             options.MaxCommandStdoutChars,
@@ -167,7 +170,10 @@ public static class MsBuildProjectGraph
             $"dotnet sln {relativeSolution} list",
             ct).ConfigureAwait(false);
 
-        if (result.Success)
+        // A cap-breaching exit-0 run produced truncated stdout — treat it as
+        // a failure so discovery falls back to filesystem enumeration rather
+        // than parsing a partial project list.
+        if (result.Success && !result.StdoutLimitExceeded && !result.StderrLimitExceeded)
         {
             var fromDotnet = ParseSlnList(result.Stdout, repoRoot, options.MaxProjectFiles);
             if (fromDotnet.Count > 0)
@@ -312,12 +318,11 @@ public static class MsBuildProjectGraph
         string repoRoot,
         string projectRelative,
         TestSelectionProducerOptions options,
-        IHostCommandRunner runner,
+        HostCommands commands,
         CancellationToken ct)
     {
         var label = $"dotnet msbuild -getItem:Compile {projectRelative}";
-        var result = await HostCommandRun.CappedAsync(
-            runner,
+        var result = await commands.CappedAsync(
             // -nr:false: never leave a node-reuse MSBuild server running —
             // it outlives the CLI process while still holding the output
             // pipes open.
@@ -333,7 +338,7 @@ public static class MsBuildProjectGraph
         if (!result.Success)
         {
             throw new TestSelectionBaselineProduceException(
-                $"{label} exited {result.ExitCode}: {HostCommandRun.Tail(result.Stderr)}");
+                $"{label} exited {result.ExitCode}: {HostCommands.Tail(result.Stderr)}");
         }
 
         using var document = ParseJson(result.Stdout, label);

@@ -65,7 +65,8 @@ internal sealed class RecordingMultipassRunner : IProcessRunner
         int? maxStdoutBytes = null,
         int? maxStderrBytes = null,
         IReadOnlyDictionary<string, string>? environment = null,
-        bool killOnOutputLimit = true)
+        bool killOnOutputLimit = true,
+        string? workingDirectory = null)
     {
         Calls.Enqueue(new MultipassCall(
             argv.ToArray(),

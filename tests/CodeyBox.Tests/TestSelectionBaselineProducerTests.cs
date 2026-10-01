@@ -1,6 +1,7 @@
 using System.Text.Json;
 using CodeyBox.Audit;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.TestSelectionProducer;
 using ProducerProgram = CodeyBox.TestSelectionProducer.Program;
 
@@ -285,8 +286,9 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
         Assert.False(File.Exists(output));
     }
 
-    // Real restore + build + two isolated coverlet runs; ~15 s warm standalone
-    // but needs headroom under full-suite load (observed >180 s contended).
+    // Real restore + build + two isolated coverlet runs; ~9 s warm standalone
+    // (README measured) but needs headroom under full-suite load (observed
+    // >180 s contended).
     [Fact(Timeout = 600_000)]
     public async Task Producer_FixtureRoundTrip_ParsesWithStrictReader()
     {
@@ -294,7 +296,7 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
         WriteTinyFixture(repo);
         File.Copy(Path.Combine(FindRepoRoot(), "nuget.config"), Path.Combine(repo, "nuget.config"), overwrite: true);
         var output = Path.Combine(_root, "live-baseline.json");
-        var producer = new TestSelectionBaselineProducer(new HostCommandRunner());
+        var producer = new TestSelectionBaselineProducer(new DefaultProcessRunner());
         var options = new TestSelectionProducerOptions
         {
             RepoRoot = repo,
@@ -344,26 +346,29 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
     // holds the redirected pipes — the same shape as a detached MSBuild
     // node-reuse server surviving 'dotnet msbuild'. The runner must return
     // once the direct child exits plus a short drain grace, not wait for
-    // pipe EOF (pre-fix this blocked until the command timeout).
+    // pipe EOF (pre-fix this blocked until the command timeout), and the
+    // truncated drain must be VISIBLE via the limit-exceeded flags.
     [SkippableFact]
     public async Task Runner_DetachedGrandchildHoldingPipes_ReturnsAfterChildExit()
     {
         Skip.If(OperatingSystem.IsWindows(), "fixture requires POSIX sh");
-        var runner = new HostCommandRunner();
+        var runner = new DefaultProcessRunner();
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         var result = await runner.RunAsync(
             ["sh", "-c", "sleep 45 & echo done"],
-            _root,
-            extraEnvironment: null,
-            maxStdoutChars: 16 * 1024,
-            maxStderrChars: 16 * 1024,
-            timeout: TimeSpan.FromSeconds(120),
-            CancellationToken.None);
+            stdin: null,
+            CancellationToken.None,
+            maxStdoutBytes: 16 * 1024,
+            maxStderrBytes: 16 * 1024,
+            killOnOutputLimit: false,
+            workingDirectory: _root);
 
         stopwatch.Stop();
         Assert.True(result.Success, result.Stderr);
         Assert.Contains("done", result.Stdout, StringComparison.Ordinal);
+        Assert.True(result.StdoutLimitExceeded,
+            "the orphaned pipe writer should surface as a truncated drain");
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(30),
             $"runner returned after {stopwatch.Elapsed} — it waited on the orphaned pipe writer");
     }
@@ -429,25 +434,25 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
         Assert.Contains(TestSelectionBaseline.FormatMarker, stdout.ToString(), StringComparison.Ordinal);
     }
 
-    private static HostCommandResult Respond(IReadOnlyList<string> argv, string repo)
+    private static ProcessRunResult Respond(IReadOnlyList<string> argv, string repo)
     {
         if (argv.Contains("--list-tests", StringComparer.Ordinal))
         {
-            return new HostCommandResult(0,
+            return new ProcessRunResult(0,
                 "The following Tests are available:\n    Lib.Tests.AdderTests.Adds\n    Lib.Tests.UntouchedTests.AlwaysTrue\n",
                 "");
         }
 
         if (argv.Contains("sln", StringComparer.Ordinal) && argv.Contains("list", StringComparer.Ordinal))
         {
-            return new HostCommandResult(0,
+            return new ProcessRunResult(0,
                 "Project(s)\n----------\nsrc/Lib/Lib.csproj\ntests/Lib.Tests/Lib.Tests.csproj\n", "");
         }
 
         if (argv.Any(a => a.Contains("TargetPath", StringComparison.Ordinal)))
         {
             var dll = Path.Combine(repo, "tests", "Lib.Tests", "bin", "Debug", "net10.0", "Lib.Tests.dll");
-            return new HostCommandResult(0, dll + "\n", "");
+            return new ProcessRunResult(0, dll + "\n", "");
         }
 
         if (argv.Contains("-getItem:Compile", StringComparer.Ordinal))
@@ -460,15 +465,15 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
                 Identity = f,
                 FullPath = Path.Combine(repo, f.Replace('/', Path.DirectorySeparatorChar)),
             })));
-            return new HostCommandResult(0, "{\"Items\":{\"Compile\":[" + items + "]}}", "");
+            return new ProcessRunResult(0, "{\"Items\":{\"Compile\":[" + items + "]}}", "");
         }
 
         if (argv.Contains("build", StringComparer.Ordinal))
-            return new HostCommandResult(0, "", "");
+            return new ProcessRunResult(0, "", "");
         if (argv.Contains("rev-parse", StringComparer.Ordinal))
-            return new HostCommandResult(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+            return new ProcessRunResult(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
 
-        return new HostCommandResult(0, "", "");
+        return new ProcessRunResult(0, "", "");
     }
 
     private static void WriteTinyFixture(string repo)
@@ -567,19 +572,22 @@ public sealed class TestSelectionBaselineProducerTests : IDisposable
         throw new InvalidOperationException("Could not locate the repository root.");
     }
 
-    private sealed class ScriptedCommandRunner : IHostCommandRunner
+    private sealed class ScriptedCommandRunner : IProcessRunner
     {
-        public Func<IReadOnlyList<string>, HostCommandResult> Handle { get; set; } =
-            _ => new HostCommandResult(0, "", "");
+        public Func<IReadOnlyList<string>, ProcessRunResult> Handle { get; set; } =
+            _ => new ProcessRunResult(0, "", "");
 
-        public Task<HostCommandResult> RunAsync(
+        public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
-            string workingDirectory,
-            IReadOnlyDictionary<string, string>? extraEnvironment,
-            int maxStdoutChars,
-            int maxStderrChars,
-            TimeSpan timeout,
-            CancellationToken ct)
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
             => Task.FromResult(Handle(argv));
     }
 

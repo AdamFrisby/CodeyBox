@@ -1,15 +1,9 @@
+using System.Runtime.ExceptionServices;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 
 namespace CodeyBox.TestSelectionProducer;
-
-/// <summary>
-/// One test's recorded coverage (possibly empty — no report / no hits).
-/// </summary>
-public sealed record PerTestCoverage(
-    string TestName,
-    IReadOnlyDictionary<string, IReadOnlyList<int>> Covers);
 
 /// <summary>
 /// Collects per-test XPlat/Cobertura coverage by running each listed test in
@@ -36,12 +30,12 @@ public interface IPerTestCoverageCollector
 
 public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
 {
-    private readonly IHostCommandRunner _runner;
+    private readonly HostCommands _commands;
 
-    public PerTestCoverletCollector(IHostCommandRunner runner)
+    internal PerTestCoverletCollector(HostCommands commands)
     {
-        ArgumentNullException.ThrowIfNull(runner);
-        _runner = runner;
+        ArgumentNullException.ThrowIfNull(commands);
+        _commands = commands;
     }
 
     public async Task<IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<int>>>> CollectAsync(
@@ -96,7 +90,14 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
             }
 
             if (errors.Count > 0)
-                throw errors[0];
+            {
+                // Capture keeps the original stack; the full failure list is
+                // preserved in an AggregateException when several tests failed.
+                if (errors.Count == 1)
+                    ExceptionDispatchInfo.Capture(errors[0]).Throw();
+                throw new AggregateException(
+                    $"{errors.Count} per-test coverage runs failed.", errors);
+            }
         }
         finally
         {
@@ -147,13 +148,13 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
                 "--settings", runsettings,
             };
 
-            var run = await _runner.RunAsync(
+            var run = await _commands.CappedAsync(
                 argv,
                 repoRoot,
-                extraEnvironment: null,
                 options.MaxCommandStdoutChars,
                 options.MaxCommandStdoutChars,
                 options.PerTestTimeout,
+                $"dotnet test --collect for '{Sanitize(testName)}'",
                 ct).ConfigureAwait(false);
 
             if (run.StdoutLimitExceeded || run.StderrLimitExceeded)
@@ -258,8 +259,5 @@ public sealed class PerTestCoverletCollector : IPerTestCoverageCollector
     }
 
     private static string Sanitize(string value)
-    {
-        var chars = value.Select(ch => char.IsControl(ch) ? '_' : ch).ToArray();
-        return new string(chars);
-    }
+        => HostCommands.SanitizeForMessage(value, keepLineBreaks: false);
 }
