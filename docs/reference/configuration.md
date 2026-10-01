@@ -45,6 +45,23 @@ Hot-reloadable today:
   To stop dispatch to an agent, remove it from `AgentClasses[*].Members` or
   pause the queue. The resolved caps are logged at orchestrator startup and on
   every successful hot-reload so the effective value is visible to operators.
+  `MaxConcurrent` bounds **every agent CLI session** the provider sees — work,
+  rework, delegation, conflict-resolution turns, and each parallel LLM auditor
+  session (each auditor acquires one session slot on the audited item's agent
+  route before it starts; the count released+in-flight is the same number
+  `/concurrency` reports). To keep the item's own work slot from starving its
+  auditors, the pipeline releases ("suspends") the work slot for the duration
+  of the LLM auditor fan-out and re-acquires it before any rework turn — a
+  `MaxConcurrent: 1` agent can therefore work, audit, and rework the same item
+  without deadlock. The optional `MaxConcurrentAuditSessions` sub-cap (>= 1,
+  defaults to `MaxConcurrent` when omitted) bounds how many of a route's
+  sessions may be audit sessions so a large audit fan-out cannot starve new
+  work turns. Like `MaxConcurrent`, it is hot-reloadable and non-disruptive:
+  raised ceilings admit waiting auditor sessions, lowered ceilings leave
+  in-flight sessions running. `/concurrency` exposes
+  `currentlyRunningPerAgent` (the cap-compared total),
+  `currentlyRunningWorkPerAgent`, `currentlyRunningAuditPerAgent`, and
+  `perAgentAuditCaps`.
 - `AgentClasses` + `AgentInstances` + `AgentScoreModifiers` — re-applied via
   `AgentConfigHotReload` to the live `AgentClassRouter` catalog. In-flight
   routing calls finish against the snapshot they started with.

@@ -165,6 +165,15 @@ public sealed partial class PipelineRunner
     // Placement-driven sandbox acquisition for the work phase (null keeps the
     // legacy direct-provider path).
     private readonly SandboxPlacementAcquirer? _sandboxPlacer;
+    // Per-agent CLI session slot gate shared with the orchestrator's
+    // concurrency accounting. Every LLM auditor attempt acquires one audit
+    // slot through it, so AgentConcurrency.Members.*.MaxConcurrent bounds the
+    // real provider session count (work + audit), and the item's own work
+    // slot is suspended around the auditor fan-out (release-before-acquire —
+    // see IAgentSessionSlotGate's deadlock contract). Null in tests/embeddings
+    // that don't wire the orchestrator: sessions then run ungated, matching
+    // pre-change behaviour.
+    private readonly IAgentSessionSlotGate? _sessionSlotGate;
     // Leased workload secrets (null keeps the static host-environment path).
     // When wired, grant-authorised secrets are issued as time-bound or
     // brokered leases and revoked on terminal transitions.
@@ -562,7 +571,12 @@ public sealed partial class PipelineRunner
         // Leased workload secrets. Optional: production DI wires the
         // SecretLeaseManager; null keeps the static host-environment path
         // so existing tests and static-only deployments are unaffected.
-        SecretLeaseManager? secretLeases = null)
+        SecretLeaseManager? secretLeases = null,
+        // Per-agent session slot gate. Optional: production DI wires the
+        // orchestrator's gate through a deferred resolution (the runner is
+        // constructed before the hosted service that implements it);
+        // null leaves auditor sessions ungated for tests/embeddings.
+        IAgentSessionSlotGate? sessionSlotGate = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -719,6 +733,7 @@ public sealed partial class PipelineRunner
         _delegationEscalation = delegationEscalation;
         _sandboxPlacer = sandboxPlacer;
         _secretLeases = secretLeases;
+        _sessionSlotGate = sessionSlotGate;
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,

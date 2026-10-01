@@ -285,7 +285,7 @@ public sealed partial class PipelineRunner
                     project,
                     "planning",
                     iteration: null,
-                    async (runner, trialItem, attemptCt) =>
+                    async (runner, member, trialItem, attemptCt) =>
                         await RunWithStuckProbeAsync(
                             trialItem,
                             project,

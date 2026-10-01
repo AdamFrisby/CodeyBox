@@ -44,7 +44,11 @@ public sealed record DispatchStatusResult(
 /// <param name="Agent">The agent kind.</param>
 /// <param name="Routable">Whether the agent can currently take work.</param>
 /// <param name="ExclusionReason">Why the agent is not routable; null when routable.</param>
-/// <param name="InFlight">Items currently dispatched to this agent.</param>
+/// <param name="InFlight">Agent CLI sessions currently in flight on this agent
+/// (work + audit) — the number compared against <paramref name="MaxConcurrent"/>.</param>
+/// <param name="InFlightWork">In-flight work-phase sessions (work, rework,
+/// delegation, conflict resolution).</param>
+/// <param name="InFlightAudit">In-flight LLM auditor sessions.</param>
 /// <param name="MaxConcurrent">Configured per-agent concurrency cap; null = uncapped.</param>
 /// <param name="QuotaExhausted">Whether the agent's quota window is spent.</param>
 /// <param name="QuotaResetsAt">When the exhausted window resets; null when unknown or not exhausted.</param>
@@ -55,7 +59,9 @@ public sealed record AgentCapacityEntry(
     int InFlight,
     int? MaxConcurrent,
     bool QuotaExhausted,
-    DateTimeOffset? QuotaResetsAt);
+    DateTimeOffset? QuotaResetsAt,
+    int InFlightWork = 0,
+    int InFlightAudit = 0);
 
 /// <summary>Result of <c>get_agent_capacity</c>.</summary>
 /// <param name="Entries">One entry per agent in scope.</param>

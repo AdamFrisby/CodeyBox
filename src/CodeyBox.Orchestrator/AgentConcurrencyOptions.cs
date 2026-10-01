@@ -107,10 +107,13 @@ public sealed class AgentConcurrencyOptions
 public sealed class AgentConcurrencyEntry
 {
     /// <summary>
-    /// Maximum number of work items that may run concurrently while routed to
-    /// this agent kind. <b>Must be &gt;= 1.</b> Values &lt;= 0 are rejected at
-    /// config load — to leave the agent uncapped, omit the entry entirely.
-    /// See <see cref="AgentConcurrencyOptions"/> for the rationale.
+    /// Maximum number of agent CLI sessions that may run concurrently on this
+    /// route — work items (work, rework, delegation, conflict resolution)
+    /// <b>plus</b> each parallel LLM auditor session, since every one is a
+    /// real provider session and the cap exists to honour the provider's
+    /// concurrent-session limit. <b>Must be &gt;= 1.</b> Values &lt;= 0 are
+    /// rejected at config load — to leave the agent uncapped, omit the entry
+    /// entirely. See <see cref="AgentConcurrencyOptions"/> for the rationale.
     /// </summary>
     public int MaxConcurrent { get; set; } = 0;
 

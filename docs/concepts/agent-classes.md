@@ -89,6 +89,17 @@ When `claude/acct-a` is exhausted or rate-limited, fallback can move to
 `claude/acct-b` before trying a weaker or different kind. The VM receives only
 the selected instance's credential bundle for that invocation.
 
+`MaxConcurrent` counts **every agent CLI session** on the route — work,
+rework, delegation, conflict resolution, and each LLM auditor session —
+because operators set it to the provider's concurrent-session limit. An item
+releases its work slot for the duration of the LLM auditor fan-out and
+re-acquires it before rework, so a `MaxConcurrent: 1` agent can still work
+then audit the same item without deadlocking. The optional
+`MaxConcurrentAuditSessions` sub-cap (default: `MaxConcurrent`) bounds how
+many concurrent sessions on a route may be audit sessions — lower it when a
+large audit fan-out should never starve incoming work turns. Both values are
+hot-reloadable and route-key aware (`claude/acct-a` overrides `claude`).
+
 Same-kind siblings are ordered by `CodeyBox:QuotaRouter:IntraKindRoutingPolicy`.
 The default `MostQuotaFirst` probes sibling instances and spends the account
 with the most remaining quota first. `RoundRobin` rotates across usable

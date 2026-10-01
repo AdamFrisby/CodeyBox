@@ -399,7 +399,7 @@ public sealed partial class PipelineRunner
                     project,
                     "post-act-recheck",
                     iteration,
-                    (runner, trialItem, attemptCt) => RunPostActReCheckAgentAsync(
+                    (runner, member, trialItem, attemptCt) => RunPostActReCheckAgentAsync(
                         trialItem, project, runner, repoId, workBranch, prompt, iteration, attemptCt),
                     ct,
                     initialRunnerOverride: agentRunner,
@@ -476,7 +476,7 @@ public sealed partial class PipelineRunner
             try
             {
                 await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
-                    async (workerRunner, trialItem, attemptCt) =>
+                    async (workerRunner, member, trialItem, attemptCt) =>
                         await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
                             phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
                                 reworkPrompt, isInitial: false,

@@ -14,7 +14,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler, IRefactorProjectGateStatusProvider, IRefactorProjectDispatchGate
+public sealed partial class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSessionSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler, IRefactorProjectGateStatusProvider, IRefactorProjectDispatchGate
 {
     private const int DispatchPickupCandidatePageSize = 128;
     private const int DispatchPickupCandidateScanBudget = DispatchPickupCandidatePageSize * 4;
@@ -96,13 +96,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // dispatch time.
     private readonly AgentConcurrencySnapshot _concurrencySnapshot;
 
-    // Live in-flight count keyed by routed agent instance. For class-routed items
-    // the count is incremented atomically inside AgentClassRouter via the
+    // Live in-flight agent CLI session counts keyed by routed agent instance,
+    // split into work vs audit sessions. For class-routed items the work count
+    // is incremented atomically inside AgentClassRouter via the
     // IAgentSlotGate (this service); for direct-agent items the orchestrator
-    // reserves the slot itself after routing. In both cases the outer finally
-    // block releases the slot. Surfaced via /concurrency and consumed by the
+    // reserves the slot itself after routing. LLM auditor sessions take audit
+    // reservations through the same gate so the route's MaxConcurrent bounds
+    // every session the provider sees. The lock-guarded machinery lives in
+    // OrchestratorService.AgentSessionSlots.cs; the work reservation is bound
+    // to the item (RegisterItemWorkSlot) so the pipeline can suspend it around
+    // the auditor fan-out. Surfaced via /concurrency and consumed by the
     // rate-aware gate.
-    private readonly ConcurrentDictionary<string, int> _runningPerRoute = new(StringComparer.OrdinalIgnoreCase);
 
     // Quota escrow leases keyed by work item id string. Populated when class
     // routing authorises a dispatch with a reservation ledger wired; the outer
@@ -377,94 +381,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "startup");
     }
 
-    /// <inheritdoc />
-    public int GetRunning(AgentKind agent)
-    {
-        var total = 0;
-        foreach (var kv in _runningPerRoute)
-        {
-            if (string.Equals(AgentInstanceIds.KindFromRouteKey(kv.Key), agent.Value, StringComparison.OrdinalIgnoreCase))
-                total += kv.Value;
-        }
-        return total;
-    }
-
-    /// <inheritdoc />
-    public int GetRunning(AgentMembership member) =>
-        _runningPerRoute.TryGetValue(member.RouteKey, out var n) ? n : 0;
-
-    /// <inheritdoc />
-    public IReadOnlyDictionary<AgentKind, int> Snapshot()
-    {
-        // Materialise so callers can iterate safely while the dispatcher mutates.
-        var snap = new Dictionary<AgentKind, int>();
-        foreach (var kv in _runningPerRoute)
-        {
-            if (kv.Value <= 0) continue;
-            var kind = new AgentKind(AgentInstanceIds.KindFromRouteKey(kv.Key));
-            snap[kind] = snap.TryGetValue(kind, out var existing) ? existing + kv.Value : kv.Value;
-        }
-        return snap;
-    }
-
-    /// <summary>
-    /// Returns the per-agent cap configured for <paramref name="agent"/>, or 0
-    /// when no cap is configured (treated as "unlimited within global pool").
-    /// Values <c>&lt;= 0</c> in the stored entry are rejected at load by
-    /// <see cref="AgentConcurrencyOptions.ValidateAndThrow"/>, so the
-    /// <c>entry.MaxConcurrent &gt; 0</c> guard here is defence-in-depth — any
-    /// non-positive value reaching this read indicates the validator was
-    /// bypassed (e.g. test constructor passing a hand-built options instance).
-    /// </summary>
-    internal int GetAgentCap(AgentKind agent)
-    {
-        var opts = _concurrencySnapshot.Current;
-        return opts.Members.TryGetValue(agent.Value, out var entry) && entry is { MaxConcurrent: > 0 }
-            ? entry.MaxConcurrent
-            : 0;
-    }
-
-    internal int GetAgentCap(AgentMembership member)
-    {
-        var opts = _concurrencySnapshot.Current;
-        if (opts.Members.TryGetValue(member.RouteKey, out var exact) && exact is { MaxConcurrent: > 0 })
-            return exact.MaxConcurrent;
-        return opts.Members.TryGetValue(member.Agent.Value, out var entry) && entry is { MaxConcurrent: > 0 }
-            ? entry.MaxConcurrent
-            : 0;
-    }
-
-    public bool HasCapacity(AgentKind agent)
-    {
-        var cap = GetAgentCap(agent);
-        return cap <= 0 || GetRunning(agent) < cap;
-    }
-
-    public bool HasCapacity(AgentMembership member)
-    {
-        var cap = GetAgentCap(member);
-        return cap <= 0 || GetRunning(member) < cap;
-    }
-
-    private int GetRunningForRoute(string routeKey) =>
-        _runningPerRoute.TryGetValue(routeKey, out var n) ? n : 0;
-
-    private int GetAgentCapForRoute(AgentKind agent, string routeKey)
-    {
-        var opts = _concurrencySnapshot.Current;
-        if (opts.Members.TryGetValue(routeKey, out var exact) && exact is { MaxConcurrent: > 0 })
-            return exact.MaxConcurrent;
-        return opts.Members.TryGetValue(agent.Value, out var byKind) && byKind is { MaxConcurrent: > 0 }
-            ? byKind.MaxConcurrent
-            : 0;
-    }
-
-    private static string ResolveDirectRouteKey(AgentKind agent, string? routeKeyOrInstanceId)
-    {
-        if (string.IsNullOrWhiteSpace(routeKeyOrInstanceId))
-            return agent.Value;
-        return AgentInstanceIds.RouteKey(agent, routeKeyOrInstanceId);
-    }
 
     /// <summary>
     /// Replaces the per-agent concurrency cap dictionary with <paramref name="next"/>.
@@ -485,6 +401,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var previous = _concurrencySnapshot.Current;
         _concurrencySnapshot.Replace(next);
         LogResolvedAgentCaps(next, reason: "hot-reload");
+        // Raised/removed caps (work or audit sub-cap) may admit queued session
+        // waiters — a resumed work slot or a blocked auditor session that fit
+        // under the new ceiling. Tightened caps need no wake: in-flight slots
+        // keep their permits and converge down on release.
+        DrainAllSessionSlotWaiters();
         WakeCapDeferredItemsOnRelaxedCaps(previous, next);
     }
 
@@ -708,7 +629,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var rendered = opts.Members
             .Where(kv => kv.Value is { MaxConcurrent: > 0 })
             .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
-            .Select(kv => $"{kv.Key}={kv.Value.MaxConcurrent}")
+            .Select(kv => kv.Value.MaxConcurrentAuditSessions is { } auditCap
+                ? $"{kv.Key}={kv.Value.MaxConcurrent}(audit≤{auditCap})"
+                : $"{kv.Key}={kv.Value.MaxConcurrent}")
             .ToList();
         var summary = rendered.Count == 0 ? "<none>" : string.Join(", ", rendered);
         _log.LogInformation(
@@ -730,118 +653,35 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     {
         var opts = _concurrencySnapshot.Current;
         var caps = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var auditCaps = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var kv in opts.Members)
         {
             // Defence-in-depth: validation rejects MaxConcurrent <= 0 entries
             // at load, so the guard only fires when a test constructed an
             // options instance directly without going through the validator.
             if (kv.Value is { MaxConcurrent: > 0 })
+            {
                 caps[kv.Key] = kv.Value.MaxConcurrent;
+                auditCaps[kv.Key] = kv.Value.MaxConcurrentAuditSessions ?? kv.Value.MaxConcurrent;
+            }
         }
+        var (runningWork, runningAudit) = SnapshotRouteSessions();
         var running = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kv in _runningPerRoute)
-            if (kv.Value > 0) running[kv.Key] = kv.Value;
+        foreach (var kv in runningWork)
+            running[kv.Key] = kv.Value;
+        foreach (var kv in runningAudit)
+            running[kv.Key] = running.TryGetValue(kv.Key, out var w) ? w + kv.Value : kv.Value;
 
         return new ConcurrencyStateSnapshot(
             GlobalMaxConcurrent: _concurrencyGate.CurrentTarget,
             CurrentlyRunningTotal: Volatile.Read(ref _currentlyRunning),
             PerAgentCaps: caps,
-            CurrentlyRunningPerAgent: running);
+            CurrentlyRunningPerAgent: running,
+            CurrentlyRunningWorkPerAgent: runningWork,
+            CurrentlyRunningAuditPerAgent: runningAudit,
+            PerAgentAuditCaps: auditCaps);
     }
 
-    /// <summary>
-    /// <see cref="IAgentSlotGate.TryReserve"/> implementation.
-    /// Atomically tries to reserve a per-agent slot for <paramref name="agent"/>.
-    /// Returns true and increments the count when the routed agent has no cap
-    /// or running &lt; cap; returns false when the cap is at ceiling.
-    ///
-    /// <para>
-    /// Lock-free; the read-modify-write uses
-    /// <see cref="ConcurrentDictionary{TKey,TValue}.AddOrUpdate(TKey, Func{TKey, TValue}, Func{TKey, TValue, TValue})"/>
-    /// with a check-before-update factory so multiple dispatchers/workers can
-    /// race without exceeding the cap.
-    /// </para>
-    /// </summary>
-    public bool TryReserve(AgentKind agent)
-    {
-        return TryReserveRoute(agent.Value, GetAgentCap(agent));
-    }
-
-    /// <inheritdoc />
-    public bool TryReserve(AgentMembership member)
-    {
-        return TryReserveRoute(member.RouteKey, GetAgentCap(member));
-    }
-
-    private bool TryReserveRoute(string routeKey, int cap)
-    {
-        if (cap <= 0)
-        {
-            // No per-agent cap configured — still increment so /concurrency reflects reality.
-            _runningPerRoute.AddOrUpdate(routeKey, 1, static (_, v) => v + 1);
-            return true;
-        }
-
-        while (true)
-        {
-            if (_runningPerRoute.TryGetValue(routeKey, out var current))
-            {
-                if (current >= cap) return false;
-                if (_runningPerRoute.TryUpdate(routeKey, current + 1, current)) return true;
-                // Lost a race; retry the read and re-evaluate the cap.
-            }
-            else
-            {
-                // First reservation for this route key in this process.
-                if (_runningPerRoute.TryAdd(routeKey, 1)) return true;
-                // Lost the add race against another reserver; fall through to the
-                // TryGetValue branch which will TryUpdate against the observed value.
-            }
-        }
-    }
-
-    /// <summary>
-    /// <see cref="IAgentSlotGate.Release"/> implementation. Decrements the
-    /// in-flight count for <paramref name="agent"/>.
-    /// </summary>
-    public void Release(AgentKind agent)
-    {
-        ReleaseRoute(agent.Value);
-    }
-
-    /// <inheritdoc />
-    public void Release(AgentMembership member)
-    {
-        ReleaseRoute(member.RouteKey);
-    }
-
-    private void ReleaseRoute(string routeKey)
-    {
-        if (TryReleaseRouteSlot(routeKey))
-            WakeAgentCapWaitersForRouteRelease(routeKey);
-    }
-
-    private bool TryReleaseRouteSlot(string routeKey)
-    {
-        // Decrement-or-remove: drop the key when it hits 0 so the next
-        // TryReserveAgentSlot takes the TryAdd branch cleanly. Holding the key
-        // at 0 would cause TryUpdate(..., 1, 0) to be the only valid path —
-        // which works, but leaves stale zero-valued entries accumulating in
-        // the dictionary and turns Snapshot/GetConcurrencyState into a fuller scan.
-        while (true)
-        {
-            if (!_runningPerRoute.TryGetValue(routeKey, out var current)) return false;
-            if (current <= 1)
-            {
-                if (_runningPerRoute.TryRemove(new KeyValuePair<string, int>(routeKey, current))) return true;
-            }
-            else
-            {
-                if (_runningPerRoute.TryUpdate(routeKey, current - 1, current)) return true;
-            }
-            // Lost a race; retry.
-        }
-    }
 
     /// <summary>
     /// Per-agent release signal for cap-deferred items: a slot freed on
@@ -1208,6 +1048,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (!ReleaseWorkerSlotLease(lease))
             return false;
+
+        // The worker died without running its exit finally: the per-agent
+        // work slot it reserved (and any audit-window suspension state) is
+        // still accounted against the route — release it too so a dead
+        // worker cannot pin provider-session headroom.
+        if (workItemId is not null)
+            ReleaseItemWorkSlotIfHeld(workItemId.Value);
 
         // The worker died without running its exit finally: release the quota
         // escrow it held, if any. The ledger TTL would reap it eventually, but
@@ -2556,6 +2403,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal bool TryReserveAgentSlotForTest(AgentKind agent) => TryReserve(agent);
     internal void ReleaseAgentSlotForTest(AgentKind agent) => Release(agent);
 
+    // Binds a test's pre-reserved route to the item's work slot — the same
+    // registration the two pickup reservation sites run — so tests can drive
+    // SuspendWorkSlotForAudit/ResumeWorkSlotAfterAuditAsync without a full
+    // dispatch.
+    internal void RegisterItemWorkSlotForTest(WorkItemId item, string routeKey) =>
+        RegisterItemWorkSlot(item, routeKey);
+    internal void ReleaseItemWorkSlotIfHeldForTest(WorkItemId item) =>
+        ReleaseItemWorkSlotIfHeld(item);
+
     // Loads/releases the global ResizableConcurrencyGate the dispatcher uses,
     // distinct from the per-route TryReserve path above. Tests that exercise
     // the shrink-doesn't-abort-in-flight contract at the orchestrator level
@@ -3004,11 +2860,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
 
         // Per-agent slot tracking: set when the router pins the item to an agent
-        // and the reservation succeeds. Cleared in the outer finally so a deferral
-        // or crash cannot leak the slot. The quota escrow lease (when the router
-        // committed one) shares exactly this lifecycle: reconciled/released in
-        // the same finally, or by the recovery reaper when the worker died.
-        string? agentRouteForRelease = null;
+        // and the reservation succeeds. The item→route binding (registered
+        // alongside) is what the pipeline suspends for the LLM auditor fan-out
+        // and what the outer finally releases — a suspended slot is already
+        // freed, so a deferral or crash can neither leak nor double-release.
+        // The quota escrow lease (when the router committed one) shares exactly
+        // this lifecycle: reconciled/released in the same finally, or by the
+        // recovery reaper when the worker died.
         bool agentSlotReserved = false;
         QuotaReservationLease? quotaReservation = null;
 
@@ -3249,9 +3107,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     if (decision.SlotReserved)
                     {
                         // Router already reserved the slot through our gate —
-                        // outer finally releases on every exit path.
-                        agentRouteForRelease = chosen.RouteKey;
+                        // outer finally releases on every exit path. The
+                        // item→route binding lets the pipeline suspend this
+                        // work slot around the LLM auditor fan-out.
                         agentSlotReserved = true;
+                        RegisterItemWorkSlot(id, chosen.RouteKey);
                     }
                     if (decision.QuotaReservation is { } quotaLease)
                     {
@@ -3324,7 +3184,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     var routeKey = ResolveDirectRouteKey(routedAgent, item.AgentInstanceId);
                     var cap = GetAgentCapForRoute(routedAgent, routeKey);
-                    if (!TryReserveRoute(routeKey, cap))
+                    if (!TryReserveRoute(routeKey))
                     {
                         var running = GetRunningForRoute(routeKey);
                         _log.LogInformation(
@@ -3340,8 +3200,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         return;
                     }
                     // Reservation successful — outer finally releases on exit.
-                    agentRouteForRelease = routeKey;
                     agentSlotReserved = true;
+                    RegisterItemWorkSlot(id, routeKey);
                 }
             }
 
@@ -3559,13 +3419,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _activeItems.TryRemove(id, out _);
             _progressClock.Stamp(_time.GetUtcNow());
 
-            // Release the per-agent slot if we reserved one (the only state in
-            // which it was incremented). Doing this here — rather than at the
-            // call site — guarantees we never leak a slot on the disk-deferred /
-            // budget-deferred / pipeline-exception code paths.
-            if (agentSlotReserved && agentRouteForRelease is { } releaseRoute)
+            // Release the per-agent work slot if we reserved one. Doing this
+            // here — rather than at the call site — guarantees we never leak a
+            // slot on the disk-deferred / budget-deferred / pipeline-exception
+            // paths. Item-scoped because the pipeline may have suspended the
+            // slot for an LLM auditor fan-out: a suspended slot is already
+            // free, so this can neither double-release nor leak.
+            if (agentSlotReserved)
             {
-                ReleaseRoute(releaseRoute);
+                ReleaseItemWorkSlotIfHeld(id);
             }
 
             // Reconcile the quota escrow against this run's observed usage,
@@ -4891,11 +4753,19 @@ internal sealed record RefactorDrainClaim(
 /// <summary>
 /// Snapshot of the per-agent concurrency state surfaced by the
 /// <c>/concurrency</c> endpoint. <see cref="PerAgentCaps"/> reflects the
-/// configured ceiling per agent kind; <see cref="CurrentlyRunningPerAgent"/>
-/// is the live in-flight count.
+/// configured ceiling per agent kind (or instance route key);
+/// <see cref="CurrentlyRunningPerAgent"/> is the live in-flight session count
+/// compared against the cap — the sum of
+/// <see cref="CurrentlyRunningWorkPerAgent"/> (work/rework/delegation/conflict
+/// sessions) and <see cref="CurrentlyRunningAuditPerAgent"/> (LLM auditor
+/// sessions). <see cref="PerAgentAuditCaps"/> is the effective audit sub-cap
+/// (<c>MaxConcurrentAuditSessions</c> or the route's <c>MaxConcurrent</c>).
 /// </summary>
 public sealed record ConcurrencyStateSnapshot(
     int GlobalMaxConcurrent,
     int CurrentlyRunningTotal,
     IReadOnlyDictionary<string, int> PerAgentCaps,
-    IReadOnlyDictionary<string, int> CurrentlyRunningPerAgent);
+    IReadOnlyDictionary<string, int> CurrentlyRunningPerAgent,
+    IReadOnlyDictionary<string, int> CurrentlyRunningWorkPerAgent,
+    IReadOnlyDictionary<string, int> CurrentlyRunningAuditPerAgent,
+    IReadOnlyDictionary<string, int> PerAgentAuditCaps);

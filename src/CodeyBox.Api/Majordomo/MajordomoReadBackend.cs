@@ -133,6 +133,11 @@ internal sealed class MajordomoReadBackend
         {
             var availability = _dispatchAvailability?.GetAvailability(kind);
             var inFlight = _runningCounters.GetRunning(kind);
+            // Same numbers the /concurrency endpoint reports: inFlight is the
+            // cap-compared total; the split tells the operator whether the
+            // occupancy is work turns or LLM auditor sessions.
+            var inFlightWork = _orchestrator.GetRunningWork(kind);
+            var inFlightAudit = _orchestrator.GetRunningAudit(kind);
             var maxConcurrent = caps is not null && caps.TryGetValue(kind.Value, out var cap)
                 ? cap.MaxConcurrent
                 : (int?)null;
@@ -154,7 +159,9 @@ internal sealed class MajordomoReadBackend
                 inFlight,
                 maxConcurrent,
                 quotaExhausted,
-                quotaResetsAt));
+                quotaResetsAt,
+                InFlightWork: inFlightWork,
+                InFlightAudit: inFlightAudit));
         }
 
         return (new AgentCapacityResult(entries), null);

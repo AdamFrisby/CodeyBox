@@ -2934,6 +2934,13 @@ builder.Services.AddSingleton<IAgentBudgetConfigReloadable>(sp =>
 // first read, after both have been constructed.
 builder.Services.AddSingleton<IAgentRunningCounters>(sp =>
     new DeferredAgentRunningCounters(() => sp.GetRequiredService<OrchestratorService>()));
+// OrchestratorService implements IAgentSessionSlotGate (per-agent CLI session
+// accounting shared between dispatch work slots and LLM auditor sessions).
+// PipelineRunner consumes it and is itself a constructor dependency of
+// OrchestratorService — the deferred wrapper breaks that cycle the same way
+// DeferredAgentRunningCounters does above.
+builder.Services.AddSingleton<IAgentSessionSlotGate>(sp =>
+    new DeferredAgentSessionSlotGate(() => sp.GetRequiredService<OrchestratorService>()));
 // Worker-pool occupancy for the codeybox.workers.in_use gauge. OrchestratorService
 // owns the semaphore-backed pool; resolve it lazily (same cycle-break rationale as
 // IAgentRunningCounters) so the observable-metrics hosted service can read the live
@@ -5032,7 +5039,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     delegationOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Delegation,
     delegationEscalation: sp.GetService<DelegationEscalationService>(),
     sandboxPlacer: sp.GetRequiredService<SandboxPlacementAcquirer>(),
-    secretLeases: sp.GetService<SecretLeaseManager>()));
+    secretLeases: sp.GetService<SecretLeaseManager>(),
+    sessionSlotGate: sp.GetService<IAgentSessionSlotGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -6076,7 +6084,12 @@ app.MapGet("/concurrency", async (
         globalMaxConcurrent = state.GlobalMaxConcurrent,
         currentlyRunningTotal = state.CurrentlyRunningTotal,
         perAgentCaps = state.PerAgentCaps,
+        perAgentAuditCaps = state.PerAgentAuditCaps,
+        // The cap-compared total: every in-flight agent CLI session on the
+        // route — work turns plus LLM auditor sessions.
         currentlyRunningPerAgent = state.CurrentlyRunningPerAgent,
+        currentlyRunningWorkPerAgent = state.CurrentlyRunningWorkPerAgent,
+        currentlyRunningAuditPerAgent = state.CurrentlyRunningAuditPerAgent,
         burnEstimates = burns,
         memberFits = fits.Select(f => new
         {

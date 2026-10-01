@@ -39,7 +39,10 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
         Assert.Equal(JsonValueKind.Number, body.GetProperty("globalMaxConcurrent").ValueKind);
         Assert.Equal(JsonValueKind.Number, body.GetProperty("currentlyRunningTotal").ValueKind);
         Assert.Equal(JsonValueKind.Object, body.GetProperty("perAgentCaps").ValueKind);
+        Assert.Equal(JsonValueKind.Object, body.GetProperty("perAgentAuditCaps").ValueKind);
         Assert.Equal(JsonValueKind.Object, body.GetProperty("currentlyRunningPerAgent").ValueKind);
+        Assert.Equal(JsonValueKind.Object, body.GetProperty("currentlyRunningWorkPerAgent").ValueKind);
+        Assert.Equal(JsonValueKind.Object, body.GetProperty("currentlyRunningAuditPerAgent").ValueKind);
         Assert.Equal(JsonValueKind.Array, body.GetProperty("burnEstimates").ValueKind);
         Assert.Equal(JsonValueKind.Array, body.GetProperty("memberFits").ValueKind);
     }
@@ -68,6 +71,13 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
             // OrchestratorService.Snapshot >0 filter would have been bypassed
             // by a regression that omitted the filter.
             Assert.False(running.TryGetProperty("claude", out _));
+
+            // The split must be consistent: work + audit = the cap-compared
+            // total, and a dispatch-slot reservation counts as work.
+            var runningWork = body.GetProperty("currentlyRunningWorkPerAgent");
+            var runningAudit = body.GetProperty("currentlyRunningAuditPerAgent");
+            Assert.Equal(1, runningWork.GetProperty("codex").GetInt32());
+            Assert.False(runningAudit.TryGetProperty("codex", out _));
         }
         finally
         {
