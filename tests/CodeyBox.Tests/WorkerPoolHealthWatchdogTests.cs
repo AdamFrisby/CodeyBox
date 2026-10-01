@@ -1,4 +1,6 @@
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -872,6 +874,30 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task WatchdogEvaluationSqliteBusy_LogsWarningAndDoesNotEscalate()
+    {
+        var log = new CapturingLogger<WorkerPoolHealthWatchdog>();
+        var source = new FakePoolHealthSource
+        {
+            ListRunnableException = new SqliteException(
+                "SQLite Error 5: 'database is locked'.",
+                errorCode: SqliteDefaults.SqliteBusy),
+        };
+        var watchdog = BuildWatchdog(StandardOptions(), source, log: log);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        Assert.Contains(
+            log.Entries,
+            e => e.Level == LogLevel.Warning
+                 && e.Message.Contains("database is locked", StringComparison.Ordinal)
+                 && e.Exception is SqliteException sqlite
+                 && sqlite.SqliteErrorCode == SqliteDefaults.SqliteBusy);
+        Assert.DoesNotContain(log.Entries, e => e.Level == LogLevel.Critical);
+        Assert.DoesNotContain(_webhooks.Events, e => e.Event == "worker_pool.restart_required");
+    }
+
+    [Fact]
     public async Task HealthCandidates_FilterUnsatisfiedDependencies()
     {
         var satisfiedParent = Item() with { State = WorkItemState.Done };
@@ -1018,11 +1044,12 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     private WorkerPoolHealthWatchdog BuildWatchdog(
         WorkerPoolHealthWatchdogOptions opts,
         IWorkerPoolHealthSource source,
-        IWorkerPoolQuotaRecovery? quotaRecovery = null)
+        IWorkerPoolQuotaRecovery? quotaRecovery = null,
+        ILogger<WorkerPoolHealthWatchdog>? log = null)
         => new(
             source,
             opts,
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
+            log ?? NullLogger<WorkerPoolHealthWatchdog>.Instance,
             quotaRecovery: quotaRecovery,
             webhooks: _webhooks,
             timeProvider: _time);
@@ -1160,6 +1187,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         public bool AdvanceLastSpawnOnRecovery { get; set; }
         public bool ThrowOnStatus { get; set; }
         public bool ThrowOnRecovery { get; set; }
+        public Exception? ListRunnableException { get; set; }
         public WorkerPoolStatus Status { get; set; } = new(2, 0, 0, null);
         public IReadOnlyList<WorkerPoolHealthCandidate> Candidates { get; set; } = [];
         public int EnqueueCalls { get; private set; }
@@ -1175,8 +1203,13 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         public Task<IReadOnlyList<WorkerPoolHealthCandidate>> ListRunnableCandidatesAsync(
             int scanLimit,
-            CancellationToken ct) =>
-            Task.FromResult<IReadOnlyList<WorkerPoolHealthCandidate>>(Candidates.Take(scanLimit).ToList());
+            CancellationToken ct)
+        {
+            if (ListRunnableException is not null)
+                throw ListRunnableException;
+            return Task.FromResult<IReadOnlyList<WorkerPoolHealthCandidate>>(
+                Candidates.Take(scanLimit).ToList());
+        }
 
         public Task<int> TriggerDispatchRecoveryAsync(
             IEnumerable<WorkItemId> candidateIds,

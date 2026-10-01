@@ -94,6 +94,13 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
         {
             throw;
         }
+        catch (Exception ex) when (SqliteDefaults.IsLockContention(ex))
+        {
+            _log.LogWarning(
+                ex,
+                "Worker-pool health watchdog evaluation deferred: database is locked; retrying on the next tick");
+            return;
+        }
         catch (Exception ex)
         {
             _log.LogCritical(ex, "Worker-pool health watchdog evaluation failed");
@@ -256,6 +263,17 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
+        }
+        catch (Exception ex) when (SqliteDefaults.IsLockContention(ex))
+        {
+            // Do not spend a recovery attempt on SQLITE_BUSY: the stall is
+            // still real, but the database contention is transient.
+            if (_recoveryAttempts > 0)
+                _recoveryAttempts--;
+            _log.LogWarning(
+                ex,
+                "Worker-pool health watchdog recovery deferred: database is locked; retrying on the next tick");
+            return;
         }
         catch (Exception ex)
         {
