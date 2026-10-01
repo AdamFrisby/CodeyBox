@@ -472,7 +472,7 @@ public sealed partial class PipelineRunner
         }
         if (checkpoint.AttemptCount >= configuredLimit)
         {
-            throw new InvalidOperationException(
+            throw new AgentTurnResumeDispatchLimitException(
                 $"Durable agent-turn resume reached its configured {configuredLimit}-dispatch limit.");
         }
 
@@ -504,6 +504,301 @@ public sealed partial class PipelineRunner
             ModelId = item.ModelId,
             ReasoningMode = item.ReasoningMode,
         };
+    }
+
+    /// <summary>
+    /// Pickup-time quota consult for a durable agent-turn resume. Returns the
+    /// item to dispatch, or null when the pipeline must stop because the item
+    /// was parked (quota deferral, attempt uncounted) or failed (dispatch
+    /// limit reached with no eligible alternative).
+    ///
+    /// <para>
+    /// A resume blindly re-dispatched to its pinned agent burns a bounded
+    /// dispatch attempt on a route the quota router already knows is dead
+    /// (exhausted, below floor, or circuit-broken): the agent fails instantly
+    /// on a provider rate-limit and the phantom attempt counts toward the
+    /// resume budget. Consulting the router first keeps the counter honest:
+    /// a blocked pin with an eligible class member discards the checkpoint
+    /// and restarts the turn fresh from the pushed work branch; a blocked pin
+    /// with no alternative parks for quota reset without consuming an attempt;
+    /// a lineage that already reached its dispatch limit restarts fresh on an
+    /// eligible member instead of failing the item.
+    /// </para>
+    /// </summary>
+    private async Task<WorkItem?> TryPrepareDurableResumeDispatchAsync(
+        WorkItem item,
+        Project project,
+        CancellationToken ct)
+    {
+        if (item.AgentTurnResumeCheckpoint is not { } checkpoint)
+            return item;
+        if (item.AgentTurnRecoveryLease is not null)
+            return item;
+        if (string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+            return item;
+
+        var configuredLimit = SessionResumeOptions.MaxResumeAttempts;
+        if (configuredLimit > 0 && checkpoint.AttemptCount >= configuredLimit)
+        {
+            return await RerouteLimitHitResumeOrFailAsync(item, project, checkpoint, configuredLimit, ct)
+                .ConfigureAwait(false);
+        }
+
+        if (_classRouter is null)
+            return item;
+        var classId = item.AgentClassId ?? project.DefaultAgentClass;
+        if (classId is null)
+            return item;
+        var pinned = _classRouter.FindMember(
+            classId, checkpoint.Agent, checkpoint.ModelId, checkpoint.AgentInstanceRoute);
+        if (pinned is null)
+            return item;
+
+        ResumeDispatchEligibility eligibility;
+        try
+        {
+            eligibility = await _classRouter.CheckResumeDispatchAllowedAsync(
+                pinned, project.Id, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Durable-resume quota consult failed for work item {Id}; dispatching to the pinned agent",
+                item.Id);
+            return item;
+        }
+
+        if (eligibility.Allowed)
+            return item;
+
+        var phase = checkpoint.ResumeState == WorkItemState.Reworking ? "rework" : "work";
+        var alternative = await FindDurableResumeAlternativeAsync(item, project, pinned, phase, ct)
+            .ConfigureAwait(false);
+        if (alternative is not null)
+            return await RerouteDurableResumeAsync(item, alternative, eligibility.Reason, ct)
+                .ConfigureAwait(false);
+
+        AuditLog.DurableResumeDeferred(item.Id, checkpoint.Agent, eligibility.Reason);
+        _log.LogInformation(
+            "Durable agent-turn resume for work item {Id} deferred: pinned agent '{Agent}' is unavailable ({Reason}); parking for quota reset without consuming a dispatch attempt",
+            item.Id, checkpoint.Agent.Value, eligibility.Reason);
+        await TransitionWaitingForQuotaResetAsync(
+            item,
+            $"Durable agent-turn resume deferred: pinned agent '{checkpoint.Agent.Value}' is unavailable ({eligibility.Reason}).",
+            phase,
+            quotaResetAt: null,
+            project,
+            checkpoint.Iteration)
+            .ConfigureAwait(false);
+        return null;
+    }
+
+    /// <summary>
+    /// Handles a resume lineage that reached its dispatch budget at pickup:
+    /// restarts the turn fresh on an eligible class member (branch preserved)
+    /// instead of failing, or fails with the limit message when no member is
+    /// eligible.
+    /// </summary>
+    private async Task<WorkItem?> RerouteLimitHitResumeOrFailAsync(
+        WorkItem item,
+        Project project,
+        AgentTurnResumeCheckpoint checkpoint,
+        int configuredLimit,
+        CancellationToken ct)
+    {
+        var limitMessage =
+            $"Durable agent-turn resume reached its configured {configuredLimit}-dispatch limit.";
+        if (checkpoint.AttemptCount < configuredLimit)
+            return item;
+        var phase = checkpoint.ResumeState == WorkItemState.Reworking ? "rework" : "work";
+        var pinned = _classRouter?.FindMember(
+            item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
+            checkpoint.Agent, checkpoint.ModelId, checkpoint.AgentInstanceRoute);
+        var alternative = pinned is null
+            ? null
+            : await FindDurableResumeAlternativeAsync(item, project, pinned, phase, ct)
+                .ConfigureAwait(false);
+        if (alternative is not null)
+        {
+            _log.LogWarning(
+                "Durable agent-turn resume for work item {Id} reached its {Limit}-dispatch limit; restarting fresh on class member '{Agent}' instead of failing",
+                item.Id, configuredLimit, alternative.Agent.Value);
+            return await RerouteDurableResumeAsync(item, alternative, limitMessage, ct)
+                .ConfigureAwait(false);
+        }
+
+        _log.LogWarning(
+            "Work item {Id} failed: {Error}", item.Id, limitMessage);
+        await TransitionFailed(item, limitMessage, CancellationToken.None, project, failureKind: "other")
+            .ConfigureAwait(false);
+        return null;
+    }
+
+    /// <summary>
+    /// Finds the first quota-eligible class member other than
+    /// <paramref name="pinned"/> that has a registered runner. Null when the
+    /// router is unwired, the item has no class, or every alternative is
+    /// blocked — the caller then defers or fails instead of rerouting.
+    /// </summary>
+    private async Task<AgentMembership?> FindDurableResumeAlternativeAsync(
+        WorkItem item,
+        Project project,
+        AgentMembership pinned,
+        string phase,
+        CancellationToken ct)
+    {
+        if (_classRouter is null)
+            return null;
+        IReadOnlyList<AgentMembership> candidates;
+        try
+        {
+            candidates = await _classRouter.OrderedFallbackCandidatesAsync(
+                item, project, ct,
+                ResolvePhaseSmokeTarget(project, phase, item.BaselineImageRef),
+                requireQuota: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Durable-resume alternative lookup failed for work item {Id}; keeping the pinned route",
+                item.Id);
+            return null;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate.Agent == pinned.Agent
+                && string.Equals(candidate.RouteKey, pinned.RouteKey, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(candidate.ModelId ?? string.Empty, pinned.ModelId ?? string.Empty, StringComparison.Ordinal))
+                continue;
+            if (!_agents.TryGet(candidate.Agent, out _))
+            {
+                _log.LogDebug(
+                    "Durable-resume alternative {Agent} for work item {Id} has no registered runner; skipping",
+                    candidate.Agent.Value, item.Id);
+                continue;
+            }
+            return candidate;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Atomically discards the durable checkpoint lineage and re-points the
+    /// item at <paramref name="alternative"/>. The work branch is untouched,
+    /// so the next phase restarts the turn fresh on top of the pushed work;
+    /// the dispatch-limit counter is left behind with the checkpoint. A lost
+    /// compare-and-swap race falls back to whatever the store now holds.
+    /// </summary>
+    private async Task<WorkItem> RerouteDurableResumeAsync(
+        WorkItem item,
+        AgentMembership alternative,
+        string reason,
+        CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
+        if (current.AgentTurnResumeCheckpoint is null)
+            return current;
+
+        var rerouted = current.WithBaselinePinForAgent(alternative.Agent) with
+        {
+            Agent = alternative.Agent,
+            AgentInstanceId = alternative.RouteKey,
+            ModelId = alternative.ModelId,
+            ReasoningMode = alternative.ReasoningMode,
+            PreemptedAt = null,
+            PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        if (!await _store.TryUpdateIfStateAndUpdatedAtAsync(
+                rerouted, current.State, current.UpdatedAt, ct).ConfigureAwait(false))
+        {
+            _log.LogWarning(
+                "Work item {Id} changed while its durable resume was being rerouted; continuing with the authoritative row",
+                item.Id);
+            return await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
+        }
+
+        AuditLog.DurableResumeRerouted(item.Id, current.Agent ?? alternative.Agent, alternative.Agent, reason);
+        _log.LogWarning(
+            "Durable agent-turn resume for work item {Id} rerouted from '{FromAgent}' to class member '{ToAgent}' ({Reason}); checkpoint discarded, turn restarts from the pushed work branch",
+            item.Id, (current.Agent ?? alternative.Agent).Value, alternative.Agent.Value, reason);
+        return rerouted;
+    }
+
+    /// <summary>
+    /// TOCTOU backstop for <see cref="AgentTurnResumeDispatchLimitException"/>:
+    /// re-runs the reroute-or-fail decision against fresh store state. A
+    /// rerouted (or concurrently-freed) item is requeued for a fresh pickup;
+    /// without an eligible member or a task queue the item fails.
+    /// </summary>
+    private async Task HandleConcurrentResumeLimitHitAsync(
+        WorkItem item,
+        Project project,
+        string limitMessage)
+    {
+        var ct = CancellationToken.None;
+        var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
+        var checkpoint = current.AgentTurnResumeCheckpoint;
+        var configuredLimit = SessionResumeOptions.MaxResumeAttempts;
+        if (checkpoint is null || current.AgentTurnRecoveryLease is not null || configuredLimit <= 0)
+        {
+            await TransitionFailed(current, limitMessage, ct, project, failureKind: "other")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var rerouted = await RerouteLimitHitResumeOrFailAsync(current, project, checkpoint, configuredLimit, ct)
+            .ConfigureAwait(false);
+        if (rerouted is null)
+            return;
+
+        if (_taskQueue is null)
+        {
+            await TransitionFailed(
+                rerouted,
+                "The durable agent-turn resume was rerouted to a fresh turn, but no task queue is available to continue it automatically.",
+                ct,
+                project,
+                failureKind: WorkItemFailureKinds.Infrastructure,
+                agent: rerouted.Agent)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            await _taskQueue.EnqueueAsync(item.Id, ct).ConfigureAwait(false);
+            _log.LogInformation(
+                "Work item {Id} requeued for a fresh turn after its durable resume hit the dispatch limit concurrently",
+                item.Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Failed queueing work item {Id} after rerouting its limit-hit durable resume",
+                item.Id);
+            await TransitionFailed(
+                rerouted,
+                "The durable agent-turn resume was rerouted to a fresh turn, but queueing its continuation failed.",
+                ct,
+                project,
+                failureKind: WorkItemFailureKinds.Infrastructure,
+                agent: rerouted.Agent)
+                .ConfigureAwait(false);
+        }
     }
 
     private async Task<WorkItem> ClaimAgentTurnResumePreparationAsync(
@@ -658,6 +953,79 @@ public sealed partial class PipelineRunner
                 ex,
                 "Could not refund undispatched durable resume claim for work item {Id}; the infrastructure failure remains authoritative",
                 claimedItem.Id);
+        }
+    }
+
+    /// <summary>
+    /// Refunds the optimistically-consumed resume dispatch attempt when the
+    /// turn ended in a provider quota/rate-limit classification before the
+    /// agent produced output or left work behind. Must run BEFORE any
+    /// re-checkpoint: the replacement lineage inherits the store's count, so
+    /// refunding first keeps the phantom dispatch off the dispatch-limit
+    /// budget. No-ops for fresh (non-resume) dispatches, which hold no claim,
+    /// and keeps the count when the agent identifiably ran (stdout, a commit,
+    /// or a dirty tree) — that was a real attempt.
+    /// </summary>
+    private async Task TryRefundOutputlessQuotaResumeClaimAsync(
+        WorkItem claimedItem,
+        AgentResult agentResult,
+        ISandbox sandbox,
+        string preTurnHeadSha,
+        CancellationToken ct)
+    {
+        var checkpoint = claimedItem.AgentTurnResumeCheckpoint;
+        if (checkpoint?.DispatchClaimId is null)
+            return;
+        if (!string.IsNullOrWhiteSpace(agentResult.Stdout))
+            return;
+        if (!await AgentLeftNoWorkBehindAsync(sandbox, preTurnHeadSha, ct).ConfigureAwait(false))
+            return;
+        await TryRefundUndispatchedAgentTurnClaimAsync(claimedItem, CancellationToken.None)
+            .ConfigureAwait(false);
+        AuditLog.DurableResumeAttemptRefunded(
+            claimedItem.Id,
+            checkpoint.Agent,
+            "quota failure before agent output");
+    }
+
+    /// <summary>
+    /// True when the sandbox tree shows no trace of agent work: HEAD never
+    /// moved from its pre-turn commit and the working tree is clean. Any
+    /// verification failure reads as "work may exist" so the dispatch keeps
+    /// its attempt — a refund must never fire on uncertain evidence.
+    /// </summary>
+    private static async Task<bool> AgentLeftNoWorkBehindAsync(
+        ISandbox sandbox,
+        string preTurnHeadSha,
+        CancellationToken ct)
+    {
+        try
+        {
+            var head = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+                MaxStdoutBytes = 128,
+                MaxStderrBytes = 4096,
+                KillOnOutputLimit = true,
+            }, ct).ConfigureAwait(false);
+            if (!head.Success || head.OutputLimitExceeded)
+                return false;
+            if (!string.Equals(head.Stdout.Trim(), preTurnHeadSha, StringComparison.Ordinal))
+                return false;
+            var status = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain=v1"],
+                MaxStdoutBytes = 65536,
+                MaxStderrBytes = 4096,
+                KillOnOutputLimit = true,
+            }, ct).ConfigureAwait(false);
+            if (!status.Success || status.OutputLimitExceeded)
+                return false;
+            return string.IsNullOrWhiteSpace(status.Stdout);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
         }
     }
 

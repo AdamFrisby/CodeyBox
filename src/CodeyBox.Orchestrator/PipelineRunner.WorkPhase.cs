@@ -824,6 +824,16 @@ public sealed partial class PipelineRunner
                     ?? _authFailureClassifier.ClassifyFailure(runner, agentResult);
                 var quotaClassification = _quotaClassifier.Classify(runner.Kind, agentResult.Stderr, agentResult.Stdout);
                 var detection = quotaClassification.Detection;
+                if (detection is { Kind: var refundKind } && refundKind.IsExhaustionSignal())
+                {
+                    // A quota/rate-limit failure before the agent produced
+                    // output or left work behind never started real work:
+                    // refund the optimistically-consumed resume attempt BEFORE
+                    // re-checkpointing so the replacement lineage does not
+                    // inherit the phantom count. No-op on fresh dispatches.
+                    await TryRefundOutputlessQuotaResumeClaimAsync(
+                        item, agentResult, sandbox, shaBefore, ct);
+                }
                 var canDurablyResumeFailure = detection is not null
                     || resolvedFailureClassification.Kind == AgentFailureKind.TransientNetwork
                     || resolvedFailureClassification.Kind == AgentFailureKind.Infrastructure
@@ -1082,8 +1092,17 @@ public sealed partial class PipelineRunner
                             ct);
                     }
                 }
-                catch (TerminalQuotaError)
+                catch (TerminalQuotaError quotaError)
                 {
+                    if (quotaError.Kind.IsExhaustionSignal())
+                    {
+                        // Same phantom-dispatch refund as the nonzero-exit
+                        // quota path: a silent, changeless turn never started
+                        // real work, so its attempt must not count. Runs
+                        // before the re-checkpoint below for the same reason.
+                        await TryRefundOutputlessQuotaResumeClaimAsync(
+                            item, agentResult, sandbox, shaBefore, ct);
+                    }
                     await TryCheckpointRecoverableAgentTurnAsync(
                         item,
                         runner,

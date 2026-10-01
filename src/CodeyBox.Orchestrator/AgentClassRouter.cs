@@ -1849,6 +1849,67 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     }
 
     /// <summary>
+    /// Non-mutating circuit-breaker read for one member. True when dispatch is
+    /// currently admitted (or no breaker is wired), so callers compose it
+    /// unconditionally alongside the quota verdict.
+    /// </summary>
+    public bool IsDispatchAllowed(AgentMembership member, DateTimeOffset nowUtc) =>
+        _circuitBreaker?.IsDispatchAllowed(member, nowUtc) ?? true;
+
+    /// <summary>
+    /// Consults the quota router for a durable-resume redispatch pinned to
+    /// <paramref name="member"/>: fresh in-process exhaustion, the per-agent
+    /// circuit breaker, and the live quota-gate floor (probe + operator
+    /// budget). Availability/smoke is deliberately out of scope — the dispatch
+    /// loop re-asserts it — so a member blocked only by smoke is not rerouted
+    /// here. Never throws on probe failure: an unreadable probe reads as
+    /// unknown and flows through the configured <see cref="QuotaUnknownPolicy"/>.
+    /// </summary>
+    public async Task<ResumeDispatchEligibility> CheckResumeDispatchAllowedAsync(
+        AgentMembership member,
+        ProjectId projectId,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(member);
+        var nowUtc = _time.GetUtcNow();
+        if (IsExhausted(member, nowUtc))
+            return new ResumeDispatchEligibility(false, "quota exhausted");
+        if (!IsDispatchAllowed(member, nowUtc))
+            return new ResumeDispatchEligibility(false, "circuit breaker open");
+
+        AgentQuotaSnapshot snapshot;
+        try
+        {
+            snapshot = await ProbeAsync(member, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex,
+                "Quota probe for resume candidate {Agent}/{Model} threw; treating as unknown",
+                member.Agent.Value, member.ModelId ?? "(default)");
+            snapshot = new AgentQuotaSnapshot
+            {
+                AvailablePct = -1,
+                Notes = $"probe threw: {ex.GetType().Name}",
+            };
+        }
+
+        var quota = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
+        quota = (await ApplyBudgetAsync(member, quota, ct).ConfigureAwait(false)).Quota;
+        RecordObservedAvailability(member, quota);
+
+        var gate = await EvaluateGateAsync(member, projectId, quota, nowUtc, ct).ConfigureAwait(false);
+        RecordQuotaUsability(
+            member,
+            gate.Allow,
+            publishRecoverySignal: true,
+            resetAt: gate.Allow || !quota.IsKnown ? null : QuotaGatePolicy.ResolveResetHint(quota, gate));
+        return gate.Allow
+            ? new ResumeDispatchEligibility(true, "eligible")
+            : new ResumeDispatchEligibility(false, $"below quota floor: {gate.Reason}");
+    }
+
+    /// <summary>
     /// Returns true when <paramref name="member"/> is a member of the effective
     /// class for <paramref name="item"/> and passes the same item-specific
     /// eligibility filters <see cref="OrderedFallbackCandidatesAsync"/> applies:
@@ -3295,6 +3356,14 @@ public sealed record EffectiveQuota(
     public bool IsBalanceKnown =>
         BalanceRemaining is { } b && double.IsFinite(b) && b >= 0;
 }
+
+/// <summary>
+/// Verdict for a durable-resume redispatch pinned to one class member.
+/// <see cref="Allowed"/> is false when the member carries a fresh exhaustion
+/// verdict, its circuit breaker is open, or the live quota gate denies it;
+/// <see cref="Reason"/> names the blocking cause for logs and audit events.
+/// </summary>
+public sealed record ResumeDispatchEligibility(bool Allowed, string Reason);
 
 /// <summary>
 /// Snapshot of the router's rate-aware view for one class member, surfaced via
