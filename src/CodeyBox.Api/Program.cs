@@ -335,6 +335,31 @@ builder.Services.AddOptions<MajordomoServerOptions>()
     .Bind(builder.Configuration.GetSection(MajordomoServerOptions.SectionName))
     .ValidateOnStart();
 builder.Services.AddMajordomoMcp();
+// Majordomo sandbox: long-lived, reusable-across-turns sandbox for the
+// operator's assistant. Hot-reloadable options (network profile, idle bound,
+// model backend) mirroring MajordomoSandboxOptions. Validation fails fast at
+// host start rather than silently weakening the egress or credential posture.
+builder.Services.AddSingleton<IValidateOptions<MajordomoSandboxOptions>, MajordomoSandboxOptionsValidator>();
+builder.Services.AddOptions<MajordomoSandboxOptions>()
+    .Bind(builder.Configuration.GetSection(MajordomoSandboxOptions.SectionName))
+    .ValidateOnStart();
+// Long-lived majordomo sandbox: one reusable sandbox for the operator's
+// assistant, created on demand and torn down after the configured idle bound
+// by MajordomoSandboxIdleService. It never touches the work-item dispatch
+// path (no concurrency-gate permit, no worker-pool mutation), so the fleet's
+// accounting is unchanged while it is alive. Both accessors re-read live
+// options, so network-profile and idle-bound edits apply without a restart.
+builder.Services.AddSingleton(sp => new MajordomoSandboxSession(
+    sp.GetRequiredService<ISandboxProvider>(),
+    () => sp.GetRequiredService<IOptionsMonitor<MajordomoSandboxOptions>>().CurrentValue,
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxNetworkProfiles.Keys.ToArray(),
+    TimeProvider.System,
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<MajordomoSandboxSession>()));
+builder.Services.AddHostedService(sp => new MajordomoSandboxIdleService(
+    sp.GetRequiredService<MajordomoSandboxSession>(),
+    () => sp.GetRequiredService<IOptionsMonitor<MajordomoSandboxOptions>>().CurrentValue,
+    TimeProvider.System,
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<MajordomoSandboxIdleService>()));
 
 builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
@@ -7349,7 +7374,8 @@ namespace CodeyBox.Api
         ///   "isolated":  "cb-iso",
         ///   "claude":    "cb-claude",
         ///   "multi-llm": "cb-multi-llm",
-        ///   "graphical": "cb-graphical"
+        ///   "graphical": "cb-graphical",
+        ///   "majordomo": "cb-majordomo"
         /// }
         /// </code>
         /// Bridge names are limited to 15 characters by Linux IFNAMSIZ. Incus
@@ -7362,6 +7388,7 @@ namespace CodeyBox.Api
         public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase)
         {
             [CodeyBox.Sandbox.SandboxConventions.GraphicalNetworkProfile] = "cb-graphical",
+            [CodeyBox.Orchestrator.MajordomoSandboxOptions.DefaultNetworkProfile] = CodeyBox.Orchestrator.MajordomoSandboxOptions.DefaultBridgeName,
         };
 
         /// <summary>

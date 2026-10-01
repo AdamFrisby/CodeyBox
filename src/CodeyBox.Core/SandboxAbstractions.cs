@@ -137,6 +137,26 @@ public interface ISandboxProvider : IManagedSandboxLifecycle
     Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default);
 }
 
+/// <summary>
+/// Optional <see cref="ISandboxProvider"/> capability for creating sandboxes
+/// that live outside the fleet's work-dispatch admission accounting. Only
+/// long-lived infrastructure sandboxes (never work items) may use this path:
+/// the created sandbox holds no admission permit, so fleet concurrency is
+/// unchanged while it is alive. Enforcement posture is identical to
+/// <see cref="ISandboxProvider.CreateAsync"/> — network profiles, mounts, and
+/// image policy apply unchanged; only the admission permit is skipped.
+/// Providers that do not gate creation simply do not implement this interface
+/// and callers fall back to <see cref="ISandboxProvider.CreateAsync"/>.
+/// </summary>
+public interface IInfrastructureSandboxCreator
+{
+    /// <summary>
+    /// Provisions a sandbox without consuming a fleet admission permit.
+    /// Disposal tears it down exactly like a normally-created sandbox.
+    /// </summary>
+    Task<ISandbox> CreateInfrastructureAsync(SandboxSpec spec, CancellationToken ct = default);
+}
+
 public enum SandboxIsolationLevel
 {
     None,

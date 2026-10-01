@@ -20,7 +20,7 @@ internal interface ISandboxAdmissionSnapshot
 /// their gate derived from the member catalog instead (see
 /// <see cref="CodeyBox.Core.ISandboxProviderRegistry.SyncKindCapacities"/>).
 /// </summary>
-public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider
+public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider, IInfrastructureSandboxCreator
 {
     private readonly ISandboxProvider _inner;
     private readonly SandboxAdmissionGate _gate;
@@ -272,6 +272,21 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             lease.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Provisions a long-lived infrastructure sandbox without consuming a fleet
+    /// admission permit: no <see cref="SandboxAdmissionGate"/> lease is acquired,
+    /// so fleet concurrency accounting is unchanged while the sandbox is alive.
+    /// The sandbox is still provisioned by the wrapped provider with the same
+    /// spec enforcement (network profile, mounts, image); it is deliberately
+    /// not tracked as an active work sandbox. Only callers that must never
+    /// block fleet dispatch (the majordomo session) may use this path.
+    /// </summary>
+    public Task<ISandbox> CreateInfrastructureAsync(SandboxSpec spec, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(spec);
+        return _inner.CreateAsync(spec, ct);
     }
 
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
