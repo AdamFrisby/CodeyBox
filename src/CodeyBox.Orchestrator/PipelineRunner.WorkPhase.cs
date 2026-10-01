@@ -1160,32 +1160,165 @@ public sealed partial class PipelineRunner
                             noActionReport.Precondition);
                 }
 
-                if (!suppressNoChangesBreaker)
-                    await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
-
-                if (isInitial)
+                // Bounded continue-nudge for early-ended work turns: a Success
+                // turn with no diff and an empty completion summary (blank
+                // stdout) is the signature of a turn that ended early, e.g. a
+                // stream that stops mid-investigation. Resume the same agent
+                // session in the same sandbox with an explicit "continue and
+                // finish" prompt, bounded by
+                // PipelineTuning.EarlyEndedTurnMaxNudges (default 1). A nudged
+                // turn that commits changes rejoins the normal success path
+                // below; a still-empty turn falls through to the branch-ahead
+                // check and then the pre-existing throws. Nudges apply to
+                // initial work turns only: audit rework already owns
+                // converge-aware empty handling (escalation re-dispatch), and
+                // a blind continuation there would consume the rework's
+                // iteration budget outside the audit loop's accounting. They
+                // are also skipped on preempt-resume turns, which replay a
+                // checkpoint under resume accounting that a fresh continuation
+                // prompt would break.
+                if (isInitial && !resumingPreempt && agentResult.Success && IsEarlyEndedTurn(agentResult))
                 {
-                    // Initial work phase stays fail-fast: there is no audit /
-                    // rework loop sitting behind it to converge a "declined to
-                    // work" outcome. Same shape as before this change. (A valid
-                    // no-action-required report already threw above.)
-                    throw new InvalidOperationException("Agent produced no changes to commit");
+                    var maxNudges = Math.Max(0, _pipelineTuning.Current.EarlyEndedTurnMaxNudges);
+                    for (var nudgeAttempt = 1; nudgeAttempt <= maxNudges && !hasMeaningfulAgentChanges; nudgeAttempt++)
+                    {
+                        _log.LogInformation(
+                            "Work item {Id} {Phase} turn ended early (success with no completion summary and no diff); sending continue nudge {Attempt}/{Max} in the same session",
+                            item.Id, agentPhase, nudgeAttempt, maxNudges);
+                        AgentResult nudgeResult;
+                        try
+                        {
+                            var nudgePrompt = BuildEarlyEndedContinuePrompt(agentPhase);
+                            nudgeResult = useClaudeSession && sessionLifecycle is not null && !sessionLifecycle.IsClosed
+                                ? await sessionLifecycle.SendTurnAsync(nudgePrompt, ct, stdoutChunkCallback: null)
+                                : await runner.RunAsync(
+                                    sandbox,
+                                    SandboxConventions.WorkDir,
+                                    nudgePrompt,
+                                    credential,
+                                    item.ModelId,
+                                    item.ReasoningMode,
+                                    ct,
+                                    stdoutChunkCallback: null,
+                                    captureStructuredStream: false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.LogWarning(ex,
+                                "Work item {Id} {Phase} continue nudge {Attempt}/{Max} could not be dispatched; treating the turn as no-progress",
+                                item.Id, agentPhase, nudgeAttempt, maxNudges);
+                            break;
+                        }
+
+                        agentResult = nudgeResult;
+                        if (nudgeResult.Success)
+                            successfulAgentResult = nudgeResult;
+                        else
+                            break;
+
+                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+                        await sandbox.ExecAsync(new SandboxExec
+                        {
+                            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
+                                ".codeybox/suggestions.json"],
+                        }, ct);
+                        await StripNoActionRequiredFileFromIndexAsync(sandbox, ct);
+                        await StripAgentLogScratchFromIndexAsync(sandbox, ct);
+                        await StripReservedScratchpadPathsFromIndexAsync(sandbox, ct);
+                        var nudgeStaged = await sandbox.ExecAsync(new SandboxExec
+                        {
+                            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
+                        }, ct);
+                        ThrowIfExecutionUnavailable(nudgeStaged);
+                        if (nudgeStaged.ExitCode != 0)
+                        {
+                            var nudgeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct,
+                                promptRevisionAtDispatch: promptRevisionAtDispatch);
+                            var nudgeCommitMessage = isInitial
+                                ? $"codeybox: {item.Title}\n\n{nudgeTrailerBlock}"
+                                : $"codeybox rework: address audit findings\n\n{nudgeTrailerBlock}";
+                            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", nudgeCommitMessage);
+                        }
+                        await EnsureReservedScratchpadPathsAbsentFromTreeAsync(sandbox, ct);
+
+                        var nudgeHead = await sandbox.ExecAsync(new SandboxExec
+                        {
+                            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
+                        }, ct);
+                        ThrowIfExecutionUnavailable(nudgeHead);
+                        if (!nudgeHead.Success)
+                            break;
+                        shaAfter = nudgeHead.Stdout.Trim();
+                        hasMeaningfulAgentChanges = await HasMeaningfulAgentChangesAsync(
+                            sandbox,
+                            shaBefore,
+                            shaAfter,
+                            ct);
+                    }
                 }
 
-                if (reworkNoDiffHandling == ReworkNoDiffHandling.AuditEmptyRework)
+                if (!hasMeaningfulAgentChanges)
                 {
-                    // Audit rework: surface the empty-diff outcome via a typed
-                    // exception the audit/rework loop catches. The loop applies
-                    // converge-aware handling instead of terminal-failing the item
-                    // on the first empty pass.
-                    throw new ReworkProducedNoChangesException(
-                        runner.Kind,
-                        message: "Rework agent produced no changes");
-                }
+                    // Retry with a preserved branch: the turn committed nothing
+                    // new, but the work branch may already carry the finished
+                    // work from an earlier turn. A turn that completed WITH a
+                    // summary and no diff is a verification, not a failure —
+                    // advance to WorkComplete / audit as a normal completion
+                    // ("no new commits; branch already carries work"). Only
+                    // fail when the branch has no work ahead of base. The same
+                    // rule covers rework turns: a no-commit rework that
+                    // completed with a summary re-audits the existing branch
+                    // instead of failing. A turn that ended early (success but
+                    // no completion summary) says nothing about the task state
+                    // even when the branch is ahead — it died
+                    // mid-investigation — so it keeps the pre-existing
+                    // no-progress handling (fail-fast for work, converge-aware
+                    // escalation/park for audit rework) instead of being
+                    // misread as verification.
+                    var isDeliberateNoOp = !IsEarlyEndedTurn(agentResult);
+                    if ((isInitial || isDeliberateNoOp)
+                        && await WorkBranchAlreadyCarriesWorkAsync(repoId, baseBranch, branch, ct))
+                    {
+                        _log.LogInformation(
+                            "Work item {Id} {Phase} produced no new commits; branch already carries work ({Branch} ahead of {Base}); advancing to audit",
+                            item.Id, agentPhase, branch, baseBranch);
+                        if (isInitial && suggestionsJson is not null)
+                            await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+                        phaseSucceeded = true;
+                        return agentResult.Stdout is { } carriedStdout ? AgentVisibleStdout(runner, carriedStdout) : null;
+                    }
 
-                // Non-audit rework callers keep the pre-existing terminal error
-                // contract; only the audit loop owns the converge-aware policy.
-                throw new InvalidOperationException("Rework agent produced no changes; cannot resolve audit findings");
+                    if (!suppressNoChangesBreaker)
+                        await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
+
+                    if (isInitial)
+                    {
+                        // Initial work phase stays fail-fast: there is no audit /
+                        // rework loop sitting behind it to converge a "declined to
+                        // work" outcome. Same shape as before this change. (A valid
+                        // no-action-required report already threw above.)
+                        throw new InvalidOperationException("Agent produced no changes to commit");
+                    }
+
+                    if (reworkNoDiffHandling == ReworkNoDiffHandling.AuditEmptyRework)
+                    {
+                        // Audit rework: surface the empty-diff outcome via a typed
+                        // exception the audit/rework loop catches. The loop applies
+                        // converge-aware handling instead of terminal-failing the item
+                        // on the first empty pass.
+                        throw new ReworkProducedNoChangesException(
+                            runner.Kind,
+                            message: "Rework agent produced no changes");
+                    }
+
+                    // Non-audit rework callers keep the pre-existing terminal error
+                    // contract; only the audit loop owns the converge-aware policy.
+                    throw new InvalidOperationException("Rework agent produced no changes; cannot resolve audit findings");
+                }
             }
 
             if (deferredSuccessAuthDetection is { IsStdoutOnly: false })
@@ -1432,6 +1565,49 @@ public sealed partial class PipelineRunner
                     _ambientSessionLifecycle.Value = null;
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Detects a turn that ended early: the agent exited success but produced
+    /// no completion summary (blank stdout). Such turns typically stopped
+    /// mid-investigation and deserve one bounded continuation nudge before
+    /// the orchestrator treats the turn as no-progress.
+    /// </summary>
+    private static bool IsEarlyEndedTurn(AgentResult result) =>
+        result.Success && string.IsNullOrWhiteSpace(result.Stdout);
+
+    /// <summary>
+    /// Bounded continuation prompt for an early-ended turn. Sent in the same
+    /// sandbox session so the agent resumes its own transcript instead of
+    /// restarting the task.
+    /// </summary>
+    private static string BuildEarlyEndedContinuePrompt(string agentPhase) =>
+        $"Your previous {agentPhase} turn ended before producing a completion summary and without committing any changes. "
+        + "Continue and finish the task: implement the required changes, commit them, and provide a brief completion summary.";
+
+    /// <summary>
+    /// Checks whether the work branch already carries finished work from an
+    /// earlier turn (commits ahead of the base branch). Fail-closed: any
+    /// probe failure reports no carried work so the caller keeps the
+    /// pre-existing no-changes failure.
+    /// </summary>
+    private async Task<bool> WorkBranchAlreadyCarriesWorkAsync(
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await _gitHost.BranchHasCommitsAheadAsync(repoId, baseBranch, workBranch, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Could not determine whether work branch {Branch} is ahead of {Base}; treating it as carrying no work",
+                workBranch, baseBranch);
+            return false;
         }
     }
 

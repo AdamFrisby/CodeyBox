@@ -705,7 +705,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        // Uncorroborated stdout quota text must not reroute: no fallback
+        // fires and the healthy member is never invoked. The no-commit rework
+        // completed WITH a summary on a branch that already carries the work,
+        // so the loop re-audits the existing branch (iteration 2 passes) and
+        // the item completes instead of parking on the empty rework.
+        Assert.Equal(WorkItemState.Done, final!.State);
         Assert.False(metrics.Any("codeybox.agent.fallbacks",
                 ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")),
             "uncorroborated captured stdout quota text must not mutate quota/fallback state");

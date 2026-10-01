@@ -615,7 +615,13 @@ operator-input, or terminal-fails it as "cannot resolve findings."
 ### Step 2: converge-aware handling
 
 If no infra signature matched, the no-diff outcome is genuinely the
-agent declining to commit anything. `RunAgentPhaseAsync` throws
+agent declining to commit anything — with one exception: a rework turn
+that completed WITH a completion summary and no diff on a work branch
+that already carries commits ahead of base is treated as verification of
+existing work, so the loop re-audits the existing branch instead of
+entering empty-rework handling. A rework turn that ended early (success
+but no completion summary) carries no such signal and always enters the
+handling below. `RunAgentPhaseAsync` throws
 `ReworkProducedNoChangesException` and `RunAuditReworkAsync` catches it:
 
 * **Converging + escalation budget remains** — when the audit history
@@ -651,8 +657,15 @@ the rest of `PipelineTuning`.
 ### Why initial work stays fail-fast
 
 The initial work phase (`isInitial==true` in `RunAgentPhaseAsync`)
-continues to throw `InvalidOperationException("Agent produced no changes
-to commit")` on a genuine empty commit. There is no audit/rework loop
+throws `InvalidOperationException("Agent produced no changes
+to commit")` on a genuine empty commit — unless the work branch already
+carries commits ahead of base from an earlier turn (retry with a
+preserved branch), in which case the turn counts as verification and the
+item advances to audit as a normal completion. A work turn that ended
+early (success with no completion summary and no diff) first gets one
+bounded "continue and finish" nudge in the same session
+(`CodeyBox:PipelineTuning:EarlyEndedTurnMaxNudges`, default `1`) before
+the no-changes handling applies. There is no audit/rework loop
 sitting behind it to converge a "declined to work" outcome — the failure
 must be visible to the operator immediately so they can re-prompt or
 re-route to a different agent rather than the orchestrator silently

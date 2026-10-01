@@ -167,6 +167,20 @@ public sealed class PipelineTuningOptions
     public int EmptyReworkEscalationRetries { get; set; } = 1;
 
     /// <summary>
+    /// Maximum bounded "continue and finish the task" nudges the work
+    /// phase sends in the same sandbox session when an agent turn exits
+    /// success with no committed changes and no completion summary (empty
+    /// stdout) — the signature of a turn that ended early, e.g. a stream that
+    /// stops mid-investigation. Each nudge re-invokes the same runner in the
+    /// same sandbox with an explicit continuation prompt; when the nudged turn
+    /// still produces no changes the normal no-changes handling applies
+    /// (branch-ahead re-audit or terminal failure). Default <c>1</c>. Set to
+    /// <c>0</c> to disable nudging. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>.
+    /// </summary>
+    public int EarlyEndedTurnMaxNudges { get; set; } = 1;
+
+    /// <summary>
     /// Maximum time a single auditor may run without completing or emitting
     /// an LLM stdout chunk. A value of zero disables the per-auditor idle
     /// guard. Default 5 minutes.
@@ -353,6 +367,12 @@ public sealed class PipelineTuningOptions
             throw new ArgumentOutOfRangeException(
                 nameof(EmptyReworkEscalationRetries),
                 "EmptyReworkEscalationRetries must be non-negative");
+        }
+        if (EarlyEndedTurnMaxNudges < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(EarlyEndedTurnMaxNudges),
+                "EarlyEndedTurnMaxNudges must be non-negative");
         }
         if (SandboxPermitWaitWarningThreshold < TimeSpan.Zero)
         {

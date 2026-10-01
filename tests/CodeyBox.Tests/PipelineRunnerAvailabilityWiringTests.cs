@@ -281,12 +281,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         for (var i = 0; i < 3; i++)
         {
-            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
-                Success: true, Summary: "ok", Stdout: null, Stderr: null));
-        }
-
-        for (var i = 0; i < 3; i++)
-        {
+            // Two scripted empty successes per item: the initial turn and its
+            // bounded early-ended continue nudge (both success with no
+            // completion summary and no diff). Each item still records exactly
+            // one no-changes outcome; the nudge must not feed the breaker
+            // twice nor mask the silent-failure streak.
+            for (var j = 0; j < 2; j++)
+            {
+                fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                    Success: true, Summary: "ok", Stdout: null, Stderr: null));
+            }
             var item = NewItem(AgentKind.Codex);
             await fix.Store.CreateAsync(item);
             await fix.Pipeline.RunAsync(item, CancellationToken.None);
@@ -401,12 +405,14 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         for (var i = 0; i < 3; i++)
         {
-            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
-                Success: true, Summary: "ok", Stdout: null, Stderr: null));
-        }
-
-        for (var i = 0; i < 3; i++)
-        {
+            // Two scripted empty successes per item: the initial turn and its
+            // bounded early-ended continue nudge (both success with no
+            // completion summary and no diff).
+            for (var j = 0; j < 2; j++)
+            {
+                fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                    Success: true, Summary: "ok", Stdout: null, Stderr: null));
+            }
             var item = NewItem(AgentKind.Codex);
             await fix.Store.CreateAsync(item);
             await fix.Pipeline.RunAsync(item, CancellationToken.None);

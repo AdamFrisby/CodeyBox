@@ -48,6 +48,7 @@ public static class PipelineTuningHotReloadPolicy
         nameof(PipelineTuningOptions.SandboxPermitWaitWarningThreshold),
         nameof(PipelineTuningOptions.AuditShortCircuitEnabled),
         nameof(PipelineTuningOptions.EmptyReworkEscalationRetries),
+        nameof(PipelineTuningOptions.EarlyEndedTurnMaxNudges),
         nameof(PipelineTuningOptions.AuditorIdleTimeout),
         nameof(PipelineTuningOptions.AuditorAbsoluteTimeout),
         nameof(PipelineTuningOptions.BlockRedundantDotnetBuildTestInAuditSandbox),

@@ -363,6 +363,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative");
         }
+        if (options.PipelineTuning.EarlyEndedTurnMaxNudges < 0)
+        {
+            failures.Add("CodeyBox:PipelineTuning:EarlyEndedTurnMaxNudges must be non-negative");
+        }
         if (options.PipelineTuning.DefaultRateLimitPause <= TimeSpan.Zero)
         {
             failures.Add("CodeyBox:PipelineTuning:DefaultRateLimitPause must be a positive TimeSpan");

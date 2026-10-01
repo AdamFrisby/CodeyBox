@@ -487,6 +487,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
   "AgentSessionResumeMaxAttempts": 2,
   "MaxRetainedAgentTurnSandboxes": 16,
   "EmptyReworkEscalationRetries": 1,
+  "EarlyEndedTurnMaxNudges": 1,
   "BlockRedundantDotnetBuildTestInAuditSandbox": true,
   "DefaultRateLimitPause": "00:05:00"
 }
@@ -498,6 +499,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 | `AgentSessionResumeMaxAttempts` | `2` | Bound used independently for CLI-native resumes in a live sandbox and atomically claimed durable agent-turn re-dispatches. An exact route receives its host-private SQLite scratchpad even without a native id; Claude/Codex reuse the exact validated id when captured. Set to `0` to disable these resume paths. `AgentSuspendMaxRetries`, sandbox adoption, and legacy Git-only preempt records remain separate. |
 | `MaxRetainedAgentTurnSandboxes` | `16` | Global database-enforced cap on Incus VMs retained because infrastructure prevented creation of the normal immutable agent-turn checkpoint. Valid range 1–256 and read at lease publication. The compare-and-set publication and cap check are one SQLite statement, so concurrent workers and processes cannot exceed the configured count. This is independent of the resumed-dispatch attempt limit. |
 | `EmptyReworkEscalationRetries` | `1` | Extra rework dispatches after a genuine no-diff audit rework when audit history shows convergence. Set to `0` to park immediately for operator review. |
+| `EarlyEndedTurnMaxNudges` | `1` | Bounded "continue and finish the task" nudges sent in the same sandbox session when a work turn exits success with no commit and no completion summary (a turn that ended early). Set to `0` to disable nudging and treat such turns as no-progress immediately. |
 | `BlockRedundantDotnetBuildTestInAuditSandbox` | `true` | Prepends an audit-sandbox-only `dotnet` shim that immediately succeeds `dotnet build` and `dotnet test` with a notice because the deterministic build/test gate already ran. Other `dotnet` subcommands pass through unchanged; work, merge, and conflict-resolution sandboxes are unaffected. |
 | `CSharpTestPassAuditorIdleTimeout` | unset | Test-runner-specific idle guard for the `csharp:test-pass` (dotnet test) auditor, applied in place of `AuditorIdleTimeout`. Sourced through `DotnetTestAuditor` (an `ITestRunnerAuditor`). Unset means the generic `AuditorIdleTimeout` applies. |
 | `CSharpTestPassBlameHangTimeout` | unset | Per-test hang-dump timeout injected into the `csharp:test-pass` command as `--blame-hang --blame-hang-timeout`. Unset omits blame-hang, keeping the command byte-identical to the legacy path. |

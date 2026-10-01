@@ -177,7 +177,7 @@ When the initial work agent exits cleanly with no diff AND reports — via the s
 
 * The agent's reasoning is preserved on the item (`lastError` reads `no action required: <reason>`, plus the checked precondition when reported) and emitted on the `work_item.no_action_required` webhook, so the determination can be reviewed later.
 * The outcome is terminal and resolved: the item never re-enters the queue on its own, does not count as in-flight, and does not satisfy the dependency gate (like any other non-`Done` terminal state).
-* It is not a failure: the agent-level no-changes breaker is not fed, the per-agent dispatch breaker treats the run as a success, and no failure notification fires. An empty diff WITHOUT such a report still fails the item with "Agent produced no changes to commit" and still feeds the breaker.
+* It is not a failure: the agent-level no-changes breaker is not fed, the per-agent dispatch breaker treats the run as a success, and no failure notification fires. An empty diff WITHOUT such a report still fails the item with "Agent produced no changes to commit" and still feeds the breaker — unless the work branch already carries commits ahead of base from an earlier turn (retry with a preserved branch), in which case the verification turn advances to audit as a normal completion, or the turn ended early with no completion summary, in which case one bounded continue-nudge fires first (see `EarlyEndedTurnMaxNudges`).
 * It stays revisitable: `POST /workitems/{id}/retry` re-runs the item from scratch if the precondition later holds. `DELETE /workitems/{id}` refuses it (like `Done`) so the recorded determination is not overwritten by a cancel.
 
 ### Cancellation source attribution

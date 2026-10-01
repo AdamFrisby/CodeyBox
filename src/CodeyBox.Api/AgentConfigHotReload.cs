@@ -1614,6 +1614,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 SandboxPermitWaitWarningThresholdSeconds = opts.SandboxPermitWaitWarningThreshold.TotalSeconds,
                 opts.AuditShortCircuitEnabled,
                 opts.EmptyReworkEscalationRetries,
+                opts.EarlyEndedTurnMaxNudges,
                 AuditorIdleTimeoutSeconds = opts.AuditorIdleTimeout.TotalSeconds,
                 AuditorAbsoluteTimeoutSeconds = opts.AuditorAbsoluteTimeout.TotalSeconds,
                 opts.BlockRedundantDotnetBuildTestInAuditSandbox,
