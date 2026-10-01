@@ -40,11 +40,14 @@ public sealed partial class PipelineRunner
     /// parks and re-runs the same iteration when quota returns.
     /// </para>
     /// <para>
-    /// <paramref name="invoker"/> receives a trial <see cref="WorkItem"/> whose
+    /// <paramref name="invoker"/> receives the candidate <see cref="AgentMembership"/>
+    /// being attempted plus a trial <see cref="WorkItem"/> whose
     /// <see cref="WorkItem.Agent"/>, <see cref="WorkItem.ModelId"/>, and
-    /// <see cref="WorkItem.ReasoningMode"/> reflect the candidate currently
-    /// being attempted. Callers must propagate this trial item into the agent
-    /// invocation rather than capturing the original.
+    /// <see cref="WorkItem.ReasoningMode"/> reflect that candidate. Callers must
+    /// propagate both into the agent invocation rather than capturing the
+    /// original member/item — a quota-fallback attempt runs on a different
+    /// member than the dispatch pick.
+    /// </para>
     /// </para>
     /// </summary>
     private async Task<TResult> InvokeAgentWithQuotaFallbackAsync<TResult>(
@@ -52,7 +55,7 @@ public sealed partial class PipelineRunner
         Project project,
         string phase,
         int? iteration,
-        Func<IAgentRunner, WorkItem, CancellationToken, Task<TResult>> invoker,
+        Func<IAgentRunner, AgentMembership, WorkItem, CancellationToken, Task<TResult>> invoker,
         CancellationToken ct,
         PhaseCancellation? phaseCancellation = null,
         TimeSpan? attemptTimeout = null,
@@ -77,7 +80,7 @@ public sealed partial class PipelineRunner
 
         var agentClassTag = item.AgentClassId ?? project.DefaultAgentClass ?? "(none)";
 
-        async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem)
+        async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, AgentMembership member, WorkItem trialItem)
         {
             // Append a per-phase involvement row for the agent about to run, so the
             // full who-did-what trail captures every agent that touched the item —
@@ -117,7 +120,7 @@ public sealed partial class PipelineRunner
             bool? breakerSuccess = null;
             try
             {
-                var result = await invoker(runner, trialItem, attemptCt);
+                var result = await invoker(runner, member, trialItem, attemptCt);
                 await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
                 outcome = AgentInvolvementOutcomes.Success;
                 breakerSuccess = ClassifyDispatchOutcome(error: null, genuineAttemptTimeout: false);
@@ -414,6 +417,32 @@ public sealed partial class PipelineRunner
                 ReasoningMode = initialMemberOverride?.ReasoningMode ?? item.ReasoningMode,
             };
 
+        // The member the first attempt runs as. Prefer the catalog's real
+        // AgentMembership (correct Billing / QualityScore / ReasoningMode) so
+        // probe write-backs and session-slot accounting receive an accurate
+        // record. Only fall back to a synthesised placeholder when the catalog
+        // has no matching row — e.g. tests that exercise the wrapper without a
+        // fully-populated class. The synthesized member's RouteKey
+        // (AgentInstanceIds.RouteKey(Agent, item.AgentInstanceId)) reproduces
+        // the same route the dispatch-time direct-agent reservation used, so
+        // audit sessions land in the same accounting bucket as the item's work
+        // slot even on the no-class path.
+        var initialMember = initialMemberOverride
+            ?? _classRouter?.FindMember(
+                item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
+                initialAgent,
+                item.ModelId,
+                item.AgentInstanceId)
+            ?? new AgentMembership
+            {
+                Agent = initialAgent,
+                InstanceId = item.AgentInstanceId,
+                ModelId = item.ModelId,
+                ReasoningMode = item.ReasoningMode,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100,
+            };
+
         if (initialItem.AgentTurnRecoveryLease is not null)
         {
             // This pickup only authenticates/adopts mutable provider recovery
@@ -423,6 +452,7 @@ public sealed partial class PipelineRunner
             // The conversion has its own bounded checkpoint deadline.
             return await invoker(
                 initialRunner,
+                initialMember,
                 initialItem,
                 phaseCancellation?.Token ?? ct);
         }
@@ -462,7 +492,7 @@ public sealed partial class PipelineRunner
 
             try
             {
-                return await InvokeAttemptAsync(initialRunner, initialItem);
+                return await InvokeAttemptAsync(initialRunner, initialMember, initialItem);
             }
             catch (AgentAttemptTimeoutException timeoutEx) when (phaseCancellation is not null)
             {
@@ -502,17 +532,7 @@ public sealed partial class PipelineRunner
         // ReasoningMode) so probe write-backs receive an accurate record. Only fall
         // back to a synthesised placeholder when the catalog has no matching row —
         // e.g. tests that exercise the wrapper without a fully-populated class.
-        var currentMember = initialMemberOverride
-            ?? _classRouter.FindMember(classId, initialAgent, item.ModelId, item.AgentInstanceId)
-            ?? new AgentMembership
-            {
-                Agent = initialAgent,
-                InstanceId = item.AgentInstanceId,
-                ModelId = item.ModelId,
-                ReasoningMode = item.ReasoningMode,
-                Billing = AgentBilling.Subscription,
-                QualityScore = 100,
-            };
+        var currentMember = initialMember;
         // Bind the runner to this attempt's member: a member-scoped runner
         // (e.g. Copilot with a per-member BYOK provider) must render every
         // invocation — work, rework, audit, merge — from the member's
@@ -1001,7 +1021,7 @@ public sealed partial class PipelineRunner
 
             try
             {
-                var attemptResult = await InvokeAttemptAsync(currentRunner, currentItem);
+                var attemptResult = await InvokeAttemptAsync(currentRunner, currentMember, currentItem);
                 // A completed post-swap attempt (success or a failure the
                 // catches below do not convert) consumes the guard: later
                 // auth failures are genuine credential events, not swap

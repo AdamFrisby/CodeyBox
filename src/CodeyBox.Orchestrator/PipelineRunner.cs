@@ -554,7 +554,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     try
                     {
                         workAgentStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "work", iteration: null,
-                            async (runner, trialItem, attemptCt) =>
+                            async (runner, member, trialItem, attemptCt) =>
                                 await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "work", workPhase, ct, phaseCt =>
                                     RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
                                         _promptComposer.BuildInitialWorkPrompt(
@@ -622,7 +622,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     try
                     {
                         reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", resumeIteration,
-                            async (runner, trialItem, attemptCt) =>
+                            async (runner, member, trialItem, attemptCt) =>
                                 await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkPhase, ct,
                                     phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
                                         trialItem.PreemptCheckpoint is { } checkpointRef
@@ -824,7 +824,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 try
                 {
                     return await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
-                        async (runner, trialItem, attemptCt) =>
+                        async (runner, member, trialItem, attemptCt) =>
                             await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, phaseCt, mergeCt =>
                                 RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
                                     networkProfile: project.NetworkProfiles.Merge,

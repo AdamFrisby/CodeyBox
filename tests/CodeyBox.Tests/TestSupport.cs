@@ -362,7 +362,12 @@ internal static class TestSupport
         TimeProvider? pipelineTimeProvider = null,
         // Placement-driven sandbox acquisition for the work phase. Null
         // (default) keeps the legacy direct-provider path.
-        SandboxPlacementAcquirer? sandboxPlacer = null)
+        SandboxPlacementAcquirer? sandboxPlacer = null,
+        // Per-agent session slot gate for LLM auditor fan-out. Tests that
+        // exercise AgentConcurrency session accounting pass the real
+        // orchestrator (or a deferred wrapper around it); null leaves audit
+        // sessions ungated, matching embeddings without the orchestrator.
+        IAgentSessionSlotGate? sessionSlotGate = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -593,7 +598,8 @@ internal static class TestSupport
             briefComposer: briefComposer,
             delegationEvents: delegationEvents,
             delegationEscalation: delegationEscalation,
-            sandboxPlacer: sandboxPlacer);
+            sandboxPlacer: sandboxPlacer,
+            sessionSlotGate: sessionSlotGate);
 
         return new TestPipeline(
             pipeline,

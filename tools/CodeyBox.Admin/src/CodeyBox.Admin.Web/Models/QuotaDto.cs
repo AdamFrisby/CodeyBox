@@ -54,5 +54,9 @@ public sealed class ConcurrencyDto
     public int GlobalMaxConcurrent { get; set; }
     public int CurrentlyRunningTotal { get; set; }
     public Dictionary<string, int> PerAgentCaps { get; set; } = [];
+    /// <summary>Cap-compared total per route: work + audit sessions.</summary>
     public Dictionary<string, int> CurrentlyRunningPerAgent { get; set; } = [];
+    public Dictionary<string, int> CurrentlyRunningWorkPerAgent { get; set; } = [];
+    public Dictionary<string, int> CurrentlyRunningAuditPerAgent { get; set; } = [];
+    public Dictionary<string, int> PerAgentAuditCaps { get; set; } = [];
 }

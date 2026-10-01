@@ -851,6 +851,17 @@ public sealed partial class PipelineRunner
                 var sem = new SemaphoreSlim(maxPar, maxPar);
                 var disposeSemaphoreOnExit = true;
 
+                // Release-before-acquire (IAgentSessionSlotGate deadlock
+                // contract): the item's dispatch work slot is freed for the
+                // duration of the LLM auditor fan-out so its own audit
+                // sessions can be admitted under a tight per-agent cap — with
+                // the slot still held, a cap-1 agent would deadlock waiting
+                // on a slot only the item itself could free. The slot is
+                // resumed after the batch settles so a verdict-driven rework
+                // turn re-acquires a normal work slot; while suspended the
+                // freed capacity is genuinely available to other sessions.
+                var workSlotSuspended = _sessionSlotGate?.SuspendWorkSlotForAudit(item.Id) == true;
+
                 async Task<(SandboxSpec Spec, AuditReviewDotnetShim DotnetShim)> BuildLlmSandboxSpecAsync(
                     AgentCredential? candidateCredential,
                     IAgentRunner candidateRunner,
@@ -958,6 +969,36 @@ public sealed partial class PipelineRunner
                 async Task<AuditorRunRecord> RunLlmPairAttemptAsync(
                     (IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member) pair,
                     IAgentRunner candidateRunner,
+                    AgentMembership candidateMember,
+                    WorkItem trialItem,
+                    CancellationToken attemptCt)
+                {
+                    // Every LLM auditor attempt is a real agent CLI session on
+                    // the candidate member, so it must count against that
+                    // route's MaxConcurrent — the operator sets the cap to the
+                    // provider's concurrent-session limit. Acquire BEFORE any
+                    // sandbox/exec work so a saturated route waits instead of
+                    // over-subscribing; the finally covers failure, idle
+                    // timeout, and cancellation exits alike. Null gate keeps
+                    // pre-gate behaviour for embeddings that never wired it.
+                    var gate = _sessionSlotGate;
+                    if (gate is null)
+                        return await RunLlmPairAttemptCoreAsync(pair, candidateRunner, trialItem, attemptCt);
+
+                    await gate.WaitForAuditSlotAsync(candidateMember, attemptCt).ConfigureAwait(false);
+                    try
+                    {
+                        return await RunLlmPairAttemptCoreAsync(pair, candidateRunner, trialItem, attemptCt);
+                    }
+                    finally
+                    {
+                        gate.ReleaseAudit(candidateMember);
+                    }
+                }
+
+                async Task<AuditorRunRecord> RunLlmPairAttemptCoreAsync(
+                    (IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member) pair,
+                    IAgentRunner candidateRunner,
                     WorkItem trialItem,
                     CancellationToken attemptCt)
                 {
@@ -1035,7 +1076,7 @@ public sealed partial class PipelineRunner
                         project,
                         "audit",
                         iteration: ctx.Iteration,
-                        (candidateRunner, trialItem, attemptCt) => RunLlmPairAttemptAsync(pair, candidateRunner, trialItem, attemptCt),
+                        (candidateRunner, candidateMember, trialItem, attemptCt) => RunLlmPairAttemptAsync(pair, candidateRunner, candidateMember, trialItem, attemptCt),
                         ct,
                         initialRunnerOverride: pair.Runner,
                         initialMemberOverride: pair.Member ?? _classRouter?.FindMember(
@@ -1302,6 +1343,19 @@ public sealed partial class PipelineRunner
                 {
                     if (disposeSemaphoreOnExit)
                         sem.Dispose();
+                    if (workSlotSuspended)
+                    {
+                        // Uncancellable by design: the resume must complete so
+                        // the post-audit phases (rework, merge) run under a
+                        // held work slot again, and so the orchestrator's
+                        // outer-finally release always sees a consistent
+                        // held/released state. Waiters are woken by every
+                        // session release, so the wait is bounded by other
+                        // sessions finishing — never by a holder blocked on
+                        // this item.
+                        await _sessionSlotGate!.ResumeWorkSlotAfterAuditAsync(
+                            item.Id, CancellationToken.None).ConfigureAwait(false);
+                    }
                 }
             }
         }

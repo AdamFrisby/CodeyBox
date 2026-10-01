@@ -996,7 +996,7 @@ public sealed partial class PipelineRunner
         async Task<string?> DispatchAsync(string prompt)
         {
             return await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
-                async (workerRunner, trialItem, attemptCt) =>
+                async (workerRunner, member, trialItem, attemptCt) =>
                     await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
                         phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
                             prompt, isInitial: false,

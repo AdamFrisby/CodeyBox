@@ -554,7 +554,7 @@ public sealed partial class PipelineRunner
                 {
                     _ = await InvokeAgentWithQuotaFallbackAsync(
                         current, project, "delegation", AuditProgressIterationNumbers.DelegationPhase,
-                        async (runner, trialItem, attemptCt) =>
+                        async (runner, member, trialItem, attemptCt) =>
                         {
                             observedAgent = runner.Kind;
                             observedModel = trialItem.ModelId;
