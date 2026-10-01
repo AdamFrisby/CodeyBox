@@ -1042,9 +1042,9 @@ public sealed class KicsAuditorTests
             && exec.Argv[0] == "realpath"
             && exec.Argv[1] == "-m";
 
-    // The post-scan bounded report fetch: cat <dir>/results.json.
+    // The post-scan bounded report fetch: cat -- <dir>/results.json.
     private static bool IsReportRead(SandboxExec exec)
-        => exec.Argv.Count == 2 && exec.Argv[0] == "cat";
+        => exec.Argv.Count == 3 && exec.Argv[0] == "cat" && exec.Argv[1] == "--";
 
     // Emulates the realpath probe: canonicalizes the configured path like
     // realpath -m (relative input resolved against the /work cwd, dot

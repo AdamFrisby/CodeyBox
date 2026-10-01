@@ -88,3 +88,11 @@ e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQ
 e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:765
 3e97c04303fb6f1bda1301ad242a958299852280:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:764
 3e97c04303fb6f1bda1301ad242a958299852280:tests/CodeyBox.Tests/MajordomoProposalQueueTests.cs:generic-api-key:765
+# - The DetectSecretsAuditorTests hits are SHA-1 `hashed_secret` fixture
+#   digests that were embedded verbatim in an earlier revision of the test;
+#   the current file assembles them at runtime so no scanner-detectable
+#   40-hex literal remains. These entries cover the pre-fix checkpoint
+#   commit only.
+52dba3ff1b0c5db4e25914805585414e683ced5a:tests/CodeyBox.Tests/DetectSecretsAuditorTests.cs:generic-api-key:45
+52dba3ff1b0c5db4e25914805585414e683ced5a:tests/CodeyBox.Tests/DetectSecretsAuditorTests.cs:generic-api-key:318
+52dba3ff1b0c5db4e25914805585414e683ced5a:tests/CodeyBox.Tests/DetectSecretsAuditorTests.cs:generic-api-key:336
