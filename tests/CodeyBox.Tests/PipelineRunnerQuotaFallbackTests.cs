@@ -2412,11 +2412,22 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var workStarted = WaitForPhaseStart("work", fix.Codex);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForPhaseStartAsync("work", workStarted, pipelineTask);
-        await RunWithAdvancingTimeAsync(
-            pipelineTask,
+        // Pump manual time to just past the per-attempt timeout, then stop the
+        // clock: post-timeout teardown (sandbox dispose, store transitions,
+        // webhooks) is real-time work, and every extra pump step while the
+        // pipeline drains inflates the measured elapsed by the step size.
+        // Under full-suite parallel load that drain stalls seconds of real
+        // time, which a keep-pumping loop converts into tens of seconds of
+        // phantom manual time (observed 34.9s against the 10s timeout).
+        // Stopping the clock just past the timeout measures the timeout
+        // itself, not teardown scheduling lag — the same fix applied to
+        // ReworkFallbackPhase_UsesConfiguredAbsoluteTimeoutThroughPipeline.
+        await AdvanceManualTimeToElapsedAsync(
             time,
-            step: TimeSpan.FromMilliseconds(100),
-            maxSteps: 400);
+            TimeSpan.FromSeconds(11),
+            pipelineTask,
+            step: TimeSpan.FromMilliseconds(100));
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(30));
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
         Assert.InRange(elapsed, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(12));
@@ -2863,26 +2874,6 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         if (completed == pipelineTask)
             await pipelineTask;
         throw new TimeoutException($"Pipeline did not reach {phase} before the test timeout.");
-    }
-
-    private static async Task RunWithAdvancingTimeAsync(
-        Task pipelineTask,
-        ManualTimeProvider time,
-        TimeSpan? step = null,
-        int maxSteps = 200)
-    {
-        var delta = step ?? TimeSpan.FromMilliseconds(20);
-        for (var i = 0; i < maxSteps && !pipelineTask.IsCompleted; i++)
-        {
-            time.Advance(delta);
-            var completed = await Task.WhenAny(
-                pipelineTask,
-                Task.Delay(TimeSpan.FromMilliseconds(25)));
-            if (completed == pipelineTask)
-                break;
-        }
-
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     private static async Task AdvanceManualTimeToElapsedAsync(
