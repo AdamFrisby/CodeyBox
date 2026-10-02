@@ -327,12 +327,16 @@ declaratively:
   after the tool's presence and declared `VersionPin` are confirmed. Override
   it for repository-state gates (e.g. refusing repo-authored suppression
   files — `ProbeRepositoryFilesPresentAsync` is the shared fail-closed probe
-  for that), throwing `AuditUnavailableException` to fail closed. Run probes
-  through `ExecToolBoundedAsync` so they inherit the same timeout bounding
-  and failure classification as the scan.
+  for exact root names, `ProbeRepositoryPathGlobsPresentAsync` for a filename
+  family at any depth), throwing `AuditUnavailableException` to fail closed.
+  Run probes through `ExecToolBoundedAsync` so they inherit the same timeout
+  bounding and failure classification as the scan.
 - `BuildToolEnvironment` — extra environment variables for the tool process,
   for tools whose behavior is env-controlled (e.g. pinning configuration that
   must not come from the audited repository).
+  `BuildToolEnvironmentRemovals` is the inverse: baseline env vars that must
+  not reach the tool (e.g. a config-path var that would outrank a pinned
+  ruleset) are unset on the scan exec.
 
 `plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/` uses both to pin a
 scanner version and keep repo-authored suppression files from silencing the
