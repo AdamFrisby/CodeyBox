@@ -60,6 +60,7 @@ public sealed class ExecutorClient
     private readonly ExecutorSandboxTracker _tracker;
     private readonly TimeProvider _clock;
     private readonly ILogger<ExecutorClient> _log;
+    private readonly ExecutorAgentAdvertiser? _agentAdvertiser;
 
     private ExecutorOptions Options => _optionsAccessor();
 
@@ -71,7 +72,8 @@ public sealed class ExecutorClient
         IPipelineRunner? phaseRunner = null,
         TimeProvider? clock = null,
         ILogger<ExecutorClient>? log = null,
-        ISandboxProviderRegistry? providerRegistry = null)
+        ISandboxProviderRegistry? providerRegistry = null,
+        ExecutorAgentAdvertiser? agentAdvertiser = null)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
@@ -81,6 +83,7 @@ public sealed class ExecutorClient
         _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger<ExecutorClient>.Instance;
         _providerRegistry = providerRegistry;
+        _agentAdvertiser = agentAdvertiser;
     }
 
     /// <summary>Primary sandbox provider this executor provisions through (the first declared kind).</summary>
@@ -127,6 +130,18 @@ public sealed class ExecutorClient
         var options = Options;
         options.Validate();
         var registration = options.ToRegistration();
+        if (_agentAdvertiser is not null)
+        {
+            var runnable = await _agentAdvertiser
+                .GetRunnableAgentNamesAsync(options.AgentCredentialProbeTimeout, ct)
+                .ConfigureAwait(false);
+            var declared = ExecutorAgentAdvertiser.ApplyCredentialAllowList(
+                runnable, options.DeclaredCredentials);
+            registration = registration with { DeclaredCredentials = [.. declared] };
+            _log.LogInformation(
+                "Executor host {HostId} declares runnable agents {Agents}",
+                registration.HostId, string.Join(",", registration.DeclaredCredentials));
+        }
         registration = registration with
         {
             DeclaredCapabilities = [.. ExecutorCapabilityPolicy.EffectiveCapabilities(

@@ -14,6 +14,31 @@
     <ProjectReference Include="..\CodeyBox.HostProcess\CodeyBox.HostProcess.csproj" />
     <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Aider\CodeyBox.Agents.Aider.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Antigravity\CodeyBox.Agents.Antigravity.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Autohand\CodeyBox.Agents.Autohand.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.CavemanCode\CodeyBox.Agents.CavemanCode.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Cline\CodeyBox.Agents.Cline.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Cmd\CodeyBox.Agents.Cmd.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Codex\CodeyBox.Agents.Codex.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Continue\CodeyBox.Agents.Continue.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Copilot\CodeyBox.Agents.Copilot.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Crock\CodeyBox.Agents.Crock.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Crush\CodeyBox.Agents.Crush.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Cursor\CodeyBox.Agents.Cursor.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Devin\CodeyBox.Agents.Devin.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.DotNetOpencode\CodeyBox.Agents.DotNetOpencode.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Gemini\CodeyBox.Agents.Gemini.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Goose\CodeyBox.Agents.Goose.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Kilo\CodeyBox.Agents.Kilo.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Omp\CodeyBox.Agents.Omp.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Opencode\CodeyBox.Agents.Opencode.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Pi\CodeyBox.Agents.Pi.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Prime\CodeyBox.Agents.Prime.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Qwen\CodeyBox.Agents.Qwen.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Unreal\CodeyBox.Agents.Unreal.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Vibe\CodeyBox.Agents.Vibe.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream\CodeyBox.Upstream.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit\CodeyBox.Audit.csproj" />
     <ProjectReference Include="..\CodeyBox.Projects\CodeyBox.Projects.csproj" />
@@ -24,6 +49,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.7" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.7" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.7" />
     <PackageReference Include="System.Reflection.MetadataLoadContext" Version="10.0.1" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
   </ItemGroup>
