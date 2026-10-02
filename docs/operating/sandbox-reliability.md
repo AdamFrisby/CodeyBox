@@ -82,6 +82,27 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
 | `LeakAgeThreshold` | `1.00:30:00` | hot | Minimum age before an untracked sandbox is declared leaked. Sized above the maximum legitimate phase duration; keep it that way. |
 | `AutoDispose` | `true` | hot | Purge each detected leak automatically. |
 | `MaxConcurrentAutoDispose` | `4` | hot | Parallel disposals, capped to limit pressure on the provider during restart cleanup. |
+| `InventoryUnreferencedProviders` | `false` | hot | Inventory registered providers that no sandbox class member references. Off by default: an unused backend is never listed and can never block disposal of other providers' leaks. Turn on while draining a decommissioned backend whose VMs outlive its class members. |
+| `InventoryFailureWarningInterval` | `00:15:00` | hot | Minimum interval between repeated inventory-failure warnings for the same provider. A down backend warns once per interval instead of once per sandbox per sweep. Values below one minute are clamped to one minute. |
+
+#### Disposal verification is scoped per provider
+
+Before deleting anything, the reaper re-verifies each candidate against a
+fresh inventory. When a provider cannot verify its full inventory (an
+unreachable executor host, a down remote backend), disposal is **deferred** —
+not failed — and only for sandboxes that provider might own:
+
+- A sandbox is disposed when **its own provider** returned a complete
+  inventory. A failing unrelated provider never blocks another healthy
+  provider's leaks.
+- A failing provider blocks disposal only of names its namespace could claim
+  (matching name prefix or executor host, or a name it previously reported).
+  A shared name claimed by two providers stays blocked until every claimant's
+  inventory verifies.
+- Deferred sandboxes stay in the leaked list and are retried on the next
+  sweep. Deferral emits no per-sandbox `sandbox.leak_dispose_failed` event;
+  the failing provider logs one warning per
+  `InventoryFailureWarningInterval`, not one per sandbox per sweep.
 
 #### AutoDispose
 
@@ -101,7 +122,7 @@ and any configured webhook endpoints):
 |---|---|
 | `sandbox.leak_detected` | A leaked sandbox was found (detection-only or before auto-dispose) |
 | `sandbox.leak_disposed` | A leaked sandbox was successfully disposed |
-| `sandbox.leak_dispose_failed` | Disposal of a leaked sandbox failed |
+| `sandbox.leak_dispose_failed` | Disposal of a leaked sandbox failed (deferred disposals waiting on a provider inventory are retried silently and do not emit this) |
 
 Each event carries `{ name, ageMinutes, diskMb, reason }` in the structured log
 fields. The `reason` is a stable classification code such as

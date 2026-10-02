@@ -106,6 +106,22 @@ public sealed class BoxLiteSandboxProvider :
 
     public string Name => BoxLiteSandboxOptions.ProviderKind;
 
+    /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId)
+    {
+        _ = hostId;
+        if (string.IsNullOrWhiteSpace(name))
+            return true;
+        try
+        {
+            return IsValidManagedName(name, ReadOptions().NamePrefix);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
     /// <summary>
     /// The strongest isolation this provider can honestly claim. BoxLite runs
     /// each sandbox as a hardware-isolated microVM with its own guest kernel —

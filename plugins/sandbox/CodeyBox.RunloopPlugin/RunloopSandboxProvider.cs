@@ -86,6 +86,22 @@ public sealed class RunloopSandboxProvider : ISandboxProvider, ISuspendingSandbo
     /// <summary>Provider kind. Normalised (trimmed, lowercase) and matched by exact ordinal equality.</summary>
     public string Name => RunloopSandboxOptions.ProviderKind;
 
+    /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId)
+    {
+        _ = hostId;
+        if (string.IsNullOrWhiteSpace(name))
+            return true;
+        try
+        {
+            return IsManaged(new DevboxView { Name = name }, _readOptions().NamePrefix);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
     /// <summary>Runloop guests are VMs with a separate guest kernel.</summary>
     public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
 

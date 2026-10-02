@@ -58,6 +58,22 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
     public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
     public IReadOnlyList<string> DeclaredCapabilities => [];
 
+    /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId)
+    {
+        _ = hostId;
+        if (string.IsNullOrWhiteSpace(name))
+            return true;
+        try
+        {
+            return IsValidManagedName(name, _readOptions().NamePrefix);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(spec);

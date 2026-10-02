@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Logs;
@@ -9343,7 +9344,8 @@ public partial class Program
 
     internal static CompositeManagedSandboxProvider BuildManagedSandboxLifecycleProvider(IServiceProvider sp)
     {
-        var providers = new List<IManagedSandboxLifecycle> { sp.GetRequiredService<ISandboxProvider>() };
+        var singleton = sp.GetRequiredService<ISandboxProvider>();
+        var providers = new List<IManagedSandboxLifecycle> { singleton };
         // Touch the catalog first: snapshot construction warms every configured
         // provider kind into the registry, so the registry snapshot below covers
         // the members placement can actually select. Registry-built providers
@@ -9361,11 +9363,48 @@ public partial class Program
             if (seenNames.Add(registration.Provider.Name))
                 providers.Add(registration.Provider);
         }
-        if (sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
+        var e2eManaged = sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source
+            ? source.ManagedSandboxProviders.ToArray()
+            : [];
+        providers.AddRange(e2eManaged);
+        // Leak-sweep inventory scope: a registered provider no sandbox class
+        // member references is skipped by default — an unused backend (e.g. a
+        // configured-but-unselected remote pool) is never listed and can never
+        // block disposal of other providers' leaks. The primary singleton and
+        // the E2E managed sources are always inventoried; everything else must
+        // be named by a member's provider kind (or opted back in via
+        // CodeyBox:SandboxLeak:InventoryUnreferencedProviders, e.g. while
+        // draining a decommissioned backend). Evaluated live so catalog
+        // hot-reloads take effect on the next sweep without a restart.
+        bool ShouldInventory(IManagedSandboxLifecycle lifecycle)
         {
-            providers.AddRange(source.ManagedSandboxProviders);
+            if (ReferenceEquals(lifecycle, singleton))
+                return true;
+            foreach (var managed in e2eManaged)
+            {
+                if (ReferenceEquals(managed, lifecycle))
+                    return true;
+            }
+            var leakOptions = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxLeak;
+            if (leakOptions.InventoryUnreferencedProviders)
+                return true;
+            foreach (var sandboxClass in sp.GetRequiredService<SandboxClassesSnapshot>().Current)
+            {
+                foreach (var member in sandboxClass.Members)
+                {
+                    if (string.Equals(member.ProviderKind, lifecycle.Name, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            return false;
         }
-        return new CompositeManagedSandboxProvider(providers);
+        return new CompositeManagedSandboxProvider(
+            providers,
+            ShouldInventory,
+            () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxLeak,
+            sp.GetService<ILogger<CompositeManagedSandboxProvider>>()
+                ?? NullLogger<CompositeManagedSandboxProvider>.Instance,
+            TimeProvider.System);
     }
 
     /// <summary>

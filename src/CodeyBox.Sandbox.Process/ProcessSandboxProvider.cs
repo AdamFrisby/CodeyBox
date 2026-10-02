@@ -27,6 +27,9 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
     public IReadOnlyList<string> DeclaredCapabilities => [];
 
     /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId) => false;
+
+    /// <inheritdoc/>
     /// <remarks>
     /// The process provider has no managed VM lifecycle; it returns an empty list.
     /// </remarks>

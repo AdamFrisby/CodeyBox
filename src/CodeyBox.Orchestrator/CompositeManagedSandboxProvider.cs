@@ -1,6 +1,26 @@
 using CodeyBox.Core;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Orchestrator;
+
+/// <summary>
+/// Thrown when a disposal cannot be verified because a provider that might own
+/// the sandbox could not confirm its full inventory. Deferring — not a
+/// disposal failure — so the leak reaper keeps the sandbox listed and retries
+/// on a later sweep instead of emitting per-sandbox failure events.
+/// </summary>
+public sealed class SandboxInventoryVerificationException : InvalidOperationException
+{
+    public SandboxInventoryVerificationException(string providerId, string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+        ProviderId = providerId;
+    }
+
+    /// <summary>Composite provider id that could not verify its inventory.</summary>
+    public string ProviderId { get; }
+}
 
 /// <summary>
 /// Read/dispose-only provider used by lifecycle services that need to sweep
@@ -9,12 +29,42 @@ namespace CodeyBox.Orchestrator;
 public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 {
     private const string NestedProviderIdPrefix = "nested:";
+    private static readonly TimeSpan DefaultInventoryFailureWarningInterval = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan MinimumInventoryFailureWarningInterval = TimeSpan.FromMinutes(1);
     private readonly IReadOnlyList<ProviderEntry> _providers;
     private readonly IReadOnlyDictionary<string, ProviderEntry> _providersById;
+    private readonly Func<IManagedSandboxLifecycle, bool>? _shouldInventory;
+    private readonly Func<SandboxLeakOptions>? _optionsAccessor;
+    private readonly ILogger<CompositeManagedSandboxProvider> _log;
+    private readonly TimeProvider _time;
     private readonly object _lastListLock = new();
     private Dictionary<string, ProviderEntry[]> _lastReportedByName = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> _lastInventoryFailureWarning = new(StringComparer.Ordinal);
 
     public CompositeManagedSandboxProvider(IEnumerable<IManagedSandboxLifecycle> providers)
+        : this(providers, shouldInventory: null, optionsAccessor: null, log: null, timeProvider: null)
+    {
+    }
+
+    /// <param name="providers">Constituent lifecycles, deduplicated by reference.</param>
+    /// <param name="shouldInventory">
+    /// Live predicate selecting which providers participate in listing and
+    /// disposal verification. Providers it rejects are skipped entirely: never
+    /// listed, never queried for verification, and never blocking disposal of
+    /// other providers' sandboxes. Evaluated on every operation so catalog
+    /// edits take effect without rebuilding this composite. Null inventories
+    /// every provider. A predicate that throws is treated as approval for that
+    /// provider (fail closed).
+    /// </param>
+    /// <param name="optionsAccessor">Live leak options for the failure-warning throttle.</param>
+    /// <param name="log">Sink for the rate-limited inventory-failure warning.</param>
+    /// <param name="timeProvider">Clock for the warning throttle.</param>
+    public CompositeManagedSandboxProvider(
+        IEnumerable<IManagedSandboxLifecycle> providers,
+        Func<IManagedSandboxLifecycle, bool>? shouldInventory,
+        Func<SandboxLeakOptions>? optionsAccessor = null,
+        ILogger<CompositeManagedSandboxProvider>? log = null,
+        TimeProvider? timeProvider = null)
     {
         var lifecycles = providers
             .Where(static p => p is not null)
@@ -32,9 +82,19 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
             })
             .ToArray();
         _providersById = _providers.ToDictionary(static p => p.Id, StringComparer.Ordinal);
+        _shouldInventory = shouldInventory;
+        _optionsAccessor = optionsAccessor;
+        _log = log ?? NullLogger<CompositeManagedSandboxProvider>.Instance;
+        _time = timeProvider ?? TimeProvider.System;
     }
 
     public string Name => "composite-managed";
+
+    public bool MightOwnSandbox(string name, string? hostId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        return _providers.Any(p => IsInventoried(p) && SafeMightOwn(p.Lifecycle, name, hostId));
+    }
 
     public IReadOnlyList<IManagedSandboxLifecycle> Providers => _providers.Select(static p => p.Lifecycle).ToArray();
 
@@ -45,19 +105,28 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
     {
         var result = new List<ManagedSandboxInfo>();
         var failures = new List<Exception>();
+        var unverifiableProviders = new HashSet<ProviderEntry>();
         var reportedByName = new Dictionary<string, List<ProviderEntry>>(StringComparer.Ordinal);
         var inventoriedHostIds = new HashSet<string>(StringComparer.Ordinal);
         var completedProviderCount = 0;
+        var inventoriedProviderCount = 0;
         var allProviderInventoriesComplete = true;
         foreach (var provider in _providers)
         {
+            if (!IsInventoried(provider))
+                continue;
+            inventoriedProviderCount++;
             ct.ThrowIfCancellationRequested();
             try
             {
                 var inventory = await provider.Lifecycle.ListManagedInventoryAsync(ct).ConfigureAwait(false);
                 completedProviderCount++;
                 if (!inventory.IsComplete)
+                {
                     allProviderInventoriesComplete = false;
+                    unverifiableProviders.Add(provider);
+                    NoteInventoryFailure(provider.Id, "partial inventory");
+                }
                 foreach (var hostId in inventory.InventoriedHostIds)
                     inventoriedHostIds.Add(hostId);
 
@@ -85,37 +154,66 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failures.Add(ex);
+                unverifiableProviders.Add(provider);
+                NoteInventoryFailure(provider.Id, ex.Message);
             }
         }
 
-        if (result.Count == 0 && failures.Count == _providers.Count && failures.Count > 0)
+        if (result.Count == 0 && failures.Count == inventoriedProviderCount && failures.Count > 0)
             throw new AggregateException("Every managed sandbox provider failed to list sandboxes.", failures);
 
         lock (_lastListLock)
         {
-            _lastReportedByName = reportedByName.ToDictionary(
+            var merged = reportedByName.ToDictionary(
                 static kvp => kvp.Key,
                 static kvp => kvp.Value.ToArray(),
                 StringComparer.Ordinal);
+            // A provider that could not verify its inventory may hide names it
+            // previously reported, so its last-known entries stay sticky until
+            // it reports a complete inventory again. Providers that completed
+            // keep only their fresh entries — a complete view proves absence.
+            if (unverifiableProviders.Count > 0)
+            {
+                foreach (var (name, previous) in _lastReportedByName)
+                {
+                    foreach (var entry in previous)
+                    {
+                        if (!unverifiableProviders.Contains(entry))
+                            continue;
+                        if (!merged.TryGetValue(name, out var current))
+                        {
+                            merged[name] = [entry];
+                        }
+                        else if (!current.Contains(entry))
+                        {
+                            merged[name] = [.. current, entry];
+                        }
+                    }
+                }
+            }
+            _lastReportedByName = merged;
         }
 
         return new ManagedSandboxInventory(
             result,
-            isComplete: completedProviderCount == _providers.Count && allProviderInventoriesComplete,
+            isComplete: inventoriedProviderCount > 0
+                && completedProviderCount == inventoriedProviderCount
+                && allProviderInventoriesComplete,
             inventoriedHostIds: inventoriedHostIds);
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
-        var reporters = await RequireNotOwnedByLiveWorkAsync(name, hostId: null, ct).ConfigureAwait(false);
+        var reporters = await RequireNotOwnedByLiveWorkAsync(name, hostId: null, ownerProviderId: null, ct).ConfigureAwait(false);
 
         ProviderEntry[]? candidates = reporters.Length > 0 ? reporters : LastReportedCandidates(name);
+        candidates = FilterInventoried(candidates);
 
         if (candidates is not { Length: > 0 })
         {
-            if (_providers.Count == 1)
+            if (InventoriedEntries().Count == 1)
             {
-                await _providers[0].Lifecycle.DisposeLeakedAsync(name, ct).ConfigureAwait(false);
+                await InventoriedEntries()[0].Lifecycle.DisposeLeakedAsync(name, ct).ConfigureAwait(false);
                 return;
             }
 
@@ -137,21 +235,33 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
             return;
         }
 
-        _ = await RequireNotOwnedByLiveWorkAsync(sandbox.Name, sandbox.HostId, ct).ConfigureAwait(false);
-
         var outerProviderId = sandbox.LifecycleProviderId;
-        string? innerProviderId = null;
         if (TryDecodeNestedProviderId(
                 sandbox.LifecycleProviderId,
                 out var decodedOuterProviderId,
-                out var decodedInnerProviderId))
+                out _))
         {
             outerProviderId = decodedOuterProviderId;
-            innerProviderId = decodedInnerProviderId;
         }
 
         if (!_providersById.TryGetValue(outerProviderId, out var provider))
             throw new InvalidOperationException($"Unknown managed sandbox provider '{sandbox.LifecycleProviderId}' for leaked sandbox '{sandbox.Name}'.");
+
+        if (!IsInventoried(provider))
+            throw new SandboxInventoryVerificationException(
+                provider.Id,
+                $"Refusing to dispose managed sandbox '{sandbox.Name}': provider '{provider.Id}' is not inventoried by the current sandbox configuration and its inventory cannot be verified.");
+
+        _ = await RequireNotOwnedByLiveWorkAsync(sandbox.Name, sandbox.HostId, outerProviderId, ct).ConfigureAwait(false);
+
+        string? innerProviderId = null;
+        if (TryDecodeNestedProviderId(
+                sandbox.LifecycleProviderId,
+                out _,
+                out var decodedInnerProviderId))
+        {
+            innerProviderId = decodedInnerProviderId;
+        }
 
         // Strip this composite's scope and pass the inner snapshot through.
         // Calling the name-only overload here would make a nested composite
@@ -170,19 +280,34 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
     /// disposal this re-verifies the name against live phase/worker state:
     /// every constituent lifecycle's active-work snapshot, plus a fresh
     /// managed inventory where ANY provider reporting the name as
-    /// tracked-active vetoes the delete. Verification failures fail closed —
-    /// a provider that could not fully enumerate its inventory (e.g. an
-    /// unreachable executor host on a multi-host backend) also vetoes the
-    /// delete, since a partial view can hide the tracked-active entry that
-    /// proves the VM live. The sweep retries on its next pass rather than
-    /// deleting an unverifiable VM.
+    /// tracked-active vetoes the delete.
+    ///
+    /// Inventory-completeness failures are scoped per provider. A provider
+    /// whose inventory is incomplete or unavailable (e.g. an unreachable
+    /// executor host on a multi-host backend) vetoes disposal only of
+    /// sandboxes it might own — its own provider-scoped snapshots, and
+    /// unscoped names its namespace could claim — since a partial view can
+    /// hide the tracked-active entry that proves the VM live. A failing
+    /// unrelated provider never blocks disposal of another healthy provider's
+    /// leaks: the sweep retries the deferred sandbox on its next pass rather
+    /// than deleting an unverifiable VM.
     /// </summary>
+    /// <param name="ownerProviderId">
+    /// Composite id of the provider that reported the sandbox, for
+    /// provider-scoped disposals; null for name-only disposals whose owner is
+    /// unknown and which therefore stay fail-closed on any unverifiable
+    /// provider that could own the name.
+    /// </param>
     /// <returns>
     /// The lifecycles whose fresh inventory reported <paramref name="name"/> —
     /// the same evidence the last sweep's reported-by-name map holds, but
     /// current, so a caller that has not swept recently can still route.
     /// </returns>
-    private async Task<ProviderEntry[]> RequireNotOwnedByLiveWorkAsync(string name, string? hostId, CancellationToken ct)
+    private async Task<ProviderEntry[]> RequireNotOwnedByLiveWorkAsync(
+        string name,
+        string? hostId,
+        string? ownerProviderId,
+        CancellationToken ct)
     {
         var liveNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var provider in _providers)
@@ -205,14 +330,27 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
         }
 
         var reporters = new List<ProviderEntry>();
+        var failedProviders = new List<(ProviderEntry Entry, Exception Error)>();
+        var incompleteProviders = new List<(ProviderEntry Entry, ManagedSandboxInventory Inventory)>();
         foreach (var provider in _providers)
         {
-            var inventory = await provider.Lifecycle.ListManagedInventoryAsync(ct).ConfigureAwait(false);
-            if (!inventory.IsComplete
-                && (hostId is null || !inventory.InventoriedHostIds.Contains(hostId)))
+            if (!IsInventoried(provider))
+                continue;
+            ManagedSandboxInventory inventory;
+            try
             {
-                throw new InvalidOperationException(
-                    $"Refusing to dispose managed sandbox '{name}': provider '{provider.Id}' could not verify its full inventory.");
+                inventory = await provider.Lifecycle.ListManagedInventoryAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failedProviders.Add((provider, ex));
+                NoteInventoryFailure(provider.Id, ex.Message);
+                continue;
+            }
+            if (!inventory.IsComplete)
+            {
+                incompleteProviders.Add((provider, inventory));
+                NoteInventoryFailure(provider.Id, "partial inventory");
             }
             foreach (var info in inventory)
             {
@@ -232,7 +370,190 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
                 }
             }
         }
+
+        if (ownerProviderId is not null)
+            ThrowIfOwnerUnverifiable(name, hostId, ownerProviderId, failedProviders, incompleteProviders);
+        else
+            ThrowIfUnscopedUnverifiable(name, hostId, failedProviders, incompleteProviders);
+
+        foreach (var (entry, inventory) in incompleteProviders)
+        {
+            if (string.Equals(entry.Id, ownerProviderId, StringComparison.Ordinal))
+                continue;
+            if (ReportsName(inventory, name)
+                || (SafeMightOwn(entry.Lifecycle, name, hostId) && PreviouslyReportedBy(entry, name)))
+            {
+                throw new SandboxInventoryVerificationException(
+                    entry.Id,
+                    $"Refusing to dispose managed sandbox '{name}': provider '{entry.Id}' could not verify its full inventory.");
+            }
+        }
+        foreach (var (entry, error) in failedProviders)
+        {
+            if (string.Equals(entry.Id, ownerProviderId, StringComparison.Ordinal))
+                continue;
+            if (SafeMightOwn(entry.Lifecycle, name, hostId) && PreviouslyReportedBy(entry, name))
+            {
+                throw new SandboxInventoryVerificationException(
+                    entry.Id,
+                    $"Refusing to dispose managed sandbox '{name}': provider '{entry.Id}' could not verify its full inventory.",
+                    error);
+            }
+        }
         return reporters.ToArray();
+    }
+
+    private static void ThrowIfOwnerUnverifiable(
+        string name,
+        string? hostId,
+        string ownerProviderId,
+        List<(ProviderEntry Entry, Exception Error)> failedProviders,
+        List<(ProviderEntry Entry, ManagedSandboxInventory Inventory)> incompleteProviders)
+    {
+        foreach (var (entry, error) in failedProviders)
+        {
+            if (string.Equals(entry.Id, ownerProviderId, StringComparison.Ordinal))
+            {
+                throw new SandboxInventoryVerificationException(
+                    entry.Id,
+                    $"Refusing to dispose managed sandbox '{name}': provider '{entry.Id}' could not verify its full inventory.",
+                    error);
+            }
+        }
+        foreach (var (entry, inventory) in incompleteProviders)
+        {
+            if (string.Equals(entry.Id, ownerProviderId, StringComparison.Ordinal)
+                && (hostId is null || !inventory.InventoriedHostIds.Contains(hostId)))
+            {
+                throw new SandboxInventoryVerificationException(
+                    entry.Id,
+                    $"Refusing to dispose managed sandbox '{name}': provider '{entry.Id}' could not verify its full inventory.");
+            }
+        }
+    }
+
+    private static void ThrowIfUnscopedUnverifiable(
+        string name,
+        string? hostId,
+        List<(ProviderEntry Entry, Exception Error)> failedProviders,
+        List<(ProviderEntry Entry, ManagedSandboxInventory Inventory)> incompleteProviders)
+    {
+        foreach (var (entry, error) in failedProviders)
+        {
+            if (SafeMightOwn(entry.Lifecycle, name, hostId))
+            {
+                throw new SandboxInventoryVerificationException(
+                    entry.Id,
+                    $"Refusing to dispose managed sandbox '{name}': provider '{entry.Id}' could not verify its full inventory.",
+                    error);
+            }
+        }
+        foreach (var (entry, inventory) in incompleteProviders)
+        {
+            if ((hostId is null || !inventory.InventoriedHostIds.Contains(hostId))
+                && SafeMightOwn(entry.Lifecycle, name, hostId))
+            {
+                throw new SandboxInventoryVerificationException(
+                    entry.Id,
+                    $"Refusing to dispose managed sandbox '{name}': provider '{entry.Id}' could not verify its full inventory.");
+            }
+        }
+    }
+
+    private static bool ReportsName(ManagedSandboxInventory inventory, string name)
+    {
+        foreach (var info in inventory)
+        {
+            if (string.Equals(info.Name, name, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    private bool PreviouslyReportedBy(ProviderEntry entry, string name)
+    {
+        lock (_lastListLock)
+        {
+            return _lastReportedByName.TryGetValue(name, out var candidates)
+                && Array.IndexOf(candidates, entry) >= 0;
+        }
+    }
+
+    private bool IsInventoried(ProviderEntry entry)
+    {
+        var predicate = _shouldInventory;
+        if (predicate is null)
+            return true;
+        try
+        {
+            return predicate(entry.Lifecycle);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private IReadOnlyList<ProviderEntry> InventoriedEntries()
+    {
+        var result = new List<ProviderEntry>(_providers.Count);
+        foreach (var provider in _providers)
+        {
+            if (IsInventoried(provider))
+                result.Add(provider);
+        }
+        return result;
+    }
+
+    private ProviderEntry[]? FilterInventoried(ProviderEntry[]? candidates)
+    {
+        if (candidates is null)
+            return null;
+        var result = new List<ProviderEntry>(candidates.Length);
+        foreach (var candidate in candidates)
+        {
+            if (IsInventoried(candidate))
+                result.Add(candidate);
+        }
+        return result.Count == 0 ? null : result.ToArray();
+    }
+
+    private static bool SafeMightOwn(IManagedSandboxLifecycle lifecycle, string name, string? hostId)
+    {
+        try
+        {
+            return lifecycle.MightOwnSandbox(name, hostId);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Rate-limited inventory-failure warning: repeated failures from one
+    /// provider emit one warning per interval, not one per sandbox per sweep.
+    /// </summary>
+    private void NoteInventoryFailure(string providerId, string reason)
+    {
+        var interval = _optionsAccessor?.Invoke()?.InventoryFailureWarningInterval
+            ?? DefaultInventoryFailureWarningInterval;
+        if (interval < MinimumInventoryFailureWarningInterval)
+            interval = MinimumInventoryFailureWarningInterval;
+        var now = _time.GetUtcNow();
+        lock (_lastListLock)
+        {
+            if (_lastInventoryFailureWarning.TryGetValue(providerId, out var last)
+                && now - last < interval)
+            {
+                return;
+            }
+            _lastInventoryFailureWarning[providerId] = now;
+        }
+        _log.LogWarning(
+            "CompositeManagedSandboxProvider: provider '{ProviderId}' could not verify its full inventory ({Reason}); deferring disposals it might own until its inventory recovers",
+            providerId,
+            reason);
     }
 
     private ProviderEntry[]? LastReportedCandidates(string name)

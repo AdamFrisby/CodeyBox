@@ -723,6 +723,7 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     private int _activeDisposes;
     private int _maxConcurrentDisposesObserved;
     private bool _throwOnList;
+    private int _inventoryListCalls;
 
     public IReadOnlyList<string> DisposedNames
     {
@@ -784,6 +785,17 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
     public void SetDisposeDelay(TimeSpan delay) => _disposeDelay = delay;
     public void SetListThrows() => _throwOnList = true;
 
+    /// <summary>When true, inventory reports a partial enumeration.</summary>
+    public bool InventoryIncomplete { get; set; }
+
+    /// <summary>When set, inventory listing throws this failure.</summary>
+    public Exception? InventoryFailure { get; set; }
+
+    /// <summary>Namespace ownership hook; null keeps the conservative default.</summary>
+    public Func<string, string?, bool>? MightOwnFunc { get; set; }
+
+    public int InventoryListCalls => _inventoryListCalls;
+
     public string Name => "fake";
 
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
@@ -804,6 +816,18 @@ internal sealed class FakeSandboxProvider : ISandboxProvider
                     })
                     .ToList());
         }
+    }
+
+    public bool MightOwnSandbox(string name, string? hostId) =>
+        MightOwnFunc?.Invoke(name, hostId) ?? true;
+
+    public async Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
+    {
+        Interlocked.Increment(ref _inventoryListCalls);
+        if (InventoryFailure is not null)
+            throw InventoryFailure;
+        var managed = await ListAllManagedAsync(ct).ConfigureAwait(false);
+        return new ManagedSandboxInventory(managed, isComplete: !InventoryIncomplete);
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)

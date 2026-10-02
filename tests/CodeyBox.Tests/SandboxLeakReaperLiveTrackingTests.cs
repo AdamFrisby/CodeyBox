@@ -232,10 +232,11 @@ public sealed class SandboxLeakReaperLiveTrackingTests
         provider.SeedUntracked("codeybox-half-seen", DateTimeOffset.UtcNow - TimeSpan.FromHours(2));
         var composite = new CompositeManagedSandboxProvider([provider]);
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+        var ex = await Assert.ThrowsAsync<SandboxInventoryVerificationException>(
             () => composite.DisposeLeakedAsync("codeybox-half-seen", CancellationToken.None));
 
         Assert.Contains("could not verify", ex.Message);
+        Assert.Equal("incus", ex.ProviderId);
         Assert.Empty(provider.DisposedNames);
     }
 

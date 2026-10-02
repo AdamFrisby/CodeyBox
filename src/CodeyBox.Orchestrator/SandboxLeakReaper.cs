@@ -548,6 +548,20 @@ public sealed class SandboxLeakReaper : BackgroundService
         }
         catch (Exception ex)
         {
+            if (ex is SandboxInventoryVerificationException verification)
+            {
+                // Deferred, not failed: a provider that might own this sandbox
+                // could not verify its full inventory, so disposal waits for a
+                // later sweep. The composite already emitted the rate-limited
+                // warning for that provider — stay quiet here so one down
+                // backend does not fan out into one audit/webhook/log event
+                // per sandbox per sweep. The leak stays listed for retry.
+                _log.LogDebug(
+                    verification,
+                    "SandboxLeakReaper: deferred disposal of leaked sandbox {Name} pending inventory recovery",
+                    leak.Name);
+                return LeakIdentity.From(leak);
+            }
             AuditLog.SandboxLeakDisposeFailed(leak.Name, leak.Age.TotalMinutes, diskMb, ex.Message, leak.Reason);
             _ = _webhooks.PublishAsync(new WebhookEvent
             {
@@ -728,4 +742,27 @@ public sealed class SandboxLeakOptions
     /// <para><b>Hot-reloadable:</b> read from the Func accessor on each sweep.</para>
     /// </summary>
     public TimeSpan DisposeTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Whether providers that no sandbox class member references are still
+    /// inventoried by the leak sweep. Default false: an unused registered
+    /// provider (for example a remote pool configured but not selected by any
+    /// member) is skipped entirely — never listed, never queried for disposal
+    /// verification, and never able to block disposal of other providers'
+    /// leaks. Set true to inventory every registered provider (e.g. while
+    /// draining a decommissioned backend whose VMs outlive its class members).
+    /// <para><b>Hot-reloadable:</b> read from the Func accessor on each sweep and disposal.</para>
+    /// </summary>
+    public bool InventoryUnreferencedProviders { get; set; }
+
+    /// <summary>
+    /// Minimum interval between repeated inventory-failure warnings for the
+    /// same provider. A provider with a down backend would otherwise emit one
+    /// warning per sandbox per sweep; the composite instead warns once per
+    /// interval per provider and defers affected disposals quietly until the
+    /// inventory recovers. Default 15 minutes (the default sweep cadence).
+    /// Values below one minute are clamped to one minute.
+    /// <para><b>Hot-reloadable:</b> read from the Func accessor on each failure.</para>
+    /// </summary>
+    public TimeSpan InventoryFailureWarningInterval { get; set; } = TimeSpan.FromMinutes(15);
 }

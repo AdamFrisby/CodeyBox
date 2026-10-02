@@ -59,6 +59,19 @@ public interface IManagedSandboxLifecycle
     }
 
     /// <summary>
+    /// Whether a sandbox with this name could belong to this provider, used to
+    /// scope inventory-completeness guards: when this provider cannot verify its
+    /// full inventory, disposal of a sandbox it could own stays blocked, while
+    /// disposal of sandboxes outside its namespace proceeds on the owning
+    /// provider's complete inventory. Providers with a configured name
+    /// namespace (prefix) or host set answer from that namespace; providers
+    /// whose ownership is label-based (verifiable only by listing) keep the
+    /// conservative default <c>true</c>. Must be pure and cheap: it runs per
+    /// candidate on every disposal verification, never touches the network.
+    /// </summary>
+    bool MightOwnSandbox(string name, string? hostId) => true;
+
+    /// <summary>
     /// Best-effort dispose of a sandbox by name. Used by the
     /// <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> when
     /// <c>AutoDispose=true</c>, and by the
