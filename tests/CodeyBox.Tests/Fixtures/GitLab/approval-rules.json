@@ -1,0 +1,24 @@
+[
+  {
+    "id": 21,
+    "name": "security",
+    "rule_type": "regular",
+    "approvals_required": 1,
+    "approved": false,
+    "approved_by": [],
+    "approvers": [
+      { "user": { "id": 12, "username": "reviewer-ada", "name": "Ada Reviewer" } }
+    ]
+  },
+  {
+    "id": 22,
+    "name": "default",
+    "rule_type": "any_approver",
+    "approvals_required": 1,
+    "approved": true,
+    "approved_by": [
+      { "user": { "id": 11, "username": "approver-bob", "name": "Bob Approver" } }
+    ],
+    "approvers": []
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "id": 402,
+  "url": "https://codeybox.example.com/hooks/gitlab",
+  "push_events": true,
+  "tag_push_events": false,
+  "merge_requests_events": true,
+  "pipeline_events": false,
+  "job_events": false,
+  "note_events": false,
+  "wiki_page_events": false,
+  "deployment_events": false,
+  "member_events": false,
+  "subgroup_events": false,
+  "release_events": false,
+  "push_events_branch_filter": ""
+}

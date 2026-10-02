@@ -1,0 +1,44 @@
+[
+  {
+    "id": 1001,
+    "iid": 7,
+    "project_id": 4,
+    "title": "Add feature Z",
+    "state": "opened",
+    "detailed_merge_status": "mergeable",
+    "source_branch": "codeybox/abc123",
+    "target_branch": "main",
+    "sha": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c",
+    "merge_commit_sha": null,
+    "squash_commit_sha": null,
+    "web_url": "https://gitlab.example.com/myteam/myproject/-/merge_requests/7"
+  },
+  {
+    "id": 1002,
+    "iid": 8,
+    "project_id": 4,
+    "title": "Work in progress",
+    "state": "opened",
+    "detailed_merge_status": "checking",
+    "source_branch": "codeybox/def456",
+    "target_branch": "main",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "merge_commit_sha": null,
+    "squash_commit_sha": null,
+    "web_url": "https://gitlab.example.com/myteam/myproject/-/merge_requests/8"
+  },
+  {
+    "id": 1003,
+    "iid": 9,
+    "project_id": 4,
+    "title": "Unrelated work",
+    "state": "opened",
+    "detailed_merge_status": "conflict",
+    "source_branch": "feature/other",
+    "target_branch": "main",
+    "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "merge_commit_sha": null,
+    "squash_commit_sha": null,
+    "web_url": "https://gitlab.example.com/myteam/myproject/-/merge_requests/9"
+  }
+]

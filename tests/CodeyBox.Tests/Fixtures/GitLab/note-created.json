@@ -1,0 +1,14 @@
+{
+  "id": 304,
+  "body": "Acknowledged.",
+  "author": {
+    "id": 10,
+    "username": "codeybox-bot",
+    "name": "CodeyBox"
+  },
+  "system": false,
+  "created_at": "2026-09-10T12:00:00.000Z",
+  "discussion_id": "aaa111",
+  "position": null,
+  "resolvable": false
+}
