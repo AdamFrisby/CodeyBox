@@ -58,7 +58,7 @@ public static class Program
             rest = args;
         else
         {
-            error.WriteLine($"Unknown command: {args[0]}");
+            error.WriteLine(HostCommands.SanitizeForMessage($"Unknown command: {args[0]}", keepLineBreaks: false));
             PrintUsage(error);
             return ExitUsage;
         }
@@ -76,7 +76,7 @@ public static class Program
         }
         catch (TestSelectionBaselineProduceException ex)
         {
-            error.WriteLine(ex.Message);
+            error.WriteLine(HostCommands.SanitizeForMessage(ex.Message, keepLineBreaks: true));
             PrintUsage(error);
             return ExitUsage;
         }
@@ -85,14 +85,15 @@ public static class Program
         {
             var producer = new TestSelectionBaselineProducer(runner, coverage);
             var baseline = await producer.ProduceAsync(options, ct).ConfigureAwait(false);
-            output.WriteLine(
-                $"Wrote {TestSelectionBaseline.FormatMarker} with {baseline.Tests.Count} tests to {options.OutputPath}");
+            output.WriteLine(HostCommands.SanitizeForMessage(
+                $"Wrote {TestSelectionBaseline.FormatMarker} with {baseline.Tests.Count} tests to {options.OutputPath}",
+                keepLineBreaks: false));
             return ExitOk;
         }
         catch (Exception ex) when (ex is TestSelectionBaselineProduceException
             or FormatException or TimeoutException or IOException or UnauthorizedAccessException)
         {
-            error.WriteLine(ex.Message);
+            error.WriteLine(HostCommands.SanitizeForMessage(ex.Message, keepLineBreaks: true));
             return ExitFailed;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -102,7 +103,8 @@ public static class Program
         }
         catch (Exception ex)
         {
-            error.WriteLine($"Unexpected failure ({ex.GetType().Name}): {ex.Message}");
+            error.WriteLine(HostCommands.SanitizeForMessage(
+                $"Unexpected failure ({ex.GetType().Name}): {ex.Message}", keepLineBreaks: true));
             return ExitFailed;
         }
     }

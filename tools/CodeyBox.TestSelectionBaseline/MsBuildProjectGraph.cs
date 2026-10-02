@@ -18,6 +18,11 @@ public static class MsBuildProjectGraph
     public const int MaxProjectXmlBytes = 4 * 1024 * 1024;
     public const int MaxWalkDepth = 16;
 
+    // This repository's own solution name. Only short-circuits when that
+    // exact file exists; foreign checkouts fall through to generic
+    // *.slnx/*.sln enumeration below.
+    private const string PreferredSolutionFileName = "CodeyBox.slnx";
+
     public sealed record Graph(
         IReadOnlyList<string> Projects,
         IReadOnlyList<string> TestProjects,
@@ -114,11 +119,7 @@ public static class MsBuildProjectGraph
     public static string? FindSolutionFile(string repoRoot)
     {
         var root = Path.GetFullPath(repoRoot);
-        // Prefer this repository's own solution name when present — the
-        // producer's primary job is CodeyBox itself. Only short-circuits
-        // when that exact file exists; foreign checkouts fall through to
-        // generic *.slnx/*.sln enumeration.
-        var preferred = Path.Combine(root, "CodeyBox.slnx");
+        var preferred = Path.Combine(root, PreferredSolutionFileName);
         if (File.Exists(preferred))
             return preferred;
 

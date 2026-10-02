@@ -10,6 +10,15 @@ namespace CodeyBox.TestSelectionProducer;
 /// </summary>
 public sealed class TestSelectionBaselineProducer
 {
+    // Caps for the 'git rev-parse HEAD' probe: stdout holds one hex sha plus
+    // a newline, stderr holds only a short git diagnostic on failure.
+    private const int MaxCommitStdoutChars = 256;
+    private const int MaxGitStderrChars = 16 * 1024;
+
+    // SHA-1 (40 hex chars) and SHA-256 (64 hex chars) object names.
+    private const int Sha1HexLength = 40;
+    private const int Sha256HexLength = 64;
+
     private readonly HostCommands _commands;
     private readonly IPerTestCoverageCollector _coverage;
 
@@ -274,8 +283,8 @@ public sealed class TestSelectionBaselineProducer
         var result = await _commands.CappedAsync(
             [options.GitExecutable, "-C", repoRoot, "rev-parse", "--verify", "HEAD"],
             repoRoot,
-            maxStdoutChars: 256,
-            maxStderrChars: 16 * 1024,
+            maxStdoutChars: MaxCommitStdoutChars,
+            maxStderrChars: MaxGitStderrChars,
             options.CommandTimeout,
             "git rev-parse HEAD",
             ct).ConfigureAwait(false);
@@ -359,7 +368,7 @@ public sealed class TestSelectionBaselineProducer
 
     private static bool IsCommitSha(string sha)
     {
-        if (sha.Length is not (40 or 64))
+        if (sha.Length is not (Sha1HexLength or Sha256HexLength))
             return false;
         foreach (var c in sha)
         {
