@@ -3279,6 +3279,8 @@ builder.Services.AddSingleton<IInteractionVerifier>(sp =>
         "teams",
         Program.InteractionProviderOpts(sp, "teams"),
         keyProvider: sp.GetRequiredService<IBotFrameworkSigningKeyProvider>()));
+builder.Services.AddSingleton<IInteractionVerifier>(sp =>
+    new DiscordInteractionVerifier("discord", Program.InteractionProviderOpts(sp, "discord")));
 
 // --- Changelog automation ----------------------------------------------------
 // Named HTTP client for direct Anthropic Messages API calls (changelog generation).

@@ -206,6 +206,39 @@ internal static class InteractionEndpoints
                 validationError = ValidatePayload(payload);
             }
         }
+
+        // Discord delivers its own envelope (never the canonical JSON) to
+        // the Interactions Endpoint URL registered in the Developer Portal.
+        // After verification, answer the PING registration challenge
+        // immediately — Discord refuses to enable an endpoint that does
+        // not — else map the component press onto the canonical shape.
+        // Verification already passed either way.
+        var discord = IsDiscordScheme(providerOpts.Scheme);
+        if (discord)
+        {
+            if (DiscordInteractionParser.IsPingRequest(bodyBytes))
+                return Results.Json(new { type = 1 });
+            if (DiscordInteractionParser.TryParse(bodyBytes, out var discordCanonical, out var discordReason)
+                && discordCanonical is not null)
+            {
+                payload = new InteractionPayload
+                {
+                    InteractionId = discordCanonical.InteractionId,
+                    WorkItemId = discordCanonical.WorkItemId,
+                    QuestionId = discordCanonical.QuestionId,
+                    Answer = discordCanonical.Answer,
+                    User = new InteractionUser { UserId = discordCanonical.UserId, Login = discordCanonical.Login },
+                    ChannelId = discordCanonical.ChannelId,
+                    ResponseUrl = null,
+                    CorrelationToken = discordCanonical.CorrelationToken,
+                };
+                validationError = ValidatePayload(payload);
+            }
+            else
+            {
+                return Results.BadRequest(new { error = discordReason });
+            }
+        }
         if (validationError is not null)
             return Results.BadRequest(new { error = validationError });
         if (payload is null)
@@ -214,7 +247,9 @@ internal static class InteractionEndpoints
         // Replay guard: platforms retry, so the same interaction delivered
         // twice answers once. The claim happens before any state change.
         if (!dedup.TryClaim(payload.InteractionId!))
-            return Results.Ok(new { status = "duplicate" });
+            return discord
+                ? DiscordOutcome("Already recorded — this press was already received.")
+                : Results.Ok(new { status = "duplicate" });
 
         // Authorisation: connecting the integration is the grant, narrowed
         // optionally by exact-match channel/user allowlists.
@@ -225,7 +260,9 @@ internal static class InteractionEndpoints
             log.LogWarning(
                 "Interactions: rejected interaction from unlisted channel for provider '{Provider}'",
                 providerOpts.Provider);
-            return Results.Json(new { error = "channel is not authorised for this integration" }, statusCode: 403);
+            return discord
+                ? DiscordOutcome("This channel is not authorised for this integration.")
+                : Results.Json(new { error = "channel is not authorised for this integration" }, statusCode: 403);
         }
         if (providerOpts.AllowedUsers.Count > 0
             && !providerOpts.AllowedUsers.Any(u => string.Equals(u, payload.User!.UserId, StringComparison.Ordinal)))
@@ -233,7 +270,9 @@ internal static class InteractionEndpoints
             log.LogWarning(
                 "Interactions: rejected interaction from unlisted user for provider '{Provider}'",
                 providerOpts.Provider);
-            return Results.Json(new { error = "user is not authorised for this integration" }, statusCode: 403);
+            return discord
+                ? DiscordOutcome("You are not authorised to answer from this integration.")
+                : Results.Json(new { error = "user is not authorised for this integration" }, statusCode: 403);
         }
 
         // Stale-button guard: an interaction that carries a correlation token
@@ -243,7 +282,9 @@ internal static class InteractionEndpoints
             var expected = NotificationInteractionHelper.CorrelationTokenFor(
                 payload.WorkItemId!, payload.QuestionId!);
             if (!string.Equals(payload.CorrelationToken, expected, StringComparison.Ordinal))
-                return Results.Conflict(new { error = "stale interaction: it does not match the current question" });
+                return discord
+                    ? DiscordOutcome("Stale button: it does not match the current question.")
+                    : Results.Conflict(new { error = "stale interaction: it does not match the current question" });
         }
 
         if (questionStore is null)
@@ -255,21 +296,31 @@ internal static class InteractionEndpoints
 
         var item = await store.GetAsync(workItemId, ct);
         if (item is null)
-            return Results.NotFound(new { error = "work item not found" });
+            return discord
+                ? DiscordOutcome("Work item not found.")
+                : Results.NotFound(new { error = "work item not found" });
 
         if (item.State != WorkItemState.NeedsOperatorInput)
-            return Results.Conflict(new { error = "stale interaction: the work item is no longer awaiting operator input" });
+            return discord
+                ? DiscordOutcome("Too late — the work item is no longer awaiting operator input.")
+                : Results.Conflict(new { error = "stale interaction: the work item is no longer awaiting operator input" });
 
         var question = await questionStore.GetAsync(item.Id.ToString(), payload.QuestionId!, ct);
         if (question is null)
-            return Results.NotFound(new { error = $"question '{payload.QuestionId}' not found" });
+            return discord
+                ? DiscordOutcome($"Question '{payload.QuestionId}' was not found.")
+                : Results.NotFound(new { error = $"question '{payload.QuestionId}' not found" });
 
         // A stale button must fail cleanly and say why — never silently
         // overwrite or resurrect a decided question.
         if (question.State == "answered")
-            return Results.Conflict(new { error = "question was already answered", questionState = question.State });
+            return discord
+                ? DiscordOutcome("Already answered — this question already has a decision.")
+                : Results.Conflict(new { error = "question was already answered", questionState = question.State });
         if (question.State != "open")
-            return Results.Conflict(new { error = $"question is no longer open ({question.State})", questionState = question.State });
+            return discord
+                ? DiscordOutcome($"No longer open ({question.State}) — this question can no longer be answered.")
+                : Results.Conflict(new { error = $"question is no longer open ({question.State})", questionState = question.State });
 
         var answeredBy = NotificationInteractionHelper.FormatAnsweredBy(
             providerOpts.Provider, payload.User!.UserId!, payload.User.Login);
@@ -300,6 +351,14 @@ internal static class InteractionEndpoints
             providerOpts.Provider, renderProviders, payload, question.QuestionText,
             redactedAnswer, answeredBy, log, ct);
 
+        // Discord requires the acknowledgement in the HTTP response itself
+        // (an ephemeral confirmation here; the channel-visible loop-close
+        // lands via the provider update above). The answer pipeline is
+        // local and fast, so this stays inside Discord's acknowledgement
+        // deadline without deferring.
+        if (discord)
+            return DiscordOutcome($"Decided: {redactedAnswer} — by {answeredBy}");
+
         return Results.Ok(new { status = "answered", questionState = "answered" });
     }
 
@@ -308,6 +367,26 @@ internal static class InteractionEndpoints
 
     private static bool IsTeamsScheme(string? scheme) =>
         string.Equals(scheme, TeamsInteractionVerifier.Scheme, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDiscordScheme(string? scheme) =>
+        string.Equals(scheme, "discord-ed25519", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Acknowledge a Discord interaction in-band: a
+    /// <c>type 4</c> (channel message) ephemeral response carrying the
+    /// outcome. Discord reports any other shape to the user as a failure,
+    /// even when the answer landed — so verified domain outcomes answer
+    /// this way while transport and verification problems keep their HTTP
+    /// error codes.</summary>
+    private static IResult DiscordOutcome(string content) =>
+        Results.Json(new
+        {
+            type = 4,
+            data = new
+            {
+                content = NotificationRendering.Truncate(content, 2000),
+                flags = 64,
+            },
+        });
 
     /// <summary>Hand a landed decision to the matching render provider when
     /// it carries interactions itself. Notification-only providers (the
