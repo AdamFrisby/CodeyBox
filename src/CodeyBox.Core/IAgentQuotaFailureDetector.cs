@@ -48,6 +48,18 @@ public interface IAgentQuotaFailureDetector
     /// events cannot false-positive the final failure. Must never throw.
     /// </summary>
     string? ScopeStdoutForQuotaDetection(string? stdout) => stdout;
+
+    /// <summary>
+    /// Optional hook: returns the provider-side transient family when the
+    /// captured streams carry one of this agent's exact transient signatures
+    /// (model capacity, output truncation, transport/upstream blip), or null
+    /// when nothing matches. The orchestrator parks a match for bounded
+    /// transient retry on the same agent and model instead of failing the
+    /// work item. Signatures are matched exactly (compiled expressions over
+    /// multi-token provider diagnostics, never loose substrings). The default
+    /// implementation returns null. Must never throw.
+    /// </summary>
+    ProviderTransientDetection? DetectProviderTransient(string? stderr, string? stdout, string? summary) => null;
 }
 
 /// <summary>
