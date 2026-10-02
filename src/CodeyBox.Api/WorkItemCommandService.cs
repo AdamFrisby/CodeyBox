@@ -1251,34 +1251,40 @@ internal sealed class WorkItemCommandService
             item = fenced;
         }
 
-        var (success, error, resumeState, actualFrom, openQuestions) = await _retrier.RetryAsync(
+        var retry = await _retrier.RetryAsync(
             item,
             plan.RequestedFrom,
             trigger: "manual",
             ct: ct,
             workTimeoutMinutes: workTimeoutMinutes);
 
-        if (!success)
+        if (!retry.Success)
         {
-            if (openQuestions is { Count: > 0 })
-                return new WorkItemCommandOutcome(
-                    StatusCodes.Status409Conflict, new { error, openQuestions }, Error: error,
-                    WritesApplied: plan.NeedsStaleFence);
-
-            if (error!.Contains("no longer exists"))
+            if (retry.OpenQuestions is { Count: > 0 } openQuestions)
                 return new WorkItemCommandOutcome(
                     StatusCodes.Status409Conflict,
-                    new { error, hint = "retry with from=\"work\" to start over from a fresh clone" },
-                    Error: error,
+                    new { error = retry.Error, openQuestions },
+                    Error: retry.Error,
                     WritesApplied: plan.NeedsStaleFence);
 
-            return WorkItemCommandOutcome.Conflict(error!)
+            // The retrier reports a bare-repo loss that a fresh-clone restart
+            // can clear only when a from="work" retry would actually succeed —
+            // a retained-sandbox recovery lease blocks that path, so no hint is
+            // offered for it.
+            if (retry.FreshCloneRetryAvailable)
+                return new WorkItemCommandOutcome(
+                    StatusCodes.Status409Conflict,
+                    new { error = retry.Error, hint = "retry with from=\"work\" to start over from a fresh clone" },
+                    Error: retry.Error,
+                    WritesApplied: plan.NeedsStaleFence);
+
+            return WorkItemCommandOutcome.Conflict(retry.Error!)
                 with { WritesApplied = plan.NeedsStaleFence };
         }
 
         return new WorkItemCommandOutcome(
             StatusCodes.Status202Accepted,
-            new { id = item.Id.ToString(), from = plan.RequestedFrom ?? "auto", actualFrom = actualFrom!, state = resumeState!.Value.ToString() },
+            new { id = item.Id.ToString(), from = plan.RequestedFrom ?? "auto", actualFrom = retry.ActualFrom!, state = retry.ResumeState!.Value.ToString() },
             Location: $"/workitems/{item.Id}",
             Item: item,
             WritesApplied: true);
