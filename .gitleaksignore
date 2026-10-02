@@ -102,3 +102,12 @@ e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQ
 #   runtime so no scanner-detectable PEM literal remains. This entry covers
 #   the pre-fix commit only.
 1cf93cd32577248c2736c5b86e1a9f613a72b3f7:tests/CodeyBox.Tests/OpenStackSandboxProviderTests.cs:private-key:347
+# Synthetic Discord snowflake IDs in an earlier revision of the Discord
+# interaction-parser test
+# (tests/CodeyBox.Tests/DiscordInteractionParserTests.cs): invented
+# high-entropy-looking 18-digit interaction/user/channel/guild/message IDs
+# used only as recorded-shape hermetic fixtures, never live credentials.
+# A Discord application (client) ID is a public identifier, not a secret.
+# The current file uses repeated-digit placeholders; this entry covers the
+# pre-fix commit only.
+05547d9acc6f62e28df7282e0d715af53db4f045:tests/CodeyBox.Tests/DiscordInteractionParserTests.cs:discord-client-id:58
