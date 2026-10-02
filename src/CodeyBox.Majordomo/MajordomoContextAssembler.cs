@@ -23,10 +23,11 @@ namespace CodeyBox.Majordomo;
 /// stdout, audit findings). They are stored as data and replayed only inside
 /// demarcated <c>[untrusted_tool_result]</c> blocks framed as data — never
 /// as instructions — with embedded closing markers escaped so a payload
-/// cannot break out of its block. Fleet free-text lines (in-flight items,
-/// quota lines, recent failures) are untrusted for the same reason and replay
-/// only inside demarcated <c>[untrusted_fleet_data]</c> blocks carrying the
-/// same notice and closing-marker escaping.</para>
+/// cannot break out of its block. All fleet content (queue state, state-count
+/// keys, in-flight items, quota lines, recent failures) is caller-supplied
+/// and untrusted for the same reason; it replays only inside demarcated
+/// <c>[untrusted_fleet_data]</c> blocks carrying the same notice and
+/// closing-marker escaping, never in a privileged header.</para>
 /// </remarks>
 public static class MajordomoContextAssembler
 {
@@ -151,16 +152,31 @@ public static class MajordomoContextAssembler
         if (maxChars == 0)
             return string.Empty;
         var body = new StringBuilder();
-        body.Append(string.Create(CultureInfo.InvariantCulture, $"[fleet queue={EscapeFleetContent(fleet.QueueState)}"));
-        var counts = fleet.StateCounts.OrderBy(static kv => kv.Key, StringComparer.Ordinal).ToList();
-        if (counts.Count > 0)
-            body.Append(string.Create(CultureInfo.InvariantCulture, $" counts={string.Join(",", counts.Select(static kv => $"{EscapeFleetContent(kv.Key)}:{kv.Value}"))}"));
-        body.Append(']');
+        body.Append("[fleet]");
+        AppendFleetQueueState(body, fleet);
         AppendFleetLines(body, "in-flight", fleet.InFlightItems);
         AppendFleetLines(body, "quota", fleet.QuotaLines);
         AppendFleetLines(body, "failures", fleet.RecentFailures);
         var text = body.ToString();
         return text.Length <= maxChars ? text : text[..maxChars];
+    }
+
+    /// <summary>
+    /// Replays the queue state and state-count keys — both caller-supplied
+    /// free text — inside a fenced untrusted-data block framed as data, never
+    /// as a privileged header. Counts stay numeric; only the state names are
+    /// untrusted. Mirrors the tool-result path: the embedded closing marker
+    /// is escaped with an ordinal replacement so a payload carrying
+    /// <c>]</c>, newlines, or fake transcript blocks cannot break out.
+    /// </summary>
+    private static void AppendFleetQueueState(StringBuilder body, MajordomoFleetSnapshot fleet)
+    {
+        var payload = new StringBuilder();
+        payload.Append(string.Create(CultureInfo.InvariantCulture, $"queue={fleet.QueueState}"));
+        var counts = fleet.StateCounts.OrderBy(static kv => kv.Key, StringComparer.Ordinal).ToList();
+        if (counts.Count > 0)
+            payload.Append(string.Create(CultureInfo.InvariantCulture, $" counts={string.Join(",", counts.Select(static kv => $"{kv.Key}:{kv.Value}"))}"));
+        body.Append(string.Create(CultureInfo.InvariantCulture, $" {FleetDataOpen} queue-state]\n{UntrustedDataNotice}\n{EscapeFleetContent(payload.ToString())}\n{FleetDataClose}"));
     }
 
     /// <summary>
