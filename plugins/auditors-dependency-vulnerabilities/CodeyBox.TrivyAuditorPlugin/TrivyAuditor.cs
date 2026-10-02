@@ -286,67 +286,8 @@ public sealed class TrivyAuditor : ExternalToolAuditorBase, IPluginInitializer
             return [];
 
         var canonical = await CanonicalizeOutsideWorktreeAsync(
-            sandbox, workingDirectory, configured, options, ct).ConfigureAwait(false);
+            sandbox, workingDirectory, configured, ConfigPathKey, options, ct).ConfigureAwait(false);
         return ["--config", canonical];
-    }
-
-    /// <summary>
-    /// Canonicalizes the operator's <c>ConfigPath</c> inside the sandbox
-    /// and fails closed when it resolves inside the audited worktree, using
-    /// one <c>realpath -m</c> call over the configured path and
-    /// <c>"."</c>: relative paths, <c>..</c> segments, and symlinked
-    /// components all collapse to the path trivy would actually open, and
-    /// containment is judged against the same canonicalized scan root.
-    /// </summary>
-    private async Task<string> CanonicalizeOutsideWorktreeAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string configured,
-        ExternalToolAuditorOptions options,
-        CancellationToken ct)
-    {
-        var probe = await ExecToolBoundedAsync(
-            sandbox,
-            ToolName,
-            "config-file check",
-            new SandboxExec
-            {
-                Argv = ["realpath", "-m", "--", configured, "."],
-                WorkingDirectory = workingDirectory,
-                MaxStdoutBytes = ProbeMaxOutputBytes,
-                MaxStderrBytes = ProbeMaxOutputBytes,
-                KillOnOutputLimit = true,
-            },
-            ProbeTimeout(options),
-            ct).ConfigureAwait(false);
-
-        if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' {ConfigPathKey} canonicalization could "
-                + "not run: the sandbox exec transport was unavailable.");
-
-        var lines = probe.Stdout.Split(
-            '\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (probe.ExitCode != 0 || lines.Length != 2)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' could not canonicalize {ConfigPathKey} "
-                + $"'{TruncateForMessage(configured)}' (exit {probe.ExitCode}) — an unchecked config "
-                + "path is never trusted, so this is infrastructure, not a verdict on the diff.",
-                probe.ExitCode,
-                probe.Stderr);
-
-        var canonicalConfig = ValidatedArgumentValue(lines[0], ConfigPathKey);
-        var canonicalWorktree = lines[1];
-        if (HostPathPolicy.IsWithinDirectory(canonicalConfig, canonicalWorktree))
-            throw new AuditUnavailableException(
-                $"could-not-verify: auditor 'codeybox:trivy' {ConfigPathKey} "
-                + $"'{TruncateForMessage(configured)}' resolves to '{TruncateForMessage(canonicalConfig)}' "
-                + "inside the audited worktree — a repository-controlled config can bind severity "
-                + "filters, skip globs, and ignores that silently empty the report. Set an absolute "
-                + "path outside the repository, or unset it.")
-            { IsDeterministic = true };
-
-        return canonicalConfig;
     }
 
     /// <inheritdoc />
