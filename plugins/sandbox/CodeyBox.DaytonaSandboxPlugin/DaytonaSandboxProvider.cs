@@ -102,6 +102,22 @@ public sealed class DaytonaSandboxProvider :
 
     public string Name => DaytonaSandboxOptions.ProviderKind;
 
+    /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId)
+    {
+        _ = hostId;
+        if (string.IsNullOrWhiteSpace(name))
+            return true;
+        try
+        {
+            return IsValidManagedName(name, ReadOptions().NamePrefix);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
     /// <summary>
     /// The strongest isolation this provider can honestly claim. Daytona's
     /// default sandbox class is container-based (shared runner kernel);

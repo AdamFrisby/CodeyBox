@@ -77,6 +77,26 @@ internal sealed class ReloadableSandboxProvider :
     public string Name => SelectedProvider.Provider.Name;
     public SandboxIsolationLevel IsolationLevel => SelectedProvider.Provider.IsolationLevel;
 
+    /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return true;
+        foreach (var provider in _providers)
+        {
+            try
+            {
+                if (provider.Provider.MightOwnSandbox(name, hostId))
+                    return true;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public SandboxAgentOutputTransportKind AgentOutputTransportKind =>
         SelectedProvider.Provider.AgentOutputTransportKind;
 

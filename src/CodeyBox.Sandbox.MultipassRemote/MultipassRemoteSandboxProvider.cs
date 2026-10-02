@@ -128,6 +128,27 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     public string Name => "multipass-remote";
     public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
 
+    /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return true;
+        IReadOnlyList<MultipassRemoteSandboxOptions> hosts;
+        try
+        {
+            hosts = ResolveHosts();
+        }
+        catch
+        {
+            return true;
+        }
+        if (!string.IsNullOrWhiteSpace(hostId))
+        {
+            return hosts.Any(host => string.Equals(host.HostId, hostId, StringComparison.Ordinal));
+        }
+        return hosts.Any(host => RemoteMultipassVmNames.IsManagedVmNameForPrefix(name, host.VmNamePrefix));
+    }
+
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         spec = SandboxConventions.WithTimingEnvironment(spec);

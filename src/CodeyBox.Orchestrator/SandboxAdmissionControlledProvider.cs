@@ -243,6 +243,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     public string Name => _inner.Name;
     public SandboxIsolationLevel IsolationLevel => _inner.IsolationLevel;
+
+    /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId) => _inner.MightOwnSandbox(name, hostId);
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
     public virtual IReadOnlyList<string> DeclaredCapabilities => _inner.DeclaredCapabilities;

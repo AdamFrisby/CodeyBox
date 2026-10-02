@@ -54,6 +54,9 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
     public IReadOnlyList<string> DeclaredCapabilities => [];
 
     /// <inheritdoc/>
+    public bool MightOwnSandbox(string name, string? hostId) => false;
+
+    /// <inheritdoc/>
     /// <remarks>
     /// Bubblewrap sandboxes are transient processes with no persistent lifecycle
     /// marker the reaper can interrogate after a crash. The process exits on its

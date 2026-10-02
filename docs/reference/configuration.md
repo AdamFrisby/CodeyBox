@@ -166,7 +166,8 @@ Hot-reloadable today:
   `SandboxProviderCutover:RetainedInventoryProviders` until its retained
   resources have been recovered or cleaned up.
 - `SandboxLeak.LeakAgeThreshold` / `PreemptRetention` / `AutoDispose` /
-  `MaxConcurrentAutoDispose` — re-read on every reaper sweep. `Enabled` and
+  `MaxConcurrentAutoDispose` / `InventoryUnreferencedProviders` /
+  `InventoryFailureWarningInterval` — re-read on every reaper sweep. `Enabled` and
   `CheckInterval` are sampled once at startup (PeriodicTimer cadence is fixed).
 - `AuditLog.RetainedDays` (database retention) — re-read on every daily
   `AuditReportRetentionService` sweep. The Serilog rolling-file sink pins
