@@ -241,7 +241,7 @@ public sealed class IncusCliRunnerTests
             stderrLimitExceeded);
         var runner = new IncusCliRunner(new StubProcessRunner((_, _, _) => Task.FromResult(result)));
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var exception = await Assert.ThrowsAsync<IncusOutputBoundException>(() =>
             runner.RunCheckedAsync(
                 "list",
                 Options,
@@ -251,6 +251,9 @@ public sealed class IncusCliRunnerTests
                 CancellationToken.None));
 
         Assert.Contains("exceeded its configured output bound", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("output-bound", exception.Message, StringComparison.Ordinal);
+        Assert.Equal("list", exception.Operation);
+        Assert.IsAssignableFrom<InvalidOperationException>(exception);
     }
 
     [Fact]

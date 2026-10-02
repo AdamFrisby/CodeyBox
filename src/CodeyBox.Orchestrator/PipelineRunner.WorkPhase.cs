@@ -838,6 +838,7 @@ public sealed partial class PipelineRunner
                     || resolvedFailureClassification.Kind == AgentFailureKind.TransientNetwork
                     || resolvedFailureClassification.Kind == AgentFailureKind.Infrastructure
                         && agentResult.ExecutionUnavailable
+                    || AgentOutputBoundFailure.IsOutputBound(agentResult)
                     || AgentSuspendResilience.IsInfrastructureProcessExitCode(
                         AgentSuspendResilience.ParseAgentExitCode(agentResult.Summary));
                 if (canDurablyResumeFailure)
@@ -893,6 +894,21 @@ public sealed partial class PipelineRunner
                 }
 
                 ThrowIfTransientAgentFailure(runner, agentResult, agentPhase);
+                // An output-volume kill must never surface as generic
+                // termination: agent-turn execs stream without a kill
+                // threshold, so a set flag means a bounded exec hit its cap
+                // and the failure carries the distinct output-bound kind.
+                if (agentResult.OutputLimitExceeded)
+                {
+                    throw new AgentInfrastructureFailureException(
+                        runner.Kind,
+                        agentPhase,
+                        BuildAgentFailureDetail(
+                            AgentOutputBoundFailure.DescribeTurn(runner.Kind, agentPhase),
+                            agentResult,
+                            _opts.MaxFailureDetailBytes),
+                        isOutputBound: true);
+                }
                 var agentExitCode = AgentSuspendResilience.ParseAgentExitCode(agentResult.Summary);
                 if (AgentSuspendResilience.IsInfrastructureProcessExitCode(agentExitCode))
                 {

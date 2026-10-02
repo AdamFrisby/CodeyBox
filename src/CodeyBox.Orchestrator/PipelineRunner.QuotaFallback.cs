@@ -206,6 +206,20 @@ public sealed partial class PipelineRunner
                 }
 
                 var exitCode = AgentSuspendResilience.ParseAgentExitCode(ex.LastResult.Summary);
+                if (AgentOutputBoundFailure.IsOutputBound(ex.LastResult))
+                {
+                    await FinalizeInvolvementAsync(
+                        involvementId,
+                        AgentInvolvementOutcomes.FailureInfrastructure);
+                    throw new AgentInfrastructureFailureException(
+                        runner.Kind,
+                        phase,
+                        BuildAgentFailureDetail(
+                            AgentOutputBoundFailure.DescribeResumeExhausted(runner.Kind),
+                            ex.LastResult,
+                            _opts.MaxFailureDetailBytes),
+                        isOutputBound: true);
+                }
                 if (AgentSuspendResilience.IsInfrastructureProcessExitCode(exitCode))
                 {
                     await FinalizeInvolvementAsync(

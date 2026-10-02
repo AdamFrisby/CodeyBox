@@ -624,7 +624,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         var capturedSessionId = sessionResumeContext?.InitialNativeSessionId;
         while (true)
         {
-            last = await ExecuteInvocationOnceAsync(
+            var invocationOutcome = await ExecuteInvocationOnceAsync(
                 sandbox,
                 workingDirectory,
                 current,
@@ -632,6 +632,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 stdoutChunkCallback,
                 captureStructuredStream,
                 ct);
+            last = invocationOutcome.Result;
+            var stdoutHead = invocationOutcome.StdoutHead;
 
             // Session id extraction requires the CLI's structured (id-bearing)
             // output mode: plain stdout on the model-controlled call paths
@@ -650,7 +652,14 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 && (!sessionResumeContext.Capability.RequiresStructuredStreamForSessionId
                     || sessionResumeContext.CaptureStructuredStream)
                 && AgentNativeSessionId.TryCreate(
-                    sessionResumeContext.Capability.TryExtractSessionId(last.Stdout)) is { } freshId)
+                    sessionResumeContext.Capability.TryExtractSessionId(last.Stdout)
+                    // Streaming providers retain only a bounded tail, so the
+                    // leading init event may already be gone from Stdout.
+                    // Fall back to the bounded head snooped from the live
+                    // stream (raw stdout, same trust as retained Stdout).
+                    ?? (stdoutHead is not null
+                        ? sessionResumeContext.Capability.TryExtractSessionId(stdoutHead)
+                        : null)) is { } freshId)
             {
                 capturedSessionId = freshId;
             }
@@ -942,7 +951,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         AgentResumeContext? ResumeContext,
         ICliSessionResumableAgentRunner Capability);
 
-    private async Task<AgentResult> ExecuteInvocationOnceAsync(
+    private async Task<(AgentResult Result, string? StdoutHead)> ExecuteInvocationOnceAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
@@ -984,6 +993,35 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             stderrChunkCallback = stdoutChunkCallback;
         }
 
+        // Bounded head of RAW stdout (before any stderr tee/envelope, which
+        // bypass this wrapper by holding the caller's callback directly), so
+        // session-id extraction keeps working when the provider retains only
+        // a tail. Only installed when the caller observes the stream — the
+        // null-callback contract (no delivery) is preserved. 64 KiB always
+        // covers the leading init event; a chunk that would overflow is
+        // skipped rather than split.
+        const int stdoutHeadMaxBytes = 64 * 1024;
+        var stdoutHeadBuilder = new StringBuilder();
+        var stdoutHeadBytes = 0;
+        Action<string>? execStdoutCallback = stdoutChunkCallback;
+        if (execStdoutCallback is not null)
+        {
+            var inner = execStdoutCallback;
+            execStdoutCallback = chunk =>
+            {
+                if (stdoutHeadBytes < stdoutHeadMaxBytes)
+                {
+                    var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+                    if (stdoutHeadBytes + chunkBytes <= stdoutHeadMaxBytes)
+                    {
+                        stdoutHeadBuilder.Append(chunk);
+                        stdoutHeadBytes += chunkBytes;
+                    }
+                }
+                inner(chunk);
+            };
+        }
+
         var exec = new SandboxExec
         {
             Argv = invocation.Argv,
@@ -991,8 +1029,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             ExtraEnvironment = BuildExecEnvironment(
                 invocation.ExtraEnvironment, runId, invocation.StdoutIsEnvelopeFramed),
             Stdin = invocation.Stdin,
-            StdoutChunkCallback = stdoutChunkCallback,
+            StdoutChunkCallback = execStdoutCallback,
             StderrChunkCallback = stderrChunkCallback,
+            // Agent-turn streaming: every work, rework, delegation, and
+            // conflict-resolution turn rides this path, so the no-kill
+            // streaming policy is declared here, once, rather than inherited
+            // from a provider-wide default. The provider streams all chunks
+            // to the callbacks (and the agent-stream file sink) with no
+            // cumulative kill threshold and retains only a bounded tail.
+            StreamOutputWithoutKill = true,
+            KillOnOutputLimit = false,
             // Envelope-framed stdout is a claimable channel, so it must ride
             // the attached exec pipe only: on the HTTP ingest transport the
             // bearer credential authenticating the stream endpoint is
@@ -1023,14 +1069,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             RemoveActiveAgentRunId(runKey, runId);
         }
 
-        return new AgentResult(
+        return (new AgentResult(
             Success: result.Success,
             Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
             Stdout: result.Stdout,
             Stderr: result.Stderr)
         {
             ExecutionUnavailable = result.ExecutionUnavailable,
-        };
+            OutputLimitExceeded = result.OutputLimitExceeded,
+        },
+        stdoutHeadBuilder.Length == 0 ? null : stdoutHeadBuilder.ToString());
     }
 
     // Centralised batch-runner policy. Transport chooses the output data plane;

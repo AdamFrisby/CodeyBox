@@ -1,4 +1,5 @@
 using CodeyBox.Api;
+using CodeyBox.Core;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Configuration;
@@ -545,6 +546,21 @@ public sealed class IncusSandboxConfigMapperTests
         var mapped = IncusSandboxConfigMapper.Build(options);
         Assert.Equal("/opt/custom-fallback", mapped.NuGetFallbackGuestPath);
         Assert.False(mapped.ShareNuGetPackageSeedsAsFallback);
+    }
+
+    [Fact]
+    public void Build_MapsAgentExecTailKnobs()
+    {
+        var mapped = IncusSandboxConfigMapper.Build(CreateOptions());
+        Assert.Equal(SandboxExec.DefaultStreamedOutputTailBytes, mapped.AgentExecTailStdoutBytes);
+        Assert.Equal(SandboxExec.DefaultStreamedOutputTailBytes, mapped.AgentExecTailStderrBytes);
+
+        var options = CreateOptions();
+        options.Incus.AgentExecTailStdoutBytes = 2 * 1024 * 1024;
+        options.Incus.AgentExecTailStderrBytes = 512 * 1024;
+        mapped = IncusSandboxConfigMapper.Build(options);
+        Assert.Equal(2 * 1024 * 1024, mapped.AgentExecTailStdoutBytes);
+        Assert.Equal(512 * 1024, mapped.AgentExecTailStderrBytes);
     }
 
     private sealed class DeceptiveReadOnlyCollection<T>(

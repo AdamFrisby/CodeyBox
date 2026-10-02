@@ -9,12 +9,14 @@ internal sealed class AgentInfrastructureFailureException : Exception, IExecutio
         string phase,
         string message,
         Exception? innerException = null,
-        bool executionUnavailable = false)
+        bool executionUnavailable = false,
+        bool isOutputBound = false)
         : base(message, innerException)
     {
         Agent = agent;
         Phase = phase;
         ExecutionUnavailable = executionUnavailable;
+        IsOutputBound = isOutputBound;
     }
 
     public AgentKind Agent { get; }
@@ -30,4 +32,13 @@ internal sealed class AgentInfrastructureFailureException : Exception, IExecutio
     /// delete the working tree.
     /// </summary>
     public bool ExecutionUnavailable { get; }
+
+    /// <summary>
+    /// True when the failure is an output-volume bound (a bounded exec was
+    /// killed or cut for exceeding its output cap). Still infrastructure —
+    /// the agent did nothing wrong — but reported under the distinct
+    /// <c>output-bound</c> failure kind so a volume kill is never
+    /// misreported as generic termination (for example exit 137).
+    /// </summary>
+    public bool IsOutputBound { get; }
 }

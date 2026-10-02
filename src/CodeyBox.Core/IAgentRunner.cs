@@ -338,6 +338,15 @@ public sealed record AgentResult(bool Success, string Summary, string? Stdout, s
     public bool ExecutionUnavailable { get; init; }
 
     /// <summary>
+    /// True when the exec was terminated (or its output truncated) because it
+    /// exceeded a provider output bound. Agent-turn streaming execs never set
+    /// this; a set flag means a bounded control-plane-style exec hit its cap
+    /// and the pipeline must classify the failure as the distinct
+    /// output-bound kind rather than generic infrastructure termination.
+    /// </summary>
+    public bool OutputLimitExceeded { get; init; }
+
+    /// <summary>
     /// Validated native CLI session identifier captured before a failed run.
     /// Orchestration may persist it and supply it through
     /// <see cref="AgentResumeContext.NativeSessionId"/> after the sandbox has
