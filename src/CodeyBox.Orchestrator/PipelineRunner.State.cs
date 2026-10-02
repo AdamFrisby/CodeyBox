@@ -174,6 +174,14 @@ public sealed partial class PipelineRunner
     // that don't wire the orchestrator: sessions then run ungated, matching
     // pre-change behaviour.
     private readonly IAgentSessionSlotGate? _sessionSlotGate;
+    // Post-merge baseline production (null keeps the pre-feature behaviour:
+    // merges schedule nothing and audit sandboxes stage no baseline).
+    // When wired, successful base-branch merges schedule one sandboxed
+    // production job per project (newest commit wins) and audit sandbox
+    // setup stages the freshest ancestry-reachable baseline read-only.
+    private readonly TestSelectionBaselineScheduler? _baselineScheduler;
+    private readonly Func<TestSelectionBaselineProductionOptions>? _baselineProductionOptions;
+    private readonly TestSelectionBaselineAuditStager? _baselineStager;
     // Leased workload secrets (null keeps the static host-environment path).
     // When wired, grant-authorised secrets are issued as time-bound or
     // brokered leases and revoked on terminal transitions.
@@ -576,7 +584,13 @@ public sealed partial class PipelineRunner
         // orchestrator's gate through a deferred resolution (the runner is
         // constructed before the hosted service that implements it);
         // null leaves auditor sessions ungated for tests/embeddings.
-        IAgentSessionSlotGate? sessionSlotGate = null)
+        IAgentSessionSlotGate? sessionSlotGate = null,
+        // Post-merge per-test coverage baseline production. All three are
+        // optional: unwired, merges schedule nothing and audit setup stages
+        // nothing (selectors fall back to the full suite unchanged).
+        TestSelectionBaselineScheduler? baselineScheduler = null,
+        Func<TestSelectionBaselineProductionOptions>? baselineProductionOptions = null,
+        TestSelectionBaselineAuditStager? baselineStager = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -734,6 +748,9 @@ public sealed partial class PipelineRunner
         _sandboxPlacer = sandboxPlacer;
         _secretLeases = secretLeases;
         _sessionSlotGate = sessionSlotGate;
+        _baselineScheduler = baselineScheduler;
+        _baselineProductionOptions = baselineProductionOptions;
+        _baselineStager = baselineStager;
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,

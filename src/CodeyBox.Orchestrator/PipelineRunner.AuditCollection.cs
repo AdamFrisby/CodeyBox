@@ -656,6 +656,12 @@ public sealed partial class PipelineRunner
                                 // Heal an inherited root-owned $HOME/.nuget once, before
                                 // this shared sandbox's dotnet build/test/format gates run.
                                 await HealAuditNuGetHomeAsync(setupSandbox, setupCt);
+                                // Stage the freshest ancestry-reachable
+                                // test-selection baseline (read-only) so the
+                                // coverage selector can narrow the run.
+                                // Stages nothing when no baseline is fresh —
+                                // the selector then runs the full suite.
+                                await StageTestSelectionBaselineAsync(setupSandbox, item, project, repoId, setupCt);
                             },
                             ct);
                         return prepared;
@@ -940,6 +946,10 @@ public sealed partial class PipelineRunner
                                 SandboxConventions.WorkDir,
                                 "checkout",
                                 ctx.WorkBranch);
+                            // Same baseline staging as the shared tool
+                            // sandbox: read-only oracle for the coverage
+                            // selector, fail-safe no-op when nothing is fresh.
+                            await StageTestSelectionBaselineAsync(setupSandbox, trialItem, project, repoId, setupCt);
                         },
                         attemptCt);
                     var candidateCtx = ctx with

@@ -397,6 +397,18 @@ public interface IGitHost
         => throw new NotSupportedException("This git host does not support host-side commit resolution.");
 
     /// <summary>
+    /// Returns true when <paramref name="ancestorCommit"/> is reachable from
+    /// <paramref name="descendantCommit"/> in the host bare repo
+    /// (<c>git merge-base --is-ancestor</c>). Both inputs must be full commit
+    /// shas — validated at the sink so a caller-supplied ref can never widen
+    /// the probe into an arbitrary revision walk. A non-ancestor answers
+    /// false; unknown commits and real git failures throw (staging callers
+    /// treat a throw as "skip this candidate").
+    /// </summary>
+    Task<bool> IsAncestorAsync(string repositoryId, string ancestorCommit, string descendantCommit, CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side ancestry checks.");
+
+    /// <summary>
     /// Resets <paramref name="workBranch"/> in the host bare repo so it points
     /// at <paramref name="baseBranch"/>'s head, discarding any prior-attempt
     /// commits on the work branch. If the work branch does not exist, it is

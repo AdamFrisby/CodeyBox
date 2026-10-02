@@ -251,6 +251,19 @@ public sealed record Project
     public IReadOnlyList<ProjectSandboxSecret> SandboxSecrets { get; init; } = [];
 
     /// <summary>
+    /// Per-project opt-in for post-merge per-test coverage baseline
+    /// production. When true AND the global
+    /// <c>Audit:TestSelection:BaselineProduction:Enabled</c> flag is set,
+    /// each successful merge to this project's base branch schedules one
+    /// sandboxed baseline-production job (bounded concurrency 1 per project,
+    /// newest commit wins) whose output the audit sandbox setup stages at
+    /// <c>Audit:TestSelection:Coverage:BaselineSandboxPath</c> for
+    /// coverage-guided test selection. Default false: nothing is scheduled
+    /// and no extra load is added until an operator opts in here.
+    /// </summary>
+    public bool TestSelectionBaselineEnabled { get; init; }
+
+    /// <summary>
     /// Operator-declared grants authorising secret groups for this project.
     /// A secret is injected only when its group has a matching grant (default
     /// deny); a group with no matching grant injects nothing. Grants live on

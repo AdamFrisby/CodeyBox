@@ -58,6 +58,8 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `audit.auditor_timed_out` | An auditor timed out during execution or sandbox launch (see [Details](#auditauditor_timed_out-details)) |
 | `merge.started` | Merge phase started |
 | `merge.completed` | Merge phase succeeded; carries the merge commit SHA |
+| `test-selection.baseline_produced` | A post-merge baseline-production job stored a baseline; carries project, commit, size, test count, duration |
+| `test-selection.baseline_failed` | A post-merge baseline-production job failed (reported only — merges and audits are unaffected); carries project, commit, duration, error |
 | `upstream.pr_stale_base` | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase (see [Details](#upstreampr_stale_base-details)) |
 | `work_item.merge_conflict_resolution_failed` | Merge conflict resolution was rejected by host verification or the scope fence; the item is terminal |
 | `work_item.waiting_for_quota_reset` | Every eligible class member hit quota in one pickup; the item is parked, not failed. Details use the agent-fallback shape |
@@ -875,6 +877,36 @@ trackers should rely on the terminal failure event to close the iteration.
 If the merge phase throws (agent failure, host shutdown), the matching
 `merge.started` will have no partner event; trackers should rely on the
 terminal failure event in the same way as for the iteration/audit phases.
+
+### `test-selection.baseline_produced` / `test-selection.baseline_failed` details
+
+```json
+{
+  "details": {
+    "projectId": "my-project",
+    "commit": "abc123def456...",
+    "success": true,
+    "sizeBytes": 1234567,
+    "testCount": 1234,
+    "durationMs": 60000,
+    "error": null
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `projectId` | string | The CodeyBox project whose base moved |
+| `commit` | string | The merge commit that triggered the job (the job measures the live base tip, which may be newer) |
+| `success` | bool | True for `baseline_produced`, false for `baseline_failed` |
+| `sizeBytes` | int | Stored artifact size (0 on failure) |
+| `testCount` | int | Tests in the stored baseline (0 on failure) |
+| `durationMs` | int | Job wall-clock time |
+| `error` | string\|null | Sanitised failure reason (null on success) |
+
+Failures are reported only — they never block merges or audits (the
+coverage selector falls back to the full suite). Calibration progress is
+also queryable via `GET /audit/test-selection/baseline`.
 
 ### `upstream.pr_stale_base` details
 

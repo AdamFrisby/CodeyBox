@@ -844,6 +844,23 @@ public sealed class LocalGitHost : IGitHost
         return rc.Stdout.Trim();
     }
 
+    public async Task<bool> IsAncestorAsync(string repositoryId, string ancestorCommit, string descendantCommit, CancellationToken ct = default)
+    {
+        if (!LooksLikeSha(ancestorCommit))
+            throw new ArgumentException("Ancestor must be a full commit sha.", nameof(ancestorCommit));
+        if (!LooksLikeSha(descendantCommit))
+            throw new ArgumentException("Descendant must be a full commit sha.", nameof(descendantCommit));
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "merge-base", "--is-ancestor", ancestorCommit, descendantCommit);
+        return rc.ExitCode switch
+        {
+            0 => true,
+            1 => false,
+            _ => throw new InvalidOperationException($"git merge-base --is-ancestor failed: {rc.Stderr}"),
+        };
+    }
+
     public async Task ResetWorkBranchToBaseAsync(
         string repositoryId,
         string workBranch,
