@@ -61,6 +61,12 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
     private const int MaxRateLimitRetries = 3;
     private const int MaxRateLimitDelaySeconds = 30;
 
+    // WHY 100ms: branch-restriction patterns are operator-configured globs compiled to a
+    // regex per match; the timeout bounds a pathological pattern without failing closed
+    // (MatchesPattern is a local filter — a timeout throws RegexMatchTimeoutException,
+    // which surfaces as infrastructure rather than a silent mismatch).
+    private static readonly TimeSpan PatternMatchTimeout = TimeSpan.FromMilliseconds(100);
+
     private readonly IGitHost _gitHost;
     private readonly IHttpClientFactory _httpClientFactory;
 
@@ -162,7 +168,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
                 ?? throw new BitbucketUpstreamException(
                     $"Bitbucket PR #{existing} from a prior attempt is no longer available.");
             prId = existing;
-            prUrl = pr.Links?.Html?.Href ?? WebPullUrl(endpoint, existing);
+            prUrl = PullUrl(endpoint, existing, pr.Links);
         }
         else
         {
@@ -177,7 +183,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
             }
 
             prId = ToInt32(created.Id, "PR id");
-            prUrl = created.Links?.Html?.Href ?? WebPullUrl(endpoint, prId);
+            prUrl = PullUrl(endpoint, prId, created.Links);
             _host.Logger.LogInformation("Bitbucket PR #{Id} opened: {Url}", prId, prUrl);
         }
 
@@ -319,7 +325,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
             result.Add(new UpstreamPullRequest
             {
                 Number = (int)pull.Id,
-                Url = pull.Links?.Html?.Href ?? WebPullUrl(endpoint, (int)pull.Id),
+                Url = PullUrl(endpoint, (int)pull.Id, pull.Links),
                 HeadBranch = headBranch,
                 HeadSha = headSha,
                 BaseBranch = baseBranch,
@@ -353,7 +359,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
         };
         return new UpstreamPullRequestState(
             number,
-            detail.Links?.Html?.Href ?? WebPullUrl(endpoint, number),
+            PullUrl(endpoint, number, detail.Links),
             status,
             detail.MergeCommit?.Hash);
     }
@@ -382,8 +388,8 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
         var blocked = false;
         foreach (var participant in detail.Participants ?? [])
         {
-            var name = participant.User?.DisplayName ?? participant.User?.Nickname;
-            if (string.IsNullOrWhiteSpace(name))
+            var name = AuthorName(participant.User);
+            if (string.Equals(name, "unknown", StringComparison.Ordinal))
                 continue;
             var verdict = MapParticipantVerdict(participant);
             reviews.Add(new UpstreamReview
@@ -489,7 +495,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
             .Select(c => new UpstreamComment
             {
                 Id = c.Id.ToString(CultureInfo.InvariantCulture),
-                Author = c.User?.DisplayName ?? c.User?.Nickname ?? "unknown",
+                Author = AuthorName(c.User),
                 Body = c.Content!.Raw!,
                 FilePath = string.IsNullOrWhiteSpace(c.Inline?.Path) ? null : c.Inline.Path,
                 Line = string.IsNullOrWhiteSpace(c.Inline?.Path)
@@ -541,7 +547,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
         return new UpstreamComment
         {
             Id = created.Id.ToString(CultureInfo.InvariantCulture),
-            Author = created.User?.DisplayName ?? created.User?.Nickname ?? "unknown",
+            Author = AuthorName(created.User),
             Body = created.Content?.Raw ?? comment.Body,
             CreatedAt = created.CreatedOn,
         };
@@ -850,6 +856,40 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
     private static string WebPullUrl(BitbucketEndpoint endpoint, int id)
         => $"https://bitbucket.org/{endpoint.Workspace}/{endpoint.Repo}/pull-requests/{id}";
 
+    private static string PullUrl(BitbucketEndpoint endpoint, int id, BitbucketLinks? links)
+        => links?.Html?.Href ?? WebPullUrl(endpoint, id);
+
+    private static string AuthorName(BitbucketUser? user)
+    {
+        var name = user?.DisplayName ?? user?.Nickname;
+        return string.IsNullOrWhiteSpace(name) ? "unknown" : name;
+    }
+
+    // Guards the pagination sink: the `next` cursor comes from the forge response body
+    // (untrusted), but the follow-up request carries the Bitbucket credential. Only an
+    // absolute https URL on the configured ApiBase host is followed; anything else is an
+    // infrastructure failure (throw) rather than a credential leak to an attacker-chosen
+    // target. Relative URLs are rejected too — Bitbucket Cloud always returns absolute
+    // `next` links, so a relative one is either a forge bug or tampering.
+    private static string ValidateNextPageUrl(
+        BitbucketEndpoint endpoint, string next, string relativePath)
+    {
+        var candidate = next.Trim();
+        if (!Uri.TryCreate(candidate, UriKind.Absolute, out var nextUri))
+            throw new BitbucketUpstreamException(
+                $"Bitbucket list '{relativePath}' returned an invalid pagination URL.");
+        if (!string.Equals(nextUri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
+            throw new BitbucketUpstreamException(
+                $"Bitbucket list '{relativePath}' returned a non-https pagination URL.");
+        if (!Uri.TryCreate(endpoint.ApiBase, UriKind.Absolute, out var baseUri)
+            || !string.Equals(nextUri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase)
+            || nextUri.Port != baseUri.Port)
+            throw new BitbucketUpstreamException(
+                $"Bitbucket list '{relativePath}' returned a pagination URL on an unexpected host " +
+                $"('{nextUri.Host}'); refusing to follow it with credentials.");
+        return candidate;
+    }
+
     private async Task PushBranchAsync(
         string repositoryId, BitbucketEndpoint endpoint, string branch,
         UpstreamPushReconcileStrategy strategy, CancellationToken ct)
@@ -999,7 +1039,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
         if (!pattern.Contains('*'))
             return string.Equals(pattern, branch, StringComparison.Ordinal);
         var regex = "^" + Regex.Escape(pattern).Replace(@"\*", ".*", StringComparison.Ordinal) + "$";
-        return Regex.IsMatch(branch, regex, RegexOptions.None, TimeSpan.FromMilliseconds(100));
+        return Regex.IsMatch(branch, regex, RegexOptions.None, PatternMatchTimeout);
     }
 
     private static UpstreamReviewVerdict MapParticipantVerdict(BitbucketParticipant participant)
@@ -1046,7 +1086,7 @@ public sealed class BitbucketUpstreamRemote : IUpstreamRemote, IPluginInitialize
             all.AddRange(items);
             if (string.IsNullOrWhiteSpace(envelope?.Next))
                 return all;
-            url = envelope.Next;
+            url = ValidateNextPageUrl(endpoint, envelope.Next, relativePath);
         }
 
         throw new BitbucketUpstreamException(

@@ -807,6 +807,46 @@ public sealed class BitbucketUpstreamPluginTests : IDisposable
     }
 
     [Fact]
+    public async Task ListOpenPullRequests_ForgedNextUrl_ThrowsWithoutFollowing()
+    {
+        UseToken();
+        var git = new BitbucketRecordingGitHost();
+        var http = new FakeHttpMessageHandler();
+        var remote = BuildRemote(git, http, new BitbucketFakePluginHost(ScopedConfig()));
+
+        http.Enqueue(JsonResponse(
+            "{\"pagelen\": 50, \"page\": 1, \"size\": 2"
+            + ", \"next\": \"https://evil.example.com/repositories/myteam/myproject/pullrequests?page=2\""
+            + ", \"values\": [{\"id\": 1, \"state\": \"OPEN\""
+            + ", \"source\": {\"branch\": {\"name\": \"codeybox/x\"}, \"commit\": {\"hash\": \"abc\"}}"
+            + ", \"destination\": {\"branch\": {\"name\": \"main\"}}}]}"));
+
+        var ex = await Assert.ThrowsAsync<BitbucketUpstreamException>(
+            () => remote.ListOpenPullRequestsAsync("codeybox/"));
+        Assert.Contains("unexpected host", ex.Message);
+        Assert.DoesNotContain(http.Requests, r => r.RequestUri!.Host.Contains("evil", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task ListOpenPullRequests_NonHttpsNextUrl_ThrowsWithoutFollowing()
+    {
+        UseToken();
+        var git = new BitbucketRecordingGitHost();
+        var http = new FakeHttpMessageHandler();
+        var remote = BuildRemote(git, http, new BitbucketFakePluginHost(ScopedConfig()));
+
+        http.Enqueue(JsonResponse(
+            "{\"pagelen\": 50, \"page\": 1, \"size\": 2"
+            + ", \"next\": \"http://api.bitbucket.org/2.0/repositories/myteam/myproject/pullrequests?page=2\""
+            + ", \"values\": []}"));
+
+        var ex = await Assert.ThrowsAsync<BitbucketUpstreamException>(
+            () => remote.ListOpenPullRequestsAsync("codeybox/"));
+        Assert.Contains("non-https", ex.Message);
+        Assert.Single(http.Requests);
+    }
+
+    [Fact]
     public void Options_RejectBadConfig()
     {
         Assert.Throws<InvalidOperationException>(() =>
