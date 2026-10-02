@@ -55,6 +55,47 @@ public abstract class ExternalToolAuditorBase : IAuditor
     private const string RepositoryFilePresenceScript =
         "for f in \"$@\"; do if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then printf '%s\\n' \"$f\"; fi; done; exit 0";
 
+    // Each glob is a `find -path` operand matched against the whole
+    // "./"-relative worktree path — `*`/`?` there match '/' too, so
+    // "*gitleaks.toml*" covers the name at any depth. The "./" prefix keeps
+    // a non-wildcard-led glob anchored the same way the C#-side re-filter
+    // sees it (it strips "./" before matching). `.git` is pruned: object
+    // storage is transport metadata, not audited source. A find failure —
+    // an unreadable directory, a resource error — truncates the walk, so
+    // the script accumulates find's exit status rather than reporting a
+    // partial enumeration as "no matches": the exit code carries probe
+    // health, stdout the matched paths.
+    private const string RepositoryPathGlobPresenceScript =
+        "rc=0; for g in \"$@\"; do find . -name .git -prune -o -path \"./$g\" -print || rc=1; done; exit $rc";
+
+    // Ambient GIT_* variables would re-point or re-configure any git an
+    // exec spawns: GIT_DIR/GIT_WORK_TREE redirect the repository,
+    // GIT_CONFIG_PARAMETERS and the GIT_CONFIG_COUNT/GIT_CONFIG_KEY_*/
+    // GIT_CONFIG_VALUE_* family inject config (e.g. diff.<name>.textconv,
+    // which a committed .gitattributes `diff=<name>` re-combines with to
+    // substitute patch content), GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM take
+    // config file paths from the baseline environment, GIT_SSH_COMMAND a
+    // command line, and the GIT_*_PATHSPECS variables rewrite how probe
+    // pathspecs match (GIT_LITERAL_PATHSPECS would read `*` literally,
+    // GIT_GLOB_PATHSPECS would stop it crossing '/'). None has a
+    // legitimate role inside an audit sandbox, so every exec that can
+    // reach git — scan, version check, or precondition probe — unsets
+    // them.
+    protected static readonly IReadOnlyList<string> GitEnvironmentRemovals =
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_SSH_COMMAND",
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ];
+
     /// <summary>Stable name for logs and findings.</summary>
     public abstract string Name { get; }
 
@@ -96,6 +137,18 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// </summary>
     protected virtual IReadOnlyDictionary<string, string>? BuildToolEnvironment(ExternalToolAuditorOptions options)
         => null;
+
+    /// <summary>
+    /// Environment variable names that must not reach the tool process even
+    /// when the sandbox baseline exports them — e.g. variables carrying a
+    /// config file path the tool would honor above the auditor's own pinned
+    /// configuration, bypassing whatever guard covers the equivalent argv
+    /// flag. Providers apply removals after the baseline and
+    /// <see cref="BuildToolEnvironment"/> merges, so a removal wins over
+    /// both. Author-chosen constants only. Default: none.
+    /// </summary>
+    protected virtual IReadOnlyList<string> BuildToolEnvironmentRemovals(ExternalToolAuditorOptions options)
+        => [];
 
     /// <summary>
     /// Optional pinned-version declaration. Non-null makes
@@ -265,18 +318,18 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 .ConfigureAwait(false);
             var result = await ExecToolAsync(sandbox, workingDirectory, tool, argv, options, ct).ConfigureAwait(false);
 
-        // A dead exec transport is infrastructure loss, not audit
-        // unavailability: propagate so the pipeline parks the item for retry
-        // instead of terminal-failing it.
-        if (result.ExecutionUnavailable)
-            throw new SandboxExecutionUnavailableException(result.ExitCode);
-        if (result.ExitCode is CommandCannotExecuteExitCode or CommandNotFoundExitCode)
-            throw Unavailable(tool, "could not execute (exit 127/126 — binary missing or not executable in the sandbox)", result);
-        if (!options.FindingsExitCodes.Contains(result.ExitCode))
-            throw Unavailable(
-                tool,
-                $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
-                result);
+            // A dead exec transport is infrastructure loss, not audit
+            // unavailability: propagate so the pipeline parks the item for
+            // retry instead of terminal-failing it.
+            if (result.ExecutionUnavailable)
+                throw new SandboxExecutionUnavailableException(result.ExitCode);
+            if (result.ExitCode is CommandCannotExecuteExitCode or CommandNotFoundExitCode)
+                throw Unavailable(tool, "could not execute (exit 127/126 — binary missing or not executable in the sandbox)", result);
+            if (!options.FindingsExitCodes.Contains(result.ExitCode))
+                throw Unavailable(
+                    tool,
+                    $"could not run (exit {result.ExitCode}). Only exits [{string.Join(", ", options.FindingsExitCodes.Order())}] are declared as findings-producing; declare this tool's convention via {nameof(ExternalToolAuditorOptions.FindingsExitCodes)}.",
+                    result);
 
             var parseInput = await ResolveParserInputAsync(
                     sandbox, workingDirectory, tool, options, result, argv, scanRoot, ct)
@@ -383,6 +436,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 MaxStderrBytes = maxBytes,
                 KillOnOutputLimit = false,
                 ExtraEnvironment = BuildToolEnvironment(options),
+                EnvironmentVariablesToUnset = BuildToolEnvironmentRemovals(options) ?? [],
             },
             EffectiveTimeout(options),
             ct);
@@ -561,6 +615,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
                 KillOnOutputLimit = true,
+                // The removals hook's contract is "must not reach the tool
+                // process" — the version check execs the tool too.
+                EnvironmentVariablesToUnset = BuildToolEnvironmentRemovals(options) ?? [],
             },
             ProbeTimeout(options),
             ct).ConfigureAwait(false);
@@ -591,8 +648,10 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// worktree root — e.g. suppression files the audit subject could use to
     /// hide findings from the tool. Returns the subset of
     /// <paramref name="relativePaths"/> that exist (regular files and
-    /// symlinks). Fails closed: an exec-transport failure or any non-zero
-    /// probe exit throws <see cref="AuditUnavailableException"/> — "could not
+    /// symlinks). Fails closed: an exec-transport failure throws
+    /// <see cref="SandboxExecutionUnavailableException"/> (retriable
+    /// infrastructure loss) and any non-zero probe exit throws
+    /// <see cref="AuditUnavailableException"/> — "could not
     /// confirm absence" is never treated as "absent". Path entries must be
     /// relative; absolute paths, <c>..</c> segments, and embedded newlines are
     /// rejected so the probe can never escape the worktree or corrupt its
@@ -609,19 +668,116 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(relativePaths);
 
+        if (await ExecRepositoryProbeAsync(
+                sandbox, workingDirectory, tool,
+                RepositoryFilePresenceScript, relativePaths, NormalizeProbePath,
+                "repository-file", options, ct).ConfigureAwait(false)
+            is not { } probe)
+            return [];
+
+        // The probe echoes each present path, one per line; intersect with
+        // the requested set — output beyond it is not trusted.
+        var present = new List<string>();
+        foreach (var line in SplitProbeLines(probe.Result.Stdout))
+        {
+            if (probe.Requested.Contains(line))
+                present.Add(line);
+        }
+        return present;
+    }
+
+    /// <summary>
+    /// Bounded probe for repository-controlled paths matching an
+    /// author-declared glob at ANY worktree depth — e.g. a filename family
+    /// the audited tool exempts from its scan wherever it appears
+    /// (<c>*gitleaks.toml*</c>), which the root-only
+    /// <see cref="ProbeRepositoryFilesPresentAsync"/> cannot see. Globs are
+    /// author-declared constants in <c>find -path</c>/git-pathspec syntax —
+    /// <c>*</c> and <c>?</c> match across directory separators — validated
+    /// by <see cref="NormalizeProbePathGlob"/>. The repository's
+    /// <c>.git</c> storage is pruned: it is transport metadata, not audited
+    /// source. Returns the deduplicated repository-relative paths that
+    /// matched; each returned line is re-verified against the declared
+    /// globs because the output bytes are repository filenames — a line
+    /// that matches no glob is chatter, not evidence. Fails closed like
+    /// the sibling probe: a transport failure is retriable infrastructure
+    /// loss, and a non-zero exit — including a <c>find</c> traversal error
+    /// the script propagates — is audit unavailability, never "absent".
+    /// </summary>
+    protected static async Task<IReadOnlyList<string>> ProbeRepositoryPathGlobsPresentAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        IReadOnlyList<string> pathGlobs,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentNullException.ThrowIfNull(pathGlobs);
+
+        if (await ExecRepositoryProbeAsync(
+                sandbox, workingDirectory, tool,
+                RepositoryPathGlobPresenceScript, pathGlobs, NormalizeProbePathGlob,
+                "repository-path", options, ct).ConfigureAwait(false)
+            is not { } probe)
+            return [];
+
+        var matchers = probe.Requested.Select(PathGlobMatcher).ToList();
+        var present = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var line in SplitProbeLines(probe.Result.Stdout))
+        {
+            // find emits "./"-prefixed paths; the declared globs are written
+            // against plain repository-relative paths.
+            var path = line.StartsWith("./", StringComparison.Ordinal) ? line[2..] : line;
+            if (path.Length == 0 || !seen.Add(path))
+                continue;
+            foreach (var matcher in matchers)
+            {
+                if (matcher.IsMatch(path))
+                {
+                    present.Add(path);
+                    break;
+                }
+            }
+        }
+        return present;
+    }
+
+    /// <summary>
+    /// The bounded-exec/fail-closed skeleton the repository-presence probes
+    /// share: dedup the normalized <paramref name="entries"/> into the
+    /// script's <c>$@</c> argv, run one bounded exec, and classify a
+    /// transport loss or non-zero exit as infrastructure — "could not
+    /// confirm absence" is never evidence of absence. Returns null when no
+    /// entry survives normalization; the caller owns the per-line verdict
+    /// on the probe output. <paramref name="absentNoun"/> names what the
+    /// probe lists (e.g. "repository-file") in the failure message.
+    /// </summary>
+    private static async Task<(HashSet<string> Requested, SandboxExecResult Result)?> ExecRepositoryProbeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        string script,
+        IReadOnlyList<string> entries,
+        Func<string?, string> normalizeEntry,
+        string absentNoun,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
         var requested = new HashSet<string>(StringComparer.Ordinal);
-        var argv = new List<string>(relativePaths.Count + 4)
+        var argv = new List<string>(entries.Count + 4)
         {
-            "sh", "-c", RepositoryFilePresenceScript, "sh",
+            "sh", "-c", script, "sh",
         };
-        foreach (var path in relativePaths)
+        foreach (var entry in entries)
         {
-            var normalized = NormalizeProbePath(path);
+            var normalized = normalizeEntry(entry);
             if (requested.Add(normalized))
                 argv.Add(normalized);
         }
         if (requested.Count == 0)
-            return [];
+            return null;
 
         var result = await ExecToolBoundedAsync(
             sandbox,
@@ -642,21 +798,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
             throw new SandboxExecutionUnavailableException(result.ExitCode);
         if (result.ExitCode != 0)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' suppression check could not confirm repository-file "
+                $"could-not-verify: audit tool '{tool}' suppression check could not confirm {absentNoun} "
                 + $"absence (exit {result.ExitCode}) — a failed probe is infrastructure, not evidence "
-                + "that the files are absent.",
+                + "of absence.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
 
-        // The probe echoes each present path, one per line; intersect with
-        // the requested set — output beyond it is not trusted.
-        var present = new List<string>();
-        foreach (var line in SplitProbeLines(result.Stdout))
-        {
-            if (requested.Contains(line))
-                present.Add(line);
-        }
-        return present;
+        return (requested, result);
     }
 
     /// <summary>
@@ -671,9 +819,11 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// absolute reported paths. The root is returned VERBATIM (no
     /// whitespace trimming — a canonical directory name may legitimately
     /// end in whitespace) so downstream relativization compares the same
-    /// bytes the tool reports. Fails closed: an exec-transport failure, a
-    /// non-zero exit, or output that is not exactly one absolute path line
-    /// throws <see cref="AuditUnavailableException"/> — a missing or
+    /// bytes the tool reports. Fails closed: an exec-transport failure
+    /// throws <see cref="SandboxExecutionUnavailableException"/> (retriable
+    /// infrastructure loss, not a verdict); a non-zero exit or output that
+    /// is not exactly one absolute path line throws
+    /// <see cref="AuditUnavailableException"/> — a missing or
     /// mis-derived scan root would let absolute paths survive normalization
     /// and silently defeat repo-relative exclusion filters.
     /// </summary>
@@ -699,9 +849,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             ct).ConfigureAwait(false);
 
         if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' scan-root probe could not run: the sandbox exec "
-                + "transport was unavailable.");
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
 
         // The scan root is a path verbatim, not text: it is compared
         // byte-for-byte against reported paths downstream, so it must not
@@ -767,9 +915,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             ct).ConfigureAwait(false);
 
         if (probe.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' {configuredKey} canonicalization could "
-                + "not run: the sandbox exec transport was unavailable.");
+            throw new SandboxExecutionUnavailableException(probe.ExitCode);
 
         // The canonical bytes realpath emitted are compared verbatim —
         // trimming a path-bearing line would mis-derive a path or root
@@ -878,10 +1024,14 @@ public abstract class ExternalToolAuditorBase : IAuditor
     /// <summary>
     /// Bounded <c>git</c> probe for baseline resolution: runs
     /// <paramref name="args"/> as <c>git</c> argv entries (never a shell
-    /// string) with the shared per-stream output caps and the probe timeout,
-    /// classifying transport failures as infrastructure naming the owning
-    /// tool. The single seam for "run git to resolve a baseline SHA" so
-    /// API-compatibility auditors cannot fork the policy.
+    /// string) with the shared per-stream output caps and the probe timeout.
+    /// A dead exec transport throws
+    /// <see cref="SandboxExecutionUnavailableException"/> — retriable
+    /// infrastructure loss, not a verdict — and ambient GIT_* variables are
+    /// unset (<see cref="GitEnvironmentRemovals"/>) so the baseline
+    /// environment can neither redirect the repository nor re-configure
+    /// git's reads. The single seam for "run git to resolve a baseline SHA"
+    /// so API-compatibility auditors cannot fork the policy.
     /// </summary>
     protected async Task<SandboxExecResult> GitProbeAsync(
         ISandbox sandbox,
@@ -903,14 +1053,13 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
                 KillOnOutputLimit = true,
+                EnvironmentVariablesToUnset = GitEnvironmentRemovals,
             },
             ProbeTimeout(options),
             ct).ConfigureAwait(false);
 
         if (result.ExecutionUnavailable)
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' baseline resolution could not run: "
-                + "the sandbox exec transport was unavailable.");
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
         return result;
     }
 
@@ -1021,15 +1170,41 @@ public abstract class ExternalToolAuditorBase : IAuditor
         ExternalToolAuditorOptions options,
         string flag,
         out string? value)
+        => TryGetExtraArgumentsFlagValue(options, flag, shortFlag: null, out value);
+
+    /// <summary>
+    /// <see cref="TryGetExtraArgumentsFlagValue(ExternalToolAuditorOptions, string, out string?)"/>
+    /// extended with a pflag-style shorthand: <paramref name="shortFlag"/>
+    /// (<c>-f</c>, exactly one dash and one letter) additionally matches a
+    /// bare <c>-f</c>, the attached <c>-f=value</c>, the joined
+    /// <c>-fvalue</c>, and the shorthand inside a single-dash cluster —
+    /// pflag reads a value-taking shorthand's value as the rest of its
+    /// token (<c>-fcfg.toml</c>) or, when the shorthand is the cluster's
+    /// last letter, the NEXT argv entry (<c>-vc cfg.toml</c> binds
+    /// <c>cfg.toml</c> to <c>-c</c>). A cluster letter that was really part
+    /// of an earlier shorthand's value over-matches into a conservative
+    /// extra check — harmless for callers guarding a path value, since the
+    /// checked value only ever fails closed.
+    /// </summary>
+    protected static bool TryGetExtraArgumentsFlagValue(
+        ExternalToolAuditorOptions options,
+        string flag,
+        string? shortFlag,
+        out string? value)
     {
         value = null;
         var supplied = false;
         var attachedPrefix = flag + "=";
+        var shortChar = shortFlag is { Length: 2 } && shortFlag[0] == '-' && shortFlag[1] != '-'
+            ? shortFlag[1]
+            : (char?)null;
         var extraArguments = options.ExtraArguments;
         for (var i = 0; i < extraArguments.Count; i++)
         {
             var arg = extraArguments[i];
-            if (string.Equals(arg, flag, StringComparison.Ordinal))
+            if (string.Equals(arg, flag, StringComparison.Ordinal)
+                || (shortFlag is not null
+                    && string.Equals(arg, shortFlag, StringComparison.Ordinal)))
             {
                 supplied = true;
                 value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
@@ -1038,6 +1213,25 @@ public abstract class ExternalToolAuditorBase : IAuditor
             {
                 supplied = true;
                 value = arg[attachedPrefix.Length..];
+            }
+            else if (shortChar is { } shorthand
+                && arg.Length > 2
+                && arg[0] == '-'
+                && arg[1] != '-')
+            {
+                // A single-dash multi-letter token is a joined "-fvalue" or
+                // a pflag cluster ("-vc"): the shorthand's value is the rest
+                // of the token — or, when the letter ends the cluster, the
+                // next argv entry.
+                var index = arg.IndexOf(shorthand, 1);
+                if (index < 0)
+                    continue;
+                var rest = arg[(index + 1)..];
+                supplied = true;
+                if (rest.Length == 0)
+                    value = i + 1 < extraArguments.Count ? extraArguments[i + 1] : null;
+                else
+                    value = rest.StartsWith("=", StringComparison.Ordinal) ? rest[1..] : rest;
             }
         }
         return supplied;
@@ -1088,6 +1282,47 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 nameof(path));
         return normalized;
     }
+
+    // Probe globs become `find -path` operands and git pathspec argv:
+    // refuse bytes that would corrupt the one-name-per-line protocol or
+    // turn into find predicates / git pathspec magic instead of a pattern.
+    // Only `*` and `?` wildcards are supported — bracket classes would
+    // need a second matcher in PathGlobMatcher for no author-facing gain.
+    // '\' is rejected on the authored glob BEFORE NormalizePath folds it
+    // into '/': in find and git patterns the backslash is the escape
+    // character, so an author writing one almost certainly meant an escape
+    // the C# matcher cannot express — not a separator. ('**' needs no
+    // special case: none of the three matchers gives it meaning beyond two
+    // '*'s — find -path, git's non-`glob` pathspec matching, and
+    // PathGlobMatcher all let `*` cross '/'.)
+    protected static string NormalizeProbePathGlob(string? glob)
+    {
+        if (glob?.Contains('\\', StringComparison.Ordinal) == true)
+            throw new ArgumentException(
+                "Repository probe globs must be non-empty relative `*`/`?` patterns without escapes.",
+                nameof(glob));
+        var normalized = ExternalToolJsonHelpers.NormalizePath(glob);
+        if (normalized.Length == 0
+            || normalized[0] is '-' or '!' or ':' or '/'
+            || normalized.Any(c => c is '\n' or '[' or ']'))
+            throw new ArgumentException(
+                "Repository probe globs must be non-empty relative `*`/`?` patterns.",
+                nameof(glob));
+        return normalized;
+    }
+
+    // Compiles a declared probe glob to a matcher with the same semantics
+    // the sandbox-side tools apply: `*` and `?` cross directory separators
+    // (find -path, git's default — non-`glob`-magic — pathspec matching),
+    // everything else is literal and case-sensitive.
+    private static Regex PathGlobMatcher(string glob)
+        => new(
+            "^"
+                + Regex.Escape(glob)
+                    .Replace("\\*", ".*", StringComparison.Ordinal)
+                    .Replace("\\?", ".", StringComparison.Ordinal)
+                + "$",
+            RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     /// <summary>
     /// Single-lines a (possibly configured) value for an exception message
