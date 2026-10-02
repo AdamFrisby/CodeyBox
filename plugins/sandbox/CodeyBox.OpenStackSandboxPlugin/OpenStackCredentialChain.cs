@@ -49,6 +49,15 @@ public sealed record OpenStackCredentials(
     bool AllowUnsafeHttp)
 {
     /// <summary>
+    /// Redacted: the default positional-record <c>ToString</c> would print
+    /// the application-credential secret. Never let a <c>$"{creds}"</c> in a
+    /// log or exception message leak it.
+    /// </summary>
+    public override string ToString() =>
+        $"OpenStackCredentials {{ AuthUrl = {AuthUrl}, ApplicationCredentialId = {ApplicationCredentialId}, " +
+        $"ApplicationCredentialSecret = [redacted], Region = {Region}, Interface = {Interface}, " +
+        $"AllowUnsafeHttp = {AllowUnsafeHttp} }}";
+    /// <summary>
     /// Resolves credentials from options plus the host environment. Empty
     /// option values fall back to the standard <c>OS_*</c> variables for the
     /// non-secret fields; the credential id and secret have no fallback —

@@ -105,6 +105,13 @@ public sealed class OpenStackApiClient
     internal const int MaxMetadataChars = 255;
     internal const int MaxServerTags = 64;
     internal const int MaxServerTagChars = 64;
+
+    /// <summary>
+    /// Fallback ceiling for status waits when the caller passes no timeout.
+    /// Mirrors <c>OpenStackSandboxOptions.ReadyTimeoutSeconds</c> default 600:
+    /// change both together.
+    /// </summary>
+    internal static readonly TimeSpan DefaultWaitTimeout = TimeSpan.FromSeconds(600);
     private const int ListPageSize = 200;
 
     private static readonly string[] RequestIdHeaders =
@@ -203,7 +210,7 @@ public sealed class OpenStackApiClient
         {
             throw new OpenStackApiException(
                 OpenStackFailureKind.Unexpected, "resolve endpoint",
-                $"{what} is not an absolute http(s) URL: '{raw?.Trim()}'");
+                $"{what} is not an absolute http(s) URL: '{SanitizeForLog(raw?.Trim() ?? string.Empty)}'");
         }
         if (uri.Scheme == Uri.UriSchemeHttp && !IsCleartextHttpPermitted(uri, _limits.AllowUnsafeHttp))
         {
@@ -265,6 +272,17 @@ public sealed class OpenStackApiClient
 
     private async Task<CachedToken> RequestTokenAsync(OpenStackCredentials credentials, CancellationToken ct)
     {
+        // Guard at the secret POST sink, not just at Resolve: any future
+        // caller constructing credentials directly must never send the
+        // application-credential secret cleartext to a remote http host.
+        if (credentials.AuthUrl.Scheme == Uri.UriSchemeHttp
+            && !IsCleartextHttpPermitted(credentials.AuthUrl, _limits.AllowUnsafeHttp))
+        {
+            throw new OpenStackApiException(
+                OpenStackFailureKind.Unexpected, "authenticate",
+                "auth URL uses cleartext http to a non-loopback host — refusing to send the credential. " +
+                "AllowUnsafeHttp permits http only for loopback test URLs, never for remote hosts.");
+        }
         var body = new KeystoneAuthRequest(
             new KeystoneAuthIdentity(
                 ["application_credential"],
@@ -549,7 +567,7 @@ public sealed class OpenStackApiClient
         if (desiredStatuses is null || desiredStatuses.Count == 0)
             throw new ArgumentException("At least one desired status is required.", nameof(desiredStatuses));
         faultStatuses ??= ["ERROR"];
-        var deadline = _clock.GetUtcNow() + (timeout ?? TimeSpan.FromSeconds(600));
+        var deadline = _clock.GetUtcNow() + (timeout ?? DefaultWaitTimeout);
         var attempt = 0;
         while (true)
         {
@@ -557,7 +575,7 @@ public sealed class OpenStackApiClient
             var server = await GetServerAsync(credentials, serverId, ct).ConfigureAwait(false)
                 ?? throw new OpenStackApiException(
                     OpenStackFailureKind.NotFound, "wait for server status",
-                    $"server '{serverId}' disappeared while waiting");
+                    $"server '{SanitizeForLog(serverId)}' disappeared while waiting");
             if (server.Status is not null
                 && desiredStatuses.Any(s => string.Equals(s, server.Status, StringComparison.OrdinalIgnoreCase)))
             {
@@ -568,16 +586,16 @@ public sealed class OpenStackApiClient
             {
                 throw new OpenStackApiException(
                     OpenStackFailureKind.Unexpected, "wait for server status",
-                    $"server '{serverId}' entered fault status '{server.Status}'" +
-                    (string.IsNullOrEmpty(server.FaultMessage) ? string.Empty : $": {server.FaultMessage}"));
+                    $"server '{SanitizeForLog(serverId)}' entered fault status '{SanitizeForLog(server.Status)}'" +
+                    (string.IsNullOrEmpty(server.FaultMessage) ? string.Empty : $": {SanitizeForLog(server.FaultMessage)}"));
             }
             var now = _clock.GetUtcNow();
             if (now >= deadline)
             {
                 throw new OpenStackApiException(
                     OpenStackFailureKind.Unexpected, "wait for server status",
-                    $"server '{serverId}' did not reach '{string.Join(",", desiredStatuses)}' in time " +
-                    $"(last status '{server.Status ?? "unknown"}')");
+                    $"server '{SanitizeForLog(serverId)}' did not reach '{SanitizeForLog(string.Join(",", desiredStatuses))}' in time " +
+                    $"(last status '{SanitizeForLog(server.Status ?? "unknown")}')");
             }
             var delay = NextPollDelay(attempt++);
             var remaining = deadline - now;
@@ -593,7 +611,7 @@ public sealed class OpenStackApiClient
         OpenStackCredentials credentials, string serverId, CancellationToken ct, TimeSpan? timeout = null)
     {
         RequireId(serverId, nameof(serverId));
-        var deadline = _clock.GetUtcNow() + (timeout ?? TimeSpan.FromSeconds(600));
+        var deadline = _clock.GetUtcNow() + (timeout ?? DefaultWaitTimeout);
         var attempt = 0;
         while (true)
         {
@@ -605,7 +623,7 @@ public sealed class OpenStackApiClient
             {
                 throw new OpenStackApiException(
                     OpenStackFailureKind.Unexpected, "wait for server deletion",
-                    $"server '{serverId}' was not deleted in time");
+                    $"server '{SanitizeForLog(serverId)}' was not deleted in time");
             }
             var delay = NextPollDelay(attempt++);
             var remaining = deadline - now;
@@ -1008,22 +1026,14 @@ public sealed class OpenStackApiClient
         try
         {
             using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            using var buffer = new MemoryStream();
-            var chunk = new byte[8192];
-            var total = 0;
-            int read;
-            while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
+            var bytes = await ReadTruncatedAsync(stream, maxBytes + 1, ct).ConfigureAwait(false);
+            if (bytes.Length > maxBytes)
             {
-                total += read;
-                if (total > maxBytes)
-                {
-                    throw new OpenStackApiException(
-                        OpenStackFailureKind.Unexpected, operation,
-                        $"response exceeded the {maxBytes.ToString(CultureInfo.InvariantCulture)}-byte bound");
-                }
-                buffer.Write(chunk, 0, read);
+                throw new OpenStackApiException(
+                    OpenStackFailureKind.Unexpected, operation,
+                    $"response exceeded the {maxBytes.ToString(CultureInfo.InvariantCulture)}-byte bound");
             }
-            return Encoding.UTF8.GetString(buffer.ToArray());
+            return Encoding.UTF8.GetString(bytes);
         }
         catch (OpenStackApiException)
         {
@@ -1037,6 +1047,25 @@ public sealed class OpenStackApiClient
                 OpenStackFailureKind.Unreachable, operation, "transport error while reading response",
                 null, null, null, null, ex);
         }
+    }
+
+    /// <summary>
+    /// Streams up to <paramref name="maxBytes"/> bytes, discarding the rest.
+    /// Single copy of the stream/read-chunk/truncate loop shared by the
+    /// bounded response and error-body readers.
+    /// </summary>
+    private static async Task<byte[]> ReadTruncatedAsync(Stream stream, int maxBytes, CancellationToken ct)
+    {
+        using var buffer = new MemoryStream();
+        var chunk = new byte[8192];
+        var total = 0;
+        int read;
+        while (total < maxBytes && (read = await stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, maxBytes - total)), ct).ConfigureAwait(false)) > 0)
+        {
+            buffer.Write(chunk, 0, read);
+            total += read;
+        }
+        return buffer.ToArray();
     }
 
     private async Task ThrowServiceErrorAsync(HttpResponseMessage response, string operation, CancellationToken ct)
@@ -1058,9 +1087,17 @@ public sealed class OpenStackApiClient
     {
         var kind = OpenStackApiException.FromStatus(response.StatusCode, body);
         var (faultCode, message) = ExtractFault(body);
+        // ExtractFault JSON-decodes the body, materializing \uXXXX escapes
+        // (e.g. \u001b, \u000a) back into live control characters that the
+        // pre-decode SanitizeForLog on the raw body cannot see. Sanitize the
+        // decoded values (and the request-id header) after decoding so log-
+        // bound exception text never carries forging/escape characters.
         return new OpenStackApiException(
-            kind, operation, message ?? body ?? "no response body",
-            response.StatusCode, faultCode, GetRequestId(response), GetRetryAfter(response, body));
+            kind, operation, message is null ? body ?? "no response body" : SanitizeForLog(message),
+            response.StatusCode,
+            faultCode is null ? null : SanitizeForLog(faultCode),
+            GetRequestId(response) is { } requestId ? SanitizeForLog(requestId) : null,
+            GetRetryAfter(response, body));
     }
 
     internal static async Task EnsureSuccessAsync(HttpResponseMessage response, string operation, CancellationToken ct)
@@ -1071,17 +1108,7 @@ public sealed class OpenStackApiClient
         try
         {
             using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            using var buffer = new MemoryStream();
-            var chunk = new byte[1024];
-            var total = 0;
-            int read;
-            while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0 && total < 8192)
-            {
-                var take = Math.Min(read, 8192 - total);
-                buffer.Write(chunk, 0, take);
-                total += take;
-            }
-            var raw = Encoding.UTF8.GetString(buffer.ToArray());
+            var raw = Encoding.UTF8.GetString(await ReadTruncatedAsync(stream, 8192, ct).ConfigureAwait(false));
             if (!string.IsNullOrWhiteSpace(raw))
             {
                 var trimmed = raw.Trim();
@@ -1102,18 +1129,7 @@ public sealed class OpenStackApiClient
         try
         {
             using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            using var buffer = new MemoryStream();
-            var chunk = new byte[1024];
-            var total = 0;
-            int read;
-            while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0
-                && total < maxErrorBytes)
-            {
-                var take = Math.Min(read, maxErrorBytes - total);
-                buffer.Write(chunk, 0, take);
-                total += take;
-            }
-            var raw = Encoding.UTF8.GetString(buffer.ToArray());
+            var raw = Encoding.UTF8.GetString(await ReadTruncatedAsync(stream, maxErrorBytes, ct).ConfigureAwait(false));
             if (string.IsNullOrWhiteSpace(raw))
                 return null;
             var trimmed = raw.Trim();
@@ -1222,8 +1238,8 @@ public sealed class OpenStackApiClient
 
     private static void RequireId(string value, string paramName)
     {
-        if (string.IsNullOrWhiteSpace(value) || value.Contains('/'))
-            throw new ArgumentException("Resource id must be non-blank without '/'.", paramName);
+        if (string.IsNullOrWhiteSpace(value) || value.Contains('/') || value.Any(char.IsControl))
+            throw new ArgumentException("Resource id must be non-blank without '/' or control characters.", paramName);
     }
 
     private static void RequireTag(string tag)

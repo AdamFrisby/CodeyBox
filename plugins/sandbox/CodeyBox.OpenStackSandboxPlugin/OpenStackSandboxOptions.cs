@@ -122,27 +122,22 @@ public sealed record OpenStackSandboxOptions
                 section, "CredentialIdEnvVar", defaults.CredentialIdEnvVar),
             CredentialSecretEnvVar = PluginConfigReaders.ReadNonEmpty(
                 section, "CredentialSecretEnvVar", defaults.CredentialSecretEnvVar),
-            HttpTimeoutSeconds = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "HttpTimeoutSeconds", defaults.HttpTimeoutSeconds), 1, 600),
-            TokenRefreshSkewSeconds = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "TokenRefreshSkewSeconds", defaults.TokenRefreshSkewSeconds), 0, 600),
-            ReadyTimeoutSeconds = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "ReadyTimeoutSeconds", defaults.ReadyTimeoutSeconds), 30, 3600),
-            PollIntervalMilliseconds = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "PollIntervalMilliseconds", defaults.PollIntervalMilliseconds), 200, 60_000),
-            MaxPollIntervalMilliseconds = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "MaxPollIntervalMilliseconds", defaults.MaxPollIntervalMilliseconds), 1000, 120_000),
-            MaxResponseBytes = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes), 64 * 1024, 64 * 1024 * 1024),
-            MaxListItems = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "MaxListItems", defaults.MaxListItems), 1, 100_000),
-            MaxListPages = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "MaxListPages", defaults.MaxListPages), 1, 500),
-            MaxUserDataBytes = Math.Clamp(
-                PluginConfigReaders.ReadInt(section, "MaxUserDataBytes", defaults.MaxUserDataBytes), 1024, 1024 * 1024),
+            HttpTimeoutSeconds = ReadClampedInt(section, "HttpTimeoutSeconds", defaults.HttpTimeoutSeconds, 1, 600),
+            TokenRefreshSkewSeconds = ReadClampedInt(section, "TokenRefreshSkewSeconds", defaults.TokenRefreshSkewSeconds, 0, 600),
+            ReadyTimeoutSeconds = ReadClampedInt(section, "ReadyTimeoutSeconds", defaults.ReadyTimeoutSeconds, 30, 3600),
+            PollIntervalMilliseconds = ReadClampedInt(section, "PollIntervalMilliseconds", defaults.PollIntervalMilliseconds, 200, 60_000),
+            MaxPollIntervalMilliseconds = ReadClampedInt(section, "MaxPollIntervalMilliseconds", defaults.MaxPollIntervalMilliseconds, 1000, 120_000),
+            MaxResponseBytes = ReadClampedInt(section, "MaxResponseBytes", defaults.MaxResponseBytes, 64 * 1024, 64 * 1024 * 1024),
+            MaxListItems = ReadClampedInt(section, "MaxListItems", defaults.MaxListItems, 1, 100_000),
+            MaxListPages = ReadClampedInt(section, "MaxListPages", defaults.MaxListPages, 1, 500),
+            MaxUserDataBytes = ReadClampedInt(section, "MaxUserDataBytes", defaults.MaxUserDataBytes, 1024, 1024 * 1024),
             AllowUnsafeHttp = PluginConfigReaders.ReadBool(section, "AllowUnsafeHttp", defaults.AllowUnsafeHttp),
         };
     }
+
+    private static int ReadClampedInt(
+        IConfigurationSection section, string name, int defaultValue, int min, int max) =>
+        Math.Clamp(PluginConfigReaders.ReadInt(section, name, defaultValue), min, max);
 
     /// <summary>Projects the size/timeout knobs onto the REST client's bounds record.</summary>
     public OpenStackClientLimits ToClientLimits() => new()

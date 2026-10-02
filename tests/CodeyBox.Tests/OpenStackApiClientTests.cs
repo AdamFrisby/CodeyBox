@@ -358,6 +358,57 @@ public sealed class OpenStackApiClientTests
         Assert.Contains("Invalid CIDR", ex.Message);
     }
 
+    [Fact]
+    public async Task ServiceError_JsonUnicodeEscapes_AreSanitizedAfterDecode()
+    {
+        // The wire body carries ANSI/log-forging characters as plain-ASCII
+        // \uXXXX escapes, invisible to the pre-decode raw-body sanitizer;
+        // ExtractFault's JSON decode materializes them into live control
+        // characters that must be sanitized after decoding.
+        var server = new FakeOpenStackServer();
+        var client = NewClient(server);
+        server.InterceptOnce = _ => new HttpResponseMessage(HttpStatusCode.BadRequest)
+        {
+            Content = new StringContent(
+                "{\"badRequest\":{\"message\":\"evil\\u001b forged\\u000aline\",\"type\":\"Bad\\u001bType\"}}",
+                Encoding.UTF8, "application/json"),
+        };
+
+        var ex = await Assert.ThrowsAsync<OpenStackApiException>(
+            () => client.CreateSecurityGroupAsync(TestCredentials(), "sg-1", null,
+                CancellationToken.None));
+        Assert.Contains("evil  forged line", ex.Message);
+        // NOTE: xUnit's string DoesNotContain is culture-sensitive and
+        // linguistic search treats control characters as ignorable (a lone
+        // ESC "matches" at position 0 of any string), so assert on Unicode
+        // categories instead — culture-independent and exact.
+        Assert.DoesNotContain(ex.Message, (char c) => char.IsControl(c));
+        Assert.DoesNotContain(ex.FaultCode ?? string.Empty, (char c) => char.IsControl(c));
+    }
+
+    [Fact]
+    public async Task Auth_RemoteHttpUrl_RefusedBeforePostingSecret()
+    {
+        var server = new FakeOpenStackServer();
+        var client = NewClient(server);
+        var creds = new OpenStackCredentials(
+            new Uri("http://203.0.113.9:5000/v3", UriKind.Absolute),
+            CredentialId, CredentialSecret, "test-region", "public", AllowUnsafeHttp: true);
+
+        var ex = await Assert.ThrowsAsync<OpenStackApiException>(
+            () => client.AuthenticateAsync(creds, CancellationToken.None));
+        Assert.Equal(OpenStackFailureKind.Unexpected, ex.Kind);
+        Assert.Equal(0, server.AuthCalls);
+    }
+
+    [Fact]
+    public void Credentials_ToString_RedactsSecret()
+    {
+        var text = TestCredentials().ToString();
+        Assert.DoesNotContain(CredentialSecret, text);
+        Assert.Contains(CredentialId, text);
+    }
+
     // ------------------------------------------------------------------
     // Nova: servers
     // ------------------------------------------------------------------
