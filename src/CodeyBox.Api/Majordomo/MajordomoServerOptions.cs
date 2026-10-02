@@ -122,6 +122,18 @@ public sealed class MajordomoServerOptions
         DecidedProposalRetention = TimeSpan.FromSeconds(DecidedProposalRetentionSeconds),
     };
 
+    /// <summary>
+    /// Bounds for the durable conversation and the context assembled from
+    /// it. Hot-reloadable alongside the rest of this section: the store
+    /// enforces the policy value passed to each append and the assembler
+    /// the value passed to each turn, so a config reload changes behaviour
+    /// for subsequent calls without a restart.
+    /// </summary>
+    public MajordomoConversationServerOptions Conversation { get; set; } = new();
+
+    /// <summary>Builds the history policy the conversation store and assembler consume.</summary>
+    public MajordomoHistoryOptions ToHistoryOptions() => Conversation.ToHistoryOptions();
+
     /// <summary>Hot-reload validator: returns the failure message or null.</summary>
     public static string? Validate(MajordomoServerOptions opts)
     {
@@ -145,6 +157,11 @@ public sealed class MajordomoServerOptions
         if (opts.DecidedProposalRetentionSeconds < MinDecidedProposalRetentionSeconds
             || opts.DecidedProposalRetentionSeconds > MaxDecidedProposalRetentionSeconds)
             return $"{SectionName}:DecidedProposalRetentionSeconds must be within [{MinDecidedProposalRetentionSeconds}, {MaxDecidedProposalRetentionSeconds}]";
+        if (opts.Conversation is null)
+            return $"{SectionName}:Conversation must not be null";
+        var conversationFailure = MajordomoConversationServerOptions.Validate(opts.Conversation);
+        if (conversationFailure is not null)
+            return $"{SectionName}:Conversation:{conversationFailure}";
         return null;
     }
 }

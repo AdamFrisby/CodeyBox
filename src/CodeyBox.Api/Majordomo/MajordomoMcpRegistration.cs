@@ -32,6 +32,14 @@ internal static class MajordomoMcpRegistration
                 sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
                 sp.GetService<ILogger<SqliteMajordomoProposalStore>>());
         });
+        services.AddSingleton<IMajordomoConversationStore>(sp =>
+        {
+            var path = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.StateDatabasePath;
+            return new SqliteMajordomoConversationStore(
+                path,
+                sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
+                sp.GetService<ILogger<SqliteMajordomoConversationStore>>());
+        });
         services.AddSingleton<MajordomoProposalService>(sp =>
             new MajordomoProposalService(
                 sp.GetRequiredService<IMajordomoProposalStore>(),
