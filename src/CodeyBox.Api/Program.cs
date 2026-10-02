@@ -411,6 +411,16 @@ builder.Services.AddOptions<TestSelectionSoundnessOptions>()
     .Validate(
         static opts => TestSelectionSoundnessOptions.IsValid(opts),
         $"{TestSelectionSoundnessOptions.SectionName} is invalid");
+// Post-merge baseline-production knobs
+// (Audit:TestSelection:BaselineProduction). Bound through AddOptions so
+// IOptionsMonitor<TestSelectionBaselineProductionOptions> hot-reloads the
+// kill-switch, the sandboxed-job timeout, retention, and the guest producer
+// binary without a restart.
+builder.Services.AddOptions<TestSelectionBaselineProductionOptions>()
+    .Bind(builder.Configuration.GetSection(TestSelectionBaselineProductionOptions.SectionName))
+    .Validate(
+        static opts => TestSelectionBaselineProductionOptions.IsValid(opts),
+        $"{TestSelectionBaselineProductionOptions.SectionName} is invalid");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
@@ -3662,6 +3672,43 @@ builder.Services.AddSingleton<TestSelectionShadowConfig>(sp => new TestSelection
         sp.GetRequiredService<IOptionsMonitor<TestSelectionOptions>>().CurrentValue.Mode),
     OptionsAccessor = () => sp.GetRequiredService<IOptionsMonitor<CoverageTestSelectionOptions>>().CurrentValue,
 });
+// Post-merge baseline production: the scheduler holds at most one pending job
+// per project (a second merge before the job starts supersedes it — newest
+// commit wins, never two jobs for one project). The hosted service drains it
+// through a sandboxed producer run, stores the artifact host-side keyed by
+// project + commit (bounded retention), and reports every outcome through the
+// status endpoint and a structured event. The audit stager places the newest
+// ancestry-reachable fresh baseline at BaselineSandboxPath (read-only) during
+// audit sandbox setup. All three self-gate on the global Enabled flag and the
+// per-project TestSelectionBaselineEnabled opt-in; unwired projects see no
+// behaviour change (selectors fall back to the full suite as before).
+builder.Services.AddSingleton<TestSelectionBaselineScheduler>();
+builder.Services.AddSingleton<ITestSelectionBaselineStore, TestSelectionBaselineStore>();
+builder.Services.AddSingleton<TestSelectionBaselineAuditStager>(sp => new TestSelectionBaselineAuditStager(
+    sp.GetRequiredService<ITestSelectionBaselineStore>(),
+    sp.GetRequiredService<IGitHost>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CoverageTestSelectionOptions>>().CurrentValue,
+    sp.GetRequiredService<ILogger<TestSelectionBaselineAuditStager>>(),
+    sp.GetService<TimeProvider>()));
+builder.Services.AddSingleton<ITestSelectionBaselineJobRunner>(sp => new SandboxTestSelectionBaselineRunner(
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<PipelineOptions>(),
+    () => sp.GetRequiredService<IOptionsMonitor<TestSelectionBaselineProductionOptions>>().CurrentValue,
+    () => sp.GetRequiredService<IOptionsMonitor<CoverageTestSelectionOptions>>().CurrentValue,
+    sp.GetRequiredService<ILogger<SandboxTestSelectionBaselineRunner>>(),
+    sp.GetService<TimeProvider>()));
+builder.Services.AddHostedService(sp => new TestSelectionBaselineProductionService(
+    sp.GetRequiredService<TestSelectionBaselineScheduler>(),
+    sp.GetRequiredService<ITestSelectionBaselineStore>(),
+    sp.GetRequiredService<ITestSelectionBaselineJobRunner>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    () => sp.GetRequiredService<IOptionsMonitor<TestSelectionBaselineProductionOptions>>().CurrentValue,
+    sp.GetRequiredService<ILogger<TestSelectionBaselineProductionService>>(),
+    sp.GetService<TimeProvider>()));
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
@@ -5065,7 +5112,15 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     delegationEscalation: sp.GetService<DelegationEscalationService>(),
     sandboxPlacer: sp.GetRequiredService<SandboxPlacementAcquirer>(),
     secretLeases: sp.GetService<SecretLeaseManager>(),
-    sessionSlotGate: sp.GetService<IAgentSessionSlotGate>()));
+    sessionSlotGate: sp.GetService<IAgentSessionSlotGate>(),
+    // Post-merge per-test coverage baseline production: the scheduler holds
+    // at most one pending job per project (newest merge wins), the stager
+    // places fresh ancestry-reachable baselines into audit sandboxes, and
+    // both are no-ops for projects that never opt in via
+    // Project.TestSelectionBaselineEnabled.
+    baselineScheduler: sp.GetRequiredService<TestSelectionBaselineScheduler>(),
+    baselineProductionOptions: () => sp.GetRequiredService<IOptionsMonitor<TestSelectionBaselineProductionOptions>>().CurrentValue,
+    baselineStager: sp.GetRequiredService<TestSelectionBaselineAuditStager>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -5820,6 +5875,7 @@ ResetAdviceEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 AgentPauseEndpoints.Map(app);
 TestSelectionSoundnessEndpoints.Map(app);
+TestSelectionBaselineEndpoints.Map(app);
 ConfigReloadEndpoints.Map(app);
 DeployConsistencyEndpoints.Map(app);
 app.MapMajordomoMcp();

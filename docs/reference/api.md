@@ -598,6 +598,34 @@ evaluated — rows without telemetry are excluded, never counted as safe.
 prose. Full gate semantics: `docs/quality/audit.md` ("Test-selection
 soundness").
 
+### `GET /audit/test-selection/baseline`
+
+Read-only post-merge baseline-production status per project: the newest
+stored baseline (commit, production time, age, size, test count) plus the
+last production outcome (duration or error) and the scheduler state
+(pending commit, running flag) — the observability surface for
+coverage-shadow calibration progress. `projectId` narrows to one project
+(404 when unknown, 400 when malformed); omitted, it returns every
+configured project.
+
+```json
+[
+  {
+    "projectId": "my-project",
+    "latestCommit": "abc123def456...",
+    "producedAtUtc": "2026-09-01T12:00:00+00:00",
+    "ageHours": 2.5,
+    "sizeBytes": 1234567,
+    "testCount": 1234,
+    "retainedCount": 3,
+    "lastDurationMs": 60000,
+    "lastError": null,
+    "pendingCommit": null,
+    "isRunning": false
+  }
+]
+```
+
 ### Agent Streams
 
 Structured agent stdout streams are captured when

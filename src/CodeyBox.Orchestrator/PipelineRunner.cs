@@ -934,6 +934,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await _store.UpdateAsync(item with { LocalSquashSha = mergeSha }, ct);
                 await Transition(item, WorkItemState.Merged, ct, project);
                 await PublishMergeCompletedAsync(item, project, baseBranch, workBranch, mergeSha, ct);
+                ScheduleBaselineProduction(project, repoId, baseBranch, mergeSha);
             }
 
             // -------- Phase 3: Upstream push (separate atomic unit) --------

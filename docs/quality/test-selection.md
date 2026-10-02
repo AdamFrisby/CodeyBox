@@ -107,7 +107,34 @@ Mechanism, licences, measured cost, and rejected alternatives:
 `tools/CodeyBox.TestSelectionBaseline/README.md`.
 
 **Distribution:** bake the file into the audit baseline image at the path
-above, OR fetch the CI artifact to that sandbox path at sandbox setup.
+above, OR fetch the CI artifact to that sandbox path at sandbox setup, OR
+(let the orchestrator do it) enable automated post-merge production:
+
+- Per-project opt-in: `"TestSelectionBaselineEnabled": true` on the project.
+- Global kill-switch and knobs:
+  `Audit:TestSelection:BaselineProduction` (`Enabled`, `Timeout` per job,
+  `MaxRetainedPerProject` host-side retention,
+  `ProducerBinary` guest binary — default
+  `codeybox-test-selection-baseline`, resolved on the job sandbox's PATH, so
+  bake the producer into the audit baseline image;
+  `SaturatedPoolRecheckDelay`).
+- After each successful merge to the project's base branch the orchestrator
+  schedules one sandboxed production job for that commit (bounded
+  concurrency 1 per project — a second merge before the job starts
+  supersedes it, newest commit wins; the job measures the live base tip at
+  execution so squash-merge divergence converges on the freshest `main`).
+  The job consumes the global sandbox budget like any other phase and parks
+  while the pipeline is saturated, so work-item phases always win.
+- The artifact is stored host-side keyed by project + commit. At audit
+  sandbox setup the orchestrator stages the newest stored baseline whose
+  commit is an ancestor of the item's base tip at `BaselineSandboxPath`
+  (read-only); when no stored baseline is fresh within `MaxBaselineAge`,
+  nothing is staged and the selector runs the full suite.
+- Progress is observable via `GET /audit/test-selection/baseline`
+  (latest commit, age, size, last production duration or error, pending /
+  running state) and the `test-selection.baseline_produced` /
+  `test-selection.baseline_failed` events. A production failure is recorded
+  there but never blocks merges or audits.
 
 **Staleness bound:** regeneration on every merge to `main` means the map is at
 most **one merge stale**. `MaxBaselineAge` (default 7 days) is an additional
