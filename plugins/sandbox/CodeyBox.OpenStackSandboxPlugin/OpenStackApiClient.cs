@@ -1197,7 +1197,7 @@ public sealed class OpenStackApiClient
             {
                 var id = values.FirstOrDefault();
                 if (!string.IsNullOrWhiteSpace(id))
-                    return id.Trim();
+                    return SanitizeForLog(id.Trim());
             }
         }
         return null;
