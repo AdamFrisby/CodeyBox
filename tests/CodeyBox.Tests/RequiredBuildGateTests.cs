@@ -8,6 +8,7 @@ using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -1582,6 +1583,188 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Contains("sandbox provisioning denied by quota", result.Reason);
         Assert.NotEqual(RequiredBuildVerificationStatus.Passed, result.Status);
         Assert.NotEqual(RequiredBuildVerificationStatus.Failed, result.Status);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_VmLostOnFirstAttempt_RetriesOnFreshSandbox()
+    {
+        // The incident shape: incusd DB contention aborts provisioning with
+        // "Failed to begin transaction: context deadline exceeded" (surfaced
+        // as a provisioning deferral). The verifier must re-run on a fresh
+        // sandbox rather than failing the work item.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "incus",
+            operation: "verify effective VM device topology",
+            errorClass: "incus-db-transaction-deadline",
+            detail: "Error: Failed to begin transaction: context deadline exceeded",
+            recheckIn: TimeSpan.FromMilliseconds(1));
+        var provider = new ScriptedBuildSandboxProvider(attempt =>
+            attempt == 1 ? throw deferred : ScriptedBuildSandbox.Healthy());
+        var verifier = new SandboxRequiredBuildVerifier(
+            provider,
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/build-vm-lost-retry") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
+        Assert.Equal(2, provider.Creates);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_ExecTransportLostOnFirstAttempt_RetriesOnFreshSandbox()
+    {
+        // The control-file-cleanup shape: the build exec's transport dies
+        // underneath verification. A fresh sandbox must reproduce the
+        // environment instead of the item failing.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var provider = new ScriptedBuildSandboxProvider(attempt =>
+            attempt == 1
+                ? new ScriptedBuildSandbox(static exec =>
+                    exec.Argv.Count > 0 && exec.Argv[0] == "git"
+                        ? new SandboxExecResult(0, string.Empty, string.Empty)
+                        : new SandboxExecResult(1, string.Empty, string.Empty, ExecutionUnavailable: true))
+                : ScriptedBuildSandbox.Healthy());
+        var verifier = new SandboxRequiredBuildVerifier(
+            provider,
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/build-transport-lost-retry") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
+        Assert.Equal(2, provider.Creates);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_ConsecutiveVmLoss_PropagatesDeferralOnce()
+    {
+        // The fresh-sandbox retry is bounded to a single re-run: a second
+        // consecutive loss propagates to the existing deferral handling,
+        // which parks the item on the bounded transient-retry path.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "incus",
+            operation: "verify effective VM device topology",
+            errorClass: "incus-db-transaction-deadline",
+            detail: "Error: Failed to begin transaction: context deadline exceeded",
+            recheckIn: TimeSpan.FromMilliseconds(1));
+        var provider = new ScriptedBuildSandboxProvider(_ => throw deferred);
+        var verifier = new SandboxRequiredBuildVerifier(
+            provider,
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/build-vm-lost-twice") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            verifier.VerifyAsync(new RequiredBuildVerificationRequest
+            {
+                WorkItemId = item.Id,
+                ProjectId = item.ProjectId,
+                SandboxPolicy = new RequiredBuildSandboxPolicy(),
+                RepositoryId = repoId,
+                BaseBranch = item.BaseBranch,
+                WorkBranch = item.WorkBranch!,
+                Phase = "audit",
+            }, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        Assert.Equal(2, provider.Creates);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_DisposalFailureAfterPassedResult_StaysPassed()
+    {
+        // Teardown after the result is determined is operational, never the
+        // item's outcome: even a delete/unmount failure during sandbox
+        // disposal must not flip a Passed verification.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var teardownFailure = new InvalidOperationException(
+            "Incus delete sandbox VM failed with exit code 1: Error: Failed unmounting instance: " +
+            "Failed to unmount \"/var/lib/incus/storage-pools/codeybox\": device busy");
+        var provider = new ScriptedBuildSandboxProvider(_ =>
+            new DisposalFailingBuildSandbox(ScriptedBuildSandbox.Healthy(), teardownFailure));
+        var log = new CapturingBuildVerifierLogger();
+        var verifier = new SandboxRequiredBuildVerifier(
+            provider,
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            new CapturingBuildVerifierLoggerAdapter(log));
+
+        var item = NewItem("feature/build-disposal-fails") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
+        Assert.Equal(1, provider.Creates);
+        // The swallowed teardown failure must be observable: a warning carrying
+        // the sandbox context is logged at the catch site.
+        var warning = Assert.Single(
+            log.Records,
+            r => r.Level == LogLevel.Warning);
+        Assert.Same(teardownFailure, warning.Exception);
+        Assert.Contains("disposal failed", warning.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -3649,6 +3832,84 @@ public sealed class RequiredBuildGateTests : IDisposable
             _ = spec;
             _ = ct;
             throw exception;
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(Array.Empty<ManagedSandboxInfo>());
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class ScriptedBuildSandbox(
+        Func<SandboxExec, SandboxExecResult> onExec,
+        Action? onDispose = null) : ISandbox
+    {
+        public string Id { get; } = "scripted-build-" + Guid.NewGuid().ToString("N")[..8];
+
+        public static ScriptedBuildSandbox Healthy(Action? disposeHook = null) =>
+            new(static _ => new SandboxExecResult(0, "build ok", string.Empty), disposeHook);
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _ = ct;
+            return Task.FromResult(onExec(exec));
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            onDispose?.Invoke();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class DisposalFailingBuildSandbox(ISandbox inner, Exception failure) : ISandbox
+    {
+        public string Id => inner.Id;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => inner.ExecAsync(exec, ct);
+
+        public async ValueTask DisposeAsync()
+        {
+            await Task.Yield();
+            throw failure;
+        }
+    }
+
+    private sealed class CapturingBuildVerifierLogger
+    {
+        public List<(LogLevel Level, string Message, Exception? Exception)> Records { get; } = [];
+    }
+
+    private sealed class CapturingBuildVerifierLoggerAdapter(CapturingBuildVerifierLogger sink)
+        : ILogger<SandboxRequiredBuildVerifier>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel level,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => sink.Records.Add((level, formatter(state, exception), exception));
+    }
+
+    private sealed class ScriptedBuildSandboxProvider(Func<int, ISandbox> factory) : ISandboxProvider
+    {
+        private int _creates;
+
+        public int Creates => Volatile.Read(ref _creates);
+
+        public string Name => "scripted-build";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            _ = spec;
+            _ = ct;
+            return Task.FromResult(factory(Interlocked.Increment(ref _creates)));
         }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)

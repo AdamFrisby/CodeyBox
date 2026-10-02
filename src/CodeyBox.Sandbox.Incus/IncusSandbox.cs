@@ -243,7 +243,7 @@ internal sealed class IncusSandbox :
         var cleanupConfirmed = true;
         Exception? primaryFailure = null;
         SandboxExecResult? sandboxResult = null;
-        InvalidOperationException? cleanupFailure = null;
+        Exception? cleanupFailure = null;
         try
         {
             var firstExec = Interlocked.Increment(ref _execCount) == 1;
@@ -418,8 +418,21 @@ internal sealed class IncusSandbox :
                         completionPath).ConfigureAwait(false);
                     if (primaryFailure is null)
                     {
-                        cleanupFailure = new InvalidOperationException(
-                            "Incus exec completed, but transient guest control-file cleanup could not be verified; the VM was stopped and must be disposed.");
+                        // The guest command completed but its secret-bearing
+                        // control files cannot be proven absent — a transient
+                        // host/guest race, not a work fault. Surface a typed
+                        // provisioning deferral so the recovery stack parks
+                        // the item for bounded transient retry on a fresh
+                        // sandbox instead of failing it; the stopped VM is
+                        // left for disposal. The detail keeps the allowlisted
+                        // signature text so downstream classification agrees.
+                        var liveOptions = _liveOptionsAccessor();
+                        cleanupFailure = new SandboxProvisioningDeferredException(
+                            IncusSandboxProvider.ProviderId,
+                            "exec control-file cleanup",
+                            IncusTransientInfrastructure.ExecCleanupFaultClass,
+                            "Incus exec completed, but transient guest control-file cleanup could not be verified; the VM was stopped and must be disposed.",
+                            liveOptions.ProvisioningRetryRecheckIn);
                     }
                 }
             }
@@ -790,6 +803,7 @@ internal sealed class IncusSandbox :
         await _lifecycleGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         var finalized = false;
         var vmAbsent = false;
+        var handedToReaper = false;
         var previousState = _lifecycleState;
         try
         {
@@ -850,8 +864,20 @@ internal sealed class IncusSandbox :
                     await WaitForInstanceAbsenceAsync(CancellationToken.None).ConfigureAwait(false);
                     vmAbsent = true;
                 }
-                catch (Exception deleteError)
+                catch (Exception deleteError) when (deleteError is not OperationCanceledException)
                 {
+                    // A transient host fault (DB/storage deadline, unmount
+                    // race) during delete must not fail the work item whose
+                    // result is already determined. Hand the VM and its
+                    // staging to the leak reaper's disposal retry: active
+                    // tracking is released below so the reaper may dispose
+                    // it, and this handle reports disposed.
+                    if (TryClassifyTransientInfrastructure(deleteError) is { } deleteFault)
+                    {
+                        HandOffToReaper(deleteFault, deleteError);
+                        handedToReaper = true;
+                        return;
+                    }
                     bool stillExists;
                     try
                     {
@@ -859,6 +885,12 @@ internal sealed class IncusSandbox :
                     }
                     catch (Exception verificationError)
                     {
+                        if (TryClassifyTransientInfrastructure(verificationError) is { } verifyFault)
+                        {
+                            HandOffToReaper(verifyFault, verificationError);
+                            handedToReaper = true;
+                            return;
+                        }
                         throw new AggregateException(
                             "Incus sandbox deletion failed and instance absence could not be verified.",
                             deleteError,
@@ -873,15 +905,25 @@ internal sealed class IncusSandbox :
             finalized = true;
             AuditLog.SandboxDisposed(Id, ResourceMetrics);
         }
+        catch (Exception ex) when (ex is not OperationCanceledException && IsTransientInfrastructure(ex))
+        {
+            // Ownership verification around the delete hit the same transient
+            // host contention. Same handoff: the reaper re-verifies against
+            // the daemon and retries disposal independently of this handle.
+            HandOffToReaper(
+                TryClassifyTransientInfrastructure(ex)!,
+                ex);
+            handedToReaper = true;
+        }
         finally
         {
-            if (finalized)
+            if (finalized || handedToReaper)
                 _lifecycleState = 4;
             else if (vmAbsent)
                 _lifecycleState = 5;
             else if (_lifecycleState == 3)
                 _lifecycleState = previousState;
-            if (finalized || vmAbsent)
+            if (finalized || vmAbsent || handedToReaper)
                 NotifyNoLongerActive();
             _lifecycleGate.Release();
         }
@@ -2290,5 +2332,33 @@ internal sealed class IncusSandbox :
         _recoveryManifestStore.Dispose();
         _onDisposed(Id);
         SandboxLiveCounter.Decrement();
+    }
+
+    private bool IsTransientInfrastructure(Exception ex) =>
+        TryClassifyTransientInfrastructure(ex) is not null;
+
+    private IncusTransientInfrastructureFault? TryClassifyTransientInfrastructure(Exception ex)
+    {
+        IReadOnlyList<string> signatures;
+        try
+        {
+            signatures = _liveOptionsAccessor()?.TransientInfrastructureSignatures
+                ?? _options.TransientInfrastructureSignatures;
+        }
+        catch (Exception)
+        {
+            signatures = _options.TransientInfrastructureSignatures;
+        }
+        return IncusTransientInfrastructure.TryClassify(ex, signatures);
+    }
+
+    private void HandOffToReaper(IncusTransientInfrastructureFault fault, Exception ex)
+    {
+        _log.LogWarning(
+            ex,
+            "Incus sandbox {SandboxId} teardown hit transient infrastructure fault '{FaultClass}' (signature '{Signature}'); leaving the VM and staging for the leak reaper disposal retry",
+            Id,
+            fault.FaultClass,
+            fault.MatchedSignature);
     }
 }

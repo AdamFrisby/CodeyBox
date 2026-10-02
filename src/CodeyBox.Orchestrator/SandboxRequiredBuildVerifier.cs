@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
@@ -184,15 +185,18 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly PipelineOptions _pipelineOptions;
+    private readonly ILogger<SandboxRequiredBuildVerifier>? _logger;
 
     public SandboxRequiredBuildVerifier(
         ISandboxProvider sandboxes,
         IGitHost gitHost,
-        PipelineOptions pipelineOptions)
+        PipelineOptions pipelineOptions,
+        ILogger<SandboxRequiredBuildVerifier>? logger = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
         _pipelineOptions = pipelineOptions;
+        _logger = logger;
     }
 
     public async Task<RequiredBuildProbeResult> ProbeAsync(
@@ -375,8 +379,72 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 ct);
             var access = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
             var spec = BuildSandboxSpec(access, request);
+            try
+            {
+                return await VerifyOnSandboxAsync(spec, access, request, ct);
+            }
+            catch (Exception ex) when (IsSandboxLost(ex))
+            {
+                // The verification VM was lost to transient host
+                // infrastructure (a provisioning deferral or a dead exec
+                // transport). The attempt's sandbox was already disposed
+                // best-effort; re-run once on a fresh sandbox rather than
+                // failing. A second consecutive loss propagates to the
+                // existing deferral/transport-loss handling, which parks the
+                // item on the bounded transient-retry path.
+                return await VerifyOnSandboxAsync(spec, access, request, ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (SandboxDiskDeferredException)
+        {
+            // Disk-guard preflight refused the verification sandbox. Re-throw
+            // so the orchestrator defers and re-queues instead of flattening
+            // this into Unavailable (which terminal-fails the item). Kept
+            // explicit even though the disk deferral derives from the
+            // provisioning deferral below, so this boundary documents the
+            // incident it guards against.
+            throw;
+        }
+        catch (Exception ex) when (SandboxDeferralGuard.IsDeferral(ex))
+        {
+            // Host-side sandbox provisioning exhausted a transient retry
+            // budget. Filtered through the shared guard (not a restated type
+            // name) so this boundary cannot drift from the isolated audit
+            // repository setup boundary in PipelineRunner.
+            throw;
+        }
+        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
+        {
+            return RequiredBuildVerificationResult.Unavailable(
+                $"could not verify required build: {SingleLineSummary(ex.Message)}",
+                output: string.Empty);
+        }
+        finally
+        {
+            if (isolatedRepoPath is not null)
+            {
+                await _gitHost.DisposeIsolatedRepositoryCloneAsync(
+                    request.RepositoryId,
+                    isolatedRepoPath,
+                    CancellationToken.None);
+            }
+        }
+    }
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+    private async Task<RequiredBuildVerificationResult> VerifyOnSandboxAsync(
+        SandboxSpec spec,
+        SandboxRepositoryAccess access,
+        RequiredBuildVerificationRequest request,
+        CancellationToken ct)
+    {
+        ISandbox? sandbox = null;
+        try
+        {
+            sandbox = await _sandboxes.CreateAsync(spec, ct);
             using var buildTimeoutCts = new CancellationTokenSource(_pipelineOptions.RequiredBuildVerificationTimeout);
             using var buildCts = CancellationTokenSource.CreateLinkedTokenSource(ct, buildTimeoutCts.Token);
             var buildCt = buildCts.Token;
@@ -458,45 +526,32 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 
             return RequiredBuildVerificationResult.Failed(build.ExitCode, redactedOutput);
         }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (SandboxDiskDeferredException)
-        {
-            // Disk-guard preflight refused the verification sandbox. Re-throw
-            // so the orchestrator defers and re-queues instead of flattening
-            // this into Unavailable (which terminal-fails the item). Kept
-            // explicit even though the disk deferral derives from the
-            // provisioning deferral below, so this boundary documents the
-            // incident it guards against.
-            throw;
-        }
-        catch (Exception ex) when (SandboxDeferralGuard.IsDeferral(ex))
-        {
-            // Host-side sandbox provisioning exhausted a transient retry
-            // budget. Filtered through the shared guard (not a restated type
-            // name) so this boundary cannot drift from the isolated audit
-            // repository setup boundary in PipelineRunner.
-            throw;
-        }
-        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
-        {
-            return RequiredBuildVerificationResult.Unavailable(
-                $"could not verify required build: {SingleLineSummary(ex.Message)}",
-                output: string.Empty);
-        }
         finally
         {
-            if (isolatedRepoPath is not null)
+            if (sandbox is not null)
             {
-                await _gitHost.DisposeIsolatedRepositoryCloneAsync(
-                    request.RepositoryId,
-                    isolatedRepoPath,
-                    CancellationToken.None);
+                try
+                {
+                    await sandbox.DisposeAsync();
+                }
+                catch (Exception ex)
+                {
+                    // Teardown after the verification result is determined is
+                    // operational, never the item's outcome: the VM stays in
+                    // the provider's managed inventory for the leak reaper's
+                    // disposal retry. Disposal failures are logged-but-ignored
+                    // per the teardown-never-fails policy.
+                    _logger?.LogWarning(
+                        ex,
+                        "Required-build verification sandbox {SandboxId} disposal failed; the provider inventory retains it for disposal retry",
+                        sandbox.Id);
+                }
             }
         }
     }
+
+    private static bool IsSandboxLost(Exception ex) =>
+        SandboxDeferralGuard.IsDeferral(ex) || SandboxDeferralGuard.IsExecutionTransportLoss(ex);
 
     private async Task<string> CreateIsolatedBuildRepositoryAsync(
         string repositoryId,
