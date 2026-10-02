@@ -5,6 +5,13 @@
     <ProjectReference Include="..\CodeyBox.Majordomo\CodeyBox.Majordomo.csproj" />
     <ProjectReference Include="..\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.Incus\CodeyBox.Sandbox.Incus.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.MultipassRemote\CodeyBox.Sandbox.MultipassRemote.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.Process\CodeyBox.Sandbox.Process.csproj" />
+    <ProjectReference Include="..\CodeyBox.Sandbox.Sprites\CodeyBox.Sandbox.Sprites.csproj" />
+    <ProjectReference Include="..\CodeyBox.HostProcess\CodeyBox.HostProcess.csproj" />
     <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream\CodeyBox.Upstream.csproj" />

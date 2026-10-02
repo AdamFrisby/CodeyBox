@@ -805,13 +805,24 @@ static ISandboxProvider BuildSandboxProviderInner(
     ILoggerFactory loggerFactory,
     string kind)
 {
+    // Provider construction lives in the shared factory
+    // (SharedSandboxProviderFactory) so the orchestrator and the executor
+    // host cannot drift apart: adding a kind means editing the factory, and
+    // the arms below only attach orchestrator-side option shaping (plugins,
+    // disk guard, banners, transports). Kinds with no arm fall through to
+    // the factory with default options, so a new factory kind needs no edit
+    // here unless it needs orchestrator-side tuning.
     return kind switch
     {
         SandboxProviderKinds.Process => BuildProcess(sp, opts, environment, startupLog, loggerFactory),
-        SandboxProviderKinds.Bubblewrap => new BubblewrapSandboxProvider(
-            new BubblewrapSandboxOptions(),
-            loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
-            sp.GetService<ITimingStore>()),
+        SandboxProviderKinds.Bubblewrap => SharedSandboxProviderFactory.Build(
+            SandboxProviderKinds.Bubblewrap,
+            new SandboxProviderBuildArgs
+            {
+                Loggers = loggerFactory,
+                BubblewrapOptions = () => new BubblewrapSandboxOptions(),
+                Timings = sp.GetService<ITimingStore>(),
+            }),
         SandboxProviderKinds.Multipass => BuildMultipass(
             opts,
             sp,
@@ -826,8 +837,15 @@ static ISandboxProvider BuildSandboxProviderInner(
             sp.GetService<ISandboxResourceUsageStore>()),
         SandboxProviderKinds.MultipassRemote => BuildMultipassRemote(sp, loggerFactory),
         SandboxProviderKinds.Sprites => BuildSprites(sp, loggerFactory, startupLog),
-        _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: {string.Join(", ", SandboxProviderKinds.All.OrderBy(static s => s, StringComparer.Ordinal))}"),
+        _ => SharedSandboxProviderFactory.Build(
+            kind,
+            new SandboxProviderBuildArgs
+            {
+                Loggers = loggerFactory,
+                ProcessRunner = sp.GetService<IProcessRunner>(),
+                Timings = sp.GetService<ITimingStore>(),
+                ResourceUsage = sp.GetService<ISandboxResourceUsageStore>(),
+            }),
     };
 }
 
@@ -1015,17 +1033,20 @@ static ISandboxProvider BuildProcess(IServiceProvider sp, CodeyBoxOptions opts, 
             RequiredConfigurationValidator.ProcessSandboxUnsafeMessage);
     }
     startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
-    return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
+    // Construction lives in the shared factory; only the dev-gate policy stays here.
+    return SharedSandboxProviderFactory.Build(
+        SandboxProviderKinds.Process,
+        new SandboxProviderBuildArgs { Loggers = loggerFactory });
 }
 
-static IncusSandboxProvider BuildIncus(
+static ISandboxProvider BuildIncus(
     IServiceProvider sp,
     ILoggerFactory loggerFactory,
     ITimingStore? timings,
     ISandboxResourceUsageStore? resourceUsageStore)
 {
     var configLog = loggerFactory.CreateLogger("CodeyBox.Incus.Config");
-    var provider = new IncusSandboxProvider(
+    Func<IncusSandboxOptions> optionsAccessor =
         // The reloadable selector may route future work to another registered
         // provider, while each Incus operation resolves the latest allowed
         // settings. A live sandbox keeps the immutable IncusSandboxOptions
@@ -1049,12 +1070,21 @@ static IncusSandboxProvider BuildIncus(
                 baselineVerificationCommands);
             return ApplyPluginBaselineContributions(
                 sp, configLog, baseline, baselineVerificationCommands.Count, providerKind: "incus");
-        },
-        loggerFactory.CreateLogger<IncusSandboxProvider>(),
-        timings,
-        resourceUsageStore);
+        };
+    // Construction lives in the shared factory; option shaping (plugins,
+    // baselines, hot-reload delegate) stays here.
+    var provider = SharedSandboxProviderFactory.Build(
+        SandboxProviderKinds.Incus,
+        new SandboxProviderBuildArgs
+        {
+            Loggers = loggerFactory,
+            IncusOptions = optionsAccessor,
+            Timings = timings,
+            ResourceUsage = resourceUsageStore,
+        });
 
-    LogDiskGuardBanner(provider, configLog);
+    if (provider is IDiskGuardedSandboxProvider guarded)
+        LogDiskGuardBanner(guarded, configLog);
     return provider;
 }
 
@@ -1139,7 +1169,7 @@ static PluginBaselineContributions ResolvePluginBaselineContributions(
     return contributions;
 }
 
-static MultipassSandboxProvider BuildMultipass(
+static ISandboxProvider BuildMultipass(
     CodeyBoxOptions opts,
     IServiceProvider sp,
     ILoggerFactory loggerFactory,
@@ -1152,7 +1182,7 @@ static MultipassSandboxProvider BuildMultipass(
     // lifetime. The cloud-init / runcmd / network-profile fields below are
     // resolved live via IOptionsMonitor on every VM launch.
     var diskGuard = MultipassDiskGuardConfig.Build(opts, startupLog);
-    var provider = new MultipassSandboxProvider(
+    Func<MultipassSandboxOptions> optionsAccessor =
         // Resolve through IOptionsMonitor so cloud-init / runcmd edits land
         // on the next VM launch without restart. Sandboxes already running
         // keep the snapshot they were constructed with.
@@ -1210,30 +1240,38 @@ static MultipassSandboxProvider BuildMultipass(
                     live.MultipassExecutableProvisions,
                     "CodeyBox:MultipassExecutableProvisions"),
             };
-        },
-        loggerFactory.CreateLogger<MultipassSandboxProvider>(),
-        timings,
-        resourceUsageStore);
+        };
+    // Construction lives in the shared factory; option shaping (disk guard,
+    // plugins, hot-reload delegate) stays here.
+    var provider = SharedSandboxProviderFactory.Build(
+        SandboxProviderKinds.Multipass,
+        new SandboxProviderBuildArgs
+        {
+            Loggers = loggerFactory,
+            MultipassOptions = optionsAccessor,
+            Timings = timings,
+            ResourceUsage = resourceUsageStore,
+        });
 
     // Startup banner: log free disk for each guarded path so the operator
     // can see at a glance whether the host is close to the threshold. Mirrors
     // the existing baseline-image banner pattern. Speaks to the capability
     // interface so this code does not depend on the concrete provider type.
-    if (diskGuard is not null)
+    if (diskGuard is not null && provider is IDiskGuardedSandboxProvider guarded)
     {
-        LogDiskGuardBanner(provider, startupLog);
+        LogDiskGuardBanner(guarded, startupLog);
     }
 
     return provider;
 }
 
-static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory)
+static ISandboxProvider BuildMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory)
     => BuildMultipassRemoteFromConfig(
         sp,
         loggerFactory,
         live => live.MultipassRemoteSandbox);
 
-static MultipassRemoteSandboxProvider BuildE2eMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory, int hostIndex)
+static ISandboxProvider BuildE2eMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory, int hostIndex)
     => BuildMultipassRemoteFromConfig(
         sp,
         loggerFactory,
@@ -1243,23 +1281,23 @@ static MultipassRemoteSandboxProvider BuildE2eMultipassRemote(IServiceProvider s
             return hostIndex >= 0 && hostIndex < hosts.Count ? hosts[hostIndex].RemoteSandbox : null;
         });
 
-static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
+static ISandboxProvider BuildMultipassRemoteFromConfig(
     IServiceProvider sp,
     ILoggerFactory loggerFactory,
     Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
 {
     // All options resolved through IOptionsMonitor so SSH endpoint, key path,
     // staging dir, host-pool membership, and timeouts hot-reload on the next
-    // CreateAsync without an orchestrator restart.
-    var transportLogger = loggerFactory.CreateLogger<OpenSshCliTransport>();
-    var runner = sp.GetService<IProcessRunner>() ?? new DefaultProcessRunner();
-    return new MultipassRemoteSandboxProvider(
-        () => ReadRemoteOpts(sp, configSelector),
-        hostOptions => new OpenSshCliTransport(
-            () => hostOptions,
-            runner,
-            transportLogger),
-        loggerFactory.CreateLogger<MultipassRemoteSandboxProvider>());
+    // CreateAsync without an orchestrator restart. Construction lives in the
+    // shared factory; the transport wiring stays here.
+    return SharedSandboxProviderFactory.Build(
+        SandboxProviderKinds.MultipassRemote,
+        new SandboxProviderBuildArgs
+        {
+            Loggers = loggerFactory,
+            MultipassRemoteOptions = () => ReadRemoteOpts(sp, configSelector),
+            ProcessRunner = sp.GetService<IProcessRunner>(),
+        });
 
     static MultipassRemoteSandboxOptions ReadRemoteOpts(
         IServiceProvider sp,
@@ -1270,11 +1308,11 @@ static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
     }
 }
 
-static SpritesSandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory loggerFactory, ILogger startupLog)
+static ISandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory loggerFactory, ILogger startupLog)
 {
     startupLog.LogInformation(
         "Using sprites.dev sandbox provider; host mounts are staged through the Sprites API.");
-    return new SpritesSandboxProvider(
+    Func<SpritesSandboxOptions> optionsAccessor =
         () =>
         {
             var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
@@ -1316,8 +1354,15 @@ static SpritesSandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory l
                 DefaultMemoryBytes = cfg.DefaultMemoryBytes,
                 Region = cfg.Region,
             };
-        },
-        loggerFactory.CreateLogger<SpritesSandboxProvider>());
+        };
+    // Construction lives in the shared factory; option shaping stays here.
+    return SharedSandboxProviderFactory.Build(
+        SandboxProviderKinds.Sprites,
+        new SandboxProviderBuildArgs
+        {
+            Loggers = loggerFactory,
+            SpritesOptions = optionsAccessor,
+        });
 
     static Dictionary<string, List<string>> CopySpritesNetworkProfiles(Dictionary<string, List<string>>? source)
     {

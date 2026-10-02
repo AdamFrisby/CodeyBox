@@ -18,18 +18,16 @@ internal static class SandboxProviderKinds
 
     /// <summary>
     /// Every provider kind the composition root can build (see
-    /// <c>Program.BuildSandboxProviderInner</c>). The sandbox class catalog
-    /// validates member provider kinds against this set.
+    /// <c>Program.BuildSandboxProviderInner</c>, which delegates to the
+    /// shared factory). The sandbox class catalog validates member provider
+    /// kinds against this set. Sourced from
+    /// <see cref="CodeyBox.Core.HostPlatformSupport.AllProviderIds"/> — the
+    /// same source the shared factory and the executor registry use — so the
+    /// three can never disagree on what is buildable.
     /// </summary>
-    internal static readonly IReadOnlySet<string> All = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        Incus,
-        Multipass,
-        MultipassRemote,
-        Sprites,
-        Bubblewrap,
-        Process,
-    };
+    internal static readonly IReadOnlySet<string> All = new HashSet<string>(
+        CodeyBox.Core.HostPlatformSupport.AllProviderIds,
+        StringComparer.OrdinalIgnoreCase);
 
     internal static bool IsRegistered(string? providerKind) =>
         !string.IsNullOrWhiteSpace(providerKind) && All.Contains(providerKind.Trim());

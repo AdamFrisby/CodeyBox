@@ -1,4 +1,9 @@
 using CodeyBox.Core;
+using CodeyBox.Sandbox.Bubblewrap;
+using CodeyBox.Sandbox.Incus;
+using CodeyBox.Sandbox.Multipass;
+using CodeyBox.Sandbox.MultipassRemote;
+using CodeyBox.Sandbox.Sprites;
 
 namespace CodeyBox.Orchestrator;
 
@@ -62,13 +67,59 @@ public sealed class ExecutorOptions
     public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
-    /// Local sandbox backend the executor provisions through. Exact-match,
-    /// one of <c>process</c> (plain-process dev runner — UNSAFE, local testing
-    /// only) or <c>bubblewrap</c> (namespace isolation, shared kernel).
-    /// VM-backed backends stay orchestrator-side; the executor runs work where
-    /// it runs, never by remote-driving another machine.
+    /// Local sandbox backend the executor provisions through. Exact-match
+    /// against the registered provider kinds (see
+    /// <see cref="HostPlatformSupport.AllProviderIds"/>). Kept as the
+    /// single-kind shortcut: when <see cref="SandboxProviders"/> is empty
+    /// this is the only kind served, so existing deployments are unaffected.
     /// </summary>
     public string LocalSandboxProvider { get; set; } = "process";
+
+    /// <summary>Maximum provider kinds one executor may declare. Bounds the list, not the registry.</summary>
+    public const int MaxDeclaredProviderKinds = 16;
+
+    /// <summary>
+    /// Every sandbox provider kind this host serves. Empty means
+    /// "just <see cref="LocalSandboxProvider"/>". When non-empty it wins
+    /// entirely and <see cref="LocalSandboxProvider"/> is only the
+    /// compatibility default for the primary slot; each entry must name a
+    /// registered provider kind (exact-match, case-insensitive, no
+    /// duplicates). A host can offer both an Incus VM and a lightweight
+    /// process sandbox from one process.
+    /// </summary>
+    public List<string> SandboxProviders { get; set; } = [];
+
+    /// <summary>
+    /// Bubblewrap settings bound from <c>CodeyBox:Executor:Bubblewrap</c>.
+    /// Read once when the kind is first built; an edit applies to providers
+    /// built afterwards (process restart in practice, since the registry
+    /// shares one instance per kind).
+    /// </summary>
+    public BubblewrapSandboxOptions Bubblewrap { get; set; } = new();
+
+    /// <summary>
+    /// Multipass settings bound from <c>CodeyBox:Executor:Multipass</c>.
+    /// Held as a live accessor, so edits land on the next VM launch.
+    /// </summary>
+    public MultipassSandboxOptions Multipass { get; set; } = new();
+
+    /// <summary>
+    /// Incus settings bound from <c>CodeyBox:Executor:Incus</c>.
+    /// Held as a live accessor, so edits land on the next operation.
+    /// </summary>
+    public IncusSandboxOptions Incus { get; set; } = new();
+
+    /// <summary>
+    /// Multipass-remote settings bound from
+    /// <c>CodeyBox:Executor:MultipassRemote</c>. Held as a live accessor.
+    /// </summary>
+    public MultipassRemoteSandboxOptions MultipassRemote { get; set; } = new();
+
+    /// <summary>
+    /// Sprites settings bound from <c>CodeyBox:Executor:Sprites</c>.
+    /// Held as a live accessor.
+    /// </summary>
+    public SpritesSandboxOptions Sprites { get; set; } = new();
 
     /// <summary>
     /// What happens to a running sandbox when the orchestrator connection
@@ -77,6 +128,50 @@ public sealed class ExecutorOptions
     /// </summary>
     public ExecutorDisconnectPolicy DisconnectPolicy { get; set; } = ExecutorDisconnectPolicy.RetainSandboxForResume;
 
+    /// <summary>
+    /// Normalised provider kinds this host serves, in declaration order.
+    /// <see cref="SandboxProviders"/> wins when non-empty; otherwise the
+    /// single-kind <see cref="LocalSandboxProvider"/> shortcut applies.
+    /// Entries are trimmed, lowercased, and deduplicated (first wins).
+    /// </summary>
+    public IReadOnlyList<string> GetDeclaredKinds()
+    {
+        var source = SandboxProviders.Count > 0
+            ? (IReadOnlyList<string>)SandboxProviders
+            : [LocalSandboxProvider];
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>(source.Count);
+        foreach (var raw in source)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+            var normalized = raw.Trim().ToLowerInvariant();
+            if (seen.Add(normalized))
+                result.Add(normalized);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Primary kind: the first declared kind, backing the singleton
+    /// <see cref="CodeyBox.Core.ISandboxProvider"/> for compatibility with
+    /// single-provider consumers. Falls back to <c>process</c> only when
+    /// configuration names nothing usable (validation rejects that first).
+    /// </summary>
+    public string GetPrimarySandboxKind()
+    {
+        var kinds = GetDeclaredKinds();
+        return kinds.Count > 0 ? kinds[0] : HostPlatformSupport.Process;
+    }
+
+    /// <summary>
+    /// Every buildable provider kind, normalised and sorted for messages.
+    /// Single source of truth for executor-side validation; mirrors the
+    /// registry's known kinds.
+    /// </summary>
+    public static string ValidProviderKinds => string.Join(
+        ", ",
+        HostPlatformSupport.AllProviderIds.OrderBy(static s => s, StringComparer.Ordinal));
     /// <summary>
     /// Builds the registration assertion sent on connect. Registration is the
     /// executor's claim of what it can run; the orchestrator decides placement.
@@ -128,9 +223,31 @@ public sealed class ExecutorOptions
         if (!Enum.IsDefined(DisconnectPolicy))
             throw new InvalidOperationException("CodeyBox:Executor:DisconnectPolicy names an unknown policy.");
         var provider = (LocalSandboxProvider ?? "").Trim().ToLowerInvariant();
-        if (provider is not ("process" or "bubblewrap"))
+        if (string.IsNullOrEmpty(provider))
             throw new InvalidOperationException(
-                "CodeyBox:Executor:LocalSandboxProvider must be 'process' or 'bubblewrap'.");
+                $"CodeyBox:Executor:LocalSandboxProvider must name a sandbox provider kind. Valid: {ValidProviderKinds}.");
+        ValidateAdditionalProviderKinds();
+    }
+
+    private void ValidateAdditionalProviderKinds()
+    {
+        if (SandboxProviders.Count > MaxDeclaredProviderKinds)
+            throw new InvalidOperationException(
+                $"CodeyBox:Executor:SandboxProviders may contain at most {MaxDeclaredProviderKinds} entries.");
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in SandboxProviders)
+        {
+            var normalized = (raw ?? "").Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(normalized))
+                throw new InvalidOperationException(
+                    "CodeyBox:Executor:SandboxProviders entries must be non-empty.");
+            if (normalized.Length > ExecutorRegistration.MaxDeclaredEntryLength)
+                throw new InvalidOperationException(
+                    $"CodeyBox:Executor:SandboxProviders entries must be at most {ExecutorRegistration.MaxDeclaredEntryLength} characters.");
+            if (!seen.Add(normalized))
+                throw new InvalidOperationException(
+                    $"CodeyBox:Executor:SandboxProviders names '{normalized}' more than once.");
+        }
     }
 
     private static void ValidateEntries(List<string> entries, string fieldName)
