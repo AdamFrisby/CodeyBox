@@ -4058,6 +4058,13 @@ builder.Services.AddSingleton<IInteractionVerifier>(sp =>
     new SlackInteractionVerifier("slack", Program.InteractionProviderOpts(sp, "slack")));
 builder.Services.AddSingleton<IInteractionVerifier>(sp =>
     new NtfyInteractionVerifier("ntfy", Program.InteractionProviderOpts(sp, "ntfy")));
+builder.Services.AddSingleton<IBotFrameworkSigningKeyProvider>(sp =>
+    new HttpBotFrameworkSigningKeyProvider(sp.GetRequiredService<IHttpClientFactory>()));
+builder.Services.AddSingleton<IInteractionVerifier>(sp =>
+    new TeamsInteractionVerifier(
+        "teams",
+        Program.InteractionProviderOpts(sp, "teams"),
+        keyProvider: sp.GetRequiredService<IBotFrameworkSigningKeyProvider>()));
 
 // --- Changelog automation ----------------------------------------------------
 // Named HTTP client for direct Anthropic Messages API calls (changelog generation).

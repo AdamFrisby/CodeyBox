@@ -180,6 +180,32 @@ internal static class InteractionEndpoints
                 validationError = ValidatePayload(payload);
             }
         }
+
+        // Teams posts the native Bot Framework activity (an Action.Submit
+        // delivery) rather than the canonical JSON shape. When the canonical
+        // parse fails on a botframework-jwt provider, map the native shape
+        // before rejecting — verification already passed either way. Teams
+        // supplies no response_url: the loop-close runs through the render
+        // provider's card refresh instead.
+        if (validationError is not null && IsTeamsScheme(providerOpts.Scheme))
+        {
+            if (TeamsInteractionParser.TryParse(bodyBytes, out var teamsCanonical, out _)
+                && teamsCanonical is not null)
+            {
+                payload = new InteractionPayload
+                {
+                    InteractionId = teamsCanonical.InteractionId,
+                    WorkItemId = teamsCanonical.WorkItemId,
+                    QuestionId = teamsCanonical.QuestionId,
+                    Answer = teamsCanonical.Answer,
+                    User = new InteractionUser { UserId = teamsCanonical.UserId, Login = teamsCanonical.Login },
+                    ChannelId = teamsCanonical.ChannelId,
+                    ResponseUrl = null,
+                    CorrelationToken = teamsCanonical.CorrelationToken,
+                };
+                validationError = ValidatePayload(payload);
+            }
+        }
         if (validationError is not null)
             return Results.BadRequest(new { error = validationError });
         if (payload is null)
@@ -279,6 +305,9 @@ internal static class InteractionEndpoints
 
     private static bool IsSlackScheme(string? scheme) =>
         string.Equals(scheme, "slack-v0", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsTeamsScheme(string? scheme) =>
+        string.Equals(scheme, TeamsInteractionVerifier.Scheme, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Hand a landed decision to the matching render provider when
     /// it carries interactions itself. Notification-only providers (the
