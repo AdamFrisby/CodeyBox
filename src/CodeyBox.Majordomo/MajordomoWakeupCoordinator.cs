@@ -267,15 +267,29 @@ public sealed class MajordomoWakeupCoordinator
         if (string.IsNullOrWhiteSpace(reason))
             return "unspecified";
         var safe = Validation.DescribeUntrustedValue(reason);
-        return safe.Length <= MaxReasonChars ? safe : safe[..MaxReasonChars];
+        var bounded = safe.Length <= MaxReasonChars ? safe : safe[..MaxReasonChars];
+        return EscapeWakeupFraming(bounded);
     }
 
     private static string TruncateReport(string report, int maxChars)
     {
-        if (report.Length <= maxChars)
-            return report;
-        return report[..Math.Max(0, maxChars - 15)] + "…[truncated]";
+        var safe = EscapeWakeupFraming(report);
+        if (safe.Length <= maxChars)
+            return safe;
+        return safe[..Math.Max(0, maxChars - 15)] + "…[truncated]";
     }
+
+    /// <summary>
+    /// Escapes the outer conversation framing so untrusted text stored in a
+    /// Majordomo-role wakeup report cannot forge a <c>[/majordomo]</c>
+    /// breakout and read as surrounding instructions. Inner untrusted-data
+    /// blocks keep their own closers; only the outer transcript framing is
+    /// neutralized here — the excerpt author must already have escaped inner
+    /// closers before wrapping the detail block.
+    /// </summary>
+    public static string EscapeWakeupFraming(string text) =>
+        text.Replace("[/majordomo]", "[\\/majordomo]", StringComparison.Ordinal)
+            .Replace("[/operator]", "[\\/operator]", StringComparison.Ordinal);
 
     private sealed class TurnLease(MajordomoWakeupCoordinator owner) : IDisposable
     {

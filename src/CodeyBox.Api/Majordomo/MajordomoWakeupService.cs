@@ -153,21 +153,108 @@ internal sealed class MajordomoWakeupService : BackgroundService
     /// <summary>
     /// Push trigger for a work item entering a terminal failure. Debounced by
     /// the coordinator: a burst of failures inside the trigger floor produces
-    /// one wakeup, not one per failure.
+    /// one wakeup, not one per failure. The work-item id and failure text are
+    /// untrusted (agent stdout / failure detail): the id is echoed through
+    /// <see cref="Validation.DescribeUntrustedValue"/> and the failure excerpt
+    /// is sanitized, bounded, and replayed only inside a demarcated
+    /// untrusted-data block — never as Majordomo-role prose — so a payload
+    /// carrying instructions or a forged <c>[/majordomo]</c> marker cannot
+    /// read as the majordomo's own reasoning.
     /// </summary>
     public Task<MajordomoWakeupResult> NotifyTerminalFailureAsync(
         string workItemId, string? failureText, CancellationToken ct = default)
     {
-        var reason = $"work item {workItemId} entered a terminal failure";
+        var (reason, report) = BuildTerminalFailureReport(workItemId, failureText);
         return _coordinator.NotifyEventAsync(
             MajordomoWakeupKind.TerminalFailure,
             reason,
-            innerCt => Task.FromResult(new MajordomoWakeupAssessment(
-                true,
-                string.IsNullOrWhiteSpace(failureText)
-                    ? $"{reason}; see get_work_item for detail."
-                    : $"{reason}: {failureText}")),
+            innerCt => Task.FromResult(new MajordomoWakeupAssessment(true, report)),
             ct: ct);
+    }
+
+    /// <summary>
+    /// Pure construction of the terminal-failure trigger reason and its
+    /// findings report from untrusted caller input, so the sanitization and
+    /// untrusted-data framing are testable without a read backend.
+    /// </summary>
+    internal static (string Reason, string Report) BuildTerminalFailureReport(
+        string? workItemId, string? failureText)
+    {
+        var safeId = SanitizeWorkItemId(workItemId);
+        var reason = $"work item {safeId} entered a terminal failure";
+        string report;
+        if (string.IsNullOrWhiteSpace(failureText))
+        {
+            report = $"{reason}; see get_work_item for detail.";
+        }
+        else
+        {
+            var excerpt = SanitizeFailureExcerpt(failureText);
+            report = $"{reason}.\n{MajordomoContextAssembler.UntrustedDataNotice}\n" +
+                $"[untrusted_tool_result failure-detail]\n{excerpt}\n[/untrusted_tool_result]\n" +
+                "See get_work_item for full detail.";
+        }
+        return (reason, report);
+    }
+
+    /// <summary>Longest failure excerpt replayed inside the untrusted-data block.</summary>
+    internal const int MaxFailureExcerptChars = 2000;
+
+    internal static string SanitizeWorkItemId(string? workItemId)
+    {
+        if (string.IsNullOrWhiteSpace(workItemId))
+            return "unspecified";
+        return MajordomoWakeupCoordinator.EscapeWakeupFraming(
+            Validation.DescribeUntrustedValue(workItemId));
+    }
+
+    /// <summary>
+    /// Sanitizes untrusted failure detail for the demarcated block: strips the
+    /// same non-echoable class <see cref="Validation.DescribeUntrustedValue"/>
+    /// drops (terminal escapes, bidi overrides, zero-width and private-use
+    /// characters, lone surrogates) while keeping CR/LF/TAB prose whitespace,
+    /// bounds the excerpt, and escapes embedded closing markers so the detail
+    /// cannot break out of its block or forge outer transcript framing.
+    /// </summary>
+    internal static string SanitizeFailureExcerpt(string failureText)
+    {
+        ArgumentNullException.ThrowIfNull(failureText);
+        var length = Math.Min(failureText.Length, MaxFailureExcerptChars);
+        var builder = new System.Text.StringBuilder(length);
+        for (var i = 0; i < length;)
+        {
+            var c = failureText[i];
+            if (c is '\r' or '\n' or '\t')
+            {
+                builder.Append(c);
+                i++;
+                continue;
+            }
+            var width = char.IsHighSurrogate(c)
+                && i + 1 < length
+                && char.IsLowSurrogate(failureText[i + 1])
+                ? 2 : 1;
+            var category = width == 2
+                ? char.GetUnicodeCategory(failureText, i)
+                : char.GetUnicodeCategory(c);
+            var echoable = category is not (
+                System.Globalization.UnicodeCategory.Control
+                or System.Globalization.UnicodeCategory.Format
+                or System.Globalization.UnicodeCategory.Surrogate
+                or System.Globalization.UnicodeCategory.PrivateUse
+                or System.Globalization.UnicodeCategory.OtherNotAssigned
+                or System.Globalization.UnicodeCategory.LineSeparator
+                or System.Globalization.UnicodeCategory.ParagraphSeparator);
+            if (echoable)
+                builder.Append(failureText, i, width);
+            i += width;
+        }
+        if (failureText.Length > MaxFailureExcerptChars)
+            builder.Append('…');
+        return builder.ToString()
+            .Replace("[/untrusted_tool_result]", "[\\/untrusted_tool_result]", StringComparison.Ordinal)
+            .Replace("[/majordomo]", "[\\/majordomo]", StringComparison.Ordinal)
+            .Replace("[/operator]", "[\\/operator]", StringComparison.Ordinal);
     }
 
     private static Task<MajordomoWakeupAssessment> AssessAsync(
