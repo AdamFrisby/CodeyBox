@@ -35,7 +35,8 @@ internal sealed class IncusCliProcessRunner : IProcessRunner
         int? maxStdoutBytes = null,
         int? maxStderrBytes = null,
         IReadOnlyDictionary<string, string>? environment = null,
-        bool killOnOutputLimit = true)
+        bool killOnOutputLimit = true,
+        string? workingDirectory = null)
     {
         if (!maxStdoutBytes.HasValue || !maxStderrBytes.HasValue)
         {
@@ -62,6 +63,7 @@ internal sealed class IncusCliProcessRunner : IProcessRunner
             maxStdoutBytes,
             maxStderrBytes,
             environment,
-            killOnOutputLimit);
+            killOnOutputLimit,
+            workingDirectory);
     }
 }

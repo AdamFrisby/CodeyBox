@@ -2194,7 +2194,8 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             Called = true;
             throw new InvalidOperationException("Incus must not run for invalid provisioning configuration.");
@@ -2285,7 +2286,8 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             ct.ThrowIfCancellationRequested();
             Invocations.Add(new Invocation(argv.ToArray(), stdin));

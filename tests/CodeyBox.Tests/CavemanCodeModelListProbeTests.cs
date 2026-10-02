@@ -178,7 +178,8 @@ public sealed class CavemanCodeModelListProbeTests
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null,
-            bool killOnOutputLimit = true)
+            bool killOnOutputLimit = true,
+            string? workingDirectory = null)
         {
             SeenArgv = argv;
             return Task.FromResult(new ProcessRunResult(1, "", "", StartFailed: true));

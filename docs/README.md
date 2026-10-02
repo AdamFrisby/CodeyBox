@@ -31,6 +31,7 @@ at anything that matters.
 | [audit reports](quality/audit-reports.md) | how findings are stored, queried, and de-duplicated |
 | [presets](quality/presets.md) | language detection and audit-type prompts, and who may override them |
 | [mutation rigor](quality/mutation-rigor.md) | the per-item gate that checks tests actually catch bugs |
+| [test selection](quality/test-selection.md) | coverage-guided narrowing of `csharp:test-pass`, including the baseline producer |
 | [test cases](quality/test-cases.md) | test cases as a first-class artifact on a work item |
 | [E2E execution](quality/e2e-execution.md) | replaying committed E2E artifacts on cheap CPU-only VMs |
 

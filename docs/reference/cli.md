@@ -5,6 +5,7 @@ Two separate binaries, easy to confuse:
 | Tool | Project | What it does |
 |---|---|---|
 | `codeybox` | `tools/CodeyBox.Cli` | typed client for the REST API — queue, inspect, watch, pause. Full command reference in [`../../tools/CodeyBox.Cli/README.md`](../../tools/CodeyBox.Cli/README.md). |
+| `codeybox-test-selection-baseline` | `tools/CodeyBox.TestSelectionBaseline` | produces the per-test coverage baseline consumed by coverage-guided test selection. See [`../../tools/CodeyBox.TestSelectionBaseline/README.md`](../../tools/CodeyBox.TestSelectionBaseline/README.md). |
 | the wizard | `src/CodeyBox.Cli` (`CodeyBox.Wizard`) | interactive project-configuration generator; prints a JSON snippet for your config file. Documented below. |
 
 ## The project-configuration wizard

@@ -633,13 +633,8 @@ public sealed class FileResetCreditTriggerStore : IResetCreditTriggerStore
 
     private async Task SaveLockedAsync(PersistedState state, CancellationToken ct)
     {
-        var directory = Path.GetDirectoryName(_filePath);
-        if (!string.IsNullOrEmpty(directory))
-            Directory.CreateDirectory(directory);
-        var tempPath = _filePath + ".tmp";
         var json = JsonSerializer.Serialize(state, JsonOptions);
-        await File.WriteAllTextAsync(tempPath, json, Encoding.UTF8, ct).ConfigureAwait(false);
-        File.Move(tempPath, _filePath, overwrite: true);
+        await AtomicFile.WriteAllTextAsync(_filePath, json, ct).ConfigureAwait(false);
     }
 
     private sealed class PersistedState

@@ -1,5 +1,6 @@
 using System.Xml;
 using System.Xml.Linq;
+using CodeyBox.Core;
 
 namespace CodeyBox.Audit;
 
@@ -36,12 +37,7 @@ public static class CoberturaParser
     {
         ArgumentNullException.ThrowIfNull(xml);
 
-        var settings = new XmlReaderSettings
-        {
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-            MaxCharactersFromEntities = 0,
-        };
+        var settings = SafeXmlSettings.Create();
 
         XDocument doc;
         using (var stringReader = new StringReader(xml))

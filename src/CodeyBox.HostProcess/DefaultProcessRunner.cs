@@ -49,7 +49,8 @@ public sealed class DefaultProcessRunner : IProcessRunner
         int? maxStdoutBytes = null,
         int? maxStderrBytes = null,
         IReadOnlyDictionary<string, string>? environment = null,
-        bool killOnOutputLimit = true)
+        bool killOnOutputLimit = true,
+        string? workingDirectory = null)
     {
         if (argv.Count == 0 || string.IsNullOrWhiteSpace(argv[0]))
             throw new ArgumentException("Process argv must contain an executable.", nameof(argv));
@@ -57,6 +58,17 @@ public sealed class DefaultProcessRunner : IProcessRunner
             throw new ArgumentOutOfRangeException(nameof(maxStdoutBytes));
         if (maxStderrBytes is < 0)
             throw new ArgumentOutOfRangeException(nameof(maxStderrBytes));
+
+        string? resolvedWorkingDirectory = null;
+        if (workingDirectory is not null)
+        {
+            resolvedWorkingDirectory = Path.GetFullPath(workingDirectory);
+            if (!Directory.Exists(resolvedWorkingDirectory))
+            {
+                throw new DirectoryNotFoundException(
+                    $"Working directory '{resolvedWorkingDirectory}' does not exist.");
+            }
+        }
 
         var isolatedLinuxProcessGroup = _options.IsolateLinuxProcessGroup && OperatingSystem.IsLinux();
         var psi = new System.Diagnostics.ProcessStartInfo
@@ -67,6 +79,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
             RedirectStandardInput = stdin is not null,
             UseShellExecute = false,
             CreateNoWindow = true,
+            WorkingDirectory = resolvedWorkingDirectory ?? "",
         };
         if (isolatedLinuxProcessGroup)
         {
@@ -95,30 +108,45 @@ public sealed class DefaultProcessRunner : IProcessRunner
         if (!p.Start())
             return new ProcessRunResult(1, "", "", StartFailed: true);
 
+        // Readers run on a linked token so the post-exit drain can be bounded
+        // by PostExitDrainGrace independently of caller cancellation.
+        using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
         var limitOutput = maxStdoutBytes.HasValue || maxStderrBytes.HasValue;
-        var streamChunks = stdoutChunkCallback is not null || stderrChunkCallback is not null;
-        if (streamChunks && !limitOutput)
+        var eventStreaming = (stdoutChunkCallback is not null || stderrChunkCallback is not null)
+            && !limitOutput;
+        TaskCompletionSource? stdoutEof = null;
+        TaskCompletionSource? stderrEof = null;
+        if (eventStreaming)
         {
+            stdoutEof = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            stderrEof = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             p.OutputDataReceived += (_, e) =>
             {
-                if (e.Data is null) return;
+                if (e.Data is null)
+                {
+                    stdoutEof.TrySetResult();
+                    return;
+                }
                 var line = e.Data + "\n";
                 stdout.Append(line);
                 stdoutChunkCallback?.Invoke(line);
             };
             p.ErrorDataReceived += (_, e) =>
             {
-                if (e.Data is null) return;
+                if (e.Data is null)
+                {
+                    stderrEof.TrySetResult();
+                    return;
+                }
                 var line = e.Data + "\n";
                 stderr.Append(line);
                 stderrChunkCallback?.Invoke(line);
             };
         }
 
-        Task<string>? stdoutTask = null;
-        Task<string>? stderrTask = null;
         Task<LimitedReadResult>? limitedStdoutTask = null;
         Task<LimitedReadResult>? limitedStderrTask = null;
         Exception? outputLimitTerminationFailure = null;
@@ -150,30 +178,25 @@ public sealed class DefaultProcessRunner : IProcessRunner
             }
         }
 
-        if (streamChunks && !limitOutput)
+        if (eventStreaming)
         {
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
         }
-        else if (limitOutput)
+        else
         {
             limitedStdoutTask = ReadLimitedAsync(
                 p.StandardOutput,
                 maxStdoutBytes,
                 stdoutChunkCallback,
                 killOnOutputLimit ? KillForLimit : null,
-                ct);
+                drainCts.Token);
             limitedStderrTask = ReadLimitedAsync(
                 p.StandardError,
                 maxStderrBytes,
                 stderrChunkCallback,
                 killOnOutputLimit ? KillForLimit : null,
-                ct);
-        }
-        else
-        {
-            stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
-            stderrTask = p.StandardError.ReadToEndAsync(ct);
+                drainCts.Token);
         }
 
         try
@@ -185,7 +208,14 @@ public sealed class DefaultProcessRunner : IProcessRunner
                 p.StandardInput.Close();
             }
 
-            await WaitForRootExitAsync(p, isolatedLinuxProcessGroup, ct).ConfigureAwait(false);
+            // With async stream readers, Process.WaitForExitAsync also awaits
+            // the redirected streams' EOF — which a detached grandchild
+            // holding the inherited pipe handles can postpone indefinitely
+            // (e.g. an MSBuild node-reuse server outliving 'dotnet msbuild').
+            // Poll for the root exit instead, then bound the remaining drain.
+            var pollForExit = isolatedLinuxProcessGroup || eventStreaming;
+            await WaitForRootExitAsync(p, pollForExit, ct).ConfigureAwait(false);
+            drainCts.CancelAfter(_options.PostExitDrainGrace);
 
             if (Volatile.Read(ref outputLimitTerminationRequested) != 0)
             {
@@ -207,29 +237,62 @@ public sealed class DefaultProcessRunner : IProcessRunner
                 }
             }
 
-            if (stdoutTask is not null && stderrTask is not null)
-                return new ProcessRunResult(p.ExitCode, await stdoutTask, await stderrTask);
-            if (limitedStdoutTask is not null && limitedStderrTask is not null)
+            if (eventStreaming)
             {
-                var stdoutResult = await limitedStdoutTask.ConfigureAwait(false);
-                var stderrResult = await limitedStderrTask.ConfigureAwait(false);
+                var stdoutTruncated = false;
+                var stderrTruncated = false;
+                try
+                {
+                    await Task.WhenAll(stdoutEof!.Task, stderrEof!.Task)
+                        .WaitAsync(drainCts.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // The drain grace elapsed: close the pipes so the async
+                    // readers finish, then flag whichever stream never
+                    // reached EOF as truncated.
+                    var drainErrors = new List<Exception>();
+                    CloseRedirectedStreams(p, drainErrors);
+                    stdoutTruncated = !stdoutEof!.Task.IsCompleted;
+                    stderrTruncated = !stderrEof!.Task.IsCompleted;
+                    try
+                    {
+                        await Task.WhenAll(stdoutEof.Task, stderrEof.Task)
+                            .WaitAsync(_options.CleanupTimeout)
+                            .ConfigureAwait(false);
+                    }
+                    catch (TimeoutException)
+                    {
+                        // The close did not settle the readers inside the
+                        // cleanup window; the output is already flagged.
+                    }
+                }
+
+                ct.ThrowIfCancellationRequested();
                 return new ProcessRunResult(
                     p.ExitCode,
-                    stdoutResult.Text,
-                    stderrResult.Text,
-                    stdoutResult.LimitExceeded,
-                    stderrResult.LimitExceeded);
+                    stdout.ToString(),
+                    stderr.ToString(),
+                    StdoutLimitExceeded: stdoutTruncated,
+                    StderrLimitExceeded: stderrTruncated);
             }
 
-            return new ProcessRunResult(p.ExitCode, stdout.ToString(), stderr.ToString());
+            var stdoutResult = await limitedStdoutTask!.ConfigureAwait(false);
+            var stderrResult = await limitedStderrTask!.ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            return new ProcessRunResult(
+                p.ExitCode,
+                stdoutResult.Text,
+                stderrResult.Text,
+                stdoutResult.LimitExceeded,
+                stderrResult.LimitExceeded);
         }
         catch (Exception initiatingError)
         {
             var cleanupErrors = await TerminateAndDrainAsync(
                 p,
                 isolatedLinuxProcessGroup,
-                stdoutTask,
-                stderrTask,
                 limitedStdoutTask,
                 limitedStderrTask).ConfigureAwait(false);
             if (cleanupErrors.Count == 0)
@@ -242,19 +305,21 @@ public sealed class DefaultProcessRunner : IProcessRunner
 
     private async Task WaitForRootExitAsync(
         DiagProcess process,
-        bool isolatedLinuxProcessGroup,
+        bool pollForExit,
         CancellationToken ct)
     {
-        if (!isolatedLinuxProcessGroup)
+        if (!pollForExit)
         {
             await process.WaitForExitAsync(ct).ConfigureAwait(false);
             return;
         }
 
-        // Very short-lived `setsid -- <command>` roots can exit between
-        // Process.WaitForExitAsync enabling exit notifications and registering
-        // its continuation. Polling HasExited also reaps the child and avoids
-        // leaving an Incus operation suspended until its outer deadline.
+        // Poll HasExited rather than WaitForExitAsync: polling applies both to
+        // very short-lived `setsid -- <command>` roots that can exit between
+        // WaitForExitAsync enabling exit notifications and registering its
+        // continuation, and to event-streamed reads — WaitForExitAsync would
+        // also await the streams' EOF, which a detached grandchild holding
+        // the inherited pipes can postpone indefinitely.
         while (!process.HasExited)
         {
             await Task.Delay(
@@ -300,8 +365,6 @@ public sealed class DefaultProcessRunner : IProcessRunner
     private async Task<IReadOnlyList<Exception>> TerminateAndDrainAsync(
         DiagProcess process,
         bool isolatedLinuxProcessGroup,
-        Task<string>? stdoutTask,
-        Task<string>? stderrTask,
         Task<LimitedReadResult>? limitedStdoutTask,
         Task<LimitedReadResult>? limitedStderrTask)
     {
@@ -343,8 +406,6 @@ public sealed class DefaultProcessRunner : IProcessRunner
         CloseRedirectedStreams(process, errors);
         if (!await ObserveOutputTasksBestEffortAsync(
                 cleanupDeadline.Token,
-                stdoutTask,
-                stderrTask,
                 limitedStdoutTask,
                 limitedStderrTask).ConfigureAwait(false))
         {
@@ -394,14 +455,10 @@ public sealed class DefaultProcessRunner : IProcessRunner
 
     private static async Task<bool> ObserveOutputTasksBestEffortAsync(
         CancellationToken ct,
-        Task<string>? stdoutTask,
-        Task<string>? stderrTask,
         Task<LimitedReadResult>? limitedStdoutTask,
         Task<LimitedReadResult>? limitedStderrTask)
     {
         var tasks = new List<Task>(4);
-        if (stdoutTask is not null) tasks.Add(stdoutTask);
-        if (stderrTask is not null) tasks.Add(stderrTask);
         if (limitedStdoutTask is not null) tasks.Add(limitedStdoutTask);
         if (limitedStderrTask is not null) tasks.Add(limitedStderrTask);
         if (tasks.Count == 0)
@@ -465,42 +522,52 @@ public sealed class DefaultProcessRunner : IProcessRunner
         var totalBytes = 0;
         var limitExceeded = false;
 
-        while (true)
+        try
         {
-            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
-            if (read == 0)
-                return new LimitedReadResult(output.ToString(), limitExceeded);
-
-            var chunk = new string(buffer, 0, read);
-            if (maxBytes is { } limit)
+            while (true)
             {
-                if (limitExceeded)
-                    continue;
+                var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read == 0)
+                    return new LimitedReadResult(output.ToString(), limitExceeded);
 
-                var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
-                if (chunkBytes > limit - totalBytes)
+                var chunk = new string(buffer, 0, read);
+                if (maxBytes is { } limit)
                 {
-                    var remaining = Math.Max(0, limit - totalBytes);
-                    if (remaining > 0)
+                    if (limitExceeded)
+                        continue;
+
+                    var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+                    if (chunkBytes > limit - totalBytes)
                     {
-                        var truncated = TakeUtf8Prefix(chunk, remaining);
-                        output.Append(truncated);
-                        chunkCallback?.Invoke(truncated);
+                        var remaining = Math.Max(0, limit - totalBytes);
+                        if (remaining > 0)
+                        {
+                            var truncated = TakeUtf8Prefix(chunk, remaining);
+                            output.Append(truncated);
+                            chunkCallback?.Invoke(truncated);
+                        }
+
+                        totalBytes = limit;
+                        limitExceeded = true;
+                        onLimitExceeded?.Invoke();
+                        if (onLimitExceeded is not null)
+                            return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                        continue;
                     }
 
-                    totalBytes = limit;
-                    limitExceeded = true;
-                    onLimitExceeded?.Invoke();
-                    if (onLimitExceeded is not null)
-                        return new LimitedReadResult(output.ToString(), LimitExceeded: true);
-                    continue;
+                    totalBytes += chunkBytes;
                 }
 
-                totalBytes += chunkBytes;
+                output.Append(chunk);
+                chunkCallback?.Invoke(chunk);
             }
-
-            output.Append(chunk);
-            chunkCallback?.Invoke(chunk);
+        }
+        catch (OperationCanceledException)
+        {
+            // Caller cancellation or the post-exit drain grace elapsed —
+            // keep the buffered prefix and flag the truncation so callers
+            // can fail loudly instead of trusting a partial output.
+            return new LimitedReadResult(output.ToString(), LimitExceeded: true);
         }
     }
 

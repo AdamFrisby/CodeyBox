@@ -138,10 +138,11 @@ See `tests/CodeyBox.Tests/CoverageAuditorTests.cs`,
 
 The aggregate gate above measures "did any test cover this line". Test
 selection needs the finer question "WHICH tests cover this line". The
-full-suite-on-`main` producer collects per-test XPlat/Cobertura coverage and
-writes the `codeybox-test-selection-baseline/1` artifact (per-test line maps
-plus project-graph and test-index data) that the advisory coverage selector
-narrows against. Consumer, freshness bound ("at most one merge stale"),
-distribution, and shadow policy: `docs/quality/test-selection.md`. The
-per-test parser reuses `CoberturaParser` executable-line semantics and
-`ToRepositoryRelative` normalisation — no new coverage tooling.
+host-side producer (`tools/CodeyBox.TestSelectionBaseline`) runs each listed
+test in isolation through coverlet XPlat, parses each Cobertura document with
+`CoberturaParser`, and writes the `codeybox-test-selection-baseline/1`
+artifact (per-test line maps plus project-graph and test-index data) that the
+advisory coverage selector narrows against. Consumer, freshness bound ("at
+most one merge stale"), distribution, and shadow policy:
+`docs/quality/test-selection.md`. Path keys use `ToRepositoryRelative` so
+they match the `tests:coverage` gate.

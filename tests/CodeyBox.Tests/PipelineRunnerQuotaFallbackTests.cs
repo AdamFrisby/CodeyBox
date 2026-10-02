@@ -2374,14 +2374,40 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var mergeStarted = WaitForPhaseStart("merge", fix.Codex, fix.Claude);
         var fallbackMergeStarted = WaitForAgentPhaseStart(AgentKind.Claude, "merge", fix.Codex, fix.Claude);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
-        await WaitForPhaseStartAsync("merge", mergeStarted, pipelineTask);
-        await RunWithAdvancingTimeUntilAsync(
-            fallbackMergeStarted,
-            pipelineTask,
+        await WaitForPhaseStartAsync("merge", mergeStarted, pipelineTask, TimeSpan.FromSeconds(60));
+        // Advance manual time only until Codex's per-attempt merge timeout has
+        // fired, then STOP. Each fallback attempt arms a fresh manual-time
+        // budget (item.MergeTimeout) at dispatch, but before Claude's runner is
+        // invoked the merge phase repeats its real-time host work — merge-tree
+        // compute, isolated-repo clone, sandbox spawn, in-sandbox conflict
+        // reproduction. Advancing manual time throughout that real work lets
+        // the manual clock outrun it (~10x) and burns Claude's attempt budget
+        // before his resolver starts, so under audit load the pipeline fails
+        // the item before fallbackMergeStarted can fire. Once advancing stops,
+        // Claude's attempt timer can never elapse and his dispatch is bounded
+        // purely by the real-time waits below.
+        await AdvanceManualTimeToElapsedAsync(
             time,
+            TimeSpan.FromSeconds(15),
+            pipelineTask,
             step: TimeSpan.FromMilliseconds(100),
             maxSteps: 200);
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
+        var fallbackReached = await Task.WhenAny(
+            fallbackMergeStarted,
+            pipelineTask,
+            Task.Delay(TimeSpan.FromSeconds(60)));
+        if (fallbackReached != fallbackMergeStarted)
+        {
+            var ended = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+            var hist = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+            if (fallbackReached == pipelineTask)
+                await pipelineTask;
+            throw new InvalidOperationException(
+                $"merge fallback to claude did not start within the real-time window: " +
+                $"state={ended?.State} err={ended?.LastError} " +
+                $"hist=[{string.Join(", ", hist.Select(h => $"{h.Phase}:{h.FromAgent}->{h.ToAgent}:{h.Reason}"))}]");
+        }
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(60));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -2871,9 +2897,16 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     private static Task WaitForReworkStartAsync(Task reworkStarted, Task pipelineTask) =>
         WaitForPhaseStartAsync("rework", reworkStarted, pipelineTask);
 
-    private static async Task WaitForPhaseStartAsync(string phase, Task phaseStarted, Task pipelineTask)
+    private static async Task WaitForPhaseStartAsync(
+        string phase,
+        Task phaseStarted,
+        Task pipelineTask,
+        TimeSpan? timeout = null)
     {
-        var completed = await Task.WhenAny(phaseStarted, pipelineTask, Task.Delay(TimeSpan.FromSeconds(10)));
+        var completed = await Task.WhenAny(
+            phaseStarted,
+            pipelineTask,
+            Task.Delay(timeout ?? TimeSpan.FromSeconds(10)));
         if (completed == phaseStarted)
             return;
         if (completed == pipelineTask)
