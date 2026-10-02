@@ -120,7 +120,7 @@
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.DaytonaSandboxPlugin\CodeyBox.DaytonaSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.BoxLiteSandboxPlugin\CodeyBox.BoxLiteSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Majordomo\CodeyBox.Majordomo.csproj" />
-    <ProjectReference Include="..\..\plugins\CodeyBox.RunloopPlugin\CodeyBox.RunloopPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.RunloopPlugin\CodeyBox.RunloopPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <!--
       Build dependency only: ensures CodeyBox.PluginSdk.SampleTests is compiled

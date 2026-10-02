@@ -750,7 +750,7 @@ Sandboxes run as Runloop Devboxes (hosted Linux VMs with disk snapshots and
 suspend/resume), contributed as a sandbox provider kind through the plugin
 trust model — off unless the operator allowlists **and** enables
 `codeybox.runloop`. Full operator reference lives in
-[`plugins/CodeyBox.RunloopPlugin/README.md`](../../plugins/CodeyBox.RunloopPlugin/README.md):
+[`plugins/sandbox/CodeyBox.RunloopPlugin/README.md`](../../plugins/sandbox/CodeyBox.RunloopPlugin/README.md):
 what to configure, what it costs, and what it cannot do.
 
 The posture mirrors `sprites` (hosted guest, staged mounts, provider-owned
