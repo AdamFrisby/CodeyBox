@@ -308,7 +308,10 @@ internal static class SuggestionEndpoints
         s.CreatedAt,
         s.State,
         s.DismissReason,
-        s.PromotedToWorkItemId);
+        s.PromotedToWorkItemId,
+        s.OccurrenceCount,
+        s.SourceWorkItemIds.ToList(),
+        s.DismissedAt);
 }
 
 public sealed record PatchSuggestionRequest(
@@ -337,7 +340,10 @@ public sealed record SuggestionDto(
     DateTimeOffset CreatedAt,
     string State,
     string? DismissReason,
-    string? PromotedToWorkItemId);
+    string? PromotedToWorkItemId,
+    int OccurrenceCount,
+    IReadOnlyList<string> SourceWorkItemIds,
+    DateTimeOffset? DismissedAt);
 
 internal sealed record PromoteResponse(string WorkItemId, SuggestionDto Suggestion);
 

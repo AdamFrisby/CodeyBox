@@ -260,6 +260,21 @@ The badge shows the number of open suggestions. Use the **Category** and
 Click a suggestion title to view its full rationale and the source work item it
 came from.
 
+#### Duplicate reports
+
+Agents often re-raise the same finding from different work items. At pickup
+the orchestrator merges repeats into one row instead of creating duplicates:
+it computes a normalized dedupe key (category + sorted referenced files +
+lower-cased, punctuation- and stop-word-stripped title) and fuzzy-matches it
+against open suggestions and suggestions dismissed within
+`SuggestionDedupeDismissedMatchWindow` (default 30 days). A repeat bumps the
+suggestion's occurrence count and records the new source work item id (bounded
+by `SuggestionDedupeMaxRecordedSources`); a dismissed suggestion stays
+dismissed. The similarity bar is `SuggestionDedupeSimilarityThreshold`
+(default 0.6). All three knobs live under `CodeyBox:PipelineTuning` and
+hot-reload. The list shows a `×N` badge and the detail page lists every
+raising work item, so frequently re-raised items stand out.
+
 #### Promoting a suggestion
 
 Promoting turns a suggestion into a queued work item. On the suggestion detail

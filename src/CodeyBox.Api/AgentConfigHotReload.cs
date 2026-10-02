@@ -1624,6 +1624,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.SelfReviewChecklistEnabled,
                 opts.PlannedItemAuditRebalanceEnabled,
                 PlannedItemAdvisoryAuditors = opts.PlannedItemAdvisoryAuditors.ToArray(),
+                opts.SuggestionDedupeSimilarityThreshold,
+                SuggestionDedupeDismissedMatchWindowSeconds = opts.SuggestionDedupeDismissedMatchWindow.TotalSeconds,
+                opts.SuggestionDedupeMaxRecordedSources,
             },
             JsonOpts);
 

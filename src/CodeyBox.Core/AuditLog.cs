@@ -1135,6 +1135,11 @@ public static class AuditLog
             .Information("Suggestion {SuggestionId} created from work item {SourceWorkItemId} in project {ProjectId}",
                 suggestionId, sourceWorkItemId, projectId);
 
+    public static void SuggestionMerged(string suggestionId, string sourceWorkItemId, int occurrenceCount) =>
+        Audit("suggestion.merged")
+            .Information("Suggestion {SuggestionId} re-raised by work item {SourceWorkItemId}; merged into existing suggestion (occurrence {OccurrenceCount})",
+                suggestionId, sourceWorkItemId, occurrenceCount);
+
     public static void SuggestionPromoted(string suggestionId, string newWorkItemId) =>
         Audit("suggestion.promoted")
             .Information("Suggestion {SuggestionId} promoted to work item {WorkItemId}",

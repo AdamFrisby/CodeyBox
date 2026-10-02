@@ -192,6 +192,16 @@ internal sealed class QuestionsSuggestionsParker
         var entries = SuggestionsFileParser.Parse(rawJson, _log);
         if (entries.Count == 0) return;
 
+        // Dedupe knobs hot-reload with the rest of PipelineTuning; snapshot
+        // once per pickup so every entry in the batch sees the same policy.
+        var tuning = _pipelineTuning.Current;
+        var policy = new SuggestionDedupePolicy
+        {
+            SimilarityThreshold = tuning.SuggestionDedupeSimilarityThreshold,
+            DismissedMatchWindow = tuning.SuggestionDedupeDismissedMatchWindow,
+            MaxRecordedSourceIds = tuning.SuggestionDedupeMaxRecordedSources,
+        };
+
         foreach (var entry in entries)
         {
             var suggestion = new Suggestion
@@ -210,7 +220,23 @@ internal sealed class QuestionsSuggestionsParker
 
             try
             {
-                await _suggestions.CreateAsync(suggestion, ct);
+                var outcome = await _suggestions.CreateOrMergeAsync(suggestion, policy, ct);
+                if (outcome.Merged)
+                {
+                    // A repeat of a finding already on file: the canonical row's
+                    // count and sources were bumped. No new suggestion exists, so
+                    // no work_item.suggestion webhook fires — the event contract
+                    // is one notification per new suggestion row. The merge is
+                    // still visible via the audit log and the occurrence count.
+                    AuditLog.SuggestionMerged(
+                        outcome.Suggestion.Id, item.Id.ToString(), outcome.Suggestion.OccurrenceCount);
+                    _log.LogInformation(
+                        "Suggestion from work item {WorkItemId} merged into existing suggestion {SuggestionId} (occurrence {Count}): {Title}",
+                        item.Id, outcome.Suggestion.Id, outcome.Suggestion.OccurrenceCount,
+                        suggestion.Title.ReplaceLineEndings(" "));
+                    continue;
+                }
+
                 AuditLog.SuggestionCreated(suggestion.Id, suggestion.SourceWorkItemId, suggestion.ProjectId);
                 _log.LogInformation(
                     "Suggestion {SuggestionId} persisted from work item {WorkItemId}: {Title}",

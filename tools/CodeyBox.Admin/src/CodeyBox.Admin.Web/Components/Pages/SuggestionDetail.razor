@@ -22,6 +22,10 @@ else if (_suggestion is not null)
         <span>effort: @_suggestion.EstimatedEffort</span>
         <span>project: @_suggestion.ProjectId</span>
         <span>from: <a href="/work-items/@_suggestion.SourceWorkItemId">@_suggestion.ShortWorkItemId</a> <CopyableId Value="@_suggestion.SourceWorkItemId" CopyButtonOnly="true" />@(_sourceExternalId is not null ? $" ({_sourceExternalId})" : "")</span>
+        @if (_suggestion.OccurrenceCount > 1)
+        {
+            <span>raised @_suggestion.OccurrenceCount times</span>
+        }
         <span title="@AdminFormat.FormatDateTime(_suggestion.CreatedAt)">@AdminFormat.FormatRelative(_suggestion.CreatedAt, DateTimeOffset.UtcNow)</span>
         <StatusChip Info="@StatusVocabulary.ForSuggestion(_suggestion.State)" />
     </div>
@@ -36,6 +40,17 @@ else if (_suggestion is not null)
             @foreach (var f in _suggestion.FilesReferenced)
             {
                 <li><code>@f</code></li>
+            }
+        </ul>
+    }
+
+    @if (_suggestion.SourceWorkItemIds.Count > 1)
+    {
+        <h2>Raised by</h2>
+        <ul>
+            @foreach (var wi in _suggestion.SourceWorkItemIds)
+            {
+                <li><a href="/work-items/@wi">@(wi.Length >= 8 ? wi[..8] : wi)</a> <CopyableId Value="@wi" CopyButtonOnly="true" /></li>
             }
         </ul>
     }

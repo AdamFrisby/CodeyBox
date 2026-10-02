@@ -17,6 +17,11 @@ public sealed class SuggestionDto
     public string State { get; set; } = "open";
     public string? DismissReason { get; set; }
     public string? PromotedToWorkItemId { get; set; }
+    /// <summary>How many times the finding has been raised; repeats merge into one row.</summary>
+    public int OccurrenceCount { get; set; } = 1;
+    /// <summary>Every work item that raised this finding, oldest first (bounded by the server's dedupe cap).</summary>
+    public List<string> SourceWorkItemIds { get; set; } = [];
+    public DateTimeOffset? DismissedAt { get; set; }
 
     public string ShortWorkItemId => SourceWorkItemId.Length >= 8 ? SourceWorkItemId[..8] : SourceWorkItemId;
 

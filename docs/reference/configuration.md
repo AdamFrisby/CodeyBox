@@ -521,6 +521,9 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 | `CSharpTestPassAuditorIdleTimeout` | unset | Test-runner-specific idle guard for the `csharp:test-pass` (dotnet test) auditor, applied in place of `AuditorIdleTimeout`. Sourced through `DotnetTestAuditor` (an `ITestRunnerAuditor`). Unset means the generic `AuditorIdleTimeout` applies. |
 | `CSharpTestPassBlameHangTimeout` | unset | Per-test hang-dump timeout injected into the `csharp:test-pass` command as `--blame-hang --blame-hang-timeout`. Unset omits blame-hang, keeping the command byte-identical to the legacy path. |
 | `DefaultRateLimitPause` | `00:05:00` (5 min) | Last-resort pause for transient provider rate limits (429) with no parseable reset window and no `Retry-After` echo. Hot-reloadable. Separate from the pause applied to spent account caps, because a throughput limit clears far sooner than a billing window. |
+| `SuggestionDedupeSimilarityThreshold` | `0.6` | Minimum Jaccard similarity over a suggestion's normalized token signature (lower-cased, punctuation- and stop-word-stripped title tokens plus normalized file paths) for a repeat to merge into an existing row instead of creating a duplicate. Must be in (0, 1]. Hot-reloadable. |
+| `SuggestionDedupeDismissedMatchWindow` | `30.00:00:00` (30 days) | How far back a dismissed suggestion still attracts repeats: a matching suggestion dismissed within this window bumps its occurrence count instead of spawning a new row (the dismissal sticks). Open suggestions always match. Hot-reloadable. |
+| `SuggestionDedupeMaxRecordedSources` | `25` | Cap on the source work-item id list recorded on a merged suggestion. Once full, repeats still bump the occurrence count but stop appending ids. Must be ≥ 1. Hot-reloadable. |
 
 Durable agent-turn scratchpad archives have a non-configurable 32 MiB safety
 cap. They are stored as content-verified, host-private SQLite BLOBs and are

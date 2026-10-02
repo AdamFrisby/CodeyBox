@@ -2,7 +2,27 @@ namespace CodeyBox.Core;
 
 public interface ISuggestionStore
 {
+    /// <summary>
+    /// Unconditional insert. Used by seeding and tests; production suggestion
+    /// pickup calls <see cref="CreateOrMergeAsync"/> so agent-filed repeats
+    /// converge on one canonical row.
+    /// </summary>
     Task CreateAsync(Suggestion suggestion, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically inserts <paramref name="suggestion"/>, or — when its
+    /// normalized dedupe key or fuzzy signature matches an open suggestion or
+    /// one dismissed within <paramref name="policy"/>'s window — merges into
+    /// the existing row: <see cref="Suggestion.OccurrenceCount"/> is
+    /// incremented and the new source work item id appended (bounded by
+    /// <see cref="SuggestionDedupePolicy.MaxRecordedSourceIds"/>). A matched
+    /// row keeps its state; merging a repeat of a dismissed suggestion leaves
+    /// it dismissed.
+    /// </summary>
+    Task<SuggestionCreateOutcome> CreateOrMergeAsync(
+        Suggestion suggestion,
+        SuggestionDedupePolicy policy,
+        CancellationToken ct = default);
     Task<Suggestion?> GetAsync(string id, CancellationToken ct = default);
     Task UpdateAsync(Suggestion suggestion, CancellationToken ct = default);
 
