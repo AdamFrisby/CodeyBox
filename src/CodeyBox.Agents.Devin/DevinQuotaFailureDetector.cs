@@ -121,7 +121,7 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     /// <c>CodeyBox:ProviderTransientSignatures:devin</c> are appended at
     /// detect time via <see cref="ProviderTransientSignatureStore"/>.
     /// </summary>
-    private static readonly (Regex Pattern, ProviderTransientKind Kind, string Signature)[] DevinTransientSignatures =
+    private static readonly AgentTransientSignature[] DevinTransientSignatures =
     [
         new(
             new Regex(
@@ -133,67 +133,5 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     ];
 
     public ProviderTransientDetection? DetectProviderTransient(string? stderr, string? stdout, string? summary)
-    {
-        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
-            return null;
-
-        try
-        {
-            foreach (var (pattern, kind, signature) in DevinTransientSignatures)
-            {
-                if (ProviderTransientMatcher.IsMatch(pattern, stderr)
-                    || ProviderTransientMatcher.IsMatch(pattern, stdout)
-                    || ProviderTransientMatcher.IsMatch(pattern, summary))
-                    return new ProviderTransientDetection(kind, signature, DetailFor(kind));
-            }
-
-            foreach (var text in (string?[])[stderr, stdout, summary])
-            {
-                var capacity = ProviderTransientModelSignatures.MatchFirst(text);
-                if (capacity is not null)
-                    return new ProviderTransientDetection(
-                        ProviderTransientKind.ModelCapacity,
-                        capacity,
-                        DetailFor(ProviderTransientKind.ModelCapacity));
-
-                var truncation = ProviderTransientTruncationSignatures.MatchFirst(text);
-                if (truncation is not null)
-                    return new ProviderTransientDetection(
-                        ProviderTransientKind.OutputTruncation,
-                        truncation,
-                        DetailFor(ProviderTransientKind.OutputTruncation));
-
-                var transport = ProviderTransientTransportSignatures.MatchFirst(text);
-                if (transport is not null)
-                    return new ProviderTransientDetection(
-                        ProviderTransientKind.InfraTransport,
-                        transport,
-                        DetailFor(ProviderTransientKind.InfraTransport));
-            }
-
-            foreach (var extra in ProviderTransientSignatureStore.GetAgentSignatures(Kind.Value))
-            {
-                if (ProviderTransientMatcher.IsMatch(extra.Pattern, stderr)
-                    || ProviderTransientMatcher.IsMatch(extra.Pattern, stdout)
-                    || ProviderTransientMatcher.IsMatch(extra.Pattern, summary))
-                    return new ProviderTransientDetection(extra.Kind, extra.Source, DetailFor(extra.Kind));
-            }
-
-            return null;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-    }
-
-    private static string DetailFor(ProviderTransientKind kind) => kind switch
-    {
-        ProviderTransientKind.ModelCapacity =>
-            "provider reported model capacity exhaustion; retry the same agent and model with backoff, never a different model",
-        ProviderTransientKind.OutputTruncation =>
-            "model hit its output-token limit; resume the same session with a bounded continue nudge",
-        _ =>
-            "transport/upstream blip after the CLI's own retries; retry the turn, resuming the session where supported",
-    };
+        => ProviderTransientDetectorCore.Detect(Kind.Value, stderr, stdout, summary, DevinTransientSignatures);
 }

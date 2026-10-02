@@ -402,6 +402,45 @@ Built-in cursor defaults already cover the observed exhaustion stderr
 (`out of usage`, `Switch to Auto`, `increase your limit`) — the config hook is
 for follow-on shapes that surface before a code release can land.
 
+### Adding provider-transient signatures
+
+`CodeyBox:ProviderTransientSignatures` lets operators append per-agent exact
+signatures for provider-side transient conditions — model capacity /
+overload, output-token truncation, transport or upstream 5xx after the CLI's
+own retries — without recompiling. Each key is an agent kind value; each entry
+is `{ pattern, kind }` where `pattern` is a .NET regular expression matched
+case-insensitively against stderr, stdout, and the summary, and `kind` is one
+of `ModelCapacity`, `OutputTruncation`, `InfraTransport`:
+
+```json
+"CodeyBox": {
+  "ProviderTransientSignatures": {
+    "devin": [
+      { "pattern": "serving model .* at capacity", "kind": "ModelCapacity" }
+    ]
+  }
+}
+```
+
+Patterns must name a multi-token provider diagnostic — never a bare word or
+status code — so model prose cannot match, and must not cover the CLI's
+outcome-neutral `retried N times` wrapper, which also prefixes genuine quota
+(429) refusals that must keep reaching the quota path. Invalid entries reject
+the configuration change and keep the prior table; edits to valid entries
+take effect without a restart.
+
+A matched turn never fails terminally and never takes quota failover (which
+could switch models): the work branch and any partial commits are
+checkpointed, and the item parks for bounded transient retry on the same
+agent and model id with the existing backoff-with-jitter budget. When the
+same signature hits several agents inside
+`CodeyBox:PipelineTuning:ProviderTransientCorrelationWindow` (default 5
+minutes, threshold
+`CodeyBox:PipelineTuning:ProviderTransientCorrelationThreshold`, default 2
+agents), the cause is treated as host/network-level and dispatch holds new
+spawns for `CodeyBox:PipelineTuning:ProviderTransientDispatchPause`
+(default 2 minutes) instead of burning every item's retry budget.
+
 ### Adding login-prompt patterns
 
 `CodeyBox:AuthFailurePatterns` lets operators append per-agent stdout/stderr

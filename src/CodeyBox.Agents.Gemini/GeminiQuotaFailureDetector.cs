@@ -109,4 +109,15 @@ public sealed class GeminiQuotaFailureDetector : IAgentQuotaFailureDetector
     {
         if (!string.IsNullOrEmpty(value)) list.Add(value);
     }
+
+    /// <summary>
+    /// Provider-side transient signatures for this agent (model capacity,
+    /// output truncation, transport/upstream blips). Shares the exact-match
+    /// evaluation in <see cref="ProviderTransientDetectorCore"/> with every
+    /// other agent detector; operator extras from
+    /// <c>CodeyBox:ProviderTransientSignatures</c> (keyed by this agent's
+    /// kind) are appended at detect time. Never throws.
+    /// </summary>
+    public ProviderTransientDetection? DetectProviderTransient(string? stderr, string? stdout, string? summary)
+        => ProviderTransientDetectorCore.Detect(Kind.Value, stderr, stdout, summary);
 }

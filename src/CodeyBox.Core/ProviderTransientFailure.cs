@@ -174,6 +174,40 @@ public static class ProviderTransientSignatureStore
         return _byAgent.TryGetValue(agent, out var entries) ? entries : [];
     }
 
+    /// <summary>
+    /// Replaces the whole operator-signature table from configuration (hot
+    /// reload). Agents absent from <paramref name="byAgent"/> lose their
+    /// operator entries; entries that are empty, overlong, or do not compile
+    /// are rejected. Throws <see cref="ArgumentException"/> identifying the
+    /// first offending agent so config validation fails loudly; detection
+    /// itself never observes the failure. Never leaves a partial table: the
+    /// live store is swapped only after every agent compiles cleanly.
+    /// </summary>
+    public static void SyncAgents(IReadOnlyDictionary<string, IEnumerable<ProviderTransientSignature>?>? byAgent)
+    {
+        if (byAgent is null || byAgent.Count == 0)
+        {
+            _byAgent.Clear();
+            return;
+        }
+
+        var staged = new Dictionary<string, ProviderTransientCompiledSignature[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (agent, signatures) in byAgent)
+        {
+            if (string.IsNullOrWhiteSpace(agent))
+                throw new ArgumentException(
+                    "ProviderTransientSignatures: agent key must not be empty.",
+                    nameof(byAgent));
+            var compiled = Compile(agent, signatures);
+            if (compiled.Length > 0)
+                staged[agent] = compiled;
+        }
+
+        _byAgent.Clear();
+        foreach (var (agent, compiled) in staged)
+            _byAgent[agent] = compiled;
+    }
+
     internal static ProviderTransientCompiledSignature[] Compile(
         string agent,
         IEnumerable<ProviderTransientSignature>? signatures)

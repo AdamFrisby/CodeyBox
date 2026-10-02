@@ -123,6 +123,23 @@ public sealed partial class PipelineRunner
             _log.LogWarning("Work item {Id} check-and-act hit transient transport failure: {Error}", item.Id, ex.Message);
             await TransitionWaitingForTransientRetryAsync(item, ex, project);
         }
+        catch (ProviderTransientRetryException ex)
+        {
+            // Provider-side transient (model capacity, output truncation,
+            // transport/upstream blip after the CLI's own retries): park for
+            // bounded transient retry on the same agent and model — never a
+            // terminal check failure.
+            _log.LogWarning(
+                "Work item {Id} check-and-act hit provider-transient failure: kind={Kind} signature={Signature} error={Error}",
+                item.Id, ex.Detection.Kind, ex.Detection.MatchedSignature, ex.Message);
+            await TransitionWaitingForTransientRetryAsync(
+                item,
+                ex.Message,
+                project,
+                ex.Phase,
+                ex.Agent,
+                ProviderTransientRetryPolicy.ParkedFailureKind);
+        }
         catch (AgentAuthRequiredException authEx)
         {
             // TerminalFailureClassifier treats AuthRequired as Deterministic

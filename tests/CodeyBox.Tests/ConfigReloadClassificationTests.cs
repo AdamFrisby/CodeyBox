@@ -532,6 +532,18 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.EarlyEndedTurnMaxNudges):
                 opts.EarlyEndedTurnMaxNudges += 100;
                 break;
+            case nameof(PipelineTuningOptions.ProviderTransientTruncationMaxNudges):
+                opts.ProviderTransientTruncationMaxNudges += 100;
+                break;
+            case nameof(PipelineTuningOptions.ProviderTransientCorrelationWindow):
+                opts.ProviderTransientCorrelationWindow += TimeSpan.FromHours(1);
+                break;
+            case nameof(PipelineTuningOptions.ProviderTransientCorrelationThreshold):
+                opts.ProviderTransientCorrelationThreshold += 100;
+                break;
+            case nameof(PipelineTuningOptions.ProviderTransientDispatchPause):
+                opts.ProviderTransientDispatchPause += TimeSpan.FromHours(1);
+                break;
             case nameof(PipelineTuningOptions.AuditorIdleTimeout):
                 opts.AuditorIdleTimeout += TimeSpan.FromHours(1);
                 break;

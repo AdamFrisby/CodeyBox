@@ -52,6 +52,19 @@ public interface IQuotaFailureClassifier
     QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout);
 
     QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout);
+
+    /// <summary>
+    /// Returns the provider-side transient family when the captured streams
+    /// carry one of the agent's exact transient signatures (model capacity,
+    /// output truncation, transport/upstream blip), or null when nothing
+    /// matches. The default implementation returns null; the composite
+    /// dispatches to the per-agent detector seam. Must never throw.
+    /// </summary>
+    ProviderTransientDetection? DetectProviderTransient(
+        AgentKind agent,
+        string? stderr,
+        string? stdout,
+        string? summary = null) => null;
 }
 
 /// <summary>

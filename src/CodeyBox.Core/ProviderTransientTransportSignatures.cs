@@ -14,9 +14,12 @@ namespace CodeyBox.Core;
 /// network concept cannot match. Verified against the September 2026 host
 /// blip that hit copilot and devin at the same instant
 /// (<c>Error: websocket: close 1006 (abnormal closure): unexpected EOF</c>)
-/// and the Copilot CLI's own-retries-exhausted shape
-/// (<c>Failed to get response from the AI model; retried 5 times … Last
-/// error: 504 Upstream response was not valid JSON</c>).</para>
+/// and the Copilot CLI's upstream-5xx shape
+/// (<c>… Last error: 504 Upstream response was not valid JSON</c>).
+/// Deliberately NOT matched: the CLI's outcome-neutral
+/// <c>Failed to get response … retried N times</c> wrapper, which also
+/// prefixes genuine quota (429) refusals that must keep reaching the quota
+/// path — only the underlying transport condition classifies.</para>
 /// </summary>
 public static class ProviderTransientTransportSignatures
 {
@@ -64,12 +67,6 @@ public static class ProviderTransientTransportSignatures
                 RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant,
                 ProviderTransientMatcher.MatchTimeout),
             "upstream-5xx-invalid"),
-        new(
-            new Regex(
-                @"failed to get response from the ai model.{0,200}retried \d+ times",
-                RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant,
-                ProviderTransientMatcher.MatchTimeout),
-            "cli-retries-exhausted"),
     ];
 
     /// <summary>
