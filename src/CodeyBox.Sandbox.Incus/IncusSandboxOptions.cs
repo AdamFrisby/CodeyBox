@@ -61,6 +61,10 @@ public sealed record IncusSandboxOptions
     /// <summary>Every effective mount root plus the provider-owned staging root.</summary>
     public const int MaximumRestrictedProjectRoots = MaximumEffectiveHostPathEntries + 1;
     public const int MaximumExecRetryAttempts = 100;
+    /// <summary>Maximum entries in the transient-infrastructure signature allowlist.</summary>
+    public const int MaximumTransientInfrastructureSignatures = 32;
+    /// <summary>Maximum UTF-8 bytes per transient-infrastructure signature.</summary>
+    public const int MaximumTransientInfrastructureSignatureUtf8Bytes = 512;
 
     /// <summary>
     /// Path to an Incus 6.3-or-newer CLI. The recommended Incus 7.0 LTS
@@ -181,6 +185,14 @@ public sealed record IncusSandboxOptions
     /// retries soon after the boot storm clears rather than being parked.
     /// </summary>
     public TimeSpan ProvisioningRetryRecheckIn { get; init; } = DefaultProvisioningRetryRecheckIn;
+    /// <summary>
+    /// Allowlisted exact Incus error signatures classified as transient host
+    /// infrastructure (incusd DB/storage contention, teardown unmount races,
+    /// unverifiable guest control-file cleanup). Only these signatures ever
+    /// match — arbitrary CLI output never does. Hot-reloadable.
+    /// </summary>
+    public IReadOnlyList<string> TransientInfrastructureSignatures { get; init; } =
+        IncusTransientInfrastructure.DefaultSignatures;
     /// <summary>Independent deadline for terminating and draining one Incus CLI process tree.</summary>
     public TimeSpan CliProcessCleanupTimeout { get; init; } = DefaultProcessRunnerOptions.DefaultCleanupTimeout;
     /// <summary>Delay between Linux Incus CLI process-group absence probes during cleanup.</summary>
@@ -345,6 +357,7 @@ public sealed record IncusSandboxOptions
         if (options.MaxReadinessPollInterval < options.ReadinessPollInterval)
             errors.Add($"{nameof(MaxReadinessPollInterval)} must be at least {nameof(ReadinessPollInterval)}.");
         RequirePositiveDuration(options.ProvisioningRetryRecheckIn, nameof(ProvisioningRetryRecheckIn), errors);
+        ValidateTransientInfrastructureSignatures(options, errors);
         try
         {
             DefaultProcessRunnerOptions.Validate(new DefaultProcessRunnerOptions
@@ -938,6 +951,40 @@ public sealed record IncusSandboxOptions
     {
         if (value is < 1 or > MaximumExecRetryAttempts)
             errors.Add($"{name} must be between 1 and {MaximumExecRetryAttempts}.");
+    }
+
+    private static void ValidateTransientInfrastructureSignatures(IncusSandboxOptions options, ICollection<string> errors)
+    {
+        if (options.TransientInfrastructureSignatures is null)
+        {
+            errors.Add($"{nameof(TransientInfrastructureSignatures)} cannot be null.");
+            return;
+        }
+        if (options.TransientInfrastructureSignatures.Count > MaximumTransientInfrastructureSignatures)
+        {
+            errors.Add(
+                $"{nameof(TransientInfrastructureSignatures)} cannot contain more than {MaximumTransientInfrastructureSignatures} entries.");
+            return;
+        }
+        foreach (var signature in options.TransientInfrastructureSignatures)
+        {
+            if (string.IsNullOrWhiteSpace(signature))
+            {
+                errors.Add($"{nameof(TransientInfrastructureSignatures)} cannot contain empty entries.");
+                continue;
+            }
+            if (!TryGetBoundedUtf8ByteCount(
+                    signature,
+                    MaximumTransientInfrastructureSignatureUtf8Bytes,
+                    $"{nameof(TransientInfrastructureSignatures)} entry",
+                    errors,
+                    out _))
+            {
+                continue;
+            }
+            if (signature.Any(char.IsControl))
+                errors.Add($"{nameof(TransientInfrastructureSignatures)} entry cannot contain control characters.");
+        }
     }
 
     internal static bool IsAbsoluteGuestPath(string value)

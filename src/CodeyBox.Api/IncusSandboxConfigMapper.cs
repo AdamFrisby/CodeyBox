@@ -67,6 +67,7 @@ internal static class IncusSandboxConfigMapper
             ReadinessPollInterval = incus.ReadinessPollInterval,
             MaxReadinessPollInterval = incus.MaxReadinessPollInterval,
             ProvisioningRetryRecheckIn = incus.ProvisioningRetryRecheckIn,
+            TransientInfrastructureSignatures = SnapshotTransientInfrastructureSignatures(incus.TransientInfrastructureSignatures),
             CliProcessCleanupTimeout = incus.CliProcessCleanupTimeout,
             CliProcessGroupExitPollInterval = incus.CliProcessGroupExitPollInterval,
             ExecPidPollAttempts = incus.ExecPidPollAttempts,
@@ -141,6 +142,33 @@ internal static class IncusSandboxConfigMapper
             copy.Add(profile, bridge);
         }
         return new ReadOnlyDictionary<string, string>(copy);
+    }
+
+    internal static IReadOnlyList<string> SnapshotTransientInfrastructureSignatures(IEnumerable<string>? signatures)
+    {
+        if (signatures is null)
+            return Array.AsReadOnly(IncusTransientInfrastructure.DefaultSignatures.ToArray());
+        var copy = new List<string>(Math.Min(IncusSandboxOptions.MaximumTransientInfrastructureSignatures, 8));
+        foreach (var candidate in signatures)
+        {
+            if (copy.Count >= IncusSandboxOptions.MaximumTransientInfrastructureSignatures)
+            {
+                throw new InvalidOperationException(
+                    $"Incus:TransientInfrastructureSignatures cannot contain more than {IncusSandboxOptions.MaximumTransientInfrastructureSignatures} entries.");
+            }
+            var signature = candidate
+                ?? throw new InvalidOperationException("Incus:TransientInfrastructureSignatures cannot contain null entries.");
+            if (string.IsNullOrWhiteSpace(signature))
+                throw new InvalidOperationException("Incus:TransientInfrastructureSignatures cannot contain empty entries.");
+            ConfigurationInputBounds.EnsureCharacterBound(
+                signature,
+                IncusSandboxOptions.MaximumTransientInfrastructureSignatureUtf8Bytes,
+                "Incus:TransientInfrastructureSignatures entry");
+            copy.Add(signature);
+        }
+        return copy.Count == 0
+            ? Array.Empty<string>()
+            : Array.AsReadOnly(copy.ToArray());
     }
 
     internal static IReadOnlyList<string> SnapshotExtraRuncmd(IEnumerable<string>? commands)

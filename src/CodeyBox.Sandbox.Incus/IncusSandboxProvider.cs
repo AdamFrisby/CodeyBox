@@ -521,14 +521,17 @@ public sealed class IncusSandboxProvider :
     }
 
     /// <summary>
-    /// Re-shapes a transient Incus liveness timeout (guest-agent readiness or a
-    /// CLI operation deadline that tripped under concurrent boot load) into a
+    /// Re-shapes a transient Incus infrastructure fault — a liveness timeout
+    /// (guest-agent readiness or a CLI operation deadline that tripped under
+    /// concurrent boot load) or an allowlisted transient error signature
+    /// (incusd DB/storage deadline, teardown unmount race, unverifiable guest
+    /// control-file cleanup) — into a
     /// <see cref="SandboxProvisioningDeferredException"/> so the recovery stack
     /// re-enqueues the work item as RETRYABLE transient infrastructure. Without
-    /// this the raw <see cref="IncusTransientTimeoutException"/> would reach the
-    /// orchestrator's catch-all and be stamped as an unclassified failure and
-    /// parked for an operator instead of auto-retried. Returns <c>null</c> for
-    /// any non-transient failure, which is rethrown unchanged.
+    /// this the raw exception would reach the orchestrator's catch-all and be
+    /// stamped as an unclassified failure and parked for an operator instead
+    /// of auto-retried. Returns <c>null</c> for any non-transient failure,
+    /// which is rethrown unchanged.
     /// </summary>
     internal static SandboxProvisioningDeferredException? TryBuildTransientProvisioningDeferral(
         Exception ex,
@@ -537,7 +540,16 @@ public sealed class IncusSandboxProvider :
         ArgumentNullException.ThrowIfNull(ex);
         ArgumentNullException.ThrowIfNull(options);
         if (ex is not IncusTransientTimeoutException transient)
-            return null;
+        {
+            var fault = IncusTransientInfrastructure.TryClassify(ex, options.TransientInfrastructureSignatures);
+            if (fault is null)
+                return null;
+            return fault.ToDeferral(
+                ExtractIncusOperation(ex) ?? "incus-operation",
+                SingleLineDetail(ex),
+                options.ProvisioningRetryRecheckIn,
+                ex);
+        }
         return new SandboxProvisioningDeferredException(
             ProviderId,
             transient.Operation,
@@ -545,6 +557,46 @@ public sealed class IncusSandboxProvider :
             transient.Message,
             options.ProvisioningRetryRecheckIn,
             innerException: ex);
+    }
+
+    /// <summary>
+    /// Best-effort recovery of the incus subcommand name from this provider's
+    /// own <c>Incus {operation} failed with exit code</c> failure shape.
+    /// Returns null for any other shape so callers fall back to a generic
+    /// operation label instead of echoing untrusted output.
+    /// </summary>
+    private static string? ExtractIncusOperation(Exception ex)
+    {
+        const string prefix = "Incus ";
+        const string suffix = " failed with exit code ";
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            var message = current.Message;
+            if (string.IsNullOrEmpty(message) || message.Length > 512)
+                continue;
+            if (!message.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+            var end = message.IndexOf(suffix, StringComparison.Ordinal);
+            if (end <= prefix.Length || end - prefix.Length > 128)
+                continue;
+            var operation = message.Substring(prefix.Length, end - prefix.Length).Trim();
+            if (string.IsNullOrWhiteSpace(operation) || operation.Any(char.IsControl))
+                return null;
+            return operation;
+        }
+        return null;
+    }
+
+    private static string SingleLineDetail(Exception ex)
+    {
+        const int maxChars = 1024;
+        var message = ex.Message ?? string.Empty;
+        if (message.Length > maxChars)
+            message = message.Substring(0, maxChars);
+        var builder = new System.Text.StringBuilder(message.Length);
+        foreach (var c in message)
+            builder.Append(char.IsControl(c) ? ' ' : c);
+        return builder.ToString().Trim();
     }
 
     private async Task<ISandbox> AdoptRetainedSandboxAsync(

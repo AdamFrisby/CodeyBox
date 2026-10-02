@@ -149,6 +149,14 @@ internal static class IncusInputSnapshot
                     static path => path
                         ?? throw new ArgumentException("DiskGuard host paths cannot contain null entries.", nameof(IncusDiskGuardOptions.HostPaths))),
             };
+        var transientSignatures = SnapshotList(
+            source.TransientInfrastructureSignatures
+                ?? throw new ArgumentException("Transient infrastructure signatures cannot be null.", nameof(IncusSandboxOptions.TransientInfrastructureSignatures)),
+            IncusSandboxOptions.MaximumTransientInfrastructureSignatures,
+            nameof(IncusSandboxOptions.TransientInfrastructureSignatures),
+            static signature => string.IsNullOrWhiteSpace(signature)
+                ? throw new ArgumentException("Transient infrastructure signatures cannot contain empty entries.", nameof(IncusSandboxOptions.TransientInfrastructureSignatures))
+                : signature);
         return source with
         {
             NetworkProfiles = networkProfiles,
@@ -158,6 +166,7 @@ internal static class IncusInputSnapshot
             ExecutableProvisions = executableProvisions,
             BaselineVerificationCommands = verificationCommands,
             DiskGuard = snappedDiskGuard,
+            TransientInfrastructureSignatures = transientSignatures,
         };
     }
 

@@ -6509,6 +6509,9 @@ namespace CodeyBox.Api
         /// <summary>Delay before the recovery stack re-attempts a sandbox creation deferred because an Incus liveness deadline tripped under concurrent boot load.</summary>
         public TimeSpan ProvisioningRetryRecheckIn { get; set; } = Defaults.ProvisioningRetryRecheckIn;
 
+        /// <summary>Allowlisted exact Incus error signatures classified as transient host infrastructure. Hot-reloadable.</summary>
+        public List<string> TransientInfrastructureSignatures { get; set; } = [.. Defaults.TransientInfrastructureSignatures];
+
         /// <summary>Independent deadline for terminating and draining one Incus CLI process tree.</summary>
         public TimeSpan CliProcessCleanupTimeout { get; set; } = Defaults.CliProcessCleanupTimeout;
 

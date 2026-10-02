@@ -236,6 +236,51 @@ public sealed class IncusTeardownResilienceTests
         }
     }
 
+    [Fact]
+    public async Task SandboxDispose_TransientUnmountFailure_HandsToReaperWithoutThrow()
+    {
+        // The evidence-shaped teardown race: `delete --force` fails stopping
+        // the instance because the storage-pool unmount is busy, while the VM
+        // is still present. Disposal must not throw — the work result is
+        // already determined — and the handle must release active tracking so
+        // the leak reaper's disposal retry may reclaim the VM and staging.
+        const string sandboxName = "codeybox-dispose-transient-unmount";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-dispose-transient-{Guid.NewGuid():N}");
+        var inactive = 0;
+        const string unmountStderr =
+            "Error: Stopping the instance codeybox-dispose-transient-unmount failed: " +
+            "Failed unmounting instance: Failed to unmount " +
+            "\"/var/lib/incus/storage-pools/codeybox\" on \"/var/lib/incus/storage-pools/codeybox\": device busy";
+        var runner = new TeardownScriptRunner(
+            onConfigSet: static () => new ProcessRunResult(0, string.Empty, string.Empty),
+            onStop: static _ => new ProcessRunResult(0, string.Empty, string.Empty),
+            onList: () => new ProcessRunResult(0, OwnedInstanceJson(sandboxName, "RUNNING"), string.Empty),
+            onDelete: static _ => new ProcessRunResult(1, string.Empty, unmountStderr));
+        var sandbox = CreateTeardownSandbox(sandboxName, root, runner, name => Interlocked.Increment(ref inactive), out var binding);
+        runner.SetRecoveryBinding(binding.TokenHash, binding.ManifestHash);
+        SandboxLiveCounter.Increment();
+
+        try
+        {
+            await sandbox.DisposeAsync();
+
+            Assert.Equal(1, Volatile.Read(ref inactive));
+            Assert.True(Directory.Exists(Path.Combine(root, sandboxName)));
+            Assert.Contains(runner.Commands, command => command.Contains("delete", StringComparer.Ordinal));
+
+            await sandbox.DisposeAsync();
+
+            Assert.Equal(1, Volatile.Read(ref inactive));
+        }
+        finally
+        {
+            if (Volatile.Read(ref inactive) == 0)
+                SandboxLiveCounter.Decrement();
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static IncusSandboxOptions StopProbeOptions() => new()
     {
         StagingDirectory = Path.GetTempPath(),
