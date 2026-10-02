@@ -83,6 +83,13 @@ else
         {
             <tr><th>Push attempts</th><td>@_item.UpstreamPushAttempts</td></tr>
         }
+        @if (_item.MergeAttempts > 0)
+        {
+            <tr><th>Merge retries</th><td>@_item.MergeAttempts@if (_item.MergeRetryReason is not null)
+                {
+                    <span> — @_item.MergeRetryReason</span>
+                }</td></tr>
+        }
         @if (_item.LastError is not null)
         {
             <tr><th>Last error</th><td class="last-error">@_item.LastError</td></tr>

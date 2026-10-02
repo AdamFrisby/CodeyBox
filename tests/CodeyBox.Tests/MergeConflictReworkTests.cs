@@ -929,9 +929,11 @@ public sealed class MergeConflictReworkTests : IDisposable
     /// <c>git reset --hard origin/main</c> mid-iteration (discarding prior
     /// commits), the orchestrator detects that the prior commits are no
     /// longer in the new tip's ancestry and refuses to advance the work
-    /// branch. The item parks at
-    /// <see cref="WorkItemState.MergeConflictResolutionFailed"/> with a
-    /// clear error.
+    /// branch. The guard keeps its teeth but routes to another bounded
+    /// rework turn (briefed with the guard reason) instead of parking
+    /// immediately; only when the <c>MergeGuardReworkMaxAttempts</c> budget
+    /// (default 2) is exhausted does the item park at
+    /// <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
     /// </summary>
     [Fact]
     public async Task ConflictRework_DestructiveActionDiscardsCommits_DetectedAndParked()
@@ -942,15 +944,20 @@ public sealed class MergeConflictReworkTests : IDisposable
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
-        tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
+        // Both rework turns misbehave the same way so the test observes the
+        // full bounded budget: guard trip -> rework -> guard trip -> park.
+        for (var i = 0; i < 2; i++)
         {
-            // Misbehaving agent: aborts the rebase + resets HEAD to main,
-            // throwing away the work commit. The orchestrator's
-            // anti-abandonment check must catch this.
-            await Run(sandbox, "git", "-C", workDir, "rebase", "--abort");
-            await Run(sandbox, "git", "-C", workDir, "reset", "--hard", "origin/main");
-            return new AgentResult(true, "abandoned", null, null);
-        });
+            tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
+            {
+                // Misbehaving agent: aborts the rebase + resets HEAD to main,
+                // throwing away the work commit. The orchestrator's
+                // anti-abandonment check must catch this.
+                await Run(sandbox, "git", "-C", workDir, "rebase", "--abort");
+                await Run(sandbox, "git", "-C", workDir, "reset", "--hard", "origin/main");
+                return new AgentResult(true, "abandoned", null, null);
+            });
+        }
 
         var workBranch = "codeybox/" + WorkItemId.New().ToString()[..8];
         var item = NewItem(workBranch);
@@ -960,8 +967,11 @@ public sealed class MergeConflictReworkTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
-        Assert.Equal(1, final.ConflictReworkAttempts);
+        Assert.Equal(2, final.ConflictReworkAttempts);
         Assert.Contains("discarded prior commits", final.LastError);
+        // The second turn was briefed with the first turn's guard trip.
+        Assert.Equal(2, tp.Agent.ConflictReworkPrompts.Count);
+        Assert.Contains("discarded prior commits", tp.Agent.ConflictReworkPrompts[1], StringComparison.Ordinal);
 
         // The original work branch must still hold the work commits in the
         // bare repo — the destructive action happened in the isolated
@@ -1056,13 +1066,14 @@ public sealed class MergeConflictReworkTests : IDisposable
     }
 
     /// <summary>
-    /// One-iteration cap. Spec acceptance criterion #1 caps the agent at one
-    /// rework engagement per merge attempt. We simulate "the rework already
-    /// happened" by seeding <see cref="WorkItem.ConflictReworkAttempts"/> = 1
-    /// before the pipeline runs; when the merge phase then surfaces a
-    /// conflict, the cap check at the top of the catch block must trip and
-    /// the agent's <see cref="ScriptedAgent.ConflictReworkPlan"/> must NOT be
-    /// dequeued (or the counter bumped a second time).
+    /// Bounded rework budget. The merge phase runs at most
+    /// <c>MergeGuardReworkMaxAttempts</c> conflict-rework turns (default 2)
+    /// before parking. We simulate "the budget is already spent" by seeding
+    /// <see cref="WorkItem.ConflictReworkAttempts"/> at the cap before the
+    /// pipeline runs; when the merge phase then surfaces a conflict, the cap
+    /// check at the top of the catch block must trip and the agent's
+    /// <see cref="ScriptedAgent.ConflictReworkPlan"/> must NOT be dequeued
+    /// (or the counter bumped past the cap).
     /// </summary>
     [Fact]
     public async Task ConflictRework_OneIterationCap_SecondAttemptSkipsAgent()
@@ -1080,7 +1091,7 @@ public sealed class MergeConflictReworkTests : IDisposable
 
         var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]) with
         {
-            ConflictReworkAttempts = 1,
+            ConflictReworkAttempts = 2,
         };
         await tp.Store.CreateAsync(item);
 
@@ -1089,7 +1100,7 @@ public sealed class MergeConflictReworkTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
         // Counter must NOT be bumped: the cap blocked re-engagement.
-        Assert.Equal(1, final.ConflictReworkAttempts);
+        Assert.Equal(2, final.ConflictReworkAttempts);
         // The agent's rework plan was never consulted.
         Assert.Empty(tp.Agent.ConflictReworkPrompts);
     }

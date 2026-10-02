@@ -1516,7 +1516,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             State = WorkItemState.WorkComplete,
             // Skip the third-line conflict-rework fallback so this test only
             // observes the merge resolver's availability classification.
-            ConflictReworkAttempts = 1,
+            // Seeded at the MergeGuardReworkMaxAttempts cap: any lower value
+            // would earn a rework turn instead of parking.
+            ConflictReworkAttempts = 2,
         };
         var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         await CommitToBareBranchAsync(

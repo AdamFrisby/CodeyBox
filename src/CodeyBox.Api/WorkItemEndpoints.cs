@@ -1953,6 +1953,8 @@ internal static class WorkItemEndpoints
             AutoDelegationEscalated: item.AutoDelegationEscalated,
             DelegationFailed: item.DelegationFailed,
             TerminalFailureCount: item.TerminalFailureCount,
+            MergeAttempts: item.MergeAttempts,
+            MergeRetryReason: item.MergeRetryReason,
             Knobs: item.Knobs.Count == 0
                 ? null
                 : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
@@ -2372,6 +2374,9 @@ public sealed record WorkItemDto(
     bool AutoDelegationEscalated = false,
     bool DelegationFailed = false,
     int TerminalFailureCount = 0,
+    int MergeAttempts = 0,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? MergeRetryReason = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyDictionary<string, string>? Knobs = null);
 

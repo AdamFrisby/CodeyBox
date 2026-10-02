@@ -23,6 +23,8 @@ internal sealed class WorkItemDto
     public DateTimeOffset UpdatedAt { get; set; }
     public string? LastError { get; set; }
     public int UpstreamPushAttempts { get; set; }
+    public int MergeAttempts { get; set; }
+    public string? MergeRetryReason { get; set; }
     public List<string> DependsOn { get; set; } = [];
     public bool DependsOnSatisfied { get; set; }
     public Dictionary<string, string?> DependsOnExternalIds { get; set; } = [];

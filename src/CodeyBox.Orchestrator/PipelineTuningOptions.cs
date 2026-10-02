@@ -111,6 +111,33 @@ public sealed class PipelineTuningOptions
     public int AutoMergeRaceRecoveryMaxAttempts { get; set; } = 3;
 
     /// <summary>
+    /// Maximum times a single merge phase re-queues its landing after
+    /// detecting the base branch moved between composition and the
+    /// conditional base-ref update. A base-moved retry re-runs the merge
+    /// against the fresh base WITHOUT consuming the resolver-guard rework
+    /// budget (<see cref="MergeGuardReworkMaxAttempts"/>): motion under a
+    /// serialized landing gate is environmental, not evidence the item's
+    /// own resolution failed. Past the cap the item parks at
+    /// <c>MergeConflictResolutionFailed</c> with the recorded reason so an
+    /// operator can see the base never settled. Default 3. Hot-reloaded
+    /// with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public int MergeLandingMaxAttempts { get; set; } = 3;
+
+    /// <summary>
+    /// Maximum conflict-rework turns the merge phase runs after a resolver
+    /// safety guard fires (edits outside the permitted conflict hunks, or a
+    /// rework that discarded prior commits). Each turn re-engages the work
+    /// agent on the refreshed base with the guard reason in the brief; only
+    /// when the cap is exhausted does the item park at
+    /// <c>MergeConflictResolutionFailed</c>. Bounds the remediation so a
+    /// persistently misbehaving resolver cannot loop unbounded. Values below
+    /// 1 are treated as 1. Default 2. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>.
+    /// </summary>
+    public int MergeGuardReworkMaxAttempts { get; set; } = 2;
+
+    /// <summary>
     /// Whether to keep the same warm VM/sandbox alive across work<->rework cycles.
     /// Default true.
     /// </summary>
@@ -393,6 +420,18 @@ public sealed class PipelineTuningOptions
             throw new ArgumentOutOfRangeException(
                 nameof(EmptyReworkEscalationRetries),
                 "EmptyReworkEscalationRetries must be non-negative");
+        }
+        if (MergeLandingMaxAttempts < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MergeLandingMaxAttempts),
+                "MergeLandingMaxAttempts must be >= 1");
+        }
+        if (MergeGuardReworkMaxAttempts < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MergeGuardReworkMaxAttempts),
+                "MergeGuardReworkMaxAttempts must be >= 1");
         }
         if (EarlyEndedTurnMaxNudges < 0)
         {

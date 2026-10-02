@@ -41,6 +41,8 @@ public static class PipelineTuningHotReloadPolicy
         nameof(PipelineTuningOptions.AgentSessionResumeMaxAttempts),
         nameof(PipelineTuningOptions.MaxRetainedAgentTurnSandboxes),
         nameof(PipelineTuningOptions.AutoMergeRaceRecoveryMaxAttempts),
+        nameof(PipelineTuningOptions.MergeLandingMaxAttempts),
+        nameof(PipelineTuningOptions.MergeGuardReworkMaxAttempts),
         nameof(PipelineTuningOptions.EnableSandboxReuse),
         nameof(PipelineTuningOptions.MaxSandboxReuses),
         nameof(PipelineTuningOptions.MaxSandboxLifetime),

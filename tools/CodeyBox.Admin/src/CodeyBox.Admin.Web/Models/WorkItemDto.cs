@@ -42,6 +42,8 @@ public sealed class WorkItemDto
     public DateTimeOffset? NextTransientRetryAt { get; set; }
     public string? AgentPauseTarget { get; set; }
     public int ConflictReworkAttempts { get; set; }
+    public int MergeAttempts { get; set; }
+    public string? MergeRetryReason { get; set; }
     public int DelegationAttempts { get; set; }
     public List<AgentInvolvementEntryDto>? AgentHistory { get; set; }
     public string? WorkAgent { get; set; }

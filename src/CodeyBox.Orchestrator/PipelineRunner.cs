@@ -831,27 +831,55 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // PhaseCancellation + quota-fallback + stuck-probe wiring.
             async Task<(string MergeSha, string? AgentStdout)> RunMergePhase(CancellationToken phaseCt)
             {
-                using var mergePhase = new PhaseCancellation("merge", phaseCt, _opts.TimeProvider);
-                mergePhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.MergeTimeout));
-                mergePhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
-                try
+                // A base-moved landing (the conditional base-ref update
+                // refused because an out-of-band writer moved the base
+                // mid-merge) re-queues the merge against the fresh base
+                // WITHOUT consuming the resolver-guard rework budget: motion
+                // is environmental, not evidence this item's resolution
+                // failed. Bounded by MergeLandingMaxAttempts; exhaustion
+                // parks with the recorded reason (the merge-section catch
+                // recognises the chained MergeBaseMovedException and skips
+                // the guard-rework turn).
+                var maxLandings = Math.Max(1, _pipelineTuning.Current.MergeLandingMaxAttempts);
+                for (var landing = 1; ; landing++)
                 {
-                    return await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
-                        async (runner, member, trialItem, attemptCt) =>
-                            await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, phaseCt, mergeCt =>
-                                RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
-                                    networkProfile: project.NetworkProfiles.Merge,
-                                    project: project,
-                                    mergeCt,
-                                    hostShutdownToken),
-                                workToken: attemptCt),
-                        phaseCt,
-                        phaseCancellation: mergePhase,
-                        attemptTimeout: item.MergeTimeout);
-                }
-                catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
-                {
-                    throw mergePhase.Wrap(oce);
+                    using var mergePhase = new PhaseCancellation("merge", phaseCt, _opts.TimeProvider);
+                    mergePhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.MergeTimeout));
+                    mergePhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+                    try
+                    {
+                        return await InvokeAgentWithQuotaFallbackAsync(item, project, "merge", iteration: null,
+                            async (runner, member, trialItem, attemptCt) =>
+                                await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "merge", mergePhase, phaseCt, mergeCt =>
+                                    RunAgentMergePhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
+                                        networkProfile: project.NetworkProfiles.Merge,
+                                        project: project,
+                                        mergeCt,
+                                        hostShutdownToken),
+                                    workToken: attemptCt),
+                            phaseCt,
+                            phaseCancellation: mergePhase,
+                            attemptTimeout: item.MergeTimeout);
+                    }
+                    catch (MergeBaseMovedException ex) when (landing < maxLandings)
+                    {
+                        _log.LogWarning(
+                            ex,
+                            "Merge landing base moved for work item {Id} (landing {Landing}/{Max}); re-queueing against the fresh base",
+                            item.Id, landing, maxLandings);
+                        await RecordMergeRetryAsync(item.Id, ex.Message, bumpLandingAttempt: true, ct);
+                    }
+                    catch (MergeBaseMovedException ex)
+                    {
+                        await RecordMergeRetryAsync(item.Id, ex.Message, bumpLandingAttempt: true, ct);
+                        throw new MergeConflictResolutionFailedException(
+                            $"merge landing could not settle base branch '{baseBranch}' after {maxLandings} attempts against a moving base; last: {ex.Message}",
+                            ex);
+                    }
+                    catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+                    {
+                        throw mergePhase.Wrap(oce);
+                    }
                 }
             }
 
@@ -886,43 +914,90 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }
                 catch (MergeConflictResolutionFailedException firstFailure)
                 {
+                    // A base-moved landing exhaustion already retried against
+                    // fresh bases inside the merge phase; a further rework
+                    // turn cannot settle a base that never stops moving, so
+                    // park directly without burning the guard-rework budget.
+                    if (firstFailure.InnerException is MergeBaseMovedException)
+                        throw;
+
                     // Third-line fallback: c9fd5b75 (preventive auto-rebase) and the
                     // merge-phase agent (77ce33c667 on 405 race) have both run their
                     // course. Re-engage the ORIGINAL work agent — who knows why this
                     // PR was written — with a focused conflict-resolution prompt on
-                    // the existing work branch. Capped at one iteration per merge
-                    // attempt; a second failure parks at MergeConflictResolutionFailed.
-                    var current = await _store.GetAsync(item.Id, ct) ?? item;
-                    var conflictReworkAttemptAlreadyReserved =
-                        resumingConflictRework && current.ConflictReworkAttempts > 0;
-                    if (current.ConflictReworkAttempts > 0 && !conflictReworkAttemptAlreadyReserved)
+                    // the existing work branch.
+                    //
+                    // Resolver safety guards (edits outside the permitted
+                    // conflict hunks; a rework that discarded prior commits)
+                    // keep their teeth, but instead of parking they earn a
+                    // bounded number of conflict-rework turns on the refreshed
+                    // base, each briefed with the latest guard reason. Only
+                    // when the MergeGuardReworkMaxAttempts cap is exhausted
+                    // does the item park at MergeConflictResolutionFailed.
+                    var guardCap = Math.Max(1, _pipelineTuning.Current.MergeGuardReworkMaxAttempts);
+                    Exception lastFailure = firstFailure;
+                    // A stale-base router reservation (ReworkingForConflict
+                    // entry) already bumped ConflictReworkAttempts for this
+                    // pickup's first turn; consume that reservation once so
+                    // later turns in the same pickup count toward the cap
+                    // instead of looping unbounded.
+                    var reservationConsumed = false;
+                    while (true)
                     {
-                        _log.LogWarning(
-                            "Work item {Id} merge conflict-rework already ran ({Attempts}); not re-engaging the agent",
-                            item.Id, current.ConflictReworkAttempts);
-                        throw;
-                    }
+                        var current = await _store.GetAsync(item.Id, ct) ?? item;
+                        if (current.ConflictReworkAttempts >= guardCap)
+                        {
+                            _log.LogWarning(
+                                "Work item {Id} exhausted merge guard-rework budget ({Attempts}/{Cap}); parking: {Reason}",
+                                item.Id, current.ConflictReworkAttempts, guardCap, lastFailure.Message);
+                            throw lastFailure as MergeConflictResolutionFailedException
+                                ?? new MergeConflictResolutionFailedException(lastFailure.Message, lastFailure);
+                        }
 
-                    var reworkOutcome = await RunConflictReworkIterationAsync(
-                        current, project, agentRunner, repoId, baseBranch, workBranch,
-                        firstFailure, ct, hostShutdownToken,
-                        countAttempt: !conflictReworkAttemptAlreadyReserved);
-                    if (!reworkOutcome.Success)
-                    {
-                        throw new MergeConflictResolutionFailedException(
-                            reworkOutcome.ParkReason!,
-                            firstFailure,
-                            failureKind: reworkOutcome.FailureKind,
-                            agent: reworkOutcome.Agent);
+                        var attemptAlreadyReserved = !reservationConsumed
+                            && resumingConflictRework
+                            && current.ConflictReworkAttempts > 0;
+                        var guardBrief = lastFailure as MergeConflictResolutionFailedException
+                            ?? new MergeConflictResolutionFailedException(lastFailure.Message, lastFailure);
+                        await RecordMergeRetryAsync(item.Id, guardBrief.Message, bumpLandingAttempt: false, ct);
+                        var reworkOutcome = await RunConflictReworkIterationAsync(
+                            current, project, agentRunner, repoId, baseBranch, workBranch,
+                            guardBrief, ct, hostShutdownToken,
+                            countAttempt: !attemptAlreadyReserved);
+                        reservationConsumed = true;
+                        if (reworkOutcome.Success)
+                        {
+                            // Refresh the local snapshot so subsequent
+                            // UpdateAsync calls (which use UPDATE … SET …
+                            // from a stale `item`) don't clobber the bumped
+                            // ConflictReworkAttempts and the new state
+                            // recorded during the rework iteration.
+                            item = await _store.GetAsync(item.Id, ct) ?? item;
+                            await Transition(item, WorkItemState.Merging, ct, project);
+                            try
+                            {
+                                (mergeSha, agentStdout) = await RunMergePhase(ct);
+                                break;
+                            }
+                            catch (MergeConflictResolutionFailedException next)
+                            {
+                                if (next.InnerException is MergeBaseMovedException)
+                                    throw;
+                                lastFailure = next;
+                            }
+                        }
+                        else
+                        {
+                            var reworkFailure = new MergeConflictResolutionFailedException(
+                                reworkOutcome.ParkReason!,
+                                lastFailure,
+                                failureKind: reworkOutcome.FailureKind,
+                                agent: reworkOutcome.Agent);
+                            if (!MergeScopeFence.IsResolverGuardFailure(reworkFailure))
+                                throw reworkFailure;
+                            lastFailure = reworkFailure;
+                        }
                     }
-
-                    // Refresh the local snapshot so subsequent UpdateAsync
-                    // calls (which use UPDATE … SET … from a stale `item`)
-                    // don't clobber the bumped ConflictReworkAttempts and the
-                    // new state recorded during the rework iteration.
-                    item = await _store.GetAsync(item.Id, ct) ?? item;
-                    await Transition(item, WorkItemState.Merging, ct, project);
-                    (mergeSha, agentStdout) = await RunMergePhase(ct);
                 }
                 await _prs.MarkMergedAsync(pr!.Id, mergeSha!, ct);
                 // mergeSha is the LOCAL bare-repo merge sha produced by the

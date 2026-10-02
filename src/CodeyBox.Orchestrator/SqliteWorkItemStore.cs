@@ -350,6 +350,15 @@ public sealed class SqliteWorkItemStore :
             // the original work agent a second time.
             RunMigration("ALTER TABLE work_items ADD COLUMN conflict_rework_attempts INTEGER NOT NULL DEFAULT 0;");
 
+            // Additive migration: counts merge-landing retries after a
+            // base-moved detection, plus the operator-visible reason for the
+            // most recent merge retry or guard-triggered rework. Base-moved
+            // retries do not consume conflict_rework_attempts, so they need
+            // their own counter; the reason rides alongside so the final
+            // park message and the retry history agree.
+            RunMigration("ALTER TABLE work_items ADD COLUMN merge_attempts INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN merge_retry_reason TEXT;");
+
             // B1: content-hashed baseline image ref pinned at pickup. Lets in-flight
             // items keep using their original baseline across an operator edit to
             // ExtraRuncmd / ExtraCloudInit / cloud-init contents. Null for legacy rows
@@ -1447,7 +1456,7 @@ public sealed class SqliteWorkItemStore :
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
-                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref, baseline_image_agent,
+                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, merge_attempts, merge_retry_reason, baseline_image_ref, baseline_image_agent,
                         required_capabilities_json,
                         job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
@@ -1468,7 +1477,7 @@ public sealed class SqliteWorkItemStore :
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
-                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref, $baseline_image_agent,
+                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $merge_attempts, $merge_retry_reason, $baseline_image_ref, $baseline_image_agent,
                         $required_capabilities,
                         $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
@@ -1818,6 +1827,8 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    merge_attempts = $merge_attempts,
+                    merge_retry_reason = $merge_retry_reason,
                     delegation_attempts = $delegation_attempts,
                     delegation_requested = $delegation_requested,
                     delegation_reason = $delegation_reason,
@@ -1922,6 +1933,8 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    merge_attempts = $merge_attempts,
+                    merge_retry_reason = $merge_retry_reason,
                     delegation_attempts = $delegation_attempts,
                     delegation_requested = $delegation_requested,
                     delegation_reason = $delegation_reason,
@@ -2028,6 +2041,8 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    merge_attempts = $merge_attempts,
+                    merge_retry_reason = $merge_retry_reason,
                     delegation_attempts = $delegation_attempts,
                     delegation_requested = $delegation_requested,
                     delegation_reason = $delegation_reason,
@@ -2503,6 +2518,8 @@ public sealed class SqliteWorkItemStore :
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
+                    merge_attempts = $merge_attempts,
+                    merge_retry_reason = $merge_retry_reason,
                     delegation_attempts = $delegation_attempts,
                     delegation_requested = $delegation_requested,
                     delegation_reason = $delegation_reason,
@@ -2945,6 +2962,8 @@ public sealed class SqliteWorkItemStore :
                         cancellation_source = $cancellation_source,
                         transient_cancel_retries = $transient_cancel_retries,
                         conflict_rework_attempts = $conflict_rework_attempts,
+                        merge_attempts = $merge_attempts,
+                        merge_retry_reason = $merge_retry_reason,
                         delegation_attempts = $delegation_attempts,
                         delegation_requested = $delegation_requested,
                         delegation_reason = $delegation_reason,
@@ -4588,6 +4607,8 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$transient_cancel_retries", item.TransientCancelRetries);
         cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
         cmd.Parameters.AddWithValue("$conflict_rework_attempts", item.ConflictReworkAttempts);
+        cmd.Parameters.AddWithValue("$merge_attempts", item.MergeAttempts);
+        cmd.Parameters.AddWithValue("$merge_retry_reason", (object?)item.MergeRetryReason ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$baseline_image_ref", (object?)item.BaselineImageRef ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$baseline_image_agent", (object?)item.BaselineImageAgent?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$required_capabilities",
@@ -4731,6 +4752,8 @@ public sealed class SqliteWorkItemStore :
         TransientCancelRetries = ReadInt32OrDefault(r, "transient_cancel_retries", defaultValue: 0),
         PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),
         ConflictReworkAttempts = ReadInt32OrDefault(r, "conflict_rework_attempts", defaultValue: 0),
+        MergeAttempts = ReadInt32OrDefault(r, "merge_attempts", defaultValue: 0),
+        MergeRetryReason = ReadNullableString(r, "merge_retry_reason"),
         BaselineImageRef = ReadNullableString(r, "baseline_image_ref"),
         BaselineImageAgent = ReadNullableAgentKind(r, "baseline_image_agent"),
         RequiredCapabilities = ReadRequiredCapabilities(r),
