@@ -406,6 +406,7 @@ public sealed partial class PipelineRunner
     // never see each other's lifecycle.
     private readonly AsyncLocal<ClaudeSessionLifecycle?> _ambientSessionLifecycle = new();
     private readonly PickupRebaseLockRegistry _rebaseLocks;
+    private readonly MergeLandingGate _mergeLandingGate;
     // CancellationTokenSource timers use a uint millisecond due-time internally;
     // keep computed phase caps inside that runtime ceiling.
     private static readonly TimeSpan MaxCancellationTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
@@ -565,6 +566,10 @@ public sealed partial class PipelineRunner
         // one instance process-wide (matching the pre-extraction static
         // behavior); tests inject a fresh instance per fixture for isolation.
         PickupRebaseLockRegistry? rebaseLockRegistry = null,
+        // Per-base-branch merge-landing gate. Optional: production DI shares
+        // one instance process-wide so concurrent landings on the same base
+        // serialize; tests inject a fresh instance per fixture for isolation.
+        MergeLandingGate? mergeLandingGate = null,
         // Live accessor for the global default work-timeout minutes
         // (CodeyBox:DefaultWorkTimeoutMinutes). Optional: production DI reads
         // IOptionsMonitor so reloads apply to subsequently dispatched work;
@@ -752,6 +757,7 @@ public sealed partial class PipelineRunner
         _baselineProductionOptions = baselineProductionOptions;
         _baselineStager = baselineStager;
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
+        _mergeLandingGate = mergeLandingGate ?? MergeLandingGate.Shared;
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
             _auditReports is null ? null : PersistAuditReportAsync,

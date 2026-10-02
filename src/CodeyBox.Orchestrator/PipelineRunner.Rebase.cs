@@ -503,7 +503,7 @@ public sealed partial class PipelineRunner
         }
     }
 
-    private sealed record PickupRebaseResolutionResult(
+    internal sealed record PickupRebaseResolutionResult(
         IReadOnlyList<string> ConflictFiles,
         IAgentRunner? ChosenResolver,
         AgentCredential? ChosenCredential);
@@ -599,7 +599,16 @@ public sealed partial class PipelineRunner
             requiresCredentialsTmpfs);
     }
 
-    private async Task<PickupRebaseResolutionResult> RebaseCheckedOutBranchWithScopeFenceAsync(
+    /// <summary>
+    /// Rebases an already-checked-out work branch onto <paramref name="upstreamRef"/>
+    /// inside <paramref name="sandbox"/>, resolving conflicts through the
+    /// agentic resolver under the merge-scope fence. Internal (rather than
+    /// private) so focused regression tests can drive the exact
+    /// resolver-loop states — including the "no conflicts to resolve"
+    /// clean-rebase path — against a staged sandbox without standing up a
+    /// full pipeline pickup.
+    /// </summary>
+    internal async Task<PickupRebaseResolutionResult> RebaseCheckedOutBranchWithScopeFenceAsync(
         WorkItem item,
         IAgentRunner runner,
         ISandbox sandbox,
@@ -641,6 +650,10 @@ public sealed partial class PipelineRunner
             ],
         }, ct);
 
+        // Tracks the commit a no-conflict stop was last handled at. A second
+        // consecutive no-conflict stop at the same commit means the
+        // continue/skip below made no progress — fail instead of looping.
+        string? lastNoConflictStop = null;
         while (!rebase.Success)
         {
             try
@@ -680,6 +693,73 @@ public sealed partial class PipelineRunner
 
                 await HandleAgenticResolverAuthRequiredOutputAsync(
                     item, project, "rebase-resolver", resolveResult, ct);
+
+                if (resolveResult.Success && resolveResult.ChosenRunner is null)
+                {
+                    // Success with no chosen runner means the resolver found
+                    // no unmerged paths ("no conflicts to resolve") — the
+                    // rebase stop is non-conflict (typically an empty commit
+                    // whose change already exists upstream), NOT a resolver
+                    // failure. Proceed with a clean rebase instead of
+                    // parking: --continue first; when the worktree is clean
+                    // but the stop persists, --skip the empty commit.
+                    var stopId = await TryRevParseSandboxAsync(sandbox, "REBASE_HEAD", ct)
+                        ?? await RevParseSandboxAsync(sandbox, "HEAD", ct);
+                    if (string.Equals(stopId, lastNoConflictStop, StringComparison.Ordinal))
+                    {
+                        throw new MergeConflictResolutionFailedException(
+                            $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' is stopped with no unmerged paths and made no progress; work branch left at original tip {oldTip}");
+                    }
+
+                    lastNoConflictStop = stopId;
+                    _log.LogInformation(
+                        "Pickup-time rebase of work branch {WorkBranch} onto {BaseBranch} stopped with no unmerged paths; continuing the clean rebase",
+                        workBranch, baseBranch);
+                    rebase = await sandbox.ExecAsync(new SandboxExec
+                    {
+                        Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--continue"],
+                        ExtraEnvironment = new Dictionary<string, string>
+                        {
+                            ["GIT_EDITOR"] = "true",
+                            ["GIT_SEQUENCE_EDITOR"] = "true",
+                        },
+                    }, ct);
+                    if (!rebase.Success)
+                    {
+                        var stopStatus = await sandbox.ExecAsync(new SandboxExec
+                        {
+                            Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+                        }, ct);
+                        var stopUnmerged = await MergeConflictPathInspector.ListUnmergedPathsAsync(
+                            sandbox, SandboxConventions.WorkDir, ct);
+                        // --skip drops the stopped commit. Only take it when
+                        // the worktree is clean AND no unmerged paths remain:
+                        // together those prove the stopped commit's
+                        // application produced no changes against the current
+                        // HEAD, so skipping loses no content (it drops at
+                        // most an empty-effect commit, matching git's own
+                        // --empty=drop default). A persistent environmental
+                        // failure (signing, hooks, bad identity) leaves
+                        // staged changes behind, so it refuses the skip and
+                        // parks via the no-progress guard below instead of
+                        // silently discarding the whole work branch one
+                        // commit at a time.
+                        if (stopStatus.Success
+                            && string.IsNullOrWhiteSpace(stopStatus.Stdout)
+                            && stopUnmerged.Count == 0)
+                        {
+                            _log.LogInformation(
+                                "Pickup-time rebase stop on {WorkBranch} applied no changes with a clean worktree; skipping the empty-effect commit",
+                                workBranch);
+                            rebase = await sandbox.ExecAsync(new SandboxExec
+                            {
+                                Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--skip"],
+                            }, ct);
+                        }
+                    }
+
+                    continue;
+                }
 
                 if (!resolveResult.Success || resolveResult.ChosenRunner is null)
                 {
@@ -1139,6 +1219,23 @@ public sealed partial class PipelineRunner
         if (!result.Success)
             throw new InvalidOperationException($"failed to resolve sandbox revision '{rev}': {result.Stderr}");
         return result.Stdout.Trim();
+    }
+
+    /// <summary>
+    /// Best-effort sandbox rev-parse for pseudo-refs that may not exist
+    /// (e.g. <c>REBASE_HEAD</c> outside a conflict stop). Returns null
+    /// instead of throwing so callers can fall back to a stable ref.
+    /// </summary>
+    private static async Task<string?> TryRevParseSandboxAsync(ISandbox sandbox, string rev, CancellationToken ct)
+    {
+        try
+        {
+            return await RevParseSandboxAsync(sandbox, rev, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
     }
 
     // Cold-tier extraction forwarder: implementation lives on PromptComposer.

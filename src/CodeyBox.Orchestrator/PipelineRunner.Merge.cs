@@ -22,6 +22,18 @@ public sealed partial class PipelineRunner
     /// not push; the orchestrator compares clean merges against
     /// <c>git merge-tree --write-tree</c> and scope-fences conflict
     /// resolutions before pushing.
+    ///
+    /// <para>
+    /// Local composition stays parallel across items (each item owns a
+    /// private bare repo, so local landings cannot contend). The shared
+    /// serialization point is the upstream landing
+    /// (<see cref="MergeLandingGate"/> around the forge merge call in the
+    /// upstream-push phase). When the local base ref still moves under the
+    /// merge — only possible via an out-of-band writer — the conditional
+    /// base-ref update raises <see cref="MergeBaseMovedException"/> and the
+    /// merge-section retry loop re-queues the merge against the fresh base
+    /// without consuming the resolver-guard rework budget.
+    /// </para>
     /// </summary>
     private async Task<(string MergeSha, string? AgentStdout)> RunAgentMergePhaseAsync(
         WorkItem item,
@@ -635,6 +647,46 @@ public sealed partial class PipelineRunner
         await RunHostGitAsync(target, ct, "fetch", "--no-tags", isolatedRepoPath, $"+{verificationRef}:{verificationRef}");
     }
 
+    /// <summary>
+    /// Records a merge retry (landing-attempt count and/or reason) on the
+    /// persisted work item for operator visibility. Best-effort: a
+    /// bookkeeping-write failure must not fail the retry itself, which
+    /// proceeds regardless — the warning keeps the gap observable instead
+    /// of silent.
+    /// </summary>
+    private async Task RecordMergeRetryAsync(
+        WorkItemId id, string reason, bool bumpLandingAttempt, CancellationToken ct)
+    {
+        try
+        {
+            var current = await _store.GetAsync(id, ct);
+            if (current is null)
+                return;
+            await _store.UpdateAsync(current with
+            {
+                MergeAttempts = current.MergeAttempts + (bumpLandingAttempt ? 1 : 0),
+                MergeRetryReason = reason,
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Could not record merge retry for work item {Id}; continuing with the retry",
+                id);
+        }
+    }
+
+    /// <summary>
+    /// Atomically advances the host base ref to <paramref name="mergeSha"/>
+    /// iff it still points at <paramref name="expectedOldSha"/>. When the
+    /// base moved underneath the merge (a concurrent landing or an
+    /// out-of-band writer), throws <see cref="MergeBaseMovedException"/> so
+    /// the caller re-queues the merge against the fresh base instead of
+    /// parking. The <c>update-ref</c> itself is the atomic compare-and-set —
+    /// the pre-check only produces a sharper reason; the catch after the
+    /// write closes the check-then-act window.
+    /// </summary>
     private async Task UpdateHostBaseRefAsync(
         string repoId,
         string baseBranch,
@@ -644,7 +696,47 @@ public sealed partial class PipelineRunner
     {
         Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
         var target = _gitHost.GetRepoPath(repoId);
-        await RunHostGitAsync(target, ct, "update-ref", $"refs/heads/{baseBranch}", mergeSha, expectedOldSha);
+        try
+        {
+            var current = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
+            if (!string.Equals(current, expectedOldSha, StringComparison.Ordinal))
+                throw new MergeBaseMovedException(repoId, baseBranch, expectedOldSha, current);
+        }
+        catch (MergeBaseMovedException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(
+                ex,
+                "Could not pre-read base branch '{BaseBranch}' before conditional update; attempting the atomic update-ref anyway",
+                baseBranch);
+        }
+
+        try
+        {
+            await RunHostGitAsync(target, ct, "update-ref", $"refs/heads/{baseBranch}", mergeSha, expectedOldSha);
+        }
+        catch (InvalidOperationException ex)
+        {
+            string? actual = null;
+            try
+            {
+                actual = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
+            }
+            catch (Exception readEx) when (readEx is not OperationCanceledException)
+            {
+                _log.LogDebug(
+                    readEx,
+                    "Could not re-read base branch '{BaseBranch}' after failed update-ref",
+                    baseBranch);
+            }
+
+            if (actual is null || !string.Equals(actual, expectedOldSha, StringComparison.Ordinal))
+                throw new MergeBaseMovedException(repoId, baseBranch, expectedOldSha, actual, ex);
+            throw;
+        }
     }
 
     private async Task DeleteHostRefBestEffortAsync(string repoId, string refName, CancellationToken ct)

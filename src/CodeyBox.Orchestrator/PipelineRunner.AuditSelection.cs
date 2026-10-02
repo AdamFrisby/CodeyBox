@@ -1245,6 +1245,11 @@ public sealed partial class PipelineRunner
         // cancellation — not the agent's fault, so it must not move the breaker.
         if (error is OperationCanceledException)
             return null;
+        // A base-moved landing is environmental motion observed AFTER the
+        // agent finished its merge composition — the agent did nothing
+        // wrong, so the retry must not feed the agent's failure window.
+        if (error is MergeBaseMovedException)
+            return null;
         // Every other terminal exception is a real dispatch failure.
         return false;
     }

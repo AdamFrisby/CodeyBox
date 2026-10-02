@@ -568,6 +568,12 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.SuggestionDedupeMaxRecordedSources):
                 opts.SuggestionDedupeMaxRecordedSources += 10;
                 break;
+            case nameof(PipelineTuningOptions.MergeLandingMaxAttempts):
+                opts.MergeLandingMaxAttempts += 10;
+                break;
+            case nameof(PipelineTuningOptions.MergeGuardReworkMaxAttempts):
+                opts.MergeGuardReworkMaxAttempts += 10;
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(field), field, "No mutator for this PipelineTuning field.");
         }

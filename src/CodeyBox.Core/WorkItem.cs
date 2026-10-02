@@ -303,13 +303,32 @@ public sealed record WorkItem
 
     /// <summary>
     /// Number of focused conflict-rework iterations the pipeline has executed
-    /// for this work item. Capped at <c>1</c> per merge attempt; the original
-    /// work agent gets exactly one re-engagement to resolve merge-phase
-    /// conflicts that the preventive auto-rebase and the merge-phase LLM
-    /// rerun could not handle. Past the cap the item parks at
+    /// for this work item. Bounded by the hot-reloadable
+    /// <c>PipelineTuning:MergeGuardReworkMaxAttempts</c> cap; past the cap
+    /// the item parks at
     /// <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
     /// </summary>
     public int ConflictReworkAttempts { get; init; }
+
+    /// <summary>
+    /// Number of times the merge phase re-queued its landing after
+    /// detecting the base branch moved between merge composition and the
+    /// conditional base-ref update. Base-moved retries re-run the merge
+    /// against the fresh base and do NOT consume
+    /// <see cref="ConflictReworkAttempts"/>. Persisted so operators can see
+    /// how often an item's landing raced a moving base.
+    /// </summary>
+    public int MergeAttempts { get; init; }
+
+    /// <summary>
+    /// Operator-visible reason for the most recent merge-landing retry or
+    /// guard-triggered rework (e.g. which base-moved or safety-guard event
+    /// caused the current <see cref="MergeAttempts"/> /
+    /// <see cref="ConflictReworkAttempts"/>). Updated on every retry and
+    /// preserved on the terminal park so the final <c>LastError</c> and this
+    /// field agree about why the item cycled.
+    /// </summary>
+    public string? MergeRetryReason { get; init; }
 
     /// <summary>
     /// Number of plan-review passes attempted for the current planning

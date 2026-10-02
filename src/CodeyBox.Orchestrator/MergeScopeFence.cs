@@ -40,10 +40,68 @@ public sealed class MergeConflictResolutionFailedException : Exception
     }
 }
 
+/// <summary>
+/// Retryable signal that the base branch moved between merge composition
+/// and landing (the conditional <c>update-ref</c> refused to advance).
+/// Unlike <see cref="MergeConflictResolutionFailedException"/> this does
+/// not burn a merge attempt: the caller re-queues the merge against the
+/// fresh base and retries within its landing budget.
+/// </summary>
+public sealed class MergeBaseMovedException : Exception
+{
+    public string RepoId { get; }
+    public string BaseBranch { get; }
+    public string ExpectedSha { get; }
+    public string? ActualSha { get; }
+
+    public MergeBaseMovedException(
+        string repoId,
+        string baseBranch,
+        string expectedSha,
+        string? actualSha,
+        Exception? innerException = null)
+        : base(
+            $"base branch '{baseBranch}' moved during merge landing (expected {expectedSha}, now {actualSha ?? "unknown"}); re-queueing against the fresh base",
+            innerException)
+    {
+        RepoId = repoId;
+        BaseBranch = baseBranch;
+        ExpectedSha = expectedSha;
+        ActualSha = actualSha;
+    }
+}
+
 internal sealed record ConflictHunk(string Path, int StartLine, int EndLine);
 
 internal static partial class MergeScopeFence
 {
+    /// <summary>
+    /// True when <paramref name="ex"/> is a resolver <em>safety-guard</em>
+    /// trip rather than an ordinary resolution failure: the scope fence
+    /// (edits outside the permitted conflict hunks) or the
+    /// anti-abandonment guard (a rework that discarded prior commits).
+    /// Guard trips keep their teeth but route to another bounded
+    /// conflict-rework turn instead of parking; everything else parks.
+    /// A base-moved exhaustion chained inside is environmental, never a
+    /// guard, so it parks directly.
+    /// </summary>
+    internal static bool IsResolverGuardFailure(MergeConflictResolutionFailedException ex)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        for (var current = (Exception?)ex; current is not null; current = current.InnerException)
+        {
+            if (current is MergeBaseMovedException)
+                return false;
+            if (current is ScopeFenceViolation)
+                return true;
+        }
+
+        return ex.Message.Contains("outside the permitted conflict hunks", StringComparison.Ordinal)
+            || ex.Message.Contains("discarded prior commits", StringComparison.Ordinal)
+            || ex.Message.Contains("was not part of the resolved diff", StringComparison.Ordinal)
+            || ex.Message.Contains("returned non-conflicted file", StringComparison.Ordinal);
+    }
+
     public static IReadOnlyList<ConflictHunk> ExtractConflictHunks(string path, string conflictedContent)
     {
         var hunks = new List<ConflictHunk>();

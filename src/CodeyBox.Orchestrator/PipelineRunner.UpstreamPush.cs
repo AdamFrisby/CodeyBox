@@ -248,7 +248,30 @@ public sealed partial class PipelineRunner
                         metadata: new Dictionary<string, object> { ["attempt"] = attempt },
                         log: _log))
                     {
-                        outcome = await upstream.CompleteAsync(request, ct);
+                        // Serialized landing: merges into the same upstream
+                        // base land one at a time through the shared
+                        // per-base-branch queue (also observed by
+                        // merge-result verification), so a concurrent
+                        // landing cannot mutate the base mid-merge and force
+                        // this attempt into auto-merge race recovery. The
+                        // gate is per-attempt, not per-loop: between attempts
+                        // the item only touches its private bare repo.
+                        var landingKey = MergeLandingGate.KeyFor(
+                            project.Upstream.Kind,
+                            project.RepositoryUrl,
+                            baseBranch);
+                        var landingSlot = _mergeLandingGate.Retain(landingKey);
+                        var landingAcquired = false;
+                        try
+                        {
+                            await landingSlot.Semaphore.WaitAsync(ct);
+                            landingAcquired = true;
+                            outcome = await upstream.CompleteAsync(request, ct);
+                        }
+                        finally
+                        {
+                            _mergeLandingGate.Release(landingKey, landingSlot, landingAcquired);
+                        }
                     }
                     if (outcome.PullRequestUrl is not null)
                         _log.LogInformation("Upstream PR: {Url}", outcome.PullRequestUrl);
@@ -258,6 +281,17 @@ public sealed partial class PipelineRunner
                         _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
 
                     lastIterationRaced = outcome.AutoMergeRaced;
+                    if (outcome.AutoMergeRaced)
+                    {
+                        // Recorded for operator visibility: a raced landing
+                        // re-queues through race recovery below without
+                        // consuming the resolver-guard rework budget.
+                        await RecordMergeRetryAsync(
+                            item.Id,
+                            $"upstream landing raced on base branch '{baseBranch}'; re-running merge against the fresh base",
+                            bumpLandingAttempt: true,
+                            ct);
+                    }
                     if (outcome.AutoMergeRaced && reRunMergePhase is not null)
                     {
                         // GitHub said the PR is unmergeable. Two plausible causes:
