@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
@@ -184,15 +185,18 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly PipelineOptions _pipelineOptions;
+    private readonly ILogger<SandboxRequiredBuildVerifier>? _logger;
 
     public SandboxRequiredBuildVerifier(
         ISandboxProvider sandboxes,
         IGitHost gitHost,
-        PipelineOptions pipelineOptions)
+        PipelineOptions pipelineOptions,
+        ILogger<SandboxRequiredBuildVerifier>? logger = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
         _pipelineOptions = pipelineOptions;
+        _logger = logger;
     }
 
     public async Task<RequiredBuildProbeResult> ProbeAsync(
@@ -530,13 +534,17 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 {
                     await sandbox.DisposeAsync();
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
                     // Teardown after the verification result is determined is
                     // operational, never the item's outcome: the VM stays in
                     // the provider's managed inventory for the leak reaper's
-                    // disposal retry. The provider logs teardown faults with
-                    // sandbox context, so nothing observable is lost.
+                    // disposal retry. Disposal failures are logged-but-ignored
+                    // per the teardown-never-fails policy.
+                    _logger?.LogWarning(
+                        ex,
+                        "Required-build verification sandbox {SandboxId} disposal failed; the provider inventory retains it for disposal retry",
+                        sandbox.Id);
                 }
             }
         }

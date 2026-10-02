@@ -1378,7 +1378,8 @@ builder.Services.AddSingleton<IPreMergeVerifier>(sp =>
 builder.Services.AddSingleton<IRequiredBuildVerifier>(sp => new SandboxRequiredBuildVerifier(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
-    sp.GetRequiredService<PipelineOptions>()));
+    sp.GetRequiredService<PipelineOptions>(),
+    sp.GetRequiredService<ILogger<SandboxRequiredBuildVerifier>>()));
 
 // --- Pull request service (in-memory by default) -----------------------------
 builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>();

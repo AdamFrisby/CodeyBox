@@ -8,6 +8,7 @@ using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -1732,10 +1733,12 @@ public sealed class RequiredBuildGateTests : IDisposable
             "Failed to unmount \"/var/lib/incus/storage-pools/codeybox\": device busy");
         var provider = new ScriptedBuildSandboxProvider(_ =>
             new DisposalFailingBuildSandbox(ScriptedBuildSandbox.Healthy(), teardownFailure));
+        var log = new CapturingBuildVerifierLogger();
         var verifier = new SandboxRequiredBuildVerifier(
             provider,
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" });
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            new CapturingBuildVerifierLoggerAdapter(log));
 
         var item = NewItem("feature/build-disposal-fails") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -1755,6 +1758,13 @@ public sealed class RequiredBuildGateTests : IDisposable
 
         Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
         Assert.Equal(1, provider.Creates);
+        // The swallowed teardown failure must be observable: a warning carrying
+        // the sandbox context is logged at the catch site.
+        var warning = Assert.Single(
+            log.Records,
+            r => r.Level == LogLevel.Warning);
+        Assert.Same(teardownFailure, warning.Exception);
+        Assert.Contains("disposal failed", warning.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -3864,6 +3874,27 @@ public sealed class RequiredBuildGateTests : IDisposable
             await Task.Yield();
             throw failure;
         }
+    }
+
+    private sealed class CapturingBuildVerifierLogger
+    {
+        public List<(LogLevel Level, string Message, Exception? Exception)> Records { get; } = [];
+    }
+
+    private sealed class CapturingBuildVerifierLoggerAdapter(CapturingBuildVerifierLogger sink)
+        : ILogger<SandboxRequiredBuildVerifier>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel level,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => sink.Records.Add((level, formatter(state, exception), exception));
     }
 
     private sealed class ScriptedBuildSandboxProvider(Func<int, ISandbox> factory) : ISandboxProvider
