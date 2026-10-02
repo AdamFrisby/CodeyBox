@@ -534,11 +534,27 @@ public sealed class DefaultProcessRunner : IProcessRunner
                 if (maxBytes is { } limit)
                 {
                     if (limitExceeded)
+                    {
+                        // Non-killing limit: the retained prefix stays
+                        // bounded, but every further chunk still streams to
+                        // the callback so file sinks observe the full volume.
+                        chunkCallback?.Invoke(chunk);
                         continue;
+                    }
 
                     var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
                     if (chunkBytes > limit - totalBytes)
                     {
+                        limitExceeded = true;
+                        if (onLimitExceeded is null)
+                        {
+                            // Non-killing limit: retain nothing more, but
+                            // stream the whole straddling chunk instead of
+                            // dropping the bytes past the bound.
+                            chunkCallback?.Invoke(chunk);
+                            continue;
+                        }
+
                         var remaining = Math.Max(0, limit - totalBytes);
                         if (remaining > 0)
                         {
@@ -548,11 +564,8 @@ public sealed class DefaultProcessRunner : IProcessRunner
                         }
 
                         totalBytes = limit;
-                        limitExceeded = true;
-                        onLimitExceeded?.Invoke();
-                        if (onLimitExceeded is not null)
-                            return new LimitedReadResult(output.ToString(), LimitExceeded: true);
-                        continue;
+                        onLimitExceeded.Invoke();
+                        return new LimitedReadResult(output.ToString(), LimitExceeded: true);
                     }
 
                     totalBytes += chunkBytes;

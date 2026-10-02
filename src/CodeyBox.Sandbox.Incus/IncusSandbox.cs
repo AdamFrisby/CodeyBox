@@ -273,6 +273,40 @@ internal sealed class IncusSandbox :
                     execTimeout = limit;
             }
             ProcessRunResult result;
+            var streamingOutput = exec.StreamOutputWithoutKill;
+            // Agent-turn streaming execs forward every chunk to the sink and
+            // retain only a bounded tail in memory. The tail interceptors are
+            // always installed in this mode — even without a caller callback
+            // — so the returned excerpt is the stream suffix, not the CLI
+            // bound's retained prefix. The null-forgiving operators below are
+            // safe: both tails are constructed exactly when streamingOutput is
+            // true, in the same method scope.
+            var stdoutTail = streamingOutput
+                ? new OutputTail(exec.MaxRetainedStdoutBytes ?? _options.AgentExecTailStdoutBytes)
+                : null;
+            var stderrTail = streamingOutput
+                ? new OutputTail(exec.MaxRetainedStderrBytes ?? _options.AgentExecTailStderrBytes)
+                : null;
+            var stdoutChunkCallback = exec.StdoutChunkCallback;
+            if (stdoutTail is not null)
+            {
+                var inner = stdoutChunkCallback;
+                stdoutChunkCallback = chunk =>
+                {
+                    stdoutTail.Append(chunk);
+                    inner?.Invoke(chunk);
+                };
+            }
+            var stderrChunkCallback = exec.StderrChunkCallback;
+            if (stderrTail is not null)
+            {
+                var inner = stderrChunkCallback;
+                stderrChunkCallback = chunk =>
+                {
+                    stderrTail.Append(chunk);
+                    inner?.Invoke(chunk);
+                };
+            }
             try
             {
                 result = await _cli.RunAllowFailureAsync(
@@ -282,10 +316,14 @@ internal sealed class IncusSandbox :
                     execTimeout,
                     ct,
                     heavyOperation: false,
-                    maxStdoutBytes: exec.MaxStdoutBytes ?? _options.MaxCliStdoutBytes,
-                    maxStderrBytes: exec.MaxStderrBytes ?? _options.MaxCliStderrBytes,
-                    stdoutChunkCallback: exec.StdoutChunkCallback,
-                    stderrChunkCallback: exec.StderrChunkCallback,
+                    maxStdoutBytes: streamingOutput
+                        ? stdoutTail!.MaxBytes
+                        : exec.MaxStdoutBytes ?? _options.MaxCliStdoutBytes,
+                    maxStderrBytes: streamingOutput
+                        ? stderrTail!.MaxBytes
+                        : exec.MaxStderrBytes ?? _options.MaxCliStderrBytes,
+                    stdoutChunkCallback: stdoutChunkCallback,
+                    stderrChunkCallback: stderrChunkCallback,
                     killOnOutputLimit: exec.KillOnOutputLimit).ConfigureAwait(false);
             }
             catch
@@ -336,13 +374,21 @@ internal sealed class IncusSandbox :
                     pidPath,
                     completionPath).ConfigureAwait(false);
             }
-            sandboxResult = new SandboxExecResult(
-                result.ExitCode,
-                result.Stdout,
-                result.Stderr,
-                result.StdoutLimitExceeded,
-                result.StderrLimitExceeded,
-                executionInterrupted);
+            sandboxResult = streamingOutput
+                ? new SandboxExecResult(
+                    result.ExitCode,
+                    stdoutTail!.ToString(),
+                    stderrTail!.ToString(),
+                    StdoutLimitExceeded: false,
+                    StderrLimitExceeded: false,
+                    executionInterrupted)
+                : new SandboxExecResult(
+                    result.ExitCode,
+                    result.Stdout,
+                    result.Stderr,
+                    result.StdoutLimitExceeded,
+                    result.StderrLimitExceeded,
+                    executionInterrupted);
         }
         catch (Exception ex)
         {
@@ -2035,6 +2081,41 @@ internal sealed class IncusSandbox :
             ValidateEnvironment(exec.ExtraEnvironment, nameof(exec));
         if (exec.MaxStdoutBytes is <= 0 || exec.MaxStderrBytes is <= 0)
             throw new ArgumentOutOfRangeException(nameof(exec), "Exec output limits must be positive when supplied.");
+        if (exec.StreamOutputWithoutKill)
+        {
+            // Agent-turn streaming execs never inherit the provider-wide CLI
+            // output bound: there is no cumulative kill threshold, so nothing
+            // to clamp. Only the bounded in-memory tail is validated here; it
+            // can never exceed the control-plane bound, which keeps even a
+            // misconfigured per-exec override from growing host memory.
+            if (exec.KillOnOutputLimit)
+                throw new ArgumentException(
+                    "Streaming execs (StreamOutputWithoutKill) require KillOnOutputLimit to be false.",
+                    nameof(exec));
+            if (exec.MaxRetainedStdoutBytes is <= 0 || exec.MaxRetainedStderrBytes is <= 0)
+                throw new ArgumentOutOfRangeException(nameof(exec), "Exec retained-output limits must be positive when supplied.");
+            var retainedStdoutBytes = exec.MaxRetainedStdoutBytes;
+            var retainedStderrBytes = exec.MaxRetainedStderrBytes;
+            if (retainedStdoutBytes > _options.MaxCliStdoutBytes)
+            {
+                _log.LogWarning(
+                    "Streaming exec retained stdout {RequestedBytes} exceeds the provider-wide CLI output bound {BoundBytes}; clamping to the bound.",
+                    retainedStdoutBytes,
+                    _options.MaxCliStdoutBytes);
+                retainedStdoutBytes = _options.MaxCliStdoutBytes;
+            }
+            if (retainedStderrBytes > _options.MaxCliStderrBytes)
+            {
+                _log.LogWarning(
+                    "Streaming exec retained stderr {RequestedBytes} exceeds the provider-wide CLI output bound {BoundBytes}; clamping to the bound.",
+                    retainedStderrBytes,
+                    _options.MaxCliStderrBytes);
+                retainedStderrBytes = _options.MaxCliStderrBytes;
+            }
+            return retainedStdoutBytes == exec.MaxRetainedStdoutBytes && retainedStderrBytes == exec.MaxRetainedStderrBytes
+                ? exec
+                : exec with { MaxRetainedStdoutBytes = retainedStdoutBytes, MaxRetainedStderrBytes = retainedStderrBytes };
+        }
         var stdoutBytes = exec.MaxStdoutBytes;
         var stderrBytes = exec.MaxStderrBytes;
         if (stdoutBytes > _options.MaxCliStdoutBytes)
@@ -2060,6 +2141,90 @@ internal sealed class IncusSandbox :
 
     private void DeleteStaging() =>
         IncusMountStaging.DeleteOwnedTreeIfContained(_stagingRoot, _sandboxRoot, Id);
+
+    /// <summary>
+    /// Byte-bounded (UTF-8) tail over an append-only chunk stream. Callbacks
+    /// may arrive from arbitrary threads; every mutation is locked. Whole
+    /// chunks are evicted oldest-first; a single chunk larger than the bound
+    /// is cut to its byte suffix on a rune boundary so the excerpt never
+    /// exceeds <see cref="MaxBytes"/> and never splits a surrogate pair.
+    /// </summary>
+    private sealed class OutputTail
+    {
+        private readonly object _sync = new();
+        private readonly Queue<(string Text, int Bytes)> _chunks = new();
+        private int _bytes;
+
+        internal OutputTail(int maxBytes)
+        {
+            if (maxBytes <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maxBytes), "Tail bound must be positive.");
+            MaxBytes = maxBytes;
+        }
+
+        internal int MaxBytes { get; }
+
+        internal void Append(string chunk)
+        {
+            if (string.IsNullOrEmpty(chunk))
+                return;
+            var bytes = Encoding.UTF8.GetByteCount(chunk);
+            lock (_sync)
+            {
+                if (bytes > MaxBytes)
+                {
+                    _chunks.Clear();
+                    var suffix = TakeByteSuffix(chunk, MaxBytes);
+                    var suffixBytes = Encoding.UTF8.GetByteCount(suffix);
+                    _chunks.Enqueue((suffix, suffixBytes));
+                    _bytes = suffixBytes;
+                    return;
+                }
+                _chunks.Enqueue((chunk, bytes));
+                _bytes += bytes;
+                while (_bytes > MaxBytes && _chunks.Count > 1)
+                {
+                    var evicted = _chunks.Dequeue();
+                    _bytes -= evicted.Bytes;
+                }
+            }
+        }
+
+        public override string ToString()
+        {
+            lock (_sync)
+            {
+                if (_chunks.Count == 0)
+                    return string.Empty;
+                if (_chunks.Count == 1)
+                    return _chunks.Peek().Text;
+                var builder = new StringBuilder(_bytes);
+                foreach (var (text, _) in _chunks)
+                    builder.Append(text);
+                return builder.ToString();
+            }
+        }
+
+        private static string TakeByteSuffix(string value, int maxBytes)
+        {
+            var bytes = 0;
+            var index = value.Length;
+            while (index > 0)
+            {
+                var charCount = char.IsLowSurrogate(value[index - 1])
+                    && index >= 2
+                    && char.IsHighSurrogate(value[index - 2])
+                    ? 2
+                    : 1;
+                var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(index - charCount, charCount));
+                if (bytes + charBytes > maxBytes)
+                    break;
+                bytes += charBytes;
+                index -= charCount;
+            }
+            return value[index..];
+        }
+    }
 
     private Guid NextGuid(string purpose)
     {

@@ -70,7 +70,9 @@ internal sealed class IncusCliRunner
             }
 
             if (result.StdoutLimitExceeded || result.StderrLimitExceeded)
-                throw new InvalidOperationException($"Incus {operation} exceeded its configured output bound.");
+                throw new IncusOutputBoundException(
+                    operation,
+                    $"Incus {operation} exceeded its configured output bound (output-bound).");
             if (result.StartFailed || result.ExecutionUnavailable)
                 throw new InvalidOperationException($"Incus {operation} could not start the configured CLI.");
             if (result.ExitCode != 0)

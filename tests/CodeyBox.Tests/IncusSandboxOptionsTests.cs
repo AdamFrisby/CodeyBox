@@ -182,4 +182,21 @@ public sealed class IncusSandboxOptionsTests
         Assert.Contains(errors, error =>
             error.StartsWith("StagingDirectory", StringComparison.Ordinal));
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(1023)]
+    [InlineData(64 * 1024 * 1024 + 1)]
+    public void Validate_RejectsOutOfRangeAgentExecTail(int tailBytes)
+    {
+        var errors = IncusSandboxOptions.Validate(new IncusSandboxOptions
+        {
+            AgentExecTailStdoutBytes = tailBytes,
+            AgentExecTailStderrBytes = tailBytes,
+        });
+
+        Assert.Contains(errors, error => error.StartsWith("AgentExecTailStdoutBytes", StringComparison.Ordinal));
+        Assert.Contains(errors, error => error.StartsWith("AgentExecTailStderrBytes", StringComparison.Ordinal));
+    }
 }

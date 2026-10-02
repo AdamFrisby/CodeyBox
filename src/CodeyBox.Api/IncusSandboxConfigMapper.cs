@@ -79,6 +79,8 @@ internal static class IncusSandboxConfigMapper
             BootLaunchDelay = TimeSpan.FromMilliseconds(incus.BootLaunchDelayMs),
             MaxCliStdoutBytes = incus.MaxCliStdoutBytes,
             MaxCliStderrBytes = incus.MaxCliStderrBytes,
+            AgentExecTailStdoutBytes = incus.AgentExecTailStdoutBytes,
+            AgentExecTailStderrBytes = incus.AgentExecTailStderrBytes,
             CaptureResourceMetrics = incus.CaptureResourceMetrics,
             ResourceMetricsCaptureTimeout = incus.ResourceMetricsCaptureTimeout,
             ResourceMetricsSampleInterval = incus.ResourceMetricsSampleInterval,

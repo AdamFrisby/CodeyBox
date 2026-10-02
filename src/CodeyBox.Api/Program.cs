@@ -6545,6 +6545,12 @@ namespace CodeyBox.Api
         /// <summary>Maximum stderr bytes retained from one Incus CLI invocation.</summary>
         public int MaxCliStderrBytes { get; set; } = Defaults.MaxCliStderrBytes;
 
+        /// <summary>Bounded in-memory stdout tail retained by agent-turn streaming execs. Hot-reloadable.</summary>
+        public int AgentExecTailStdoutBytes { get; set; } = Defaults.AgentExecTailStdoutBytes;
+
+        /// <summary>Bounded in-memory stderr tail retained by agent-turn streaming execs. Hot-reloadable.</summary>
+        public int AgentExecTailStderrBytes { get; set; } = Defaults.AgentExecTailStderrBytes;
+
         /// <summary>Capture best-effort guest resource metrics before sandbox teardown.</summary>
         public bool CaptureResourceMetrics { get; set; } = Defaults.CaptureResourceMetrics;
 

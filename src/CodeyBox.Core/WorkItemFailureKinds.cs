@@ -32,11 +32,20 @@ public static class WorkItemFailureKinds
     /// </summary>
     public const string Configuration = "configuration";
 
+    /// <summary>
+    /// An exec was killed (or its output cut) for exceeding a provider output
+    /// bound. Infrastructure-shaped — the agent did nothing wrong — but kept
+    /// distinct from <see cref="Infrastructure"/> so a volume kill is never
+    /// misreported as generic termination (for example exit 137).
+    /// </summary>
+    public const string OutputBound = "output-bound";
+
     private static readonly string[] InfraShaped =
     [
         Infrastructure,
         AgentUnavailable,
         AuthRequired,
+        OutputBound,
     ];
 
     public static bool IsInfraShaped(string? failureKind)

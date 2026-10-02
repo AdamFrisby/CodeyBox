@@ -414,6 +414,8 @@ snapshot before using a pin.
 | `BootLaunchDelay` | TimeSpan | `00:00:02` | Inter-boot stagger applied after a boot slot under `MaxConcurrentBoots` is acquired, spacing out qemu spin-up. Valid range zero (disables the delay) through five minutes. |
 | `MaxCliStdoutBytes` | int | `4194304` | Maximum retained stdout from one Incus CLI invocation. |
 | `MaxCliStderrBytes` | int | `4194304` | Maximum retained stderr from one Incus CLI invocation. |
+| `AgentExecTailStdoutBytes` | int | `1048576` | Bounded in-memory stdout tail retained by agent-turn streaming execs (work, rework, delegation, conflict-resolution turns), which stream without a cumulative kill threshold. Valid range 1024–67108864; read live. |
+| `AgentExecTailStderrBytes` | int | `1048576` | Bounded in-memory stderr tail retained by agent-turn streaming execs. Valid range 1024–67108864; read live. |
 | `CaptureResourceMetrics` | bool | `false` | Capture best-effort guest resource metrics before teardown. |
 | `ResourceMetricsCaptureTimeout` | TimeSpan | `00:00:05` | Deadline for the best-effort metrics read during teardown. |
 | `ResourceMetricsSampleInterval` | TimeSpan | `00:00:10` | Interval used by the guest peak-memory sampler. |

@@ -759,6 +759,7 @@ public sealed partial class PipelineRunner
                 result.Stdout) is not null
             || classification.Kind == AgentFailureKind.TransientNetwork
             || classification.Kind == AgentFailureKind.Infrastructure && result.ExecutionUnavailable
+            || AgentOutputBoundFailure.IsOutputBound(result)
             || AgentSuspendResilience.IsInfrastructureProcessExitCode(
                 AgentSuspendResilience.ParseAgentExitCode(result.Summary));
         if (!isRecoverableFailure)

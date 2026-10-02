@@ -1195,7 +1195,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex.Message,
                 CancellationToken.None,
                 project,
-                failureKind: WorkItemFailureKinds.Infrastructure,
+                failureKind: ex.IsOutputBound ? WorkItemFailureKinds.OutputBound : WorkItemFailureKinds.Infrastructure,
                 agent: ex.Agent);
         }
         catch (GitRepositorySeedingException ex)

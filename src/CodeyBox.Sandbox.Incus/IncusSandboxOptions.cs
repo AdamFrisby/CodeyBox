@@ -227,6 +227,22 @@ public sealed record IncusSandboxOptions
     public TimeSpan BootLaunchDelay { get; init; } = TimeSpan.FromSeconds(2);
     public int MaxCliStdoutBytes { get; init; } = DefaultMaxCliOutputBytes;
     public int MaxCliStderrBytes { get; init; } = DefaultMaxCliOutputBytes;
+    /// <summary>
+    /// Bounded in-memory tail retained for stdout by agent-turn streaming
+    /// execs (<see cref="SandboxExec.StreamOutputWithoutKill"/>). The full
+    /// volume still reaches the chunk callbacks and the agent-stream file
+    /// sink; only the in-memory excerpt handed to failure classification
+    /// and lastError is bounded, so verbose agents can never trip the
+    /// cumulative <see cref="MaxCliStdoutBytes"/> kill threshold.
+    /// Hot-reloadable.
+    /// </summary>
+    public int AgentExecTailStdoutBytes { get; init; } = SandboxExec.DefaultStreamedOutputTailBytes;
+    /// <summary>
+    /// Bounded in-memory tail retained for stderr by agent-turn streaming
+    /// execs (<see cref="SandboxExec.StreamOutputWithoutKill"/>).
+    /// Hot-reloadable.
+    /// </summary>
+    public int AgentExecTailStderrBytes { get; init; } = SandboxExec.DefaultStreamedOutputTailBytes;
     public bool CaptureResourceMetrics { get; init; }
     public TimeSpan ResourceMetricsCaptureTimeout { get; init; } = TimeSpan.FromSeconds(5);
     public TimeSpan ResourceMetricsSampleInterval { get; init; } = TimeSpan.FromSeconds(10);
@@ -384,6 +400,10 @@ public sealed record IncusSandboxOptions
             errors.Add($"{nameof(MaxCliStdoutBytes)} must be between 1024 and 67108864.");
         if (options.MaxCliStderrBytes is < 1024 or > 64 * 1024 * 1024)
             errors.Add($"{nameof(MaxCliStderrBytes)} must be between 1024 and 67108864.");
+        if (options.AgentExecTailStdoutBytes is < 1024 or > 64 * 1024 * 1024)
+            errors.Add($"{nameof(AgentExecTailStdoutBytes)} must be between 1024 and 67108864.");
+        if (options.AgentExecTailStderrBytes is < 1024 or > 64 * 1024 * 1024)
+            errors.Add($"{nameof(AgentExecTailStderrBytes)} must be between 1024 and 67108864.");
         if (options.BaselineCpus is < 1 or > 256)
             errors.Add($"{nameof(BaselineCpus)} must be between 1 and 256.");
         if (options.BaselineMemoryBytes < 256L * 1024 * 1024

@@ -1500,6 +1500,15 @@ public sealed record SandboxExec
     /// <summary>Maximum distinct environment-variable removals requested by one exec.</summary>
     public const int MaximumEnvironmentVariablesToUnset = 256;
 
+    /// <summary>
+    /// Default bounded in-memory tail retained per stream for agent-turn
+    /// streaming execs (<see cref="StreamOutputWithoutKill"/>): 1 MiB. The
+    /// full volume still reaches the chunk callbacks and the agent-stream
+    /// file sink; only the in-memory excerpt handed to failure
+    /// classification and lastError is bounded.
+    /// </summary>
+    public const int DefaultStreamedOutputTailBytes = 1024 * 1024;
+
     private IReadOnlyList<string> _environmentVariablesToUnset = [];
 
     public required IReadOnlyList<string> Argv { get; init; }
@@ -1526,7 +1535,44 @@ public sealed record SandboxExec
     public string? Stdin { get; init; }
     public int? MaxStdoutBytes { get; init; }
     public int? MaxStderrBytes { get; init; }
+    /// <summary>
+    /// When true (the default) the provider terminates the exec once retained
+    /// output reaches <see cref="MaxStdoutBytes"/>/<see
+    /// cref="MaxStderrBytes"/>. Short control-plane execs keep this true;
+    /// agent-turn streaming execs (<see cref="StreamOutputWithoutKill"/>) set
+    /// it false.
+    /// </summary>
     public bool KillOnOutputLimit { get; init; } = true;
+    /// <summary>
+    /// Agent-turn streaming mode (work, rework, delegation, and
+    /// conflict-resolution turns). When true the exec streams stdout/stderr
+    /// incrementally through the chunk callbacks with no cumulative kill
+    /// threshold: total volume is unbounded and the process is never
+    /// terminated for output size. Providers retain only a bounded tail
+    /// (<see cref="MaxRetainedStdoutBytes"/>/<see
+    /// cref="MaxRetainedStderrBytes"/>, defaulting to
+    /// <see cref="DefaultStreamedOutputTailBytes"/>) for failure
+    /// classification and lastError excerpts. Requires
+    /// <see cref="KillOnOutputLimit"/> to be false; combining streaming with
+    /// a kill threshold is rejected. Control-plane execs (inventory, file
+    /// reads, checkpoint transfers) must leave this false so their
+    /// <see cref="KillOnOutputLimit"/> caps keep protecting the host.
+    /// </summary>
+    public bool StreamOutputWithoutKill { get; init; }
+    /// <summary>
+    /// Bounded in-memory tail retained for stdout when
+    /// <see cref="StreamOutputWithoutKill"/> is set. Null selects the
+    /// provider default. Ignored for bounded (<see
+    /// cref="StreamOutputWithoutKill"/> false) execs.
+    /// </summary>
+    public int? MaxRetainedStdoutBytes { get; init; }
+    /// <summary>
+    /// Bounded in-memory tail retained for stderr when
+    /// <see cref="StreamOutputWithoutKill"/> is set. Null selects the
+    /// provider default. Ignored for bounded (<see
+    /// cref="StreamOutputWithoutKill"/> false) execs.
+    /// </summary>
+    public int? MaxRetainedStderrBytes { get; init; }
     public SandboxAgentOutputTransportPreference AgentOutputTransport { get; init; } =
         SandboxAgentOutputTransportPreference.ExecPipe;
     public SandboxExecLaunchMode LaunchMode { get; init; } = SandboxExecLaunchMode.Attached;
