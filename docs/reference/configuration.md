@@ -1283,6 +1283,13 @@ hot-reloadable; the executor reads the current options on every call.
   "MaxPendingProposals": 256,
   "DecidedProposalRetentionSeconds": 604800,
   "ConversationStreamPollSeconds": 1,
+  "Wakeup": {
+    "Enabled": true,
+    "WakeupIntervalSeconds": 900,
+    "MinTriggerIntervalSeconds": 300,
+    "PurposePrompt": "Queue-health pass: what failed since last time, what is stuck, what is quota-blocked, what needs the operator.",
+    "MaxReportChars": 8000
+  },
   "Conversation": {
     "MaxEntryChars": 16384,
     "MaxEntries": 2000,
@@ -1304,6 +1311,11 @@ hot-reloadable; the executor reads the current options on every call.
 | `MaxPendingProposals` | `256` | Cap on proposals awaiting an operator decision (pending plus in-flight `applying` commits). Past the cap, new proposals are refused as `proposal_queue_full` until decisions drain the backlog. 1–4096. |
 | `DecidedProposalRetentionSeconds` | `604800` | How long a decided (approved/rejected/expired/superseded) proposal row is kept for review before an enqueue sweep removes it (7 days). Pending rows past their TTL are reaped by the same sweep; `applying` rows are never reaped. 60–7776000. |
 | `ConversationStreamPollSeconds` | `1` | How often the operator conversation stream (`GET /majordomo/conversation/stream`) re-reads the store for new rows, in seconds. 1–60. |
+| `Wakeup:Enabled` | `true` | Whether the majordomo wakes itself: scheduled ticks on the cadence below plus debounced event wakeups (terminal failures, stalls with free capacity). A wakeup reports into the durable conversation and, in `autonomous` mode, may act through the same authorization gate as an operator-driven turn; in `proposed` mode it produces proposals and mutates nothing. Wakeups are skipped while a turn is in flight and silent when they find nothing. |
+| `Wakeup:WakeupIntervalSeconds` | `900` | Cadence between scheduled wakeups (15 minutes). Each tick carries `Wakeup:PurposePrompt`. 60–86400. |
+| `Wakeup:MinTriggerIntervalSeconds` | `300` | Minimum interval between event-triggered wakeups: a burst of triggers inside this window collapses into one considered pass. 30–3600. |
+| `Wakeup:PurposePrompt` | _(queue-health pass)_ | Purpose prompt carried by each scheduled tick. At most 4000 characters. |
+| `Wakeup:MaxReportChars` | `8000` | Bound on one wakeup report before it is stored; longer reports are truncated with a marker. 1024–65536. |
 | `Conversation:MaxEntryChars` | `16384` | Per-row cap on stored conversation text. Longer payloads are truncated with a marker before they are persisted, so one huge tool result cannot grow the state database at request rate. 1024–262144. |
 | `Conversation:MaxEntries` | `2000` | Cap on stored conversation rows. Appending past it compacts the oldest excess into the deterministic summary (summarised, never dropped) inside the same write. 100–100000. |
 | `Conversation:MaxContextChars` | `12000` | Total bound on one assembled majordomo context, in characters. Assembly never returns more than this no matter how far history grows past it. 1000–200000. |

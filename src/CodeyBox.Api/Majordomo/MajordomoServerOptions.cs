@@ -150,6 +150,16 @@ public sealed class MajordomoServerOptions
     /// <summary>Builds the history policy the conversation store and assembler consume.</summary>
     public MajordomoHistoryOptions ToHistoryOptions() => Conversation.ToHistoryOptions();
 
+    /// <summary>
+    /// Self-wakeup policy: the scheduled cadence, the event burst-collapsing
+    /// floor, and the purpose prompt. Hot-reloadable alongside the rest of
+    /// this section: the coordinator reads the current value on every tick.
+    /// </summary>
+    public MajordomoWakeupServerOptions Wakeup { get; set; } = new();
+
+    /// <summary>Builds the wakeup policy the self-wakeup coordinator consumes.</summary>
+    public MajordomoWakeupOptions ToWakeupOptions() => Wakeup.ToWakeupOptions();
+
     /// <summary>Hot-reload validator: returns the failure message or null.</summary>
     public static string? Validate(MajordomoServerOptions opts)
     {
@@ -182,6 +192,11 @@ public sealed class MajordomoServerOptions
             or > MaxConversationStreamPollSeconds)
             return $"{SectionName}:ConversationStreamPollSeconds must be within "
                 + $"[{MinConversationStreamPollSeconds}, {MaxConversationStreamPollSeconds}]";
+        if (opts.Wakeup is null)
+            return $"{SectionName}:Wakeup must not be null";
+        var wakeupFailure = MajordomoWakeupServerOptions.Validate(opts.Wakeup);
+        if (wakeupFailure is not null)
+            return $"{SectionName}:Wakeup:{wakeupFailure}";
         return null;
     }
 }

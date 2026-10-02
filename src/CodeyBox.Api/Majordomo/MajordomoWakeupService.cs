@@ -1,0 +1,246 @@
+using CodeyBox.Core;
+using CodeyBox.Majordomo;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+
+namespace CodeyBox.Api.Majordomo;
+
+/// <summary>
+/// Lets the majordomo wake itself to watch the queue instead of only
+/// answering when spoken to. Each scheduled tick carries the configured
+/// purpose prompt (by default a queue-health pass); the tick also detects
+/// the event conditions worth reacting to — a queue stalled while dispatch
+/// capacity sits free — and fires those as debounced event wakeups rather
+/// than extra scheduled passes. Direct push triggers (for example a work
+/// item entering a terminal failure) arrive through
+/// <see cref="NotifyTerminalFailureAsync"/>; a burst of triggers inside the
+/// configured floor collapses into one considered pass.
+/// </summary>
+/// <remarks>
+/// A wakeup reports into the durable conversation and never escalates
+/// privilege: mutations, when an assessment carries any, pass through
+/// <see cref="MajordomoAuthorization"/> with the live policy exactly like an
+/// operator-driven turn. The default assessment is report-only. Wakeups are
+/// skipped, not queued, while a turn is in flight, and a pass that finds
+/// nothing stores no conversation row. Every attempt — including skips and
+/// quiet passes — lands in <see cref="MajordomoWakeupCoordinator.History"/>.
+/// </remarks>
+internal sealed class MajordomoWakeupService : BackgroundService
+{
+    /// <summary>Upper cap for the derived poll interval.</summary>
+    public static readonly TimeSpan MaxPollInterval = TimeSpan.FromMinutes(5);
+
+    /// <summary>Lower floor for the derived poll interval.</summary>
+    public static readonly TimeSpan MinPollInterval = TimeSpan.FromSeconds(30);
+
+    private readonly MajordomoWakeupCoordinator _coordinator;
+    private readonly IOptionsMonitor<MajordomoServerOptions> _options;
+    private readonly MajordomoReadBackend _reads;
+    private readonly TimeProvider _clock;
+    private readonly ILogger _log;
+
+    public MajordomoWakeupService(
+        MajordomoWakeupCoordinator coordinator,
+        IOptionsMonitor<MajordomoServerOptions> options,
+        MajordomoReadBackend reads,
+        TimeProvider? clock = null,
+        ILogger? log = null)
+    {
+        _coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _reads = reads ?? throw new ArgumentNullException(nameof(reads));
+        _clock = clock ?? TimeProvider.System;
+        _log = log ?? NullLogger.Instance;
+    }
+
+    /// <summary>
+    /// Pure derivation of the poll interval from the live wakeup cadence: one
+    /// quarter of the cadence so expiry is noticed promptly, floored so a
+    /// short cadence does not hot-loop and capped so a day-long cadence still
+    /// notices a config change within minutes.
+    /// </summary>
+    public static TimeSpan ComputePollInterval(TimeSpan cadence)
+    {
+        if (cadence <= TimeSpan.Zero)
+            return MaxPollInterval;
+        var quarter = TimeSpan.FromTicks(cadence.Ticks / 4);
+        if (quarter < MinPollInterval)
+            return MinPollInterval;
+        return quarter > MaxPollInterval ? MaxPollInterval : quarter;
+    }
+
+    /// <summary>
+    /// Pure stall predicate: items wait in <c>Queued</c> while the dispatcher
+    /// has free slots on a running queue — capacity the queue is not using.
+    /// </summary>
+    public static bool IsStalled(QueueStatusResult queue, DispatchStatusResult dispatch)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        ArgumentNullException.ThrowIfNull(dispatch);
+        return queue.State == QueueState.Running
+            && dispatch.QueuedCount > 0
+            && dispatch.CurrentlyRunning < dispatch.MaxConcurrent;
+    }
+
+    /// <summary>
+    /// One watch pass: fires a debounced event wakeup when the queue is
+    /// stalled with free capacity, otherwise runs the scheduled tick when
+    /// due. Returns the wakeup result, or null when there was nothing due.
+    /// </summary>
+    public async Task<MajordomoWakeupResult?> CheckOnceAsync(CancellationToken ct = default)
+    {
+        QueueStatusResult queue;
+        DispatchStatusResult dispatch;
+        try
+        {
+            queue = await _reads.GetQueueStatusAsync(ct).ConfigureAwait(false);
+            dispatch = await _reads.GetDispatchStatusAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Majordomo wakeup: queue read failed; will retry next tick.");
+            return null;
+        }
+
+        if (IsStalled(queue, dispatch))
+        {
+            var detail = $"queued={dispatch.QueuedCount} running={dispatch.CurrentlyRunning}/{dispatch.MaxConcurrent}";
+            try
+            {
+                return await _coordinator.NotifyEventAsync(
+                    MajordomoWakeupKind.QueueStalled,
+                    detail,
+                    innerCt => AssessAsync(queue, dispatch, $"Queue stalled with free capacity ({detail}).", innerCt),
+                    ct: ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Majordomo wakeup: stalled-queue pass failed; will retry next tick.");
+                return null;
+            }
+        }
+
+        if (!_coordinator.IsScheduledDue())
+            return null;
+
+        try
+        {
+            return await _coordinator.RunScheduledAsync(
+                innerCt => AssessAsync(queue, dispatch, null, innerCt),
+                ct: ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Majordomo wakeup: scheduled pass failed; will retry next tick.");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Push trigger for a work item entering a terminal failure. Debounced by
+    /// the coordinator: a burst of failures inside the trigger floor produces
+    /// one wakeup, not one per failure.
+    /// </summary>
+    public Task<MajordomoWakeupResult> NotifyTerminalFailureAsync(
+        string workItemId, string? failureText, CancellationToken ct = default)
+    {
+        var reason = $"work item {workItemId} entered a terminal failure";
+        return _coordinator.NotifyEventAsync(
+            MajordomoWakeupKind.TerminalFailure,
+            reason,
+            innerCt => Task.FromResult(new MajordomoWakeupAssessment(
+                true,
+                string.IsNullOrWhiteSpace(failureText)
+                    ? $"{reason}; see get_work_item for detail."
+                    : $"{reason}: {failureText}")),
+            ct: ct);
+    }
+
+    private static Task<MajordomoWakeupAssessment> AssessAsync(
+        QueueStatusResult queue, DispatchStatusResult dispatch, string? prefix, CancellationToken ct)
+    {
+        var lines = new List<string>();
+        if (queue.State != QueueState.Running)
+            lines.Add($"Queue is {queue.State} (paused).");
+        var failures = queue.ItemCountsByState
+            .Where(kv => kv.Key is WorkItemState.Failed or WorkItemState.AuditFailed
+                or WorkItemState.MergeConflictResolutionFailed or WorkItemState.AbandonedAfterRecoveryAttempts
+                && kv.Value > 0)
+            .Select(kv => $"{kv.Key}: {kv.Value}")
+            .ToList();
+        if (failures.Count > 0)
+            lines.Add("Terminal failures: " + string.Join(", ", failures) + ".");
+        if (IsStalled(queue, dispatch))
+            lines.Add($"Queue stalled: {dispatch.QueuedCount} queued with {dispatch.CurrentlyRunning}/{dispatch.MaxConcurrent} slots occupied.");
+        var waitingQuota = queue.ItemCountsByState.TryGetValue(WorkItemState.WaitingForQuotaReset, out var quota) ? quota : 0;
+        if (waitingQuota > 0)
+            lines.Add($"Quota-blocked: {waitingQuota} items waiting for quota reset.");
+        var needsInput = queue.ItemCountsByState.TryGetValue(WorkItemState.NeedsOperatorInput, out var input) ? input : 0;
+        if (needsInput > 0)
+            lines.Add($"Needs operator: {needsInput} items parked for input.");
+
+        if (lines.Count == 0)
+            return Task.FromResult(new MajordomoWakeupAssessment(false));
+
+        var body = (prefix is null ? string.Empty : prefix + " ") + string.Join(" ", lines);
+        return Task.FromResult(new MajordomoWakeupAssessment(true, body));
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            TimeSpan delay;
+            try
+            {
+                delay = ComputePollInterval(TimeSpan.FromSeconds(
+                    _options.CurrentValue.Wakeup.WakeupIntervalSeconds));
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Majordomo wakeup service: failed to read options; retrying later.");
+                delay = MaxPollInterval;
+            }
+
+            try
+            {
+                await Task.Delay(delay, _clock, stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            try
+            {
+                var result = await CheckOnceAsync(stoppingToken).ConfigureAwait(false);
+                if (result is not null)
+                    _log.LogInformation(
+                        "Majordomo wakeup: {Kind} concluded {Outcome}.",
+                        result.Kind, result.Outcome);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Majordomo wakeup service: watch pass failed; will retry.");
+            }
+        }
+    }
+}
