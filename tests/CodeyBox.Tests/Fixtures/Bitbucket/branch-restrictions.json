@@ -1,0 +1,19 @@
+{
+  "pagelen": 50,
+  "page": 1,
+  "size": 2,
+  "values": [
+    {
+      "id": 1001,
+      "kind": "require_approvals_to_merge",
+      "pattern": "main",
+      "value": 2
+    },
+    {
+      "id": 1002,
+      "kind": "require_passing_builds_to_merge",
+      "pattern": "main",
+      "value": null
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "uuid": "{d4e5f678-9012-3456-7890-abcdef012345}",
+  "url": "https://hooks.example.com/codeybox-new",
+  "description": "CodeyBox upstream webhook",
+  "active": true,
+  "events": ["pullrequest:created"]
+}

@@ -1,0 +1,52 @@
+{
+  "id": 12,
+  "title": "Add feature Z",
+  "description": "Automated via CodeyBox",
+  "state": "OPEN",
+  "links": {
+    "html": {
+      "href": "https://bitbucket.org/myteam/myproject/pull-requests/12"
+    }
+  },
+  "source": {
+    "branch": { "name": "codeybox/abc123" },
+    "commit": { "hash": "4b5d3f4b0c1a2b3c4d5e6f708192a3b4c5d6e7f" }
+  },
+  "destination": {
+    "branch": { "name": "main" },
+    "commit": { "hash": "0be8717da52d7b24b5dd3586c8c4b7c8d0dcf0d" }
+  },
+  "merge_commit": null,
+  "author": { "display_name": "codeybox-bot", "nickname": "codeybox-bot" },
+  "participants": [
+    {
+      "user": { "display_name": "Alice", "nickname": "alice" },
+      "role": "REVIEWER",
+      "approved": true,
+      "state": "approved",
+      "participated_on": "2026-03-02T10:00:00.000+00:00"
+    },
+    {
+      "user": { "display_name": "Bob", "nickname": "bob" },
+      "role": "REVIEWER",
+      "approved": false,
+      "state": null,
+      "participated_on": null
+    },
+    {
+      "user": { "display_name": "Carol", "nickname": "carol" },
+      "role": "REVIEWER",
+      "approved": false,
+      "state": "changes_requested",
+      "participated_on": "2026-03-03T10:00:00.000+00:00"
+    },
+    {
+      "user": { "display_name": "Dave", "nickname": "dave" },
+      "role": "PARTICIPANT",
+      "approved": false,
+      "state": null,
+      "participated_on": "2026-03-04T10:00:00.000+00:00"
+    }
+  ],
+  "comment_count": 2
+}

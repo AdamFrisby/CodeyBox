@@ -1,0 +1,14 @@
+{
+  "pagelen": 50,
+  "page": 1,
+  "size": 1,
+  "values": [
+    {
+      "uuid": "{c3d4e5f6-7890-1234-5678-9abcdef01234}",
+      "url": "https://hooks.example.com/codeybox",
+      "description": "CodeyBox upstream webhook",
+      "active": true,
+      "events": ["repo:push", "pullrequest:created"]
+    }
+  ]
+}
