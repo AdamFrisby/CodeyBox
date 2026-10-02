@@ -1,0 +1,22 @@
+{
+  "devboxes": [
+    {
+      "id": "dbx_2XyZ9AbCDeF",
+      "name": "codeybox-a1b2c3d4-54321",
+      "status": "running",
+      "create_time_ms": 1789000000000,
+      "metadata": {
+        "codeybox-managed": "true",
+        "codeybox-provider": "runloop"
+      }
+    },
+    {
+      "id": "dbx_other",
+      "name": "someone-else",
+      "status": "running",
+      "create_time_ms": 1789000010000,
+      "metadata": {}
+    }
+  ],
+  "has_more": false
+}

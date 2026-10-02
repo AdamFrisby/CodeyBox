@@ -1,0 +1,10 @@
+{
+  "id": "snap_3AbCDeFgHiJk",
+  "name": "codeybox-baseline",
+  "create_time_ms": 1789000100000,
+  "metadata": {
+    "codeybox-managed": "true",
+    "codeybox-provider": "runloop"
+  },
+  "source_devbox_id": "dbx_2XyZ9AbCDeF"
+}

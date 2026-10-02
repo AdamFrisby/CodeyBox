@@ -1,0 +1,10 @@
+{
+  "devbox_id": "dbx_2XyZ9AbCDeF",
+  "execution_id": "exec_01J9ZQ7XYZABCDEF",
+  "status": "completed",
+  "stdout": "hello from the devbox\n",
+  "stderr": "",
+  "exit_status": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false
+}
