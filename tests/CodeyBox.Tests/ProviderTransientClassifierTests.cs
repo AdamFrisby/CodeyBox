@@ -105,12 +105,59 @@ public sealed class ProviderTransientClassifierTests
     [Fact]
     public void DevinCapacityError_ParksOnTransientBudgetPreservingModel()
     {
-        // The parked failure kind is the established transient budget (backoff
-        // with jitter, no TerminalFailureCount increment); the transition
-        // preserves the item's agent and model id, so the retry re-dispatches
-        // the same model id and never a different one.
-        Assert.Equal("transient", ProviderTransientRetryPolicy.ParkedFailureKind);
-        Assert.NotEqual("quota", ProviderTransientRetryPolicy.ParkedFailureKind);
+        // End-to-end through the real park path for the incident's Devin
+        // capacity shape: detector -> parked error -> WaitingForTransientRetry
+        // transition. The retry must re-dispatch the SAME agent and SAME
+        // model id (never a different, billable model), carry the established
+        // transient failure kind (bounded backoff-with-jitter budget), keep
+        // the work branch, and never increment TerminalFailureCount.
+        const string stderr = "Agent error: Client error: Protocol error (unimplemented): " +
+            "We are currently experiencing capacity issues with this serving model. " +
+            "Please switch to a different model";
+
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(stderr, null, null);
+        Assert.NotNull(detection);
+        Assert.Equal(ProviderTransientKind.ModelCapacity, detection!.Kind);
+
+        // The quota path is what switches models mid-iteration: it must stay
+        // silent so no failover re-dispatches a different model id.
+        var classifier = new CompositeQuotaFailureClassifier([new DevinQuotaFailureDetector()]);
+        Assert.Equal(
+            QuotaFailureClassificationKind.None,
+            classifier.Classify(AgentKind.Devin, stderr, null).Kind);
+
+        var parkedError = ProviderTransientRetryPolicy.BuildParkedError(detection);
+        Assert.Contains("model-capacity", parkedError);
+        Assert.Contains(detection.MatchedSignature, parkedError);
+
+        const string modelId = "devin-free-model";
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("provider-transient-test-project"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Working,
+            Agent = AgentKind.Devin,
+            ModelId = modelId,
+            WorkBranch = "codeybox/wip-test",
+        };
+
+        var parked = item.With(
+            WorkItemState.WaitingForTransientRetry,
+            parkedError,
+            failureKind: ProviderTransientRetryPolicy.ParkedFailureKind);
+
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, parked.State);
+        Assert.Equal(ProviderTransientRetryPolicy.ParkedFailureKind, parked.FailureKind);
+        Assert.Equal("transient", parked.FailureKind);
+        Assert.Equal(AgentKind.Devin, parked.Agent);
+        Assert.Equal(modelId, parked.ModelId);
+        Assert.NotEqual("some-other-model", parked.ModelId);
+        Assert.Equal(item.TerminalFailureCount, parked.TerminalFailureCount);
+        Assert.Equal(0, parked.TerminalFailureCount);
+        Assert.Equal(item.WorkBranch, parked.WorkBranch);
+        Assert.Equal(parkedError, parked.LastError);
     }
 
     [Theory]
