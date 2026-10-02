@@ -58,6 +58,7 @@
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.CargoDenyAuditorPlugin\CodeyBox.CargoDenyAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.GovulncheckAuditorPlugin\CodeyBox.GovulncheckAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.GrypeAuditorPlugin\CodeyBox.GrypeAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-dependency-vulnerabilities\CodeyBox.PipAuditAuditorPlugin\CodeyBox.PipAuditAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-documentation\CodeyBox.LycheeAuditorPlugin\CodeyBox.LycheeAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-documentation\CodeyBox.MarkdownlintAuditorPlugin\CodeyBox.MarkdownlintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-documentation\CodeyBox.ValeAuditorPlugin\CodeyBox.ValeAuditorPlugin.csproj" />
