@@ -126,6 +126,7 @@
     <Project Path="plugins/upstream/CodeyBox.GiteaUpstreamPlugin/CodeyBox.GiteaUpstreamPlugin.csproj" />
     <Project Path="plugins/upstream/CodeyBox.ForgejoUpstreamPlugin/CodeyBox.ForgejoUpstreamPlugin.csproj" />
     <Project Path="plugins/upstream/CodeyBox.BitbucketUpstreamPlugin/CodeyBox.BitbucketUpstreamPlugin.csproj" />
+    <Project Path="plugins/upstream/CodeyBox.GitLabUpstreamPlugin/CodeyBox.GitLabUpstreamPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.SlackPlugin/CodeyBox.SlackPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.GotifyPlugin/CodeyBox.GotifyPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.NtfyPlugin/CodeyBox.NtfyPlugin.csproj" />

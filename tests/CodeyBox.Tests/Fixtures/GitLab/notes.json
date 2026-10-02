@@ -1,0 +1,50 @@
+[
+  {
+    "id": 301,
+    "body": "Looks good overall.",
+    "author": {
+      "id": 12,
+      "username": "reviewer-ada",
+      "name": "Ada Reviewer"
+    },
+    "system": false,
+    "created_at": "2026-09-10T11:00:00.000Z",
+    "discussion_id": "aaa111",
+    "position": null,
+    "resolvable": false
+  },
+  {
+    "id": 302,
+    "body": "Please rename this variable.",
+    "author": {
+      "id": 11,
+      "username": "approver-bob",
+      "name": "Bob Approver"
+    },
+    "system": false,
+    "created_at": "2026-09-10T11:05:00.000Z",
+    "discussion_id": "bbb222",
+    "position": {
+      "position_type": "text",
+      "old_path": null,
+      "new_path": "src/widget.cs",
+      "old_line": null,
+      "new_line": 42
+    },
+    "resolvable": true
+  },
+  {
+    "id": 303,
+    "body": "added 1 commit",
+    "author": {
+      "id": 10,
+      "username": "codeybox-bot",
+      "name": "CodeyBox"
+    },
+    "system": true,
+    "created_at": "2026-09-10T11:06:00.000Z",
+    "discussion_id": "ccc333",
+    "position": null,
+    "resolvable": false
+  }
+]
