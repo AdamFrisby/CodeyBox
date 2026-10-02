@@ -51,6 +51,26 @@ public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier, I
     public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
         => Classify(agent, stderr, stdout).Detection;
 
+    public ProviderTransientDetection? DetectProviderTransient(
+        AgentKind agent,
+        string? stderr,
+        string? stdout,
+        string? summary = null)
+    {
+        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
+            return null;
+        try
+        {
+            if (!_detectors.TryGetValue(agent, out var detector))
+                return null;
+            return detector.DetectProviderTransient(stderr, stdout, summary);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     public void EmitAdvisoryAuditEvents(AgentKind agent, string? stderr, string? stdout, string phase, string? sandboxName)
     {
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))

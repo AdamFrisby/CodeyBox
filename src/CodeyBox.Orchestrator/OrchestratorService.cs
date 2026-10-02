@@ -49,6 +49,16 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         }
     }
 
+    /// <summary>
+    /// True while a host-level provider-transient pause is active: the same
+    /// transient signature recently hit several agents, so the cause is
+    /// likely host/network-level and new spawns hold briefly instead of
+    /// dispatching into the blip. Unlike <see cref="IsDispatchPaused"/> this
+    /// is temporary and self-expiring — the dispatch loop waits it out and
+    /// re-checks rather than stopping.
+    /// </summary>
+    public bool IsHostTransientPaused() =>
+        _hostTransientPause?.IsPaused(DateTimeOffset.UtcNow) ?? false;
 
     private readonly ITaskQueue _queue;
     private readonly IWorkItemStore _store;
@@ -175,6 +185,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     // notes an evaluation, every pickup clears the quota episode. Deferred
     // membership is answered live from _deferredItems so the two cannot drift.
     private readonly DispatchItemLivenessTracker? _dispatchLiveness;
+    private readonly ProviderTransientCorrelationTracker? _hostTransientPause;
 
     /// <summary>Test/diagnostic hook for the dispatch-liveness record.</summary>
     internal DispatchItemLivenessTracker? DispatchLiveness => _dispatchLiveness;
@@ -259,6 +270,13 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     // load on SqliteQueueController so cadence is not a contention concern.
     private static readonly TimeSpan QueuePauseResumePollInterval = TimeSpan.FromMilliseconds(250);
 
+    /// <summary>
+    /// Re-check cadence while a host-level provider-transient pause holds
+    /// dispatch. Fifteen seconds keeps the hold responsive to the pause's
+    /// self-expiry (default two minutes) without spinning the loop.
+    /// </summary>
+    private static readonly TimeSpan HostTransientPauseRecheckDelay = TimeSpan.FromSeconds(15);
+
     private enum SpawnPacingWaitResult
     {
         Completed,
@@ -327,7 +345,13 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         QuotaReservationLedger? reservationLedger = null,
         IWorkItemCostStore? costStore = null,
         AgentBurnEstimatorOptions? burnEstimatorOptions = null,
-        DispatchItemLivenessTracker? dispatchLiveness = null)
+        DispatchItemLivenessTracker? dispatchLiveness = null,
+        // Host-level provider-transient correlation gate: while a tripped
+        // signature pause is active the dispatch loop holds new spawns
+        // briefly instead of dispatching into a host/network blip. Optional;
+        // null disables the gate. Production DI shares the process-wide
+        // instance the PipelineRunner observes into.
+        ProviderTransientCorrelationTracker? hostTransientPause = null)
     {
         _queue = queue;
         _store = store;
@@ -359,6 +383,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         _burnEstimatorOptions = burnEstimatorOptions;
         _time = timeProvider ?? TimeProvider.System;
         _dispatchLiveness = dispatchLiveness;
+        _hostTransientPause = hostTransientPause;
         if (_dispatchLiveness is not null)
             _dispatchLiveness.IsDeferredProvider = id => _deferredItems.Contains(id);
         _activeSandboxCountProvider = activeSandboxCountProvider ?? (static () => SandboxLiveCounter.Active);
@@ -1486,6 +1511,23 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
             // in-flight worker tasks already in flight continue normally.
             if (IsDispatchPaused) break;
 
+            // Host-level provider-transient pause: the same transient
+            // signature recently hit several agents, so the cause is likely
+            // host/network-level. Hold new spawns briefly instead of
+            // dispatching into the blip and burning every item's retry
+            // budget; in-flight workers continue normally. Unlike the
+            // shutdown gate above this is temporary and self-expiring — wait
+            // it out and re-check rather than stopping the loop.
+            if (IsHostTransientPaused())
+            {
+                _log.LogDebug(
+                    "Dispatch held by host-level provider-transient pause; re-checking in {Delay}",
+                    HostTransientPauseRecheckDelay);
+                try { await Task.Delay(HostTransientPauseRecheckDelay, stoppingToken); }
+                catch (OperationCanceledException) { break; }
+                continue;
+            }
+
             // Pause gate: spin-wait while the queue is paused, without consuming
             // from the channel. In-flight workers continue normally during pause.
             if (!await WaitIfPausedAsync(stoppingToken)) break;
@@ -1505,6 +1547,15 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
             // happily pick up a real queued item from the store and spawn a new
             // sandbox that races the snapshot.
             if (IsDispatchPaused) break;
+
+            // Post-dequeue host-transient check: a pause may have tripped
+            // while the dispatch signal wait was blocked. Preserve a wake for
+            // resume but do not pick work while the host pause is active.
+            if (IsHostTransientPaused())
+            {
+                await RequeueDispatchWakeAsync(stoppingToken);
+                continue;
+            }
 
             // Post-dequeue pause check: handles the race where the queue was paused
             // while we were blocked in DequeueAsync. Just loop; we'll re-check

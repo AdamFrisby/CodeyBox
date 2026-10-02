@@ -165,6 +165,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Agents.CavemanCode\CodeyBox.Agents.CavemanCode.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Unreal\CodeyBox.Agents.Unreal.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Devin\CodeyBox.Agents.Devin.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents.Cmd\CodeyBox.Agents.Cmd.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents\CodeyBox.Agents.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />

@@ -776,6 +776,23 @@ public sealed partial class PipelineRunner
             // but produces no useful diff — without this log, we have no
             // visibility into what the agent reasoned.
             LogAgentOutput(_log, runner.Kind, agentResult);
+            // Output-truncation transients (the model hit its maximum output
+            // token limit mid-turn) resume the same session with a bounded
+            // "continue" nudge instead of failing outright: a nudged turn
+            // that succeeds rejoins the normal success path below with the
+            // work branch intact; otherwise the failure handling parks the
+            // checkpointed turn for bounded transient retry.
+            if (!agentResult.Success)
+                agentResult = await TryTruncationContinueNudgesAsync(
+                    item,
+                    runner,
+                    sandbox,
+                    credential,
+                    sessionLifecycle,
+                    useClaudeSession,
+                    agentResult,
+                    agentPhase,
+                    ct);
             AgentAuthFailureDetection? deferredSuccessAuthDetection = null;
             if (agentResult.Success)
             {
@@ -824,6 +841,14 @@ public sealed partial class PipelineRunner
                     ?? _authFailureClassifier.ClassifyFailure(runner, agentResult);
                 var quotaClassification = _quotaClassifier.Classify(runner.Kind, agentResult.Stderr, agentResult.Stdout);
                 var detection = quotaClassification.Detection;
+                // Provider-side transients are detected before the quota path
+                // below: a capacity-shaped error must retry the SAME agent and
+                // model (quota failover could switch models, and for some
+                // agents only the configured model may be used), and
+                // truncation/transport retries resume the checkpointed session.
+                // Execution-unavailable results (dead sandbox transport) stay
+                // on the infrastructure path below, which owns them.
+                var providerTransient = DetectProviderTransientForRetry(runner.Kind, agentResult);
                 if (detection is { Kind: var refundKind } && refundKind.IsExhaustionSignal())
                 {
                     // A quota/rate-limit failure before the agent produced
@@ -835,6 +860,7 @@ public sealed partial class PipelineRunner
                         item, agentResult, sandbox, shaBefore, ct);
                 }
                 var canDurablyResumeFailure = detection is not null
+                    || providerTransient is not null
                     || resolvedFailureClassification.Kind == AgentFailureKind.TransientNetwork
                     || resolvedFailureClassification.Kind == AgentFailureKind.Infrastructure
                         && agentResult.ExecutionUnavailable
@@ -856,6 +882,19 @@ public sealed partial class PipelineRunner
 
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
+                if (providerTransient is not null)
+                {
+                    // The turn is already checkpointed above, so the work
+                    // branch and any partial commits survive; the parked item
+                    // keeps its agent and model id and counts toward the
+                    // existing bounded transient-retry budget (backoff with
+                    // jitter) instead of incrementing TerminalFailureCount.
+                    ObserveProviderTransient(runner.Kind, providerTransient);
+                    AuditLog.ProviderTransientParked(
+                        item.Id, runner.Kind, observedModelId,
+                        providerTransient.Kind, providerTransient.MatchedSignature, agentPhase);
+                    throw BuildProviderTransientRetry(runner.Kind, agentPhase, providerTransient, "during");
+                }
                 // Only genuine quota/rate-limit signals take the quota path. A
                 // 401/403 (Unauthorized) never clears on a quota window: it must
                 // fall through to the auth handling above/below, never bench the
@@ -1617,6 +1656,124 @@ public sealed partial class PipelineRunner
     /// sandbox session so the agent resumes its own transcript instead of
     /// restarting the task.
     /// </summary>
+    /// <summary>
+    /// Bounded same-session "continue" nudges for output-truncation
+    /// transients: the turn failed because the model hit its maximum output
+    /// token limit mid-turn. Each nudge resumes the same session (the live
+    /// session handle when one is open, otherwise the same runner in the same
+    /// sandbox with the work branch intact) with an explicit continuation
+    /// prompt, bounded by
+    /// <c>PipelineTuning.ProviderTransientTruncationMaxNudges</c> clamped to
+    /// <see cref="ProviderTransientRetryPolicy.MaxTruncationContinueNudges"/>.
+    /// Returns the last result — a successful nudge rejoins the normal
+    /// success path; otherwise the caller parks the checkpointed turn for
+    /// bounded transient retry. Nudging stops early when a nudge fails
+    /// without the truncation signature (a different failure needs the normal
+    /// failure handling, not more continuation). Cancellation propagates;
+    /// other dispatch failures end nudging and return the last result.
+    /// </summary>
+    private async Task<AgentResult> TryTruncationContinueNudgesAsync(
+        WorkItem item,
+        IAgentRunner runner,
+        ISandbox sandbox,
+        AgentCredential? credential,
+        ClaudeSessionLifecycle? sessionLifecycle,
+        bool useClaudeSession,
+        AgentResult failedResult,
+        string agentPhase,
+        CancellationToken ct)
+    {
+        ProviderTransientDetection? detection;
+        try
+        {
+            // A dead sandbox transport cannot run nudge turns; the failure
+            // handling below routes those to the infrastructure path.
+            detection = failedResult.ExecutionUnavailable
+                ? null
+                : _quotaClassifier.DetectProviderTransient(
+                    runner.Kind,
+                    failedResult.Stderr,
+                    failedResult.Stdout,
+                    failedResult.Summary);
+        }
+        catch (Exception)
+        {
+            return failedResult;
+        }
+
+        if (detection?.Kind != ProviderTransientKind.OutputTruncation)
+            return failedResult;
+
+        var maxNudges = ProviderTransientRetryPolicy.ClampTruncationNudges(
+            Math.Max(0, _pipelineTuning.Current.ProviderTransientTruncationMaxNudges));
+        if (maxNudges <= 0)
+            return failedResult;
+
+        var current = failedResult;
+        for (var nudgeAttempt = 1; nudgeAttempt <= maxNudges; nudgeAttempt++)
+        {
+            _log.LogInformation(
+                "Work item {Id} {Phase} turn hit the model output-token limit; sending continue nudge {Attempt}/{Max} in the same session",
+                item.Id, agentPhase, nudgeAttempt, maxNudges);
+            AgentResult nudgeResult;
+            try
+            {
+                var nudgePrompt = ProviderTransientRetryPolicy.BuildTruncationContinuePrompt(agentPhase);
+                nudgeResult = useClaudeSession && sessionLifecycle is not null && !sessionLifecycle.IsClosed
+                    ? await sessionLifecycle.SendTurnAsync(nudgePrompt, ct, stdoutChunkCallback: null)
+                    : await runner.RunAsync(
+                        sandbox,
+                        SandboxConventions.WorkDir,
+                        nudgePrompt,
+                        credential,
+                        item.ModelId,
+                        item.ReasoningMode,
+                        ct,
+                        stdoutChunkCallback: null,
+                        captureStructuredStream: false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Work item {Id} {Phase} truncation continue nudge {Attempt}/{Max} could not be dispatched; parking for transient retry",
+                    item.Id, agentPhase, nudgeAttempt, maxNudges);
+                break;
+            }
+
+            current = nudgeResult;
+            if (nudgeResult.Success)
+            {
+                _log.LogInformation(
+                    "Work item {Id} {Phase} truncation continue nudge {Attempt}/{Max} succeeded; resuming normal evaluation",
+                    item.Id, agentPhase, nudgeAttempt, maxNudges);
+                return current;
+            }
+
+            ProviderTransientDetection? nudgeDetection;
+            try
+            {
+                nudgeDetection = _quotaClassifier.DetectProviderTransient(
+                    runner.Kind,
+                    nudgeResult.Stderr,
+                    nudgeResult.Stdout,
+                    nudgeResult.Summary);
+            }
+            catch (Exception)
+            {
+                break;
+            }
+
+            if (nudgeDetection?.Kind != ProviderTransientKind.OutputTruncation)
+                break;
+        }
+
+        return current;
+    }
+
     private static string BuildEarlyEndedContinuePrompt(string agentPhase) =>
         $"Your previous {agentPhase} turn ended before producing a completion summary and without committing any changes. "
         + "Continue and finish the task: implement the required changes, commit them, and provide a brief completion summary.";

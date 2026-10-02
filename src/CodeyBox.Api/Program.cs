@@ -479,12 +479,21 @@ builder.Services.AddSingleton(sp =>
     AgentClassesOverrideResolver.ApplyTo(snapshot, config);
     AgentClassesOverrideResolver.ApplySandboxClassesTo(snapshot, config);
     AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(snapshot.TransientNetworkFailurePatterns);
+    ProviderTransientSignatureBinder.SyncStore(snapshot);
     return new CodeyBoxOptionsStartupSnapshot(snapshot);
 });
 builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
     sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value,
-        opts => AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns)));
+        opts =>
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns);
+            if (!ProviderTransientSignatureBinder.TrySyncStore(opts, out var transientError))
+            {
+                sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBoxOptions")
+                    .LogWarning("Hot-reload of CodeyBox:ProviderTransientSignatures rejected; keeping prior signatures: {Error}", transientError);
+            }
+        }));
 builder.Services.TryAddSingleton<IProcessRunner, DefaultProcessRunner>();
 builder.Services.TryAddSingleton<IOpenSshConfigResolver, OpenSshConfigResolver>();
 builder.Services.TryAddSingleton<E2eRemoteHostValidation>();
@@ -2862,6 +2871,21 @@ builder.Services.AddSingleton<PipelineTuningSnapshot>(sp =>
     new PipelineTuningSnapshot(
         sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.PipelineTuning));
 
+// Provider-transient host correlation — one process-wide tracker shared by
+// the PipelineRunner (which observes signature hits) and the
+// OrchestratorService dispatch loop (which holds new spawns while a tripped
+// pause is active). Settings read live from PipelineTuningSnapshot so
+// operator edits to the correlation window / threshold / pause take effect
+// without a restart.
+builder.Services.AddSingleton<ProviderTransientCorrelationTracker>(sp =>
+{
+    var tuning = sp.GetRequiredService<PipelineTuningSnapshot>();
+    return new ProviderTransientCorrelationTracker(() => ProviderTransientCorrelationSettings.Create(
+        tuning.Current.ProviderTransientCorrelationWindow,
+        tuning.Current.ProviderTransientCorrelationThreshold,
+        tuning.Current.ProviderTransientDispatchPause));
+});
+
 // NonDeterministicTestEscalationSnapshot — hot-reloadable thresholds for the
 // NotDiffAttributable flake-escalation path (spawn-or-reuse a base-branch
 // fix item and park the parent on dependsOn). Same swappable-singleton
@@ -5121,7 +5145,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // Project.TestSelectionBaselineEnabled.
     baselineScheduler: sp.GetRequiredService<TestSelectionBaselineScheduler>(),
     baselineProductionOptions: () => sp.GetRequiredService<IOptionsMonitor<TestSelectionBaselineProductionOptions>>().CurrentValue,
-    baselineStager: sp.GetRequiredService<TestSelectionBaselineAuditStager>()));
+    baselineStager: sp.GetRequiredService<TestSelectionBaselineAuditStager>(),
+    providerTransientCorrelation: sp.GetRequiredService<ProviderTransientCorrelationTracker>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -5385,7 +5410,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     reservationLedger: sp.GetRequiredService<QuotaReservationLedger>(),
     costStore: sp.GetService<IWorkItemCostStore>(),
     burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>(),
-    dispatchLiveness: sp.GetRequiredService<DispatchItemLivenessTracker>()));
+    dispatchLiveness: sp.GetRequiredService<DispatchItemLivenessTracker>(),
+    hostTransientPause: sp.GetRequiredService<ProviderTransientCorrelationTracker>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -7585,6 +7611,16 @@ namespace CodeyBox.Api
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
+        /// Operator-extensible per-agent provider-transient signatures. Keys
+        /// are agent kind values (e.g. <c>devin</c>, <c>copilot</c>); each
+        /// entry adds a .NET regular expression + transient family to the
+        /// per-provider detector's built-in exact signatures. Matched against
+        /// stderr, stdout, and the summary. Hot-reloaded without a restart.
+        /// See docs/operating/quota.md for the schema.
+        /// </summary>
+        public Dictionary<string, List<ProviderTransientSignatureOptions>> ProviderTransientSignatures { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
         /// Operator-extensible per-agent auth/login-prompt output patterns.
         /// Keys are agent kind values (e.g. <c>antigravity</c>); each entry adds
         /// a case-insensitive stderr/stdout substring to the built-in login-prompt
@@ -9106,6 +9142,24 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
+    /// One operator-supplied provider-transient signature entry. Appended to
+    /// the per-agent detector's built-in exact signatures and matched as a
+    /// .NET regular expression (case-insensitive, singleline) against stderr,
+    /// stdout, and the summary. Bound from
+    /// <c>CodeyBox:ProviderTransientSignatures:&lt;agent-kind&gt;</c>.
+    /// Patterns must name a multi-token provider diagnostic — never a bare
+    /// word or status code — so model prose cannot match. Hot-reloaded: edits
+    /// take effect without a restart.
+    /// </summary>
+    public sealed class ProviderTransientSignatureOptions
+    {
+        /// <summary>The .NET regular expression to match.</summary>
+        public string Pattern { get; set; } = string.Empty;
+        /// <summary>Which transient family to report on match.</summary>
+        public ProviderTransientKind Kind { get; set; } = ProviderTransientKind.InfraTransport;
+    }
+
+    /// <summary>
     /// One operator-supplied auth/login-prompt pattern entry. Appended to the
     /// built-in defaults and matched case-insensitively against the configured
     /// stream. Bound from <c>CodeyBox:AuthFailurePatterns:&lt;agent-kind&gt;</c>.
@@ -9150,6 +9204,67 @@ namespace CodeyBox.Api
                             .ToArray(),
                         StringComparer.OrdinalIgnoreCase);
             return new AgentAuthFailureClassifier(extras);
+        }
+    }
+
+    /// <summary>
+    /// Pure conversion from operator-supplied
+    /// <see cref="CodeyBoxOptions.ProviderTransientSignatures"/> to the
+    /// hot-reloadable <see cref="ProviderTransientSignatureStore"/>. Extracted
+    /// from the DI wiring so the binding shape (config section name,
+    /// per-agent dictionary, pattern filtering) is reachable from unit tests
+    /// without booting the full host.
+    /// </summary>
+    public static class ProviderTransientSignatureBinder
+    {
+        public static IReadOnlyDictionary<string, ProviderTransientSignature[]> Build(CodeyBoxOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            if (options.ProviderTransientSignatures is null)
+                return new Dictionary<string, ProviderTransientSignature[]>(StringComparer.OrdinalIgnoreCase);
+            return options.ProviderTransientSignatures
+                .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Key))
+                .ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => (kvp.Value ?? new List<ProviderTransientSignatureOptions>())
+                        .Where(p => p is not null && !string.IsNullOrWhiteSpace(p.Pattern))
+                        .Select(p => new ProviderTransientSignature(p.Pattern.Trim(), p.Kind))
+                        .ToArray(),
+                    StringComparer.OrdinalIgnoreCase);
+        }
+
+        public static void SyncStore(CodeyBoxOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            ProviderTransientSignatureStore.SyncAgents(
+                Build(options).ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => (IEnumerable<ProviderTransientSignature>?)kvp.Value,
+                    StringComparer.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Reload-safe <see cref="SyncStore"/> wrapper: invalid operator
+        /// patterns keep the prior live table (the sync is atomic) and report
+        /// the rejection instead of throwing through the options-refresh
+        /// pipeline, which would disturb every other re-bound section.
+        /// Startup still fails loudly through
+        /// <see cref="CodeyBoxOptionsValidator"/>.
+        /// </summary>
+        public static bool TrySyncStore(CodeyBoxOptions options, out string? error)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            try
+            {
+                SyncStore(options);
+                error = null;
+                return true;
+            }
+            catch (ArgumentException ex)
+            {
+                error = ex.Message;
+                return false;
+            }
         }
     }
 

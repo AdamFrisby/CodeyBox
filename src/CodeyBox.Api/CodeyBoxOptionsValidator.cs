@@ -367,6 +367,23 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:EarlyEndedTurnMaxNudges must be non-negative");
         }
+        if (options.PipelineTuning.ProviderTransientTruncationMaxNudges < 0)
+        {
+            failures.Add("CodeyBox:PipelineTuning:ProviderTransientTruncationMaxNudges must be non-negative");
+        }
+        if (options.PipelineTuning.ProviderTransientCorrelationWindow <= TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:ProviderTransientCorrelationWindow must be a positive TimeSpan");
+        }
+        if (options.PipelineTuning.ProviderTransientCorrelationThreshold < 1)
+        {
+            failures.Add("CodeyBox:PipelineTuning:ProviderTransientCorrelationThreshold must be >= 1");
+        }
+        if (options.PipelineTuning.ProviderTransientDispatchPause < TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:ProviderTransientDispatchPause must be non-negative");
+        }
+        ValidateProviderTransientSignatures(options, failures);
         if (options.PipelineTuning.DefaultRateLimitPause <= TimeSpan.Zero)
         {
             failures.Add("CodeyBox:PipelineTuning:DefaultRateLimitPause must be a positive TimeSpan");
@@ -435,6 +452,46 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
+    }
+
+    private static void ValidateProviderTransientSignatures(CodeyBoxOptions options, ICollection<string> failures)
+    {
+        if (options.ProviderTransientSignatures is null)
+            return;
+        foreach (var (agent, entries) in options.ProviderTransientSignatures)
+        {
+            if (string.IsNullOrWhiteSpace(agent))
+            {
+                failures.Add("CodeyBox:ProviderTransientSignatures: agent key must not be empty");
+                continue;
+            }
+            if (entries is null)
+                continue;
+            if (entries.Count > ProviderTransientSignatureStore.MaxSignaturesPerAgent)
+            {
+                failures.Add(
+                    $"CodeyBox:ProviderTransientSignatures:{agent}: at most {ProviderTransientSignatureStore.MaxSignaturesPerAgent} entries are retained");
+            }
+            foreach (var entry in entries)
+            {
+                if (entry is null || string.IsNullOrWhiteSpace(entry.Pattern))
+                {
+                    failures.Add($"CodeyBox:ProviderTransientSignatures:{agent}: pattern must not be empty");
+                    continue;
+                }
+                if (entry.Pattern.Length > ProviderTransientSignatureStore.MaxSignatureChars)
+                {
+                    failures.Add(
+                        $"CodeyBox:ProviderTransientSignatures:{agent}: pattern exceeds {ProviderTransientSignatureStore.MaxSignatureChars} chars");
+                    continue;
+                }
+                if (ProviderTransientMatcher.TryCompile(entry.Pattern) is null)
+                {
+                    failures.Add(
+                        $"CodeyBox:ProviderTransientSignatures:{agent}: pattern does not compile as a .NET regular expression: '{entry.Pattern}'");
+                }
+            }
+        }
     }
 
     private static string NormalizeSandboxProviderId(

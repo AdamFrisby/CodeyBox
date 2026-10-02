@@ -60,6 +60,8 @@ public sealed partial class PipelineRunner
     {
         if (TryBuildTransientAgentFailure(runner, result, phase, "during") is { } transient)
             throw transient;
+        if (TryBuildProviderTransientFailure(runner, result, phase, "during") is { } providerTransient)
+            throw providerTransient;
     }
 
     private void ThrowIfInfrastructureAgentFailure(
@@ -139,6 +141,14 @@ public sealed partial class PipelineRunner
         {
             throw transient;
         }
+        if (TryBuildProviderTransientFailure(
+                runner,
+                resumeEx.LastResult,
+                phase,
+                "after exhausting session resume during") is { } providerTransient)
+        {
+            throw providerTransient;
+        }
     }
 
     private TerminalTransientNetworkError? TryBuildTransientAgentFailure(
@@ -161,6 +171,99 @@ public sealed partial class PipelineRunner
             phase,
             classification,
             $"Agent {runner.Kind} reported transient transport failure {failureContext}{phaseSuffix}: {summary} ({reason})");
+    }
+
+    /// <summary>
+    /// Builds a bounded provider-transient retry for failures carrying one of
+    /// the agent's exact transient signatures (model capacity, output-token
+    /// truncation, transport/upstream blip). Consulted after the generic
+    /// transport classifier so every <c>ThrowIfTransientAgentFailure</c> call
+    /// site — work, planning, audit, rework, merge, check, rebase — parks
+    /// these instead of failing terminally. Returns null when nothing
+    /// matches. Never throws: the per-agent detectors are total, and the
+    /// composite call is guarded.
+    /// </summary>
+    private ProviderTransientRetryException? TryBuildProviderTransientFailure(
+        IAgentRunner runner,
+        AgentResult result,
+        string? phase,
+        string failureContext)
+    {
+        var detection = DetectProviderTransientForRetry(runner.Kind, result);
+        if (detection is null)
+            return null;
+
+        ObserveProviderTransient(runner.Kind, detection);
+        return BuildProviderTransientRetry(runner.Kind, phase, detection, failureContext);
+    }
+
+    /// <summary>
+    /// Returns the provider-side transient family for a failed turn, or null
+    /// when nothing matches or the result is execution-unavailable. An
+    /// execution-unavailable result means the sandbox transport itself is
+    /// dead (reaped VM, severed exec channel): nothing the CLI printed about
+    /// the provider is trustworthy, and shapes like "connection reset"
+    /// describe the sandbox — not the provider. The established
+    /// infrastructure handling owns those; provider-transients only cover
+    /// failures the CLI itself reports after its own retries. Never throws.
+    /// </summary>
+    private ProviderTransientDetection? DetectProviderTransientForRetry(AgentKind agent, AgentResult result)
+    {
+        if (result.ExecutionUnavailable)
+            return null;
+        return DetectProviderTransientSafe(agent, result);
+    }
+
+    /// <summary>
+    /// Returns the provider-side transient family for a failed turn, or null
+    /// when nothing matches. Never throws.
+    /// </summary>
+    private ProviderTransientDetection? DetectProviderTransientSafe(AgentKind agent, AgentResult result)
+    {
+        try
+        {
+            return _quotaClassifier.DetectProviderTransient(
+                agent,
+                result.Stderr,
+                result.Stdout,
+                result.Summary);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static ProviderTransientRetryException BuildProviderTransientRetry(
+        AgentKind agent,
+        string? phase,
+        ProviderTransientDetection detection,
+        string failureContext)
+    {
+        var phaseSuffix = string.IsNullOrWhiteSpace(phase) ? "" : $" {phase}";
+        return new ProviderTransientRetryException(
+            agent,
+            phase,
+            detection,
+            $"Agent {agent} reported provider-transient failure {failureContext}{phaseSuffix}: {ProviderTransientRetryPolicy.BuildParkedError(detection)}");
+    }
+
+    /// <summary>
+    /// Records one provider-transient observation for host-level correlation.
+    /// When the same signature recently hit several agents, dispatch is
+    /// already (or now) paused briefly instead of burning every item's retry
+    /// budget; either way this item still parks for its own bounded retry.
+    /// </summary>
+    private void ObserveProviderTransient(AgentKind agent, ProviderTransientDetection detection)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (!_providerTransientCorrelation.Observe(detection.MatchedSignature, agent, now))
+            return;
+
+        _log.LogWarning(
+            "Provider-transient signature {Signature} observed from multiple agents within the correlation window; pausing dispatch briefly (host/network-level cause suspected)",
+            detection.MatchedSignature);
+        AuditLog.ProviderTransientHostPause(detection.MatchedSignature, agent);
     }
 
     internal static string BuildAgentFailureDetail(

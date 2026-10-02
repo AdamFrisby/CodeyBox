@@ -211,6 +211,7 @@ public sealed partial class PipelineRunner
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
     private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
+    private readonly ProviderTransientCorrelationTracker _providerTransientCorrelation;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
     private readonly IAgentAuthRequiredHandler _authRequiredHandler;
     // Structured port replacing the freeform AgentAvailability.Reason
@@ -595,7 +596,13 @@ public sealed partial class PipelineRunner
         // nothing (selectors fall back to the full suite unchanged).
         TestSelectionBaselineScheduler? baselineScheduler = null,
         Func<TestSelectionBaselineProductionOptions>? baselineProductionOptions = null,
-        TestSelectionBaselineAuditStager? baselineStager = null)
+        TestSelectionBaselineAuditStager? baselineStager = null,
+        // Host-level provider-transient correlation (same signature across
+        // agents within a short window pauses dispatch briefly). Optional:
+        // production DI shares one process-wide instance with the dispatch
+        // loop's pause gate; null falls back to a runner-local default
+        // tracker so the behavior is on everywhere.
+        ProviderTransientCorrelationTracker? providerTransientCorrelation = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -642,6 +649,7 @@ public sealed partial class PipelineRunner
             _quotaAuditEmitter = quotaClassifier as IQuotaFailureAuditEmitter
                 ?? NullQuotaFailureAuditEmitter.Instance;
         }
+        _providerTransientCorrelation = providerTransientCorrelation ?? new ProviderTransientCorrelationTracker();
         _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
         _inVmSmokeGate = inVmSmokeGate;
         _retryScheduler = retryScheduler;

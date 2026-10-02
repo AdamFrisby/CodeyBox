@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 
@@ -110,4 +111,27 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
 
         return null;
     }
+
+    /// <summary>
+    /// Devin-specific exact transient signatures, checked before the shared
+    /// agent-neutral sets. The devin CLI wraps provider refusals in its own
+    /// <c>Agent error: Client error: Protocol error (unimplemented)</c>
+    /// envelope (verified), which is devin-shaped rather than
+    /// provider-relayed. Operator extras from
+    /// <c>CodeyBox:ProviderTransientSignatures:devin</c> are appended at
+    /// detect time via <see cref="ProviderTransientSignatureStore"/>.
+    /// </summary>
+    private static readonly AgentTransientSignature[] DevinTransientSignatures =
+    [
+        new(
+            new Regex(
+                @"protocol error\s*\(unimplemented\)",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant,
+                ProviderTransientMatcher.MatchTimeout),
+            ProviderTransientKind.ModelCapacity,
+            "protocol-unimplemented"),
+    ];
+
+    public ProviderTransientDetection? DetectProviderTransient(string? stderr, string? stdout, string? summary)
+        => ProviderTransientDetectorCore.Detect(Kind.Value, stderr, stdout, summary, DevinTransientSignatures);
 }

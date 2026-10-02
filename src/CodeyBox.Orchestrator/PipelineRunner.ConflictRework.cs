@@ -173,6 +173,21 @@ public sealed partial class PipelineRunner
                 parkReason: ex.Message);
             throw;
         }
+        catch (ProviderTransientRetryException ex)
+        {
+            // Provider-side transient: report the park and rethrow so the
+            // outer pipeline parks for bounded transient retry on the same
+            // agent and model instead of converting this to a rework
+            // failure below.
+            _log.LogWarning(ex,
+                "Conflict rework agent invocation hit provider-transient failure for work item {Id}: kind={Kind} signature={Signature}",
+                item.Id, ex.Detection.Kind, ex.Detection.MatchedSignature);
+            await PublishFinishedAfterStartedAsync(
+                success: false, newTip: null, filesChanged: null,
+                insertions: null, deletions: null, semanticIncompatible: null,
+                parkReason: ex.Message);
+            throw;
+        }
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not SandboxProvisioningDeferredException
             && ex is not AgentPausedException

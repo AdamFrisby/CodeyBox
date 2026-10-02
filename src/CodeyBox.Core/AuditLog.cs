@@ -1471,6 +1471,37 @@ public static class AuditLog
                 id.ToString(), source, outcome, state, reason ?? "");
 
     /// <summary>
+    /// Emitted when the same provider-transient signature is observed from
+    /// several agents inside the correlation window: the cause is treated as
+    /// host/network-level and dispatch pauses briefly instead of burning
+    /// every item's retry budget. Carries only the detector-owned signature
+    /// label — never raw agent output.
+    /// </summary>
+    public static void ProviderTransientHostPause(string signature, AgentKind trippingAgent) =>
+        Audit("provider_transient_host_pause")
+            .Warning(
+                "Provider-transient host pause: signature={Signature} tripped by agent={Agent}",
+                signature, trippingAgent.Value);
+
+    /// <summary>
+    /// Emitted when an agent turn fails with a provider-transient signature
+    /// and parks for bounded transient retry on the same agent and model.
+    /// Carries only the detector-owned family and signature label — never raw
+    /// agent output.
+    /// </summary>
+    public static void ProviderTransientParked(
+        WorkItemId id,
+        AgentKind agent,
+        string? modelId,
+        ProviderTransientKind kind,
+        string signature,
+        string? phase = null) =>
+        Audit("provider_transient_parked")
+            .Information(
+                "Provider-transient parked for retry: workItem={WorkItemId} agent={Agent} model={Model} kind={Kind} signature={Signature} phase={Phase}",
+                id.ToString(), agent.Value, modelId ?? "(default)", kind, signature, phase ?? "(unknown)");
+
+    /// <summary>
     /// Emitted when all class members fail the MinModelScore floor check. Records
     /// the rejected members and their below-floor reasons so the audit log captures
     /// the failure detail even though no member was chosen.

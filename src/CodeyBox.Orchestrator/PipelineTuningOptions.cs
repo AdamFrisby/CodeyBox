@@ -208,6 +208,49 @@ public sealed class PipelineTuningOptions
     public int EarlyEndedTurnMaxNudges { get; set; } = 1;
 
     /// <summary>
+    /// Maximum bounded "continue where you left off" nudges the work phase
+    /// sends in the same session when an agent turn fails with an
+    /// output-truncation transient (the model hit its maximum output token
+    /// limit mid-turn). Each nudge resumes the same session with an explicit
+    /// continuation prompt instead of starting a fresh turn; when the nudged
+    /// turns keep failing the item parks for bounded transient retry, whose
+    /// re-dispatch resumes the session via the durable agent-turn checkpoint
+    /// where the agent supports it. Bounded by
+    /// <see cref="CodeyBox.Core.ProviderTransientRetryPolicy.MaxTruncationContinueNudges"/>
+    /// however high this is set. Default <c>2</c>. Set to <c>0</c> to park
+    /// truncations for transient retry without an inline nudge. Hot-reloaded
+    /// with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public int ProviderTransientTruncationMaxNudges { get; set; } = 2;
+
+    /// <summary>
+    /// Correlation window for host-level provider-transient detection: when
+    /// the same transient signature is observed from at least
+    /// <see cref="ProviderTransientCorrelationThreshold"/> distinct agents
+    /// inside this window, the cause is treated as host/network-level and
+    /// dispatch pauses for <see cref="ProviderTransientDispatchPause"/>
+    /// instead of burning every item's retry budget at once. Default 5
+    /// minutes. Hot-reloaded with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public TimeSpan ProviderTransientCorrelationWindow { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Distinct agents that must report the same transient signature inside
+    /// <see cref="ProviderTransientCorrelationWindow"/> before dispatch
+    /// pauses. A single agent's failure is never host-level evidence, so
+    /// values below two behave as two. Default <c>2</c>. Hot-reloaded with
+    /// the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public int ProviderTransientCorrelationThreshold { get; set; } = 2;
+
+    /// <summary>
+    /// How long dispatch pauses when correlated provider-transient evidence
+    /// trips the host-level gate. Default 2 minutes. Hot-reloaded with the
+    /// rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public TimeSpan ProviderTransientDispatchPause { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
     /// Maximum time a single auditor may run without completing or emitting
     /// an LLM stdout chunk. A value of zero disables the per-auditor idle
     /// guard. Default 5 minutes.
@@ -438,6 +481,30 @@ public sealed class PipelineTuningOptions
             throw new ArgumentOutOfRangeException(
                 nameof(EarlyEndedTurnMaxNudges),
                 "EarlyEndedTurnMaxNudges must be non-negative");
+        }
+        if (ProviderTransientTruncationMaxNudges < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ProviderTransientTruncationMaxNudges),
+                "ProviderTransientTruncationMaxNudges must be non-negative");
+        }
+        if (ProviderTransientCorrelationWindow <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ProviderTransientCorrelationWindow),
+                "ProviderTransientCorrelationWindow must be positive");
+        }
+        if (ProviderTransientCorrelationThreshold < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ProviderTransientCorrelationThreshold),
+                "ProviderTransientCorrelationThreshold must be >= 1 (values below 2 behave as 2)");
+        }
+        if (ProviderTransientDispatchPause < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ProviderTransientDispatchPause),
+                "ProviderTransientDispatchPause must be non-negative");
         }
         if (SandboxPermitWaitWarningThreshold < TimeSpan.Zero)
         {

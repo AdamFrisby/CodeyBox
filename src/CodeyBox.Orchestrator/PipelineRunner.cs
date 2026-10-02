@@ -1497,6 +1497,34 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogError(ex, "Work item {Id} failed after session resume exhaustion", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "other");
         }
+        catch (ProviderTransientRetryException ex)
+        {
+            // Provider-side transient (model capacity, output truncation,
+            // transport/upstream blip after the CLI's own retries): the work
+            // branch and any partial commits are already checkpointed by the
+            // throwing phase, so park for bounded transient retry on the same
+            // agent and model id. Never a terminal failure (no
+            // TerminalFailureCount increment) and never quota failover (no
+            // model switch): the transition below preserves agent and model,
+            // and the scheduler applies backoff with jitter against the
+            // existing transient-retry budget.
+            _log.LogWarning(
+                "Work item {Id} hit provider-transient failure: kind={Kind} signature={Signature} phase={Phase} agent={Agent} model={Model} error={Error}",
+                item.Id,
+                ex.Detection.Kind,
+                ex.Detection.MatchedSignature,
+                ex.Phase ?? "(unknown)",
+                ex.Agent.Value,
+                item.ModelId ?? "(default)",
+                ex.Message);
+            await TransitionWaitingForTransientRetryAsync(
+                item,
+                ex.Message,
+                project,
+                ex.Phase,
+                ex.Agent,
+                ProviderTransientRetryPolicy.ParkedFailureKind);
+        }
         catch (TerminalTransientNetworkError ex)
         {
             _log.LogWarning(
