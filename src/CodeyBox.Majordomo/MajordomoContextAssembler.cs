@@ -23,7 +23,10 @@ namespace CodeyBox.Majordomo;
 /// stdout, audit findings). They are stored as data and replayed only inside
 /// demarcated <c>[untrusted_tool_result]</c> blocks framed as data — never
 /// as instructions — with embedded closing markers escaped so a payload
-/// cannot break out of its block.</para>
+/// cannot break out of its block. Fleet free-text lines (in-flight items,
+/// quota lines, recent failures) are untrusted for the same reason and replay
+/// only inside demarcated <c>[untrusted_fleet_data]</c> blocks carrying the
+/// same notice and closing-marker escaping.</para>
 /// </remarks>
 public static class MajordomoContextAssembler
 {
@@ -36,6 +39,8 @@ public static class MajordomoContextAssembler
     private const string ToolResultOpen = "[untrusted_tool_result";
     private const string ToolResultClose = "[/untrusted_tool_result]";
     private const string ToolCallClose = "[/tool_call]";
+    private const string FleetDataOpen = "[untrusted_fleet_data";
+    private const string FleetDataClose = "[/untrusted_fleet_data]";
     private const string TruncationMarker = "[...truncated to fit the context bound]";
 
     /// <summary>
@@ -146,24 +151,35 @@ public static class MajordomoContextAssembler
         if (maxChars == 0)
             return string.Empty;
         var body = new StringBuilder();
-        body.Append(string.Create(CultureInfo.InvariantCulture, $"[fleet queue={fleet.QueueState}"));
+        body.Append(string.Create(CultureInfo.InvariantCulture, $"[fleet queue={EscapeFleetContent(fleet.QueueState)}"));
         var counts = fleet.StateCounts.OrderBy(static kv => kv.Key, StringComparer.Ordinal).ToList();
         if (counts.Count > 0)
-            body.Append(string.Create(CultureInfo.InvariantCulture, $" counts={string.Join(",", counts.Select(static kv => $"{kv.Key}:{kv.Value}"))}"));
+            body.Append(string.Create(CultureInfo.InvariantCulture, $" counts={string.Join(",", counts.Select(static kv => $"{EscapeFleetContent(kv.Key)}:{kv.Value}"))}"));
         body.Append(']');
-        AppendLines(body, "in-flight", fleet.InFlightItems);
-        AppendLines(body, "quota", fleet.QuotaLines);
-        AppendLines(body, "failures", fleet.RecentFailures);
+        AppendFleetLines(body, "in-flight", fleet.InFlightItems);
+        AppendFleetLines(body, "quota", fleet.QuotaLines);
+        AppendFleetLines(body, "failures", fleet.RecentFailures);
         var text = body.ToString();
         return text.Length <= maxChars ? text : text[..maxChars];
     }
 
-    private static void AppendLines(StringBuilder body, string label, System.Collections.Immutable.ImmutableArray<string> lines)
+    /// <summary>
+    /// Replays one fleet free-text list (in-flight items, quota lines, recent
+    /// failures — all caller-supplied and potentially carrying work-item
+    /// failure text or agent stdout) inside a fenced untrusted-data block
+    /// framed as data, never as instructions. Mirrors the tool-result path:
+    /// the embedded closing marker is escaped with an ordinal replacement so
+    /// a payload cannot break out of its block.
+    /// </summary>
+    private static void AppendFleetLines(StringBuilder body, string label, System.Collections.Immutable.ImmutableArray<string> lines)
     {
         if (lines.IsEmpty)
             return;
-        body.Append(string.Create(CultureInfo.InvariantCulture, $" [{label}: {string.Join(" | ", lines)}]"));
+        body.Append(string.Create(CultureInfo.InvariantCulture, $" {FleetDataOpen} {label}]\n{UntrustedDataNotice}\n{EscapeFleetContent(string.Join(" | ", lines))}\n{FleetDataClose}"));
     }
+
+    private static string EscapeFleetContent(string text) =>
+        text.Replace(FleetDataClose, "[\\/untrusted_fleet_data]", StringComparison.Ordinal);
 
     private static string RenderSummary(MajordomoConversationSummary summary, int maxChars)
     {
