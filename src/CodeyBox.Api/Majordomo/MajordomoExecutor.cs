@@ -5,6 +5,8 @@ using System.Text.Json.Nodes;
 using CodeyBox.Core;
 using CodeyBox.Majordomo;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
@@ -87,6 +89,10 @@ internal sealed class MajordomoExecutor
     private readonly MajordomoTurnLedger _ledger;
     private readonly MajordomoProposalService _proposals;
     private readonly IHttpContextAccessor _httpContext;
+    private readonly MajordomoAutonomySwitch _modeSwitch;
+    private readonly IMajordomoConversationStore _conversation;
+    private readonly TimeProvider _time;
+    private readonly ILogger<MajordomoExecutor> _logger;
 
     /// <summary>
     /// Per-identity serialization for mutate calls. Keys are configured API
@@ -112,7 +118,11 @@ internal sealed class MajordomoExecutor
         IOptionsMonitor<MajordomoServerOptions> options,
         MajordomoTurnLedger ledger,
         MajordomoProposalService proposals,
-        IHttpContextAccessor httpContext)
+        IHttpContextAccessor httpContext,
+        MajordomoAutonomySwitch modeSwitch,
+        IMajordomoConversationStore conversation,
+        TimeProvider? time = null,
+        ILogger<MajordomoExecutor>? logger = null)
     {
         _reads = reads;
         _mutates = mutates;
@@ -120,6 +130,10 @@ internal sealed class MajordomoExecutor
         _ledger = ledger;
         _proposals = proposals;
         _httpContext = httpContext;
+        _modeSwitch = modeSwitch;
+        _conversation = conversation;
+        _time = time ?? TimeProvider.System;
+        _logger = logger ?? NullLogger<MajordomoExecutor>.Instance;
     }
 
     /// <summary>
@@ -190,8 +204,13 @@ internal sealed class MajordomoExecutor
             }
 
             var usage = _ledger.Snapshot(identity, TimeSpan.FromSeconds(options.TurnWindowSeconds));
+            // The panel's autonomy switch overrides the configured mode at
+            // runtime; clearing it returns to configuration. The executor
+            // reads the resolution on every call, so a flip applies to the
+            // next tool call without a restart — same as a config reload.
+            var policy = options.ToPolicy() with { Mode = _modeSwitch.Resolve(options.Mode) };
             var decision = MajordomoAuthorization.Decide(
-                name, args, options.ToPolicy(), usage, projectedAffected);
+                name, args, policy, usage, projectedAffected);
 
             // The call record is written before any mutation is attempted —
             // refused calls are audited too. The wire name is untrusted input
@@ -206,10 +225,25 @@ internal sealed class MajordomoExecutor
 
             try
             {
+                // The durable conversation captures what the majordomo did,
+                // not just what it changed: the panel replays these rows as
+                // the inline tool-call trail beside the prose. Only exact
+                // vocabulary names are recorded — an unknown wire name is
+                // already refused below and stays in the audit log alone.
+                if (tool is not null)
+                    await RecordConversationAsync(
+                        MajordomoConversationRole.ToolCall, tool.Name,
+                        BoundArguments(argsNode) ?? "(no arguments)", options, ct)
+                        .ConfigureAwait(false);
                 var (envelope, outcome, detail, isError) = await DispatchAsync(
                     decision, name, identity, args, argsNode, bindRefusal, cancelCascade, ct)
                     .ConfigureAwait(false);
                 AuditLog.MajordomoToolOutcome(callId, auditIdentity, auditTool, outcome, detail);
+                if (tool is not null)
+                    await RecordConversationAsync(
+                        MajordomoConversationRole.ToolResult, tool.Name,
+                        string.IsNullOrEmpty(detail) ? outcome : $"{outcome}: {detail}",
+                        options, ct).ConfigureAwait(false);
 
                 var json = JsonSerializer.SerializeToElement(envelope, MajordomoJson.Options);
                 return new CallToolResult
@@ -377,6 +411,34 @@ internal sealed class MajordomoExecutor
     {
         var raw = args?.ToJsonString() ?? "{}";
         return raw.Length <= MaxAuditArgumentChars ? raw : raw[..MaxAuditArgumentChars] + "…";
+    }
+
+    /// <summary>
+    /// Appends one tool-call or tool-result row to the durable conversation
+    /// so the panel can replay what the majordomo did. The store truncates
+    /// over-long text with a marker and compacts past its row cap, so the
+    /// write is bounded. A recording failure never fails the tool call it
+    /// describes — the call's own audit record is the durable truth; this
+    /// row is the replayable trail, and its loss is logged, not silent.
+    /// </summary>
+    private async Task RecordConversationAsync(
+        MajordomoConversationRole role,
+        string toolName,
+        string text,
+        MajordomoServerOptions options,
+        CancellationToken ct)
+    {
+        try
+        {
+            await _conversation.AppendAsync(
+                role, text, toolName, _time.GetUtcNow(),
+                options.ToHistoryOptions(), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                ex, "Majordomo conversation record for tool {Tool} was not persisted", toolName);
+        }
     }
 
     private static string DecisionLabel(MajordomoDecision decision) => decision switch

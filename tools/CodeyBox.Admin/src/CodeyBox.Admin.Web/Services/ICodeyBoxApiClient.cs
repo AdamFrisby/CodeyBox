@@ -225,7 +225,53 @@ public interface ICodeyBoxApiClient
         return result;
     }
 
-    // ── Task templates ────────────────────────────────────────────────────────    /// <summary>
+    // ── Majordomo panel (fleet-map side panel) ──────────────────────────────
+    /// <summary>
+    /// Reads the durable majordomo conversation (<c>GET /majordomo/conversation</c>).
+    /// </summary>
+    Task<MajordomoConversationPageDto?> GetMajordomoConversationAsync(
+        long afterSequence = 0, int limit = 100, CancellationToken ct = default)
+        => Task.FromResult<MajordomoConversationPageDto?>(null);
+
+    /// <summary>
+    /// Appends an operator turn (<c>POST /majordomo/conversation</c>). The
+    /// turn is durable and visible to the majordomo's next assembled context.
+    /// </summary>
+    Task<MajordomoConversationEntryDto?> PostMajordomoMessageAsync(
+        string text, CancellationToken ct = default)
+        => Task.FromResult<MajordomoConversationEntryDto?>(null);
+
+    /// <summary>Reads the effective autonomy mode (<c>GET /majordomo/mode</c>).</summary>
+    Task<MajordomoModeDto?> GetMajordomoModeAsync(CancellationToken ct = default)
+        => Task.FromResult<MajordomoModeDto?>(null);
+
+    /// <summary>
+    /// Flips the autonomy switch (<c>POST /majordomo/mode</c>). Returns null
+    /// when the server refuses the value.
+    /// </summary>
+    Task<MajordomoModeDto?> SetMajordomoModeAsync(string mode, CancellationToken ct = default)
+        => Task.FromResult<MajordomoModeDto?>(null);
+
+    /// <summary>Lists proposals (<c>GET /majordomo/proposals</c>).</summary>
+    Task<List<MajordomoProposalDto>> GetMajordomoProposalsAsync(
+        string? state = "pending", CancellationToken ct = default)
+        => Task.FromResult(new List<MajordomoProposalDto>());
+
+    /// <summary>
+    /// Approves a proposal (<c>POST /majordomo/proposals/{id}/approve</c>).
+    /// A stale proposal is refused with its reason — never committed.
+    /// </summary>
+    Task<MajordomoProposalDecisionDto> ApproveMajordomoProposalAsync(
+        string id, CancellationToken ct = default)
+        => Task.FromResult(new MajordomoProposalDecisionDto { Ok = false, Status = "refused" });
+
+    /// <summary>Rejects a proposal (<c>POST /majordomo/proposals/{id}/reject</c>).</summary>
+    Task<MajordomoProposalDecisionDto> RejectMajordomoProposalAsync(
+        string id, string? reason = null, CancellationToken ct = default)
+        => Task.FromResult(new MajordomoProposalDecisionDto { Ok = false, Status = "refused" });
+
+    // ── Task templates ────────────────────────────────────────────────────────
+    /// <summary>
     /// Lists orchestrator task templates (<c>GET /templates</c>). Defaults
     /// to empty when the client does not implement it.
     /// </summary>

@@ -33,6 +33,15 @@ public sealed class MajordomoServerOptions
     /// <summary>Largest accepted <see cref="TurnWindowSeconds"/>.</summary>
     public const int MaxTurnWindowSeconds = 3600;
 
+    /// <summary>Default poll interval for the operator conversation stream, in seconds.</summary>
+    public const int DefaultConversationStreamPollSeconds = 1;
+
+    /// <summary>Shortest accepted conversation-stream poll interval, in seconds.</summary>
+    public const int MinConversationStreamPollSeconds = 1;
+
+    /// <summary>Longest accepted conversation-stream poll interval, in seconds.</summary>
+    public const int MaxConversationStreamPollSeconds = 60;
+
     /// <summary>Default proposal time-to-live in seconds (24 hours).</summary>
     public static readonly int DefaultProposalTimeToLiveSeconds =
         (int)MajordomoOptions.DefaultProposalTimeToLive.TotalSeconds;
@@ -131,6 +140,13 @@ public sealed class MajordomoServerOptions
     /// </summary>
     public MajordomoConversationServerOptions Conversation { get; set; } = new();
 
+    /// <summary>
+    /// How often the operator conversation stream re-reads the store for new
+    /// rows, in seconds. Between <see cref="MinConversationStreamPollSeconds"/>
+    /// and <see cref="MaxConversationStreamPollSeconds"/> seconds.
+    /// </summary>
+    public int ConversationStreamPollSeconds { get; set; } = DefaultConversationStreamPollSeconds;
+
     /// <summary>Builds the history policy the conversation store and assembler consume.</summary>
     public MajordomoHistoryOptions ToHistoryOptions() => Conversation.ToHistoryOptions();
 
@@ -162,6 +178,10 @@ public sealed class MajordomoServerOptions
         var conversationFailure = MajordomoConversationServerOptions.Validate(opts.Conversation);
         if (conversationFailure is not null)
             return $"{SectionName}:Conversation:{conversationFailure}";
+        if (opts.ConversationStreamPollSeconds is < MinConversationStreamPollSeconds
+            or > MaxConversationStreamPollSeconds)
+            return $"{SectionName}:ConversationStreamPollSeconds must be within "
+                + $"[{MinConversationStreamPollSeconds}, {MaxConversationStreamPollSeconds}]";
         return null;
     }
 }

@@ -796,4 +796,77 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         => PluginsFailure is not null
             ? Task.FromException<List<PluginDto>>(PluginsFailure)
             : Task.FromResult(PluginsOverride);
+
+    // ── Majordomo panel ───────────────────────────────────────────────────────
+
+    public MajordomoModeDto MajordomoModeOverride { get; set; } = new() { Mode = "proposed", Source = "config" };
+    public List<string> MajordomoModeSets { get; } = [];
+    public List<MajordomoConversationEntryDto> ConversationOverride { get; set; } = [];
+    public List<MajordomoProposalDto> ProposalsOverride { get; set; } = [];
+    public List<string> ApprovedProposalIds { get; } = [];
+    public List<(string Id, string? Reason)> RejectedProposals { get; } = [];
+    public List<string> SentMessages { get; } = [];
+    public bool FleetChangedFired => FleetChangedCount > 0;
+    public int FleetChangedCount { get; set; }
+    public Func<string, MajordomoProposalDecisionDto>? DecideHook { get; set; }
+
+    public Task<MajordomoModeDto?> GetMajordomoModeAsync(CancellationToken ct = default)
+        => Task.FromResult<MajordomoModeDto?>(MajordomoModeOverride);
+
+    public Task<MajordomoModeDto?> SetMajordomoModeAsync(string mode, CancellationToken ct = default)
+    {
+        MajordomoModeSets.Add(mode);
+        MajordomoModeOverride = new MajordomoModeDto { Mode = mode, Source = "override" };
+        return Task.FromResult<MajordomoModeDto?>(MajordomoModeOverride);
+    }
+
+    public Task<MajordomoConversationPageDto?> GetMajordomoConversationAsync(
+        long afterSequence = 0, int limit = 100, CancellationToken ct = default)
+        => Task.FromResult<MajordomoConversationPageDto?>(new MajordomoConversationPageDto
+        {
+            Entries = ConversationOverride.Where(e => e.Sequence > afterSequence).Take(limit).ToList(),
+        });
+
+    public Task<MajordomoConversationEntryDto?> PostMajordomoMessageAsync(
+        string text, CancellationToken ct = default)
+    {
+        SentMessages.Add(text);
+        var entry = new MajordomoConversationEntryDto
+        {
+            Sequence = ConversationOverride.Count == 0 ? 1 : ConversationOverride.Max(e => e.Sequence) + 1,
+            Role = "operator",
+            Text = text,
+            RecordedAt = DateTimeOffset.UtcNow,
+        };
+        ConversationOverride.Add(entry);
+        return Task.FromResult<MajordomoConversationEntryDto?>(entry);
+    }
+
+    public Task<List<MajordomoProposalDto>> GetMajordomoProposalsAsync(
+        string? state = "pending", CancellationToken ct = default)
+        => Task.FromResult(ProposalsOverride
+            .Where(p => state is null || string.Equals(p.State, state, StringComparison.OrdinalIgnoreCase))
+            .ToList());
+
+    public Task<MajordomoProposalDecisionDto> ApproveMajordomoProposalAsync(
+        string id, CancellationToken ct = default)
+    {
+        if (DecideHook is not null)
+            return Task.FromResult(DecideHook(id));
+        ApprovedProposalIds.Add(id);
+        var proposal = ProposalsOverride.FirstOrDefault(p => p.Id == id);
+        if (proposal is not null)
+            proposal.State = "approved";
+        return Task.FromResult(new MajordomoProposalDecisionDto { Ok = true, Status = "approved" });
+    }
+
+    public Task<MajordomoProposalDecisionDto> RejectMajordomoProposalAsync(
+        string id, string? reason = null, CancellationToken ct = default)
+    {
+        if (DecideHook is not null)
+            return Task.FromResult(DecideHook(id));
+        RejectedProposals.Add((id, reason));
+        ProposalsOverride.RemoveAll(p => p.Id == id);
+        return Task.FromResult(new MajordomoProposalDecisionDto { Ok = true, Status = "rejected" });
+    }
 }

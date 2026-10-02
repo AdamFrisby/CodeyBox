@@ -1,0 +1,131 @@
+@using CodeyBox.Admin.Web.Models
+@using CodeyBox.Admin.Web.Services
+
+<section class="mj" aria-label="Majordomo conversation">
+    @* The autonomy switch: legible at a glance, no menu. What the majordomo
+       says next is a report or an action depending on this. *@
+    <div class="mj-mode" role="group" aria-label="Autonomy mode">
+        <span class="mj-mode-label" title="Autonomous executes mutations immediately; Proposed files them for review below.">Majordomo</span>
+        <button type="button"
+                class="mj-mode-btn @(IsAutonomous ? "" : "mj-mode-btn--on")"
+                aria-pressed="@((!IsAutonomous).ToString().ToLowerInvariant())"
+                title="Mutations become proposals reviewed below"
+                @onclick='() => SwitchModeAsync("proposed")'>Proposed</button>
+        <button type="button"
+                class="mj-mode-btn @(IsAutonomous ? "mj-mode-btn--on mj-mode-btn--auto" : "")"
+                aria-pressed="@(IsAutonomous.ToString().ToLowerInvariant())"
+                title="Mutations execute immediately"
+                @onclick='() => SwitchModeAsync("autonomous")'>Autonomous</button>
+        <span class="mj-mode-state" aria-live="polite">@(_mode is null ? "loading…" : IsAutonomous ? "acting now" : "reporting for review")</span>
+    </div>
+    @if (_modeError is not null)
+    {
+        <p class="mj-error" role="alert">@_modeError</p>
+    }
+    @if (_loadError is not null)
+    {
+        <p class="mj-error" role="alert">@_loadError</p>
+    }
+
+    <div class="mj-thread" role="log" aria-live="polite" aria-label="Conversation with the majordomo">
+        @if (_summary is { Length: > 0 })
+        {
+            <details class="mj-summary">
+                <summary>Earlier history (summarised)</summary>
+                <p>@_summary</p>
+            </details>
+        }
+        @if (_entries.Count == 0)
+        {
+            <p class="mj-empty">No conversation yet. Say hello below — the majordomo sees it on its next turn.</p>
+        }
+        @foreach (var entry in _entries)
+        {
+            var role = (entry.Role ?? "").ToLowerInvariant();
+            if (role is "toolcall" or "tool_call" or "toolresult" or "tool_result")
+            {
+                var isCall = role.StartsWith("toolcall", StringComparison.Ordinal);
+                <details class="mj-tool @(isCall ? "mj-tool--call" : "mj-tool--result")">
+                    <summary>
+                        <span class="mj-tool-chip">@(entry.ToolName ?? "tool")</span>
+                        <span>@(isCall ? "called" : "returned")</span>
+                    </summary>
+                    <pre class="mj-tool-body">@foreach (var part in Linkify(entry.Text)) { if (part.IsLink) { <a href="/work-items/@part.WorkItemId">@part.Text</a> } else { @part.Text } }</pre>
+                </details>
+            }
+            else
+            {
+                <div class="mj-turn @(role == "operator" ? "mj-turn--operator" : "mj-turn--majordomo")">
+                    <span class="mj-turn-role">@(role == "operator" ? "You" : "Majordomo")</span>
+                    <p class="mj-turn-text">@foreach (var part in Linkify(entry.Text)) { if (part.IsLink) { <a href="/work-items/@part.WorkItemId">@part.Text</a> } else { @part.Text } }</p>
+                </div>
+            }
+        }
+    </div>
+
+    <form class="mj-compose" @onsubmit="SendAsync" @onsubmit:preventDefault="true">
+        <label class="mj-compose-label" for="mj-input">Message the majordomo</label>
+        <textarea id="mj-input" class="mj-input" rows="2" maxlength="16384"
+                  placeholder="Ask about the fleet, or tell it what to do…"
+                  @bind="_input" @bind:event="oninput" disabled="@_sending"></textarea>
+        <button type="submit" class="mj-send" disabled="@(string.IsNullOrWhiteSpace(_input) || _sending)">
+            @(_sending ? "Sending…" : "Send")
+        </button>
+        @if (_sendError is not null)
+        {
+            <p class="mj-error" role="alert">@_sendError</p>
+        }
+    </form>
+
+    <div class="mj-proposals" aria-label="Pending proposals">
+        <div class="mj-proposals-head">
+            <span class="mj-proposals-title">Proposals</span>
+            <span class="mj-proposals-count">@_proposals.Count</span>
+        </div>
+        @if (_proposals.Count == 0)
+        {
+            <p class="mj-empty">Nothing awaiting review.</p>
+        }
+        @foreach (var proposal in _proposals)
+        {
+            <article class="mj-proposal" data-proposal-id="@proposal.Id">
+                <div class="mj-proposal-head">
+                    <span class="mj-tool-chip">@proposal.Tool</span>
+                    <span class="mj-ov-muted" title="@proposal.ProposedAt.ToString("u")">@proposal.ProposedBy</span>
+                </div>
+                @if (!string.IsNullOrWhiteSpace(proposal.Reasoning))
+                {
+                    <p class="mj-proposal-reason">@proposal.Reasoning</p>
+                }
+                <div class="mj-proposal-changes">
+                    <span class="mj-proposal-changes-label">Will change:</span>
+                    <ul>
+                        @foreach (var line in ChangeLines(proposal))
+                        {
+                            <li>@line</li>
+                        }
+                    </ul>
+                    @if (ChangeItemIds(proposal) is { Count: > 0 } ids)
+                    {
+                        <div class="mj-proposal-items">
+                            @foreach (var id in ids)
+                            {
+                                <a href="/work-items/@id">@(ResolveTitle(id) ?? "Unknown item")</a>
+                            }
+                        </div>
+                    }
+                </div>
+                @if (_decisionErrors.TryGetValue(proposal.Id, out var refusal))
+                {
+                    <p class="mj-error" role="alert">@refusal</p>
+                }
+                <div class="mj-proposal-actions">
+                    <button type="button" class="mj-approve" @onclick="() => ApproveAsync(proposal)">Approve</button>
+                    <input type="text" class="mj-reject-reason" placeholder="Reason (optional)"
+                           @bind="_rejectReasons[proposal.Id]" aria-label="Rejection reason" />
+                    <button type="button" class="mj-reject" @onclick="() => RejectAsync(proposal)">Reject</button>
+                </div>
+            </article>
+        }
+    </div>
+</section>
