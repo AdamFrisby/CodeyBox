@@ -55,6 +55,7 @@ public sealed class ExecutorClient
     private readonly HttpClient _http;
     private readonly Func<ExecutorOptions> _optionsAccessor;
     private readonly ISandboxProvider _sandboxes;
+    private readonly ISandboxProviderRegistry? _providerRegistry;
     private readonly IPipelineRunner? _phaseRunner;
     private readonly ExecutorSandboxTracker _tracker;
     private readonly TimeProvider _clock;
@@ -69,7 +70,8 @@ public sealed class ExecutorClient
         ExecutorSandboxTracker? tracker = null,
         IPipelineRunner? phaseRunner = null,
         TimeProvider? clock = null,
-        ILogger<ExecutorClient>? log = null)
+        ILogger<ExecutorClient>? log = null,
+        ISandboxProviderRegistry? providerRegistry = null)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
@@ -78,9 +80,10 @@ public sealed class ExecutorClient
         _phaseRunner = phaseRunner;
         _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger<ExecutorClient>.Instance;
+        _providerRegistry = providerRegistry;
     }
 
-    /// <summary>Local sandbox provider this executor provisions through. Never a remote provider: the executor runs work where it runs.</summary>
+    /// <summary>Primary sandbox provider this executor provisions through (the first declared kind).</summary>
     public ISandboxProvider SandboxProvider => _sandboxes;
 
     /// <summary>Sandbox tracker implementing the disconnect retain/reconcile policy.</summary>
@@ -90,8 +93,7 @@ public sealed class ExecutorClient
     public bool HasPhaseRunner => _phaseRunner is not null;
 
     /// <summary>
-    /// Provisions a sandbox locally through the injected provider abstraction.
-    /// The executor never provisions remotely: it runs work on its own machine.
+    /// Provisions a sandbox through the primary provider.
     /// </summary>
     public Task<ISandbox> ProvisionSandboxAsync(SandboxSpec spec, CancellationToken ct = default)
     {
@@ -125,6 +127,12 @@ public sealed class ExecutorClient
         var options = Options;
         options.Validate();
         var registration = options.ToRegistration();
+        registration = registration with
+        {
+            DeclaredCapabilities = [.. ExecutorCapabilityPolicy.EffectiveCapabilities(
+                registration.DeclaredCapabilities,
+                ServingProviders(options))],
+        };
         using var request = new HttpRequestMessage(HttpMethod.Post, "executors/register")
         {
             Content = JsonContent.Create(
@@ -192,7 +200,7 @@ public sealed class ExecutorClient
                 if (wasDisconnected)
                 {
                     wasDisconnected = false;
-                    var outcome = await _tracker.ReconcileOnReconnectAsync(_sandboxes, ct).ConfigureAwait(false);
+                    var outcome = await ReconcileAfterReconnectAsync(ct).ConfigureAwait(false);
                     _log.LogInformation(
                         "Executor {WorkerId} reconnected: retained {Retained} sandboxes, reclaimed {Reclaimed} untracked",
                         workerId, outcome.RetainedCount, outcome.ReclaimedCount);
@@ -219,6 +227,44 @@ public sealed class ExecutorClient
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Providers backing this host's declared kinds. Without a registry this
+    /// is just the injected singleton (single-kind shortcut); with one, each
+    /// declared kind resolves to its shared registry instance.
+    /// </summary>
+    private IReadOnlyList<ISandboxProvider> ServingProviders(ExecutorOptions options)
+    {
+        if (_providerRegistry is null)
+            return [_sandboxes];
+        return options.GetDeclaredKinds()
+            .Select(kind => _providerRegistry.EnsureKind(kind))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Reconciles every serving provider's inventory against the tracked set
+    /// after reconnect. Reclaimed counts sum across providers; the retained
+    /// count is the tracker's (identical for each pass) and completeness
+    /// requires every provider's inventory to be complete.
+    /// </summary>
+    private async Task<ExecutorReconnectOutcome> ReconcileAfterReconnectAsync(CancellationToken ct)
+    {
+        var providers = ServingProviders(Options);
+        ExecutorReconnectOutcome? last = null;
+        var reclaimed = 0;
+        var complete = true;
+        foreach (var provider in providers)
+        {
+            ct.ThrowIfCancellationRequested();
+            last = await _tracker.ReconcileOnReconnectAsync(provider, ct).ConfigureAwait(false);
+            reclaimed += last.ReclaimedCount;
+            complete = complete && last.InventoryComplete;
+        }
+        return last is null
+            ? new ExecutorReconnectOutcome(0, 0, InventoryComplete: false)
+            : new ExecutorReconnectOutcome(last.RetainedCount, reclaimed, complete);
     }
 
     private async Task<HttpResponseMessage> SendAsync(

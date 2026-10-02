@@ -1,9 +1,26 @@
 using System.Collections.Concurrent;
-using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace CodeyBox.Api;
+namespace CodeyBox.Core;
+
+/// <summary>
+/// A sandbox provider wrapper whose admission gate derives from the member
+/// catalog: each constructed kind's gate target becomes the summed capacity
+/// of the members naming it (see
+/// <see cref="ISandboxProviderRegistry.SyncKindCapacities"/>).
+/// </summary>
+public interface IKindCapacityReloadable
+{
+    /// <summary>Current admission gate target.</summary>
+    int MaxConcurrentSandboxes { get; }
+
+    /// <summary>
+    /// Applies a catalog-derived kind capacity. Implementations no-op when
+    /// the target is unchanged.
+    /// </summary>
+    void ApplyKindCapacityReload(int newKindCapacity, string kind);
+}
 
 /// <summary>
 /// Composition-root <see cref="ISandboxProviderRegistry"/>: builds each
@@ -11,10 +28,12 @@ namespace CodeyBox.Api;
 /// <see cref="Lazy{T}"/>) and shares the instance across every member that
 /// names the kind. Lookup is keyed by normalised kind (trimmed, lowercase,
 /// ordinal ignore-case), so registration order never affects resolution.
-/// <see cref="KnownKinds"/> covers built-in kinds plus host-registered
-/// plugin-contributed kinds (see <c>PluginSandboxProviderCatalog</c>).
-/// Unknown or blank kinds fail closed — a member is never silently
-/// re-pointed at another provider.
+/// <see cref="KnownKinds"/> covers the built-in kinds (see
+/// <see cref="HostPlatformSupport.AllProviderIds"/>) plus host-registered
+/// plugin-contributed kinds. Unknown or blank kinds fail closed — a member
+/// is never silently re-pointed at another provider.
+/// Shared by the orchestrator and the executor host so both resolve through
+/// one implementation.
 /// </summary>
 public sealed class SandboxProviderRegistry : ISandboxProviderRegistry
 {
@@ -31,7 +50,7 @@ public sealed class SandboxProviderRegistry : ISandboxProviderRegistry
         ArgumentNullException.ThrowIfNull(buildKind);
         _buildKind = buildKind;
         _log = log ?? NullLogger<SandboxProviderRegistry>.Instance;
-        var known = new HashSet<string>(SandboxProviderKinds.All, StringComparer.OrdinalIgnoreCase);
+        var known = new HashSet<string>(HostPlatformSupport.AllProviderIds, StringComparer.OrdinalIgnoreCase);
         if (pluginKinds is not null)
             known.UnionWith(pluginKinds);
         KnownKinds = known;
@@ -105,7 +124,7 @@ public sealed class SandboxProviderRegistry : ISandboxProviderRegistry
             if (!sums.TryGetValue(registration.Kind, out var sum) || sum < 1)
                 continue;
             var target = sum >= int.MaxValue ? int.MaxValue : (int)sum;
-            if (registration.Provider is CodeyBox.Orchestrator.SandboxAdmissionControlledProvider wrapper
+            if (registration.Provider is IKindCapacityReloadable wrapper
                 && wrapper.MaxConcurrentSandboxes != target)
                 wrapper.ApplyKindCapacityReload(target, registration.Kind);
         }

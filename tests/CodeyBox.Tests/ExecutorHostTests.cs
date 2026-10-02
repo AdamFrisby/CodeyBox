@@ -71,11 +71,23 @@ public sealed class ExecutorHostTests
     }
 
     [Fact]
-    public void ExecutorOptions_Validate_RejectsUnknownProvider()
+    public void ExecutorOptions_Validate_AcceptsRegisteredProviderKinds()
+    {
+        foreach (var kind in new[] { "process", "bubblewrap", "incus", "multipass", "multipass-remote", "sprites" })
+        {
+            var options = ValidOptions();
+            options.LocalSandboxProvider = kind;
+            options.Validate();
+        }
+    }
+
+    [Fact]
+    public void ExecutorOptions_Validate_RejectsBlankProvider()
     {
         var options = ValidOptions();
-        options.LocalSandboxProvider = "multipass";
-        Assert.Throws<InvalidOperationException>(options.Validate);
+        options.LocalSandboxProvider = "  ";
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains("LocalSandboxProvider", ex.Message, StringComparison.Ordinal);
     }
 
     // ── tracker: disconnect policy ──────────────────────────────────────────

@@ -20,7 +20,7 @@ internal interface ISandboxAdmissionSnapshot
 /// their gate derived from the member catalog instead (see
 /// <see cref="CodeyBox.Core.ISandboxProviderRegistry.SyncKindCapacities"/>).
 /// </summary>
-public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider, IInfrastructureSandboxCreator
+public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider, IInfrastructureSandboxCreator, CodeyBox.Core.IKindCapacityReloadable
 {
     private readonly ISandboxProvider _inner;
     private readonly SandboxAdmissionGate _gate;

@@ -11,8 +11,6 @@
     <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
     <ProjectReference Include="..\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />
-    <ProjectReference Include="..\CodeyBox.Sandbox.Process\CodeyBox.Sandbox.Process.csproj" />
-    <ProjectReference Include="..\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
   </ItemGroup>
 
   <ItemGroup>

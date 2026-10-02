@@ -105,10 +105,12 @@ All operational values live under `CodeyBox:Executor` and are hot-reloadable
 | `MaxConcurrentSandboxes` | `int?` | `null` (uncapped) | Host-local sandbox capacity. `0` registers but is never selected |
 | `AllowedNetworkProfiles` | `string[]` | `[]` (all) | Network profiles this host accepts; `"*"` also means all |
 | `DeclaredCredentials` | `string[]` | `[]` | Agent credential sets this host holds (e.g. `claude`, `codex`) |
-| `DeclaredCapabilities` | `string[]` | `[]` | Clearance tags this host may handle, in the work item `RequiredCapabilities` vocabulary |
+| `DeclaredCapabilities` | `string[]` | `[]` | Clearance tags this host may handle, in the work item `RequiredCapabilities` vocabulary. Well-known provider capabilities (for example `suspend-resume`) must be implemented by at least one serving provider — the providers are the truth, and an unimplemented claim fails the host fast at startup |
 | `Cordoned` | `bool` | `false` | Draining: registers and heartbeats but is never selected |
 | `Healthy` | `bool` | `true` | Health gate: `false` routes placements away without unregistering |
-| `LocalSandboxProvider` | `string` | `process` | `process` (dev runner, UNSAFE) or `bubblewrap` |
+| `LocalSandboxProvider` | `string` | `process` | Single-kind shortcut: the provider kind served when `SandboxProviders` is empty. Any registered kind (`process`, `bubblewrap`, `incus`, `multipass`, `multipass-remote`, `sprites`) |
+| `SandboxProviders` | `string[]` | `[]` (means `[LocalSandboxProvider]`) | Every provider kind this host serves. When non-empty it wins entirely, so one host can offer both an Incus VM and a lightweight process sandbox |
+| `Bubblewrap`, `Multipass`, `Incus`, `MultipassRemote`, `Sprites` | sections | provider defaults | Per-provider settings under `CodeyBox:Executor:<Kind>` (for example `CodeyBox:Executor:Incus:ProjectName`), tuned the same way as the orchestrator's provider sections |
 | `HeartbeatInterval` | `string` (TimeSpan) | `"00:00:15"` | Registry heartbeat cadence |
 | `RequestTimeout` | `string` (TimeSpan) | `"00:00:20"` | Per-request timeout for register/heartbeat calls |
 | `DisconnectPolicy` | `enum` | `RetainSandboxForResume` | Only policy in this item (see below) |

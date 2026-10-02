@@ -1,7 +1,5 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
-using CodeyBox.Sandbox.Bubblewrap;
-using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -25,21 +23,12 @@ builder.Services.Configure<ExecutorOptions>(builder.Configuration.GetSection("Co
 builder.Services.AddSingleton<Func<ExecutorOptions>>(sp =>
     () => sp.GetRequiredService<IOptionsMonitor<ExecutorOptions>>().CurrentValue);
 
-builder.Services.AddSingleton<ISandboxProvider>(sp =>
-{
-    var options = sp.GetRequiredService<Func<ExecutorOptions>>()();
-    var logFactory = sp.GetRequiredService<ILoggerFactory>();
-    return (options.LocalSandboxProvider ?? "").Trim().ToLowerInvariant() switch
-    {
-        "bubblewrap" => new BubblewrapSandboxProvider(
-            new BubblewrapSandboxOptions(),
-            logFactory.CreateLogger<BubblewrapSandboxProvider>()),
-        "process" => new ProcessSandboxProvider(
-            logFactory.CreateLogger<ProcessSandboxProvider>()),
-        var other => throw new InvalidOperationException(
-            $"CodeyBox:Executor:LocalSandboxProvider must be 'process' or 'bubblewrap', not '{other}'."),
-    };
-});
+// Sandbox providers resolve through the shared registry composition — the
+// same factory the orchestrator uses — so every registered kind is
+// available here with no executor-side switch to extend. Provider options
+// bind from the executor's own CodeyBox:Executor section (see
+// ExecutorOptions), and one host may declare several kinds.
+builder.Services.AddExecutorSandboxProviders();
 
 builder.Services.AddSingleton<ExecutorSandboxTracker>();
 builder.Services.AddHttpClient("executor");
@@ -57,7 +46,8 @@ builder.Services.AddSingleton<ExecutorClient>(sp =>
         sp.GetRequiredService<ISandboxProvider>(),
         sp.GetRequiredService<ExecutorSandboxTracker>(),
         phaseRunner: null,
-        log: sp.GetRequiredService<ILogger<ExecutorClient>>());
+        log: sp.GetRequiredService<ILogger<ExecutorClient>>(),
+        providerRegistry: sp.GetRequiredService<ISandboxProviderRegistry>());
 });
 builder.Services.AddHostedService<ExecutorWorker>();
 builder.Services.AddHostedService<ExecutorStartupValidator>();
@@ -66,31 +56,42 @@ var host = builder.Build();
 await host.RunAsync().ConfigureAwait(false);
 
 /// <summary>
-/// Fail-fast startup validation: a bad host id or orchestrator URL surfaces
-/// here instead of registering garbage. Runs before <see cref="ExecutorWorker"/>
+/// Fail-fast startup validation: a bad host id, orchestrator URL, provider
+/// kind, or unimplemented capability surfaces here instead of registering
+/// garbage. Warms every declared provider kind through the shared registry
+/// so an unknown or unusable kind fails the host fast with the registered
+/// kinds named. Runs before <see cref="ExecutorWorker"/>
 /// because hosted services start in registration order.
 /// </summary>
 internal sealed class ExecutorStartupValidator : IHostedService
 {
     private readonly Func<ExecutorOptions> _options;
+    private readonly ISandboxProviderRegistry _registry;
     private readonly ILogger<ExecutorWorker> _log;
 
-    public ExecutorStartupValidator(Func<ExecutorOptions> options, ILogger<ExecutorWorker> log)
+    public ExecutorStartupValidator(
+        Func<ExecutorOptions> options,
+        ISandboxProviderRegistry registry,
+        ILogger<ExecutorWorker> log)
     {
         _options = options;
+        _registry = registry;
         _log = log;
     }
 
     public Task StartAsync(CancellationToken ct)
     {
         var options = _options();
-        options.Validate();
+        var providers = ExecutorSandboxStartup.Validate(options, _registry);
         _log.LogInformation(
-            "Executor host {HostId} starting against {Orchestrator} (provider {Provider}, capacity {Capacity})",
+            "Executor host {HostId} starting against {Orchestrator} (providers {Providers}, capacity {Capacity})",
             options.HostId.Trim(),
             options.OrchestratorBaseUrl.Trim(),
-            (options.LocalSandboxProvider ?? "").Trim().ToLowerInvariant(),
+            string.Join(",", options.GetDeclaredKinds()),
             options.MaxConcurrentSandboxes?.ToString() ?? "uncapped");
+        _log.LogInformation(
+            "Executor sandbox provider capabilities: {Capabilities}",
+            SandboxCapabilities.FormatMatrix(providers));
         return Task.CompletedTask;
     }
 
