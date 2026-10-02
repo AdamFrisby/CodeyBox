@@ -294,6 +294,20 @@ repository webhooks, repository metadata). See its `README.md` for the
 support matrix, configuration, and instance-version requirements. It is off
 unless an operator allowlists it and selects the kind.
 
+## Production GitLab plugin
+
+`plugins/upstream/CodeyBox.GitLabUpstreamPlugin/` is a production-quality,
+first-class upstream remote for GitLab SaaS and self-hosted instances
+(`codeybox.gitlab-upstream`, `Upstream.Kind = "gitlab"`) implementing the
+full `IUpstreamRemote` contract against REST API v4: push/open/auto-merge,
+release-sync branch merges, base-branch fetch, MR listing/reads, plus the
+extended surfaces GitLab genuinely provides — approval-based review state
+(rule names, not GitHub-style reviews), pipelines + commit statuses,
+discussions/notes (plain, replies, and file-anchored threads), project /
+group / system webhooks, and project metadata. See its `README.md` for the
+support matrix, configuration, and instance-version requirements. It is off
+unless an operator allowlists it and selects the kind.
+
 ## Registering your plugin
 
 1. Add the plugin assembly path to `CodeyBox:Plugins:AssemblyPaths`.

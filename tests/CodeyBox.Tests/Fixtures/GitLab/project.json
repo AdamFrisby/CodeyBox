@@ -1,0 +1,15 @@
+{
+  "id": 4,
+  "description": "Example project",
+  "path_with_namespace": "myteam/myproject",
+  "default_branch": "main",
+  "visibility": "private",
+  "web_url": "https://gitlab.example.com/myteam/myproject",
+  "only_allow_merge_if_pipeline_succeeds": true,
+  "namespace": {
+    "id": 2,
+    "name": "myteam",
+    "path": "myteam",
+    "kind": "group"
+  }
+}

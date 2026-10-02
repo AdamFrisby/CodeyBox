@@ -1,0 +1,23 @@
+{
+  "id": 1001,
+  "iid": 7,
+  "project_id": 4,
+  "title": "Add feature Z",
+  "description": "Automated via CodeyBox",
+  "state": "merged",
+  "detailed_merge_status": "merged",
+  "source_branch": "codeybox/abc123",
+  "target_branch": "main",
+  "sha": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c",
+  "merge_commit_sha": "cafef00dcafef00dcafef00dcafef00dcafef00d",
+  "squash_commit_sha": null,
+  "web_url": "https://gitlab.example.com/myteam/myproject/-/merge_requests/7",
+  "diff_refs": {
+    "base_sha": "1111111111111111111111111111111111111111",
+    "head_sha": "9f2c4a1b8d3e5f60718293a4b5c6d7e8f90a1b2c",
+    "start_sha": "1111111111111111111111111111111111111111"
+  },
+  "created_at": "2026-09-10T08:00:00.000Z",
+  "updated_at": "2026-09-10T09:00:00.000Z",
+  "merged_at": "2026-09-10T13:00:00.000Z"
+}

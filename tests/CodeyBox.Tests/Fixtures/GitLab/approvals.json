@@ -1,0 +1,19 @@
+{
+  "id": 1001,
+  "iid": 7,
+  "project_id": 4,
+  "title": "Add feature Z",
+  "state": "opened",
+  "approved": false,
+  "approvals_required": 2,
+  "approvals_left": 1,
+  "approved_by": [
+    {
+      "user": {
+        "id": 11,
+        "username": "approver-bob",
+        "name": "Bob Approver"
+      }
+    }
+  ]
+}
