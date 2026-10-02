@@ -27,10 +27,12 @@ namespace CodeyBox.Tests;
 public sealed class SemgrepAuditorTests
 {
     // Mirrors what `semgrep scan --config .semgrep --sarif --error .` writes
-    // for a match: results carry a SARIF "level" derived from the rule's
-    // severity (ERROR→error, WARNING→warning, INFO→note), the rule id,
-    // message text, and the first physical location's repo-relative artifact
-    // uri plus region.startLine.
+    // for a match (verified against the pinned release's real output): results
+    // carry no "level" — the rule's severity surfaces once per run as
+    // tool.driver.rules[].defaultConfiguration.level (ERROR→error,
+    // WARNING→warning, INFO→note) — plus the rule id, message text, and the
+    // first physical location's repo-relative artifact uri plus
+    // region.startLine.
     private const string SarifWithDangerousCall = """
         {
           "version": "2.1.0",
@@ -41,14 +43,12 @@ public sealed class SemgrepAuditorTests
                 "rules": [{
                   "id": "fixture.dangerous-call",
                   "name": "fixture.dangerous-call",
-                  "defaultConfiguration": { "level": "error" },
-                  "properties": { "severity": "ERROR" }
+                  "defaultConfiguration": { "level": "error" }
                 }]
               }
             },
             "results": [{
               "ruleId": "fixture.dangerous-call",
-              "level": "error",
               "message": { "text": "dangerous_sink invoked with untrusted input" },
               "locations": [{
                 "physicalLocation": {
@@ -214,17 +214,17 @@ public sealed class SemgrepAuditorTests
         Assert.Equal(AuditSeverity.Error, Assert.Single(error.Findings).Severity);
         Assert.False(error.Passed);
 
-        // A warning-level result is advisory: findings without a failed audit.
+        // A warning-severity rule is advisory: findings without a failed audit.
         var warning = await auditor.RunAsync(
-            HealthyTool(0, WithResultLevel(SarifWithDangerousCall, "warning")),
+            HealthyTool(0, WithRuleLevel(SarifWithDangerousCall, "warning")),
             "/work", FakeContext(), CancellationToken.None);
         var warningFinding = Assert.Single(warning.Findings);
         Assert.Equal(AuditSeverity.Warning, warningFinding.Severity);
         Assert.True(warning.Passed);
 
-        // A note-level result (INFO rules) is informational.
+        // A note-severity rule (INFO) is informational.
         var note = await auditor.RunAsync(
-            HealthyTool(0, WithResultLevel(SarifWithDangerousCall, "note")),
+            HealthyTool(0, WithRuleLevel(SarifWithDangerousCall, "note")),
             "/work", FakeContext(), CancellationToken.None);
         Assert.Equal(AuditSeverity.Info, Assert.Single(note.Findings).Severity);
         Assert.True(note.Passed);
@@ -232,9 +232,25 @@ public sealed class SemgrepAuditorTests
         // An unrecognised tool level falls back to the declared default,
         // not to a raw pass-through.
         var unknown = await auditor.RunAsync(
-            HealthyTool(0, WithResultLevel(SarifWithDangerousCall, "cosmic")),
+            HealthyTool(0, WithRuleLevel(SarifWithDangerousCall, "cosmic")),
             "/work", FakeContext(), CancellationToken.None);
         Assert.Equal(AuditSeverity.Warning, Assert.Single(unknown.Findings).Severity);
+
+        // A result that carries its own SARIF level wins over the rule's
+        // defaultConfiguration (SARIF level-resolution order).
+        var explicitLevel = await auditor.RunAsync(
+            HealthyTool(0, WithResultLevel(SarifWithDangerousCall, "note")),
+            "/work", FakeContext(), CancellationToken.None);
+        Assert.Equal(AuditSeverity.Info, Assert.Single(explicitLevel.Findings).Severity);
+
+        // A result whose rule is absent from rules[] keeps the SARIF
+        // default level (warning) — the mapping still applies.
+        var unmappedRule = SarifWithDangerousCall.Replace(
+            "\"id\": \"fixture.dangerous-call\"", "\"id\": " + "\"other.rule\"",
+            StringComparison.Ordinal);
+        var defaulted = await auditor.RunAsync(
+            HealthyTool(0, unmappedRule), "/work", FakeContext(), CancellationToken.None);
+        Assert.Equal(AuditSeverity.Warning, Assert.Single(defaulted.Findings).Severity);
     }
 
     [Fact]
@@ -669,10 +685,20 @@ public sealed class SemgrepAuditorTests
             Host: new TestPluginHost(config.GetSection("Scoped")));
     }
 
+    // Real semgrep results carry no "level"; the rule's severity lives in
+    // its defaultConfiguration — vary that to vary a finding's level.
+    private static string WithRuleLevel(string sarif, string level)
+        => sarif.Replace(
+            "\"level\": \"error\"",
+            "\"level\": \"" + level + "\"",
+            StringComparison.Ordinal);
+
+    // Gives the result its own "level", which SARIF resolves ahead of the
+    // rule's defaultConfiguration.
     private static string WithResultLevel(string sarif, string level)
         => sarif.Replace(
-            "\"level\": \"error\",",
-            "\"level\": \"" + level + "\",",
+            "\"ruleId\": \"fixture.dangerous-call\"",
+            "\"level\": \"" + level + "\", \"ruleId\": \"fixture.dangerous-call\"",
             StringComparison.Ordinal);
 
     private static SandboxExecResult Ok(SandboxExec exec)

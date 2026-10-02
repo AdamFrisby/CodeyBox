@@ -19,11 +19,14 @@ namespace CodeyBox.SemgrepAuditorPlugin;
 ///
 /// <para><b>Gate behaviour: hybrid / severity-driven — not blocking on every
 /// finding.</b> Semgrep rule severities (<c>ERROR</c>/<c>WARNING</c>/<c>INFO</c>)
-/// surface in SARIF as <c>error</c>/<c>warning</c>/<c>note</c> and go through a
-/// declared map, never raw: <c>error</c> → <see cref="AuditSeverity.Error"/>
-/// (fails the audit), <c>warning</c> → <see cref="AuditSeverity.Warning"/>
-/// (advisory), <c>note</c>/<c>none</c> → <see cref="AuditSeverity.Info"/>
-/// (informational); anything unrecognised → <see cref="AuditSeverity.Warning"/>.
+/// surface in SARIF on the rule's <c>defaultConfiguration.level</c> as
+/// <c>error</c>/<c>warning</c>/<c>note</c> (results carry no <c>level</c>; the
+/// <see cref="SarifRuleMetadataOutputParser"/> decorator recovers them) and go
+/// through a declared map, never raw: <c>error</c> → <see
+/// cref="AuditSeverity.Error"/> (fails the audit), <c>warning</c> → <see
+/// cref="AuditSeverity.Warning"/> (advisory), <c>note</c>/<c>none</c> → <see
+/// cref="AuditSeverity.Info"/> (informational); anything unrecognised → <see
+/// cref="AuditSeverity.Warning"/>.
 /// <c>MinimumSeverity</c> can only drop findings, it never raises them. The
 /// auditor is therefore a merge gate for rules the ruleset authors marked
 /// ERROR, not a blocker on every INFO note.</para>
@@ -156,7 +159,16 @@ public sealed class SemgrepAuditor : ExternalToolAuditorBase, IPluginInitializer
     protected override string ToolName => "semgrep";
 
     /// <inheritdoc />
-    protected override IExternalToolOutputParser OutputParser { get; } = new SarifToolOutputParser();
+    /// <summary>
+    /// Semgrep SARIF carries no <c>level</c> on individual results — each
+    /// rule's severity is recorded once per run in
+    /// <c>tool.driver.rules[].defaultConfiguration.level</c> — so the shared
+    /// <see cref="SarifRuleMetadataOutputParser"/> decorator resolves the
+    /// per-result level from that rule metadata before
+    /// <see cref="SarifToolOutputParser"/> reads the shape.
+    /// </summary>
+    protected override IExternalToolOutputParser OutputParser { get; } =
+        new SarifRuleMetadataOutputParser(new SarifToolOutputParser());
 
     /// <summary>
     /// Declared mapping from Semgrep's severity vocabulary to CodeyBox's

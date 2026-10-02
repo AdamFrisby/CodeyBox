@@ -292,7 +292,11 @@ Behaviour the base guarantees identically for every tool:
   with a bounded timeout and per-stream output caps; stdout/stderr captured
   separately, truncation reported explicitly in the raw output.
 - **Result mapping** — SARIF is first-class (`SarifToolOutputParser`);
-  anything else gets an `IExternalToolOutputParser` implementation.
+  anything else gets an `IExternalToolOutputParser` implementation. For SARIF
+  dialects whose results omit `level` (severity recorded once per run in
+  `rules[].defaultConfiguration.level`, as CodeQL and Semgrep emit), wrap the
+  parser in `SarifRuleMetadataOutputParser` — it resolves the per-result level
+  from the rule metadata before shape parsing.
 - **Severity mapping** — the tool's levels go through the declared
   `ExternalToolSeverityMapping`; raw strings never reach findings.
 - **Absent tool** — a declared-but-missing binary throws

@@ -18,12 +18,15 @@ fatal error) is infrastructure — never a pass.
   `path:startLine`; paths are relative to the repository root.
 - **Gate behaviour: hybrid / severity-driven — not blocking on every
   finding.** Semgrep severities go through a declared map, never raw:
-  `ERROR` (SARIF `error`) → `Error` (fails the audit); `WARNING` (SARIF
-  `warning`) → `Warning` (advisory); `INFO` (SARIF `note`) → `Info`
-  (informational); anything unrecognised → `Warning`. `MinimumSeverity` can
-  only drop findings, it never raises them. A rule's severity is set by the
-  ruleset author, so the gate blocks exactly the rules the chosen ruleset
-  marks `ERROR`.
+  `ERROR` → `Error` (fails the audit); `WARNING` → `Warning` (advisory);
+  `INFO` → `Info` (informational); anything unrecognised → `Warning`.
+  Semgrep's SARIF carries no `level` on individual results — the rule's
+  severity surfaces once per run in
+  `tool.driver.rules[].defaultConfiguration.level` (`error`/`warning`/`note`),
+  which the shared rule-metadata parser resolves onto each result before the
+  declared map applies. `MinimumSeverity` can only drop findings, it never
+  raises them. A rule's severity is set by the ruleset author, so the gate
+  blocks exactly the rules the chosen ruleset marks `ERROR`.
 - SARIF may embed code snippets around each location, so findings and raw
   output can contain the reported source context. That is the point of a
   SAST finding; treat audit reports accordingly.
