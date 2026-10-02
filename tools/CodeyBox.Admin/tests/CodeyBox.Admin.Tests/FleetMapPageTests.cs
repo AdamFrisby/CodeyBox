@@ -139,8 +139,8 @@ public sealed class FleetMapPageTests : BunitContext
         await cut.InvokeAsync(() => cut.Instance.OnNodeAction("a1", "addDependent"));
         cut.Markup.Contains("New item, depending on “Work a1”").ShouldBeTrue();
 
-        cut.Find("input[type=text]").Input("Follow-up: wire the auditor");
-        cut.Find("textarea").Input("Do the follow-up work once the base lands.");
+        cut.Find(".fm-overlay input[type=text]").Input("Follow-up: wire the auditor");
+        cut.Find(".fm-overlay textarea").Input("Do the follow-up work once the base lands.");
         await cut.InvokeAsync(() => cut.FindAll("button").Single(b => b.TextContent.Contains("Create dependent")).Click());
 
         cut.WaitForAssertion(() => Assert.NotNull(sent));

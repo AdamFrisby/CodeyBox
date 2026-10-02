@@ -1282,6 +1282,7 @@ hot-reloadable; the executor reads the current options on every call.
   "ProposalTimeToLiveSeconds": 86400,
   "MaxPendingProposals": 256,
   "DecidedProposalRetentionSeconds": 604800,
+  "ConversationStreamPollSeconds": 1,
   "Conversation": {
     "MaxEntryChars": 16384,
     "MaxEntries": 2000,
@@ -1302,6 +1303,7 @@ hot-reloadable; the executor reads the current options on every call.
 | `ProposalTimeToLiveSeconds` | `86400` | How long a queued proposal stays approvable (24 hours). Approving past the deadline is refused and the proposal is marked expired. 60–2592000. |
 | `MaxPendingProposals` | `256` | Cap on proposals awaiting an operator decision (pending plus in-flight `applying` commits). Past the cap, new proposals are refused as `proposal_queue_full` until decisions drain the backlog. 1–4096. |
 | `DecidedProposalRetentionSeconds` | `604800` | How long a decided (approved/rejected/expired/superseded) proposal row is kept for review before an enqueue sweep removes it (7 days). Pending rows past their TTL are reaped by the same sweep; `applying` rows are never reaped. 60–7776000. |
+| `ConversationStreamPollSeconds` | `1` | How often the operator conversation stream (`GET /majordomo/conversation/stream`) re-reads the store for new rows, in seconds. 1–60. |
 | `Conversation:MaxEntryChars` | `16384` | Per-row cap on stored conversation text. Longer payloads are truncated with a marker before they are persisted, so one huge tool result cannot grow the state database at request rate. 1024–262144. |
 | `Conversation:MaxEntries` | `2000` | Cap on stored conversation rows. Appending past it compacts the oldest excess into the deterministic summary (summarised, never dropped) inside the same write. 100–100000. |
 | `Conversation:MaxContextChars` | `12000` | Total bound on one assembled majordomo context, in characters. Assembly never returns more than this no matter how far history grows past it. 1000–200000. |

@@ -80,6 +80,16 @@ credential whose calls are being reviewed can never approve them. Approval
 commits through the same path as Autonomous mode, revalidated against live
 queue state.
 
+The fleet-map conversation panel is served by the same operator-only gate
+under `/majordomo`: `GET /conversation` pages the durable conversation
+(operator turns plus the tool calls the majordomo made, shown inline),
+`POST /conversation` records an operator turn the majordomo sees on its
+next assembled context, `GET /conversation/stream` tails new rows as
+server-sent events, and `GET`/`POST`/`DELETE /mode` reads, overrides, or
+clears the autonomy switch (an override flips the next tool call between
+`proposed` and `autonomous` without a restart; clearing returns to the
+configured mode).
+
 ### GitHub App delivery credentials
 
 For team installations, configure the GitHub upstream with a GitHub App

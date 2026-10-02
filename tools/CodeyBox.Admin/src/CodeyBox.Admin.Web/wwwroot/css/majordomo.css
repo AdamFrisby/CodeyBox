@@ -1,0 +1,260 @@
+/* ── Majordomo side panel ────────────────────────────────────────────────
+   The panel is a flex sibling of the canvas inside .fm-stage (see map.css),
+   so opening it resizes the canvas instead of overlaying it. Widths are
+   chosen so the canvas keeps a usable width at 1280px: 20rem panel +
+   17rem attention rail leaves ~43rem for the canvas. The canvas wrap keeps its
+   existing flex sizing from map.css (flex: 1, min-width: 0): the panel
+   takes its fixed width and the canvas the remainder, so the rail is
+   never covered or moved at any width. */
+
+.fm-side {
+    width: 20rem;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-right: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-card) 80%, var(--bg-inset));
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+@media (max-width: 1350px) {
+    .fm-side { width: 17rem; }
+}
+
+@media (max-width: 1100px) {
+    .fm-side { width: 15rem; }
+}
+
+/* panel internals -------------------------------------------------------- */
+.mj {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.6rem;
+    font-size: 0.82rem;
+}
+
+/* autonomy switch: unambiguous at a glance, no menu ---------------------- */
+.mj-mode {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    padding: 0.45rem 0.5rem;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-m);
+    background: var(--bg-overlay);
+}
+
+.mj-mode-label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    margin-right: auto;
+}
+
+.mj-mode-btn {
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: var(--radius-pill);
+    padding: 0.2rem 0.7rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 650;
+}
+
+.mj-mode-btn:hover { background: var(--bg-hover); }
+.mj-mode-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.mj-mode-btn--on {
+    border-color: var(--accent);
+    color: var(--accent-strong);
+    background: var(--info-bg);
+}
+.mj-mode-btn--on.mj-mode-btn--auto {
+    border-color: var(--warn);
+    color: var(--warn);
+    background: var(--warn-bg);
+}
+
+.mj-mode-state {
+    width: 100%;
+    font-size: 0.74rem;
+    color: var(--text-faint);
+}
+
+/* thread ------------------------------------------------------------------ */
+.mj-thread {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    min-height: 6rem;
+    max-height: 40vh;
+    overflow-y: auto;
+    padding: 0.1rem;
+}
+
+.mj-empty { color: var(--text-faint); font-size: 0.8rem; margin: 0; }
+
+.mj-summary { font-size: 0.78rem; color: var(--text-dim); }
+.mj-summary > p { margin: 0.3rem 0 0; white-space: pre-wrap; }
+
+.mj-turn { display: flex; flex-direction: column; gap: 0.15rem; }
+.mj-turn-role {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-faint);
+}
+.mj-turn--operator .mj-turn-role { color: var(--accent-strong); }
+.mj-turn-text { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.mj-turn-text a, .mj-tool-body a, .mj-proposal-items a { color: var(--accent-strong); }
+
+.mj-tool {
+    border: 1px solid var(--border);
+    border-left-width: 4px;
+    border-radius: var(--radius-s);
+    background: var(--bg-inset);
+    font-size: 0.78rem;
+}
+.mj-tool--call { border-left-color: var(--accent); }
+.mj-tool--result { border-left-color: var(--ok); }
+.mj-tool > summary { cursor: pointer; padding: 0.25rem 0.5rem; list-style: none; display: flex; gap: 0.4rem; align-items: baseline; }
+.mj-tool > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.mj-tool-chip {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    font-weight: 650;
+    background: var(--bg-overlay);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-s);
+    padding: 0 0.35rem;
+    white-space: nowrap;
+}
+.mj-tool-body {
+    margin: 0;
+    padding: 0.35rem 0.5rem;
+    border-top: 1px solid var(--border);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: 0.74rem;
+    color: var(--text-dim);
+    max-height: 12rem;
+    overflow-y: auto;
+}
+
+/* composer ---------------------------------------------------------------- */
+.mj-compose { display: flex; flex-direction: column; gap: 0.35rem; }
+.mj-compose-label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+}
+.mj-input {
+    font: inherit;
+    color: var(--text);
+    background: var(--bg-overlay);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-s);
+    padding: 0.4rem 0.5rem;
+    resize: vertical;
+}
+.mj-input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.mj-send {
+    align-self: flex-end;
+    border: 1px solid var(--accent);
+    background: var(--info-bg);
+    color: var(--accent-strong);
+    border-radius: var(--radius-pill);
+    padding: 0.2rem 1rem;
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 650;
+}
+.mj-send:disabled { opacity: 0.5; cursor: default; }
+.mj-send:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* proposals --------------------------------------------------------------- */
+.mj-proposals { display: flex; flex-direction: column; gap: 0.45rem; }
+.mj-proposals-head { display: flex; align-items: baseline; gap: 0.5rem; }
+.mj-proposals-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+}
+.mj-proposals-count { font-family: var(--mono); font-size: 0.78rem; color: var(--warn); font-weight: 650; }
+
+.mj-proposal {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding: 0.5rem 0.6rem;
+    background: var(--bg-card);
+    border: 1px solid var(--warn);
+    border-left-width: 4px;
+    border-radius: var(--radius-m);
+}
+.mj-proposal-head { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; }
+.mj-proposal-reason { margin: 0; font-size: 0.8rem; color: var(--text-dim); overflow-wrap: anywhere; }
+.mj-proposal-changes { font-size: 0.78rem; }
+.mj-proposal-changes-label { font-weight: 650; color: var(--text-dim); }
+.mj-proposal-changes ul { margin: 0.2rem 0 0; padding-left: 1.1rem; }
+.mj-proposal-items { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.25rem; font-size: 0.76rem; }
+.mj-proposal-actions { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+.mj-approve {
+    border: 1px solid var(--ok);
+    background: var(--ok-bg);
+    color: var(--ok);
+    border-radius: var(--radius-pill);
+    padding: 0.2rem 0.8rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 650;
+}
+.mj-reject {
+    border: 1px solid var(--danger);
+    background: transparent;
+    color: var(--danger);
+    border-radius: var(--radius-pill);
+    padding: 0.2rem 0.8rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 650;
+}
+.mj-approve:focus-visible, .mj-reject:focus-visible, .mj-reject-reason:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+}
+.mj-reject-reason {
+    flex: 1;
+    min-width: 6rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: var(--text);
+    background: var(--bg-overlay);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-s);
+    padding: 0.2rem 0.4rem;
+}
+
+.mj-error {
+    margin: 0;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--danger);
+    border-radius: var(--radius-s);
+    background: var(--danger-bg);
+    color: var(--danger);
+    font-size: 0.76rem;
+    overflow-wrap: anywhere;
+}
+
+.mj-ov-muted { color: var(--text-faint); font-size: 0.74rem; }

@@ -688,4 +688,110 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
     }
 
     private sealed record AgentAvailabilityPage(List<AgentAvailabilityDto> Agents);
+
+    // ── Majordomo panel ───────────────────────────────────────────────────────
+    public async Task<MajordomoConversationPageDto?> GetMajordomoConversationAsync(
+        long afterSequence = 0, int limit = 100, CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync(
+            $"/majordomo/conversation?afterSequence={afterSequence}&limit={limit}", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<MajordomoConversationPageDto>(JsonOptions, ct);
+    }
+
+    public async Task<MajordomoConversationEntryDto?> PostMajordomoMessageAsync(
+        string text, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            "/majordomo/conversation", new { text }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<MajordomoConversationEntryDto>(JsonOptions, ct);
+    }
+
+    public async Task<MajordomoModeDto?> GetMajordomoModeAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync("/majordomo/mode", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<MajordomoModeDto>(JsonOptions, ct);
+    }
+
+    public async Task<MajordomoModeDto?> SetMajordomoModeAsync(string mode, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync("/majordomo/mode", new { mode }, JsonOptions, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<MajordomoModeDto>(JsonOptions, ct);
+    }
+
+    public async Task<List<MajordomoProposalDto>> GetMajordomoProposalsAsync(
+        string? state = "pending", CancellationToken ct = default)
+    {
+        var query = string.IsNullOrWhiteSpace(state)
+            ? "/majordomo/proposals/"
+            : $"/majordomo/proposals/?state={Uri.EscapeDataString(state)}";
+        var resp = await _http.GetAsync(query, ct);
+        if (!resp.IsSuccessStatusCode) return [];
+        return await resp.Content.ReadFromJsonAsync<List<MajordomoProposalDto>>(JsonOptions, ct) ?? [];
+    }
+
+    public async Task<MajordomoProposalDecisionDto> ApproveMajordomoProposalAsync(
+        string id, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsync(
+            $"/majordomo/proposals/{Uri.EscapeDataString(id)}/approve", content: null, ct);
+        return await ReadProposalDecisionAsync(resp, ct);
+    }
+
+    public async Task<MajordomoProposalDecisionDto> RejectMajordomoProposalAsync(
+        string id, string? reason = null, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/majordomo/proposals/{Uri.EscapeDataString(id)}/reject",
+            new { reason }, JsonOptions, ct);
+        return await ReadProposalDecisionAsync(resp, ct);
+    }
+
+    private static async Task<MajordomoProposalDecisionDto> ReadProposalDecisionAsync(
+        HttpResponseMessage resp, CancellationToken ct)
+    {
+        JsonElement body;
+        try
+        {
+            body = await resp.Content.ReadFromJsonAsync<JsonElement>(JsonOptions, ct);
+        }
+        catch (JsonException)
+        {
+            return new MajordomoProposalDecisionDto
+            {
+                Ok = false,
+                Status = "refused",
+                Detail = $"The server answered {(int)resp.StatusCode}; the proposal was not changed.",
+            };
+        }
+
+        if (resp.IsSuccessStatusCode)
+        {
+            var status = body.TryGetProperty("status", out var s) ? s.GetString() ?? "" : "";
+            var affected = new List<string>();
+            if (body.TryGetProperty("affectedItems", out var items) && items.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in items.EnumerateArray())
+                    if (item.GetString() is { } id)
+                        affected.Add(id);
+            }
+            return new MajordomoProposalDecisionDto
+            {
+                Ok = status is "approved" or "already-approved" or "rejected" or "superseded",
+                Status = status,
+                AffectedItems = affected,
+            };
+        }
+
+        return new MajordomoProposalDecisionDto
+        {
+            Ok = false,
+            Status = "refused",
+            Reason = body.TryGetProperty("reason", out var r) ? r.GetString() : null,
+            Detail = body.TryGetProperty("error", out var e) ? e.GetString() : null,
+        };
+    }
 }

@@ -13,6 +13,7 @@
 <PageTitle>Fleet map — CodeyBox Admin</PageTitle>
 <HeadContent>
     <link rel="stylesheet" href="css/map.css" />
+    <link rel="stylesheet" href="css/majordomo.css" />
 </HeadContent>
 
 @* One canvas, one continuous progression. Zoomed out, every item is a node
@@ -39,6 +40,11 @@
             {
                 <button type="button" class="fm-btn fm-btn--primary" @onclick="ResumeAutoAsync">Resume auto-follow</button>
             }
+            <button type="button" class="fm-btn @(_majordomoOpen ? "fm-btn--primary" : "")"
+                    aria-expanded="@_majordomoOpen.ToString().ToLowerInvariant()"
+                    aria-controls="fleet-majordomo-panel"
+                    title="Talk to the majordomo and review its proposals beside the map"
+                    @onclick="ToggleMajordomoAsync">Majordomo</button>
         </span>
         <span class="fm-prefs" title="Settled work (landed or cancelled) stays while something in flight builds on it; otherwise it folds away past this horizon.">
             <label class="fm-check"><input type="checkbox" checked="@_showSettled" @onchange="OnShowSettledChanged" /> settled</label>
@@ -74,6 +80,17 @@
     }
 
     <div class="fm-stage">
+        @* The majordomo panel: a flex sibling of the canvas, never an
+           overlay, so opening it resizes the canvas instead of covering
+           it. The attention rail stays docked on the right untouched. *@
+        @if (_majordomoOpen)
+        {
+            <aside class="fm-side" id="fleet-majordomo-panel" aria-label="Majordomo">
+                <MajordomoPanel TitleFor="@TitleOf"
+                                TitleMap="@MajordomoTitleMap"
+                                OnFleetChanged="PollAndRenderAsync" />
+            </aside>
+        }
         <div class="fm-canvas-wrap" id="fleet-map-wrap">
             <canvas id="fleet-map-canvas" class="fm-canvas" tabindex="0"
                     aria-label="Fleet map canvas: dependency tree of work items. Drag to pan, wheel to zoom, click a node to zoom to it; at close zoom each node shows its stage circuit, or its evidence and actions when it needs you. The chain list below is the text equivalent."></canvas>
@@ -431,6 +448,10 @@
                 {
                     _suggestionSeverity = sev.GetString()!;
                 }
+                if (p.TryGetProperty("majordomoOpen", out var majo) && majo.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                {
+                    _majordomoOpen = majo.GetBoolean();
+                }
             }
         }
         catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException or JsonException)
@@ -447,7 +468,7 @@
         }
         try
         {
-            await JS.InvokeVoidAsync("codeyboxFleetMap.prefs.set", new { showSettled = _showSettled, horizon = _horizonKey, showSuggestions = _showSuggestions, suggestionSeverity = _suggestionSeverity });
+            await JS.InvokeVoidAsync("codeyboxFleetMap.prefs.set", new { showSettled = _showSettled, horizon = _horizonKey, showSuggestions = _showSuggestions, suggestionSeverity = _suggestionSeverity, majordomoOpen = _majordomoOpen });
         }
         catch (Exception ex) when (ex is JSDisconnectedException or JSException or InvalidOperationException)
         {
@@ -1248,6 +1269,31 @@
     {
         var title = _snapshot?.Items.FirstOrDefault(i => string.Equals(i.Id, id, StringComparison.Ordinal))?.Title;
         return string.IsNullOrWhiteSpace(title) ? ShortId(id) : title.Trim();
+    }
+
+    // The majordomo panel beside the map. Open by default — the panel is
+    // the point — remembered per browser like the other map preferences.
+    // It is a flex sibling of the canvas, so the canvas resizes instead of
+    // being overlaid, and the attention rail on the right is untouched.
+    private bool _majordomoOpen = true;
+
+    private string? MajordomoTitleFor(string id)
+    {
+        var title = _snapshot?.Items.FirstOrDefault(i => string.Equals(i.Id, id, StringComparison.Ordinal))?.Title;
+        return string.IsNullOrWhiteSpace(title) ? null : title.Trim();
+    }
+
+    private IReadOnlyDictionary<string, string> MajordomoTitleMap =>
+        _snapshot?.Items
+            .Where(i => !string.IsNullOrWhiteSpace(i.Title))
+            .GroupBy(i => i.Id, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First().Title.Trim(), StringComparer.Ordinal)
+        ?? (IReadOnlyDictionary<string, string>)new Dictionary<string, string>();
+
+    private async Task ToggleMajordomoAsync()
+    {
+        _majordomoOpen = !_majordomoOpen;
+        await SavePrefsAsync();
     }
 
     private static string ShortId(string id) => id.Length >= 8 ? id[..8] : id;
