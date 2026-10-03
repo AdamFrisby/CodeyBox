@@ -1,0 +1,11 @@
+{
+  "sandbox_id": "sb_000042",
+  "name": "codeybox-a1b2c3d4-54321",
+  "status": "running",
+  "created_at_unix": 1700000000,
+  "metadata": {
+    "codeybox-managed": "true",
+    "codeybox-provider": "modal",
+    "codeybox-purpose": "WorkItem"
+  }
+}

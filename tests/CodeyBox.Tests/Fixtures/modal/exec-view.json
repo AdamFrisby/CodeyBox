@@ -1,0 +1,11 @@
+{
+  "exec_id": "exec_000007",
+  "status": "completed",
+  "exit_code": 0,
+  "stdout": "hello from the sandbox\n",
+  "stderr": "",
+  "stdout_length": 23,
+  "stderr_length": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false
+}
