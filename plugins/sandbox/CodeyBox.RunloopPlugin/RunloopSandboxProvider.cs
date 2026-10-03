@@ -524,7 +524,7 @@ public sealed class RunloopSandboxProvider : ISandboxProvider, ISuspendingSandbo
         foreach (var mount in spec.Mounts)
         {
             ct.ThrowIfCancellationRequested();
-            RunloopGuestPath.ValidateAbsolute(mount.SandboxPath);
+            HostedGuestPath.ValidateAbsolute(mount.SandboxPath);
 
             if (mount.Tmpfs)
             {
@@ -649,7 +649,7 @@ public sealed class RunloopSandboxProvider : ISandboxProvider, ISuspendingSandbo
             }
 
             var guestPath = guestRoot.TrimEnd('/') + "/" + relative.Replace(Path.DirectorySeparatorChar, '/');
-            RunloopGuestPath.ValidateAbsolute(guestPath);
+            HostedGuestPath.ValidateAbsolute(guestPath);
 
             byte[] content;
             try

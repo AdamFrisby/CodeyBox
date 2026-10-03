@@ -538,7 +538,7 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
         foreach (var mount in spec.Mounts)
         {
             ct.ThrowIfCancellationRequested();
-            E2bGuestPath.ValidateAbsolute(mount.SandboxPath);
+            HostedGuestPath.ValidateAbsolute(mount.SandboxPath);
 
             if (mount.Tmpfs)
             {
@@ -659,7 +659,7 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
             }
 
             var guestPath = guestRoot.TrimEnd('/') + "/" + relative.Replace(Path.DirectorySeparatorChar, '/');
-            E2bGuestPath.ValidateAbsolute(guestPath);
+            HostedGuestPath.ValidateAbsolute(guestPath);
 
             byte[] content;
             try

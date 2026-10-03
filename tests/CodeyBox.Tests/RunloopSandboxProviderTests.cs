@@ -614,7 +614,7 @@ public sealed class RunloopSandboxProviderTests
     [Fact]
     public void ShellCommand_BuildsQuotedCommand_WithBase64Environment()
     {
-        var command = RunloopShellCommand.Build(
+        var command = HostedGuestShellCommand.Build(
             new Dictionary<string, string> { ["BASE"] = "1", ["DROP"] = "x" },
             new SandboxExec
             {
@@ -698,7 +698,7 @@ public sealed class RunloopSandboxProviderTests
     [Fact]
     public void ShellCommand_RejectsOversizedEnvironment()
     {
-        Assert.Throws<ArgumentException>(() => RunloopShellCommand.Build(
+        Assert.Throws<ArgumentException>(() => HostedGuestShellCommand.Build(
             new Dictionary<string, string> { ["BIG"] = new string('v', 100) },
             new SandboxExec { Argv = ["true"] },
             "/work",
@@ -710,9 +710,9 @@ public sealed class RunloopSandboxProviderTests
     [Fact]
     public void GuestPath_Validation_RejectsEscapes()
     {
-        Assert.Throws<ArgumentException>(() => RunloopGuestPath.ValidateAbsolute("relative/path"));
-        Assert.Throws<ArgumentException>(() => RunloopGuestPath.ValidateAbsolute("/work/../etc"));
-        Assert.Equal("sub/file", RunloopGuestPath.GetRelativePath("/work", "/work/sub/file"));
-        Assert.Throws<ArgumentException>(() => RunloopGuestPath.GetRelativePath("/work", "/other/file"));
+        Assert.Throws<ArgumentException>(() => HostedGuestPath.ValidateAbsolute("relative/path"));
+        Assert.Throws<ArgumentException>(() => HostedGuestPath.ValidateAbsolute("/work/../etc"));
+        Assert.Equal("sub/file", HostedGuestPath.GetRelativePath("/work", "/work/sub/file"));
+        Assert.Throws<ArgumentException>(() => HostedGuestPath.GetRelativePath("/work", "/other/file"));
     }
 }

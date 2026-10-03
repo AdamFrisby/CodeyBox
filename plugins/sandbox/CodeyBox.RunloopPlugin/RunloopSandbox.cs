@@ -84,7 +84,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         }
         else
         {
-            command = RunloopShellCommand.Build(
+            command = HostedGuestShellCommand.Build(
                 _spec.Environment,
                 exec,
                 exec.WorkingDirectory ?? _workingDirectory,
@@ -147,8 +147,8 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         string workingDirectory,
         CancellationToken ct)
     {
-        var (merged, removals) = RunloopShellCommand.MergeEnvironment(_spec.Environment, exec);
-        var content = RunloopShellCommand.BuildEnvFileContent(merged, removals, opts.MaxEnvironmentBytes);
+        var (merged, removals) = HostedGuestShellCommand.MergeEnvironment(_spec.Environment, exec);
+        var content = HostedGuestShellCommand.BuildEnvFileContent(merged, removals, opts.MaxEnvironmentBytes);
         var envFilePath = $"{SecretEnvStagingDirectory}/env-{Guid.NewGuid():N}";
 
         try
@@ -160,7 +160,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
             throw ToUnavailable(ex);
         }
 
-        return RunloopShellCommand.BuildSourcingCommand(
+        return HostedGuestShellCommand.BuildSourcingCommand(
             envFilePath, exec, workingDirectory, opts.MaxCommandBytes, opts.MaxStdinBytes);
     }
 
@@ -186,7 +186,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         ArgumentException.ThrowIfNullOrWhiteSpace(guestPath);
         ArgumentNullException.ThrowIfNull(contents);
         ThrowIfDisposed();
-        RunloopGuestPath.ValidateAbsolute(guestPath);
+        HostedGuestPath.ValidateAbsolute(guestPath);
         var opts = _readOptions();
         try
         {
@@ -203,7 +203,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(guestPath);
         ThrowIfDisposed();
-        RunloopGuestPath.ValidateAbsolute(guestPath);
+        HostedGuestPath.ValidateAbsolute(guestPath);
         var opts = _readOptions();
         try
         {
@@ -514,7 +514,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
                 string relative;
                 try
                 {
-                    relative = RunloopGuestPath.GetRelativePath(mount.GuestPath, guestFile);
+                    relative = HostedGuestPath.GetRelativePath(mount.GuestPath, guestFile);
                 }
                 catch (ArgumentException)
                 {
@@ -569,7 +569,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         int maxStderr,
         CancellationToken ct)
     {
-        var command = RunloopShellCommand.Build(
+        var command = HostedGuestShellCommand.Build(
             new Dictionary<string, string>(),
             new SandboxExec { Argv = argv, WorkingDirectory = workingDirectory },
             workingDirectory,

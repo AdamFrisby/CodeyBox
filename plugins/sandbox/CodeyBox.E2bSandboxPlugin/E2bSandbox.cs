@@ -95,7 +95,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
         }
         else
         {
-            command = E2bShellCommand.Build(
+            command = HostedGuestShellCommand.Build(
                 _spec.Environment,
                 exec,
                 exec.WorkingDirectory ?? _workingDirectory,
@@ -127,10 +127,10 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
     private async Task<(string Command, string EnvFilePath)> BuildSecretCommandAsync(
         E2bSandboxOptions opts, SandboxExec exec, string workingDirectory, CancellationToken ct)
     {
-        var (merged, removals) = E2bShellCommand.MergeEnvironment(_spec.Environment, exec);
-        var content = E2bShellCommand.BuildEnvFileContent(merged, removals, opts.MaxEnvironmentBytes);
+        var (merged, removals) = HostedGuestShellCommand.MergeEnvironment(_spec.Environment, exec);
+        var content = HostedGuestShellCommand.BuildEnvFileContent(merged, removals, opts.MaxEnvironmentBytes);
         var envFilePath = $"{SecretEnvStagingDirectory}/env-{Guid.NewGuid():N}";
-        E2bGuestPath.ValidateAbsolute(envFilePath);
+        HostedGuestPath.ValidateAbsolute(envFilePath);
 
         try
         {
@@ -141,7 +141,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
             throw ToUnavailable(ex);
         }
 
-        return (E2bShellCommand.BuildSourcingCommand(
+        return (HostedGuestShellCommand.BuildSourcingCommand(
             envFilePath, exec, workingDirectory, opts.MaxCommandBytes, opts.MaxStdinBytes), envFilePath);
     }
 
@@ -288,7 +288,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
         ArgumentException.ThrowIfNullOrWhiteSpace(guestPath);
         ArgumentNullException.ThrowIfNull(contents);
         ThrowIfDisposed();
-        E2bGuestPath.ValidateAbsolute(guestPath);
+        HostedGuestPath.ValidateAbsolute(guestPath);
         var opts = _readOptions();
         var encoded = Convert.ToBase64String(contents);
         try
@@ -308,7 +308,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
         ArgumentException.ThrowIfNullOrWhiteSpace(guestPath);
         ArgumentNullException.ThrowIfNull(contents);
         ThrowIfDisposed();
-        E2bGuestPath.ValidateAbsolute(guestPath);
+        HostedGuestPath.ValidateAbsolute(guestPath);
         var opts = _readOptions();
         var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(contents));
         try
@@ -327,7 +327,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(guestPath);
         ThrowIfDisposed();
-        E2bGuestPath.ValidateAbsolute(guestPath);
+        HostedGuestPath.ValidateAbsolute(guestPath);
         var opts = _readOptions();
         try
         {
@@ -529,7 +529,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
                 string relative;
                 try
                 {
-                    relative = E2bGuestPath.GetRelativePath(mount.GuestPath, guestFile);
+                    relative = HostedGuestPath.GetRelativePath(mount.GuestPath, guestFile);
                 }
                 catch (ArgumentException)
                 {
@@ -648,7 +648,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
     internal async Task<SandboxExecResult> RunInternalAsync(
         E2bSandboxOptions opts, string[] argv, string workingDirectory, CancellationToken ct)
     {
-        var command = E2bShellCommand.Build(
+        var command = HostedGuestShellCommand.Build(
             new Dictionary<string, string>(),
             new SandboxExec { Argv = argv, WorkingDirectory = workingDirectory },
             workingDirectory,

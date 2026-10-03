@@ -675,7 +675,7 @@ public sealed class E2bSandboxProviderTests
     [Fact]
     public void ShellCommand_BuildsQuotedCommand_WithBase64Environment()
     {
-        var command = E2bShellCommand.Build(
+        var command = HostedGuestShellCommand.Build(
             new Dictionary<string, string> { ["BASE"] = "1", ["DROP"] = "x" },
             new SandboxExec
             {
@@ -776,7 +776,7 @@ public sealed class E2bSandboxProviderTests
     [Fact]
     public void ShellCommand_RejectsOversizedEnvironment()
     {
-        Assert.Throws<ArgumentException>(() => E2bShellCommand.Build(
+        Assert.Throws<ArgumentException>(() => HostedGuestShellCommand.Build(
             new Dictionary<string, string> { ["BIG"] = new string('v', 100) },
             new SandboxExec { Argv = ["true"] },
             "/work",
@@ -786,12 +786,28 @@ public sealed class E2bSandboxProviderTests
     }
 
     [Fact]
+    public void SourcingCommand_AlwaysRemovesEnvFile_BeforeExit()
+    {
+        var command = HostedGuestShellCommand.BuildSourcingCommand(
+            "/tmp/.codeybox-exec-env/env-abc",
+            new SandboxExec { Argv = ["true"] },
+            "/work",
+            maxCommandBytes: 4096,
+            maxStdinBytes: 1024);
+
+        var rmIndex = command.IndexOf("rm -f -- '/tmp/.codeybox-exec-env/env-abc'", StringComparison.Ordinal);
+        var exitIndex = command.IndexOf("exit 127", StringComparison.Ordinal);
+        Assert.True(rmIndex >= 0, "Sourcing command must delete the staged env file.");
+        Assert.True(exitIndex > rmIndex, "The env file must be deleted even when sourcing fails.");
+    }
+
+    [Fact]
     public void GuestPath_Validation_RejectsEscapes()
     {
-        Assert.Throws<ArgumentException>(() => E2bGuestPath.ValidateAbsolute("relative/path"));
-        Assert.Throws<ArgumentException>(() => E2bGuestPath.ValidateAbsolute("/work/../etc"));
-        Assert.Equal("sub/file", E2bGuestPath.GetRelativePath("/work", "/work/sub/file"));
-        Assert.Throws<ArgumentException>(() => E2bGuestPath.GetRelativePath("/work", "/other/file"));
+        Assert.Throws<ArgumentException>(() => HostedGuestPath.ValidateAbsolute("relative/path"));
+        Assert.Throws<ArgumentException>(() => HostedGuestPath.ValidateAbsolute("/work/../etc"));
+        Assert.Equal("sub/file", HostedGuestPath.GetRelativePath("/work", "/work/sub/file"));
+        Assert.Throws<ArgumentException>(() => HostedGuestPath.GetRelativePath("/work", "/other/file"));
     }
 
     private static E2bSandbox NewSyncSandbox(FakeE2bHandler handler, E2bSandboxOptions? opts = null)

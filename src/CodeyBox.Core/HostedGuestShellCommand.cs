@@ -1,24 +1,24 @@
 using System.Text;
-using CodeyBox.Core;
 
-namespace CodeyBox.RunloopPlugin;
+namespace CodeyBox.Core;
 
 /// <summary>
-/// Pure construction of the guest shell commands sent to Runloop's
-/// <c>execute_async</c> endpoint. Merges spec and exec environments (exec wins),
-/// applies removals, base64-encodes values so no quoting edge case can break
-/// out of the generated preamble, establishes the working directory, pipes
-/// bounded stdin, and appends the caller argv. All inputs are treated as
-/// untrusted; every bound is enforced before the command is returned.
+/// Pure construction of the guest shell commands sent to a hosted sandbox
+/// command gateway. Shared by every hosted-sandbox plugin (E2B, Runloop):
+/// merges spec and exec environments (exec wins), applies removals,
+/// base64-encodes values so no quoting edge case can break out of the
+/// generated preamble, establishes the working directory, pipes bounded
+/// stdin, and appends the caller argv. All inputs are treated as untrusted;
+/// every bound is enforced before the command is returned.
 ///
 /// <para>Secret-bearing execs (<see cref="SandboxExec.EnvironmentContainsSecrets"/>)
 /// must not use <see cref="Build"/>: it embeds every value in the command
-/// string, which the hosted control plane retains with the execution record.
-/// Route those through <see cref="BuildEnvFileContent"/> (staged via
-/// <c>write_file_contents</c>) plus <see cref="BuildSourcingCommand"/>, so
-/// values never enter host-visible command argv.</para>
+/// string, which the hosted control plane may retain with the execution
+/// record. Route those through <see cref="BuildEnvFileContent"/> (staged via
+/// the provider's file gateway) plus <see cref="BuildSourcingCommand"/>, so values
+/// never enter host-visible command payloads.</para>
 /// </summary>
-public static class RunloopShellCommand
+public static class HostedGuestShellCommand
 {
     /// <summary>Builds the guest shell command for one exec.</summary>
     /// <exception cref="ArgumentException">Empty argv, oversized payload, or invalid env names.</exception>
@@ -96,7 +96,7 @@ public static class RunloopShellCommand
 
     /// <summary>
     /// Renders the merged environment as a sourceable shell script for staging
-    /// via <c>write_file_contents</c>. Values travel base64-encoded, so the raw
+    /// via the provider's file gateway. Values travel base64-encoded, so the raw
     /// secret never appears in the file as a bare literal either.
     /// </summary>
     /// <exception cref="ArgumentException">Merged environment exceeds the byte budget.</exception>
@@ -141,8 +141,11 @@ public static class RunloopShellCommand
     /// Builds the guest shell command for a secret-bearing exec. Sources the
     /// staged env file, deletes it before running argv (so secrets do not
     /// linger on the guest disk past process start), then behaves like
-    /// <see cref="Build"/>. The command carries only the env-file path —
-    /// never a secret value — so the hosted execution record stays clean.
+    /// <see cref="Build"/>. The sourcing result is captured first and the env
+    /// file is always removed — even when sourcing fails — before exiting 127,
+    /// so a bad env file can never leave secrets on guest disk. The command
+    /// carries only the env-file path — never a secret value — so the hosted
+    /// execution record stays clean.
     /// </summary>
     /// <exception cref="ArgumentException">Empty argv, oversized payload, or invalid guest path.</exception>
     public static string BuildSourcingCommand(
@@ -156,7 +159,7 @@ public static class RunloopShellCommand
         ArgumentNullException.ThrowIfNull(exec);
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
         ValidateArgv(exec);
-        RunloopGuestPath.ValidateAbsolute(envFilePath);
+        HostedGuestPath.ValidateAbsolute(envFilePath);
 
         var stdinBase64 = EncodeStdin(exec, maxStdinBytes);
 
@@ -164,9 +167,9 @@ public static class RunloopShellCommand
         var builder = new StringBuilder();
         builder.Append("set -u; . ");
         builder.Append(quotedEnvFile);
-        builder.Append(" || exit 127; rm -f -- ");
+        builder.Append("; _codeybox_env_rc=$?; rm -f -- ");
         builder.Append(quotedEnvFile);
-        builder.Append("; ");
+        builder.Append("; [ $_codeybox_env_rc -ne 0 ] && exit 127; ");
         AppendWorkdirAndArgv(builder, exec.Argv, workingDirectory);
 
         var command = WrapStdin(builder.ToString(), stdinBase64);
