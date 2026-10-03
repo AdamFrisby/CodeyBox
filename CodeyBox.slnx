@@ -135,6 +135,7 @@
     <Project Path="plugins/notifications/CodeyBox.GotifyPlugin/CodeyBox.GotifyPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.NtfyPlugin/CodeyBox.NtfyPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.TeamsPlugin/CodeyBox.TeamsPlugin.csproj" />
+    <Project Path="plugins/notifications/CodeyBox.DiscordPlugin/CodeyBox.DiscordPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.DaytonaSandboxPlugin/CodeyBox.DaytonaSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.OpenStackSandboxPlugin/CodeyBox.OpenStackSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.BoxLiteSandboxPlugin/CodeyBox.BoxLiteSandboxPlugin.csproj" />

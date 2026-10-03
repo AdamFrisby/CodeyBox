@@ -58,6 +58,7 @@ Supported schemes (`Scheme` per provider entry):
 |---|---|---|
 | `hmac-sha256` | `X-CodeyBox-Signature: sha256=<hex HMAC over raw body>`, `X-CodeyBox-Timestamp` (unix seconds) | env var named by `SigningSecretEnvVar` |
 | `slack-v0` | `X-Slack-Signature: v0=<hex HMAC over "v0:{ts}:{body}">`, `X-Slack-Request-Timestamp` | Slack signing secret via `SigningSecretEnvVar` |
+| `discord-ed25519` | `X-Signature-Ed25519: <hex Ed25519 over "{timestamp}{raw_body}">`, `X-Signature-Timestamp` (unix seconds, also the replay window) | Application public key (32-byte hex) via `SigningSecretEnvVar` |
 | `ntfy-hmac` | `X-CodeyBox-Signature: sha256=<hex HMAC over raw body>` — no timestamp; the ntfy client invokes a button minted at publish time, so replays are absorbed by dedup + question state | interaction secret via `SigningSecretEnvVar` |
 | `botframework-jwt` | `Authorization: Bearer <RS256 JWT>` issued by `https://api.botframework.com` — no timestamp; the token's own expiry plus dedup + question state absorb replays | expected App ID (token audience) via `SigningSecretEnvVar` |
 
