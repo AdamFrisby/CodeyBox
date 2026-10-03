@@ -27,8 +27,11 @@ namespace CodeyBox.Orchestrator;
 /// capabilities are matched against each host's declared attributes, and
 /// cordoned, unhealthy, runtime-backed-off and at-capacity hosts are
 /// excluded. The decision — chosen host plus the per-candidate refusal
-/// reason — is logged for observability. With no executor registered at all,
-/// fall back to the in-process runner with unchanged behaviour.</item>
+/// reason — is logged for observability. The colocated in-process executor
+/// (host <c>"local"</c>) always takes part, so a deployment with no remote
+/// executor configured still executes phases through the executor path; an
+/// empty candidate set is a configuration fault that fails loudly instead
+/// of falling back to a second implementation.</item>
 /// <item>Stage the phase's single bare repo to the executor, run the phase
 /// there, and stage the repo back as a tar archive. Only the per-item repo
 /// path is ever transferred — never the whole repos root. A transport
@@ -93,7 +96,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
     private readonly IExecutorPhaseTransportFactory _transports;
     private readonly IGitHost _gitHost;
     private readonly IIdempotencyStore _idempotency;
-    private readonly IExecutorPhaseRunner _inner;
+    private readonly ColocatedExecutorHost _local;
     private readonly Func<ExecutorPhaseDispatchOptions> _optionsAccessor;
     private readonly IAgentStreamStore? _streamStore;
     private readonly IStdoutBroadcaster? _broadcaster;
@@ -109,7 +112,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         IExecutorPhaseTransportFactory transports,
         IGitHost gitHost,
         IIdempotencyStore idempotency,
-        IExecutorPhaseRunner inner,
+        ColocatedExecutorHost local,
         Func<ExecutorPhaseDispatchOptions> optionsAccessor,
         TimeProvider? clock = null,
         ILogger<ExecutorPhaseProxy>? log = null,
@@ -120,7 +123,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         _transports = transports ?? throw new ArgumentNullException(nameof(transports));
         _gitHost = gitHost ?? throw new ArgumentNullException(nameof(gitHost));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
-        _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        _local = local ?? throw new ArgumentNullException(nameof(local));
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _clock = clock ?? TimeProvider.System;
         _log = log ?? NullLogger<ExecutorPhaseProxy>.Instance;
@@ -154,16 +157,6 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         }
 
         var hostIds = await SelectExecutorChainAsync(request, options, ct).ConfigureAwait(false);
-        if (hostIds is null)
-        {
-            _log.LogInformation("No executor registered for dispatch {DispatchKey}; falling back to in-process execution", dispatchKey);
-            var fallback = await _inner.ExecutePhaseAsync(request, ct).ConfigureAwait(false);
-            var validatedFallback = ValidateResult(fallback, options);
-            await _idempotency.PutAsync(
-                new IdempotencyEntry(dispatchKey, bodyHash, 200, SerializeResult(validatedFallback), "application/json", now + options.IdempotencyTtl),
-                ct).ConfigureAwait(false);
-            return validatedFallback;
-        }
 
         var result = await ExecuteRemoteWithFailoverAsync(request, hostIds, options, dispatchKey, ct).ConfigureAwait(false);
         await _idempotency.PutAsync(
@@ -423,7 +416,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         return value[..maxLength] + "…";
     }
 
-    private async Task<IReadOnlyList<string>?> SelectExecutorChainAsync(
+    private async Task<IReadOnlyList<string>> SelectExecutorChainAsync(
         ExecutorPhaseRequest request,
         ExecutorPhaseDispatchOptions options,
         CancellationToken ct)
@@ -444,8 +437,15 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
             .Select(SandboxPlacementMember.FromExecutorRegistration)
             .ToList();
 
-        if (hosts.Count == 0)
-            return null;
+        // The colocated host always takes part: a deployment with no remote
+        // executor configured still executes phases through the executor
+        // path. Its id is reserved — a remote registration colliding with it
+        // is a configuration fault that fails the dispatch loudly rather
+        // than silently running on the wrong host.
+        if (hosts.Any(h => string.Equals(h.MemberId, ColocatedExecutorHost.HostId, StringComparison.Ordinal)))
+            throw new InvalidOperationException(
+                $"A remote executor registered under the reserved host id '{ColocatedExecutorHost.HostId}'; rename the remote host.");
+        hosts.Add(SandboxPlacementMember.FromExecutorRegistration(_local.GetRegistration()));
 
         var requirements = ExecutorPlacementRequirements.FromRequest(request);
         var loads = BuildLoads(workers);
@@ -491,7 +491,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
             recheckIn: options.PlacementRecheckIn);
     }
 
-    private IReadOnlyDictionary<string, int> BuildLoads(IReadOnlyList<WorkerRegistration> workers)
+    private Dictionary<string, int> BuildLoads(IReadOnlyList<WorkerRegistration> workers)
     {
         var loads = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var worker in workers)
@@ -514,6 +514,13 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
             if (!loads.ContainsKey(hostId) && active > 0)
                 loads[hostId] = Math.Max(0, active);
         }
+        // The colocated host reports live load directly instead of
+        // heartbeating it: take the max with proxy-observed in-flight for
+        // the same double-count reason as remote hosts.
+        var localInflight = _inflightByHost.TryGetValue(ColocatedExecutorHost.HostId, out var localActive)
+            ? Math.Max(0, localActive)
+            : 0;
+        loads[ColocatedExecutorHost.HostId] = Math.Max(localInflight, Math.Max(0, _local.ActivePhaseCount));
         return loads;
     }
 

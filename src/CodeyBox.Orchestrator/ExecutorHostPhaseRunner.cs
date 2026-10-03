@@ -8,10 +8,10 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Shared executor-side phase mechanics: the default sandbox spec, the
-/// staged-repo path resolution, and the provision/invoke/teardown core both
-/// the in-process runner and the executor-host runner execute around. One
-/// implementation so the two runners cannot drift apart on sandbox setup,
-/// result validation, or teardown.
+/// staged-repo path resolution, and the sandbox teardown helper the
+/// executor-host runner and the colocated transport execute around. One
+/// implementation so local and remote execution cannot drift apart on
+/// sandbox setup, path resolution, or teardown.
 /// </summary>
 internal static class ExecutorPhaseExecution
 {
@@ -41,75 +41,38 @@ internal static class ExecutorPhaseExecution
     /// content-hashed leaf, and the result is canonicalized and contained
     /// under the root before it is returned.
     /// </summary>
-    internal static string ResolveStagedRepoPath(string stagingRoot, string repositoryId)
+    internal static string ResolveStagedRepoPath(string stagingRoot, string repositoryId) =>
+        CombineLeaf(stagingRoot, ToSafeLeaf(repositoryId), repositoryId);
+
+    /// <summary>
+    /// Resolves the staged bare-repo path for one dispatch: the per-repo leaf
+    /// plus a hash of the dispatch key (work item + phase + attempt), so two
+    /// concurrent dispatches against the same repo stage, run and tar
+    /// isolated copies instead of interleaving delete/copy/run/tar on one
+    /// shared leaf. Deterministic from the request so the colocated transport
+    /// and the executor-side runner agree on the leaf without extra I/O.
+    /// Same containment guarantees as <see cref="ResolveStagedRepoPath"/>.
+    /// </summary>
+    internal static string ResolveStagedRepoPathForDispatch(string stagingRoot, ExecutorPhaseRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var dispatchKey = ExecutorPhaseProxy.BuildDispatchKey(request);
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(dispatchKey));
+        var suffix = Convert.ToHexString(hash).ToLowerInvariant()[..16];
+        return CombineLeaf(stagingRoot, ToSafeLeaf(request.RepositoryId) + "-d-" + suffix, request.RepositoryId);
+    }
+
+    private static string CombineLeaf(string stagingRoot, string leaf, string repositoryId)
     {
         if (string.IsNullOrWhiteSpace(stagingRoot))
             throw new ExecutorPhaseException("No executor staging root is configured; cannot resolve the staged repository.");
         var rootFull = Path.GetFullPath(stagingRoot);
-        var leaf = ToSafeLeaf(repositoryId);
         var full = Path.GetFullPath(Path.Combine(rootFull, leaf));
         var prefix = rootFull.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             + Path.DirectorySeparatorChar;
         if (!full.StartsWith(prefix, StringComparison.Ordinal))
             throw new ExecutorPhaseException($"Staged repo path for '{repositoryId}' escapes the staging root.");
         return full;
-    }
-
-    /// <summary>
-    /// Provisions a sandbox, optionally binds it in <paramref name="tracker"/>
-    /// under <paramref name="trackerPhaseId"/>, invokes
-    /// <paramref name="handler"/> with the repo path and the live sandbox,
-    /// validates the result, then unbinds and tears the sandbox down. A null
-    /// handler result is a phase failure; teardown best-effort never masks
-    /// the phase outcome.
-    /// </summary>
-    internal static async Task<ExecutorPhaseResult> RunInSandboxAsync(
-        IExecutorPhaseHandler handler,
-        ExecutorPhaseRequest request,
-        string repoPath,
-        ISandboxProvider provider,
-        Func<ExecutorPhaseRequest, SandboxSpec> specFactory,
-        ExecutorPhaseDispatchOptions dispatchOptions,
-        ExecutorSandboxTracker? tracker,
-        string? trackerPhaseId,
-        ILogger? log,
-        CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(handler);
-        ArgumentNullException.ThrowIfNull(request);
-        ArgumentNullException.ThrowIfNull(provider);
-        ArgumentNullException.ThrowIfNull(specFactory);
-        ArgumentNullException.ThrowIfNull(dispatchOptions);
-        if (tracker is not null)
-            ArgumentException.ThrowIfNullOrWhiteSpace(trackerPhaseId);
-
-        var sandbox = await provider.CreateAsync(specFactory(request), ct).ConfigureAwait(false);
-        if (tracker is not null)
-        {
-            try
-            {
-                tracker.Track(trackerPhaseId!, sandbox.Id, sandbox);
-            }
-            catch
-            {
-                await DisposeQuietAsync(sandbox, log).ConfigureAwait(false);
-                throw;
-            }
-        }
-
-        try
-        {
-            var raw = await handler.ExecuteAsync(request, repoPath, sandbox, ct).ConfigureAwait(false);
-            if (raw is null)
-                throw new ExecutorPhaseException($"Phase handler for phase '{request.Phase}' returned no result.");
-            return ExecutorPhaseProxy.ValidateResult(raw, dispatchOptions);
-        }
-        finally
-        {
-            if (tracker is not null)
-                tracker.TryUntrack(trackerPhaseId!, out _);
-            await DisposeQuietAsync(sandbox, log).ConfigureAwait(false);
-        }
     }
 
     internal static async Task DisposeQuietAsync(ISandbox sandbox, ILogger? log)
@@ -317,7 +280,7 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
         var stagingRoot = string.IsNullOrWhiteSpace(options.PhaseStagingRoot)
             ? Path.Combine(Path.GetTempPath(), "codeybox-executor-phases")
             : options.PhaseStagingRoot.Trim();
-        var repoPath = ExecutorPhaseExecution.ResolveStagedRepoPath(stagingRoot, request.RepositoryId);
+        var repoPath = ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(stagingRoot, request);
         if (!Directory.Exists(repoPath))
             throw new ExecutorPhaseTransportException(
                 hostId,

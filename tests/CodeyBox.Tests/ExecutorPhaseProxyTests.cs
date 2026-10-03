@@ -11,10 +11,10 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Verification for the executor phase-dispatch proxy: remote execution
 /// equivalence, per-item repo staging and stage-back, stage-out bounds,
-/// idempotent redelivery, transport-vs-agent failure classification, and
-/// in-process fallback. Uses a real <see cref="LocalGitHost"/>, a real
-/// <see cref="SqliteIdempotencyStore"/>, real tar archives and real git
-/// commits; only the network hop to the executor is faked (a tar-based
+/// idempotent redelivery, transport-vs-agent failure classification, and the
+/// always-present colocated host. Uses a real <see cref="LocalGitHost"/>, a
+/// real <see cref="SqliteIdempotencyStore"/>, real tar archives and real git
+/// commits; only the network hop to a remote executor is faked (a tar-based
 /// loopback transport over a per-host directory).
 /// </summary>
 public sealed class ExecutorPhaseProxyTests : IDisposable
@@ -28,22 +28,26 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         try { Directory.Delete(_root, recursive: true); } catch { }
     }
 
-    // ── verification 1: remote dispatch ≡ in-process ────────────────────────
+    // ── verification 1: remote dispatch ≡ colocated dispatch ─────────────────
 
     [Fact]
-    public async Task RemoteDispatch_ReturnsOutcomeShaFindingsAndUsage_EquivalentToInProcess()
+    public async Task RemoteDispatch_ReturnsOutcomeShaFindingsAndUsage_EquivalentToColocated()
     {
-        using var ctx = CreateContext(["exec-1"]);
+        using var remoteCtx = CreateContext(["exec-1"]);
+        using var localCtx = CreateContext([]);
         var item = WorkItemId.New();
         var twin = WorkItemId.New();
-        await SeedBareRepoAsync(ctx.Git, item);
-        await SeedBareRepoAsync(ctx.Git, twin);
+        await SeedBareRepoAsync(remoteCtx.Git, item);
+        await SeedBareRepoAsync(localCtx.Git, twin);
 
-        var remote = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
-        var inner = await ctx.Inner.ExecutePhaseAsync(NewRequest(twin, "work", 0), CancellationToken.None);
+        var remote = await remoteCtx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
+        var local = await localCtx.Proxy.ExecutePhaseAsync(NewRequest(twin, "work", 0), CancellationToken.None);
 
+        // The two harnesses share nothing but the seed content and the fixed
+        // git identity: identical outcomes prove the colocated host runs the
+        // same path as a remote host.
         Assert.Equal(ExecutorPhaseOutcome.Succeeded, remote.Outcome);
-        AssertResultsEqual(inner, remote);
+        AssertResultsEqual(remote, local);
     }
 
     // ── verification 2: commits land in the bare repo; push path unchanged ──
@@ -234,9 +238,12 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     // ── verification 6: transport vs agent failure ──────────────────────────
 
     [Fact]
-    public async Task TransportFailure_PropagatesWithoutCachingOrRepoWrite()
+    public async Task TransportFailureOnLastEligibleHost_PropagatesWithoutCachingOrRepoWrite()
     {
-        using var ctx = CreateContext(["exec-1"]);
+        // The colocated host is excluded by zero capacity so the failing
+        // remote is the last eligible host: its host-attributed failure
+        // propagates instead of failing over.
+        using var ctx = CreateContext(["exec-1"], colocatedCapacity: 0);
         var item = WorkItemId.New();
         await SeedBareRepoAsync(ctx.Git, item);
         var bare = ctx.Git.GetRepoPath(item.ToString());
@@ -249,7 +256,6 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.Equal("stage-in", thrown.Operation);
 
         Assert.Equal(before, (await RunGitBareCapture(bare, "rev-parse", "phase/seed")).Trim());
-        Assert.Equal(0, ctx.InnerSpy.Calls);
         var lookup = await ctx.Store.LookupAsync(
             ExecutorPhaseProxy.BuildDispatchKey(request),
             ExecutorPhaseProxy.ComputeBodyHash(request),
@@ -274,10 +280,10 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.Equal(1, ctx.Transports["exec-1"].RunPhaseCalls);
     }
 
-    // ── verification 7: fallback ────────────────────────────────────────────
+    // ── verification 7: no remote executor — the colocated host runs it ────
 
     [Fact]
-    public async Task NoExecutorRegistered_FallsBackToInProcess_Unchanged()
+    public async Task NoRemoteExecutorConfigured_ExecutesThroughColocatedHost()
     {
         using var ctx = CreateContext([]);
         var item = WorkItemId.New();
@@ -285,17 +291,39 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         await SeedBareRepoAsync(ctx.Git, item);
         await SeedBareRepoAsync(ctx.Git, twin);
 
-        var fallback = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
-        var direct = await ctx.Inner.ExecutePhaseAsync(NewRequest(twin, "work", 0), CancellationToken.None);
+        // Zero remote configuration still executes — through the executor
+        // path on the colocated host, not a second implementation.
+        var local = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, local.Outcome);
+        Assert.NotNull(local.CommitSha);
 
-        AssertResultsEqual(direct, fallback);
-        Assert.Equal(0, ctx.Factory.Resolves);
+        var bare = ctx.Git.GetRepoPath(item.ToString());
+        var log = await RunGitBareCapture(bare, "log", "--format=%H", "phase/work-0");
+        Assert.Contains(local.CommitSha!, log.Split('\n', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    [Fact]
+    public void Proxy_HasNoInProcessFallback()
+    {
+        // The fallback branch must not exist — assert on the absence of that
+        // code path, not merely that it is unused: no constructor takes an
+        // inner runner and no field holds one.
+        var runnerParams = typeof(ExecutorPhaseProxy).GetConstructors()
+            .SelectMany(c => c.GetParameters())
+            .Where(p => p.ParameterType == typeof(IExecutorPhaseRunner));
+        Assert.Empty(runnerParams);
+        var runnerFields = typeof(ExecutorPhaseProxy).GetFields(
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .Where(f => f.FieldType == typeof(IExecutorPhaseRunner));
+        Assert.Empty(runnerFields);
     }
 
     [Fact]
     public async Task CordonedExecutor_IsNeverSelected_RequeuedUnderBackoff_NotFailed()
     {
-        using var ctx = CreateContext(["exec-1"], cordoned: true);
+        // The colocated host is excluded by zero capacity so this exercises
+        // remote-only deferral: a cordoned remote defers under backoff.
+        using var ctx = CreateContext(["exec-1"], cordoned: true, colocatedCapacity: 0);
         var item = WorkItemId.New();
         await SeedBareRepoAsync(ctx.Git, item);
         var request = NewRequest(item, "work", 0);
@@ -309,7 +337,6 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.Contains("exec-1=cordoned", thrown.Detail);
         Assert.Equal(TimeSpan.FromSeconds(15), thrown.RecheckIn);
         Assert.Equal(0, ctx.Factory.Resolves);
-        Assert.Equal(0, ctx.InnerSpy.Calls);
         var lookup = await ctx.Store.LookupAsync(
             ExecutorPhaseProxy.BuildDispatchKey(request),
             ExecutorPhaseProxy.ComputeBodyHash(request),
@@ -333,7 +360,9 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     [Fact]
     public async Task ReportedLoad_AtCapacity_DefersWithoutDispatching()
     {
-        using var ctx = CreateContext(["exec-1"]);
+        // The colocated host is excluded by zero capacity so this exercises
+        // remote-only deferral when the single remote reports itself full.
+        using var ctx = CreateContext(["exec-1"], colocatedCapacity: 0);
         // Same host row, but the executor reports itself full: placement must
         // defer under backoff instead of dispatching onto it.
         ctx.Registry.AddExecutor("exec-1", activePhases: 4);
@@ -346,7 +375,6 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.Equal("executor", thrown.Provider);
         Assert.Equal("no-eligible-host", thrown.ErrorClass);
         Assert.Equal(0, ctx.Transports["exec-1"].RunPhaseCalls);
-        Assert.Equal(0, ctx.InnerSpy.Calls);
     }
 
     [Fact]
@@ -429,7 +457,9 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     [Fact]
     public async Task UnhealthyHost_Excluded_RequeuedUnderBackoff_NotFailed()
     {
-        using var ctx = CreateContext([]);
+        // The colocated host is excluded by zero capacity so this exercises
+        // remote-only deferral: an unhealthy remote defers under backoff.
+        using var ctx = CreateContext([], colocatedCapacity: 0);
         AddExecutorHost(ctx, "exec-1", healthy: false);
         var item = WorkItemId.New();
         await SeedBareRepoAsync(ctx.Git, item);
@@ -443,7 +473,6 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.Contains("exec-1=unhealthy", thrown.Detail);
         Assert.Equal(TimeSpan.FromSeconds(15), thrown.RecheckIn);
         Assert.Equal(0, ctx.Factory.Resolves);
-        Assert.Equal(0, ctx.InnerSpy.Calls);
     }
 
     // ── verification 12: unplaceable capability ─────────────────────────────
@@ -467,7 +496,6 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.NotNull(thrown.Decision);
         Assert.True(thrown.Decision.IsUnplaceable);
         Assert.Equal(0, ctx.Factory.Resolves);
-        Assert.Equal(0, ctx.InnerSpy.Calls);
         var lookup = await ctx.Store.LookupAsync(
             ExecutorPhaseProxy.BuildDispatchKey(request),
             ExecutorPhaseProxy.ComputeBodyHash(request),
@@ -480,7 +508,9 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     [Fact]
     public async Task NoEligibleHost_DeferralNames_EachCandidateRefusalReason()
     {
-        using var ctx = CreateContext([]);
+        // The colocated host is excluded by zero capacity so the deferral
+        // names only the remote candidates' refusal reasons.
+        using var ctx = CreateContext([], colocatedCapacity: 0);
         AddExecutorHost(ctx, "exec-1", cordoned: true);
         AddExecutorHost(ctx, "exec-2", capacity: 1, currentWorkItemId: WorkItemId.New().ToString());
         var item = WorkItemId.New();
@@ -519,7 +549,6 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.NotNull(result.CommitSha);
         Assert.Equal(1, ctx.Transports["exec-1"].RunPhaseCalls);
         Assert.Equal(1, ctx.Transports["exec-2"].RunPhaseCalls);
-        Assert.Equal(0, ctx.InnerSpy.Calls);
 
         var next = WorkItemId.New();
         await SeedBareRepoAsync(ctx.Git, next);
@@ -544,7 +573,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         Assert.Equal(expected.ErrorMessage, actual.ErrorMessage);
     }
 
-    private TestHarness CreateContext(string[] executors, long? maxArchiveBytes = null, int? maxEntries = null, bool cordoned = false)
+    private TestHarness CreateContext(string[] executors, long? maxArchiveBytes = null, int? maxEntries = null, bool cordoned = false, int? colocatedCapacity = null)
     {
         var gitRoot = Path.Combine(_root, "git-" + Guid.NewGuid().ToString("N"));
         var git = new LocalGitHost(
@@ -557,11 +586,20 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         var options = new ExecutorPhaseDispatchOptions();
         if (maxArchiveBytes is not null) options.StageOutMaxArchiveBytes = maxArchiveBytes.Value;
         if (maxEntries is not null) options.StageOutMaxEntries = maxEntries.Value;
+        var colocatedOptions = new ColocatedExecutorOptions
+        {
+            StagingRoot = Path.Combine(_root, "local-stage-" + Guid.NewGuid().ToString("N")),
+        };
+        if (colocatedCapacity is not null) colocatedOptions.MaxConcurrentSandboxes = colocatedCapacity.Value;
+        var local = new ColocatedExecutorHost(
+            new NoopSandboxProvider(),
+            () => colocatedOptions,
+            () => options,
+            handler);
         var factory = new FakeTransportFactory();
-        var inner = new InProcessExecutorPhaseRunner(git, handler, new NoopSandboxProvider(), () => options);
-        var spy = new SpyRunner(inner);
-        var proxy = new ExecutorPhaseProxy(registry, factory, git, store, spy, () => options);
-        var ctx = new TestHarness(git, store, registry, handler, factory, inner, spy, proxy);
+        var transports = new ColocatedExecutorTransportFactory(local, factory);
+        var proxy = new ExecutorPhaseProxy(registry, transports, git, store, local, () => options);
+        var ctx = new TestHarness(git, store, registry, handler, factory, local, proxy);
         foreach (var host in executors)
             AddExecutorHost(ctx, host, cordoned: cordoned);
         return ctx;
@@ -703,8 +741,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
             FakeWorkerRegistry registry,
             GitCommitPhaseHandler handler,
             FakeTransportFactory factory,
-            InProcessExecutorPhaseRunner inner,
-            SpyRunner spy,
+            ColocatedExecutorHost local,
             ExecutorPhaseProxy proxy)
         {
             Git = git;
@@ -712,8 +749,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
             Registry = registry;
             Handler = handler;
             Factory = factory;
-            Inner = inner;
-            InnerSpy = spy;
+            Local = local;
             Proxy = proxy;
         }
 
@@ -723,26 +759,10 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         public GitCommitPhaseHandler Handler { get; }
         public FakeTransportFactory Factory { get; }
         public Dictionary<string, FakePhaseTransport> Transports => Factory.Transports;
-        public InProcessExecutorPhaseRunner Inner { get; }
-        public SpyRunner InnerSpy { get; }
+        public ColocatedExecutorHost Local { get; }
         public ExecutorPhaseProxy Proxy { get; }
 
         public void Dispose() => Store.Dispose();
-    }
-
-    private sealed class SpyRunner : IExecutorPhaseRunner
-    {
-        private readonly IExecutorPhaseRunner _inner;
-
-        public SpyRunner(IExecutorPhaseRunner inner) => _inner = inner;
-
-        public int Calls { get; private set; }
-
-        public Task<ExecutorPhaseResult> ExecutePhaseAsync(ExecutorPhaseRequest request, CancellationToken ct)
-        {
-            Calls++;
-            return _inner.ExecutePhaseAsync(request, ct);
-        }
     }
 
     private sealed class FakeWorkerRegistry : IWorkerRegistry
