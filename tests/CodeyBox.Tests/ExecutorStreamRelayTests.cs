@@ -227,7 +227,7 @@ public sealed class ExecutorStreamRelayTests : IDisposable
         var options = new ExecutorPhaseDispatchOptions();
         var transport = new FakeStreamingTransport("exec-1", Path.Combine(_root, "executor-" + Guid.NewGuid().ToString("N")));
         var factory = new FakeTransportFactory(transport);
-        var inner = new InProcessExecutorPhaseRunner(git, new UncalledHandler(), () => options);
+        var inner = new InProcessExecutorPhaseRunner(git, new UncalledHandler(), new RelayNoopSandboxProvider(), () => options);
         var streamsRoot = Path.Combine(_root, "streams-" + Guid.NewGuid().ToString("N"));
         var streams = new AgentStreamStore(
             new AgentStreamsOptions { Enabled = true, Path = streamsRoot, MaxFileSizeMb = maxFileSizeMb },
@@ -255,7 +255,7 @@ public sealed class ExecutorStreamRelayTests : IDisposable
 
     private sealed class UncalledHandler : IExecutorPhaseHandler
     {
-        public Task<ExecutorPhaseResult> ExecuteAsync(ExecutorPhaseRequest request, string repoPath, CancellationToken ct) =>
+        public Task<ExecutorPhaseResult> ExecuteAsync(ExecutorPhaseRequest request, string repoPath, ISandbox sandbox, CancellationToken ct) =>
             throw new InvalidOperationException("Fallback runner must not run while an executor is registered.");
     }
 
@@ -347,7 +347,7 @@ public sealed class ExecutorStreamRelayTests : IDisposable
             return Task.CompletedTask;
         }
 
-        public Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default)
+        public Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default, int? executorActivePhases = null)
         {
             if (_rows.TryGetValue(workerId, out var row))
                 _rows[workerId] = row with { LastHeartbeatAt = DateTimeOffset.UtcNow, CurrentWorkItemId = currentWorkItemId };
@@ -384,6 +384,29 @@ public sealed class ExecutorStreamRelayTests : IDisposable
 
         public Task<IExecutorPhaseTransport?> ResolveAsync(string hostId, CancellationToken ct) =>
             Task.FromResult<IExecutorPhaseTransport?>(_transport);
+    }
+
+    private sealed class RelayNoopSandbox : ISandbox
+    {
+        public string Id => "relay-noop-sandbox";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class RelayNoopSandboxProvider : ISandboxProvider
+    {
+        public string Name => "relay-noop";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            Task.FromResult<ISandbox>(new RelayNoopSandbox());
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
     /// <summary>

@@ -1450,6 +1450,7 @@ Response: `200 OK` with a JSON array:
 | `executorCapabilities` | Clearance tags the executor declares, in the work item `RequiredCapabilities` vocabulary (`null` for non-executor rows) |
 | `cordoned` | Draining flag: registers and heartbeats but is never selected for new placements |
 | `healthy` | Operator health gate: `false` routes new placements away without removing the registration |
+| `executorActivePhases` | Live phase load last reported by the executor's heartbeat (`null` when unknown); placement takes the max of this and the orchestrator-observed in-flight count |
 
 An empty array means no workers are currently registered. A row with a stale `lastHeartbeatAt` means the worker process has crashed and the dead-worker reaper will recover it on the next sweep (or has already done so and the row wasn't cleaned up). See [`recovery.md`](../operating/recovery.md) for the full reaper design.
 
@@ -1487,7 +1488,7 @@ Response: `200 OK` with `{ "workerId": "executor:exec-1", "hostId": "exec-1", "h
 
 ### `POST /executors/{hostId}/heartbeat`
 
-Heartbeat a registered executor into the worker registry. Request body is `{ "currentWorkItemId": "<uuid>" }` (or empty when idle). Response: `200 OK`. `404` when no executor is registered for the host id. Ceasing heartbeats lets the row go stale, at which point the existing dead-worker reaper reclaims it exactly like a dead in-process worker.
+Heartbeat a registered executor into the worker registry. Request body is `{ "currentWorkItemId": "<uuid>", "activePhases": 2 }` (`activePhases` is the host's self-reported live phase count for least-loaded placement; omit or `null` to leave the stored value unchanged, `0`–`100000`). Response: `200 OK`. `404` when no executor is registered for the host id. Ceasing heartbeats lets the row go stale, at which point the existing dead-worker reaper reclaims it exactly like a dead in-process worker.
 
 ### `POST /executors/{hostId}/deregister`
 

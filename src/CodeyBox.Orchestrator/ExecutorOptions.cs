@@ -143,6 +143,45 @@ public sealed class ExecutorOptions
     public ExecutorDisconnectPolicy DisconnectPolicy { get; set; } = ExecutorDisconnectPolicy.RetainSandboxForResume;
 
     /// <summary>
+    /// Root directory under which the executor resolves staged bare-repo
+    /// copies, one leaf per dispatched <c>RepositoryId</c>. Empty means a
+    /// process-temp subdirectory. The delivery plane stages the phase's
+    /// single bare repo here; the phase runner resolves it with
+    /// canonicalize-then-contain and refuses to run when it is absent.
+    /// </summary>
+    public string PhaseStagingRoot { get; set; } = "";
+
+    /// <summary>Maximum path chars accepted in <see cref="PhaseStagingRoot"/>.</summary>
+    public const int MaxPhaseStagingRootLength = 1024;
+
+    /// <summary>
+    /// Image reference stamped on sandbox specs the phase runner provisions.
+    /// Empty means "provider default". Hosts on VM-backed providers must set
+    /// a real image; the lightweight process provider ignores it.
+    /// </summary>
+    public string PhaseSandboxImageReference { get; set; } = "";
+
+    /// <summary>Maximum chars accepted in <see cref="PhaseSandboxImageReference"/>.</summary>
+    public const int MaxPhaseSandboxImageReferenceLength = 512;
+
+    /// <summary>
+    /// Maximum completed phase results the executor-side replay guard keeps.
+    /// Oldest-completed entries are evicted first; in-flight phases are never
+    /// evicted. Bounds the guard's memory; the control plane's idempotency
+    /// store stays authoritative across restarts.
+    /// </summary>
+    public int MaxCachedPhaseResults { get; set; } = 1024;
+
+    /// <summary>Maximum entries accepted in the phase-result replay guard.</summary>
+    public const int MaxCachedPhaseResultsLimit = 1_000_000;
+
+    /// <summary>
+    /// How long the executor replays a completed phase result on redelivery
+    /// before dropping it. Mirrors the dispatch idempotency TTL.
+    /// </summary>
+    public TimeSpan PhaseResultCacheTtl { get; set; } = TimeSpan.FromHours(24);
+
+    /// <summary>
     /// Normalised provider kinds this host serves, in declaration order.
     /// <see cref="SandboxProviders"/> wins when non-empty; otherwise the
     /// single-kind <see cref="LocalSandboxProvider"/> shortcut applies.
@@ -241,6 +280,7 @@ public sealed class ExecutorOptions
             throw new InvalidOperationException("CodeyBox:Executor:AgentCredentialProbeTimeout must be positive.");
         if (!Enum.IsDefined(DisconnectPolicy))
             throw new InvalidOperationException("CodeyBox:Executor:DisconnectPolicy names an unknown policy.");
+        ValidatePhaseExecution();
         var provider = (LocalSandboxProvider ?? "").Trim().ToLowerInvariant();
         if (string.IsNullOrEmpty(provider))
             throw new InvalidOperationException(
@@ -267,6 +307,33 @@ public sealed class ExecutorOptions
                 throw new InvalidOperationException(
                     $"CodeyBox:Executor:SandboxProviders names '{normalized}' more than once.");
         }
+    }
+
+    private void ValidatePhaseExecution()
+    {
+        if (!string.IsNullOrWhiteSpace(PhaseStagingRoot))
+        {
+            if (PhaseStagingRoot.Trim().Length > MaxPhaseStagingRootLength)
+                throw new InvalidOperationException(
+                    $"CodeyBox:Executor:PhaseStagingRoot must be at most {MaxPhaseStagingRootLength} characters.");
+            if (PhaseStagingRoot.Any(char.IsControl))
+                throw new InvalidOperationException("CodeyBox:Executor:PhaseStagingRoot must not contain control characters.");
+            if (!Path.IsPathFullyQualified(PhaseStagingRoot.Trim()))
+                throw new InvalidOperationException("CodeyBox:Executor:PhaseStagingRoot must be an absolute path.");
+        }
+        if (!string.IsNullOrEmpty(PhaseSandboxImageReference))
+        {
+            if (PhaseSandboxImageReference.Length > MaxPhaseSandboxImageReferenceLength)
+                throw new InvalidOperationException(
+                    $"CodeyBox:Executor:PhaseSandboxImageReference must be at most {MaxPhaseSandboxImageReferenceLength} characters.");
+            if (PhaseSandboxImageReference.Any(char.IsControl))
+                throw new InvalidOperationException("CodeyBox:Executor:PhaseSandboxImageReference must not contain control characters.");
+        }
+        if (MaxCachedPhaseResults < 1 || MaxCachedPhaseResults > MaxCachedPhaseResultsLimit)
+            throw new InvalidOperationException(
+                $"CodeyBox:Executor:MaxCachedPhaseResults must be between 1 and {MaxCachedPhaseResultsLimit}.");
+        if (PhaseResultCacheTtl <= TimeSpan.Zero)
+            throw new InvalidOperationException("CodeyBox:Executor:PhaseResultCacheTtl must be positive.");
     }
 
     private static void ValidateEntries(List<string> entries, string fieldName)

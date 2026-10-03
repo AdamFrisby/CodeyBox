@@ -13,8 +13,11 @@ public interface IWorkerRegistry
     /// Updates <c>last_heartbeat_at</c> (and optionally <c>current_work_item_id</c>)
     /// for the given worker. Fail-soft: implementations must not throw on transient
     /// storage errors — the caller logs and retries on the next interval.
+    /// <paramref name="executorActivePhases"/> carries the executor host's
+    /// self-reported live phase load for placement; null leaves the stored
+    /// value unchanged.
     /// </summary>
-    Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default);
+    Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default, int? executorActivePhases = null);
 
     Task DeregisterAsync(string workerId, CancellationToken ct = default);
 

@@ -115,8 +115,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id, executor_host_id, max_concurrent_sandboxes, executor_network_profiles, executor_credentials, executor_capabilities, cordoned, healthy)
-                VALUES ($id, $host, $pid, $started, $hb, $item, $exhost, $cap, $profiles, $creds, $caps, $cordoned, $healthy)
+                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id, executor_host_id, max_concurrent_sandboxes, executor_network_profiles, executor_credentials, executor_capabilities, cordoned, healthy, executor_active_phases)
+                VALUES ($id, $host, $pid, $started, $hb, $item, $exhost, $cap, $profiles, $creds, $caps, $cordoned, $healthy, $load)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     host_name = excluded.host_name,
                     process_id = excluded.process_id,
@@ -129,7 +129,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     executor_credentials = excluded.executor_credentials,
                     executor_capabilities = excluded.executor_capabilities,
                     cordoned = excluded.cordoned,
-                    healthy = excluded.healthy;
+                    healthy = excluded.healthy,
+                    executor_active_phases = excluded.executor_active_phases;
                 """;
             Bind(cmd, reg);
             cmd.ExecuteNonQuery();
@@ -146,7 +147,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     /// on the next heartbeat interval, while non-transient storage failures still
     /// propagate to avoid reporting success when the row could not be persisted.
     /// </remarks>
-    public async Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default)
+    public async Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default, int? executorActivePhases = null)
     {
         for (var attempt = 1; ; attempt++)
         {
@@ -161,11 +162,13 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     cmd.CommandTimeout = _commandTimeoutSeconds;
                     cmd.CommandText = """
                         UPDATE worker_registry
-                        SET last_heartbeat_at = $hb, current_work_item_id = $item
+                        SET last_heartbeat_at = $hb, current_work_item_id = $item,
+                            executor_active_phases = COALESCE($load, executor_active_phases)
                         WHERE worker_id = $id;
                         """;
                     cmd.Parameters.AddWithValue("$hb", DateTimeOffset.UtcNow.ToString("O"));
                     cmd.Parameters.AddWithValue("$item", (object?)currentWorkItemId ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$load", (object?)executorActivePhases ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("$id", workerId);
                     cmd.ExecuteNonQuery();
                     return;
@@ -405,6 +408,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         cmd.Parameters.AddWithValue("$caps", (object?)SerializeStringList(reg.ExecutorCapabilities) ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$cordoned", reg.Cordoned ? 1 : 0);
         cmd.Parameters.AddWithValue("$healthy", reg.Healthy ? 1 : 0);
+        cmd.Parameters.AddWithValue("$load", (object?)reg.ExecutorActivePhases ?? DBNull.Value);
     }
 
     private static WorkerRegistration Read(SqliteDataReader r) => new()
@@ -420,6 +424,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         ExecutorNetworkProfiles = r.IsDBNull(r.GetOrdinal("executor_network_profiles")) ? null : DeserializeStringList(r.GetString(r.GetOrdinal("executor_network_profiles"))),
         ExecutorCredentials = r.IsDBNull(r.GetOrdinal("executor_credentials")) ? null : DeserializeStringList(r.GetString(r.GetOrdinal("executor_credentials"))),
         ExecutorCapabilities = HasColumn(r, "executor_capabilities") && !r.IsDBNull(r.GetOrdinal("executor_capabilities")) ? DeserializeStringList(r.GetString(r.GetOrdinal("executor_capabilities"))) : null,
+        ExecutorActivePhases = HasColumn(r, "executor_active_phases") && !r.IsDBNull(r.GetOrdinal("executor_active_phases")) ? r.GetInt32(r.GetOrdinal("executor_active_phases")) : (int?)null,
         Cordoned = r.GetInt32(r.GetOrdinal("cordoned")) != 0,
         Healthy = r.GetInt32(r.GetOrdinal("healthy")) != 0,
     };
@@ -472,6 +477,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         ("executor_capabilities", "executor_capabilities TEXT"),
         ("cordoned", "cordoned INTEGER NOT NULL DEFAULT 0"),
         ("healthy", "healthy INTEGER NOT NULL DEFAULT 1"),
+        ("executor_active_phases", "executor_active_phases INTEGER"),
     ];
 
     private static string? SerializeStringList(IReadOnlyList<string>? values) =>

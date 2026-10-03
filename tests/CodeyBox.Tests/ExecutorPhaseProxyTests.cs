@@ -331,6 +331,40 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
     // ── verification 8: credential-aware placement ──────────────────────────
 
     [Fact]
+    public async Task ReportedLoad_AtCapacity_DefersWithoutDispatching()
+    {
+        using var ctx = CreateContext(["exec-1"]);
+        // Same host row, but the executor reports itself full: placement must
+        // defer under backoff instead of dispatching onto it.
+        ctx.Registry.AddExecutor("exec-1", activePhases: 4);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None));
+
+        Assert.Equal("executor", thrown.Provider);
+        Assert.Equal("no-eligible-host", thrown.ErrorClass);
+        Assert.Equal(0, ctx.Transports["exec-1"].RunPhaseCalls);
+        Assert.Equal(0, ctx.InnerSpy.Calls);
+    }
+
+    [Fact]
+    public async Task ReportedLoad_LeastLoadedHostWins()
+    {
+        using var ctx = CreateContext(["exec-1", "exec-2"]);
+        ctx.Registry.AddExecutor("exec-1", activePhases: 3);
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+
+        var result = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
+
+        Assert.Equal(ExecutorPhaseOutcome.Succeeded, result.Outcome);
+        Assert.Equal(0, ctx.Transports["exec-1"].RunPhaseCalls);
+        Assert.Equal(1, ctx.Transports["exec-2"].RunPhaseCalls);
+    }
+
+    [Fact]
     public async Task CredentialHeldByOneHost_PlacedOnThatHost()
     {
         using var ctx = CreateContext([]);
@@ -524,7 +558,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         if (maxArchiveBytes is not null) options.StageOutMaxArchiveBytes = maxArchiveBytes.Value;
         if (maxEntries is not null) options.StageOutMaxEntries = maxEntries.Value;
         var factory = new FakeTransportFactory();
-        var inner = new InProcessExecutorPhaseRunner(git, handler, () => options);
+        var inner = new InProcessExecutorPhaseRunner(git, handler, new NoopSandboxProvider(), () => options);
         var spy = new SpyRunner(inner);
         var proxy = new ExecutorPhaseProxy(registry, factory, git, store, spy, () => options);
         var ctx = new TestHarness(git, store, registry, handler, factory, inner, spy, proxy);
@@ -723,7 +757,8 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
             string[]? profiles = null,
             string[]? credentials = null,
             string[]? capabilities = null,
-            string? currentWorkItemId = null)
+            string? currentWorkItemId = null,
+            int? activePhases = null)
         {
             var now = DateTimeOffset.UtcNow;
             _rows[ExecutorRegistration.WorkerIdFor(hostId)] = new WorkerRegistration
@@ -739,6 +774,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
                 ExecutorNetworkProfiles = profiles ?? [],
                 ExecutorCredentials = credentials ?? [],
                 ExecutorCapabilities = capabilities ?? [],
+                ExecutorActivePhases = activePhases,
                 Cordoned = cordoned,
                 Healthy = healthy,
             };
@@ -750,10 +786,10 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
             return Task.CompletedTask;
         }
 
-        public Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default)
+        public Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default, int? executorActivePhases = null)
         {
             if (_rows.TryGetValue(workerId, out var row))
-                _rows[workerId] = row with { LastHeartbeatAt = DateTimeOffset.UtcNow, CurrentWorkItemId = currentWorkItemId };
+                _rows[workerId] = row with { LastHeartbeatAt = DateTimeOffset.UtcNow, CurrentWorkItemId = currentWorkItemId, ExecutorActivePhases = executorActivePhases ?? row.ExecutorActivePhases };
             return Task.CompletedTask;
         }
 
@@ -791,7 +827,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
         public int PlantFileCount;
         public bool ForceAgentFailure;
 
-        public async Task<ExecutorPhaseResult> ExecuteAsync(ExecutorPhaseRequest request, string repoPath, CancellationToken ct)
+        public async Task<ExecutorPhaseResult> ExecuteAsync(ExecutorPhaseRequest request, string repoPath, ISandbox sandbox, CancellationToken ct)
         {
             if (ForceAgentFailure)
             {
@@ -917,7 +953,7 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
             }
             RunPhaseCalls++;
             var staged = StagedCopy ?? throw new InvalidOperationException("No staged repo on fake executor.");
-            return _handler.ExecuteAsync(request, staged, ct);
+            return _handler.ExecuteAsync(request, staged, NoopSandbox.Instance, ct);
         }
 
         public async Task StageOutToArchiveAsync(string hostArchivePath, long maxArchiveBytes, CancellationToken ct)
@@ -1066,5 +1102,35 @@ public sealed class ExecutorPhaseProxyTests : IDisposable
             Resolves++;
             return Task.FromResult<IExecutorPhaseTransport?>(Transports.GetValueOrDefault(hostId));
         }
+    }
+
+    private sealed class NoopSandbox : ISandbox
+    {
+        public static readonly NoopSandbox Instance = new();
+
+        public string Id => "noop-sandbox";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class NoopSandboxProvider : ISandboxProvider
+    {
+        public string Name => "noop";
+
+        public int Provisions { get; private set; }
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            Provisions++;
+            return Task.FromResult<ISandbox>(NoopSandbox.Instance);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 }

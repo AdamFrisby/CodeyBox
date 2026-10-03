@@ -352,7 +352,7 @@ public sealed class ExecutorHostTests
         var client = MakeClient(ValidOptions(), (_, _) => Task.FromResult(JsonResponse(new { })), out _);
         Assert.False(client.HasPhaseRunner);
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => client.RunPhaseAsync(MakeItem(), CancellationToken.None));
+            () => client.ExecutePhaseAsync(NewPhaseRequest(), CancellationToken.None));
     }
 
     [Fact]
@@ -363,11 +363,53 @@ public sealed class ExecutorHostTests
             ValidOptions(), (_, _) => Task.FromResult(JsonResponse(new { })), out _,
             phaseRunner: runner);
 
-        var item = MakeItem();
-        await client.RunPhaseAsync(item, CancellationToken.None);
+        var request = NewPhaseRequest();
+        var result = await client.ExecutePhaseAsync(request, CancellationToken.None);
 
         Assert.True(client.HasPhaseRunner);
-        Assert.Same(item, Assert.Single(runner.Ran));
+        Assert.Same(request, Assert.Single(runner.Ran));
+        Assert.Same(runner.Result, result);
+    }
+
+    [Fact]
+    public async Task Client_Heartbeat_ReportsLivePhaseLoad()
+    {
+        string? body = null;
+        var client = MakeClient(
+            ValidOptions(),
+            async (req, ct) =>
+            {
+                body = await req.Content!.ReadAsStringAsync(ct);
+                return JsonResponse(new { workerId = "executor:exec-1" });
+            },
+            out _,
+            activePhaseCountProvider: () => 3);
+
+        await client.RegisterAsync();
+        await client.HeartbeatAsync(null);
+
+        using var doc = JsonDocument.Parse(body!);
+        Assert.Equal(3, doc.RootElement.GetProperty("activePhases").GetInt32());
+    }
+
+    [Fact]
+    public async Task Client_Heartbeat_OmitsLoadWithoutProbe()
+    {
+        string? body = null;
+        var client = MakeClient(
+            ValidOptions(),
+            async (req, ct) =>
+            {
+                body = await req.Content!.ReadAsStringAsync(ct);
+                return JsonResponse(new { workerId = "executor:exec-1" });
+            },
+            out _);
+
+        await client.RegisterAsync();
+        await client.HeartbeatAsync(null);
+
+        using var doc = JsonDocument.Parse(body!);
+        Assert.Equal(JsonValueKind.Null, doc.RootElement.GetProperty("activePhases").ValueKind);
     }
 
     // ── server: registration appears in the worker registry ─────────────────
@@ -484,6 +526,50 @@ public sealed class ExecutorHostTests
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
 
+    [Fact]
+    public async Task Server_Heartbeat_PersistsActivePhases_AndSurfacesOnWorkers()
+    {
+        using var factory = new ExecutorApiFactory();
+        using var api = factory.CreateClient();
+        using var executorHttp = factory.CreateClient();
+        var options = ValidOptions();
+        var client = new ExecutorClient(
+            executorHttp,
+            () => options,
+            new FakeSandboxProvider(),
+            new ExecutorSandboxTracker(),
+            null,
+            null,
+            NullLogger<ExecutorClient>.Instance,
+            activePhaseCountProvider: () => 2);
+
+        await client.RegisterAsync();
+        await client.HeartbeatAsync(null);
+
+        var workers = await api.GetFromJsonAsync<JsonElement>("/workers");
+        var row = workers.EnumerateArray()
+            .Single(w => w.GetProperty("workerId").GetString() == "executor:exec-1");
+        Assert.Equal(2, row.GetProperty("executorActivePhases").GetInt32());
+    }
+
+    [Fact]
+    public async Task Server_Heartbeat_RejectsOutOfRangeLoad()
+    {
+        using var factory = new ExecutorApiFactory();
+        using var api = factory.CreateClient();
+        using var executorHttp = factory.CreateClient();
+        var client = MakeClientForServer(ValidOptions(), executorHttp);
+
+        await client.RegisterAsync();
+
+        var negative = await api.PostAsJsonAsync("/executors/exec-1/heartbeat", new { activePhases = -1 });
+        Assert.Equal(HttpStatusCode.BadRequest, negative.StatusCode);
+
+        var huge = await api.PostAsJsonAsync(
+            "/executors/exec-1/heartbeat", new { activePhases = ExecutorRegistration.MaxDeclaredCapacity + 1 });
+        Assert.Equal(HttpStatusCode.BadRequest, huge.StatusCode);
+    }
+
     // ── registry: persistence + migration ───────────────────────────────────
 
     [Fact]
@@ -509,6 +595,8 @@ public sealed class ExecutorHostTests
                 Healthy = false,
             });
 
+            await registry.HeartbeatAsync("executor:exec-1", null, CancellationToken.None, executorActivePhases: 2);
+
             var found = Assert.Single(await registry.ListAsync());
             Assert.Equal("exec-1", found.ExecutorHostId);
             Assert.Equal(3, found.MaxConcurrentSandboxes);
@@ -517,7 +605,12 @@ public sealed class ExecutorHostTests
             Assert.Equal(["sensitive"], found.ExecutorCapabilities);
             Assert.True(found.Cordoned);
             Assert.False(found.Healthy);
+            Assert.Equal(2, found.ExecutorActivePhases);
             Assert.True(found.IsExecutor);
+
+            // A heartbeat without a load report leaves the stored value alone.
+            await registry.HeartbeatAsync("executor:exec-1", null);
+            Assert.Equal(2, Assert.Single(await registry.ListAsync()).ExecutorActivePhases);
         }
         finally
         {
@@ -555,6 +648,7 @@ public sealed class ExecutorHostTests
             Assert.Equal("w-old", found.WorkerId);
             Assert.Null(found.ExecutorHostId);
             Assert.Null(found.MaxConcurrentSandboxes);
+            Assert.Null(found.ExecutorActivePhases);
             Assert.False(found.Cordoned);
             Assert.True(found.Healthy);
             Assert.False(found.IsExecutor);
@@ -690,7 +784,8 @@ public sealed class ExecutorHostTests
         ExecutorSandboxTracker? tracker = null,
         FakeSandboxProvider? provider = null,
         TimeProvider? clock = null,
-        IPipelineRunner? phaseRunner = null)
+        IExecutorPhaseRunner? phaseRunner = null,
+        Func<int>? activePhaseCountProvider = null)
     {
         recording = new RecordingHandler(handler);
         var http = new HttpClient(recording) { BaseAddress = new Uri("http://127.0.0.1:9/") };
@@ -701,7 +796,8 @@ public sealed class ExecutorHostTests
             tracker,
             phaseRunner,
             clock,
-            NullLogger<ExecutorClient>.Instance);
+            NullLogger<ExecutorClient>.Instance,
+            activePhaseCountProvider: activePhaseCountProvider);
     }
 
     private static ExecutorClient MakeClientForServer(ExecutorOptions options, HttpClient http) =>
@@ -720,13 +816,13 @@ public sealed class ExecutorHostTests
             Content = JsonContent.Create(payload, options: JsonOptions),
         };
 
-    private static WorkItem MakeItem() => new()
+    private static ExecutorPhaseRequest NewPhaseRequest() => new()
     {
-        Id = WorkItemId.New(),
-        ProjectId = new ProjectId("test"),
-        Title = "t",
-        Prompt = "p",
-        State = WorkItemState.Queued,
+        WorkItemId = Guid.NewGuid().ToString("N"),
+        Phase = "work",
+        Attempt = 0,
+        RepositoryId = Guid.NewGuid().ToString("N"),
+        PayloadJson = "{}",
     };
 
     private static string TempDbPath() =>
@@ -813,13 +909,20 @@ public sealed class ExecutorHostTests
         }
     }
 
-    private sealed class FakePhaseRunner : IPipelineRunner
+    private sealed class FakePhaseRunner : IExecutorPhaseRunner
     {
-        public List<WorkItem> Ran { get; } = [];
-        public Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+        public List<ExecutorPhaseRequest> Ran { get; } = [];
+
+        public ExecutorPhaseResult Result { get; set; } = new()
         {
-            Ran.Add(item);
-            return Task.CompletedTask;
+            Outcome = ExecutorPhaseOutcome.Succeeded,
+            Usage = new ExecutorPhaseUsage(0, 0, 0),
+        };
+
+        public Task<ExecutorPhaseResult> ExecutePhaseAsync(ExecutorPhaseRequest request, CancellationToken ct)
+        {
+            Ran.Add(request);
+            return Task.FromResult(Result);
         }
     }
 

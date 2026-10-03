@@ -119,7 +119,11 @@ internal static class ExecutorEndpoints
         if (currentWorkItemId is not null && currentWorkItemId.Length > 128)
             return Results.BadRequest(new { error = "currentWorkItemId must be at most 128 characters" });
 
-        await registry.HeartbeatAsync(workerId, currentWorkItemId, ct);
+        if (req?.ActivePhases is < 0 or > ExecutorRegistration.MaxDeclaredCapacity)
+            return Results.BadRequest(
+                new { error = $"activePhases must be between 0 and {ExecutorRegistration.MaxDeclaredCapacity}" });
+
+        await registry.HeartbeatAsync(workerId, currentWorkItemId, ct, req?.ActivePhases);
         return Results.Ok(new { workerId, lastHeartbeatAt = DateTimeOffset.UtcNow });
     }
 
@@ -306,6 +310,14 @@ internal static class ExecutorEndpoints
     public sealed class ExecutorHeartbeatRequest
     {
         public string? CurrentWorkItemId { get; set; }
+
+        /// <summary>
+        /// Live phase load self-reported by the executor host: how many
+        /// phases it is currently executing. Feeds the shared placement
+        /// decider's least-loaded selection; null leaves the stored value
+        /// unchanged.
+        /// </summary>
+        public int? ActivePhases { get; set; }
     }
 
     /// <summary>
