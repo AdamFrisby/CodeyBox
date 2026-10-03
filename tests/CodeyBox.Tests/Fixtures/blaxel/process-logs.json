@@ -1,0 +1,5 @@
+{
+  "logs": "hi\nboom\n",
+  "stdout": "hi\n",
+  "stderr": "boom\n"
+}

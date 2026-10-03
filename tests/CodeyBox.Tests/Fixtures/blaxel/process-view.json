@@ -1,0 +1,13 @@
+{
+  "pid": "1234",
+  "name": "process-1234",
+  "command": "echo hi",
+  "status": "completed",
+  "exitCode": 0,
+  "stdout": "hi\n",
+  "stderr": "",
+  "logs": "hi\n",
+  "startedAt": "Wed, 01 Jan 2026 12:00:00 GMT",
+  "completedAt": "Wed, 01 Jan 2026 12:00:01 GMT",
+  "workingDir": "/work"
+}
