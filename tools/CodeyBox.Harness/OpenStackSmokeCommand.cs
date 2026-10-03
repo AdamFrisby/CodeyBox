@@ -14,7 +14,7 @@ namespace CodeyBox.Harness;
 /// </summary>
 public static class OpenStackSmokeCommand
 {
-    public enum ParseStatus { Ok, Usage, Invalid }
+    public enum ParseStatus { Ok, Usage }
 
     public sealed record Parsed(ParseStatus Status, string? ConfigPath, string? Error);
 

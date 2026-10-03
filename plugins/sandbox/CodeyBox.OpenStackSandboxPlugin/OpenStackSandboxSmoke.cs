@@ -108,6 +108,8 @@ public static class OpenStackSandboxSmoke
         }
 
         ISandbox? sandbox = null;
+        OpenStackSmokeResult? pending = null;
+        string? disposeFailure = null;
         try
         {
             var start = time.GetTimestamp();
@@ -121,45 +123,66 @@ public static class OpenStackSandboxSmoke
 
             start = time.GetTimestamp();
             var uname = await sandbox.ExecAsync(new SandboxExec { Argv = ["uname", "-a"] }, ct).ConfigureAwait(false);
-            if (uname.ExitCode != 0 || uname.ExecutionUnavailable)
-                return new OpenStackSmokeResult(false, timings, string.Empty,
-                    $"uname -a exited {uname.ExitCode} (unavailable={uname.ExecutionUnavailable}): {uname.Stderr}");
-            unameOutput = uname.Stdout.Trim();
-            timings.Add(new OpenStackSmokeStep("uname", time.GetElapsedTime(start)));
-            await output.WriteLineAsync($"[smoke] uname -a in {timings[^1].Elapsed}: {unameOutput}").ConfigureAwait(false);
+            var execFailure = ExecFailure("uname -a", uname);
+            if (execFailure is not null)
+            {
+                pending = new OpenStackSmokeResult(false, timings, string.Empty, execFailure);
+            }
+            else
+            {
+                unameOutput = uname.Stdout.Trim();
+                timings.Add(new OpenStackSmokeStep("uname", time.GetElapsedTime(start)));
+                await output.WriteLineAsync($"[smoke] uname -a in {timings[^1].Elapsed}: {unameOutput}").ConfigureAwait(false);
 
-            start = time.GetTimestamp();
-            var inbound = await sandbox.ExecAsync(
-                new SandboxExec { Argv = ["cat", SmokeMountGuestPath + "/" + SmokeInboundFileName] }, ct).ConfigureAwait(false);
-            if (inbound.ExitCode != 0 || inbound.ExecutionUnavailable)
-                return new OpenStackSmokeResult(false, timings, unameOutput,
-                    $"stage read exited {inbound.ExitCode} (unavailable={inbound.ExecutionUnavailable}): {inbound.Stderr}");
-            if (!string.Equals(inbound.Stdout, token, StringComparison.Ordinal))
-                return new OpenStackSmokeResult(false, timings, unameOutput,
-                    "stage read mismatch: guest content differs from the seeded host file");
-            timings.Add(new OpenStackSmokeStep("stage-read", time.GetElapsedTime(start)));
-            await output.WriteLineAsync($"[smoke] stage read ok in {timings[^1].Elapsed}").ConfigureAwait(false);
+                start = time.GetTimestamp();
+                var inbound = await sandbox.ExecAsync(
+                    new SandboxExec { Argv = ["cat", SmokeMountGuestPath + "/" + SmokeInboundFileName] }, ct).ConfigureAwait(false);
+                execFailure = ExecFailure("stage read", inbound);
+                if (execFailure is not null)
+                {
+                    pending = new OpenStackSmokeResult(false, timings, unameOutput, execFailure);
+                }
+                else if (!string.Equals(inbound.Stdout, token, StringComparison.Ordinal))
+                {
+                    pending = new OpenStackSmokeResult(false, timings, unameOutput,
+                        "stage read mismatch: guest content differs from the seeded host file");
+                }
+                else
+                {
+                    timings.Add(new OpenStackSmokeStep("stage-read", time.GetElapsedTime(start)));
+                    await output.WriteLineAsync($"[smoke] stage read ok in {timings[^1].Elapsed}").ConfigureAwait(false);
 
-            start = time.GetTimestamp();
-            var outbound = await sandbox.ExecAsync(
-                new SandboxExec { Argv = ["tee", SmokeMountGuestPath + "/" + SmokeOutboundFileName], Stdin = token }, ct).ConfigureAwait(false);
-            if (outbound.ExitCode != 0 || outbound.ExecutionUnavailable)
-                return new OpenStackSmokeResult(false, timings, unameOutput,
-                    $"stage write exited {outbound.ExitCode} (unavailable={outbound.ExecutionUnavailable}): {outbound.Stderr}");
-            await sandbox.SyncStateToHostAsync(ct).ConfigureAwait(false);
-            var echoed = await File.ReadAllTextAsync(Path.Combine(hostDir, SmokeOutboundFileName), ct).ConfigureAwait(false);
-            if (!string.Equals(echoed, token, StringComparison.Ordinal))
-                return new OpenStackSmokeResult(false, timings, unameOutput,
-                    "stage round-trip mismatch: synced-back content differs from what the guest wrote");
-            timings.Add(new OpenStackSmokeStep("stage-write", time.GetElapsedTime(start)));
-            await output.WriteLineAsync($"[smoke] stage round-trip ok in {timings[^1].Elapsed}").ConfigureAwait(false);
-
-            return new OpenStackSmokeResult(true, timings, unameOutput, null);
+                    start = time.GetTimestamp();
+                    var outbound = await sandbox.ExecAsync(
+                        new SandboxExec { Argv = ["tee", SmokeMountGuestPath + "/" + SmokeOutboundFileName], Stdin = token }, ct).ConfigureAwait(false);
+                    execFailure = ExecFailure("stage write", outbound);
+                    if (execFailure is not null)
+                    {
+                        pending = new OpenStackSmokeResult(false, timings, unameOutput, execFailure);
+                    }
+                    else
+                    {
+                        await sandbox.SyncStateToHostAsync(ct).ConfigureAwait(false);
+                        var echoed = await File.ReadAllTextAsync(Path.Combine(hostDir, SmokeOutboundFileName), ct).ConfigureAwait(false);
+                        if (!string.Equals(echoed, token, StringComparison.Ordinal))
+                        {
+                            pending = new OpenStackSmokeResult(false, timings, unameOutput,
+                                "stage round-trip mismatch: synced-back content differs from what the guest wrote");
+                        }
+                        else
+                        {
+                            timings.Add(new OpenStackSmokeStep("stage-write", time.GetElapsedTime(start)));
+                            await output.WriteLineAsync($"[smoke] stage round-trip ok in {timings[^1].Elapsed}").ConfigureAwait(false);
+                            pending = new OpenStackSmokeResult(true, timings, unameOutput, null);
+                        }
+                    }
+                }
+            }
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             var reason = ex is OperationCanceledException ? "cancelled" : ex.GetType().Name + ": " + ex.Message;
-            return new OpenStackSmokeResult(false, timings, unameOutput, reason);
+            pending = new OpenStackSmokeResult(false, timings, unameOutput, reason);
         }
         finally
         {
@@ -174,12 +197,27 @@ public static class OpenStackSandboxSmoke
                 }
                 catch (Exception ex)
                 {
-                    await output.WriteLineAsync($"[smoke] dispose failed: {ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
+                    disposeFailure = $"dispose failed (sandbox may leak server/keypair/security-group): {ex.GetType().Name}: {ex.Message}";
+                    await output.WriteLineAsync($"[smoke] {disposeFailure}").ConfigureAwait(false);
                 }
             }
             DeleteHostDir(hostDir);
         }
+
+        if (disposeFailure is not null)
+        {
+            var stepFailure = pending?.Failure;
+            var combined = stepFailure is null ? disposeFailure : stepFailure + "; " + disposeFailure;
+            return new OpenStackSmokeResult(false, timings, pending?.UnameOutput ?? unameOutput, combined);
+        }
+
+        return pending ?? new OpenStackSmokeResult(false, timings, unameOutput, "smoke did not complete");
     }
+
+    private static string? ExecFailure(string step, SandboxExecResult result) =>
+        result.ExitCode != 0 || result.ExecutionUnavailable
+            ? $"{step} exited {result.ExitCode} (unavailable={result.ExecutionUnavailable}): {result.Stderr}"
+            : null;
 
     private static void DeleteHostDir(string hostDir)
     {
@@ -188,6 +226,8 @@ public static class OpenStackSandboxSmoke
             if (Directory.Exists(hostDir))
                 Directory.Delete(hostDir, recursive: true);
         }
+        // WHY: best-effort temp cleanup must not mask the smoke result or
+        // throw from the finally path; the OS reclaims temp dirs on reboot.
         catch (IOException)
         {
         }

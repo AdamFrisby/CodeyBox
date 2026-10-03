@@ -91,6 +91,60 @@ public sealed class OpenStackSmokeTests
         Assert.Empty(harness.Cloud.SecurityGroups);
     }
 
+    [Fact]
+    public async Task Smoke_DisposeFailure_ReportsFailure()
+    {
+        using var harness = new SmokeHarness();
+        var provider = new DisposeThrowingProvider(harness.Provider);
+        var liveBefore = SandboxLiveCounter.Active;
+
+        var output = new StringWriter();
+        var result = await OpenStackSandboxSmoke.RunAsync(
+            provider, output, TimeProvider.System, roundTripToken: "smoke-token-4");
+
+        Assert.False(result.Succeeded);
+        Assert.Contains("dispose failed", result.Failure, StringComparison.Ordinal);
+        Assert.Contains("may leak", result.Failure, StringComparison.Ordinal);
+        Assert.DoesNotContain("dispose", result.Timings.Select(t => t.Name), StringComparer.Ordinal);
+        Assert.Contains("dispose failed", output.ToString(), StringComparison.Ordinal);
+
+        Assert.Equal(liveBefore, SandboxLiveCounter.Active);
+        Assert.Empty(harness.Cloud.Servers);
+        Assert.Empty(harness.Cloud.Keypairs);
+        Assert.Empty(harness.Cloud.SecurityGroups);
+    }
+
+    private sealed class DisposeThrowingProvider(ISandboxProvider inner) : ISandboxProvider
+    {
+        public string Name => inner.Name;
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            inner.DisposeLeakedAsync(name, ct);
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            new DisposeThrowingSandbox(await inner.CreateAsync(spec, ct).ConfigureAwait(false));
+    }
+
+    private sealed class DisposeThrowingSandbox(ISandbox inner) : ISandbox
+    {
+        public string Id => inner.Id;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            inner.ExecAsync(exec, ct);
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default) =>
+            inner.SyncStateToHostAsync(ct);
+
+        public async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync().ConfigureAwait(false);
+            throw new InvalidOperationException("injected dispose failure");
+        }
+    }
+
     // ------------------------------------------------------------------
     // Harness: real provider, fake cloud, simulated transport
     // ------------------------------------------------------------------
@@ -277,14 +331,6 @@ public sealed class OpenStackSmokeTests
                     File.WriteAllText(Path.Combine(hostPath, path[prefix.Length..]), content);
             }
             return Task.CompletedTask;
-        }
-
-        private static string Unquote(string token)
-        {
-            token = token.Trim();
-            return token.Length >= 2 && token.StartsWith('\'') && token.EndsWith('\'')
-                ? token[1..^1].Replace("'\\''", "'", StringComparison.Ordinal)
-                : token;
         }
 
         private static string[] SplitShell(string segment)

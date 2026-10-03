@@ -204,9 +204,6 @@ public static class Program
                     error.WriteLine(parsed.Error);
                 OpenStackSmokeCommand.PrintUsage(error);
                 return ExitUsage;
-            case OpenStackSmokeCommand.ParseStatus.Invalid:
-                error.WriteLine(parsed.Error);
-                return ExitLaunchFailed;
             default:
                 return await OpenStackSmokeCommand.RunAsync(parsed, output, error).ConfigureAwait(false);
         }
