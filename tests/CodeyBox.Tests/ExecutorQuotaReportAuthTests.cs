@@ -311,10 +311,16 @@ public sealed class ExecutorQuotaReportMiddlewareTests : IDisposable
     [Fact]
     public async Task UnboundToken_IsRejected()
     {
-        using var client = ClientWith(UnboundToken);
-
-        var registered = await client.PostAsJsonAsync("/executors/register", new { hostId = "exec-1" });
+        // Register with the host-bound token (the unbound bearer cannot
+        // register: lifecycle endpoints require a host-bound token), then
+        // prove the unbound bearer cannot report for the host either.
+        using var bound = _factory.CreateClient();
+        bound.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ExecutorToken);
+        var registered = await bound.PostAsJsonAsync("/executors/register", new { hostId = "exec-1" });
         Assert.Equal(HttpStatusCode.OK, registered.StatusCode);
+
+        using var client = ClientWith(UnboundToken);
         var reported = await client.PostAsJsonAsync(
             "/executors/exec-1/quota-reports",
             new { pool = "exec-pool", availablePct = 55.0, observedAt = DateTimeOffset.UtcNow });
@@ -402,10 +408,11 @@ internal sealed class QuotaReportAuthFactory : WebApplicationFactory<Program>
 
 /// <summary>
 /// Caller binding for host-scoped executor lifecycle endpoints (register,
-/// heartbeat, deregister): a host-bound token may act only for its own
-/// host, so host A cannot forge host B's load report and steer
+/// heartbeat, deregister): only a host-bound token for the path host may
+/// act, so host A cannot forge host B's load report and steer
 /// least-loaded placement, nor register/deregister as B. Unbound callers
-/// (operator) remain allowed; the binding check runs before the registry
+/// (including the shared operator key) are rejected because every executor
+/// holds the bearer it presents; the binding check runs before the registry
 /// lookup so a rejected caller cannot probe which hosts exist.
 /// </summary>
 public sealed class ExecutorHostCallerTests
@@ -451,14 +458,21 @@ public sealed class ExecutorHostCallerTests
     }
 
     [Fact]
-    public void UnboundOperatorToken_IsAllowed()
+    public void UnboundOperatorToken_IsForbidden()
     {
+        // The shared operator key carries no host identity, and every
+        // executor host holds the bearer it presents: allowing it here
+        // would let any executor register, heartbeat (forging least-loaded
+        // placement input), or deregister as any other host.
         var ctx = ContextWith(new ApiClientPrincipal(
             "legacy-operator",
             Initiator("operator"),
             CanDelegateInitiator: false));
 
-        Assert.Null(ExecutorEndpoints.CheckExecutorHostCaller(ctx, "exec-1"));
+        var result = ExecutorEndpoints.CheckExecutorHostCaller(ctx, "exec-1");
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status403Forbidden, GetStatusCode(result));
     }
 
     [Fact]
@@ -514,6 +528,7 @@ public sealed class ExecutorHostCallerTests
 public sealed class ExecutorHeartbeatCallerMiddlewareTests : IDisposable
 {
     private const string ExecutorToken = "test-bearer-bound-to-exec-1";
+    private const string UnboundToken = "test-bearer-with-no-host-binding";
 
     private readonly QuotaReportAuthFactory _factory = new();
 
@@ -557,5 +572,35 @@ public sealed class ExecutorHeartbeatCallerMiddlewareTests : IDisposable
         var spoofed = await client.PostAsJsonAsync("/executors/register", new { hostId = "exec-2" });
 
         Assert.Equal(HttpStatusCode.Forbidden, spoofed.StatusCode);
+    }
+
+    [Fact]
+    public async Task UnboundToken_RegisterIsForbidden()
+    {
+        using var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", UnboundToken);
+
+        var resp = await client.PostAsJsonAsync("/executors/register", new { hostId = "exec-1" });
+
+        Assert.Equal(HttpStatusCode.Forbidden, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task UnboundToken_HeartbeatIsForbidden()
+    {
+        using var bound = _factory.CreateClient();
+        bound.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ExecutorToken);
+        var registered = await bound.PostAsJsonAsync("/executors/register", new { hostId = "exec-1" });
+        Assert.Equal(HttpStatusCode.OK, registered.StatusCode);
+
+        using var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", UnboundToken);
+        var heartbeat = await client.PostAsJsonAsync(
+            "/executors/exec-1/heartbeat", new { activePhases = 1 });
+
+        Assert.Equal(HttpStatusCode.Forbidden, heartbeat.StatusCode);
     }
 }

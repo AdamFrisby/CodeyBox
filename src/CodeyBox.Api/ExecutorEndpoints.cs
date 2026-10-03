@@ -276,21 +276,19 @@ internal static class ExecutorEndpoints
 
     /// <summary>
     /// Binds a host-scoped executor endpoint (register, heartbeat,
-    /// deregister) to the authenticated caller. A host-bound executor token
-    /// may act only for its own host; a token bound to host A that asserts
-    /// host B's identity is rejected before the registry is consulted, so a
-    /// compromised or curious executor cannot forge another host's load
-    /// report (which feeds least-loaded placement), register or deregister
-    /// as another host, or spoof its current work item. Callers without a
-    /// host binding — the loopback-disabled operator and the operator/shared
-    /// bearer — retain full access: they already hold unrestricted
-    /// control-plane power (enqueue, merge, reconfigure), so scoping them
-    /// here would add no security boundary while breaking operator
-    /// provisioning. The stricter quota-report gate
-    /// (<see cref="CheckQuotaReportCaller"/>) additionally rejects unbound
-    /// callers because pool meters carry a holder allowlist that unbound
-    /// bearers prove nothing about; lifecycle/load endpoints have no such
-    /// allowlist, so binding-bound callers are the check that matters.
+    /// deregister) to the authenticated caller. Only a host-bound executor
+    /// token exactly matching the path/body host may proceed; the check runs
+    /// before the registry is consulted, so a compromised or curious
+    /// executor cannot forge another host's load report (which feeds
+    /// least-loaded placement), register or deregister as another host, or
+    /// spoof its current work item. Callers without a host binding — the
+    /// operator/shared bearer and any named token without an
+    /// <c>ExecutorHostId</c> — are rejected: every executor host holds the
+    /// bearer it presents, so a shared bearer proves nothing about which
+    /// host is calling and would let any executor spoof any other host's
+    /// load and work-item pointer. The loopback auth-disabled operator
+    /// (local dev only) remains allowed. This matches the quota-report gate
+    /// (<see cref="CheckQuotaReportCaller"/>).
     /// Returns null when the caller may proceed. Pure apart from reading
     /// the already-authenticated principal.
     /// </summary>
@@ -301,7 +299,9 @@ internal static class ExecutorEndpoints
         if (ApiKeyAuth.IsAuthenticationDisabled(principal))
             return null;
         if (string.IsNullOrWhiteSpace(principal.ExecutorHostId))
-            return null;
+            return Results.Json(
+                new { error = "register, heartbeat, and deregister require a host-bound executor token (CodeyBox:ApiClients ExecutorHostId) matching the host id; shared bearer tokens cannot act for a host" },
+                statusCode: StatusCodes.Status403Forbidden);
         if (!string.Equals(principal.ExecutorHostId, normalizedHostId, StringComparison.Ordinal))
             return Results.Json(
                 new { error = $"this token is bound to executor host '{principal.ExecutorHostId}' and cannot act for host '{normalizedHostId}'" },

@@ -87,10 +87,22 @@ never fails the phase — losing the stream degrades observability only.
 
 ## Running the executor
 
+Each executor host gets its own bearer token: add a `CodeyBox:ApiClients`
+entry with `ExecutorHostId` set to the host id on the orchestrator, and
+point that host's `CodeyBox:Executor:ApiKeyEnvVar` at the env var carrying
+its token. The shared operator key (`CODEYBOX_API_KEY`) is rejected on
+`POST /executors/register`, heartbeat, deregister, and quota-report
+ingress — every executor holds the bearer it presents, so a shared bearer
+would let any host spoof any other host's registration, load report, and
+work-item pointer.
+
 ```sh
-export CODEYBOX_API_KEY='<orchestrator-api-key>'
+# Orchestrator config (one entry per host):
+# CodeyBox:ApiClients:0:Name=exec-1, TokenEnvVar=CODEYBOX_EXEC_1_API_KEY, ExecutorHostId=exec-1
+export CODEYBOX_EXEC_1_API_KEY='<per-host-executor-token>'
 dotnet run --project src/CodeyBox.Executor -- \
   --CodeyBox:Executor:HostId=exec-1 \
+  --CodeyBox:Executor:ApiKeyEnvVar=CODEYBOX_EXEC_1_API_KEY \
   --CodeyBox:Executor:OrchestratorBaseUrl=https://orchestrator:5000/
 ```
 
@@ -101,7 +113,7 @@ All operational values live under `CodeyBox:Executor` and are hot-reloadable
 |---|---|---|---|
 | `HostId` | `string` | `""` (executor mode disabled) | Stable host id; survives restarts so re-registration upserts one row |
 | `OrchestratorBaseUrl` | `string` | `""` | Absolute `http(s)` URL of the orchestrator |
-| `ApiKeyEnvVar` | `string` | `CODEYBOX_API_KEY` | Env var carrying the orchestrator API key (never stored in config, never logged) |
+| `ApiKeyEnvVar` | `string` | `CODEYBOX_API_KEY` | Env var carrying this host's bearer token: set it to the env var holding the host-bound token for this host's `HostId` (never the shared operator key, which executor endpoints reject; never stored in config, never logged) |
 | `MaxConcurrentSandboxes` | `int?` | `null` (uncapped) | Host-local sandbox capacity. `0` registers but is never selected |
 | `AllowedNetworkProfiles` | `string[]` | `[]` (all) | Network profiles this host accepts; `"*"` also means all |
 | `DeclaredCredentials` | `string[]` | `[]` | Agent credential sets this host holds (e.g. `claude`, `codex`) |

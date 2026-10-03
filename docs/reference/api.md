@@ -55,10 +55,12 @@ credentials—and are persisted with the work item for API, commit, and pull
 request attribution.
 
 A client with `ExecutorHostId` is a host-bound executor token: it may act
-only as that executor host on host-scoped executor endpoints (notably
-`POST /executors/{hostId}/quota-reports`, which rejects any other caller —
-including the operator key — so a shared bearer cannot forge another host's
-quota meter). Give each executor host its own token environment variable and
+only as that executor host on host-scoped executor endpoints (`POST
+/executors/register`, `POST /executors/{hostId}/heartbeat`, `POST
+/executors/{hostId}/deregister`, `POST /executors/{hostId}/quota-reports`),
+which reject any other caller — including the operator key — so a shared
+bearer cannot forge another host's registration, load report, or quota
+meter. Give each executor host its own token environment variable and
 matching `ExecutorHostId`, and put that token (not the operator key) in the
 executor's `ApiKeyEnvVar` on that host.
 
@@ -1484,15 +1486,15 @@ Request (`application/json`):
 | `healthy` | Health gate, default `true` |
 | `processId` | Executor OS process id, informational only |
 
-Response: `200 OK` with `{ "workerId": "executor:exec-1", "hostId": "exec-1", "heartbeatIntervalSeconds": 15 }`. `400` on any validation failure.
+Caller binding: the bearer must be a per-executor token bound to the registered host (see `ExecutorHostId` under [Authentication](#authentication)); the shared operator key and any token without a host binding are rejected with `403`, so one executor cannot register, spoof load, or deregister as another host. Response: `200 OK` with `{ "workerId": "executor:exec-1", "hostId": "exec-1", "heartbeatIntervalSeconds": 15 }`. `400` on any validation failure.
 
 ### `POST /executors/{hostId}/heartbeat`
 
-Heartbeat a registered executor into the worker registry. Request body is `{ "currentWorkItemId": "<uuid>", "activePhases": 2 }` (`activePhases` is the host's self-reported live phase count for least-loaded placement; omit or `null` to leave the stored value unchanged, `0`–`100000`). Response: `200 OK`. `404` when no executor is registered for the host id. Ceasing heartbeats lets the row go stale, at which point the existing dead-worker reaper reclaims it exactly like a dead in-process worker.
+Heartbeat a registered executor into the worker registry. Request body is `{ "currentWorkItemId": "<uuid>", "activePhases": 2 }` (`activePhases` is the host's self-reported live phase count for least-loaded placement; omit or `null` to leave the stored value unchanged, `0`–`100000`). The bearer must be the host-bound token for the path host (see `ExecutorHostId` under [Authentication](#authentication)); any other caller is rejected with `403` before the registry is consulted. Response: `200 OK`. `404` when no executor is registered for the host id. Ceasing heartbeats lets the row go stale, at which point the existing dead-worker reaper reclaims it exactly like a dead in-process worker.
 
 ### `POST /executors/{hostId}/deregister`
 
-Remove an executor registration (clean shutdown). Response: `200 OK` with `{ "hostId": "exec-1" }`.
+Remove an executor registration (clean shutdown). The bearer must be the host-bound token for the path host (see `ExecutorHostId` under [Authentication](#authentication)); any other caller is rejected with `403`. Response: `200 OK` with `{ "hostId": "exec-1" }`.
 
 ### `POST /executors/{hostId}/quota-reports`
 
