@@ -2194,7 +2194,10 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
         Assert.Equal(phaseCap, elapsed);
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
+        // Real-time budget only: post-cap continuations (timeout
+        // classification, history/webhook writes) stall under parallel-suite
+        // CPU starvation. Matches the 60s budgets used elsewhere in this file.
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(60));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
