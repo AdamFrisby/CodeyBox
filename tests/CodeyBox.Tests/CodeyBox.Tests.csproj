@@ -92,6 +92,7 @@
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PhpstanAuditorPlugin\CodeyBox.PhpstanAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.DetektAuditorPlugin\CodeyBox.DetektAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PmdAuditorPlugin\CodeyBox.PmdAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.RoslynatorAuditorPlugin\CodeyBox.RoslynatorAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.GitleaksAuditorPlugin\CodeyBox.GitleaksAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.DetectSecretsAuditorPlugin\CodeyBox.DetectSecretsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.BetterleaksAuditorPlugin\CodeyBox.BetterleaksAuditorPlugin.csproj" />
