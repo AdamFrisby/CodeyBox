@@ -869,6 +869,97 @@ public sealed class ModalSandboxProviderTests
         Assert.Equal("limit-exceeded", ex.ErrorClass);
     }
 
+    [Fact]
+    public async Task PollExec_ContentLengthOverBudget_RejectedBeforeBuffering()
+    {
+        var poll = JsonSerializer.Serialize(new
+        {
+            exec_id = "exec-1",
+            status = "running",
+            exit_code = (int?)null,
+            stdout = "hi",
+            stderr = "",
+            stdout_length = 2L,
+            stderr_length = 0L,
+            stdout_truncated = false,
+            stderr_truncated = false,
+        });
+        using var httpClient = new HttpClient(new FixedBodyHandler(poll, contentLength: 1_000_000));
+        var client = new ModalApiClient(httpClient);
+        var ex = await Assert.ThrowsAsync<ModalApiException>(() => client.PollExecAsync(
+            "https://api.modal.com",
+            new ModalCredentials(TestTokenId, TestTokenSecret),
+            "sbx-1",
+            "exec-1",
+            0,
+            0,
+            TimeSpan.FromSeconds(5),
+            CancellationToken.None,
+            maxResponseBytes: 10));
+        Assert.Equal("limit-exceeded", ex.ErrorClass);
+    }
+
+    [Fact]
+    public async Task PollExec_OversizeStreamedChunk_RejectedAsLimitExceeded()
+    {
+        var poll = JsonSerializer.Serialize(new
+        {
+            exec_id = "exec-1",
+            status = "running",
+            exit_code = (int?)null,
+            stdout = new string('x', 64 * 1024),
+            stderr = "",
+            stdout_length = 65536L,
+            stderr_length = 0L,
+            stdout_truncated = false,
+            stderr_truncated = false,
+        });
+        using var httpClient = new HttpClient(new FixedBodyHandler(poll, contentLength: null));
+        var client = new ModalApiClient(httpClient);
+        var ex = await Assert.ThrowsAsync<ModalApiException>(() => client.PollExecAsync(
+            "https://api.modal.com",
+            new ModalCredentials(TestTokenId, TestTokenSecret),
+            "sbx-1",
+            "exec-1",
+            0,
+            0,
+            TimeSpan.FromSeconds(5),
+            CancellationToken.None,
+            maxResponseBytes: 10));
+        Assert.Equal("limit-exceeded", ex.ErrorClass);
+    }
+
+    [Fact]
+    public async Task PollExec_ChunkWithinBudget_Parses()
+    {
+        var poll = JsonSerializer.Serialize(new
+        {
+            exec_id = "exec-1",
+            status = "completed",
+            exit_code = (int?)0,
+            stdout = "hi",
+            stderr = "",
+            stdout_length = 2L,
+            stderr_length = 0L,
+            stdout_truncated = false,
+            stderr_truncated = false,
+        });
+        using var httpClient = new HttpClient(new FixedBodyHandler(poll, contentLength: null));
+        var client = new ModalApiClient(httpClient);
+        var view = await client.PollExecAsync(
+            "https://api.modal.com",
+            new ModalCredentials(TestTokenId, TestTokenSecret),
+            "sbx-1",
+            "exec-1",
+            0,
+            0,
+            TimeSpan.FromSeconds(5),
+            CancellationToken.None,
+            maxResponseBytes: 1024 * 1024);
+        Assert.Equal("exec-1", view.ExecId);
+        Assert.Equal("hi", view.Stdout);
+    }
+
     private sealed class FixedBodyHandler(string body, long? contentLength) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)

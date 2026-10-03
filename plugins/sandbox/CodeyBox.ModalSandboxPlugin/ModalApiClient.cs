@@ -38,6 +38,16 @@ internal sealed class ModalApiClient
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
+    // Bounds for exec control-plane reads, which carry guest-controlled
+    // stdout/stderr. Poll bodies are incremental chunks: the caller passes
+    // the per-exec output budget (stdout cap + stderr cap) and the reader
+    // adds envelope slack for the JSON framing plus string-escape growth,
+    // rejecting on Content-Length first and streaming through a capped
+    // reader so one chunk can never force unbounded host allocation.
+    private const long ExecPollEnvelopeSlackBytes = 32768;
+    internal const long DefaultExecPollMaxBytes = 2L * 64 * 1024 * 1024;
+    private const long StartExecMaxBytes = 64 * 1024;
+
     private readonly HttpClient _http;
 
     public ModalApiClient(HttpClient httpClient)
@@ -121,7 +131,7 @@ internal sealed class ModalApiClient
         using var response = await SendAsync(
             baseUrl, credentials, HttpMethod.Post, $"/v1/sandboxes/{Uri.EscapeDataString(sandboxId)}/exec",
             content, timeout, "start-exec", ct).ConfigureAwait(false);
-        return await ReadJsonAsync<ModalExecView>(response, "start-exec", ct).ConfigureAwait(false);
+        return await ReadBoundedExecJsonAsync<ModalExecView>(response, "start-exec", StartExecMaxBytes, ct).ConfigureAwait(false);
     }
 
     public async Task<ModalExecView> PollExecAsync(
@@ -132,15 +142,21 @@ internal sealed class ModalApiClient
         long stdoutAfter,
         long stderrAfter,
         TimeSpan timeout,
-        CancellationToken ct)
+        CancellationToken ct,
+        long maxResponseBytes = DefaultExecPollMaxBytes)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sandboxId);
         ArgumentException.ThrowIfNullOrWhiteSpace(execId);
+        if (maxResponseBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxResponseBytes), "Exec poll bound must be positive.");
+        }
+
         var query = $"/v1/sandboxes/{Uri.EscapeDataString(sandboxId)}/exec/{Uri.EscapeDataString(execId)}" +
             $"?stdout_after={Math.Max(0, stdoutAfter)}&stderr_after={Math.Max(0, stderrAfter)}";
         using var response = await SendAsync(
             baseUrl, credentials, HttpMethod.Get, query, content: null, timeout, "poll-exec", ct).ConfigureAwait(false);
-        return await ReadJsonAsync<ModalExecView>(response, "poll-exec", ct).ConfigureAwait(false);
+        return await ReadBoundedExecJsonAsync<ModalExecView>(response, "poll-exec", maxResponseBytes, ct).ConfigureAwait(false);
     }
 
     public async Task KillExecAsync(
@@ -316,6 +332,89 @@ internal sealed class ModalApiClient
             throw new ModalApiException(null, "timeout", $"{operation} read exceeded its budget", ex);
         }
         catch (Exception ex) when (ex is HttpRequestException or JsonException or NotSupportedException)
+        {
+            throw new ModalApiException(null, "malformed-response", $"{operation} returned an unreadable body: {ex.Message}", ex);
+        }
+    }
+
+    private static async Task<T> ReadBoundedExecJsonAsync<T>(
+        HttpResponseMessage response, string operation, long maxPayloadBytes, CancellationToken ct)
+    {
+        // Bound before buffering: reject on Content-Length over the per-exec
+        // output budget plus envelope slack, then stream through a capped
+        // reader aborting past that budget so guest-controlled exec output
+        // can never force unbounded host allocation. Mirrors the read-file
+        // pattern; the OutputBuffer cap at the call site remains as the
+        // second line of defence for the accumulated total.
+        long maxBodyBytes;
+        try
+        {
+            checked
+            {
+                maxBodyBytes = maxPayloadBytes + ExecPollEnvelopeSlackBytes;
+            }
+        }
+        catch (OverflowException)
+        {
+            maxBodyBytes = long.MaxValue;
+        }
+
+        if (response.Content.Headers.ContentLength is { } contentLength && contentLength > maxBodyBytes)
+        {
+            throw new ModalApiException(null, "limit-exceeded", $"{operation} exceeds its {maxPayloadBytes}-byte bound");
+        }
+
+        byte[] body;
+        try
+        {
+            using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var sink = new MemoryStream();
+            var buffer = new byte[64 * 1024];
+            int read;
+            while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+            {
+                if (sink.Length + read > maxBodyBytes)
+                {
+                    throw new ModalApiException(null, "limit-exceeded", $"{operation} exceeds its {maxPayloadBytes}-byte bound");
+                }
+
+                sink.Write(buffer, 0, read);
+            }
+
+            body = sink.ToArray();
+        }
+        catch (ModalApiException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            throw new ModalApiException(null, "timeout", $"{operation} read exceeded its budget", ex);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException)
+        {
+            throw new ModalApiException(null, "malformed-response", $"{operation} returned an unreadable body: {ex.Message}", ex);
+        }
+
+        try
+        {
+            var value = JsonSerializer.Deserialize<T>(body, JsonOptions);
+            if (value is null)
+            {
+                throw new ModalApiException(null, "malformed-response", $"{operation} returned an empty body");
+            }
+
+            return value;
+        }
+        catch (ModalApiException)
+        {
+            throw;
+        }
+        catch (JsonException ex)
         {
             throw new ModalApiException(null, "malformed-response", $"{operation} returned an unreadable body: {ex.Message}", ex);
         }

@@ -386,6 +386,18 @@ public sealed class ModalSandbox : ISandbox, IPreemptibleSandbox,
         var stderr = new OutputBuffer(stderrCap, streaming, exec.StderrChunkCallback);
         long stdoutAfter = 0;
         long stderrAfter = 0;
+        long pollBudget;
+        try
+        {
+            checked
+            {
+                pollBudget = (long)stdoutCap + (long)stderrCap;
+            }
+        }
+        catch (OverflowException)
+        {
+            pollBudget = long.MaxValue;
+        }
 
         try
         {
@@ -400,7 +412,12 @@ public sealed class ModalSandbox : ISandbox, IPreemptibleSandbox,
                     view = await _client.PollExecAsync(
                         opts.ApiBaseUrl, credentials, Id, execId,
                         stdoutAfter, stderrAfter,
-                        ModalApiClient.WaitCallTimeout(opts.ApiTimeout), execCt).ConfigureAwait(false);
+                        ModalApiClient.WaitCallTimeout(opts.ApiTimeout), execCt, pollBudget).ConfigureAwait(false);
+                }
+                catch (ModalApiException ex) when (string.Equals(ex.ErrorClass, "limit-exceeded", StringComparison.Ordinal))
+                {
+                    await KillExecutionsAsync([execId], opts, CancellationToken.None).ConfigureAwait(false);
+                    return Unavailable($"modal exec observation failure: {ex.Message}");
                 }
                 catch (ModalApiException ex)
                 {
