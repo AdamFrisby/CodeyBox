@@ -141,6 +141,7 @@
     <Project Path="plugins/sandbox/CodeyBox.RunloopPlugin/CodeyBox.RunloopPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.E2bSandboxPlugin/CodeyBox.E2bSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.ModalSandboxPlugin/CodeyBox.ModalSandboxPlugin.csproj" />
+    <Project Path="plugins/sandbox/CodeyBox.TartSandboxPlugin/CodeyBox.TartSandboxPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />

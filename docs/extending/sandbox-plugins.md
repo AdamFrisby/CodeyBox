@@ -129,3 +129,7 @@ not; `NotEnforced` providers are logged as a warning stating the restriction.
 - [`modal-sandbox-plugin.md`](modal-sandbox-plugin.md) — hosted Modal
   Sandboxes (`ProviderKind: modal`; `NotEnforced` classification, custom
   images, filesystem snapshots, high concurrency, streaming execution).
+- [`tart-sandbox-plugin.md`](tart-sandbox-plugin.md) — local Tart VMs on
+  Apple Silicon macOS hosts (`ProviderKind: tart`; `NotEnforced`
+  classification — macOS cannot provide nftables egress — OCI images,
+  stop/start suspend/resume, SSH guest transport).

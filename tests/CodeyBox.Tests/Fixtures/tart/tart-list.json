@@ -1,0 +1,5 @@
+[
+  {"name": "codeybox-a1b2c3d4-1a2b3c", "state": "running", "size": 42.5, "disk": 50},
+  {"name": "codeybox-e5f6a7b8-9d8e7f", "state": "stopped", "size": 42.5, "disk": 50},
+  {"name": "someone-else", "state": "running", "size": 20.0, "disk": 20}
+]
