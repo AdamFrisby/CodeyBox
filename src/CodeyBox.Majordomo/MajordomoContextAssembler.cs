@@ -233,7 +233,9 @@ public static class MajordomoContextAssembler
     /// Neutralizes embedded closing markers so a payload cannot break out of
     /// its fenced block and read as surrounding instructions. Deterministic
     /// ordinal replacement; the escape is visible so nothing is silently
-    /// altered.
+    /// altered. Operator and Majordomo rows are escaped too: wakeup reports
+    /// embed untrusted queue and failure text, so a payload carrying a forged
+    /// closing marker must not read as surrounding transcript structure.
     /// </summary>
     private static string EscapeFencedContent(string text, MajordomoConversationRole role) =>
         role switch
@@ -242,6 +244,12 @@ public static class MajordomoContextAssembler
                 text.Replace(ToolResultClose, "[\\/untrusted_tool_result]", StringComparison.Ordinal),
             MajordomoConversationRole.ToolCall =>
                 text.Replace(ToolCallClose, "[\\/tool_call]", StringComparison.Ordinal),
+            MajordomoConversationRole.Majordomo =>
+                text.Replace("[/majordomo]", "[\\/majordomo]", StringComparison.Ordinal)
+                    .Replace("[/operator]", "[\\/operator]", StringComparison.Ordinal),
+            MajordomoConversationRole.Operator =>
+                text.Replace("[/operator]", "[\\/operator]", StringComparison.Ordinal)
+                    .Replace("[/majordomo]", "[\\/majordomo]", StringComparison.Ordinal),
             _ => text,
         };
 }

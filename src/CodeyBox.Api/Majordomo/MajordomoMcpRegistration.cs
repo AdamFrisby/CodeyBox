@@ -58,6 +58,19 @@ internal static class MajordomoMcpRegistration
             sp.GetRequiredService<IMajordomoConversationStore>(),
             sp.GetService<TimeProvider>() ?? TimeProvider.System,
             sp.GetService<ILogger<MajordomoExecutor>>()));
+        services.AddSingleton<MajordomoWakeupCoordinator>(sp =>
+            new MajordomoWakeupCoordinator(
+                sp.GetRequiredService<IMajordomoConversationStore>(),
+                () => sp.GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>().CurrentValue.ToWakeupOptions(),
+                () => sp.GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>().CurrentValue.ToPolicy(),
+                () => sp.GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>().CurrentValue.ToHistoryOptions(),
+                sp.GetService<TimeProvider>() ?? TimeProvider.System));
+        services.AddHostedService(sp => new MajordomoWakeupService(
+            sp.GetRequiredService<MajordomoWakeupCoordinator>(),
+            sp.GetRequiredService<IOptionsMonitor<MajordomoServerOptions>>(),
+            sp.GetRequiredService<MajordomoReadBackend>(),
+            sp.GetService<TimeProvider>() ?? TimeProvider.System,
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger<MajordomoWakeupService>()));
         services.AddHttpContextAccessor();
 
         // Fail composition if any vocabulary descriptor lacks a handler —
