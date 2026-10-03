@@ -87,10 +87,22 @@ never fails the phase — losing the stream degrades observability only.
 
 ## Running the executor
 
+Each executor host gets its own bearer token: add a `CodeyBox:ApiClients`
+entry with `ExecutorHostId` set to the host id on the orchestrator, and
+point that host's `CodeyBox:Executor:ApiKeyEnvVar` at the env var carrying
+its token. The shared operator key (`CODEYBOX_API_KEY`) is rejected on
+`POST /executors/register`, heartbeat, deregister, and quota-report
+ingress — every executor holds the bearer it presents, so a shared bearer
+would let any host spoof any other host's registration, load report, and
+work-item pointer.
+
 ```sh
-export CODEYBOX_API_KEY='<orchestrator-api-key>'
+# Orchestrator config (one entry per host):
+# CodeyBox:ApiClients:0:Name=exec-1, TokenEnvVar=CODEYBOX_EXEC_1_API_KEY, ExecutorHostId=exec-1
+export CODEYBOX_EXEC_1_API_KEY='<per-host-executor-token>'
 dotnet run --project src/CodeyBox.Executor -- \
   --CodeyBox:Executor:HostId=exec-1 \
+  --CodeyBox:Executor:ApiKeyEnvVar=CODEYBOX_EXEC_1_API_KEY \
   --CodeyBox:Executor:OrchestratorBaseUrl=https://orchestrator:5000/
 ```
 
@@ -101,7 +113,7 @@ All operational values live under `CodeyBox:Executor` and are hot-reloadable
 |---|---|---|---|
 | `HostId` | `string` | `""` (executor mode disabled) | Stable host id; survives restarts so re-registration upserts one row |
 | `OrchestratorBaseUrl` | `string` | `""` | Absolute `http(s)` URL of the orchestrator |
-| `ApiKeyEnvVar` | `string` | `CODEYBOX_API_KEY` | Env var carrying the orchestrator API key (never stored in config, never logged) |
+| `ApiKeyEnvVar` | `string` | `CODEYBOX_EXECUTOR_API_KEY` | Env var carrying this host's bearer token: set it to the env var holding the host-bound token for this host's `HostId` (never the shared operator key, which executor endpoints reject; never stored in config, never logged) |
 | `MaxConcurrentSandboxes` | `int?` | `null` (uncapped) | Host-local sandbox capacity. `0` registers but is never selected |
 | `AllowedNetworkProfiles` | `string[]` | `[]` (all) | Network profiles this host accepts; `"*"` also means all |
 | `DeclaredCredentials` | `string[]` | `[]` | Agent credential sets this host holds (e.g. `claude`, `codex`) |
@@ -112,6 +124,10 @@ All operational values live under `CodeyBox:Executor` and are hot-reloadable
 | `SandboxProviders` | `string[]` | `[]` (means `[LocalSandboxProvider]`) | Every provider kind this host serves. When non-empty it wins entirely, so one host can offer both an Incus VM and a lightweight process sandbox |
 | `Bubblewrap`, `Multipass`, `Incus`, `MultipassRemote`, `Sprites` | sections | provider defaults | Per-provider settings under `CodeyBox:Executor:<Kind>` (for example `CodeyBox:Executor:Incus:ProjectName`), tuned the same way as the orchestrator's provider sections |
 | `HeartbeatInterval` | `string` (TimeSpan) | `"00:00:15"` | Registry heartbeat cadence |
+| `PhaseStagingRoot` | `string` | `""` (process-temp subdirectory) | Root under which the delivery plane stages the phase's single bare repo, one leaf per `RepositoryId`; the phase runner resolves it with canonicalize-then-contain and refuses to run when it is absent |
+| `PhaseSandboxImageReference` | `string` | `""` (provider default) | Image reference stamped on sandbox specs the phase runner provisions. Hosts on VM-backed providers must set a real image |
+| `MaxCachedPhaseResults` | `int` | `1024` | Maximum completed phase results the executor-side replay guard keeps; oldest-completed evicted first, in-flight never evicted |
+| `PhaseResultCacheTtl` | `string` (TimeSpan) | `"24:00:00"` | How long the executor replays a completed phase result on redelivery |
 | `RequestTimeout` | `string` (TimeSpan) | `"00:00:20"` | Per-request timeout for register/heartbeat calls |
 | `DisconnectPolicy` | `enum` | `RetainSandboxForResume` | Only policy in this item (see below) |
 
@@ -119,6 +135,43 @@ Capacity, cordoning and health reuse the per-host placement vocabulary from
 the remote sandbox provider (`HostId`, `MaxConcurrentSandboxes`, `Cordoned`,
 `Healthy`, `AllowedNetworkProfiles`) — one meaning on both sides of the
 connection, not two.
+
+## Executing phases on the host
+
+`ExecutorHostPhaseRunner` (`src/CodeyBox.Orchestrator/ExecutorHostPhaseRunner.cs`)
+implements `IExecutorPhaseRunner` on the executor: it takes an
+`ExecutorPhaseRequest`, validates the envelope (the payload stays opaque —
+the runner never interprets pipeline semantics), provisions one sandbox
+through the host's primary provider, runs the phase's agent work through the
+injected `IExecutorPhaseHandler` against the staged bare repo and the live
+sandbox, validates the result, and tears the sandbox down. Every phase the
+pipeline dispatches (work, rework, the audit phases, merge) executes through
+this one path, with the handler owning the per-phase agent logic. The runner
+is wired into `ExecutorClient` (so `HasPhaseRunner` is true) whenever an
+`IExecutorPhaseHandler` is composed; without one the executor keeps the
+acceptance state — registered, heartbeating, never sent work.
+
+The executing side mirrors the dispatch contract without duplicating the
+control plane's decisions (placement and authoritative idempotency stay with
+the orchestrator):
+
+- A redelivered phase with a matching key replays the original result
+  without provisioning a second sandbox; a matching key with a differing
+  body is a conflict that never executes. Entries expire under
+  `PhaseResultCacheTtl` with a bounded count (`MaxCachedPhaseResults`).
+- A redelivery that arrives while the phase still runs attaches to the
+  in-flight execution instead of starting a duplicate. Connection loss never
+  cancels local execution, so under `RetainSandboxForResume` a dropped
+  connection resumes rather than re-running.
+- Admissions never exceed the declared `MaxConcurrentSandboxes` (`0`
+  refuses fast; `null` means uncapped), and each heartbeat reports the live
+  phase count (`activePhases`) into the worker registry. Placement takes the
+  max of the reported load and the orchestrator-observed in-flight count, so
+  the shared decider's least-loaded selection stays accurate.
+- Executor-environment failures (nothing staged, provisioning, sandbox or
+  handler transport loss) throw `ExecutorPhaseTransportException` —
+  infrastructure retried elsewhere, never an `AgentFailed` verdict on the
+  work item's diff.
 
 ## Registration and liveness
 

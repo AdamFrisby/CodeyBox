@@ -500,7 +500,14 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
                 continue;
             var baseLoad = string.IsNullOrWhiteSpace(worker.CurrentWorkItemId) ? 0 : 1;
             var inflight = _inflightByHost.TryGetValue(worker.ExecutorHostId, out var active) ? Math.Max(0, active) : 0;
-            loads[worker.ExecutorHostId] = baseLoad + inflight;
+            var observed = baseLoad + inflight;
+            // The executor reports its own live phase count on heartbeats.
+            // Take the max: a dispatch the proxy just started is not yet
+            // visible to the host, and a phase the host just finished is not
+            // yet visible to the proxy — summing would double-count both.
+            if (worker.ExecutorActivePhases is int reported && reported >= 0)
+                observed = Math.Max(observed, reported);
+            loads[worker.ExecutorHostId] = observed;
         }
         foreach (var (hostId, active) in _inflightByHost)
         {

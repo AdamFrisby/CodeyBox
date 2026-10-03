@@ -10,18 +10,24 @@ using Microsoft.Extensions.Options;
 // orchestrator (plain HTTPS POSTs via ExecutorClient) and never opens an
 // inbound listening port, so it can sit behind NAT or a host firewall.
 //
-// This item delivers the process, its registration and its liveness:
-// register + heartbeat into the existing worker registry, local sandbox
-// provisioning through ISandboxProvider, and the retain-for-resume
-// disconnect policy. Dispatching work to this host is a separate item — an
-// executor that registers and heartbeats but is never sent work is the
-// acceptance state, so no phase runner is wired here yet.
+// This host registers and heartbeats into the existing worker registry,
+// provisions sandboxes locally through ISandboxProvider, and executes
+// dispatched phases through ExecutorHostPhaseRunner: envelope validation,
+// executor-side idempotent replay, capacity gating, sandbox provision and
+// tracking with retain-for-resume across disconnects, and live-load
+// heartbeats for least-loaded placement. The per-phase agent logic behind
+// the runner's IExecutorPhaseHandler seam is composed separately — without a
+// registered handler the executor keeps today's acceptance state: registered,
+// heartbeating, never sent work.
 
 var builder = Host.CreateApplicationBuilder(args);
 
 builder.Services.Configure<ExecutorOptions>(builder.Configuration.GetSection("CodeyBox:Executor"));
 builder.Services.AddSingleton<Func<ExecutorOptions>>(sp =>
     () => sp.GetRequiredService<IOptionsMonitor<ExecutorOptions>>().CurrentValue);
+builder.Services.Configure<ExecutorPhaseDispatchOptions>(builder.Configuration.GetSection("CodeyBox:ExecutorPhaseDispatch"));
+builder.Services.AddSingleton<Func<ExecutorPhaseDispatchOptions>>(sp =>
+    () => sp.GetRequiredService<IOptionsMonitor<ExecutorPhaseDispatchOptions>>().CurrentValue);
 
 // Sandbox providers resolve through the shared registry composition — the
 // same factory the orchestrator uses — so every registered kind is
@@ -48,15 +54,29 @@ builder.Services.AddSingleton<ExecutorClient>(sp =>
     var factory = sp.GetRequiredService<IHttpClientFactory>();
     var http = factory.CreateClient("executor");
     http.BaseAddress = new Uri(options.OrchestratorBaseUrl.Trim(), UriKind.Absolute);
+    var tracker = sp.GetRequiredService<ExecutorSandboxTracker>();
+    ExecutorHostPhaseRunner? phaseRunner = null;
+    var handler = sp.GetService<IExecutorPhaseHandler>();
+    if (handler is not null)
+    {
+        phaseRunner = new ExecutorHostPhaseRunner(
+            sp.GetRequiredService<ISandboxProvider>(),
+            tracker,
+            handler,
+            sp.GetRequiredService<Func<ExecutorOptions>>(),
+            sp.GetRequiredService<Func<ExecutorPhaseDispatchOptions>>(),
+            log: sp.GetRequiredService<ILogger<ExecutorHostPhaseRunner>>());
+    }
     return new ExecutorClient(
         http,
         sp.GetRequiredService<Func<ExecutorOptions>>(),
         sp.GetRequiredService<ISandboxProvider>(),
-        sp.GetRequiredService<ExecutorSandboxTracker>(),
-        phaseRunner: null,
+        tracker,
+        phaseRunner: phaseRunner,
         log: sp.GetRequiredService<ILogger<ExecutorClient>>(),
         providerRegistry: sp.GetRequiredService<ISandboxProviderRegistry>(),
-        agentAdvertiser: sp.GetRequiredService<ExecutorAgentAdvertiser>());
+        agentAdvertiser: sp.GetRequiredService<ExecutorAgentAdvertiser>(),
+        activePhaseCountProvider: phaseRunner is null ? null : () => phaseRunner.ActivePhaseCount);
 });
 builder.Services.AddHostedService<ExecutorWorker>();
 builder.Services.AddHostedService<ExecutorStartupValidator>();
@@ -109,10 +129,11 @@ internal sealed class ExecutorStartupValidator : IHostedService
 
 /// <summary>
 /// Runs the executor session (register once, then heartbeat until stopped).
-/// No phase runner is wired in this item, so after registration the worker
-/// idles: it registers and heartbeats but is never sent work. Graceful stop
-/// tears down tracked sandboxes — retention applies to connection loss, not
-/// to process exit, where nothing could resume them.
+/// Without a registered <see cref="IExecutorPhaseHandler"/> no phase runner
+/// is wired, so after registration the worker idles: it registers and
+/// heartbeats but is never sent work. Graceful stop tears down tracked
+/// sandboxes — retention applies to connection loss, not to process exit,
+/// where nothing could resume them.
 /// </summary>
 internal sealed class ExecutorWorker : BackgroundService
 {
@@ -130,7 +151,7 @@ internal sealed class ExecutorWorker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!_client.HasPhaseRunner)
-            _log.LogInformation("No phase runner wired; executor will register and heartbeat but accept no phases (dispatch is a separate item).");
+            _log.LogInformation("No phase handler composed; executor will register and heartbeat but accept no phases.");
         await _client.RunAsync(stoppingToken).ConfigureAwait(false);
     }
 

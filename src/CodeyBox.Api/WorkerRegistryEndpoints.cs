@@ -29,6 +29,7 @@ internal static class WorkerRegistryEndpoints
             executorNetworkProfiles = w.ExecutorNetworkProfiles,
             executorCredentials = w.ExecutorCredentials,
             executorCapabilities = w.ExecutorCapabilities,
+            executorActivePhases = w.ExecutorActivePhases,
             cordoned = w.Cordoned,
             healthy = w.Healthy,
         }));

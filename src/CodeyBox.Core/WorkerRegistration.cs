@@ -66,6 +66,17 @@ public sealed record WorkerRegistration
     /// </summary>
     public bool Healthy { get; init; } = true;
 
+    /// <summary>
+    /// Live phase load last reported by the executor host's heartbeat: how
+    /// many phases it is currently executing. The placement decider takes
+    /// the max of this and the orchestrator-observed in-flight count so
+    /// least-loaded selection stays accurate when the two disagree
+    /// transiently. Null when unknown (non-executor rows, or a host whose
+    /// client predates load reporting) — placement then falls back to the
+    /// orchestrator-observed count alone.
+    /// </summary>
+    public int? ExecutorActivePhases { get; init; }
+
     /// <summary>True when this row belongs to a remote executor host registration.</summary>
     public bool IsExecutor => ExecutorHostId is not null;
 }

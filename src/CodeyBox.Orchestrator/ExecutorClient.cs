@@ -56,7 +56,8 @@ public sealed class ExecutorClient
     private readonly Func<ExecutorOptions> _optionsAccessor;
     private readonly ISandboxProvider _sandboxes;
     private readonly ISandboxProviderRegistry? _providerRegistry;
-    private readonly IPipelineRunner? _phaseRunner;
+    private readonly IExecutorPhaseRunner? _phaseRunner;
+    private readonly Func<int>? _activePhaseCountProvider;
     private readonly ExecutorSandboxTracker _tracker;
     private readonly TimeProvider _clock;
     private readonly ILogger<ExecutorClient> _log;
@@ -69,11 +70,12 @@ public sealed class ExecutorClient
         Func<ExecutorOptions> optionsAccessor,
         ISandboxProvider sandboxes,
         ExecutorSandboxTracker? tracker = null,
-        IPipelineRunner? phaseRunner = null,
+        IExecutorPhaseRunner? phaseRunner = null,
         TimeProvider? clock = null,
         ILogger<ExecutorClient>? log = null,
         ISandboxProviderRegistry? providerRegistry = null,
-        ExecutorAgentAdvertiser? agentAdvertiser = null)
+        ExecutorAgentAdvertiser? agentAdvertiser = null,
+        Func<int>? activePhaseCountProvider = null)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
@@ -84,6 +86,7 @@ public sealed class ExecutorClient
         _log = log ?? NullLogger<ExecutorClient>.Instance;
         _providerRegistry = providerRegistry;
         _agentAdvertiser = agentAdvertiser;
+        _activePhaseCountProvider = activePhaseCountProvider;
     }
 
     /// <summary>Primary sandbox provider this executor provisions through (the first declared kind).</summary>
@@ -92,7 +95,7 @@ public sealed class ExecutorClient
     /// <summary>Sandbox tracker implementing the disconnect retain/reconcile policy.</summary>
     public ExecutorSandboxTracker Tracker => _tracker;
 
-    /// <summary>True when a phase runner is wired. Dispatch (a separate item) supplies it; without one the executor idles after registration.</summary>
+    /// <summary>True when a phase runner is wired. Without one the executor idles after registration: it registers and heartbeats but is never sent work.</summary>
     public bool HasPhaseRunner => _phaseRunner is not null;
 
     /// <summary>
@@ -105,19 +108,18 @@ public sealed class ExecutorClient
     }
 
     /// <summary>
-    /// Executes a work-item phase through the phase-execution seam
-    /// (<see cref="IPipelineRunner"/>). Throws
+    /// Executes one dispatched phase through the phase-execution seam
+    /// (<see cref="IExecutorPhaseRunner"/>). Throws
     /// <see cref="InvalidOperationException"/> when no runner is wired —
-    /// dispatch wiring is a separate item, and failing fast beats pretending
-    /// to run a phase that goes nowhere.
+    /// failing fast beats pretending to run a phase that goes nowhere.
     /// </summary>
-    public Task RunPhaseAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+    public Task<ExecutorPhaseResult> ExecutePhaseAsync(ExecutorPhaseRequest request, CancellationToken ct = default)
     {
-        ArgumentNullException.ThrowIfNull(item);
+        ArgumentNullException.ThrowIfNull(request);
         var runner = _phaseRunner
             ?? throw new InvalidOperationException(
-                "No phase runner is wired on this executor; dispatch wiring arrives in a separate item. The executor registers and heartbeats but cannot accept phases yet.");
-        return runner.RunAsync(item, ct, hostShutdownToken);
+                "No phase runner is wired on this executor; it registers and heartbeats but cannot accept phases yet.");
+        return runner.ExecutePhaseAsync(request, ct);
     }
 
     /// <summary>
@@ -187,11 +189,35 @@ public sealed class ExecutorClient
             $"executors/{Uri.EscapeDataString(hostId)}/heartbeat")
         {
             Content = JsonContent.Create(
-                new { currentWorkItemId = string.IsNullOrWhiteSpace(currentWorkItemId) ? null : currentWorkItemId.Trim() },
+                new
+                {
+                    currentWorkItemId = string.IsNullOrWhiteSpace(currentWorkItemId) ? null : currentWorkItemId.Trim(),
+                    activePhases = ProbeActivePhases(),
+                },
                 options: JsonOptions),
         };
         using var response = await SendAsync(request, "heartbeat", options, ct).ConfigureAwait(false);
         await ReadBoundedAsync(response, "heartbeat", ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads live phase load for heartbeat reporting. Never throws: a broken
+    /// probe must not fail liveness. Returns null when no probe is wired, in
+    /// which case the orchestrator keeps its last reported value.
+    /// </summary>
+    private int? ProbeActivePhases()
+    {
+        if (_activePhaseCountProvider is null)
+            return null;
+        try
+        {
+            return Math.Clamp(_activePhaseCountProvider(), 0, ExecutorRegistration.MaxDeclaredCapacity);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Executor load probe failed; heartbeating without a load report");
+            return null;
+        }
     }
 
     /// <summary>

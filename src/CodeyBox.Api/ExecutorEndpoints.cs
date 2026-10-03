@@ -33,6 +33,7 @@ internal static class ExecutorEndpoints
     private static async Task<IResult> RegisterAsync(
         ExecutorRegistrationRequest req,
         IWorkerRegistry registry,
+        HttpContext httpContext,
         CancellationToken ct)
     {
         if (req is null)
@@ -47,6 +48,9 @@ internal static class ExecutorEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+
+        if (CheckExecutorHostCaller(httpContext, hostId) is { } callerRejection)
+            return callerRejection;
 
         var capacityError = ValidateCapacity(req.MaxConcurrentSandboxes);
         if (capacityError is not null)
@@ -96,6 +100,7 @@ internal static class ExecutorEndpoints
         string hostId,
         ExecutorHeartbeatRequest? req,
         IWorkerRegistry registry,
+        HttpContext httpContext,
         CancellationToken ct)
     {
         string normalized;
@@ -107,6 +112,9 @@ internal static class ExecutorEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+
+        if (CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
+            return callerRejection;
 
         var workerId = ExecutorRegistration.WorkerIdFor(normalized);
         var existing = await registry.ListAsync(ct);
@@ -119,13 +127,18 @@ internal static class ExecutorEndpoints
         if (currentWorkItemId is not null && currentWorkItemId.Length > 128)
             return Results.BadRequest(new { error = "currentWorkItemId must be at most 128 characters" });
 
-        await registry.HeartbeatAsync(workerId, currentWorkItemId, ct);
+        if (req?.ActivePhases is < 0 or > ExecutorRegistration.MaxDeclaredCapacity)
+            return Results.BadRequest(
+                new { error = $"activePhases must be between 0 and {ExecutorRegistration.MaxDeclaredCapacity}" });
+
+        await registry.HeartbeatAsync(workerId, currentWorkItemId, ct, req?.ActivePhases);
         return Results.Ok(new { workerId, lastHeartbeatAt = DateTimeOffset.UtcNow });
     }
 
     private static async Task<IResult> DeregisterAsync(
         string hostId,
         IWorkerRegistry registry,
+        HttpContext httpContext,
         CancellationToken ct)
     {
         string normalized;
@@ -137,6 +150,9 @@ internal static class ExecutorEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+
+        if (CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
+            return callerRejection;
 
         await registry.DeregisterAsync(ExecutorRegistration.WorkerIdFor(normalized), ct);
         return Results.Ok(new { hostId = normalized });
@@ -258,6 +274,41 @@ internal static class ExecutorEndpoints
         return null;
     }
 
+    /// <summary>
+    /// Binds a host-scoped executor endpoint (register, heartbeat,
+    /// deregister) to the authenticated caller. Only a host-bound executor
+    /// token exactly matching the path/body host may proceed; the check runs
+    /// before the registry is consulted, so a compromised or curious
+    /// executor cannot forge another host's load report (which feeds
+    /// least-loaded placement), register or deregister as another host, or
+    /// spoof its current work item. Callers without a host binding — the
+    /// operator/shared bearer and any named token without an
+    /// <c>ExecutorHostId</c> — are rejected: every executor host holds the
+    /// bearer it presents, so a shared bearer proves nothing about which
+    /// host is calling and would let any executor spoof any other host's
+    /// load and work-item pointer. The loopback auth-disabled operator
+    /// (local dev only) remains allowed. This matches the quota-report gate
+    /// (<see cref="CheckQuotaReportCaller"/>).
+    /// Returns null when the caller may proceed. Pure apart from reading
+    /// the already-authenticated principal.
+    /// </summary>
+    internal static IResult? CheckExecutorHostCaller(HttpContext httpContext, string normalizedHostId)
+    {
+        if (!ApiKeyAuth.TryGetPrincipal(httpContext, out var principal) || principal is null)
+            return Results.Unauthorized();
+        if (ApiKeyAuth.IsAuthenticationDisabled(principal))
+            return null;
+        if (string.IsNullOrWhiteSpace(principal.ExecutorHostId))
+            return Results.Json(
+                new { error = "register, heartbeat, and deregister require a host-bound executor token (CodeyBox:ApiClients ExecutorHostId) matching the host id; shared bearer tokens cannot act for a host" },
+                statusCode: StatusCodes.Status403Forbidden);
+        if (!string.Equals(principal.ExecutorHostId, normalizedHostId, StringComparison.Ordinal))
+            return Results.Json(
+                new { error = $"this token is bound to executor host '{principal.ExecutorHostId}' and cannot act for host '{normalizedHostId}'" },
+                statusCode: StatusCodes.Status403Forbidden);
+        return null;
+    }
+
     internal static string? ValidateCapacity(int? capacity)
     {
         if (capacity is null)
@@ -306,6 +357,14 @@ internal static class ExecutorEndpoints
     public sealed class ExecutorHeartbeatRequest
     {
         public string? CurrentWorkItemId { get; set; }
+
+        /// <summary>
+        /// Live phase load self-reported by the executor host: how many
+        /// phases it is currently executing. Feeds the shared placement
+        /// decider's least-loaded selection; null leaves the stored value
+        /// unchanged.
+        /// </summary>
+        public int? ActivePhases { get; set; }
     }
 
     /// <summary>

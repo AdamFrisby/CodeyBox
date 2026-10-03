@@ -344,11 +344,15 @@ public sealed class ApiClientOptions
     /// <summary>
     /// Optional executor host this client's token is bound to. When set, the
     /// token may only act as that host on host-scoped executor endpoints
-    /// (notably <c>POST /executors/{hostId}/quota-reports</c>): a path host
-    /// that does not exactly equal this value is rejected, so one executor
-    /// cannot forge another host's quota meter. Tokens without a binding
-    /// (including the operator key) are rejected on quota-report ingress —
-    /// a shared bearer proves nothing about which host is calling.
+    /// (<c>POST /executors/register</c>, <c>POST
+    /// /executors/{hostId}/heartbeat</c>, <c>POST
+    /// /executors/{hostId}/deregister</c>, and <c>POST
+    /// /executors/{hostId}/quota-reports</c>): a path host that does not
+    /// exactly equal this value is rejected, so one executor cannot forge
+    /// another host's registration, load report, or quota meter. Tokens
+    /// without a binding (including the operator key) are rejected on all
+    /// of those endpoints — a shared bearer proves nothing about which host
+    /// is calling.
     /// </summary>
     public string? ExecutorHostId { get; set; }
 }
