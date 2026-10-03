@@ -196,7 +196,7 @@ internal sealed class ModalApiClient
         var query = $"/v1/sandboxes/{Uri.EscapeDataString(sandboxId)}/files?path={Uri.EscapeDataString(guestPath)}";
         using var response = await SendAsync(
             baseUrl, credentials, HttpMethod.Get, query, content: null, timeout, "read-file", ct).ConfigureAwait(false);
-        var view = await ReadJsonAsync<ModalFileView>(response, "read-file", ct).ConfigureAwait(false);
+        var view = await ReadBoundedJsonAsync<ModalFileView>(response, "read-file", guestPath, maxBytes, ct).ConfigureAwait(false);
         byte[] decoded;
         try
         {
@@ -316,6 +316,89 @@ internal sealed class ModalApiClient
             throw new ModalApiException(null, "timeout", $"{operation} read exceeded its budget", ex);
         }
         catch (Exception ex) when (ex is HttpRequestException or JsonException or NotSupportedException)
+        {
+            throw new ModalApiException(null, "malformed-response", $"{operation} returned an unreadable body: {ex.Message}", ex);
+        }
+    }
+
+    private static async Task<T> ReadBoundedJsonAsync<T>(
+        HttpResponseMessage response, string operation, string guestPath, long maxDecodedBytes, CancellationToken ct)
+    {
+        // Bound before buffering: base64 inflates by 4/3 plus a small JSON
+        // envelope. Reject on Content-Length first, then stream through a
+        // capped reader so guest-controlled bytes can never force unbounded
+        // host allocation; the decoded-size check at the call site remains
+        // as the second line of defence.
+        const long envelopeSlackBytes = 8192;
+        long maxBodyBytes;
+        try
+        {
+            checked
+            {
+                maxBodyBytes = ((maxDecodedBytes + 2) / 3) * 4 + envelopeSlackBytes;
+            }
+        }
+        catch (OverflowException)
+        {
+            maxBodyBytes = long.MaxValue;
+        }
+
+        if (response.Content.Headers.ContentLength is { } contentLength && contentLength > maxBodyBytes)
+        {
+            throw new ModalApiException(null, "limit-exceeded", $"{operation} for '{guestPath}' exceeds its {maxDecodedBytes}-byte bound");
+        }
+
+        byte[] body;
+        try
+        {
+            using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var sink = new MemoryStream();
+            var buffer = new byte[64 * 1024];
+            int read;
+            while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+            {
+                if (sink.Length + read > maxBodyBytes)
+                {
+                    throw new ModalApiException(null, "limit-exceeded", $"{operation} for '{guestPath}' exceeds its {maxDecodedBytes}-byte bound");
+                }
+
+                sink.Write(buffer, 0, read);
+            }
+
+            body = sink.ToArray();
+        }
+        catch (ModalApiException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            throw new ModalApiException(null, "timeout", $"{operation} read exceeded its budget", ex);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException)
+        {
+            throw new ModalApiException(null, "malformed-response", $"{operation} returned an unreadable body: {ex.Message}", ex);
+        }
+
+        try
+        {
+            var value = JsonSerializer.Deserialize<T>(body, JsonOptions);
+            if (value is null)
+            {
+                throw new ModalApiException(null, "malformed-response", $"{operation} returned an empty body");
+            }
+
+            return value;
+        }
+        catch (ModalApiException)
+        {
+            throw;
+        }
+        catch (JsonException ex)
         {
             throw new ModalApiException(null, "malformed-response", $"{operation} returned an unreadable body: {ex.Message}", ex);
         }

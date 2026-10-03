@@ -826,4 +826,56 @@ public sealed class ModalSandboxProviderTests
         Assert.Throws<InvalidOperationException>(() => ModalSandboxProvider.ValidateOptions(
             TestOptions() with { CpuCount = 0 }));
     }
+
+    [Fact]
+    public async Task ReadFileBytes_ContentLengthOverBound_RejectedBeforeBuffering()
+    {
+        var tiny = JsonSerializer.Serialize(new
+        {
+            path = "/work/big.bin",
+            content_b64 = Convert.ToBase64String("hi"u8.ToArray()),
+        });
+        using var httpClient = new HttpClient(new FixedBodyHandler(tiny, contentLength: 1_000_000));
+        var client = new ModalApiClient(httpClient);
+        var ex = await Assert.ThrowsAsync<ModalApiException>(() => client.ReadFileBytesAsync(
+            "https://api.modal.com",
+            new ModalCredentials(TestTokenId, TestTokenSecret),
+            "sbx-1",
+            "/work/big.bin",
+            10,
+            TimeSpan.FromSeconds(5),
+            CancellationToken.None));
+        Assert.Equal("limit-exceeded", ex.ErrorClass);
+    }
+
+    [Fact]
+    public async Task ReadFileBytes_OversizeStreamedBody_RejectedAsLimitExceeded()
+    {
+        var big = JsonSerializer.Serialize(new
+        {
+            path = "/work/big.bin",
+            content_b64 = Convert.ToBase64String(new byte[16 * 1024]),
+        });
+        using var httpClient2 = new HttpClient(new FixedBodyHandler(big, contentLength: null));
+        var client2 = new ModalApiClient(httpClient2);
+        var ex = await Assert.ThrowsAsync<ModalApiException>(() => client2.ReadFileBytesAsync(
+            "https://api.modal.com",
+            new ModalCredentials(TestTokenId, TestTokenSecret),
+            "sbx-1",
+            "/work/big.bin",
+            10,
+            TimeSpan.FromSeconds(5),
+            CancellationToken.None));
+        Assert.Equal("limit-exceeded", ex.ErrorClass);
+    }
+
+    private sealed class FixedBodyHandler(string body, long? contentLength) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var content = new StringContent(body, Encoding.UTF8, "application/json");
+            content.Headers.ContentLength = contentLength;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+        }
+    }
 }
