@@ -27,10 +27,14 @@ public sealed class ExecutorOptions
     public string OrchestratorBaseUrl { get; set; } = "";
 
     /// <summary>
-    /// Name of the environment variable carrying the orchestrator API key.
-    /// The key itself is never stored in config files and never logged.
+    /// Name of the environment variable carrying this host's bearer token.
+    /// This must be the env var holding the host-bound executor token for
+    /// this host's <see cref="HostId"/> (a <c>CodeyBox:ApiClients</c> entry
+    /// with a matching <c>ExecutorHostId</c>), never the shared operator key:
+    /// executor endpoints reject the operator key. The key itself is never
+    /// stored in config files and never logged.
     /// </summary>
-    public string ApiKeyEnvVar { get; set; } = "CODEYBOX_API_KEY";
+    public string ApiKeyEnvVar { get; set; } = "CODEYBOX_EXECUTOR_API_KEY";
 
     /// <summary>
     /// Host-local sandbox capacity, mirroring the per-host

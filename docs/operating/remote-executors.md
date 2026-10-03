@@ -113,7 +113,7 @@ All operational values live under `CodeyBox:Executor` and are hot-reloadable
 |---|---|---|---|
 | `HostId` | `string` | `""` (executor mode disabled) | Stable host id; survives restarts so re-registration upserts one row |
 | `OrchestratorBaseUrl` | `string` | `""` | Absolute `http(s)` URL of the orchestrator |
-| `ApiKeyEnvVar` | `string` | `CODEYBOX_API_KEY` | Env var carrying this host's bearer token: set it to the env var holding the host-bound token for this host's `HostId` (never the shared operator key, which executor endpoints reject; never stored in config, never logged) |
+| `ApiKeyEnvVar` | `string` | `CODEYBOX_EXECUTOR_API_KEY` | Env var carrying this host's bearer token: set it to the env var holding the host-bound token for this host's `HostId` (never the shared operator key, which executor endpoints reject; never stored in config, never logged) |
 | `MaxConcurrentSandboxes` | `int?` | `null` (uncapped) | Host-local sandbox capacity. `0` registers but is never selected |
 | `AllowedNetworkProfiles` | `string[]` | `[]` (all) | Network profiles this host accepts; `"*"` also means all |
 | `DeclaredCredentials` | `string[]` | `[]` | Agent credential sets this host holds (e.g. `claude`, `codex`) |
