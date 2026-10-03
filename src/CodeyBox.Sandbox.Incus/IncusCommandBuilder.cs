@@ -115,6 +115,43 @@ internal static class IncusBaselineNaming
         effectivePrefix.StartsWith(BakeCandidatePrefix, StringComparison.Ordinal)
         || BakeCandidatePrefix.StartsWith(effectivePrefix, StringComparison.Ordinal);
 
+    /// <summary>
+    /// Computes the provider-neutral toolchain hash for these Incus options by
+    /// delegating to <see cref="BaselineContentHash"/> — the same computation
+    /// every baseline-baking provider shares, so an identical toolchain hashes
+    /// identically on Incus and OpenStack. This intentionally covers only the
+    /// toolchain (runcmd, staged executables, verification commands): the
+    /// full <see cref="ComputeConfigHash"/> additionally binds
+    /// provider-specific infrastructure (pool, bridge, image, sizing), which
+    /// selects where a baseline runs rather than what it carries.
+    /// </summary>
+    internal static string ComputeSharedToolchainHash(
+        IncusSandboxOptions options,
+        IReadOnlyList<string>? executableContentSha256 = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (executableContentSha256 is null)
+            throw new ArgumentException(
+                "Executable fingerprints must be supplied; fingerprinting reads host files and stays with the caller.",
+                nameof(executableContentSha256));
+        if (executableContentSha256.Count != options.ExecutableProvisions.Count)
+            throw new ArgumentException("Executable fingerprint count does not match the Incus provisioning configuration.", nameof(executableContentSha256));
+        var executables = new BaselineToolchainExecutable[options.ExecutableProvisions.Count];
+        for (var i = 0; i < options.ExecutableProvisions.Count; i++)
+        {
+            var provision = options.ExecutableProvisions[i];
+            executables[i] = new BaselineToolchainExecutable(
+                provision.VmDestPath,
+                provision.VmSymlinks,
+                provision.Label,
+                executableContentSha256[i]);
+        }
+        return BaselineContentHash.ComputeToolchainHash(new BaselineToolchainInputs(
+            options.ExtraRuncmd,
+            executables,
+            options.BaselineVerificationCommands));
+    }
+
     internal static string ComputeConfigHash(
         IncusSandboxOptions options,
         string profileName,

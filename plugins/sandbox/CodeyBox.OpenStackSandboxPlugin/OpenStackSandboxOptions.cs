@@ -206,6 +206,74 @@ public sealed record OpenStackSandboxOptions
     public bool AllowUnsafeHttp { get; init; }
 
     /// <summary>
+    /// Bake and clone content-hashed Glance baseline images carrying the same
+    /// toolchain as the local Incus baseline (provisioning commands, staged
+    /// executables, verification probes). Default true so an enabled provider
+    /// serves warm clones; disable to always boot the base cloud image.
+    /// </summary>
+    public bool UseBaselineImages { get; init; } = true;
+
+    /// <summary>
+    /// Base cloud image the builder server boots from before provisioning.
+    /// Image id or exact image name. Empty falls back to <see cref="ImageName"/>.
+    /// </summary>
+    public string BaselineBaseImageName { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Name prefix for baked Glance baseline images. Must start with
+    /// <c>codeybox-</c> so image GC never touches unrelated images.
+    /// </summary>
+    public string BaselineImagePrefix { get; init; } = "codeybox-baseline-";
+
+    /// <summary>Ceiling for one baseline bake, in seconds (300–14400).</summary>
+    public int BaselineBakeTimeoutSeconds { get; init; } = 1800;
+
+    /// <summary>
+    /// Newest baked images kept per retention group (1–64), plus every image
+    /// pinned by a non-terminal item. Older unpinned images are pruned.
+    /// </summary>
+    public int BaselineRetainedImageCount { get; init; } = 3;
+
+    /// <summary>
+    /// Builder-server egress during the bake: true opens full egress so
+    /// provisioning commands can fetch toolchains. The builder is ephemeral
+    /// (deleted after the snapshot) and carries no credentials; work sandboxes
+    /// keep their locked-down groups either way.
+    /// </summary>
+    public bool BaselineBuilderOpenEgress { get; init; } = true;
+
+    /// <summary>
+    /// Shell commands run on the builder server during the bake, after the
+    /// base image's first boot. Mirror the toolchain half of
+    /// <c>CodeyBox:MultipassExtraRuncmd</c> / <c>CodeyBox:Incus:ExtraRuncmd</c>
+    /// here plus any host-composed plugin tool install lines, so the baked
+    /// toolchain matches the local baseline. Joins the baseline content hash:
+    /// any edit rebakes.
+    /// </summary>
+    public IReadOnlyList<string> ExtraRuncmd { get; init; } = [];
+
+    /// <summary>
+    /// Host executables staged onto the builder and installed into the baked
+    /// image. Uses the shared provider-neutral
+    /// <see cref="CodeyBox.Sandbox.BaselineExecutableProvision"/> contract —
+    /// the same shape as the Incus option — rather than a duplicated one.
+    /// </summary>
+    public IReadOnlyList<CodeyBox.Sandbox.BaselineExecutableProvision> ExecutableProvisions { get; init; } = [];
+
+    /// <summary>
+    /// Commands that must pass on the builder after provisioning, before the
+    /// snapshot is taken. Append the same agent-CLI probes and plugin tool
+    /// presence checks the local baseline verifies.
+    /// </summary>
+    public IReadOnlyList<CodeyBox.Sandbox.BaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
+
+    /// <summary>Maximum bytes read from one host executable provision (1 byte–4 GiB).</summary>
+    public long MaxExecutableProvisionBytes { get; init; } = 512L * 1024 * 1024;
+
+    /// <summary>Maximum aggregate bytes read from all executable provisions in one bake.</summary>
+    public long MaxAggregateExecutableProvisionBytes { get; init; } = 1024L * 1024 * 1024;
+
+    /// <summary>
     /// Binds options from the plugin's scoped configuration section. Invalid
     /// values fall back to safe defaults via <see cref="PluginConfigReaders"/>
     /// so a bad hot-reload never crashes an operation.
@@ -262,12 +330,145 @@ public sealed record OpenStackSandboxOptions
             DnsTimeoutSeconds = ReadClampedInt(
                 section, "DnsTimeoutSeconds", defaults.DnsTimeoutSeconds, 1, 120),
             AllowUnsafeHttp = PluginConfigReaders.ReadBool(section, "AllowUnsafeHttp", defaults.AllowUnsafeHttp),
+            UseBaselineImages = PluginConfigReaders.ReadBool(
+                section, "UseBaselineImages", defaults.UseBaselineImages),
+            BaselineBaseImageName = (section["BaselineBaseImageName"] ?? string.Empty).Trim(),
+            BaselineImagePrefix = PluginConfigReaders.ReadNonEmpty(
+                section, "BaselineImagePrefix", defaults.BaselineImagePrefix),
+            BaselineBakeTimeoutSeconds = ReadClampedInt(
+                section, "BaselineBakeTimeoutSeconds", defaults.BaselineBakeTimeoutSeconds, 300, 14_400),
+            BaselineRetainedImageCount = ReadClampedInt(
+                section, "BaselineRetainedImageCount", defaults.BaselineRetainedImageCount, 1, 64),
+            BaselineBuilderOpenEgress = PluginConfigReaders.ReadBool(
+                section, "BaselineBuilderOpenEgress", defaults.BaselineBuilderOpenEgress),
+            ExtraRuncmd = PluginConfigReaders.ReadList(
+                section.GetSection("ExtraRuncmd"), defaults.ExtraRuncmd),
+            ExecutableProvisions = ReadExecutableProvisions(section.GetSection("ExecutableProvisions")),
+            BaselineVerificationCommands = ReadVerificationCommands(
+                section.GetSection("BaselineVerificationCommands")),
+            MaxExecutableProvisionBytes = ReadClampedLong(
+                section, "MaxExecutableProvisionBytes", defaults.MaxExecutableProvisionBytes, 1, 4L * 1024 * 1024 * 1024),
+            MaxAggregateExecutableProvisionBytes = ReadClampedLong(
+                section, "MaxAggregateExecutableProvisionBytes", defaults.MaxAggregateExecutableProvisionBytes,
+                512L * 1024 * 1024, 64L * 1024 * 1024 * 1024),
         };
+    }
+
+    private static IReadOnlyList<CodeyBox.Sandbox.BaselineExecutableProvision> ReadExecutableProvisions(
+        IConfigurationSection section)
+    {
+        var provisions = new List<CodeyBox.Sandbox.BaselineExecutableProvision>();
+        foreach (var child in section.GetChildren())
+        {
+            if (provisions.Count >= CodeyBox.Sandbox.BaselineProvisioningLimits.MaximumExecutableProvisions)
+                break;
+            var symlinks = child.GetSection("VmSymlinks").GetChildren()
+                .Select(c => c.Value?.Trim())
+                .Where(v => !string.IsNullOrWhiteSpace(v))
+                .Cast<string>()
+                .Take(CodeyBox.Sandbox.BaselineProvisioningLimits.MaximumExecutableSymlinks)
+                .ToArray();
+            provisions.Add(new CodeyBox.Sandbox.BaselineExecutableProvision
+            {
+                HostSourcePath = (child["HostSourcePath"] ?? string.Empty).Trim(),
+                VmDestPath = (child["VmDestPath"] ?? string.Empty).Trim(),
+                VmSymlinks = symlinks,
+                Label = string.IsNullOrWhiteSpace(child["Label"]) ? null : child["Label"]!.Trim(),
+            });
+        }
+        return provisions;
+    }
+
+    private static IReadOnlyList<CodeyBox.Sandbox.BaselineVerificationCommand> ReadVerificationCommands(
+        IConfigurationSection section)
+    {
+        var commands = new List<CodeyBox.Sandbox.BaselineVerificationCommand>();
+        foreach (var child in section.GetChildren())
+        {
+            if (commands.Count >= CodeyBox.Sandbox.BaselineProvisioningLimits.MaximumVerificationCommands)
+                break;
+            var argv = child.GetSection("Argv").GetChildren()
+                .Select(c => c.Value?.Trim())
+                .Where(v => !string.IsNullOrWhiteSpace(v))
+                .Cast<string>()
+                .Take(CodeyBox.Sandbox.BaselineProvisioningLimits.MaximumVerificationArguments)
+                .ToArray();
+            commands.Add(new CodeyBox.Sandbox.BaselineVerificationCommand(
+                string.IsNullOrWhiteSpace(child["Label"]) ? "(unnamed)" : child["Label"]!.Trim(),
+                argv,
+                string.IsNullOrWhiteSpace(child["FailureHint"]) ? null : child["FailureHint"]!.Trim()));
+        }
+        return commands;
+    }
+
+    private static long ReadClampedLong(
+        IConfigurationSection section, string name, long defaultValue, long min, long max)
+    {
+        var raw = section[name];
+        if (!string.IsNullOrWhiteSpace(raw)
+            && long.TryParse(
+                raw.Trim(),
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var parsed))
+        {
+            return Math.Clamp(parsed, min, max);
+        }
+        return defaultValue;
     }
 
     private static int ReadClampedInt(
         IConfigurationSection section, string name, int defaultValue, int min, int max) =>
         Math.Clamp(PluginConfigReaders.ReadInt(section, name, defaultValue), min, max);
+
+    /// <summary>
+    /// Validates the baseline bake inputs without touching the host or the
+    /// cloud: prefixes, provision shapes, and byte-cap coherence. Returns an
+    /// empty list when the configuration is usable.
+    /// </summary>
+    public IReadOnlyList<string> ValidateBaseline()
+    {
+        var errors = new List<string>();
+        if (string.IsNullOrWhiteSpace(BaselineImagePrefix)
+            || !BaselineImagePrefix.StartsWith("codeybox-", StringComparison.Ordinal))
+        {
+            errors.Add("BaselineImagePrefix must start with 'codeybox-'.");
+        }
+        if (ExtraRuncmd.Count > CodeyBox.Sandbox.BaselineProvisioningLimits.MaximumVerificationCommands * 4)
+            errors.Add("ExtraRuncmd exceeds the bounded command count.");
+        for (var i = 0; i < ExtraRuncmd.Count; i++)
+        {
+            if (string.IsNullOrWhiteSpace(ExtraRuncmd[i]))
+                errors.Add($"ExtraRuncmd[{i}] cannot be blank.");
+        }
+        for (var i = 0; i < ExecutableProvisions.Count; i++)
+        {
+            var provision = ExecutableProvisions[i];
+            if (provision is null)
+            {
+                errors.Add($"ExecutableProvisions[{i}] cannot be null.");
+                continue;
+            }
+            if (string.IsNullOrWhiteSpace(provision.HostSourcePath))
+                errors.Add($"ExecutableProvisions[{i}].HostSourcePath cannot be blank.");
+            if (string.IsNullOrWhiteSpace(provision.VmDestPath) || !provision.VmDestPath.StartsWith('/'))
+                errors.Add($"ExecutableProvisions[{i}].VmDestPath must be an absolute guest path.");
+        }
+        for (var i = 0; i < BaselineVerificationCommands.Count; i++)
+        {
+            var command = BaselineVerificationCommands[i];
+            if (command is null)
+            {
+                errors.Add($"BaselineVerificationCommands[{i}] cannot be null.");
+                continue;
+            }
+            if (command.Argv.Count == 0)
+                errors.Add($"BaselineVerificationCommands[{i}] must name a command to run.");
+        }
+        if (MaxAggregateExecutableProvisionBytes < MaxExecutableProvisionBytes)
+            errors.Add("MaxAggregateExecutableProvisionBytes must cover MaxExecutableProvisionBytes.");
+        return errors;
+    }
 
     /// <summary>Projects the size/timeout knobs onto the REST client's bounds record.</summary>
     public OpenStackClientLimits ToClientLimits() => new()

@@ -31,6 +31,9 @@ public sealed class OpenStackSandboxProvider :
     ISandboxProvider,
     IPluginInitializer,
     IActiveSandboxProvider,
+    IBaselineImageResolver,
+    IBaselineImageProvisioner,
+    IBaselineImageRetention,
     IDisposable
 {
     internal const string ManagedTag = "codeybox";
@@ -133,8 +136,10 @@ public sealed class OpenStackSandboxProvider :
     /// </summary>
     public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
 
-    /// <summary>Honest capability set: fresh VM per work item, torn down on disposal. No baseline bake, no suspend.</summary>
-    public IReadOnlyList<string> DeclaredCapabilities => [SandboxCapabilities.Teardown];
+    /// <summary>Honest capability set: fresh VM per work item, torn down on disposal; baseline bake when enabled.</summary>
+    public IReadOnlyList<string> DeclaredCapabilities => [SandboxCapabilities.Teardown, SandboxCapabilities.BaselineBake];
+
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _baselineBuildLocks = new(StringComparer.Ordinal);
 
     private OpenStackSandboxOptions ReadOptions() => _readOptions();
 
@@ -168,7 +173,7 @@ public sealed class OpenStackSandboxProvider :
                 $"OpenStack flavor '{opts.FlavorName}' not found. Set CodeyBox:Plugins:{OpenStackSandboxOptions.PluginId}:FlavorName " +
                 "to an exact visible flavor name.");
         await EnsureQuotaHeadroomAsync(api, credentials, opts, flavor, ct).ConfigureAwait(false);
-        var imageId = await ResolveImageIdAsync(api, credentials, opts, spec, ct).ConfigureAwait(false);
+        var imageId = await ResolveBootImageIdAsync(api, credentials, opts, spec, ct).ConfigureAwait(false);
 
         var suffix = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
         var serverName = opts.ServerNamePrefix + suffix;
@@ -369,6 +374,203 @@ public sealed class OpenStackSandboxProvider :
         }
         MarkNoLongerActive(name);
         await SweepOrphanResourcesAsync(api, credentials, opts, ownerId, ct).ConfigureAwait(false);
+    }
+
+    // ------------------------------------------------------------------
+    // Baseline images (Glance, content-hashed by the shared toolchain hash)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Deterministic scoped pin for the live toolchain: a content hash over
+    /// the bake inputs (provisioning commands, staged executables,
+    /// verification probes) shared with the Incus provider, so the same
+    /// toolchain resolves to the same hash wherever it bakes. Baselines are
+    /// profile-independent here — placement refuses profiled work on
+    /// NotEnforced kinds before this provider is ever called.
+    /// </summary>
+    public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
+    {
+        _ = profileName;
+        var opts = ReadOptions();
+        if (!opts.Enabled || !opts.UseBaselineImages)
+            return null;
+        if (flavor != SandboxProfileFlavor.Headless)
+            return null;
+        ThrowIfBaselineInvalid(opts);
+        var credentials = OpenStackCredentials.Resolve(opts, _environment);
+        return CreateBaselineBuilder(opts, credentials).ResolveBaselineRef();
+    }
+
+    public async Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct)
+    {
+        var opts = ReadValidatedOptions();
+        ThrowIfBaselineInvalid(opts);
+        var credentials = OpenStackCredentials.Resolve(opts, _environment);
+        var api = CreateClient(opts);
+        var images = await api.ListImagesAsync(credentials, name: null, tag: null, ct).ConfigureAwait(false);
+        var result = new List<BaselineImageInfo>(images.Count);
+        foreach (var image in images)
+        {
+            if (image.Id is null || image.Name is null)
+                continue;
+            var hash = OpenStackBaselineNaming.TryExtractHashFromName(image.Name, opts.BaselineImagePrefix)
+                ?? OpenStackBaselineNaming.TryExtractHashFromTags(image.Tags);
+            if (hash is null
+                && !image.Name.StartsWith(opts.BaselineImagePrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            result.Add(new BaselineImageInfo(
+                hash is null ? image.Name : OpenStackBaselineNaming.FormatScopedPin(hash, image.Name),
+                image.CreatedAt,
+                DiskBytes: image.Size));
+        }
+        return result;
+    }
+
+    public async Task DisposeBaselineImageAsync(string name, CancellationToken ct)
+    {
+        var opts = ReadValidatedOptions();
+        ThrowIfBaselineInvalid(opts);
+        if (BaselinePin.TryParseScopedPin(name, out var scope, out _, out var scopeRef))
+        {
+            if (!string.Equals(scope, OpenStackSandboxOptions.ProviderKind, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Refusing to delete a baseline owned by provider '{scope}' through the openstack provider.");
+            }
+            name = scopeRef;
+        }
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("Baseline image name must not be blank.", nameof(name));
+        var credentials = OpenStackCredentials.Resolve(opts, _environment);
+        var api = CreateClient(opts);
+        var image = await ResolveOwnedImageAsync(api, credentials, opts, name, ct).ConfigureAwait(false)
+            ?? throw new InvalidOperationException(
+                $"OpenStack baseline image '{name}' was not found among this provider's images.");
+        await api.DeleteImageAsync(credentials, image.Id!, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Ensures the baked image for the profile/flavor (or the pinned ref)
+    /// exists: look up by toolchain hash, then bake by booting a builder
+    /// server, provisioning over SSH, powering off, and snapshotting. The
+    /// bake is single-flight per hash with a bounded timeout; a failed build
+    /// leaves no half image and deletes the builder.
+    /// </summary>
+    public async Task<string?> EnsureBaselineImageAsync(
+        string profileName, SandboxProfileFlavor flavor, string? pinnedBaselineRef, CancellationToken ct)
+    {
+        _ = profileName;
+        var opts = ReadValidatedOptions();
+        if (flavor != SandboxProfileFlavor.Headless)
+            return null;
+        ThrowIfBaselineInvalid(opts);
+        var credentials = OpenStackCredentials.Resolve(opts, _environment);
+        return await CreateBaselineBuilder(opts, credentials)
+            .EnsureBaselineImageAsync(pinnedBaselineRef, _baselineBuildLocks, ct)
+            .ConfigureAwait(false);
+    }
+
+    public async Task PruneRetainedImagesAsync(IReadOnlySet<string> livePins, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(livePins);
+        var opts = ReadValidatedOptions();
+        ThrowIfBaselineInvalid(opts);
+        var credentials = OpenStackCredentials.Resolve(opts, _environment);
+        var api = CreateClient(opts);
+        var images = await api.ListImagesAsync(credentials, name: null, tag: null, ct).ConfigureAwait(false);
+        var retained = new List<OpenStackRetainedImage>(images.Count);
+        var idsByName = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var image in images)
+        {
+            if (image.Id is null || image.Name is null)
+                continue;
+            var hash = OpenStackBaselineNaming.TryExtractHashFromName(image.Name, opts.BaselineImagePrefix)
+                ?? OpenStackBaselineNaming.TryExtractHashFromTags(image.Tags);
+            if (hash is null
+                && !image.Name.StartsWith(opts.BaselineImagePrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            retained.Add(new OpenStackRetainedImage(
+                image.Name, hash, ReadProjectProperty(image), image.CreatedAt));
+            if (!idsByName.TryGetValue(image.Name, out var ids))
+                idsByName[image.Name] = ids = [];
+            ids.Add(image.Id);
+        }
+        var doomed = OpenStackBaselineRetention.SelectForDeletion(
+            retained, livePins, opts.BaselineRetainedImageCount);
+        foreach (var name in doomed)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!idsByName.TryGetValue(name, out var ids))
+                continue;
+            foreach (var id in ids)
+            {
+                try
+                {
+                    await api.DeleteImageAsync(credentials, id, ct).ConfigureAwait(false);
+                    _log.LogInformation("Pruned retained OpenStack baseline image {Image} ({Id})", name, id);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to prune retained OpenStack baseline image {Image} ({Id})", name, id);
+                }
+            }
+        }
+    }
+
+    private OpenStackBaselineBuilder CreateBaselineBuilder(
+        OpenStackSandboxOptions opts, OpenStackCredentials credentials) =>
+        new(opts, credentials, CreateClient(opts), _keys, _transports, _environment, _clock, _log);
+
+    private async Task<OpenStackImage?> ResolveOwnedImageAsync(
+        OpenStackApiClient api, OpenStackCredentials credentials, OpenStackSandboxOptions opts,
+        string name, CancellationToken ct)
+    {
+        var byId = await api.GetImageAsync(credentials, name, ct).ConfigureAwait(false);
+        if (byId?.Id is not null && byId.Name is not null && IsOwnedBaselineImage(byId, opts))
+            return byId;
+        var matches = await api.ListImagesAsync(credentials, name, tag: null, ct).ConfigureAwait(false);
+        var exact = matches
+            .Where(image => image.Id is not null
+                && string.Equals(image.Name, name, StringComparison.Ordinal)
+                && IsOwnedBaselineImage(image, opts))
+            .ToList();
+        return exact.Count == 1 ? exact[0] : null;
+    }
+
+    private static bool IsOwnedBaselineImage(OpenStackImage image, OpenStackSandboxOptions opts)
+    {
+        if (image.Name is not null
+            && image.Name.StartsWith(opts.BaselineImagePrefix, StringComparison.Ordinal))
+        {
+            return true;
+        }
+        return OpenStackBaselineNaming.TryExtractHashFromTags(image.Tags) is not null;
+    }
+
+    private static string? ReadProjectProperty(OpenStackImage image)
+    {
+        if (image.AdditionalProperties is not null
+            && image.AdditionalProperties.TryGetValue("codeybox_project", out var raw)
+            && raw.ValueKind == System.Text.Json.JsonValueKind.String)
+        {
+            var project = raw.GetString();
+            return string.IsNullOrWhiteSpace(project) ? null : project.Trim();
+        }
+        return null;
+    }
+
+    private static void ThrowIfBaselineInvalid(OpenStackSandboxOptions opts)
+    {
+        var errors = opts.ValidateBaseline();
+        if (errors.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "OpenStack baseline options are invalid: " + string.Join("; ", errors));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -867,6 +1069,62 @@ public sealed class OpenStackSandboxProvider :
         SandboxSpec spec, CancellationToken ct)
     {
         var reference = string.IsNullOrWhiteSpace(spec.ImageReference) ? opts.ImageName : spec.ImageReference.Trim();
+        return await ResolveImageReferenceAsync(api, credentials, opts, reference, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Resolves the boot image for one acquisition. A pinned baseline ref wins
+    /// over <c>ImageReference</c>: scoped pins resolve by toolchain hash to the
+    /// equivalent local image (building it when the pin is live), legacy refs
+    /// resolve by image id or exact name exactly as before.
+    /// </summary>
+    private async Task<string> ResolveBootImageIdAsync(
+        OpenStackApiClient api, OpenStackCredentials credentials, OpenStackSandboxOptions opts,
+        SandboxSpec spec, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(spec.BaselineImageRef))
+        {
+            return await ResolvePinnedBaselineImageIdAsync(
+                api, credentials, opts, spec.BaselineImageRef.Trim(), ct).ConfigureAwait(false);
+        }
+        return await ResolveImageIdAsync(api, credentials, opts, spec, ct).ConfigureAwait(false);
+    }
+
+    private async Task<string> ResolvePinnedBaselineImageIdAsync(
+        OpenStackApiClient api, OpenStackCredentials credentials, OpenStackSandboxOptions opts,
+        string pin, CancellationToken ct)
+    {
+        if (BaselinePin.TryParseScopedPin(pin, out _, out var pinHash, out _))
+        {
+            var builder = CreateBaselineBuilder(opts, credentials);
+            var live = builder.Plan();
+            if (!string.Equals(pinHash, live.ShortHash, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Pinned OpenStack baseline '{pin}' names toolchain tc-{pinHash}, " +
+                    $"but the live configuration resolves tc-{live.ShortHash}; " +
+                    "refusing to boot current configuration under a stale ref.");
+            }
+            if (!opts.UseBaselineImages)
+            {
+                throw new InvalidOperationException(
+                    $"Pinned OpenStack baseline '{pin}' cannot be served while baseline images are disabled.");
+            }
+            var ensured = await builder.EnsureBaselineImageAsync(pin, _baselineBuildLocks, ct).ConfigureAwait(false);
+            _ = ensured;
+            var image = await builder.FindImageByHashAsync(live.ShortHash, live.ImageName, ct).ConfigureAwait(false);
+            if (image?.Id is not null)
+                return image.Id;
+            throw new InvalidOperationException(
+                $"Pinned OpenStack baseline '{pin}' was ensured but no active image was found.");
+        }
+        return await ResolveImageReferenceAsync(api, credentials, opts, pin, ct).ConfigureAwait(false);
+    }
+
+    private async Task<string> ResolveImageReferenceAsync(
+        OpenStackApiClient api, OpenStackCredentials credentials, OpenStackSandboxOptions opts,
+        string reference, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(reference))
         {
             throw new InvalidOperationException(

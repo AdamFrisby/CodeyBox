@@ -76,6 +76,7 @@ public sealed class IncusSandboxProvider :
     internal const string KindKey = "user.codeybox.kind";
     internal const string CreatedAtKey = "user.codeybox.created_at";
     internal const string BaselineHashKey = "user.codeybox.baseline_hash";
+    internal const string BaselineToolchainHashKey = "user.codeybox.baseline_tchash";
     internal const string BaselinePoolKey = "user.codeybox.baseline_pool";
     internal const string BaselineProfileKey = "user.codeybox.baseline_profile";
     internal const string BaselineFlavorKey = "user.codeybox.baseline_flavor";
@@ -812,11 +813,26 @@ public sealed class IncusSandboxProvider :
             return null;
         if (flavor == SandboxProfileFlavor.Graphical)
             return null;
-        return DeriveLiveBaselineName(
+        return DeriveLiveScopedPin(options, profileName, flavor, CancellationToken.None);
+    }
+
+    private string DeriveLiveScopedPin(
+        IncusSandboxOptions options,
+        string profileName,
+        SandboxProfileFlavor flavor,
+        CancellationToken ct)
+    {
+        var fingerprints = FingerprintExecutableInputs(options, ct);
+        var baselineHash = IncusBaselineNaming.ComputeConfigHash(
             options,
             profileName,
             flavor,
-            CancellationToken.None);
+            environmentVariableReader: null,
+            ct,
+            fingerprints);
+        var liveName = IncusBaselineNaming.DeriveBaselineNameFromHash(options, profileName, flavor, baselineHash);
+        var toolchainHash = IncusBaselineNaming.ComputeSharedToolchainHash(options, fingerprints);
+        return BaselinePin.FormatScopedPin(ProviderId, toolchainHash, liveName);
     }
 
     private string DeriveLiveBaselineName(
@@ -920,9 +936,17 @@ public sealed class IncusSandboxProvider :
     /// pins survive prefix edits and process restarts. It is not proof that an
     /// instance exists or is owned; the provider verifies exact metadata,
     /// profile, flavor, pool, and ready snapshot before use.
+    /// Provider-scoped pins (<c>incus/tc-&lt;hash&gt;/&lt;ref&gt;</c>) route by
+    /// exact provider match; legacy bare refs keep their structural check so
+    /// pre-scoping pins still load and route.
     /// </summary>
     public static bool IsRoutableBaselineRef(string baselineRef)
     {
+        if (BaselinePin.TryParseScopedPin(baselineRef, out var scope, out _, out var scopeRef))
+        {
+            return string.Equals(scope, ProviderId, StringComparison.Ordinal)
+                && IsRoutableBaselineRef(scopeRef);
+        }
         if (baselineRef is null || baselineRef.Length is < 1 or > 63)
             return false;
         if (string.IsNullOrWhiteSpace(baselineRef))
@@ -961,6 +985,28 @@ public sealed class IncusSandboxProvider :
         return true;
     }
 
+    /// <summary>
+    /// Formats one owned baseline instance for inventory listings. Baselines
+    /// baked with a recorded toolchain hash list under their provider-scoped
+    /// pin (the same string new pins carry, so the reaper matches them
+    /// exactly); older baselines without the marker list under their bare
+    /// name so legacy pins keep matching them.
+    /// </summary>
+    private static string FormatListedBaselineName(IncusSandboxOptions options, IncusInstanceInfo instance)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(instance);
+        var toolchainHash = GetConfig(instance.Config, BaselineToolchainHashKey);
+        if (!string.IsNullOrEmpty(toolchainHash)
+            && toolchainHash.Length == BaselineContentHash.ShortHashChars
+            && BaselineContentHash.IsLowerHex(toolchainHash)
+            && IsOwnedBaselineRef(options, instance.Name))
+        {
+            return BaselinePin.FormatScopedPin(ProviderId, toolchainHash, instance.Name);
+        }
+        return instance.Name;
+    }
+
     public async Task<string?> EnsureBaselineImageAsync(
         string profileName,
         SandboxProfileFlavor flavor,
@@ -985,13 +1031,52 @@ public sealed class IncusSandboxProvider :
                 flavor,
                 ct)
             : null;
-        return await ResolveOrEnsureBaselineAsync(
+        var bare = await ResolveOrEnsureBaselineAsync(
             options,
             profileName,
             flavor,
             expected,
             pinnedBaselineRef,
             ct).ConfigureAwait(false);
+        return ToScopedPin(options, profileName, flavor, pinnedBaselineRef, bare, ct);
+    }
+
+    /// <summary>
+    /// Reports the resolved bare baseline as the provider-scoped pin callers
+    /// persist. An already-scoped pin that still names the resolved baseline
+    /// is returned verbatim (drift-tolerant identity: the same string the
+    /// caller stored keeps matching); a legacy bare pin resolving to itself
+    /// stays bare; anything newly resolved from live config is formatted with
+    /// the live toolchain hash.
+    /// </summary>
+    private string ToScopedPin(
+        IncusSandboxOptions options,
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? pinnedBaselineRef,
+        string bareBaselineName,
+        CancellationToken ct)
+    {
+        if (pinnedBaselineRef is not null
+            && BaselinePin.TryParseScopedPin(pinnedBaselineRef, out _, out _, out var pinRef)
+            && string.Equals(bareBaselineName, pinRef, StringComparison.Ordinal))
+        {
+            return pinnedBaselineRef;
+        }
+        if (pinnedBaselineRef is not null
+            && !BaselinePin.IsScopedPin(pinnedBaselineRef)
+            && string.Equals(bareBaselineName, pinnedBaselineRef, StringComparison.Ordinal))
+        {
+            return pinnedBaselineRef;
+        }
+        var live = DeriveLiveScopedPin(options, profileName, flavor, ct);
+        if (!BaselinePin.TryParseScopedPin(live, out _, out _, out var liveRef)
+            || !string.Equals(liveRef, bareBaselineName, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Incus executable provisioning content changed after the baseline reference was resolved; retry with a freshly resolved reference.");
+        }
+        return live;
     }
 
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
@@ -1066,7 +1151,10 @@ public sealed class IncusSandboxProvider :
         var instances = await ListInstancesAsync(options, ct).ConfigureAwait(false);
         var listed = instances
             .Where(instance => IsOwned(instance, BaselineKind))
-            .Select(instance => new BaselineImageInfo(instance.Name, ParseCreatedAt(instance.Config), DiskBytes: null))
+            .Select(instance => new BaselineImageInfo(
+                FormatListedBaselineName(options, instance),
+                ParseCreatedAt(instance.Config),
+                DiskBytes: null))
             .ToList();
         var known = listed.Select(static baseline => baseline.Name).ToHashSet(StringComparer.Ordinal);
         foreach (var (name, createdAt) in _uncertainBaselines)
@@ -1080,6 +1168,13 @@ public sealed class IncusSandboxProvider :
     public async Task DisposeBaselineImageAsync(string name, CancellationToken ct)
     {
         var options = ReadOptions();
+        if (BaselinePin.TryParseScopedPin(name, out var scope, out _, out var scopeRef))
+        {
+            if (!string.Equals(scope, ProviderId, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"Refusing to delete a baseline owned by provider '{scope}' through the Incus provider.");
+            name = scopeRef;
+        }
         IncusInputValidation.ValidateInstanceName(name, nameof(name));
         var baseline = await RequireManagedProjectIfPresentAsync(options, ct).ConfigureAwait(false)
             ? await FindInstanceAsync(options, name, ct).ConfigureAwait(false)
@@ -1282,6 +1377,18 @@ public sealed class IncusSandboxProvider :
 
         if (string.IsNullOrWhiteSpace(pinnedBaselineRef))
             throw new ArgumentException("A pinned Incus baseline reference cannot be blank.", nameof(pinnedBaselineRef));
+        if (BaselinePin.TryParseScopedPin(pinnedBaselineRef, out _, out var pinToolchainHash, out var pinRef))
+        {
+            return await ResolveOrEnsureScopedBaselineAsync(
+                options,
+                profileName,
+                flavor,
+                liveBaselineName,
+                pinnedBaselineRef,
+                pinToolchainHash,
+                pinRef,
+                ct).ConfigureAwait(false);
+        }
         IncusInputValidation.ValidateInstanceName(pinnedBaselineRef, nameof(pinnedBaselineRef));
         var pinned = await FindInstanceAsync(options, pinnedBaselineRef, ct).ConfigureAwait(false);
         if (pinned is null)
@@ -1307,6 +1414,75 @@ public sealed class IncusSandboxProvider :
             throw new InvalidOperationException(
                 $"Pinned Incus baseline '{pinnedBaselineRef}' no longer exists; refusing to bake current configuration under a stale ref.");
         }
+        await ValidateExistingPinnedBaselineAsync(
+            options, pinned, pinnedBaselineRef, profileName, flavor, ct).ConfigureAwait(false);
+        return pinnedBaselineRef;
+    }
+
+    /// <summary>
+    /// Resolves a provider-scoped pin (<c>{provider}/tc-&lt;hash&gt;/&lt;ref&gt;</c>).
+    /// A self-scoped pin whose ref still names a bound baseline reuses it —
+    /// the same drift tolerance legacy pins enjoy. Otherwise (missing ref, or
+    /// a foreign scope such as an OpenStack pin) the pin's toolchain hash must
+    /// equal the live toolchain hash; on equality the live baseline bakes or
+    /// reuses, on mismatch the pin is stale and refused rather than baked
+    /// under.
+    /// </summary>
+    private async Task<string> ResolveOrEnsureScopedBaselineAsync(
+        IncusSandboxOptions options,
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? liveBaselineName,
+        string pinnedScopedRef,
+        string pinToolchainHash,
+        string pinRef,
+        CancellationToken ct)
+    {
+        if (BaselinePin.IsScopedTo(pinnedScopedRef, ProviderId)
+            && IsOwnedBaselineRef(options, pinRef))
+        {
+            var pinned = await FindInstanceAsync(options, pinRef, ct).ConfigureAwait(false);
+            if (pinned is not null)
+            {
+                await ValidateExistingPinnedBaselineAsync(options, pinned, pinRef, profileName, flavor, ct)
+                    .ConfigureAwait(false);
+                return pinRef;
+            }
+        }
+
+        var fingerprints = FingerprintExecutableInputs(options, ct);
+        var liveToolchainHash = IncusBaselineNaming.ComputeSharedToolchainHash(options, fingerprints);
+        if (!string.Equals(
+                BaselineContentHash.ToShortHash(liveToolchainHash),
+                pinToolchainHash,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Pinned baseline '{pinnedScopedRef}' names toolchain tc-{pinToolchainHash}, " +
+                $"but the live configuration resolves tc-{BaselineContentHash.ToShortHash(liveToolchainHash)}; " +
+                "refusing to bake current configuration under a stale ref.");
+        }
+        var live = liveBaselineName ?? IncusBaselineNaming.DeriveBaselineNameFromHash(
+            options,
+            profileName,
+            flavor,
+            IncusBaselineNaming.ComputeConfigHash(options, profileName, flavor, null, ct, fingerprints));
+        return await EnsureBaselineAsync(
+            options,
+            profileName,
+            flavor,
+            live,
+            ct).ConfigureAwait(false);
+    }
+
+    private async Task ValidateExistingPinnedBaselineAsync(
+        IncusSandboxOptions options,
+        IncusInstanceInfo pinned,
+        string pinnedBaselineRef,
+        string profileName,
+        SandboxProfileFlavor flavor,
+        CancellationToken ct)
+    {
         if (!IsOwned(pinned, BaselineKind)
             || !string.Equals(GetConfig(pinned.Config, BaselineProfileKey), profileName, StringComparison.Ordinal)
             || !string.Equals(GetConfig(pinned.Config, BaselineFlavorKey), flavor.ToString(), StringComparison.Ordinal)
@@ -1321,7 +1497,6 @@ public sealed class IncusSandboxProvider :
             throw new InvalidOperationException(
                 $"Pinned Incus baseline '{pinnedBaselineRef}' is not a stopped baseline with an immutable ready snapshot.");
         }
-        return pinnedBaselineRef;
     }
 
     private async Task<string> EnsureBaselineAsync(
@@ -1383,6 +1558,11 @@ public sealed class IncusSandboxProvider :
                 AddConfig(initArgs, BaselineProfileKey, profileName);
                 AddConfig(initArgs, BaselineFlavorKey, flavor.ToString());
                 AddConfig(initArgs, BaselinePoolKey, options.StoragePoolName);
+                AddConfig(
+                    initArgs,
+                    BaselineToolchainHashKey,
+                    BaselineContentHash.ToShortHash(
+                        IncusBaselineNaming.ComputeSharedToolchainHash(options, executableFingerprints)));
                 AddConfig(initArgs, BakeTokenKey, bakeToken);
                 candidateMayExist = true;
                 await _cli.RunCheckedAsync(
