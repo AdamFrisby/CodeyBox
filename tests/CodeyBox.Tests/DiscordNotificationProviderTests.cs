@@ -224,12 +224,27 @@ public sealed class DiscordNotificationProviderTests
         {
             var handler = new CapturingHttpHandler(_ =>
                 new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("""{"message": "Missing Access"}""") });
-            var provider = BuildProvider(EnabledConfig(), new HttpClient(handler));
+            var threads = new DiscordThreadStore();
+            var provider = BuildProvider(EnabledConfig(), new HttpClient(handler), threads);
 
-            await provider.SendAsync(MakeNotification(), CancellationToken.None);
+            var sendNotification = MakeNotification();
+            await provider.SendAsync(sendNotification, CancellationToken.None);
+
+            var send = Assert.Single(handler.Requests);
+            Assert.Equal(HttpMethod.Post, send.Method);
+            Assert.EndsWith($"/channels/{Channel}/messages", send.Url);
+
+            const string correlationToken = "work-1:q-001";
+            threads.RememberMessage(correlationToken, Channel, "1700000000000000001");
+
             await provider.UpdateDecisionAsync(
-                MakeNotification(correlationToken: "work-1:q-001"),
+                MakeNotification(correlationToken: correlationToken),
                 "Decided: x", CancellationToken.None);
+
+            Assert.Equal(2, handler.Requests.Count);
+            var edit = handler.Requests[1];
+            Assert.Equal(HttpMethod.Patch, edit.Method);
+            Assert.EndsWith($"/channels/{Channel}/messages/1700000000000000001", edit.Url);
         }
         finally
         {
