@@ -133,7 +133,7 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
         BlaxelSandbox sandbox;
         try
         {
-            var sandboxUrl = ResolveSandboxUrl(created, credentials.Workspace);
+            var sandboxUrl = ResolveSandboxUrl(created, credentials.Workspace, opts.AllowUnsafeHttp);
             sandbox = new BlaxelSandbox(
                 sandboxName,
                 sandboxUrl,
@@ -149,6 +149,11 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
             {
                 throw new InvalidOperationException($"Blaxel sandbox name collision: '{sandboxName}'.");
             }
+        }
+        catch (BlaxelApiException ex)
+        {
+            await DeleteBestEffortAsync(opts, credentials, sandboxName).ConfigureAwait(false);
+            throw ToDeferred(ex, "resolve-sandbox-url");
         }
         catch (Exception ex) when (ex is not SandboxProvisioningDeferredException)
         {
@@ -274,10 +279,19 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
             return;
         }
 
-        var sandboxUrl = ResolveSandboxUrl(view, credentials.Workspace);
+        string sandboxUrl;
         try
         {
-            await _dataPlane.GetProcessAsync(sandboxUrl, credentials, "codeybox-resume-touch", opts.ApiTimeout, ct).ConfigureAwait(false);
+            sandboxUrl = ResolveSandboxUrl(view, credentials.Workspace, opts.AllowUnsafeHttp);
+        }
+        catch (BlaxelApiException ex)
+        {
+            throw ToDeferred(ex, "resume-wake");
+        }
+
+        try
+        {
+            await _dataPlane.GetProcessAsync(sandboxUrl, credentials, "codeybox-resume-touch", opts.ApiTimeout, ct, BlaxelSandboxApiClient.MaxStartResponseBytes).ConfigureAwait(false);
         }
         catch (BlaxelApiException ex) when (string.Equals(ex.ErrorClass, "not-found", StringComparison.Ordinal))
         {
@@ -305,7 +319,15 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
 
             if (string.Equals(current.State, "RUNNING", StringComparison.OrdinalIgnoreCase))
             {
-                sandboxUrl = ResolveSandboxUrl(current, credentials.Workspace);
+                try
+                {
+                    sandboxUrl = ResolveSandboxUrl(current, credentials.Workspace, opts.AllowUnsafeHttp);
+                }
+                catch (BlaxelApiException ex)
+                {
+                    throw ToDeferred(ex, "resume-wait");
+                }
+
                 break;
             }
 
@@ -340,6 +362,7 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
         BlaxelSandboxOptions opts, BlaxelCredentials credentials, string name, string sandboxUrl, CancellationToken ct)
     {
         var nonce = $"resume-probe-{Guid.NewGuid():N}";
+        var probeCap = BlaxelSandboxApiClient.ResponseCap(64 * 1024, 64 * 1024);
         BlaxelProcessView started;
         try
         {
@@ -375,7 +398,7 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
             BlaxelProcessView view;
             try
             {
-                view = await _dataPlane.GetProcessAsync(sandboxUrl, credentials, processId, opts.ApiTimeout, ct).ConfigureAwait(false);
+                view = await _dataPlane.GetProcessAsync(sandboxUrl, credentials, processId, opts.ApiTimeout, ct, probeCap).ConfigureAwait(false);
             }
             catch (BlaxelApiException ex)
             {
@@ -398,7 +421,7 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
             string output;
             try
             {
-                var logs = await _dataPlane.GetProcessLogsAsync(sandboxUrl, credentials, processId, opts.ApiTimeout, ct).ConfigureAwait(false);
+                var logs = await _dataPlane.GetProcessLogsAsync(sandboxUrl, credentials, processId, opts.ApiTimeout, ct, probeCap).ConfigureAwait(false);
                 output = logs.Stdout ?? view.Stdout ?? string.Empty;
             }
             catch (BlaxelApiException ex) when (string.Equals(ex.ErrorClass, "not-found", StringComparison.Ordinal))
@@ -432,11 +455,53 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
                 $"Blaxel API base URL '{baseUrl}' is not absolute; configure ApiBaseUrl with an absolute https URL.");
         }
 
-        if (!string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase) && !allowUnsafeHttp)
+        if (!string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase)
+            && !IsCleartextHttpPermitted(uri, allowUnsafeHttp))
         {
             throw new InvalidOperationException(
-                $"Blaxel API base URL '{baseUrl}' must use https (or set AllowUnsafeHttp for local mocks).");
+                $"Blaxel API base URL '{baseUrl}' must use https (AllowUnsafeHttp permits http only for loopback test URLs, never for remote hosts).");
         }
+    }
+
+    /// <summary>
+    /// Cleartext http is permitted only for loopback test URLs under the
+    /// dev-only <c>AllowUnsafeHttp</c> opt-in: credentials ride every request,
+    /// so one operator edit must never send them cleartext to a remote host.
+    /// </summary>
+    internal static bool IsCleartextHttpPermitted(Uri uri, bool allowUnsafeHttp) =>
+        allowUnsafeHttp
+        && uri.Scheme == Uri.UriSchemeHttp
+        && uri.IsLoopback;
+
+    /// <summary>
+    /// The sandbox data-plane endpoint arrives in the Blaxel API response field
+    /// <c>metadata.url</c> — service output, untrusted input to an
+    /// outbound-request sink carrying workload code and secret-bearing env
+    /// values. Only an absolute https URI (http solely when
+    /// <see cref="IsCleartextHttpPermitted"/> holds) is accepted; anything
+    /// else fails closed instead of redirecting requests to an arbitrary target.
+    /// </summary>
+    internal static string ValidateSandboxUrl(string raw, bool allowUnsafeHttp)
+    {
+        if (string.IsNullOrWhiteSpace(raw)
+            || !Uri.TryCreate(raw.Trim(), UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+        {
+            throw new BlaxelApiException(
+                null, "malformed-response",
+                $"service returned a non-absolute or non-http(s) sandbox URL: '{raw?.Trim()}'");
+        }
+
+        if (uri.Scheme == Uri.UriSchemeHttp && !IsCleartextHttpPermitted(uri, allowUnsafeHttp))
+        {
+            throw new BlaxelApiException(
+                null, "malformed-response",
+                "service returned a cleartext http sandbox URL that is not permitted; " +
+                "refusing to send credentials over cleartext. " +
+                "AllowUnsafeHttp permits http only for loopback test URLs, never for remote hosts.");
+        }
+
+        return raw.Trim();
     }
 
     internal static void ValidateOptions(BlaxelSandboxOptions opts)
@@ -586,12 +651,12 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
         return new BlaxelCredentials(apiKey, workspace);
     }
 
-    internal static string ResolveSandboxUrl(BlaxelSandboxView view, string workspace)
+    internal static string ResolveSandboxUrl(BlaxelSandboxView view, string workspace, bool allowUnsafeHttp = false)
     {
         ArgumentNullException.ThrowIfNull(view);
         if (!string.IsNullOrWhiteSpace(view.Url))
         {
-            return view.Url;
+            return ValidateSandboxUrl(view.Url, allowUnsafeHttp);
         }
 
         // Older records may predate the auto-generated endpoint: reconstruct
@@ -604,7 +669,7 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
                 $"Blaxel sandbox '{view.Name}' reports no endpoint URL and its region is unknown; cannot address its data plane.");
         }
 
-        return $"https://sbx-{view.Name}-{workspace}.{view.Region}.bl.run";
+        return ValidateSandboxUrl($"https://sbx-{view.Name}-{workspace}.{view.Region}.bl.run", allowUnsafeHttp);
     }
 
     private static string BuildSandboxName(string prefix)
@@ -644,7 +709,14 @@ public sealed class BlaxelSandboxProvider : ISandboxProvider, ISuspendingSandbox
             {
                 if (!string.IsNullOrWhiteSpace(view.Url))
                 {
-                    sandbox.RefreshSandboxUrl(view.Url);
+                    try
+                    {
+                        sandbox.RefreshSandboxUrl(view.Url);
+                    }
+                    catch (BlaxelApiException ex)
+                    {
+                        throw ToDeferred(ex, "wait-for-usable");
+                    }
                 }
 
                 return;

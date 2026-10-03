@@ -108,7 +108,7 @@ What it **does not** give:
 | `MaxCommandBytes` / `MaxEnvironmentBytes` / `MaxStdinBytes` | `512KiB` / `256KiB` / `1MiB` | Per-exec payload bounds. |
 | `MaxListPages` | `10` | Inventory sweep bound. |
 | `AllowPersistentTmpfsDowngrade` | `false` | Downgrade non-secret tmpfs mounts to persistent guest dirs. |
-| `AllowUnsafeHttp` | `false` | Test-only: allow http API base for local mocks. |
+| `AllowUnsafeHttp` | `false` | Test-only: allow http for loopback-local mocks (never for remote hosts). |
 
 ## Repository setup
 
@@ -141,7 +141,15 @@ retention. Size work to `MemoryMb` deliberately — CPU scales with memory.
 - Data plane at the sandbox's `metadata.url` (same headers): `POST /process`
   (`{command, workingDir, waitForCompletion: false, name, env}`),
   `GET /process/{id}`, `GET /process/{id}/logs` (`{logs, stdout, stderr}`),
-  `DELETE /process/{id}/kill`.
+  `DELETE /process/{id}/kill`. The endpoint URL is service output and is
+  validated before use (absolute https; http only for loopback-local mocks):
+  a non-conforming URL fails the operation as infrastructure, never
+  redirects credentials and workload code elsewhere.
+- Exec output is bounded twice: each data-plane poll response is streamed
+  through a byte ceiling derived from `MaxExecOutputBytes` (plus 1 MiB of
+  JSON-envelope slack), and accumulation caps apply per stream. A guest that
+  overruns the response ceiling has its process killed and gets a
+  limit-flagged result instead of OOMing the host.
 - Suspend has no explicit endpoint: the platform moves idle sandboxes to
   `STANDBY` automatically (≈15s after activity drains). `SuspendAsync` waits
   for that state (bounded); resume is any data-plane request followed by a

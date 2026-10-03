@@ -58,11 +58,13 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentException.ThrowIfNullOrWhiteSpace(sandboxUrl);
+        var initialOptions = (readOptions ?? throw new ArgumentNullException(nameof(readOptions)))();
+        ArgumentNullException.ThrowIfNull(initialOptions);
         Name = name;
-        SandboxUrl = sandboxUrl;
+        SandboxUrl = BlaxelSandboxProvider.ValidateSandboxUrl(sandboxUrl, initialOptions.AllowUnsafeHttp);
         _control = control ?? throw new ArgumentNullException(nameof(control));
         _dataPlane = dataPlane ?? throw new ArgumentNullException(nameof(dataPlane));
-        _readOptions = readOptions ?? throw new ArgumentNullException(nameof(readOptions));
+        _readOptions = readOptions;
         _readCredentials = readCredentials ?? throw new ArgumentNullException(nameof(readCredentials));
         _spec = spec ?? throw new ArgumentNullException(nameof(spec));
         _workingDirectory = string.IsNullOrWhiteSpace(spec.WorkingDirectory) ? "/work" : spec.WorkingDirectory;
@@ -107,6 +109,7 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
 
         var maxStdout = exec.MaxStdoutBytes ?? opts.MaxExecOutputBytes;
         var maxStderr = exec.MaxStderrBytes ?? opts.MaxExecOutputBytes;
+        var responseCap = BlaxelSandboxApiClient.ResponseCap(maxStdout, maxStderr);
         var deadline = _timeProvider.GetUtcNow() + (_spec.Limits.WallClock ?? TimeSpan.FromHours(6));
         var processName = $"codeybox-{Guid.NewGuid():N}";
 
@@ -130,7 +133,7 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
         try
         {
             return await PollToCompletionAsync(
-                opts, credentials, processId, exec, maxStdout, maxStderr, deadline, ct).ConfigureAwait(false);
+                opts, credentials, processId, exec, maxStdout, maxStderr, responseCap, deadline, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -147,7 +150,7 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
     internal void RefreshSandboxUrl(string sandboxUrl)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sandboxUrl);
-        SandboxUrl = sandboxUrl;
+        SandboxUrl = BlaxelSandboxProvider.ValidateSandboxUrl(sandboxUrl, _readOptions().AllowUnsafeHttp);
     }
 
     private IReadOnlyList<WritableMountSync> WritableMounts => _stagedWritableMounts;
@@ -363,6 +366,7 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
         SandboxExec exec,
         int maxStdout,
         int maxStderr,
+        long responseCap,
         DateTimeOffset deadline,
         CancellationToken ct)
     {
@@ -389,7 +393,12 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
                 BlaxelProcessView view;
                 try
                 {
-                    view = await _dataPlane.GetProcessAsync(SandboxUrl, credentials, processId, opts.ApiTimeout, ct).ConfigureAwait(false);
+                    view = await _dataPlane.GetProcessAsync(SandboxUrl, credentials, processId, opts.ApiTimeout, ct, responseCap).ConfigureAwait(false);
+                }
+                catch (BlaxelApiException ex) when (IsOutputLimit(ex))
+                {
+                    await KillProcessesAsync([processId], CancellationToken.None).ConfigureAwait(false);
+                    return new SandboxExecResult(1, stdout.ToString(), stderr.ToString(), true, true);
                 }
                 catch (BlaxelApiException ex)
                 {
@@ -401,7 +410,12 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
                 {
                     try
                     {
-                        logs = await _dataPlane.GetProcessLogsAsync(SandboxUrl, credentials, processId, opts.ApiTimeout, ct).ConfigureAwait(false);
+                        logs = await _dataPlane.GetProcessLogsAsync(SandboxUrl, credentials, processId, opts.ApiTimeout, ct, responseCap).ConfigureAwait(false);
+                    }
+                    catch (BlaxelApiException ex) when (IsOutputLimit(ex))
+                    {
+                        await KillProcessesAsync([processId], CancellationToken.None).ConfigureAwait(false);
+                        return FinalResult(view, stdout, stderr, stdoutLimit: true, stderrLimit: true);
                     }
                     catch (BlaxelApiException ex) when (string.Equals(ex.ErrorClass, "not-found", StringComparison.Ordinal) && view.IsTerminal)
                     {
@@ -438,7 +452,11 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
                     {
                         try
                         {
-                            logs = await _dataPlane.GetProcessLogsAsync(SandboxUrl, credentials, processId, opts.ApiTimeout, ct).ConfigureAwait(false);
+                            logs = await _dataPlane.GetProcessLogsAsync(SandboxUrl, credentials, processId, opts.ApiTimeout, ct, responseCap).ConfigureAwait(false);
+                        }
+                        catch (BlaxelApiException ex) when (IsOutputLimit(ex))
+                        {
+                            return FinalResult(view, stdout, stderr, stdoutLimit: true, stderrLimit: true);
                         }
                         catch (BlaxelApiException ex) when (string.Equals(ex.ErrorClass, "not-found", StringComparison.Ordinal))
                         {
@@ -475,6 +493,9 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
             throw;
         }
     }
+
+    private static bool IsOutputLimit(BlaxelApiException ex) =>
+        string.Equals(ex.ErrorClass, "output-limit", StringComparison.Ordinal);
 
     private static void EmitDelta(
         string? latest,
@@ -691,6 +712,7 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
             ct).ConfigureAwait(false);
         var processId = !string.IsNullOrWhiteSpace(started.Pid) ? started.Pid : started.Name ?? string.Empty;
         var deadline = _timeProvider.GetUtcNow() + TimeSpan.FromMinutes(5);
+        var responseCap = BlaxelSandboxApiClient.ResponseCap(maxStdout, maxStderr);
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
         while (true)
@@ -701,16 +723,29 @@ public sealed class BlaxelSandbox : ISandbox, ISuspendableSandbox, IPreemptibleS
                 throw new TimeoutException($"Internal exec on sandbox {Name} exceeded its budget.");
             }
 
-            var view = await _dataPlane.GetProcessAsync(SandboxUrl, _readCredentials(), processId, opts.ApiTimeout, ct).ConfigureAwait(false);
+            BlaxelProcessView view;
+            try
+            {
+                view = await _dataPlane.GetProcessAsync(SandboxUrl, _readCredentials(), processId, opts.ApiTimeout, ct, responseCap).ConfigureAwait(false);
+            }
+            catch (BlaxelApiException ex) when (IsOutputLimit(ex))
+            {
+                throw new InvalidOperationException("Internal exec output exceeded its bound.", ex);
+            }
+
             if (view.IsTerminal)
             {
                 BlaxelProcessLogs? logs = null;
                 try
                 {
-                    logs = await _dataPlane.GetProcessLogsAsync(SandboxUrl, _readCredentials(), processId, opts.ApiTimeout, ct).ConfigureAwait(false);
+                    logs = await _dataPlane.GetProcessLogsAsync(SandboxUrl, _readCredentials(), processId, opts.ApiTimeout, ct, responseCap).ConfigureAwait(false);
                 }
                 catch (BlaxelApiException ex) when (string.Equals(ex.ErrorClass, "not-found", StringComparison.Ordinal))
                 {
+                }
+                catch (BlaxelApiException ex) when (IsOutputLimit(ex))
+                {
+                    throw new InvalidOperationException("Internal exec output exceeded its bound.", ex);
                 }
 
                 stdout.Append(logs?.Stdout ?? view.Stdout ?? string.Empty);

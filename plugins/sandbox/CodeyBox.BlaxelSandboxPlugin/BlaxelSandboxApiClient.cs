@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -24,6 +25,25 @@ internal sealed class BlaxelSandboxApiClient
 
     private readonly BlaxelControlPlaneClient _transport;
 
+    /// <summary>
+    /// Ceiling for process-start responses, which carry no guest output
+    /// (just pid/status) and must stay small.
+    /// </summary>
+    internal const long MaxStartResponseBytes = 1L * 1024 * 1024;
+
+    /// <summary>
+    /// Envelope slack added to the caller's stdout+stderr caps when bounding
+    /// one data-plane poll response, which carries both streams plus JSON framing.
+    /// </summary>
+    internal const long DataPlaneOverheadBytes = 1L * 1024 * 1024;
+
+    /// <summary>
+    /// Response ceiling for one poll, tied to the exec's output caps so a
+    /// runaway guest cannot OOM the host before accumulation caps apply.
+    /// </summary>
+    public static long ResponseCap(long maxStdoutBytes, long maxStderrBytes) =>
+        maxStdoutBytes + maxStderrBytes + DataPlaneOverheadBytes;
+
     public BlaxelSandboxApiClient(HttpClient httpClient)
     {
         _transport = new BlaxelControlPlaneClient(httpClient ?? throw new ArgumentNullException(nameof(httpClient)));
@@ -34,14 +54,15 @@ internal sealed class BlaxelSandboxApiClient
         BlaxelCredentials credentials,
         BlaxelProcessRequest request,
         TimeSpan timeout,
-        CancellationToken ct)
+        CancellationToken ct,
+        long maxResponseBytes = MaxStartResponseBytes)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sandboxUrl);
         ArgumentNullException.ThrowIfNull(request);
         using var content = JsonContent.Create(request, options: JsonOptions);
         using var response = await _transport.SendAsync(
             sandboxUrl, credentials, HttpMethod.Post, "/process", content, timeout, "start-process", ct).ConfigureAwait(false);
-        return await ReadProcessAsync(response, "start-process", ct).ConfigureAwait(false);
+        return await ReadProcessAsync(response, "start-process", maxResponseBytes, ct).ConfigureAwait(false);
     }
 
     public async Task<BlaxelProcessView> GetProcessAsync(
@@ -49,13 +70,14 @@ internal sealed class BlaxelSandboxApiClient
         BlaxelCredentials credentials,
         string processId,
         TimeSpan timeout,
-        CancellationToken ct)
+        CancellationToken ct,
+        long maxResponseBytes = 64L * 1024 * 1024 + 64L * 1024 * 1024 + DataPlaneOverheadBytes)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(processId);
         using var response = await _transport.SendAsync(
             sandboxUrl, credentials, HttpMethod.Get, $"/process/{Uri.EscapeDataString(processId)}",
             content: null, timeout, "get-process", ct).ConfigureAwait(false);
-        return await ReadProcessAsync(response, "get-process", ct).ConfigureAwait(false);
+        return await ReadProcessAsync(response, "get-process", maxResponseBytes, ct).ConfigureAwait(false);
     }
 
     public async Task<BlaxelProcessLogs> GetProcessLogsAsync(
@@ -63,13 +85,14 @@ internal sealed class BlaxelSandboxApiClient
         BlaxelCredentials credentials,
         string processId,
         TimeSpan timeout,
-        CancellationToken ct)
+        CancellationToken ct,
+        long maxResponseBytes = 64L * 1024 * 1024 + 64L * 1024 * 1024 + DataPlaneOverheadBytes)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(processId);
         using var response = await _transport.SendAsync(
             sandboxUrl, credentials, HttpMethod.Get, $"/process/{Uri.EscapeDataString(processId)}/logs",
             content: null, timeout, "get-process-logs", ct).ConfigureAwait(false);
-        return await ReadLogsAsync(response, ct).ConfigureAwait(false);
+        return await ReadLogsAsync(response, maxResponseBytes, ct).ConfigureAwait(false);
     }
 
     public async Task KillProcessAsync(
@@ -83,15 +106,70 @@ internal sealed class BlaxelSandboxApiClient
         using var response = await _transport.SendAsync(
             sandboxUrl, credentials, HttpMethod.Delete, $"/process/{Uri.EscapeDataString(processId)}/kill",
             content: null, timeout, "kill-process", ct).ConfigureAwait(false);
-        response.Dispose();
+        await DrainAsync(response, "kill-process", ct).ConfigureAwait(false);
     }
 
-    private static async Task<BlaxelProcessView> ReadProcessAsync(HttpResponseMessage response, string operation, CancellationToken ct)
+    private static async Task DrainAsync(HttpResponseMessage response, string operation, CancellationToken ct)
     {
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        _ = await ReadBoundedAsync(response.Content, MaxStartResponseBytes, operation, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Streams an untrusted data-plane response through a byte ceiling before
+    /// materialising it: guest output is attacker-influenced and unbounded, so
+    /// the declared <c>Content-Length</c> is checked first (fail fast on a
+    /// lying-large header), then every chunk is counted so a missing or lying
+    /// header cannot blow the bound either. Breaches report
+    /// <c>output-limit</c> so callers kill the guest process instead of buffering.
+    /// </summary>
+    private static async Task<string> ReadBoundedAsync(
+        HttpContent content, long maxBytes, string operation, CancellationToken ct)
+    {
         try
         {
-            var view = await JsonSerializer.DeserializeAsync<BlaxelProcessView>(stream, JsonOptions, ct).ConfigureAwait(false);
+            if (content.Headers.ContentLength is { } known && known > maxBytes)
+            {
+                throw new BlaxelApiException(
+                    null, "output-limit",
+                    $"{operation}: response body of {known} bytes exceeds the {maxBytes}-byte bound");
+            }
+
+            await using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var sink = new MemoryStream();
+            var buffer = new byte[64 * 1024];
+            int read;
+            while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+            {
+                if (sink.Length + read > maxBytes)
+                {
+                    throw new BlaxelApiException(
+                        null, "output-limit",
+                        $"{operation}: response body exceeds the {maxBytes}-byte bound");
+                }
+
+                sink.Write(buffer, 0, read);
+            }
+
+            sink.Position = 0;
+            using var reader = new StreamReader(sink, Encoding.UTF8);
+            return await reader.ReadToEndAsync(ct).ConfigureAwait(false);
+        }
+        catch (BlaxelApiException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException)
+        {
+            throw new BlaxelApiException(null, "unreachable", $"{operation}: failed reading the response body", ex);
+        }
+    }
+
+    private static async Task<BlaxelProcessView> ReadProcessAsync(HttpResponseMessage response, string operation, long maxBytes, CancellationToken ct)
+    {
+        var body = await ReadBoundedAsync(response.Content, maxBytes, operation, ct).ConfigureAwait(false);
+        try
+        {
+            var view = JsonSerializer.Deserialize<BlaxelProcessView>(body, JsonOptions);
             if (view is null)
             {
                 throw new BlaxelApiException(null, "malformed-response", $"{operation}: empty JSON body");
@@ -105,12 +183,12 @@ internal sealed class BlaxelSandboxApiClient
         }
     }
 
-    private static async Task<BlaxelProcessLogs> ReadLogsAsync(HttpResponseMessage response, CancellationToken ct)
+    private static async Task<BlaxelProcessLogs> ReadLogsAsync(HttpResponseMessage response, long maxBytes, CancellationToken ct)
     {
-        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        var body = await ReadBoundedAsync(response.Content, maxBytes, "get-process-logs", ct).ConfigureAwait(false);
         try
         {
-            var logs = await JsonSerializer.DeserializeAsync<BlaxelProcessLogs>(stream, JsonOptions, ct).ConfigureAwait(false);
+            var logs = JsonSerializer.Deserialize<BlaxelProcessLogs>(body, JsonOptions);
             if (logs is null)
             {
                 throw new BlaxelApiException(null, "malformed-response", "get-process-logs: empty JSON body");
