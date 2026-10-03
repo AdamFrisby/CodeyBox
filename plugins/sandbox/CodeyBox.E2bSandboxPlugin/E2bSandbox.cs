@@ -529,26 +529,10 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
                     return $"more than {opts.MaxStageFileCount} files under {mount.GuestPath}";
                 }
 
-                string relative;
-                try
+                if (!HostedMountSyncGuard.TryResolveHostFile(
+                    mount.HostPath, mount.GuestPath, guestFile, out var hostFile, out var refusal))
                 {
-                    relative = HostedGuestPath.GetRelativePath(mount.GuestPath, guestFile);
-                }
-                catch (ArgumentException)
-                {
-                    return $"guest path escapes its mount: {guestFile}";
-                }
-
-                var hostFile = Path.GetFullPath(Path.Combine(mount.HostPath, relative));
-                if (!hostFile.StartsWith(mount.HostPath + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-                    && !string.Equals(hostFile, mount.HostPath, StringComparison.Ordinal))
-                {
-                    return $"host path escapes its mount root for {guestFile}";
-                }
-
-                if (HostPathPassesThroughSymlink(mount.HostPath, hostFile))
-                {
-                    return $"host path passes through a symlink for {guestFile}";
+                    return refusal;
                 }
 
                 byte[] bytes;
@@ -568,84 +552,21 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
                     return $"read-back exceeds {opts.MaxStageTotalBytes} bytes";
                 }
 
-                try
+                // The guarded write re-checks the symlink probe immediately
+                // before touching the host filesystem: the resolve-time probe
+                // ran before a network round-trip, so a symlink swapped into
+                // the host tree in between must still be refused rather than
+                // followed by CreateDirectory/WriteAllBytesAsync.
+                var writeError = await HostedMountSyncGuard.WriteFileGuardedAsync(
+                    mount.HostPath, hostFile, guestFile, bytes, ct).ConfigureAwait(false);
+                if (writeError is not null)
                 {
-                    // Re-check immediately before touching the host filesystem: the
-                    // earlier probe ran before a network round-trip, so a symlink
-                    // swapped into the host tree in between must still be refused
-                    // rather than followed by CreateDirectory/WriteAllBytesAsync.
-                    if (HostPathPassesThroughSymlink(mount.HostPath, hostFile))
-                    {
-                        return $"host path passes through a symlink for {guestFile}";
-                    }
-
-                    Directory.CreateDirectory(Path.GetDirectoryName(hostFile)!);
-                    await File.WriteAllBytesAsync(hostFile, bytes, ct).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    return $"write-back {hostFile}: {ex.GetType().Name}";
+                    return writeError;
                 }
             }
         }
 
         return null;
-    }
-
-    private static bool HostPathPassesThroughSymlink(string mountRoot, string hostFile)
-    {
-        // Inspect every component with lstat semantics (LinkTarget does not
-        // follow the final link), starting at the final component itself: an
-        // Exists-based probe would miss a dangling symlink, and
-        // WriteAllBytesAsync follows links when opening, so the final
-        // component must never be skipped.
-        var current = hostFile;
-        while (true)
-        {
-            if (string.Equals(current, mountRoot, StringComparison.Ordinal))
-            {
-                return false;
-            }
-
-            if (IsSymlinkNoFollow(current))
-            {
-                return true;
-            }
-
-            var parent = Path.GetDirectoryName(current);
-            if (string.IsNullOrEmpty(parent) || parent.Length >= current.Length)
-            {
-                return true;
-            }
-
-            current = parent;
-            if (!current.Equals(mountRoot, StringComparison.Ordinal)
-                && !current.StartsWith(mountRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-    }
-
-    private static bool IsSymlinkNoFollow(string path)
-    {
-        try
-        {
-            // LinkTarget lstats without following: non-null for live and
-            // dangling links alike, null for non-links (including paths that
-            // do not exist). Both views are probed because a directory link
-            // may surface through either.
-            if (new FileInfo(path).LinkTarget is not null)
-            {
-                return true;
-            }
-
-            return new DirectoryInfo(path).LinkTarget is not null;
-        }
-        catch (Exception)
-        {
-            return true;
-        }
     }
 
     internal async Task<SandboxExecResult> RunInternalAsync(
