@@ -91,50 +91,27 @@ internal sealed class MajordomoWakeupService : BackgroundService
     /// </summary>
     public async Task<MajordomoWakeupResult?> CheckOnceAsync(CancellationToken ct = default)
     {
-        QueueStatusResult queue;
-        DispatchStatusResult dispatch;
+        var phase = "queue read";
         try
         {
-            queue = await _reads.GetQueueStatusAsync(ct).ConfigureAwait(false);
-            dispatch = await _reads.GetDispatchStatusAsync(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Majordomo wakeup: queue read failed; will retry next tick.");
-            return null;
-        }
+            var queue = await _reads.GetQueueStatusAsync(ct).ConfigureAwait(false);
+            var dispatch = await _reads.GetDispatchStatusAsync(ct).ConfigureAwait(false);
 
-        if (IsStalled(queue, dispatch))
-        {
-            var detail = $"queued={dispatch.QueuedCount} running={dispatch.CurrentlyRunning}/{dispatch.MaxConcurrent}";
-            try
+            if (IsStalled(queue, dispatch))
             {
+                phase = "stalled-queue pass";
+                var detail = $"queued={dispatch.QueuedCount} running={dispatch.CurrentlyRunning}/{dispatch.MaxConcurrent}";
                 return await _coordinator.NotifyEventAsync(
                     MajordomoWakeupKind.QueueStalled,
                     detail,
                     innerCt => AssessAsync(queue, dispatch, $"Queue stalled with free capacity ({detail}).", innerCt),
                     ct: ct).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Majordomo wakeup: stalled-queue pass failed; will retry next tick.");
+
+            if (!_coordinator.IsScheduledDue())
                 return null;
-            }
-        }
 
-        if (!_coordinator.IsScheduledDue())
-            return null;
-
-        try
-        {
+            phase = "scheduled pass";
             return await _coordinator.RunScheduledAsync(
                 innerCt => AssessAsync(queue, dispatch, null, innerCt),
                 ct: ct).ConfigureAwait(false);
@@ -145,7 +122,7 @@ internal sealed class MajordomoWakeupService : BackgroundService
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "Majordomo wakeup: scheduled pass failed; will retry next tick.");
+            _log.LogWarning(ex, "Majordomo wakeup: {Phase} failed; will retry next tick.", phase);
             return null;
         }
     }
@@ -154,9 +131,10 @@ internal sealed class MajordomoWakeupService : BackgroundService
     /// Push trigger for a work item entering a terminal failure. Debounced by
     /// the coordinator: a burst of failures inside the trigger floor produces
     /// one wakeup, not one per failure. The work-item id and failure text are
-    /// untrusted (agent stdout / failure detail): the id is echoed through
-    /// <see cref="Validation.DescribeUntrustedValue"/> and the failure excerpt
-    /// is sanitized, bounded, and replayed only inside a demarcated
+    /// untrusted (agent stdout / failure detail): the id is allowlisted to the
+    /// system GUID alphabet (anything else becomes 'unspecified') so it can
+    /// safely echo in the trigger reason, and the failure excerpt is
+    /// sanitized, bounded, and replayed only inside a demarcated
     /// untrusted-data block — never as Majordomo-role prose — so a payload
     /// carrying instructions or a forged <c>[/majordomo]</c> marker cannot
     /// read as the majordomo's own reasoning.
@@ -204,8 +182,15 @@ internal sealed class MajordomoWakeupService : BackgroundService
     {
         if (string.IsNullOrWhiteSpace(workItemId))
             return "unspecified";
-        return MajordomoWakeupCoordinator.EscapeWakeupFraming(
-            Validation.DescribeUntrustedValue(workItemId));
+        var trimmed = workItemId.Trim();
+        // Work-item ids are system GUIDs (WorkItemId.ToString("N")); only that
+        // alphabet may echo in Majordomo-role prose. Anything else — including
+        // instruction-shaped free text — collapses to 'unspecified' so the
+        // trigger reason can never carry instructions into the stored report.
+        if (Guid.TryParseExact(trimmed, "N", out var id)
+            || Guid.TryParseExact(trimmed, "D", out id))
+            return id.ToString("N");
+        return "unspecified";
     }
 
     /// <summary>

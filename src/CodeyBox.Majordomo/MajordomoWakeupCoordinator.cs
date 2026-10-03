@@ -26,6 +26,9 @@ public sealed class MajordomoWakeupCoordinator
     /// <summary>Most characters of the trigger reason kept in ledger/report echoes.</summary>
     public const int MaxReasonChars = 1000;
 
+    /// <summary>Marker appended when a wakeup report is truncated to its char cap.</summary>
+    private const string TruncationSuffix = "…[truncated]";
+
     private readonly TimeProvider _clock;
     private readonly Func<MajordomoWakeupOptions> _wakeupOptions;
     private readonly Func<MajordomoOptions> _policy;
@@ -147,10 +150,11 @@ public sealed class MajordomoWakeupCoordinator
             if (_lastWakeupAt.HasValue && now >= _lastWakeupAt.Value
                 && now - _lastWakeupAt.Value < options.MinTriggerInterval)
             {
+                var safeReason = TruncateReason(reason);
                 var collapsed = new MajordomoWakeupResult(
-                    MajordomoWakeupOutcome.CollapsedBurst, kind, TruncateReason(reason), 0, 0, 0, now);
+                    MajordomoWakeupOutcome.CollapsedBurst, kind, safeReason, 0, 0, 0, now);
                 AppendHistory(new MajordomoWakeupRecord(
-                    now, kind, TruncateReason(reason), MajordomoWakeupOutcome.CollapsedBurst, 0, 0, 0));
+                    now, kind, safeReason, MajordomoWakeupOutcome.CollapsedBurst, 0, 0, 0));
                 return Task.FromResult(collapsed);
             }
         }
@@ -276,7 +280,7 @@ public sealed class MajordomoWakeupCoordinator
         var safe = EscapeWakeupFraming(report);
         if (safe.Length <= maxChars)
             return safe;
-        return safe[..Math.Max(0, maxChars - 15)] + "…[truncated]";
+        return safe[..Math.Max(0, maxChars - TruncationSuffix.Length)] + TruncationSuffix;
     }
 
     /// <summary>
