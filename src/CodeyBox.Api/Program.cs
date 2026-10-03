@@ -570,6 +570,27 @@ ApiKeyAuth.Configure(builder);
 //                 SPRITES_TOKEN (or configured token env var).
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
+// Colocated executor: the in-process executor host giving single-host
+// deployments working local phase execution with no configuration. Every
+// knob carries a safe default and validation fails fast at host start, so an
+// operator who configures nothing still gets the executor path. The phase
+// handler is optional here (none is composed yet): without one the host
+// reports no runner and any dispatch to it fails loudly instead of silently
+// running elsewhere.
+builder.Services.AddSingleton<IValidateOptions<ColocatedExecutorOptions>, ColocatedExecutorOptionsValidator>();
+builder.Services.AddOptions<ColocatedExecutorOptions>()
+    .Bind(builder.Configuration.GetSection(ColocatedExecutorOptions.SectionName))
+    .ValidateOnStart();
+builder.Services.AddSingleton(sp => new ColocatedExecutorHost(
+    sp.GetRequiredService<ISandboxProvider>(),
+    () => sp.GetRequiredService<IOptionsMonitor<ColocatedExecutorOptions>>().CurrentValue,
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ExecutorPhaseDispatch,
+    sp.GetService<IExecutorPhaseHandler>(),
+    tracker: new ExecutorSandboxTracker(),
+    loggerFactory: sp.GetRequiredService<ILoggerFactory>()));
+builder.Services.AddSingleton<IExecutorPhaseTransportFactory>(sp =>
+    new ColocatedExecutorTransportFactory(sp.GetRequiredService<ColocatedExecutorHost>()));
+
 // Member-keyed provider registry for sandbox placement. Each provider kind
 // named by a SandboxClass member is constructed once here (via the same
 // BuildSandboxProviderInner the singleton uses, or via the plugin catalog for

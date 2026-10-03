@@ -227,7 +227,14 @@ public sealed class ExecutorStreamRelayTests : IDisposable
         var options = new ExecutorPhaseDispatchOptions();
         var transport = new FakeStreamingTransport("exec-1", Path.Combine(_root, "executor-" + Guid.NewGuid().ToString("N")));
         var factory = new FakeTransportFactory(transport);
-        var inner = new InProcessExecutorPhaseRunner(git, new UncalledHandler(), new RelayNoopSandboxProvider(), () => options);
+        var local = new ColocatedExecutorHost(
+            new RelayNoopSandboxProvider(),
+            () => new ColocatedExecutorOptions
+            {
+                StagingRoot = Path.Combine(_root, "local-stage-" + Guid.NewGuid().ToString("N")),
+            },
+            () => options,
+            new UncalledHandler());
         var streamsRoot = Path.Combine(_root, "streams-" + Guid.NewGuid().ToString("N"));
         var streams = new AgentStreamStore(
             new AgentStreamsOptions { Enabled = true, Path = streamsRoot, MaxFileSizeMb = maxFileSizeMb },
@@ -235,7 +242,7 @@ public sealed class ExecutorStreamRelayTests : IDisposable
         var broadcaster = new RecordingBroadcaster();
         registry.AddExecutor("exec-1");
         var proxy = new ExecutorPhaseProxy(
-            registry, factory, git, idempotency, inner, () => options,
+            registry, factory, git, idempotency, local, () => options,
             streamStore: streamStore ?? streams, broadcaster: broadcaster);
         return new RelayContext(git, idempotency, options, transport, streams, streamsRoot, broadcaster, proxy);
     }
@@ -256,7 +263,7 @@ public sealed class ExecutorStreamRelayTests : IDisposable
     private sealed class UncalledHandler : IExecutorPhaseHandler
     {
         public Task<ExecutorPhaseResult> ExecuteAsync(ExecutorPhaseRequest request, string repoPath, ISandbox sandbox, CancellationToken ct) =>
-            throw new InvalidOperationException("Fallback runner must not run while an executor is registered.");
+            throw new InvalidOperationException("Colocated runner must not run while the fake streaming transport serves every host.");
     }
 
     private sealed class RecordingBroadcaster : IStdoutBroadcaster

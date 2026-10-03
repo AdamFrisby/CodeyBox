@@ -8,10 +8,10 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Shared executor-side phase mechanics: the default sandbox spec, the
-/// staged-repo path resolution, and the provision/invoke/teardown core both
-/// the in-process runner and the executor-host runner execute around. One
-/// implementation so the two runners cannot drift apart on sandbox setup,
-/// result validation, or teardown.
+/// staged-repo path resolution, and the sandbox teardown helper the
+/// executor-host runner and the colocated transport execute around. One
+/// implementation so local and remote execution cannot drift apart on
+/// sandbox setup, path resolution, or teardown.
 /// </summary>
 internal static class ExecutorPhaseExecution
 {
@@ -53,63 +53,6 @@ internal static class ExecutorPhaseExecution
         if (!full.StartsWith(prefix, StringComparison.Ordinal))
             throw new ExecutorPhaseException($"Staged repo path for '{repositoryId}' escapes the staging root.");
         return full;
-    }
-
-    /// <summary>
-    /// Provisions a sandbox, optionally binds it in <paramref name="tracker"/>
-    /// under <paramref name="trackerPhaseId"/>, invokes
-    /// <paramref name="handler"/> with the repo path and the live sandbox,
-    /// validates the result, then unbinds and tears the sandbox down. A null
-    /// handler result is a phase failure; teardown best-effort never masks
-    /// the phase outcome.
-    /// </summary>
-    internal static async Task<ExecutorPhaseResult> RunInSandboxAsync(
-        IExecutorPhaseHandler handler,
-        ExecutorPhaseRequest request,
-        string repoPath,
-        ISandboxProvider provider,
-        Func<ExecutorPhaseRequest, SandboxSpec> specFactory,
-        ExecutorPhaseDispatchOptions dispatchOptions,
-        ExecutorSandboxTracker? tracker,
-        string? trackerPhaseId,
-        ILogger? log,
-        CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(handler);
-        ArgumentNullException.ThrowIfNull(request);
-        ArgumentNullException.ThrowIfNull(provider);
-        ArgumentNullException.ThrowIfNull(specFactory);
-        ArgumentNullException.ThrowIfNull(dispatchOptions);
-        if (tracker is not null)
-            ArgumentException.ThrowIfNullOrWhiteSpace(trackerPhaseId);
-
-        var sandbox = await provider.CreateAsync(specFactory(request), ct).ConfigureAwait(false);
-        if (tracker is not null)
-        {
-            try
-            {
-                tracker.Track(trackerPhaseId!, sandbox.Id, sandbox);
-            }
-            catch
-            {
-                await DisposeQuietAsync(sandbox, log).ConfigureAwait(false);
-                throw;
-            }
-        }
-
-        try
-        {
-            var raw = await handler.ExecuteAsync(request, repoPath, sandbox, ct).ConfigureAwait(false);
-            if (raw is null)
-                throw new ExecutorPhaseException($"Phase handler for phase '{request.Phase}' returned no result.");
-            return ExecutorPhaseProxy.ValidateResult(raw, dispatchOptions);
-        }
-        finally
-        {
-            if (tracker is not null)
-                tracker.TryUntrack(trackerPhaseId!, out _);
-            await DisposeQuietAsync(sandbox, log).ConfigureAwait(false);
-        }
     }
 
     internal static async Task DisposeQuietAsync(ISandbox sandbox, ILogger? log)

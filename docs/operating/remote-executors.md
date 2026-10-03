@@ -39,8 +39,18 @@ phase + attempt and the body hash covers the request (including the placement
 requirements when set), so a redelivered
 dispatch replays the original result instead of provisioning a second
 sandbox, while the same key with a different body is refused as a conflict
-and never executes. With no executor registered, dispatch falls back to the
-in-process runner with unchanged behaviour.
+and never executes. There is no in-process fallback: local execution runs
+through the colocated executor (`ColocatedExecutorHost`,
+`src/CodeyBox.Orchestrator/ColocatedExecutorHost.cs`), an executor host that
+lives inside the orchestrator process and takes part in every placement as
+host `"local"`. It runs the same `ExecutorHostPhaseRunner` a remote host
+runs — same binary, same code path — differing only in that its transport
+crosses the local filesystem instead of a network hop, so a deployment with
+no remote executor configured still executes phases through the executor
+path with no new required settings (`CodeyBox:ColocatedExecutor`, all
+defaults safe; `"local"` is a reserved host id). An empty candidate set is a
+configuration fault that fails loudly instead of silently running a second
+implementation.
 
 An agent failure on the executor is returned as a result (`AgentFailed`); a
 host, connection or transfer problem throws `ExecutorPhaseTransportException`
