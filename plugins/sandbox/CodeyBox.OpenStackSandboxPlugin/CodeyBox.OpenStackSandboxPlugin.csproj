@@ -12,7 +12,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.HostProcess\CodeyBox.HostProcess.csproj" />
     <ProjectReference Include="..\..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />
+    <ProjectReference Include="..\..\..\src\CodeyBox.Sandbox.MultipassRemote\CodeyBox.Sandbox.MultipassRemote.csproj" />
   </ItemGroup>
 
   <ItemGroup>

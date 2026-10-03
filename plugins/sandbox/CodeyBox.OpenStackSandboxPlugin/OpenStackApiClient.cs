@@ -355,10 +355,11 @@ public sealed class OpenStackApiClient
         ArgumentNullException.ThrowIfNull(spec);
         spec.Validate(_limits.MaxUserDataBytes);
         var networks = spec.NetworkIds.Select(id => new OpenStackServerNetwork(id)).ToList();
+        var groups = spec.SecurityGroupNames?.Select(name => new OpenStackServerSecurityGroup(name.Trim())).ToList();
         var body = new OpenStackCreateServerWrapper(new OpenStackCreateServerBody(
             spec.Name, spec.FlavorRef, spec.ImageRef, networks,
             string.IsNullOrWhiteSpace(spec.KeyName) ? null : spec.KeyName,
-            spec.UserDataBase64(), spec.Metadata, spec.Tags));
+            spec.UserDataBase64(), spec.Metadata, spec.Tags, groups));
         using var response = await SendServiceAsync(
             credentials, ComputeServiceType, "servers", HttpMethod.Post, body, "create server", ct)
             .ConfigureAwait(false);
@@ -497,6 +498,53 @@ public sealed class OpenStackApiClient
             credentials, ComputeServiceType, $"os-keypairs/{Uri.EscapeDataString(name)}",
             HttpMethod.Delete, null, "delete keypair", ct, allowNotFound: true).ConfigureAwait(false);
         return response.StatusCode != HttpStatusCode.NotFound;
+    }
+
+    /// <summary>
+    /// Lists Nova keypairs whose names start with <paramref name="namePrefix"/>
+    /// (ordinal). Keypairs carry no tags or metadata, so the provider-owned
+    /// naming prefix is the ownership proof — the prefix must be unique to this
+    /// provider. A null/empty prefix lists every keypair (bounded); callers
+    /// sweeping orphans always pass their prefix.
+    /// </summary>
+    public async Task<IReadOnlyList<OpenStackKeypair>> ListKeypairsAsync(
+        OpenStackCredentials credentials, string? namePrefix, CancellationToken ct)
+    {
+        using var response = await SendServiceAsync(
+            credentials, ComputeServiceType, "os-keypairs", HttpMethod.Get, null, "list keypairs", ct)
+            .ConfigureAwait(false);
+        var raw = await ReadBoundedStringAsync(response.Content, _limits.MaxResponseBytes, "list keypairs", ct)
+            .ConfigureAwait(false);
+        EnsureSuccessFromBody(response, raw, "list keypairs");
+        var result = new List<OpenStackKeypair>();
+        using var doc = JsonDocument.Parse(raw);
+        if (!doc.RootElement.TryGetProperty("keypairs", out var items)
+            || items.ValueKind != JsonValueKind.Array)
+        {
+            throw new OpenStackApiException(
+                OpenStackFailureKind.Unexpected, "list keypairs", "response has no keypairs array",
+                response.StatusCode, null, GetRequestId(response));
+        }
+        foreach (var el in items.EnumerateArray())
+        {
+            var node = el;
+            if (node.ValueKind == JsonValueKind.Object && node.TryGetProperty("keypair", out var nested))
+                node = nested;
+            var keypair = node.Deserialize<OpenStackKeypair>(Json);
+            if (keypair?.Name is null)
+                continue;
+            if (!string.IsNullOrEmpty(namePrefix)
+                && !keypair.Name.StartsWith(namePrefix, StringComparison.Ordinal))
+                continue;
+            result.Add(keypair);
+            if (result.Count > _limits.MaxListItems)
+            {
+                throw new OpenStackApiException(
+                    OpenStackFailureKind.Unexpected, "list keypairs",
+                    $"keypair listing exceeded the {_limits.MaxListItems.ToString(CultureInfo.InvariantCulture)}-item bound");
+            }
+        }
+        return result;
     }
 
     /// <summary>Reads Nova absolute limits plus usage, for capacity reporting.</summary>
@@ -677,6 +725,34 @@ public sealed class OpenStackApiClient
         return response.StatusCode != HttpStatusCode.NotFound;
     }
 
+    /// <summary>
+    /// Lists Neutron security groups whose names start with
+    /// <paramref name="namePrefix"/> (ordinal, client-side — a hosted filter is
+    /// a hint, never a proof of ownership). Bounded by the list limits.
+    /// </summary>
+    public async Task<IReadOnlyList<OpenStackSecurityGroup>> ListSecurityGroupsAsync(
+        OpenStackCredentials credentials, string? namePrefix, CancellationToken ct)
+    {
+        var query = "v2.0/security-groups?limit=" + ListPageSize.ToString(CultureInfo.InvariantCulture);
+        var elements = await GetMarkerPagedAsync(
+            credentials, NetworkServiceType, query, "list security groups",
+            el => el.TryGetProperty("security_groups", out var items) ? items : null,
+            static el => el.TryGetProperty("id", out var id) ? id.GetString() : null,
+            ct).ConfigureAwait(false);
+        var result = new List<OpenStackSecurityGroup>();
+        foreach (var el in elements)
+        {
+            var group = el.Deserialize<OpenStackSecurityGroup>(Json);
+            if (group?.Id is null)
+                continue;
+            if (!string.IsNullOrEmpty(namePrefix)
+                && (group.Name is null || !group.Name.StartsWith(namePrefix, StringComparison.Ordinal)))
+                continue;
+            result.Add(group);
+        }
+        return result;
+    }
+
     /// <summary>Creates a Neutron security-group rule. Direction/ethertype are exact-match validated.</summary>
     public async Task<OpenStackSecurityGroupRule> CreateSecurityGroupRuleAsync(
         OpenStackCredentials credentials, OpenStackSecurityGroupRuleSpec spec, CancellationToken ct)
@@ -696,13 +772,19 @@ public sealed class OpenStackApiClient
                 OpenStackFailureKind.Unexpected, "create security group rule", "empty response body");
     }
 
-    /// <summary>Allocates a floating IP on the given external network.</summary>
+    /// <summary>
+    /// Allocates a floating IP on the given external network. The optional
+    /// <paramref name="description"/> stamps ownership
+    /// (<c>codeybox owner=… server=…</c>) so orphan sweeps only release
+    /// provider-owned addresses.
+    /// </summary>
     public async Task<OpenStackFloatingIp> CreateFloatingIpAsync(
-        OpenStackCredentials credentials, string floatingNetworkId, CancellationToken ct)
+        OpenStackCredentials credentials, string floatingNetworkId, CancellationToken ct,
+        string? description = null)
     {
         RequireId(floatingNetworkId, nameof(floatingNetworkId));
         var body = new OpenStackCreateFloatingIpWrapper(
-            new OpenStackCreateFloatingIpBody(floatingNetworkId));
+            new OpenStackCreateFloatingIpBody(floatingNetworkId, description?.Trim()));
         using var response = await SendServiceAsync(
             credentials, NetworkServiceType, "v2.0/floatingips", HttpMethod.Post, body,
             "create floating IP", ct).ConfigureAwait(false);
@@ -734,6 +816,37 @@ public sealed class OpenStackApiClient
             credentials, NetworkServiceType, $"v2.0/floatingips/{Uri.EscapeDataString(floatingIpId)}",
             HttpMethod.Delete, null, "delete floating IP", ct, allowNotFound: true).ConfigureAwait(false);
         return response.StatusCode != HttpStatusCode.NotFound;
+    }
+
+    /// <summary>
+    /// Lists Neutron floating IPs whose description starts with
+    /// <paramref name="descriptionPrefix"/> (ordinal, client-side). The
+    /// provider stamps every floating IP it allocates with a
+    /// <c>codeybox owner=… server=…</c> description, so orphan sweeps only
+    /// touch provider-owned addresses. Bounded by the list limits.
+    /// </summary>
+    public async Task<IReadOnlyList<OpenStackFloatingIp>> ListFloatingIpsAsync(
+        OpenStackCredentials credentials, string? descriptionPrefix, CancellationToken ct)
+    {
+        var query = "v2.0/floatingips?limit=" + ListPageSize.ToString(CultureInfo.InvariantCulture);
+        var elements = await GetMarkerPagedAsync(
+            credentials, NetworkServiceType, query, "list floating IPs",
+            el => el.TryGetProperty("floatingips", out var items) ? items : null,
+            static el => el.TryGetProperty("id", out var id) ? id.GetString() : null,
+            ct).ConfigureAwait(false);
+        var result = new List<OpenStackFloatingIp>();
+        foreach (var el in elements)
+        {
+            var floatingIp = el.Deserialize<OpenStackFloatingIp>(Json);
+            if (floatingIp?.Id is null)
+                continue;
+            if (!string.IsNullOrEmpty(descriptionPrefix)
+                && (floatingIp.Description is null
+                    || !floatingIp.Description.StartsWith(descriptionPrefix, StringComparison.Ordinal)))
+                continue;
+            result.Add(floatingIp);
+        }
+        return result;
     }
 
     /// <summary>Lists Neutron ports attached to a device (e.g. a Nova server id).</summary>
@@ -1369,7 +1482,8 @@ public sealed record OpenStackServerSpec(
     string? KeyName = null,
     string? UserData = null,
     IReadOnlyDictionary<string, string>? Metadata = null,
-    IReadOnlyList<string>? Tags = null)
+    IReadOnlyList<string>? Tags = null,
+    IReadOnlyList<string>? SecurityGroupNames = null)
 {
     /// <summary>Validates sizes and shapes before anything reaches the wire.</summary>
     /// <exception cref="ArgumentException">A value is missing or over its bound.</exception>
@@ -1413,6 +1527,21 @@ public sealed record OpenStackServerSpec(
                     throw new ArgumentException(
                         $"Tags must be 1-{OpenStackApiClient.MaxServerTagChars.ToString(CultureInfo.InvariantCulture)} printable characters.",
                         nameof(Tags));
+            }
+        }
+        if (SecurityGroupNames is not null)
+        {
+            if (SecurityGroupNames.Count == 0 || SecurityGroupNames.Count > OpenStackApiClient.MaxServerNetworks)
+                throw new ArgumentException(
+                    "At least one and at most "
+                    + OpenStackApiClient.MaxServerNetworks.ToString(CultureInfo.InvariantCulture)
+                    + " security groups are required when specified.",
+                    nameof(SecurityGroupNames));
+            foreach (var group in SecurityGroupNames)
+            {
+                if (string.IsNullOrWhiteSpace(group) || group.Trim().Length > 255 || group.Any(char.IsControl))
+                    throw new ArgumentException(
+                        "Security group names must be 1-255 printable characters.", nameof(SecurityGroupNames));
             }
         }
     }
@@ -1590,6 +1719,10 @@ public sealed class OpenStackFloatingIp
     /// <summary>Attached port id, if any.</summary>
     [JsonPropertyName("port_id")]
     public string? PortId { get; set; }
+
+    /// <summary>Operator description (the provider stamps ownership here).</summary>
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
 }
 
 /// <summary>Neutron port record (subset).</summary>
@@ -1693,6 +1826,9 @@ internal sealed class KeystoneToken
 internal sealed record OpenStackServerNetwork(
     [property: JsonPropertyName("uuid")] string Uuid);
 
+internal sealed record OpenStackServerSecurityGroup(
+    [property: JsonPropertyName("name")] string Name);
+
 internal sealed record OpenStackCreateServerBody(
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("flavorRef")] string FlavorRef,
@@ -1701,7 +1837,8 @@ internal sealed record OpenStackCreateServerBody(
     [property: JsonPropertyName("key_name")] string? KeyName,
     [property: JsonPropertyName("user_data")] string? UserData,
     [property: JsonPropertyName("metadata")] IReadOnlyDictionary<string, string>? Metadata,
-    [property: JsonPropertyName("tags")] IReadOnlyList<string>? Tags);
+    [property: JsonPropertyName("tags")] IReadOnlyList<string>? Tags,
+    [property: JsonPropertyName("security_groups")] List<OpenStackServerSecurityGroup>? SecurityGroups = null);
 
 internal sealed record OpenStackCreateServerWrapper(
     [property: JsonPropertyName("server")] OpenStackCreateServerBody Server);
@@ -1776,7 +1913,8 @@ internal sealed class OpenStackSecurityGroupRuleWrapper
 }
 
 internal sealed record OpenStackCreateFloatingIpBody(
-    [property: JsonPropertyName("floating_network_id")] string FloatingNetworkId);
+    [property: JsonPropertyName("floating_network_id")] string FloatingNetworkId,
+    [property: JsonPropertyName("description")] string? Description = null);
 
 internal sealed record OpenStackCreateFloatingIpWrapper(
     [property: JsonPropertyName("floatingip")] OpenStackCreateFloatingIpBody Floatingip);
