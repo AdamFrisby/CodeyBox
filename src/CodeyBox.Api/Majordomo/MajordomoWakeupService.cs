@@ -88,6 +88,9 @@ internal sealed class MajordomoWakeupService : BackgroundService
     /// One watch pass: fires a debounced event wakeup when the queue is
     /// stalled with free capacity, otherwise runs the scheduled tick when
     /// due. Returns the wakeup result, or null when there was nothing due.
+    /// A failed pass never returns null: the error is logged and rethrown so
+    /// a failure (for example a conversation-store write failing after the
+    /// assessment) cannot read as 'not due'.
     /// </summary>
     public async Task<MajordomoWakeupResult?> CheckOnceAsync(CancellationToken ct = default)
     {
@@ -123,7 +126,7 @@ internal sealed class MajordomoWakeupService : BackgroundService
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Majordomo wakeup: {Phase} failed; will retry next tick.", phase);
-            return null;
+            throw;
         }
     }
 
