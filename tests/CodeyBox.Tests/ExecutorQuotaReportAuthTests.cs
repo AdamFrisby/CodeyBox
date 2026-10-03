@@ -399,3 +399,163 @@ internal sealed class QuotaReportAuthFactory : WebApplicationFactory<Program>
         base.Dispose(disposing);
     }
 }
+
+/// <summary>
+/// Caller binding for host-scoped executor lifecycle endpoints (register,
+/// heartbeat, deregister): a host-bound token may act only for its own
+/// host, so host A cannot forge host B's load report and steer
+/// least-loaded placement, nor register/deregister as B. Unbound callers
+/// (operator) remain allowed; the binding check runs before the registry
+/// lookup so a rejected caller cannot probe which hosts exist.
+/// </summary>
+public sealed class ExecutorHostCallerTests
+{
+    private static WorkInitiator Initiator(string subject) => new()
+    {
+        Issuer = "test",
+        Subject = subject,
+        DisplayName = subject,
+    };
+
+    private static DefaultHttpContext ContextWith(ApiClientPrincipal principal)
+    {
+        var ctx = new DefaultHttpContext();
+        ctx.Items[ApiKeyAuth.PrincipalItemKey] = principal;
+        return ctx;
+    }
+
+    private static int GetStatusCode(IResult result)
+    {
+        var status = Assert.IsAssignableFrom<IStatusCodeHttpResult>(result);
+        return status.StatusCode ?? StatusCodes.Status200OK;
+    }
+
+    [Fact]
+    public void MissingPrincipal_IsUnauthorized()
+    {
+        var result = ExecutorEndpoints.CheckExecutorHostCaller(new DefaultHttpContext(), "exec-1");
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status401Unauthorized, GetStatusCode(result));
+    }
+
+    [Fact]
+    public void AuthenticationDisabled_IsAllowed()
+    {
+        var ctx = ContextWith(new ApiClientPrincipal(
+            ApiKeyAuth.AuthenticationDisabledClientName,
+            Initiator("operator"),
+            CanDelegateInitiator: false));
+
+        Assert.Null(ExecutorEndpoints.CheckExecutorHostCaller(ctx, "exec-1"));
+    }
+
+    [Fact]
+    public void UnboundOperatorToken_IsAllowed()
+    {
+        var ctx = ContextWith(new ApiClientPrincipal(
+            "legacy-operator",
+            Initiator("operator"),
+            CanDelegateInitiator: false));
+
+        Assert.Null(ExecutorEndpoints.CheckExecutorHostCaller(ctx, "exec-1"));
+    }
+
+    [Fact]
+    public void BoundToken_MatchingHost_IsAllowed()
+    {
+        var ctx = ContextWith(new ApiClientPrincipal(
+            "exec-1-client",
+            Initiator("exec-1"),
+            CanDelegateInitiator: false,
+            ExecutorHostId: "exec-1"));
+
+        Assert.Null(ExecutorEndpoints.CheckExecutorHostCaller(ctx, "exec-1"));
+    }
+
+    [Fact]
+    public void BoundToken_OtherHost_IsForbidden()
+    {
+        var ctx = ContextWith(new ApiClientPrincipal(
+            "exec-2-client",
+            Initiator("exec-2"),
+            CanDelegateInitiator: false,
+            ExecutorHostId: "exec-2"));
+
+        var result = ExecutorEndpoints.CheckExecutorHostCaller(ctx, "exec-1");
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status403Forbidden, GetStatusCode(result));
+    }
+
+    [Fact]
+    public void BoundToken_HostIdComparison_IsExactOrdinal()
+    {
+        var ctx = ContextWith(new ApiClientPrincipal(
+            "exec-1-client",
+            Initiator("exec-1"),
+            CanDelegateInitiator: false,
+            ExecutorHostId: "Exec-1"));
+
+        var result = ExecutorEndpoints.CheckExecutorHostCaller(ctx, "exec-1");
+
+        Assert.NotNull(result);
+        Assert.Equal(StatusCodes.Status403Forbidden, GetStatusCode(result));
+    }
+}
+
+/// <summary>
+/// End-to-end host binding on the heartbeat route through the real bearer
+/// middleware: a token bound to exec-1 cannot set exec-2's load, and the
+/// 403 precedes the registry lookup (exec-2 is never registered, yet the
+/// caller — not the missing registration — is what rejects the call).
+/// </summary>
+[Collection("GlobalSerilog")]
+public sealed class ExecutorHeartbeatCallerMiddlewareTests : IDisposable
+{
+    private const string ExecutorToken = "test-bearer-bound-to-exec-1";
+
+    private readonly QuotaReportAuthFactory _factory = new();
+
+    public void Dispose() => _factory.Dispose();
+
+    [Fact]
+    public async Task BoundToken_OtherHostHeartbeat_IsForbidden()
+    {
+        using var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ExecutorToken);
+
+        var spoofed = await client.PostAsJsonAsync(
+            "/executors/exec-2/heartbeat", new { activePhases = 99 });
+
+        Assert.Equal(HttpStatusCode.Forbidden, spoofed.StatusCode);
+    }
+
+    [Fact]
+    public async Task BoundToken_OwnHeartbeat_ReachesRegistry()
+    {
+        using var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ExecutorToken);
+
+        var registered = await client.PostAsJsonAsync("/executors/register", new { hostId = "exec-1" });
+        Assert.Equal(HttpStatusCode.OK, registered.StatusCode);
+        var heartbeat = await client.PostAsJsonAsync(
+            "/executors/exec-1/heartbeat", new { activePhases = 1 });
+
+        Assert.Equal(HttpStatusCode.OK, heartbeat.StatusCode);
+    }
+
+    [Fact]
+    public async Task BoundToken_RegisterAsOtherHost_IsForbidden()
+    {
+        using var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ExecutorToken);
+
+        var spoofed = await client.PostAsJsonAsync("/executors/register", new { hostId = "exec-2" });
+
+        Assert.Equal(HttpStatusCode.Forbidden, spoofed.StatusCode);
+    }
+}

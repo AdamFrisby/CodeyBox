@@ -33,6 +33,7 @@ internal static class ExecutorEndpoints
     private static async Task<IResult> RegisterAsync(
         ExecutorRegistrationRequest req,
         IWorkerRegistry registry,
+        HttpContext httpContext,
         CancellationToken ct)
     {
         if (req is null)
@@ -47,6 +48,9 @@ internal static class ExecutorEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+
+        if (CheckExecutorHostCaller(httpContext, hostId) is { } callerRejection)
+            return callerRejection;
 
         var capacityError = ValidateCapacity(req.MaxConcurrentSandboxes);
         if (capacityError is not null)
@@ -96,6 +100,7 @@ internal static class ExecutorEndpoints
         string hostId,
         ExecutorHeartbeatRequest? req,
         IWorkerRegistry registry,
+        HttpContext httpContext,
         CancellationToken ct)
     {
         string normalized;
@@ -107,6 +112,9 @@ internal static class ExecutorEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+
+        if (CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
+            return callerRejection;
 
         var workerId = ExecutorRegistration.WorkerIdFor(normalized);
         var existing = await registry.ListAsync(ct);
@@ -130,6 +138,7 @@ internal static class ExecutorEndpoints
     private static async Task<IResult> DeregisterAsync(
         string hostId,
         IWorkerRegistry registry,
+        HttpContext httpContext,
         CancellationToken ct)
     {
         string normalized;
@@ -141,6 +150,9 @@ internal static class ExecutorEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+
+        if (CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
+            return callerRejection;
 
         await registry.DeregisterAsync(ExecutorRegistration.WorkerIdFor(normalized), ct);
         return Results.Ok(new { hostId = normalized });
@@ -258,6 +270,41 @@ internal static class ExecutorEndpoints
         if (!string.Equals(principal.ExecutorHostId, normalizedHostId, StringComparison.Ordinal))
             return Results.Json(
                 new { error = $"this token is bound to executor host '{principal.ExecutorHostId}' and cannot report for host '{normalizedHostId}'" },
+                statusCode: StatusCodes.Status403Forbidden);
+        return null;
+    }
+
+    /// <summary>
+    /// Binds a host-scoped executor endpoint (register, heartbeat,
+    /// deregister) to the authenticated caller. A host-bound executor token
+    /// may act only for its own host; a token bound to host A that asserts
+    /// host B's identity is rejected before the registry is consulted, so a
+    /// compromised or curious executor cannot forge another host's load
+    /// report (which feeds least-loaded placement), register or deregister
+    /// as another host, or spoof its current work item. Callers without a
+    /// host binding — the loopback-disabled operator and the operator/shared
+    /// bearer — retain full access: they already hold unrestricted
+    /// control-plane power (enqueue, merge, reconfigure), so scoping them
+    /// here would add no security boundary while breaking operator
+    /// provisioning. The stricter quota-report gate
+    /// (<see cref="CheckQuotaReportCaller"/>) additionally rejects unbound
+    /// callers because pool meters carry a holder allowlist that unbound
+    /// bearers prove nothing about; lifecycle/load endpoints have no such
+    /// allowlist, so binding-bound callers are the check that matters.
+    /// Returns null when the caller may proceed. Pure apart from reading
+    /// the already-authenticated principal.
+    /// </summary>
+    internal static IResult? CheckExecutorHostCaller(HttpContext httpContext, string normalizedHostId)
+    {
+        if (!ApiKeyAuth.TryGetPrincipal(httpContext, out var principal) || principal is null)
+            return Results.Unauthorized();
+        if (ApiKeyAuth.IsAuthenticationDisabled(principal))
+            return null;
+        if (string.IsNullOrWhiteSpace(principal.ExecutorHostId))
+            return null;
+        if (!string.Equals(principal.ExecutorHostId, normalizedHostId, StringComparison.Ordinal))
+            return Results.Json(
+                new { error = $"this token is bound to executor host '{principal.ExecutorHostId}' and cannot act for host '{normalizedHostId}'" },
                 statusCode: StatusCodes.Status403Forbidden);
         return null;
     }
