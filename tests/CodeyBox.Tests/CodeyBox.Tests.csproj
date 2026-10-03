@@ -71,6 +71,7 @@
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.KubeLinterAuditorPlugin\CodeyBox.KubeLinterAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.TflintAuditorPlugin\CodeyBox.TflintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.CfnlintAuditorPlugin\CodeyBox.CfnlintAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.CheckovAuditorPlugin\CodeyBox.CheckovAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.ConftestAuditorPlugin\CodeyBox.ConftestAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ClangTidyAuditorPlugin\CodeyBox.ClangTidyAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ExampleSarifAuditorPlugin\CodeyBox.ExampleSarifAuditorPlugin.csproj" />
