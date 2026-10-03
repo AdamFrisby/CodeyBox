@@ -233,6 +233,8 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         ValidateOptions(opts);
         if (!name.StartsWith(opts.NamePrefix, StringComparison.Ordinal))
             throw new InvalidOperationException($"Refusing to dispose '{name}': outside the Tart provider's '{opts.NamePrefix}' namespace.");
+        if (!IsValidVmName(name))
+            throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
 
         var stop = await RunTartAsync(opts, ["stop", name], TimeSpan.FromSeconds(opts.TransitionTimeoutSeconds), ct).ConfigureAwait(false);
         if (stop.ExitCode != 0 && !IsNotFound(stop.Stderr))
@@ -247,6 +249,15 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         var opts = _readOptions();
         ValidateOptions(opts);
+        // The resume name reaches `tart run <name>` as a raw operand, so it
+        // is validated against the managed namespace plus a charset check
+        // before any CLI call: a dash-led value would otherwise parse as a
+        // tart flag. Resume names are host-persisted and host-generated, but
+        // the sink carries its own guard.
+        if (!name.StartsWith(opts.NamePrefix, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Refusing to resume '{name}': outside the Tart provider's '{opts.NamePrefix}' namespace.");
+        if (!IsValidVmName(name))
+            throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
 
         IReadOnlyList<TartVmListEntry> entries;
         try
@@ -301,6 +312,9 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
             throw new InvalidOperationException($"CodeyBox:Plugins:{TartSandboxOptions.PluginId}:SshUsername must be non-empty.");
         if (opts.SshUsername.Contains('@', StringComparison.Ordinal) || opts.SshUsername.Contains(' ', StringComparison.Ordinal))
             throw new InvalidOperationException($"CodeyBox:Plugins:{TartSandboxOptions.PluginId}:SshUsername must be a bare username.");
+        // Fail closed on a known_hosts path that would disable server
+        // authentication; the SSH sink re-validates at use time.
+        _ = TartSshGuestTransport.ResolveKnownHostsPath(opts);
     }
 
     internal void EnsureEnabled(TartSandboxOptions opts)
@@ -384,6 +398,19 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
 
     internal async Task CloneAsync(TartSandboxOptions opts, string image, string vmName, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(opts);
+        ArgumentException.ThrowIfNullOrWhiteSpace(image);
+        ArgumentException.ThrowIfNullOrWhiteSpace(vmName);
+        // Both operands reach `tart clone <image> <name>` raw: a dash-led
+        // image would parse as a tart flag, so it is refused at the sink.
+        // Images come from operator config today, but the sink stays safe
+        // for any future caller.
+        if (image.TrimStart().StartsWith("-", StringComparison.Ordinal))
+            throw new ArgumentException($"Image reference '{image}' must not start with '-'.", nameof(image));
+        if (vmName.TrimStart().StartsWith("-", StringComparison.Ordinal))
+            throw new ArgumentException($"Sandbox name '{vmName}' must not start with '-'.", nameof(vmName));
+        if (!IsValidVmName(vmName))
+            throw new ArgumentException($"Sandbox name '{vmName}' contains invalid characters (only [a-z0-9-] allowed).", nameof(vmName));
         var result = await RunTartAsync(opts, ["clone", image, vmName], TimeSpan.FromSeconds(opts.CliTimeoutSeconds), ct).ConfigureAwait(false);
         if (result.ExitCode != 0)
             throw TartFailureClassification.ForExit(opts.TartBinaryPath, ["clone", image, vmName], result.ExitCode, result.Stderr);
@@ -407,6 +434,12 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
 
     internal ITartDetachedProcess StartVm(TartSandboxOptions opts, string vmName)
     {
+        ArgumentNullException.ThrowIfNull(opts);
+        ArgumentException.ThrowIfNullOrWhiteSpace(vmName);
+        if (vmName.TrimStart().StartsWith("-", StringComparison.Ordinal))
+            throw new ArgumentException($"Sandbox name '{vmName}' must not start with '-'.", nameof(vmName));
+        if (!IsValidVmName(vmName))
+            throw new ArgumentException($"Sandbox name '{vmName}' contains invalid characters (only [a-z0-9-] allowed).", nameof(vmName));
         var argv = new List<string> { "run" };
         argv.AddRange(opts.ExtraRunArgs.Where(static arg => !string.IsNullOrWhiteSpace(arg)));
         argv.Add(vmName);
@@ -576,6 +609,24 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         stderr.Contains("not found", StringComparison.OrdinalIgnoreCase)
         || stderr.Contains("no such", StringComparison.OrdinalIgnoreCase)
         || stderr.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// VM names that may reach the <c>tart</c> CLI as raw operands must be
+    /// DNS-label style (ASCII letters, digits, hyphen) so a dash-led value
+    /// can never parse as a CLI flag. Mirrors the Multipass provider's
+    /// <c>IsValidSandboxName</c> for the same sink family.
+    /// </summary>
+    internal static bool IsValidVmName(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > 128)
+            return false;
+        foreach (var c in name)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-')
+                return false;
+        }
+        return true;
+    }
 
     private static string LastLine(string text)
     {

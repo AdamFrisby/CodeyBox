@@ -74,6 +74,21 @@ public sealed record TartSandboxOptions
     /// <summary>Guest SSH port (1–65535).</summary>
     public int SshPort { get; init; } = 22;
 
+    /// <summary>
+    /// Host path to the provider-owned known_hosts file used for guest SSH
+    /// server authentication. A leading <c>~</c> expands against the
+    /// orchestrator user's home directory at the SSH sink. The file is never
+    /// <c>/dev/null</c>: with <c>StrictHostKeyChecking=accept-new</c> the
+    /// first contact with a guest trusts its host key into this file and
+    /// later contacts verify against it, so a bridge-position peer cannot
+    /// silently intercept every session. Clones from one image share that
+    /// image's host keys until rotated, so this file scopes trust to Tart
+    /// guests only — it never points at the user's or the system global
+    /// known_hosts. Prefer key auth and images that regenerate host keys on
+    /// first boot where available.
+    /// </summary>
+    public string SshKnownHostsPath { get; init; } = "~/.ssh/codeybox-tart-known_hosts";
+
     /// <summary>Default vCPU count applied with <c>tart set</c> when the spec leaves <c>CpuCount</c> unset (1–32).</summary>
     public int DefaultCpuCount { get; init; } = 4;
 
@@ -187,6 +202,7 @@ public sealed record TartSandboxOptions
             SshUsername = PluginConfigReaders.ReadNonEmpty(section, "SshUsername", defaults.SshUsername),
             SshPasswordEnvVar = PluginConfigReaders.ReadNonEmpty(section, "SshPasswordEnvVar", defaults.SshPasswordEnvVar),
             SshPrivateKeyPath = (section["SshPrivateKeyPath"] ?? string.Empty).Trim(),
+            SshKnownHostsPath = PluginConfigReaders.ReadNonEmpty(section, "SshKnownHostsPath", defaults.SshKnownHostsPath),
             SshPort = Math.Clamp(
                 PluginConfigReaders.ReadInt(section, "SshPort", defaults.SshPort), 1, 65535),
             DefaultCpuCount = Math.Clamp(

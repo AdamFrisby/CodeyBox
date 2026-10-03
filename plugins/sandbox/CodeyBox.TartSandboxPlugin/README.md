@@ -31,6 +31,12 @@ What isolation this provider **does** give:
 - No process is ever launched through a shell string: `tart`, `ssh`,
   and `sshpass` are spawned as argv arrays, and every guest path or
   variable that reaches a remote shell is single-quote escaped.
+- Guest SSH server authentication: `StrictHostKeyChecking=accept-new`
+  against a provider-owned known_hosts file (`SshKnownHostsPath`), never
+  `/dev/null`. The first contact trusts the guest key into that file and
+  later contacts verify it. Clones from one image share that image's host
+  keys until rotated — prefer images that regenerate host keys on first
+  boot, and key auth over password auth.
 
 What it **does not** give:
 
@@ -93,9 +99,8 @@ What it **does not** give:
 
 ### Full knob reference (`CodeyBox:Plugins:codeybox.tart-sandbox`)
 
-All values are hot-reloadable through `IOptionsMonitor` except `Enabled`
-(which requires a host restart). Operational values are config knobs,
-never literals in source.
+All values are hot-reloadable: the provider re-reads the section on every
+operation. Operational values are config knobs, never literals in source.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -104,21 +109,21 @@ never literals in source.
 | `DefaultImage` | `ghcr.io/cirruslabs/macos-sequoia-base:latest` | Image cloned when the spec names none. Use an `-xcode` image for Xcode workers. |
 | `NamePrefix` | `codeybox-` | VM name prefix; managed-VM filtering uses it. |
 | `DefaultCpuCount` | `4` | Applied via `tart set` when the spec leaves CPU unset (1–32). |
-| `DefaultMemoryGb` | `8` | Applied via `tart set` when the spec leaves memory unset (1–128 GiB). |
-| `DefaultDiskGb` | `50` | Floor for `tart set --disk-size` (10–500). |
+| `DefaultMemoryGiB` | `8` | Applied via `tart set` when the spec leaves memory unset (1–128 GiB). |
 | `SshUsername` | `admin` | Guest SSH username (non-secret). |
 | `SshPasswordEnvVar` | `TART_SSH_PASSWORD` | Env var holding the guest SSH password. Only the *name* is configured. |
 | `SshPrivateKeyPath` | unset | Host path to an SSH private key; key auth wins over password auth. |
+| `SshKnownHostsPath` | `~/.ssh/codeybox-tart-known_hosts` | Provider-owned known_hosts file for guest server authentication (`accept-new`); never `/dev/null`. Clones from one image share that image's host keys until rotated, so trust stays scoped to this file. |
 | `SshPort` | `22` | Guest SSH port. |
 | `SshConnectTimeoutSeconds` | `10` | One SSH connect attempt. |
 | `ReadyTimeoutSeconds` | `300` | Bound on waiting for guest SSH after `tart run`; refused credentials fail fast as `unauthorised`. |
 | `TransitionTimeoutSeconds` | `180` | Bound on stop/delete transitions. |
 | `PollIntervalMilliseconds` | `2000` | Guest-reachability poll cadence. |
-| `CliTimeoutSeconds` | `120` | Per-invocation timeout for `tart` CLI calls. |
+| `CliTimeoutSeconds` | `60` | Per-invocation timeout for `tart` CLI calls. |
 | `SetupCommands` | unset | Operator-trusted guest provisioning commands, run after boot before staging. |
-| `MaxStageFileBytes` | `256 MiB` | Largest single staged file or sync-back file. |
+| `MaxStageFileBytes` | `48 MiB` | Largest single staged file or sync-back file. |
 | `AllowPersistentTmpfsDowngrade` | `false` | Downgrade non-secret tmpfs mounts to persistent guest dirs; credential tmpfs is always refused. |
-| `ProvisioningRecheckSeconds` | `30` | Backoff floor on provisioning-deferred failures; throttling suggests a longer wait. |
+| `ProvisioningRecheckSeconds` | `60` | Backoff floor on provisioning-deferred failures; throttling suggests a longer wait. |
 
 ## What it costs
 

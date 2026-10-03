@@ -190,10 +190,20 @@ public sealed class TartSshGuestTransport
     internal (string Executable, IReadOnlyList<string> Argv, IReadOnlyDictionary<string, string>? Environment) BuildSshInvocation(string ip, string remoteCommand)
     {
         var opts = _readOptions();
+        // Server authentication is enforced at this sink: trust-on-first-use
+        // against a provider-owned known_hosts file (accept-new), never
+        // /dev/null. Every guest operation — exec argv, staged secret env
+        // files, and the sshpass-carried password — traverses this channel,
+        // so unauthenticated host keys would let a bridge-position peer
+        // intercept credentials and modify the session. The global
+        // known_hosts is ignored so a guest key can neither read nor pollute
+        // host-wide trust state.
+        var knownHostsPath = ResolveKnownHostsPath(opts);
         var argv = new List<string>
         {
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=" + knownHostsPath,
+            "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=" + opts.SshConnectTimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "-p", opts.SshPort.ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
@@ -233,6 +243,33 @@ public sealed class TartSshGuestTransport
         if (string.IsNullOrEmpty(text))
             return string.Empty;
         return text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).LastOrDefault()?.Trim() ?? string.Empty;
+    }
+
+    /// <summary>
+    /// Resolves the provider-owned known_hosts path at the SSH sink. A
+    /// leading <c>~</c> expands against the orchestrator user's home; blank
+    /// and <c>/dev/null</c> values fail closed so server authentication can
+    /// never be silently disabled by misconfiguration.
+    /// </summary>
+    internal static string ResolveKnownHostsPath(TartSandboxOptions opts)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        var raw = opts.SshKnownHostsPath.Trim();
+        if (raw.Length == 0)
+            throw new InvalidOperationException(
+                $"CodeyBox:Plugins:{TartSandboxOptions.PluginId}:SshKnownHostsPath must be non-empty.");
+        if (string.Equals(raw, "/dev/null", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"CodeyBox:Plugins:{TartSandboxOptions.PluginId}:SshKnownHostsPath must not be '/dev/null': guest host keys would never be verified.");
+        if (raw.StartsWith("~/", StringComparison.Ordinal) || string.Equals(raw, "~", StringComparison.Ordinal))
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrWhiteSpace(home))
+                throw new InvalidOperationException(
+                    $"CodeyBox:Plugins:{TartSandboxOptions.PluginId}:SshKnownHostsPath uses '~' but no home directory is available.");
+            raw = raw.Length == 1 ? home : Path.Combine(home, raw[2..]);
+        }
+        return raw;
     }
 
     private static Task DelayCancellable(TimeSpan delay, CancellationToken ct)
