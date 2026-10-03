@@ -1144,6 +1144,29 @@ public sealed class NullBaselineImageProvisioner : IBaselineImageProvisioner
 }
 
 /// <summary>
+/// Optional provider capability: count-based retention for content-hashed
+/// baseline images. While <see cref="IBaselineImageResolver"/> plus the
+/// grace-window reaper keep every live-pinned image safe, hash churn (one new
+/// image per toolchain edit) still accumulates unbounded history. A provider
+/// implementing this interface additionally prunes to the newest N images per
+/// retention group, where N is provider configuration — never deleting an
+/// image pinned by a non-terminal item. The orchestrator passes the same live
+/// pin set the reaper sweep uses; implementations must treat exact-name AND
+/// hash-equivalent pins as live.
+/// </summary>
+public interface IBaselineImageRetention
+{
+    /// <summary>
+    /// Deletes retained baseline images down to the provider's configured
+    /// history depth, keeping every image in <paramref name="livePins"/>.
+    /// Must be idempotent and must never delete a pinned image, even when the
+    /// history depth is exceeded. Best-effort per image: one deletion failure
+    /// must not abort the remaining batch.
+    /// </summary>
+    Task PruneRetainedImagesAsync(IReadOnlySet<string> livePins, CancellationToken ct);
+}
+
+/// <summary>
 /// Snapshot of one baseline image on the host, returned by
 /// <see cref="IBaselineImageResolver.ListBaselineImagesAsync"/>.
 /// </summary>

@@ -177,6 +177,25 @@ public sealed class BaselineImageReaper : BackgroundService
 
             _latestReport = report;
 
+            // Count-based retention (newest-N per group) for providers that
+            // implement it. Runs on every sweep, independent of the grace
+            // reap below; implementations never delete a live-pinned image.
+            if (_resolver is IBaselineImageRetention retention)
+            {
+                try
+                {
+                    await retention.PruneRetainedImagesAsync(live, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "BaselineImageReaper: retained-image pruning failed");
+                }
+            }
+
             if (toReap.Count == 0)
             {
                 _log.LogDebug(

@@ -94,6 +94,66 @@ name at least one CIDR — without it nobody could SSH in, so provisioning
 refuses to run. `ServerNamePrefix` / `SecurityGroupNamePrefix` must start
 with `codeybox-` so leak reaping never touches unrelated resources.
 
+## Baseline images
+
+When `UseBaselineImages` (default true) the provider boots work sandboxes
+from content-hashed Glance images carrying the same toolchain as the local
+Incus baseline, instead of the bare base cloud image:
+
+```json
+"UseBaselineImages": true,
+"BaselineBaseImageName": "",
+"BaselineImagePrefix": "codeybox-baseline-",
+"BaselineBakeTimeoutSeconds": 1800,
+"BaselineRetainedImageCount": 3,
+"BaselineBuilderOpenEgress": true,
+"ExtraRuncmd": ["apt-get update", "apt-get install -y dotnet-sdk-10.0"],
+"ExecutableProvisions": [
+  {
+    "HostSourcePath": "/opt/codeybox/tools/agent-a",
+    "VmDestPath": "/usr/local/bin/agent-a",
+    "VmSymlinks": ["agent"],
+    "Label": "agent-a"
+  }
+],
+"BaselineVerificationCommands": [
+  { "Label": "dotnet", "Argv": ["dotnet", "--version"] }
+]
+```
+
+- **Parity inputs.** The bake hashes `ExtraRuncmd`, `ExecutableProvisions`
+  (by file content, never host paths), and `BaselineVerificationCommands`
+  through the same shared computation the Incus provider uses, so identical
+  inputs hash identically on both providers. Mirror the toolchain half of
+  `CodeyBox:MultipassExtraRuncmd` / `CodeyBox:Incus:ExtraRuncmd` into
+  `ExtraRuncmd` (plus any plugin tool install lines the host logs for the
+  local providers — the plugin boundary cannot see other plugins, so those
+  lines are mirrored by the operator). Any edit rebakes via the normal
+  orphan/grace path. `BaselineBaseImageName` empty falls back to `ImageName`.
+- **Bake.** The first acquisition for a new hash boots an ephemeral builder
+  (`<ServerNamePrefix>bake-*`, so leak reaping owns it), provisions it over
+  SSH, runs the verification probes unprivileged, powers it off
+  (`os-stop` → `SHUTOFF`), and snapshots it to
+  `<BaselineImagePrefix>tc-<12-hex-hash>` tagged `codeybox-tc-<hash>`.
+  Concurrent acquisitions share one in-process bake (single-flight per
+  hash); the whole bake is bounded by `BaselineBakeTimeoutSeconds`. A failed
+  build deletes the builder server, keypair, and security group and removes
+  any half-baked image. The builder needs outbound access to fetch
+  toolchains, so its security group opens full egress while baking unless
+  `BaselineBuilderOpenEgress` is false (the builder is deleted afterwards
+  and work sandboxes keep their locked-down groups either way).
+- **Pins.** Work items pin the provider-scoped ref
+  `openstack/tc-<hash>/<image>` (Incus pins look like
+  `incus/tc-<hash>/<name>`). Either provider serves either scope when the
+  hash equals its live hash — an item pinned on Incus lands on the
+  equivalent-hash OpenStack image and vice versa. A scoped pin whose hash
+  differs from live is stale and refused; pre-scoping bare refs still load
+  (legacy path: image id or exact name).
+- **Retention.** `BaselineRetainedImageCount` (default 3) keeps the newest N
+  baked images per project group plus every image pinned by a non-terminal
+  item; anything older and unpinned is pruned. Pinned means exact-name or
+  hash match, so a cross-provider pin protects the image it resolves to.
+
 ## Egress
 
 Best-effort defence in depth only: each sandbox security group starts

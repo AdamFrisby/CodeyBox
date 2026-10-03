@@ -163,11 +163,16 @@ public sealed class IncusIntegrationTests
                 ?? throw new InvalidOperationException("The Incus integration baseline bake returned null.");
             Assert.Equal(baseline, bakedBaseline);
             baseline = bakedBaseline;
+            // The persisted pin is provider-scoped; the Incus/ZFS CLIs below
+            // need the bare instance name it carries.
+            var baselineInstance = BaselinePin.TryParseScopedPin(baseline, out _, out _, out var scopedRef)
+                ? scopedRef
+                : baseline;
 
             var copy = await RunCheckedAsync(
                 [
                     settings.IncusBinary, "--project", settings.Project,
-                    "copy", baseline + "/ready", copyProbe,
+                    "copy", baselineInstance + "/ready", copyProbe,
                     "--storage", settings.Pool,
                     "--no-profiles",
                 ],
@@ -176,7 +181,7 @@ public sealed class IncusIntegrationTests
                 copy.Elapsed <= settings.MaximumCloneDuration,
                 $"COW copy took {copy.Elapsed.TotalSeconds:F3}s; expected at most " +
                 $"{settings.MaximumCloneDuration.TotalSeconds:F3}s. stdout={copy.Result.Stdout} stderr={copy.Result.Stderr}");
-            await AssertZfsCowCloneAsync(settings, baseline, copyProbe);
+            await AssertZfsCowCloneAsync(settings, baselineInstance, copyProbe);
 
             sandbox = await provider.CreateAsync(new SandboxSpec
             {
@@ -242,7 +247,7 @@ public sealed class IncusIntegrationTests
                 providerCopy <= settings.MaximumCloneDuration,
                 $"Provider incus copy took {providerCopy.TotalSeconds:F3}s; expected at most " +
                 $"{settings.MaximumCloneDuration.TotalSeconds:F3}s.");
-            await AssertZfsCowCloneAsync(settings, baseline, sandbox.Id);
+            await AssertZfsCowCloneAsync(settings, baselineInstance, sandbox.Id);
             Assert.Empty(Directory.GetFileSystemEntries(emptyReadOnlySource));
 
             await File.WriteAllTextAsync(

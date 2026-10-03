@@ -438,6 +438,23 @@ public sealed class OpenStackApiClient
     }
 
     /// <summary>
+    /// Issues the Nova <c>os-stop</c> server action (guest power-off). The
+    /// server reports <c>SHUTOFF</c> once stopped; poll with
+    /// <see cref="WaitForServerStatusAsync"/> — this call only starts the stop.
+    /// </summary>
+    public async Task StopServerAsync(
+        OpenStackCredentials credentials, string serverId, CancellationToken ct)
+    {
+        RequireId(serverId, nameof(serverId));
+        using var response = await SendServiceAsync(
+            credentials, ComputeServiceType, $"servers/{Uri.EscapeDataString(serverId)}/action",
+            HttpMethod.Post, new OpenStackStopServerAction(), "stop server", ct).ConfigureAwait(false);
+        var raw = await ReadBoundedStringAsync(response.Content, _limits.MaxResponseBytes, "stop server", ct)
+            .ConfigureAwait(false);
+        EnsureSuccessFromBody(response, raw, "stop server");
+    }
+
+    /// <summary>
     /// Looks up a Nova flavor by exact (ordinal) name. Returns null when no
     /// flavor bears the name; throws when several do — an ambiguous match must
     /// never silently pick one.
@@ -1779,6 +1796,18 @@ public sealed class OpenStackImage
     /// <summary>Size in bytes, when known.</summary>
     [JsonPropertyName("size")]
     public long? Size { get; set; }
+
+    /// <summary>Creation timestamp, when reported.</summary>
+    [JsonPropertyName("created_at")]
+    public DateTimeOffset? CreatedAt { get; set; }
+
+    /// <summary>
+    /// Extra Glance image properties (for example <c>codeybox_project</c>).
+    /// Unknown fields are preserved here instead of dropped so retention can
+    /// group images without a second round-trip.
+    /// </summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? AdditionalProperties { get; set; }
 }
 
 // ------------------------------------------------------------------
@@ -1851,6 +1880,16 @@ internal sealed class OpenStackServerWrapper
 
 internal sealed record OpenStackServerActionWrapper(
     [property: JsonPropertyName("createImage")] OpenStackCreateImageAction CreateImage);
+
+/// <summary>
+/// Nova <c>os-stop</c> server action. The null payload must serialize
+/// explicitly (<c>{"os-stop":null}</c>) even though the client's shared
+/// options drop nulls, hence the per-property override.
+/// </summary>
+internal sealed record OpenStackStopServerAction(
+    [property: JsonPropertyName("os-stop")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    string? OsStop = null);
 
 internal sealed record OpenStackCreateImageAction(
     [property: JsonPropertyName("name")] string Name,
