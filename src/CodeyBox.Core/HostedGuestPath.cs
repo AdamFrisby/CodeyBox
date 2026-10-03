@@ -1,11 +1,13 @@
-namespace CodeyBox.RunloopPlugin;
+namespace CodeyBox.Core;
 
 /// <summary>
-/// Pure validation for guest-absolute POSIX paths. Guest output (e.g. find
-/// listings) is untrusted: every path crossing the boundary is validated here
-/// before it reaches a filesystem or API sink.
+/// Pure validation for guest-absolute POSIX paths in hosted sandboxes.
+/// Shared by every hosted-sandbox plugin (E2B, Runloop): guest output is
+/// untrusted, so every path crossing the boundary is validated here before
+/// it reaches a filesystem or API sink. One implementation keeps quoting,
+/// bound, and escape checks identical across providers.
 /// </summary>
-public static class RunloopGuestPath
+public static class HostedGuestPath
 {
     /// <summary>Maximum guest path length accepted (characters).</summary>
     public const int MaxLength = 4096;

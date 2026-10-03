@@ -524,7 +524,7 @@ public sealed class RunloopSandboxProvider : ISandboxProvider, ISuspendingSandbo
         foreach (var mount in spec.Mounts)
         {
             ct.ThrowIfCancellationRequested();
-            RunloopGuestPath.ValidateAbsolute(mount.SandboxPath);
+            HostedGuestPath.ValidateAbsolute(mount.SandboxPath);
 
             if (mount.Tmpfs)
             {
@@ -608,27 +608,9 @@ public sealed class RunloopSandboxProvider : ISandboxProvider, ISuspendingSandbo
         }
         else
         {
-            foreach (var hostFile in Directory.EnumerateFiles(hostRoot, "*", SearchOption.AllDirectories))
+            foreach (var staged in HostedMountStaging.CollectStageFiles(hostRoot, "Runloop", opts.MaxStageFileCount, ct))
             {
-                ct.ThrowIfCancellationRequested();
-                var full = Path.GetFullPath(hostFile);
-                if (!full.StartsWith(hostRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-                {
-                    throw new InvalidOperationException($"Mount source escapes its root: '{hostFile}'.");
-                }
-
-                var relative = Path.GetRelativePath(hostRoot, full);
-                if (relative.Split(Path.DirectorySeparatorChar).Any(static s => s == ".." || s.Length == 0))
-                {
-                    throw new InvalidOperationException($"Mount source escapes its root: '{hostFile}'.");
-                }
-
-                files.Add((full, relative));
-                if (files.Count > opts.MaxStageFileCount)
-                {
-                    throw new InvalidOperationException(
-                        $"Runloop mount staging exceeds {opts.MaxStageFileCount} files; refusing to stage.");
-                }
+                files.Add(staged);
             }
         }
 
@@ -649,7 +631,9 @@ public sealed class RunloopSandboxProvider : ISandboxProvider, ISuspendingSandbo
             }
 
             var guestPath = guestRoot.TrimEnd('/') + "/" + relative.Replace(Path.DirectorySeparatorChar, '/');
-            RunloopGuestPath.ValidateAbsolute(guestPath);
+            HostedGuestPath.ValidateAbsolute(guestPath);
+
+            HostedMountStaging.ThrowIfSymlinked(hostRoot, hostFull, relative, "Runloop");
 
             byte[] content;
             try

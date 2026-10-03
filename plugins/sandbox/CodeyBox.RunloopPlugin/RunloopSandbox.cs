@@ -84,7 +84,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         }
         else
         {
-            command = RunloopShellCommand.Build(
+            command = HostedGuestShellCommand.Build(
                 _spec.Environment,
                 exec,
                 exec.WorkingDirectory ?? _workingDirectory,
@@ -147,8 +147,8 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         string workingDirectory,
         CancellationToken ct)
     {
-        var (merged, removals) = RunloopShellCommand.MergeEnvironment(_spec.Environment, exec);
-        var content = RunloopShellCommand.BuildEnvFileContent(merged, removals, opts.MaxEnvironmentBytes);
+        var (merged, removals) = HostedGuestShellCommand.MergeEnvironment(_spec.Environment, exec);
+        var content = HostedGuestShellCommand.BuildEnvFileContent(merged, removals, opts.MaxEnvironmentBytes);
         var envFilePath = $"{SecretEnvStagingDirectory}/env-{Guid.NewGuid():N}";
 
         try
@@ -160,7 +160,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
             throw ToUnavailable(ex);
         }
 
-        return RunloopShellCommand.BuildSourcingCommand(
+        return HostedGuestShellCommand.BuildSourcingCommand(
             envFilePath, exec, workingDirectory, opts.MaxCommandBytes, opts.MaxStdinBytes);
     }
 
@@ -186,7 +186,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         ArgumentException.ThrowIfNullOrWhiteSpace(guestPath);
         ArgumentNullException.ThrowIfNull(contents);
         ThrowIfDisposed();
-        RunloopGuestPath.ValidateAbsolute(guestPath);
+        HostedGuestPath.ValidateAbsolute(guestPath);
         var opts = _readOptions();
         try
         {
@@ -203,7 +203,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(guestPath);
         ThrowIfDisposed();
-        RunloopGuestPath.ValidateAbsolute(guestPath);
+        HostedGuestPath.ValidateAbsolute(guestPath);
         var opts = _readOptions();
         try
         {
@@ -468,7 +468,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         }
     }
 
-    private async Task<string?> SyncWritableMountsBackAsync(RunloopSandboxOptions opts, CancellationToken ct)
+    internal async Task<string?> SyncWritableMountsBackAsync(RunloopSandboxOptions opts, CancellationToken ct)
     {
         if (WritableMounts.Count == 0)
         {
@@ -511,21 +511,10 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
                     return $"more than {opts.MaxStageFileCount} files under {mount.GuestPath}";
                 }
 
-                string relative;
-                try
+                if (!HostedMountSyncGuard.TryResolveHostFile(
+                    mount.HostPath, mount.GuestPath, guestFile, out var hostFile, out var refusal))
                 {
-                    relative = RunloopGuestPath.GetRelativePath(mount.GuestPath, guestFile);
-                }
-                catch (ArgumentException)
-                {
-                    return $"guest path escapes its mount: {guestFile}";
-                }
-
-                var hostFile = Path.GetFullPath(Path.Combine(mount.HostPath, relative));
-                if (!hostFile.StartsWith(mount.HostPath + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-                    && !string.Equals(hostFile, mount.HostPath, StringComparison.Ordinal))
-                {
-                    return $"host path escapes its mount root for {guestFile}";
+                    return refusal;
                 }
 
                 byte[] bytes;
@@ -545,14 +534,17 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
                     return $"read-back exceeds {opts.MaxStageTotalBytes} bytes";
                 }
 
-                try
+                // The guarded write re-checks the symlink probe immediately
+                // before touching the host filesystem (see
+                // HostedMountSyncGuard.WriteFileGuardedAsync): the
+                // resolve-time probe ran before a network round-trip, so a
+                // symlink swapped into the host tree in between must still be
+                // refused rather than followed.
+                var writeError = await HostedMountSyncGuard.WriteFileGuardedAsync(
+                    mount.HostPath, hostFile, guestFile, bytes, ct).ConfigureAwait(false);
+                if (writeError is not null)
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(hostFile)!);
-                    await File.WriteAllBytesAsync(hostFile, bytes, ct).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    return $"write-back {hostFile}: {ex.GetType().Name}";
+                    return writeError;
                 }
             }
         }
@@ -569,7 +561,7 @@ public sealed class RunloopSandbox : ISandbox, ISuspendableSandbox, IPreemptible
         int maxStderr,
         CancellationToken ct)
     {
-        var command = RunloopShellCommand.Build(
+        var command = HostedGuestShellCommand.Build(
             new Dictionary<string, string>(),
             new SandboxExec { Argv = argv, WorkingDirectory = workingDirectory },
             workingDirectory,
