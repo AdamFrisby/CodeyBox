@@ -164,9 +164,9 @@ public static class E2bShellCommand
         var builder = new StringBuilder();
         builder.Append("set -u; . ");
         builder.Append(quotedEnvFile);
-        builder.Append(" || exit 127; rm -f -- ");
+        builder.Append("; _codeybox_env_rc=$?; rm -f -- ");
         builder.Append(quotedEnvFile);
-        builder.Append("; ");
+        builder.Append("; [ $_codeybox_env_rc -ne 0 ] && exit 127; ");
         AppendWorkdirAndArgv(builder, exec.Argv, workingDirectory);
 
         var command = WrapStdin(builder.ToString(), stdinBase64);

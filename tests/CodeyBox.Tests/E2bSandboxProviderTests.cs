@@ -732,7 +732,9 @@ public sealed class E2bSandboxProviderTests
         Assert.Contains("unset -- STALE_VAR", envScript, StringComparison.Ordinal);
         Assert.DoesNotContain(secret, envScript.Replace(secretBase64, string.Empty, StringComparison.Ordinal), StringComparison.Ordinal);
 
-        var sent = Assert.Single(handler.Requests, r => r.Path == "/commands");
+        var commands = handler.Requests.Where(static r => r.Path == "/commands").ToList();
+        Assert.Equal(2, commands.Count);
+        var sent = Assert.Single(commands, r => r.Body.Contains(". \\u0027/tmp/.codeybox-exec-env/env-", StringComparison.Ordinal));
         var sentCommand = JsonDocument.Parse(sent.Body).RootElement.GetProperty("command").GetString();
         Assert.NotNull(sentCommand);
         Assert.Contains(". '/tmp/.codeybox-exec-env/env-", sentCommand, StringComparison.Ordinal);
@@ -740,6 +742,17 @@ public sealed class E2bSandboxProviderTests
         Assert.DoesNotContain("export CODEYBOX_TEST_SECRET=", sentCommand, StringComparison.Ordinal);
         Assert.DoesNotContain(secret, sentCommand, StringComparison.Ordinal);
         Assert.DoesNotContain(secretBase64, sentCommand, StringComparison.Ordinal);
+
+        // The host deletes the staged env file best-effort after the exec
+        // settles, so a throttled/failed guest rm cannot leave secrets on
+        // hosted disk: a follow-up rm carrying no secret must exist.
+        var cleanup = Assert.Single(
+            commands,
+            r => !r.Body.Contains(". \\u0027/tmp/.codeybox-exec-env/env-", StringComparison.Ordinal));
+        var cleanupCommand = JsonDocument.Parse(cleanup.Body).RootElement.GetProperty("command").GetString();
+        Assert.NotNull(cleanupCommand);
+        Assert.DoesNotContain(secret, cleanupCommand, StringComparison.Ordinal);
+        Assert.DoesNotContain(secretBase64, cleanupCommand, StringComparison.Ordinal);
     }
 
     [Fact]

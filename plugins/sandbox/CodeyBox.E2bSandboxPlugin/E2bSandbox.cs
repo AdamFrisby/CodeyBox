@@ -87,10 +87,11 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
         ThrowIfDisposed();
         var opts = _readOptions();
 
+        string? stagedEnvFile = null;
         string command;
         if (exec.EnvironmentContainsSecrets && exec.ExtraEnvironment is { Count: > 0 })
         {
-            command = await BuildSecretCommandAsync(opts, exec, exec.WorkingDirectory ?? _workingDirectory, ct).ConfigureAwait(false);
+            (command, stagedEnvFile) = await BuildSecretCommandAsync(opts, exec, exec.WorkingDirectory ?? _workingDirectory, ct).ConfigureAwait(false);
         }
         else
         {
@@ -103,7 +104,17 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
                 opts.MaxStdinBytes);
         }
 
-        return await RunGuestCommandAsync(opts, command, exec, exec.WorkingDirectory ?? _workingDirectory, ct).ConfigureAwait(false);
+        try
+        {
+            return await RunGuestCommandAsync(opts, command, exec, exec.WorkingDirectory ?? _workingDirectory, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (stagedEnvFile is not null)
+            {
+                await DeleteStagedEnvFileAsync(opts, stagedEnvFile).ConfigureAwait(false);
+            }
+        }
     }
 
     /// <summary>
@@ -113,7 +124,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
     /// </summary>
     private const string SecretEnvStagingDirectory = "/tmp/.codeybox-exec-env";
 
-    private async Task<string> BuildSecretCommandAsync(
+    private async Task<(string Command, string EnvFilePath)> BuildSecretCommandAsync(
         E2bSandboxOptions opts, SandboxExec exec, string workingDirectory, CancellationToken ct)
     {
         var (merged, removals) = E2bShellCommand.MergeEnvironment(_spec.Environment, exec);
@@ -130,8 +141,32 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
             throw ToUnavailable(ex);
         }
 
-        return E2bShellCommand.BuildSourcingCommand(
-            envFilePath, exec, workingDirectory, opts.MaxCommandBytes, opts.MaxStdinBytes);
+        return (E2bShellCommand.BuildSourcingCommand(
+            envFilePath, exec, workingDirectory, opts.MaxCommandBytes, opts.MaxStdinBytes), envFilePath);
+    }
+
+    private async Task DeleteStagedEnvFileAsync(E2bSandboxOptions opts, string envFilePath)
+    {
+        try
+        {
+            await RunInternalAsync(opts, ["rm", "-f", envFilePath], "/", CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "E2B sandbox {SandboxId}: best-effort staged env file delete failed.", Id);
+        }
+    }
+
+    private async Task CleanupSecretStagingAsync(E2bSandboxOptions opts)
+    {
+        try
+        {
+            await RunInternalAsync(opts, ["rm", "-rf", SecretEnvStagingDirectory], "/", CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "E2B sandbox {SandboxId}: best-effort secret staging cleanup failed.", Id);
+        }
     }
 
     private async Task<SandboxExecResult> RunGuestCommandAsync(
@@ -338,6 +373,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
     {
         ThrowIfDisposed();
         var opts = _readOptions();
+        await CleanupSecretStagingAsync(opts).ConfigureAwait(false);
         try
         {
             await _client.PauseSandboxAsync(opts.ApiBaseUrl, _readApiKey(), Id, opts.ApiTimeout, ct).ConfigureAwait(false);
@@ -388,17 +424,25 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
             });
     }
 
-    public Task SyncStateToHostAsync(CancellationToken ct = default) =>
-        SyncWritableMountsBackAsync(_readOptions(), ct).ContinueWith(
-            t => LogSyncWarning(t),
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted,
-            TaskScheduler.Default);
-
-    private void LogSyncWarning(Task<string?> task)
+    public async Task SyncStateToHostAsync(CancellationToken ct = default)
     {
-        _log.LogWarning(
-            task.Exception, "E2B sandbox {SandboxId}: SyncStateToHostAsync failed.", Id);
+        string? syncError;
+        try
+        {
+            syncError = await SyncWritableMountsBackAsync(_readOptions(), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "E2B sandbox {SandboxId}: SyncStateToHostAsync failed.", Id);
+            return;
+        }
+
+        if (syncError is not null)
+        {
+            _log.LogWarning(
+                "E2B sandbox {SandboxId}: teardown sync-back incomplete ({Reason}); continuing.",
+                Id, syncError);
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -415,6 +459,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
         }
 
         var opts = _readOptions();
+        await CleanupSecretStagingAsync(opts).ConfigureAwait(false);
         var syncError = await SyncWritableMountsBackAsync(opts, CancellationToken.None).ConfigureAwait(false);
         if (syncError is not null)
         {
@@ -490,6 +535,11 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
                     return $"host path escapes its mount root for {guestFile}";
                 }
 
+                if (HostPathPassesThroughSymlink(mount.HostPath, hostFile))
+                {
+                    return $"host path passes through a symlink for {guestFile}";
+                }
+
                 byte[] bytes;
                 try
                 {
@@ -520,6 +570,50 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
         }
 
         return null;
+    }
+
+    private static bool HostPathPassesThroughSymlink(string mountRoot, string hostFile)
+    {
+        var current = hostFile;
+        if (!File.Exists(current) && !Directory.Exists(current))
+        {
+            current = Path.GetDirectoryName(current) ?? mountRoot;
+        }
+
+        while (true)
+        {
+            if (string.Equals(current, mountRoot, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            try
+            {
+                if (File.Exists(current) || Directory.Exists(current))
+                {
+                    if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+
+            var parent = Path.GetDirectoryName(current);
+            if (string.IsNullOrEmpty(parent) || parent.Length >= current.Length)
+            {
+                return true;
+            }
+
+            current = parent;
+            if (!current.StartsWith(mountRoot, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
     }
 
     internal async Task<SandboxExecResult> RunInternalAsync(

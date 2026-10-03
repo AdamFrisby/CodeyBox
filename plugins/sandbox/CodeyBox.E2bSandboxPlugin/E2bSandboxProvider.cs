@@ -173,7 +173,7 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
         var apiKey = ResolveApiKey(opts);
 
         var sandboxName = BuildSandboxName(opts.NamePrefix);
-        var environment = ValidateEnvironment(spec.Environment);
+        _ = ValidateEnvironment(spec.Environment);
         var request = new E2bCreateSandboxRequest
         {
             TemplateID = opts.TemplateId,
@@ -186,13 +186,6 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
                 ["codeybox-purpose"] = spec.Purpose.ToString(),
             },
         };
-        if (environment.Count > 0)
-        {
-            foreach (var (key, value) in environment)
-            {
-                request.Metadata[$"codeybox-env-{key}"] = value;
-            }
-        }
 
         E2bSandboxDto created;
         try
@@ -718,24 +711,12 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
 
     private static bool IsManaged(E2bSandboxDto sandbox, string namePrefix)
     {
-        if (sandbox.Metadata is not null
+        _ = namePrefix;
+        return sandbox.Metadata is not null
             && sandbox.Metadata.TryGetValue(E2bSandboxOptions.ManagedMetadataKey, out var managed)
             && string.Equals(managed, E2bSandboxOptions.ManagedMetadataValue, StringComparison.Ordinal)
             && sandbox.Metadata.TryGetValue(E2bSandboxOptions.ProviderMetadataKey, out var provider)
-            && string.Equals(provider, E2bSandboxOptions.ProviderKind, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        if (sandbox.Metadata is not null
-            && sandbox.Metadata.TryGetValue("codeybox-name", out var name)
-            && !string.IsNullOrWhiteSpace(name)
-            && name.StartsWith(namePrefix, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return false;
+            && string.Equals(provider, E2bSandboxOptions.ProviderKind, StringComparison.Ordinal);
     }
 
     private async Task DeleteBestEffortAsync(E2bSandboxOptions opts, string apiKey, string sandboxId)
