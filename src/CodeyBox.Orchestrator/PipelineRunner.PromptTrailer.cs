@@ -161,7 +161,7 @@ public sealed partial class PipelineRunner
         await using (var stampScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit.stamp_trailer",
             activitySource: CodeyBoxActivities.Sandbox, log: _log))
         {
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m", commitMessage);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m", commitMessage);
         }
 
         _log.LogInformation(

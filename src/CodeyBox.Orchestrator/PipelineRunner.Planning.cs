@@ -975,11 +975,11 @@ public sealed partial class PipelineRunner
             sandbox = await _sandboxes.CreateAsync(spec, ct);
 
             if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-            await RunWithCancellation(sandbox, ct, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
 
-            await RunWithCancellation(
+            await PipelineAgentExecutor.RunWithCancellation(
                 sandbox,
                 ct,
                 "git",
@@ -1192,7 +1192,7 @@ public sealed partial class PipelineRunner
         ISandbox sandbox,
         CancellationToken ct)
     {
-        await RunWithCancellation(
+        await PipelineAgentExecutor.RunWithCancellation(
             sandbox,
             ct,
             "git",
@@ -1223,7 +1223,7 @@ public sealed partial class PipelineRunner
         {
             var result = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
             if (!result.Success && throwOnFailure && required)
-                throw CommandFailed(result, argv);
+                throw PipelineAgentExecutor.CommandFailed(result, argv);
         }
     }
 

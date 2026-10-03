@@ -127,9 +127,10 @@ public sealed partial class PipelineRunner
             includeAgentTurnScratchpadTmpfs: true,
             credentialRunner: runner);
 
-        var sandbox = await AcquireWorkPhaseSandboxAsync(
-            item,
+        var sandbox = await _agentExecutor.AcquireWorkPhaseSandboxAsync(
+            item.Id,
             "work",
+            item.RequiredCapabilities,
             credential?.Agent.Value,
             sandboxTarget.NetworkProfile,
             spec,
@@ -137,7 +138,7 @@ public sealed partial class PipelineRunner
         try
         {
             if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
+                await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
 
             var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
                 _claudeSessionWorker,
@@ -262,7 +263,7 @@ public sealed partial class PipelineRunner
             return;
         }
 
-        var validationError = ValidateAgentControlSpec(spec);
+        var validationError = PipelineControlDecisions.ValidateAgentControlSpec(spec);
         if (validationError is not null)
         {
             await TransitionFailed(item, validationError, CancellationToken.None, project, failureKind: "configuration");
@@ -309,37 +310,6 @@ public sealed partial class PipelineRunner
 
         await PublishAgentControlWebhookBestEffortAsync(agent, spec, actor, pausedState, resumed);
         await Transition(item, WorkItemState.Done, ct, project);
-    }
-
-    private static string? ValidateAgentControlSpec(AgentControlSpec spec)
-    {
-        if (string.IsNullOrWhiteSpace(spec.Agent))
-            return "agentControl.agent is required";
-
-        switch (spec.Action)
-        {
-            case AgentControlAction.Pause:
-                if (string.IsNullOrWhiteSpace(spec.Reason))
-                    return "agentControl.reason is required for pause";
-                if (AgentPauseValidation.ValidateOptionalReason(spec.Reason, "agentControl.reason") is { } pauseReasonError)
-                    return pauseReasonError;
-                break;
-            case AgentControlAction.Resume:
-                if (AgentPauseValidation.ValidateOptionalReason(spec.Reason, "agentControl.reason") is { } resumeReasonError)
-                    return resumeReasonError;
-                break;
-            default:
-                return $"unsupported agentControl action '{spec.Action}'";
-        }
-
-        if (spec.DurationSeconds is { } seconds && seconds <= 0)
-            return "agentControl.durationSeconds must be positive";
-        if (spec.DurationSeconds is not null && spec.ExpiresAt is not null)
-            return "agentControl: provide either durationSeconds or expiresAt, not both";
-        if (spec.ExpiresAt is { } expiresAt && expiresAt <= DateTimeOffset.UtcNow)
-            return "agentControl.expiresAt must be in the future";
-
-        return null;
     }
 
     private async Task PublishAgentControlWebhookBestEffortAsync(

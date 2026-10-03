@@ -147,40 +147,6 @@ public sealed partial class PipelineRunner
     }
 
     /// <summary>
-    /// Acquires a work-phase sandbox. When placement is wired (production),
-    /// builds the placement requirements from the work item's
-    /// <see cref="WorkItem.RequiredCapabilities"/> plus the network profile
-    /// and credential the phase's sandbox target already needs, places onto a
-    /// member, and creates the sandbox on that member's registry provider.
-    /// A permanent refusal (capability no member declares) throws
-    /// <see cref="SandboxPlacementUnplaceableException"/> naming the
-    /// capability so the item fails operator-visible; a transient refusal
-    /// throws <see cref="SandboxProvisioningDeferredException"/> so the item
-    /// requeues under the existing backoff. Null placer keeps the legacy
-    /// direct-provider path.
-    /// </summary>
-    private Task<ISandbox> AcquireWorkPhaseSandboxAsync(
-        WorkItem item,
-        string phase,
-        string? credentialName,
-        string? networkProfile,
-        SandboxSpec spec,
-        CancellationToken ct)
-    {
-        if (_sandboxPlacer is null)
-            return _sandboxes.CreateAsync(spec, ct);
-        return _sandboxPlacer.AcquireAsync(
-            new SandboxPlacementAcquisition(
-                item.Id,
-                phase,
-                item.RequiredCapabilities,
-                credentialName,
-                networkProfile,
-                spec),
-            ct);
-    }
-
-    /// <summary>
     /// Resolves the project's sandbox secrets for <paramref name="scope"/>
     /// authorised for <paramref name="workItemId"/> from live host
     /// environment state. Returns an empty map when the project declares
@@ -299,30 +265,6 @@ public sealed partial class PipelineRunner
         }
     }
 
-    private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
-    {
-        SandboxCredentialFileWriter.ValidateMaterializationPlan(credential, []);
-        foreach (var (relativePath, contents) in credential.Files)
-        {
-            var safePath = SanitiseCredentialFileName(relativePath);
-            await SandboxCredentialFileWriter.WriteAsync(
-                sandbox,
-                new SandboxCredentialFileTarget(SandboxCredentialFileRoot.CredentialsDirectory, safePath),
-                contents,
-                SandboxCredentialOverwritePolicy.Overwrite,
-                ct).ConfigureAwait(false);
-        }
-    }
-
-    private static async Task Run(ISandbox sandbox, params string[] argv)
-    {
-        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv });
-        if (r.ExecutionUnavailable)
-            throw new SandboxExecutionUnavailableException(r.ExitCode);
-        if (!r.Success)
-            throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
-    }
-
     private async Task RunHostGitAsync(string workdir, CancellationToken ct, params string[] args)
     {
         var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(workdir, ct, args);
@@ -408,7 +350,7 @@ public sealed partial class PipelineRunner
             return;
 
         if (!IsNonFastForwardRejection(push.Stdout, push.Stderr))
-            throw CommandFailed(push, pushArgv);
+            throw PipelineAgentExecutor.CommandFailed(push, pushArgv);
 
         _log.LogWarning(
             "Sandbox push of work branch {Branch} was rejected as non-fast-forward; fetching and rebasing once",
@@ -451,78 +393,6 @@ public sealed partial class PipelineRunner
         return output.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
             || output.Contains("! [rejected]", StringComparison.OrdinalIgnoreCase)
             || output.Contains("fetch first", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static InvalidOperationException CommandFailed(SandboxExecResult result, IReadOnlyList<string> argv)
-        => new($"command failed (exit {result.ExitCode}): {string.Join(' ', argv)}\n{result.Stderr}");
-
-    private static async Task RunWithCancellation(ISandbox sandbox, CancellationToken ct, params string[] argv)
-    {
-        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
-        if (r.ExecutionUnavailable)
-            throw new SandboxExecutionUnavailableException(r.ExitCode);
-        if (!r.Success)
-            throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
-    }
-
-    // Best-effort recovery of a COW-inherited, root-owned per-user NuGet home run
-    // once when preparing a tool-audit sandbox, before its `dotnet build`/`test`/
-    // `format` gates. A broken home otherwise aborts restore with "Failed to read
-    // NuGet.Config due to unauthorized access". The branch's MSBuild InitialTargets
-    // hook (Directory.NuGetHomeHeal.targets) already heals every `dotnet build`/
-    // `test` invocation on its own; this setup step is a complementary safety net
-    // that also covers gate commands which do not evaluate those props (e.g. a bare
-    // `dotnet restore` or `dotnet format`) and does the repair once so the shared
-    // sandbox's later gates inherit a healthy home. It dot-sources the checked-out
-    // branch's own repository-owned recovery (scripts/nuget-home-heal.sh), whose
-    // on-disk repair persists for every gate sharing the sandbox; the trailing
-    // `true` keeps the step best-effort so a missing script or unhealable home
-    // never masks the real gate error. This adds no capability the audit sandbox
-    // lacks — it already runs the branch's arbitrary build logic via `dotnet build`
-    // in this same credential-free sandbox — and is a no-op when the home is
-    // already usable.
-    private static Task HealAuditNuGetHomeAsync(ISandbox sandbox, CancellationToken ct)
-        => RunWithCancellation(
-            sandbox,
-            ct,
-            "sh",
-            "-c",
-            "cd \"$1\" 2>/dev/null && [ -f scripts/nuget-home-heal.sh ] && "
-                + ". ./scripts/nuget-home-heal.sh; true",
-            "sh",
-            SandboxConventions.WorkDir);
-
-    private static void ThrowIfExecutionUnavailable(SandboxExecResult result)
-    {
-        if (result.ExecutionUnavailable)
-            throw new SandboxExecutionUnavailableException(result.ExitCode);
-    }
-
-
-    // Runs a command but replaces the last argv element with "***" in any exception message,
-    // used when the last element is a sensitive value (e.g. user.email) that must not reach
-    // audit-tier logs.
-    private static async Task RunMasked(ISandbox sandbox, params string[] argv)
-    {
-        await RunMasked(sandbox, CancellationToken.None, argv);
-    }
-
-    private static async Task RunMasked(ISandbox sandbox, CancellationToken ct, params string[] argv)
-    {
-        var r = await sandbox.ExecAsync(new SandboxExec { Argv = argv }, ct);
-        if (!r.Success)
-        {
-            var masked = argv.Length > 0
-                ? argv[..^1].Append("***").ToArray()
-                : argv;
-            throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', masked)}\n{r.Stderr}");
-        }
-    }
-
-    private static string SanitiseCredentialFileName(string path)
-    {
-        SandboxCredentialFileWriter.ValidateRelativePath(path, nameof(path));
-        return path;
     }
 
     // ── Stuck-probe integration ──────────────────────────────────────────────

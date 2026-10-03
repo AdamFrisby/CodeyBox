@@ -24,7 +24,7 @@ public sealed partial class PipelineRunner
     /// on it) and the agent stacks new commits on top.
     /// Returns the agent-visible answer text for post-phase processing
     /// (e.g. question parsing): the captured stdout projected through
-    /// <see cref="AgentVisibleStdout"/>, so envelope-framed runners (devin's
+    /// <see cref="PipelineAgentExecutor.AgentVisibleStdout"/>, so envelope-framed runners (devin's
     /// ACP shim emits the answer JSON-escaped inside <c>devin.acp</c>
     /// envelopes) still surface their plain text to the block parsers.
     /// </summary>
@@ -172,8 +172,8 @@ public sealed partial class PipelineRunner
                     sessionLifecycle = null;
                     useClaudeSession = false;
                     var sandboxStartSw = Stopwatch.StartNew();
-                    sandbox = await AcquireWorkPhaseSandboxAsync(
-                        item, agentPhase, credential?.Agent.Value, networkProfile, spec, ct);
+                    sandbox = await _agentExecutor.AcquireWorkPhaseSandboxAsync(
+                        item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, spec, ct);
                     sandboxStartSw.Stop();
                     CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
                     sandboxOwnedByPhase = true;
@@ -211,10 +211,10 @@ public sealed partial class PipelineRunner
                     ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(
                         spec,
                         ct,
-                        acquireAsync: (s, token) => AcquireWorkPhaseSandboxAsync(
-                            item, agentPhase, credential?.Agent.Value, networkProfile, s, token))
-                    : await AcquireWorkPhaseSandboxAsync(
-                        item, agentPhase, credential?.Agent.Value, networkProfile, spec, ct);
+                        acquireAsync: (s, token) => _agentExecutor.AcquireWorkPhaseSandboxAsync(
+                            item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, s, token))
+                    : await _agentExecutor.AcquireWorkPhaseSandboxAsync(
+                        item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, spec, ct);
                 sandboxStartSw.Stop();
                 CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
                 sandboxOwnedByPhase = true;
@@ -282,7 +282,7 @@ public sealed partial class PipelineRunner
             }
 
             if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct);
             if (useClaudeSession && !resumingPreempt)
                 await sessionLifecycle!.RefreshCredentialAsync(credential, ct);
 
@@ -292,7 +292,7 @@ public sealed partial class PipelineRunner
                     activitySource: CodeyBoxActivities.Sandbox, log: _log);
                 await using (cloneScope)
                 {
-                    await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                    await PipelineAgentExecutor.Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
                 }
                 CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
             }
@@ -300,17 +300,17 @@ public sealed partial class PipelineRunner
             {
                 // Session-mode: the prior clone is still
                 // on disk. Refresh origin without cleaning its dirty work tree.
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
+                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
                 if (useClaudeSession && !resumingPreempt)
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", access.CloneUrlInsideSandbox);
+                    await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", access.CloneUrlInsideSandbox);
             }
             var checkedOutExistingBranch = false;
             if (resumingGitCheckpoint)
             {
                 var preemptCheckpoint = item.PreemptCheckpoint!;
                 var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
+                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
+                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
                 if (durableTurnResume is not null)
                 {
                     var typedRef = AgentTurnCheckpointRef.Parse(preemptCheckpoint);
@@ -354,20 +354,20 @@ public sealed partial class PipelineRunner
             {
                 if (await OriginBranchExistsAsync(sandbox, branch, ct))
                 {
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+                    await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
                     checkedOutExistingBranch = true;
                 }
                 else
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
+                    await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
             }
             else
             {
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
                 checkedOutExistingBranch = true;
             }
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
-            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await PipelineAgentExecutor.RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
 
             // Capture HEAD before the agent runs. The rework prompt explicitly
             // asks the agent to make new commits, so the agent may move HEAD
@@ -378,7 +378,7 @@ public sealed partial class PipelineRunner
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
             }, ct);
-            ThrowIfExecutionUnavailable(beforeHead);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(beforeHead);
             if (!beforeHead.Success)
                 throw new InvalidOperationException($"Failed to read HEAD before agent: {beforeHead.Stderr}");
             var shaBefore = beforeHead.Stdout.Trim();
@@ -993,7 +993,7 @@ public sealed partial class PipelineRunner
             // Stage anything the agent left dirty in the working tree. If the
             // agent already committed (per the rework prompt's instruction
             // to make new commits), `git add -A` is a no-op.
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
 
             // Read the suggestions file BEFORE stripping it from the staged tree
             // so we capture it even when the agent staged it alongside real changes.
@@ -1034,7 +1034,7 @@ public sealed partial class PipelineRunner
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
             }, ct);
-            ThrowIfExecutionUnavailable(staged);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(staged);
             // diff --cached --quiet exits 0 on no-diff, 1 on diff.
             var hasStagedDiff = staged.ExitCode != 0;
 
@@ -1048,7 +1048,7 @@ public sealed partial class PipelineRunner
                 await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit",
                     activitySource: CodeyBoxActivities.Sandbox, log: _log))
                 {
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+                    await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
                 }
             }
             await EnsureReservedScratchpadPathsAbsentFromTreeAsync(sandbox, ct);
@@ -1059,7 +1059,7 @@ public sealed partial class PipelineRunner
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
             }, ct);
-            ThrowIfExecutionUnavailable(afterHead);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(afterHead);
             if (!afterHead.Success)
                 throw new InvalidOperationException($"Failed to read HEAD after agent: {afterHead.Stderr}");
             var shaAfter = afterHead.Stdout.Trim();
@@ -1180,7 +1180,7 @@ public sealed partial class PipelineRunner
                     await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",
                         activitySource: CodeyBoxActivities.Sandbox, log: _log))
                     {
-                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
+                        await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
                     }
                     await sandbox.SyncStateToHostAsync(ct);
                     // HEAD is now durable on the work branch. A later build or
@@ -1193,7 +1193,7 @@ public sealed partial class PipelineRunner
 
                     await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
                     phaseSucceeded = true;
-                    return agentResult.Stdout is { } resumedStdout ? AgentVisibleStdout(runner, resumedStdout) : null;
+                    return agentResult.Stdout is { } resumedStdout ? PipelineAgentExecutor.AgentVisibleStdout(runner, resumedStdout) : null;
                 }
 
                 var buildOutcome = RequiredBuildWorkPhaseOutcome.PassedOrSkipped;
@@ -1204,7 +1204,7 @@ public sealed partial class PipelineRunner
                 }
 
                 if (buildOutcome == RequiredBuildWorkPhaseOutcome.DeferredFailure)
-                    return agentResult.Stdout is { } deferredStdout ? AgentVisibleStdout(runner, deferredStdout) : null;
+                    return agentResult.Stdout is { } deferredStdout ? PipelineAgentExecutor.AgentVisibleStdout(runner, deferredStdout) : null;
 
                 // Feed the no-changes circuit breaker: a clean-exit-but-no-diff
                 // outcome is the silent-failure signature an agent exhibits when
@@ -1294,7 +1294,7 @@ public sealed partial class PipelineRunner
                         else
                             break;
 
-                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+                        await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
                         await sandbox.ExecAsync(new SandboxExec
                         {
                             Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
@@ -1307,7 +1307,7 @@ public sealed partial class PipelineRunner
                         {
                             Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
                         }, ct);
-                        ThrowIfExecutionUnavailable(nudgeStaged);
+                        PipelineAgentExecutor.ThrowIfExecutionUnavailable(nudgeStaged);
                         if (nudgeStaged.ExitCode != 0)
                         {
                             var nudgeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct,
@@ -1315,7 +1315,7 @@ public sealed partial class PipelineRunner
                             var nudgeCommitMessage = isInitial
                                 ? $"codeybox: {item.Title}\n\n{nudgeTrailerBlock}"
                                 : $"codeybox rework: address audit findings\n\n{nudgeTrailerBlock}";
-                            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", nudgeCommitMessage);
+                            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", nudgeCommitMessage);
                         }
                         await EnsureReservedScratchpadPathsAbsentFromTreeAsync(sandbox, ct);
 
@@ -1323,7 +1323,7 @@ public sealed partial class PipelineRunner
                         {
                             Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "HEAD"],
                         }, ct);
-                        ThrowIfExecutionUnavailable(nudgeHead);
+                        PipelineAgentExecutor.ThrowIfExecutionUnavailable(nudgeHead);
                         if (!nudgeHead.Success)
                             break;
                         shaAfter = nudgeHead.Stdout.Trim();
@@ -1363,7 +1363,7 @@ public sealed partial class PipelineRunner
                         if (isInitial && suggestionsJson is not null)
                             await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
                         phaseSucceeded = true;
-                        return agentResult.Stdout is { } carriedStdout ? AgentVisibleStdout(runner, carriedStdout) : null;
+                        return agentResult.Stdout is { } carriedStdout ? PipelineAgentExecutor.AgentVisibleStdout(runner, carriedStdout) : null;
                     }
 
                     if (!suppressNoChangesBreaker)
@@ -1473,7 +1473,7 @@ public sealed partial class PipelineRunner
             await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
 
             phaseSucceeded = true;
-            return agentResult.Stdout is { } capturedStdout ? AgentVisibleStdout(runner, capturedStdout) : null;
+            return agentResult.Stdout is { } capturedStdout ? PipelineAgentExecutor.AgentVisibleStdout(runner, capturedStdout) : null;
         }
         catch (AgentResumePreparationUnavailableException ex)
         {

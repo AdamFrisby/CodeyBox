@@ -58,8 +58,8 @@ public sealed partial class PipelineRunner
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, phaseCt);
-            await RunWithCancellation(sandbox, phaseCt, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            await RunWithCancellation(
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, phaseCt, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await PipelineAgentExecutor.RunWithCancellation(
                 sandbox,
                 phaseCt,
                 "git",
@@ -71,8 +71,8 @@ public sealed partial class PipelineRunner
                 $"origin/{workBranch}");
 
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
-            await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
-            await RunMasked(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await PipelineAgentExecutor.RunMasked(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
 
             var ctx = new MechanicalFixerContext(
                 item.Id,
@@ -107,7 +107,7 @@ public sealed partial class PipelineRunner
             if (string.IsNullOrWhiteSpace(status.Stdout))
                 return;
 
-            await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "add", "-u");
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "add", "-u");
             var staged = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--cached", "--quiet"],
@@ -139,7 +139,7 @@ public sealed partial class PipelineRunner
                 activitySource: CodeyBoxActivities.Sandbox,
                 log: _log))
             {
-                await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+                await PipelineAgentExecutor.RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
             }
 
             var patch = await sandbox.ExecAsync(new SandboxExec
@@ -286,8 +286,8 @@ public sealed partial class PipelineRunner
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-            await RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            await RunWithCancellation(
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await PipelineAgentExecutor.RunWithCancellation(
                 sandbox,
                 ct,
                 "git",
@@ -297,8 +297,8 @@ public sealed partial class PipelineRunner
                 "-B",
                 workBranch,
                 $"origin/{workBranch}");
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
-            await RunMasked(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await PipelineAgentExecutor.RunMasked(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
 
             const string patchPath = "/tmp/codeybox-mechanical.patch";
             var write = await sandbox.ExecAsync(new SandboxExec
@@ -309,8 +309,8 @@ public sealed partial class PipelineRunner
             if (!write.Success)
                 throw new MechanicalFixerException($"mechanical-edit could not materialize formatter patch: {write.Stderr}");
 
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "apply", "--index", patchPath);
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "apply", "--index", patchPath);
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
             await PushSandboxWorkBranchWithReconcileAsync(sandbox, workBranch, ct);
         }
         catch (MechanicalFixerException)

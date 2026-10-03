@@ -375,18 +375,18 @@ public sealed partial class PipelineRunner
             using var conflictReworkWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "conflict-rework");
             await using var sandbox = await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedRepoPath, ct);
             if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+                await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await PipelineAgentExecutor.Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
-            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await PipelineAgentExecutor.RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
 
             // Fetch the work branch + base into the sandbox clone, then check out
             // the work branch at its existing tip and start a rebase against base.
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", workBranch);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", baseBranch);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", workBranch);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", baseBranch);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
 
             // Start the rebase. We expect it to fail with conflicts (that's the
             // whole reason we're here); the agent receives the worktree in that
@@ -619,7 +619,7 @@ public sealed partial class PipelineRunner
             // the same contract the verdict / question / PR-text consumers
             // already follow (see AgentVisibleStdout).
             var visibleStdout = agentResult.Stdout is { } capturedStdout
-                ? AgentVisibleStdout(runner, capturedStdout)
+                ? PipelineAgentExecutor.AgentVisibleStdout(runner, capturedStdout)
                 : string.Empty;
             var combined = visibleStdout + "\n" + (agentResult.Stderr ?? string.Empty);
             var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);

@@ -192,7 +192,7 @@ public sealed partial class PipelineRunner
                 _timings, item.Id, timingPhase, "git.clone_into_sandbox",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
-                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                await PipelineAgentExecutor.Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             }
 
             await FetchOriginBranchAsync(sandbox, baseBranch, required: true, ct);
@@ -213,9 +213,9 @@ public sealed partial class PipelineRunner
             ValidatePickupRebaseWorkBranch(item, baseBranch, workBranch);
 
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
-            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
+            await PipelineAgentExecutor.RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
 
             IReadOnlyList<string> rebaseConflictFiles;
             IAgentRunner? rebaseReviewRunner = null;
@@ -256,7 +256,7 @@ public sealed partial class PipelineRunner
                 _timings, item.Id, timingPhase, "git.force_push_rebased_work_branch",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
-                await Run(
+                await PipelineAgentExecutor.Run(
                     sandbox,
                     "git", "-C", SandboxConventions.WorkDir,
                     "push",
