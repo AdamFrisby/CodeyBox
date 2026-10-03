@@ -32,13 +32,15 @@ public sealed class DevinQuotaProbeTests
     private static byte[] QuotaResponse(
         ulong? dailyPct = 80, ulong? weeklyPct = 40,
         ulong? dailyReset = 1800000000, ulong? weeklyReset = 1800500000,
-        ulong? overageMicros = null, ulong? acuConsumed = null, ulong? acuLimit = null,
+        long? overageMicros = null, ulong? acuConsumed = null, ulong? acuLimit = null,
         string? planName = "Pro")
     {
         var planStatus = new DevinProtoWire.MessageWriter();
         if (dailyPct is { } dp) planStatus.Field(14, dp);
         if (weeklyPct is { } wp) planStatus.Field(15, wp);
-        if (overageMicros is { } om) planStatus.Field(16, om);
+        // Signed: a negative ledger value encodes as its two's-complement
+        // 10-byte varint, exactly as the live endpoint sends it.
+        if (overageMicros is { } om) planStatus.Field(16, unchecked((ulong)om));
         if (dailyReset is { } dr) planStatus.Field(17, dr);
         if (weeklyReset is { } wr) planStatus.Field(18, wr);
         if (acuConsumed is { } ac) planStatus.Field(19, ac);
@@ -210,7 +212,60 @@ public sealed class DevinQuotaProbeTests
 
         Assert.True(snap.IsKnown);
         Assert.Equal(100, snap.AvailablePct);
+        Assert.Equal(10_000_000, snap.OverageBalanceMicros);
         Assert.Contains("overage balance $10", snap.Notes);
+        Assert.Contains("(credit)", snap.Notes);
+    }
+
+    [Fact]
+    public async Task Parse_OverageDebt_RendersOwedAndExposesSignedValue()
+    {
+        // Regression: -5,750,000 micros (-$5.75 owed) used to wrap to ~1.8e19
+        // micros and render as trillions of dollars of fake credit.
+        var probe = BuildProbe(UsageHandler(body: QuotaResponse(
+            dailyPct: 100, weeklyPct: 100, overageMicros: -5_750_000, planName: null)));
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.True(snap.IsKnown);
+        Assert.Equal(-5_750_000, snap.OverageBalanceMicros);
+        Assert.Contains("overage balance -$5.75 (owed)", snap.Notes);
+    }
+
+    [Fact]
+    public async Task Parse_OverageCredit_RendersCreditAndExposesSignedValue()
+    {
+        var probe = BuildProbe(UsageHandler(body: QuotaResponse(
+            dailyPct: 100, weeklyPct: 100, overageMicros: 1_000_000, planName: null)));
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.True(snap.IsKnown);
+        Assert.Equal(1_000_000, snap.OverageBalanceMicros);
+        Assert.Contains("overage balance $1 (credit)", snap.Notes);
+    }
+
+    [Fact]
+    public async Task Parse_OverageZero_ExposesZeroWithoutNote()
+    {
+        var probe = BuildProbe(UsageHandler(body: QuotaResponse(
+            dailyPct: 100, weeklyPct: 100, overageMicros: 0, planName: null)));
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.True(snap.IsKnown);
+        Assert.Equal(0, snap.OverageBalanceMicros);
+        Assert.DoesNotContain("overage", snap.Notes ?? string.Empty);
+    }
+
+    [Fact]
+    public async Task Parse_OverageSentinel_TreatedAsAbsent()
+    {
+        // The -1 sentinel is absent data, not a one-microdollar debt.
+        var probe = BuildProbe(UsageHandler(body: QuotaResponse(
+            dailyPct: 65, weeklyPct: null, overageMicros: -1)));
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.True(snap.IsKnown);
+        Assert.Null(snap.OverageBalanceMicros);
+        Assert.DoesNotContain("overage", snap.Notes ?? string.Empty);
     }
 
     [Fact]
