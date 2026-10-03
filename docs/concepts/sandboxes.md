@@ -17,6 +17,7 @@ operational trade-off matches your deployment.
 | `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
 | `runloop`         | Hosted VM (plugin, `codeybox.runloop`)       | Runloop account and API key; plugin allowlisted and enabled      | Working — plugin, off by default |
 | `blaxel`          | Hosted microVM (plugin, `codeybox.blaxel`)   | Blaxel account, workspace and API key; plugin allowlisted and enabled | Working — plugin, off by default |
+| `modal`           | Hosted container (plugin, `codeybox.modal`)  | Modal account and token pair; plugin allowlisted and enabled     | Working — plugin, off by default |
 
 Multipass and Incus are configured independently: selecting Incus is explicit
 and inherits none of Multipass's configuration, baselines, or lifecycle state.
@@ -791,6 +792,32 @@ egress) with two differences that matter when choosing between them:
 Like `runloop` it refuses any named network profile outright
 (`NotEnforced`): unprofiled work only.
 
+## `modal` — hosted containers via the `codeybox.modal` plugin
+
+Sandboxes run as Modal Sandboxes (hosted containers with custom images,
+filesystem snapshots, high concurrency, and streaming execution), contributed
+as a sandbox provider kind through the plugin trust model — off unless the
+operator allowlists **and** enables `codeybox.modal`. Full operator reference
+lives in
+[`plugins/sandbox/CodeyBox.ModalSandboxPlugin/README.md`](../../plugins/sandbox/CodeyBox.ModalSandboxPlugin/README.md)
+and [`docs/extending/modal-sandbox-plugin.md`](../extending/modal-sandbox-plugin.md):
+what to configure, what it costs, and what it cannot do.
+
+The posture mirrors `runloop` (hosted guest, staged mounts, provider-owned
+egress, `NotEnforced`) with three differences that matter when choosing
+between them:
+
+- **Concurrency is the point.** Member capacity may legitimately be far above
+  any local provider's; admission gates and live load keep least-loaded
+  placement accurate at that scale.
+- **Images, not bakes.** The toolchain arrives via the operator-baked
+  `ImageRef` (or a restore `SnapshotId`); the provider declares no
+  `baseline-bake`, `suspend-resume`, disk guard, cache seeding, or port
+  publishing — only `teardown`.
+- **Preserve is snapshot-and-terminate.** `StopAndPreserveAsync` freezes the
+  filesystem as a named snapshot and then terminates the sandbox; there is no
+  resume path to adopt, so recovery leases are explicitly refused.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -803,6 +830,7 @@ Like `runloop` it refuses any named network profile outright
 | No local KVM available, hosted VMs acceptable               | `sprites`           |
 | Hosted VMs with snapshots/suspend-resume, plugin-managed      | `runloop`           |
 | Hosted microVMs with standby suspend/resume, plugin-managed  | `blaxel`            |
+| Hosted containers with custom images/snapshots, high concurrency | `modal`         |
 
 ## Sandbox classes (`CodeyBox:SandboxClasses`)
 
@@ -885,6 +913,7 @@ varies by provider:**
 | sprites      | Allowed hosts declared per profile through the Sprites API; enforced by the provider, not by you |
 | runloop      | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
 | blaxel       | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
+| modal        | None — plugin kind, classified `NotEnforced`; named network profiles are refused (`AllowedHosts` is recorded intent only) |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
