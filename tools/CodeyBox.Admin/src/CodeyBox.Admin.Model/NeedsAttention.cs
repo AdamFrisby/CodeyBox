@@ -53,6 +53,18 @@ public sealed record NeedsAttentionItem
     /// <summary>Orchestrator lifecycle state name (e.g. "Failed", "NeedsOperatorInput").</summary>
     public string State { get; init; } = string.Empty;
 
+    /// <summary>
+    /// Whether a worker currently holds the item (bound-worker signal from
+    /// <c>GET /workitems</c>). Defaults true so entries built without the
+    /// signal keep the historical state-based reading.
+    /// </summary>
+    public bool IsRunning { get; init; } = true;
+
+    /// <summary>
+    /// Retried durable checkpoint with no worker holding it — waiting to resume.
+    /// </summary>
+    public bool HasPendingResume { get; init; }
+
     public string ProjectId { get; init; } = string.Empty;
 
     /// <summary>Informational failure category ("infrastructure", "build", ...).</summary>

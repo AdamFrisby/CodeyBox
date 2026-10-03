@@ -19,7 +19,9 @@ internal static class Fixtures
         IReadOnlyList<string>? dependsOn = null,
         bool dependsOnSatisfied = true,
         DateTimeOffset? createdAt = null,
-        DateTimeOffset? updatedAt = null) => new()
+        DateTimeOffset? updatedAt = null,
+        bool isRunning = true,
+        bool hasPendingResume = false) => new()
         {
             Id = id,
             Title = title,
@@ -29,6 +31,8 @@ internal static class Fixtures
             UpdatedAt = updatedAt ?? Now.AddMinutes(-5),
             DependsOn = dependsOn ?? [],
             DependsOnSatisfied = dependsOnSatisfied,
+            IsRunning = isRunning,
+            HasPendingResume = hasPendingResume,
         };
 
     public static FleetSnapshot Snapshot(

@@ -76,13 +76,47 @@ public sealed class FleetSummaryEndpointTests : IDisposable
     [Fact]
     public async Task GetFleetSummary_WorkingItem_CountsAsInFlight()
     {
-        _factory.SeedWorkItem("proj-alpha", WorkItemState.Working);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Working, startedAt: DateTimeOffset.UtcNow);
 
         var resp = await _client.GetAsync("/fleet/summary");
         var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
         var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
         Assert.Equal(0, row.QueuedCount);
         Assert.Equal(1, row.InFlightCount);
+        Assert.Equal(0, row.WaitingCount);
+        Assert.Equal("Working", row.CurrentPhase);
+    }
+
+    [Fact]
+    public async Task GetFleetSummary_WorkingWithoutStartedAt_IsWaitingNotInFlight()
+    {
+        // A durable checkpoint retried into Working with no worker holding
+        // the row: waiting for a dispatch slot, never running.
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Working);
+
+        var resp = await _client.GetAsync("/fleet/summary");
+        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
+        Assert.Equal(0, row.QueuedCount);
+        Assert.Equal(0, row.InFlightCount);
+        Assert.Equal(1, row.WaitingCount);
+        Assert.Null(row.CurrentPhase);
+    }
+
+    [Fact]
+    public async Task GetFleetSummary_RunningCountsEqualBoundWorkers()
+    {
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Working, startedAt: DateTimeOffset.UtcNow);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Working);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Reworking);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Queued);
+
+        var resp = await _client.GetAsync("/fleet/summary");
+        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
+        Assert.Equal(1, row.QueuedCount);
+        Assert.Equal(1, row.InFlightCount);
+        Assert.Equal(2, row.WaitingCount);
         Assert.Equal("Working", row.CurrentPhase);
     }
 
@@ -135,7 +169,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
     [Fact]
     public async Task GetFleetSummary_InFlightItemsNotInRecentOutcomes()
     {
-        _factory.SeedWorkItem("proj-alpha", WorkItemState.Working);
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.Working, startedAt: DateTimeOffset.UtcNow);
         _factory.SeedWorkItem("proj-alpha", WorkItemState.Done);
 
         var resp = await _client.GetAsync("/fleet/summary");
@@ -266,7 +300,8 @@ public sealed class FleetSummaryEndpointTests : IDisposable
         string? PausedReason,
         double? MonthlySpendUsd,
         double? MonthlyBudgetUsd,
-        string BudgetThresholdState);
+        string BudgetThresholdState,
+        int WaitingCount = 0);
 }
 
 /// <summary>
@@ -301,10 +336,10 @@ internal sealed class FleetApiFactory : WebApplicationFactory<Program>
         Store = new SqliteWorkItemStore(_dbPath);
     }
 
-    public void SeedWorkItem(string projectId, WorkItemState state)
-        => SeedWorkItemAt(projectId, state, DateTimeOffset.UtcNow);
+    public void SeedWorkItem(string projectId, WorkItemState state, DateTimeOffset? startedAt = null)
+        => SeedWorkItemAt(projectId, state, DateTimeOffset.UtcNow, startedAt);
 
-    public void SeedWorkItemAt(string projectId, WorkItemState state, DateTimeOffset updatedAt)
+    public void SeedWorkItemAt(string projectId, WorkItemState state, DateTimeOffset updatedAt, DateTimeOffset? startedAt = null)
     {
         var item = new WorkItem
         {
@@ -318,12 +353,12 @@ internal sealed class FleetApiFactory : WebApplicationFactory<Program>
 
         if (state != WorkItemState.Queued)
         {
-            var updated = item.With(state) with { UpdatedAt = updatedAt };
+            var updated = item.With(state) with { UpdatedAt = updatedAt, StartedAt = startedAt };
             Store.UpdateAsync(updated).GetAwaiter().GetResult();
         }
-        else if (updatedAt != item.UpdatedAt)
+        else if (updatedAt != item.UpdatedAt || startedAt is not null)
         {
-            var updated = item with { UpdatedAt = updatedAt };
+            var updated = item with { UpdatedAt = updatedAt, StartedAt = startedAt };
             Store.UpdateAsync(updated).GetAwaiter().GetResult();
         }
     }

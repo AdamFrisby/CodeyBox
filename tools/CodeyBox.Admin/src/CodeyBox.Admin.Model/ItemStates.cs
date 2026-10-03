@@ -53,6 +53,15 @@ public static class ItemStates
     public static bool IsQueued(string? state) =>
         string.Equals(state, "Queued", StringComparison.Ordinal);
 
+    /// <summary>
+    /// Whether <paramref name="state"/> is a live, non-terminal,
+    /// non-queued, non-parked lifecycle state. Used only as the fallback
+    /// reading when a snapshot predates the bound-worker signal; live code
+    /// prefers <c>AdminWorkItem.IsRunning</c>.
+    /// </summary>
+    public static bool IsInFlightState(string? state) =>
+        state is not null && KnownInFlight.Contains(state);
+
     public static bool IsTerminal(string? state) =>
         state is not null && (Failed.Contains(state) || Succeeded.Contains(state) || state == "Cancelled");
 

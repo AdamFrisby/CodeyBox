@@ -128,12 +128,35 @@ public static class StatusVocabulary
 
     public static StatusInfo ForWorkItem(string? state)
     {
-        if (state is not null && WorkItems.TryGetValue(state.Trim(), out var info))
+        return ForWorkItem(state, isRunning: null, hasPendingResume: null);
+    }
+
+    /// <summary>
+    /// Work-item chip honouring the bound-worker signal from
+    /// <c>GET /workitems</c> (<c>isRunning</c>/<c>hasPendingResume</c>). A
+    /// worker-occupiable state with no worker holding the row renders as
+    /// waiting — a retried durable checkpoint as "Waiting (resume)" — never
+    /// as running. Null signals (servers predating the fields) keep the
+    /// historical state-only reading.
+    /// </summary>
+    public static StatusInfo ForWorkItem(string? state, bool? isRunning, bool? hasPendingResume)
+    {
+        var trimmed = state?.Trim();
+        // Worker-occupiable states live in Admin.Model.ItemStates (single
+        // source of truth); the Ordinal comparison matches the
+        // orchestrator's enum names exactly as the API serializes them.
+        if (isRunning == false && trimmed is not null && CodeyBox.Admin.Model.ItemStates.KnownInFlight.Contains(trimmed))
+        {
+            if (hasPendingResume == true)
+                return new("Waiting (resume)", "↺", "wait", $"Waiting to resume the interrupted {trimmed} turn — no worker holds it");
+            return new("Waiting", "◌", "wait", $"{trimmed} — no worker holds it, waiting for a dispatch slot");
+        }
+        if (trimmed is not null && WorkItems.TryGetValue(trimmed, out var info))
         {
             return info;
         }
 
-        return new(string.IsNullOrWhiteSpace(state) ? "Unknown" : state.Trim(), "?", "muted", "Unrecognised work-item state");
+        return new(string.IsNullOrWhiteSpace(trimmed) ? "Unknown" : trimmed, "?", "muted", "Unrecognised work-item state");
     }
 
     public static StatusInfo ForRelease(string? state)

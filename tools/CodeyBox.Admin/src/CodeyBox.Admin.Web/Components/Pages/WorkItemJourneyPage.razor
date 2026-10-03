@@ -33,7 +33,7 @@ else
 
     <h1>Journey — @_item.Title</h1>
     <p>
-        <StatusChip Info="@StatusVocabulary.ForWorkItem(_item.State)" />
+        <StatusChip Info="@StatusVocabulary.ForWorkItem(_item.State, _item.IsRunning, _item.HasPendingResume)" />
         <span>Currently: <strong>@_journey.WaitingFor</strong></span>
     </p>
 

@@ -3716,6 +3716,42 @@ public sealed class SqliteWorkItemStore :
         return results;
     }
 
+    public async Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetRunningCountsAsync(CancellationToken ct = default)
+    {
+        // Worker-held rows only: started_at IS NOT NULL with the same
+        // terminal/parked exclusion as WorkItemInFlight.IsRunning, so the
+        // fleet "running" count mirrors occupied worker slots rather than
+        // the lifecycle state (a retried checkpoint sits in Working with
+        // started_at NULL until pickup and is excluded here).
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct).ConfigureAwait(false);
+        using var cmd = readConn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT project_id, state, COUNT(*) AS cnt, MAX(updated_at) AS max_updated_at
+            FROM work_items
+            WHERE started_at IS NOT NULL
+              AND state NOT IN (
+                  {(int)WorkItemState.Done},
+                  {(int)WorkItemState.Failed},
+                  {(int)WorkItemState.Cancelled},
+                  {(int)WorkItemState.AuditFailed},
+                  {(int)WorkItemState.MergeConflictResolutionFailed},
+                  {(int)WorkItemState.NeedsOperatorInput},
+                  {(int)WorkItemState.WaitingForQuotaReset},
+                  {(int)WorkItemState.WaitingForAgentResume},
+                  {(int)WorkItemState.WaitingForTransientRetry},
+                  {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                  {(int)WorkItemState.NoActionRequired}
+              )
+            GROUP BY project_id, state;
+            """;
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        var results = new List<(string, int, int, string)>();
+        while (await reader.ReadAsync(ct))
+            results.Add((reader.GetString(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetString(3)));
+        return results;
+    }
+
     public async Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default)
     {
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);

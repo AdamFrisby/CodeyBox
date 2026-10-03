@@ -20,6 +20,20 @@ public sealed class WorkItemDto
     public string? BaseBranch { get; set; }
     public string? WorkBranch { get; set; }
     public string State { get; set; } = "";
+    /// <summary>
+    /// Bound-worker signal from the orchestrator (<c>isRunning</c> on
+    /// <c>GET /workitems</c>): false while a retried checkpoint waits for a
+    /// dispatch slot. Null when the server predates the field — callers fall
+    /// back to the state-based reading.
+    /// </summary>
+    public bool? IsRunning { get; set; }
+    /// <summary>
+    /// Retried durable checkpoint with no worker holding it (<c>hasPendingResume</c>).
+    /// Null when the server predates the field.
+    /// </summary>
+    public bool? HasPendingResume { get; set; }
+    /// <summary>First pickup instant of the current attempt; null until a worker claims the item.</summary>
+    public DateTimeOffset? StartedAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
     public string? LastError { get; set; }

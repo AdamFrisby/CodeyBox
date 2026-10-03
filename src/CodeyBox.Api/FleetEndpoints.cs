@@ -58,12 +58,14 @@ internal static class FleetEndpoints
         var logger = loggerFactory.CreateLogger("CodeyBox.Api.FleetEndpoints");
         var allProjects = await projects.ListAsync(ct);
 
-        // Three single-pass SQL queries — no per-project N+1.
+        // Four single-pass SQL queries — no per-project N+1.
         var stateCounts = await workItems.GetFleetStateCountsAsync(ct);
+        var runningCounts = await workItems.GetFleetRunningCountsAsync(ct);
         var recentOutcomes = await workItems.GetFleetRecentOutcomesAsync(5, ct);
         var pauseStates = await workItems.GetFleetPauseStatesAsync(ct);
 
         var countsByProject = stateCounts.ToLookup(r => r.ProjectId);
+        var runningByProject = runningCounts.ToLookup(r => r.ProjectId);
         var outcomesByProject = recentOutcomes.ToLookup(r => r.ProjectId);
 
         var costStore = sp.GetService<IWorkItemCostStore>();
@@ -95,17 +97,29 @@ internal static class FleetEndpoints
                 .Where(r => r.State == (int)WorkItemState.Queued)
                 .Sum(r => r.Count);
 
-            var inFlightCount = projectCounts
-                .Where(r => IsInFlight(r.State))
-                .Sum(r => r.Count);
+            var projectRunning = runningByProject[projectId].ToList();
 
-            // Most recent in-flight state: pick the (project_id, state) row with the highest MAX(updated_at).
+            // Running means a worker holds the row (started, not terminal,
+            // not parked) — the same durable signal /workers/status and
+            // /concurrency report — so this count agrees with occupied worker
+            // slots. An item retried into Working on a durable checkpoint
+            // reports here only after a worker picks it up.
+            var inFlightCount = projectRunning.Sum(r => r.Count);
+
+            // Most recent running state: pick the (project_id, state) row with the highest MAX(updated_at).
             // ISO-8601 strings in the same format sort lexicographically by time.
-            var currentPhase = projectCounts
-                .Where(r => IsInFlight(r.State))
+            var currentPhase = projectRunning
                 .OrderByDescending(r => r.MaxUpdatedAt, StringComparer.Ordinal)
                 .Select(r => ((WorkItemState)r.State).ToString())
                 .FirstOrDefault();
+
+            // Active-state rows no worker holds (e.g. a retried checkpoint
+            // waiting for a dispatch slot): visible as waiting, counted
+            // nowhere else.
+            var runningByState = projectRunning.ToDictionary(r => r.State, r => r.Count);
+            var waitingCount = projectCounts
+                .Where(r => IsAwaitingPickup(r.State))
+                .Sum(r => r.Count - runningByState.GetValueOrDefault(r.State));
 
             var projectOutcomes = outcomesByProject[projectId]
                 .Select(r => ((WorkItemState)r.State).ToString())
@@ -129,6 +143,7 @@ internal static class FleetEndpoints
                 displayName = project.DisplayName,
                 queuedCount,
                 inFlightCount,
+                waitingCount,
                 currentPhase,
                 recentOutcomes = projectOutcomes,
                 isPaused,
@@ -143,13 +158,22 @@ internal static class FleetEndpoints
         return Results.Ok(summaries);
     }
 
-    private static bool IsInFlight(int state) =>
+    /// <summary>
+    /// Active lifecycle states whose rows may sit without a worker: anything
+    /// that is neither queued, terminal, nor parked. A row in one of these
+    /// states with no running counterpart is waiting for a dispatch pickup
+    /// (e.g. a retried durable checkpoint), not executing.
+    /// </summary>
+    private static bool IsAwaitingPickup(int state) =>
         state is not ((int)WorkItemState.Queued
             or (int)WorkItemState.Done
             or (int)WorkItemState.Failed
             or (int)WorkItemState.Cancelled
             or (int)WorkItemState.AuditFailed
             or (int)WorkItemState.MergeConflictResolutionFailed
+            or (int)WorkItemState.AbandonedAfterRecoveryAttempts
+            or (int)WorkItemState.NoActionRequired
+            or (int)WorkItemState.NeedsOperatorInput
             or (int)WorkItemState.WaitingForQuotaReset
             or (int)WorkItemState.WaitingForAgentResume
             or (int)WorkItemState.WaitingForTransientRetry);

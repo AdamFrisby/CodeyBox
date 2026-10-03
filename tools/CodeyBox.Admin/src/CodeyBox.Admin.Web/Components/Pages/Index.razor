@@ -195,7 +195,7 @@ else
                             @(string.IsNullOrWhiteSpace(item.Agent) ? "—" : item.Agent)
                         }
                     </td>
-                    <td><StatusChip Info="@StatusVocabulary.ForWorkItem(item.State)" /></td>
+                    <td><StatusChip Info="@StatusVocabulary.ForWorkItem(item.State, item.IsRunning, item.HasPendingResume)" /></td>
                     <td class="col-age" title="@AdminFormat.FormatRelative(item.CreatedAt, DateTimeOffset.UtcNow)">@item.Age</td>
                     <td class="col-actions">
                         <a href="/work-items/@item.Id" class="btn">open</a>

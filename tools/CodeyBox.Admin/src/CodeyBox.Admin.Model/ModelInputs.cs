@@ -16,6 +16,24 @@ public sealed record AdminWorkItem
     /// <summary>Orchestrator lifecycle state name (e.g. "Queued", "Working", "Done").</summary>
     public string State { get; init; } = string.Empty;
 
+    /// <summary>
+    /// Whether a worker currently holds the item. The bound-worker signal
+    /// from the orchestrator (<c>isRunning</c> on <c>GET /workitems</c>),
+    /// never derived from <see cref="State"/> alone: an item retried into
+    /// "Working" on a durable checkpoint reports false until a worker picks
+    /// it up. Defaults true so snapshots built without the signal keep the
+    /// historical state-based reading; the snapshot mapper always sets the
+    /// authoritative value.
+    /// </summary>
+    public bool IsRunning { get; init; } = true;
+
+    /// <summary>
+    /// Whether the item sits in a worker-occupiable state with a durable
+    /// agent-turn recovery boundary but no worker holding it — a retried
+    /// checkpoint waiting for a dispatch slot. Renders as waiting to resume.
+    /// </summary>
+    public bool HasPendingResume { get; init; }
+
     /// <summary>Canonical agent name (e.g. "Claude", "Codex").</summary>
     public string Agent { get; init; } = string.Empty;
 

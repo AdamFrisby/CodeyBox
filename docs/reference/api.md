@@ -335,6 +335,14 @@ Failed items also expose retry bookkeeping fields when applicable:
 (`nextTransientRetryAt`, `transientRetryAttempts`,
 `transientRetryFirstFailedAt`).
 
+Every item also carries its bound-worker signal: `startedAt` (first pickup
+instant of the current attempt; `null` until a worker claims the item),
+`isRunning` (a worker currently holds the row — derived from the bound
+worker, not the lifecycle state), and `hasPendingResume` (a retried durable
+agent-turn checkpoint with no worker holding it, waiting for a dispatch
+slot). An item in `Working` with `isRunning: false` is waiting to resume,
+not executing.
+
 ### `GET /workitems/{id}`
 
 Fetch a single work item. The `{id}` path segment accepts either:
@@ -1947,6 +1955,7 @@ for the Fleet dashboard view — one round-trip per refresh instead of N+1 per-p
     "displayName": "My App",
     "queuedCount": 3,
     "inFlightCount": 1,
+    "waitingCount": 2,
     "currentPhase": "Working",
     "recentOutcomes": ["Done", "Done", "Failed", "Done", "Done"],
     "isPaused": false,
@@ -1965,8 +1974,9 @@ for the Fleet dashboard view — one round-trip per refresh instead of N+1 per-p
 | `projectId` | string | Project identifier |
 | `displayName` | string | Human-readable project name |
 | `queuedCount` | int | Items in `Queued` state |
-| `inFlightCount` | int | Items in non-terminal, non-Queued states |
-| `currentPhase` | string? | State of the most-recently-updated in-flight item, or `null` |
+| `inFlightCount` | int | Items a worker currently holds (`startedAt` set, not terminal, not parked) — agrees with occupied worker slots |
+| `waitingCount` | int | Items in active states with no worker holding them (e.g. retried checkpoints waiting for a dispatch slot) |
+| `currentPhase` | string? | State of the most-recently-updated running item, or `null` |
 | `recentOutcomes` | string[] | States of the last ≤5 terminal items, newest first |
 | `isPaused` | bool | `true` when the project queue is paused (requires budget-alerts work item; currently always `false`) |
 | `pausedReason` | string? | Pause reason, or `null` |

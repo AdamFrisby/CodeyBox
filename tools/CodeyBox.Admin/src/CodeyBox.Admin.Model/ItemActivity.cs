@@ -98,9 +98,19 @@ public static class ActivityAnalyzer
         }
         if (!ItemStates.IsQueued(state))
         {
-            return ItemStates.KnownInFlight.Contains(state)
-                ? Activity(item.Id, ActivityKind.Running, ItemStates.IsExecuting(state) ? $"Running ({state})." : $"Between turns ({state}).")
-                : Activity(item.Id, ActivityKind.Unknown, $"Unrecognised state '{state}'.");
+            if (!ItemStates.KnownInFlight.Contains(state))
+                return Activity(item.Id, ActivityKind.Unknown, $"Unrecognised state '{state}'.");
+            // A worker-occupiable state with no worker holding the row is
+            // waiting for a dispatch slot — never running. A retried durable
+            // checkpoint names its resume so the operator sees waiting-to-
+            // resume instead of a phantom per-agent-cap violation.
+            if (!item.IsRunning)
+            {
+                return item.HasPendingResume
+                    ? Activity(item.Id, ActivityKind.WaitingForSlot, $"Waiting to resume the interrupted {state} turn — no worker holds it.")
+                    : Activity(item.Id, ActivityKind.WaitingForSlot, $"Waiting for a worker ({state}) — no worker holds it.");
+            }
+            return Activity(item.Id, ActivityKind.Running, ItemStates.IsExecuting(state) ? $"Running ({state})." : $"Between turns ({state}).");
         }
 
         var blockers = FindBlockers(item, snapshot);

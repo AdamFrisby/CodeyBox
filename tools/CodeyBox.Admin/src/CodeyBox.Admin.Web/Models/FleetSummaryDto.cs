@@ -10,6 +10,11 @@ public sealed class FleetSummaryDto
     public string DisplayName { get; set; } = "";
     public int QueuedCount { get; set; }
     public int InFlightCount { get; set; }
+    /// <summary>
+    /// Active-state rows no worker holds (e.g. retried checkpoints waiting
+    /// for a dispatch slot). Zero when the server predates the field.
+    /// </summary>
+    public int WaitingCount { get; set; }
     public string? CurrentPhase { get; set; }
     public List<string> RecentOutcomes { get; set; } = [];
     public bool IsPaused { get; set; }

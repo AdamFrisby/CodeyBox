@@ -90,7 +90,7 @@ public static class FleetMapFrameBuilder
                 continue;
             }
             var item = items[id];
-            var vocab = StatusVocabulary.ForWorkItem(item.State);
+            var vocab = StatusVocabulary.ForWorkItem(item.State, item.IsRunning, item.HasPendingResume);
             projection.Activities.TryGetValue(id, out var activity);
             var actions = MapItemActions.For(item.State);
             nodes.Add(new

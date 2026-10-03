@@ -44,7 +44,7 @@ else
         <section class="needs-card" aria-label="Needs attention: @entry.Item.Title">
             <header class="needs-card-head">
                 <a href="/work-items/@id"><strong>@entry.Item.Title</strong></a>
-                <StatusChip Info="@StatusVocabulary.ForWorkItem(entry.Item.State)" />
+                <StatusChip Info="@StatusVocabulary.ForWorkItem(entry.Item.State, entry.Item.IsRunning, entry.Item.HasPendingResume)" />
                 <span class="needs-score" title="Attention score 0–100 from the fleet model">score @entry.AttentionScore.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)</span>
             </header>
             <p class="needs-id"><CopyableId Value="@id" /> · @entry.Item.State · @entry.Item.AttemptsMade attempt(s)</p>
