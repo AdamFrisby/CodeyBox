@@ -162,6 +162,50 @@ public sealed class E2bRecordedShapeTests
             E2bSandboxProvider.EnvdBaseUrl(TestOptions(), "sb_abc123"));
     }
 
+    [Theory]
+    [InlineData("x.evil.com#")]
+    [InlineData("a/b")]
+    [InlineData("a?b=c")]
+    [InlineData("a b")]
+    [InlineData("a:b")]
+    [InlineData("a@b")]
+    [InlineData("")]
+    [InlineData("sb!abc")]
+    public void EnvdBaseUrl_RejectsDnsBreakoutIds(string sandboxId)
+    {
+        Assert.Throws<ArgumentException>(() =>
+            E2bSandboxProvider.EnvdBaseUrl(TestOptions(), sandboxId));
+    }
+
+    [Theory]
+    [InlineData("sb_abc123")]
+    [InlineData("ABC-123_xyz")]
+    [InlineData("a")]
+    public void SandboxId_AllowlistedIds_Accepted(string sandboxId)
+    {
+        Assert.True(E2bSandboxProvider.IsValidSandboxId(sandboxId));
+        Assert.False(string.IsNullOrWhiteSpace(
+            E2bSandboxProvider.EnvdBaseUrl(TestOptions(), sandboxId)));
+    }
+
+    [Fact]
+    public void SandboxId_OverlongId_Rejected()
+    {
+        Assert.False(E2bSandboxProvider.IsValidSandboxId(new string('a', 129)));
+        Assert.Throws<ArgumentException>(() =>
+            E2bSandboxProvider.EnvdBaseUrl(TestOptions(), new string('a', 129)));
+    }
+
+    [Fact]
+    public async Task ListSandboxes_OversizeBody_RejectedBeforeBuffering()
+    {
+        var handler = new OversizeControlPlaneHandler();
+        var client = new E2bApiClient(new HttpClient(handler));
+        var ex = await Assert.ThrowsAsync<E2bApiException>(
+            () => client.ListSandboxesAsync("https://api.e2b.dev", "test-key", TimeSpan.FromSeconds(5), CancellationToken.None));
+        Assert.Equal("oversize-response", ex.ErrorClass);
+    }
+
     [Fact]
     public async Task CreateAsync_MissingAccessToken_DeletesAndDefers()
     {
@@ -172,5 +216,19 @@ public sealed class E2bRecordedShapeTests
             () => provider.CreateAsync(BasicSpec(), CancellationToken.None));
         Assert.True(SandboxDeferralGuard.IsDeferral(ex));
         Assert.Single(handler.Requests, r => r.Method == HttpMethod.Delete);
+    }
+
+    /// <summary>
+    /// Declares a huge Content-Length with a tiny body: an unbounded reader
+    /// would trust the stream, a bounded reader rejects on the pre-check.
+    /// </summary>
+    private sealed class OversizeControlPlaneHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var content = new ByteArrayContent("[]"u8.ToArray());
+            content.Headers.ContentLength = 8L * 1024 * 1024;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+        }
     }
 }

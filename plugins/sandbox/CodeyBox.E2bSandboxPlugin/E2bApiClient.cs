@@ -52,6 +52,8 @@ internal sealed class E2bApiClient
 
     private const int MaxErrorBodyChars = 1024;
     private const int ListPageLimit = 100;
+    private const long MaxControlPlaneResponseBytes = 1L * 1024 * 1024;
+    private const long MaxErrorResponseBytes = 16L * 1024;
 
     private readonly HttpClient _http;
 
@@ -338,7 +340,8 @@ internal sealed class E2bApiClient
     {
         try
         {
-            var result = await response.Content.ReadFromJsonAsync<T>(JsonOptions, ct).ConfigureAwait(false);
+            var body = await ReadBoundedAsync(response, MaxControlPlaneResponseBytes, operation, ct).ConfigureAwait(false);
+            var result = JsonSerializer.Deserialize<T>(body, JsonOptions);
             if (result is null)
             {
                 throw new E2bApiException(null, "malformed-response", $"{operation} returned an empty body");
@@ -358,7 +361,7 @@ internal sealed class E2bApiClient
 
     private static async Task<IReadOnlyList<E2bSandboxDto>> ReadSandboxListAsync(HttpResponseMessage response, CancellationToken ct)
     {
-        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        var body = await ReadBoundedAsync(response, MaxControlPlaneResponseBytes, "list-sandboxes", ct).ConfigureAwait(false);
         try
         {
             using var doc = JsonDocument.Parse(body);
@@ -415,8 +418,13 @@ internal sealed class E2bApiClient
     {
         try
         {
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var bounded = await ReadBoundedAsync(response, MaxErrorResponseBytes, "error-body", ct).ConfigureAwait(false);
+            var body = Encoding.UTF8.GetString(bounded);
             return body.Length > MaxErrorBodyChars ? body[..MaxErrorBodyChars] : body;
+        }
+        catch (E2bApiException ex) when (string.Equals(ex.ErrorClass, "oversize-response", StringComparison.Ordinal))
+        {
+            return "(error body exceeded bounds)";
         }
         catch (Exception)
         {

@@ -154,14 +154,53 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
     /// Derives the per-sandbox envd gateway base URL
     /// (<c>https://{envdPort}-{sandboxId}.{domain}</c>). Host format verified
     /// against the E2B JS SDK (<c>getHost</c>); the sandbox id is an opaque
-    /// service-issued token, safe in a DNS label after validation.
+    /// service-issued token, so it is allowlist-validated here
+    /// (<c>^[A-Za-z0-9-]{1,128}$</c>) before interpolation to keep a crafted
+    /// id from breaking out of the DNS label (SSRF + token leak).
     /// </summary>
     internal static string EnvdBaseUrl(E2bSandboxOptions opts, string sandboxId)
     {
         ArgumentNullException.ThrowIfNull(opts);
-        ArgumentException.ThrowIfNullOrWhiteSpace(sandboxId);
+        ValidateSandboxId(sandboxId);
         var scheme = opts.ApiBaseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ? "http" : "https";
         return $"{scheme}://{opts.EnvdPort}-{sandboxId}.{opts.SandboxDomain}";
+    }
+
+    /// <summary>
+    /// Exact-match allowlist for E2B sandbox ids interpolated into DNS hosts
+    /// (envd gateway and preview hosts). Only ASCII letters, digits, hyphens,
+    /// and underscores (1…128 chars): enough to keep the id inside one DNS
+    /// label (no dots, slashes, or URL metacharacters), while accepting the
+    /// recorded service shape (<c>sb_abc123</c>). Underscores are not strict
+    /// LDH but cannot break out of the label.
+    /// </summary>
+    internal static bool IsValidSandboxId(string? sandboxId)
+    {
+        if (string.IsNullOrWhiteSpace(sandboxId) || sandboxId.Length > 128)
+        {
+            return false;
+        }
+
+        foreach (var c in sandboxId)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-' && c != '_')
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Rejects sandbox ids that would escape the DNS-label host sink.</summary>
+    internal static void ValidateSandboxId(string sandboxId)
+    {
+        if (!IsValidSandboxId(sandboxId))
+        {
+            throw new ArgumentException(
+                "E2B sandbox id must match ^[A-Za-z0-9_-]{1,128}$ to stay inside the envd DNS label.",
+                nameof(sandboxId));
+        }
     }
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
@@ -197,9 +236,17 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
             throw ToDeferred(ex, "create-sandbox");
         }
 
-        if (string.IsNullOrWhiteSpace(created.SandboxID))
+        if (!IsValidSandboxId(created.SandboxID))
         {
-            throw ToDeferred(new E2bApiException(null, "malformed-response", "create-sandbox returned no sandbox id"), "create-sandbox");
+            // Control-plane paths escape the id (Uri.EscapeDataString), so
+            // best-effort cleanup is safe even for a DNS-invalid id; the id
+            // never reaches a DNS host because EnvdBaseUrl rejects it.
+            if (!string.IsNullOrWhiteSpace(created.SandboxID))
+            {
+                await DeleteBestEffortAsync(opts, apiKey, created.SandboxID).ConfigureAwait(false);
+            }
+
+            throw ToDeferred(new E2bApiException(null, "malformed-response", "create-sandbox returned an invalid sandbox id"), "create-sandbox");
         }
 
         if (string.IsNullOrWhiteSpace(created.EnvdAccessToken))

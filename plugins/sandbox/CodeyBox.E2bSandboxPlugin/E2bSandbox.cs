@@ -412,6 +412,9 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
                 $"E2B preview port {port} is not in AllowedPreviewPorts; refusing to publish it.");
         }
 
+        // Same DNS-label allowlist as EnvdBaseUrl: the sandbox id is
+        // service-issued and must not break out of the preview host.
+        E2bSandboxProvider.ValidateSandboxId(Id);
         var host = $"{port}-{Id}.{opts.SandboxDomain}";
         return new SandboxPublishedPort(
             host,
