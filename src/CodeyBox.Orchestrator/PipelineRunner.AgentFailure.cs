@@ -625,7 +625,7 @@ public sealed partial class PipelineRunner
     /// <see cref="RunCheckAndActAgentAsync"/> — single invocation, no commit,
     /// no merge, no push — but evaluates the modified repo instead of the
     /// pristine base. Returns the agent-visible text (streamed chunks +
-    /// terminal payload, projected through <see cref="AgentVisibleStdout"/>
+    /// terminal payload, projected through <see cref="PipelineAgentExecutor.AgentVisibleStdout"/>
     /// for envelope-framed runners) so the verdict parser sees the full tail.
     /// </summary>
     private async Task<string> RunPostActReCheckAgentAsync(
@@ -653,10 +653,10 @@ public sealed partial class PipelineRunner
 
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         if (credential is not null && credential.Files.Count > 0)
-            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+            await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
+        await PipelineAgentExecutor.Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+        await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
 
         var aggregator = new System.Text.StringBuilder();
         Action<string>? chunkCallback = chunk =>
@@ -736,7 +736,7 @@ public sealed partial class PipelineRunner
             throw new InvalidOperationException(detail);
         }
 
-        return AgentVisibleStdout(agentRunner, aggregatedStdout);
+        return PipelineAgentExecutor.AgentVisibleStdout(agentRunner, aggregatedStdout);
     }
 
     /// <summary>

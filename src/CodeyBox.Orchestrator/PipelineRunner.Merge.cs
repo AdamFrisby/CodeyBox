@@ -157,13 +157,13 @@ public sealed partial class PipelineRunner
                 activitySource: CodeyBoxActivities.Sandbox, log: _log);
             await using (mergeCloneScope)
             {
-                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                await PipelineAgentExecutor.Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             }
             CodeyBoxMeters.SandboxLifecycle.Record(mergeCloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
             var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
-            await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
-            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
+            await PipelineAgentExecutor.RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
 
             var preMerge = await sandbox.ExecAsync(new SandboxExec
             {
@@ -433,7 +433,7 @@ public sealed partial class PipelineRunner
                     var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, chosenMergeRunner.Kind, observedModelId, ct);
                     await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
                     mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
+                    await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
                     await sandbox.SyncStateToHostAsync(ct);
                     await ImportIsolatedMergeCommitAsync(repoId, isolatedMergeRepoPath!, verificationRef, ct);
                     mergeSha = await _gitHost.ResolveCommitAsync(repoId, verificationRef, ct);
@@ -484,7 +484,7 @@ public sealed partial class PipelineRunner
             // project envelope-framed captures (devin's devin.acp NDJSON) back
             // to the agent-visible text first so the fenced section shows the
             // closing message, not escaped envelope lines.
-            return (mergeSha, agentResult.Stdout is { } mergeStdout ? AgentVisibleStdout(chosenMergeRunner, mergeStdout) : null);
+            return (mergeSha, agentResult.Stdout is { } mergeStdout ? PipelineAgentExecutor.AgentVisibleStdout(chosenMergeRunner, mergeStdout) : null);
         }
         finally
         {
@@ -802,7 +802,7 @@ public sealed partial class PipelineRunner
                 ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
             }, ct);
             if (!add.Success)
-                throw CommandFailed(add, addArgv);
+                throw PipelineAgentExecutor.CommandFailed(add, addArgv);
         }
 
         IReadOnlyList<string> remainingUnmergedPaths;

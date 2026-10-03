@@ -148,7 +148,7 @@ public sealed partial class PipelineRunner
             // Stage anything the self-review turn left dirty, mirroring the
             // work-phase staging policy: strip suggestions.json so the audit
             // branch never carries it.
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
             await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--",
@@ -168,7 +168,7 @@ public sealed partial class PipelineRunner
                     item.Id, runner.Kind, observedModelId, ct,
                     promptRevisionAtDispatch: promptRevisionAtDispatch);
                 var commitMessage = $"codeybox: pre-emptive self-review fixes\n\n{trailerBlock}";
-                await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
+                await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
             }
 
             var afterHead = await sandbox.ExecAsync(new SandboxExec
@@ -242,9 +242,9 @@ public sealed partial class PipelineRunner
     {
         try
         {
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", branch);
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "reset", "--hard", $"origin/{branch}");
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "clean", "-fdx");
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", branch);
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "reset", "--hard", $"origin/{branch}");
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "clean", "-fdx");
         }
         catch (OperationCanceledException)
         {
@@ -1131,7 +1131,7 @@ public sealed partial class PipelineRunner
             ],
             WorkingDirectory = "/",
         }, ct);
-        ThrowIfExecutionUnavailable(removal);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(removal);
         if (!removal.Success)
         {
             throw new InvalidOperationException(
@@ -1164,7 +1164,7 @@ public sealed partial class PipelineRunner
             MaxStderrBytes = 4096,
             KillOnOutputLimit = true,
         }, ct);
-        ThrowIfExecutionUnavailable(diff);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(diff);
         return diff.ExitCode switch
         {
             0 => false,
@@ -1193,7 +1193,7 @@ public sealed partial class PipelineRunner
             MaxStderrBytes = 4096,
             KillOnOutputLimit = true,
         }, ct);
-        ThrowIfExecutionUnavailable(ancestry);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(ancestry);
         if (ancestry.ExitCode == 1)
         {
             throw new InvalidDataException(
@@ -1338,7 +1338,7 @@ public sealed partial class PipelineRunner
             MaxStderrBytes = transferStderrBytes,
             KillOnOutputLimit = true,
         }, ct);
-        ThrowIfExecutionUnavailable(readResult);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(readResult);
         if (!readResult.Success || readResult.StdoutLimitExceeded)
         {
             throw new InvalidDataException(
@@ -1366,7 +1366,7 @@ public sealed partial class PipelineRunner
             MaxStderrBytes = 4096,
             KillOnOutputLimit = true,
         }, ct);
-        ThrowIfExecutionUnavailable(result);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(result);
         if (!result.Success)
             throw new InvalidOperationException($"Failed to read sandbox HEAD (exit {result.ExitCode}).");
 
@@ -1587,7 +1587,7 @@ public sealed partial class PipelineRunner
             MaxStderrBytes = 4096,
             KillOnOutputLimit = true,
         }, ct);
-        ThrowIfExecutionUnavailable(result);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(result);
         if (!result.Success || result.OutputLimitExceeded)
         {
             throw new InvalidDataException(
@@ -1611,7 +1611,7 @@ public sealed partial class PipelineRunner
         const string temporaryName = "scratchpad.tgz.tmp";
         const string archiveName = "scratchpad.tgz";
 
-        await RunWithCancellation(
+        await PipelineAgentExecutor.RunWithCancellation(
             sandbox,
             ct,
             "python3",
@@ -1696,12 +1696,12 @@ public sealed partial class PipelineRunner
                 MaxStderrBytes = 4096,
                 KillOnOutputLimit = true,
             }, ct);
-            ThrowIfExecutionUnavailable(write);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(write);
             if (!write.Success)
                 throw new InvalidDataException("A bounded host-private scratchpad chunk could not be restored.");
         }
 
-        await RunWithCancellation(
+        await PipelineAgentExecutor.RunWithCancellation(
             sandbox,
             ct,
             "python3",

@@ -72,7 +72,7 @@ public sealed partial class PipelineRunner
                 $"work item {item.Id} cannot merge because latest audit iteration {latest.Iteration} still has {latest.BlockingFindings} blocking finding(s)");
         }
 
-        var missingAuditors = MissingCompletedAuditors(latest.ScheduledAuditors, latest.CompletedAuditors);
+        var missingAuditors = PipelineControlDecisions.MissingCompletedAuditors(latest.ScheduledAuditors, latest.CompletedAuditors);
         if (missingAuditors.Count > 0)
         {
             throw new AuditUnavailableException(
@@ -125,20 +125,6 @@ public sealed partial class PipelineRunner
                 item.Id, result.VerifiedCaseIds.Count);
     }
 
-    private static IReadOnlyList<string> MissingCompletedAuditors(
-        IReadOnlyList<string>? scheduledAuditors,
-        IReadOnlyList<string>? completedAuditors)
-    {
-        if (scheduledAuditors is null || scheduledAuditors.Count == 0)
-            return [];
-
-        var completed = new HashSet<string>(completedAuditors ?? [], StringComparer.Ordinal);
-        return scheduledAuditors
-            .Where(a => !completed.Contains(a))
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-    }
-
     private async Task<bool> LatestAuditReportIterationHasLlmAgentExecutionFailureAsync(
         WorkItemId workItemId,
         int iteration,
@@ -181,71 +167,6 @@ public sealed partial class PipelineRunner
             .FirstOrDefault();
     }
 
-    private static int ResolveAuditMaxIterations(
-        WorkItem item,
-        Project project,
-        IReadOnlyList<AuditProgressSnapshot> priorAuditHistory)
-    {
-        var projectBudget = ResolveProjectAuditIterationBudget(project);
-        var maxIterations = ResolveConfiguredAuditMaxIterations(item, project);
-
-        if (priorAuditHistory.Count > 0)
-        {
-            // Retrying an item parked at the audit ceiling is an explicit
-            // operator re-drive, so continue from the prior trajectory even
-            // when static per-item budget overrides are capped at project
-            // defaults.
-            var priorMaxIteration = priorAuditHistory.Max(h => h.Iteration);
-            maxIterations = Math.Max(maxIterations, priorMaxIteration + projectBudget);
-        }
-
-        return Math.Min(ProjectAudit.MaxIterationBudget, maxIterations);
-    }
-
-    private static int ResolveConfiguredAuditMaxIterations(WorkItem item, Project project)
-    {
-        var projectBudget = ResolveProjectAuditIterationBudget(project);
-        return Math.Min(
-            ProjectAudit.MaxIterationBudget,
-            ResolveConfiguredAuditIterationBudget(item, project.Audit, projectBudget));
-    }
-
-    private static int ResolveProjectAuditIterationBudget(Project project)
-        => Math.Clamp(project.Audit.MaxIterations, 1, ProjectAudit.MaxIterationBudget);
-
-    private static bool HasIncompleteFinalReworkExtension(
-        IReadOnlyList<AuditProgressSnapshot> priorAuditHistory,
-        int configuredMaxIterations)
-        => priorAuditHistory.Any(progress =>
-            !progress.IsComplete
-            && AuditProgressRequiresRework(progress)
-            && progress.Iteration >= configuredMaxIterations);
-
-    private static int ResolveConfiguredAuditIterationBudget(
-        WorkItem item,
-        ProjectAudit audit,
-        int projectBudget)
-    {
-        var overrideCap = ResolveAuditBudgetOverrideCap(audit, projectBudget);
-        var requestedOverride = Math.Max(
-            item.AuditMaxIterations.GetValueOrDefault(),
-            ResolveComplexityAuditIterationBudget(item.AuditComplexity, audit).GetValueOrDefault());
-        return Math.Max(projectBudget, Math.Min(overrideCap, requestedOverride));
-    }
-
-    private static int ResolveAuditBudgetOverrideCap(ProjectAudit audit, int projectBudget)
-        => Math.Clamp(
-            audit.BudgetOverrideMaxIterations.GetValueOrDefault(projectBudget),
-            projectBudget,
-            ProjectAudit.MaxIterationBudget);
-
-    private static int? ResolveComplexityAuditIterationBudget(string? complexity, ProjectAudit audit)
-        => string.IsNullOrWhiteSpace(complexity)
-            ? null
-            : audit.ComplexityIterationBudgets.TryGetValue(complexity.Trim(), out var budget) && budget > 0
-                ? budget
-                : null;
-
     private async Task<string?> TryResolveWorkBranchTipAsync(
         string repoId,
         string workBranch,
@@ -262,50 +183,26 @@ public sealed partial class PipelineRunner
         }
     }
 
-    private static IReadOnlyList<string> FingerprintFindings(IReadOnlyList<AuditFinding> findings)
-        => findings
-            .Select(f =>
-            {
-                var (files, _) = FindingIdComputer.ParseLocation(f.Location);
-                return FindingIdComputer.Compute(f.AuditorName, f.Title, files);
-            })
-            .Distinct(StringComparer.Ordinal)
-            .OrderBy(id => id, StringComparer.Ordinal)
-            .ToList();
+    // Control/execution seam compatibility: these decisions now live on
+    // PipelineControlDecisions. The one-line forwarders below stay so the
+    // existing suite (which pins PipelineRunner.X) passes unmodified; new
+    // code must call PipelineControlDecisions directly.
+    internal static bool AuditProgressRequiresRework(AuditProgressSnapshot progress)
+        => PipelineControlDecisions.AuditProgressRequiresRework(progress);
 
-    private static AuditProgressFinding ToProgressFinding(AuditFinding finding) => new(
-        finding.AuditorName,
-        finding.Severity,
-        finding.Title,
-        finding.Description,
-        finding.Location);
+    internal static IReadOnlyList<AuditProgressFinding> BlockingProgressFindingsForSummary(AuditProgressSnapshot progress) =>
+        PipelineControlDecisions.BlockingProgressFindingsForSummary(progress);
 
-    private static AuditFinding ToAuditFinding(AuditProgressFinding finding) => new(
-        finding.AuditorName,
-        finding.Severity,
-        finding.Title,
-        finding.Description,
-        finding.Location);
-
-    private static AuditFindingPayload ToEscalationWebhookFinding(AuditProgressFinding finding) => new()
-    {
-        Auditor = finding.AuditorName,
-        Severity = finding.Severity.ToString(),
-        Title = finding.Title,
-        Description = TruncateForEscalation(finding.Description),
-        Location = finding.Location,
-    };
-
-    private static string TruncateForEscalation(string value)
-        => value.Length <= AuditEscalationFindingDescriptionLimit
-            ? value
-            : value[..AuditEscalationFindingDescriptionLimit] + "...";
-
-    // Cold-tier extraction forwarder: implementation lives on PromptComposer.
     internal static string BuildAuditMaxIterationEscalationMessage(
         IReadOnlyList<AuditProgressSnapshot> history,
         DateTimeOffset? now = null) =>
-        new PromptComposer().BuildAuditMaxIterationEscalationMessage(history, now);
+        PipelineControlDecisions.BuildAuditMaxIterationEscalationMessage(history, now);
+
+    internal static string FormatVerdictAge(TimeSpan age) =>
+        PipelineControlDecisions.FormatVerdictAge(age);
+
+    internal static (int Count, string Summary) BuildBlockingFindingSummary(AuditProgressSnapshot snapshot) =>
+        PipelineControlDecisions.BuildBlockingFindingSummary(snapshot);
 
     internal static string BuildEmptyReworkEscalationMessage(
         IReadOnlyList<AuditProgressSnapshot> history,
@@ -313,108 +210,9 @@ public sealed partial class PipelineRunner
         int reworkIterationNumber,
         int attempts,
         bool converging,
-        DateTimeOffset? now = null)
-    {
-        var last = history[^1];
-        var remaining = BuildBlockingFindingSummary(last);
-        var retrySummary = attempts == 0
-            ? "without an escalation retry"
-            : $"after {attempts} escalation retry attempt(s)";
-        var progressSummary = converging
-            ? "audit history was converging"
-            : "audit history had not established convergence yet";
-
-        return
-            $"Rework agent {agent.Value} produced no changes on rework iteration {reworkIterationNumber} {retrySummary}; " +
-            $"{progressSummary}. Parked for operator review instead of hard-failing on a blank in-budget rework pass. " +
-            $"{remaining.Count} blocking finding(s) remain after audit iteration {last.Iteration}/{last.MaxIterations} ({last.NonBlockingFindings} non-blocking advisory finding(s) also recorded)" +
-            (remaining.Count == 0 ? "." : $": {remaining.Summary}") +
-            $" {FormatAuditVerdictProvenance(last, now)}";
-    }
-
-    // Cold-tier extraction forwarder: implementation lives on PromptComposer.
-    internal static string FormatAuditVerdictProvenance(AuditProgressSnapshot snapshot, DateTimeOffset? now = null) =>
-        new PromptComposer().FormatAuditVerdictProvenance(snapshot, now);
-
-    // Cold-tier extraction forwarder: implementation lives on PromptComposer.
-    internal static string FormatVerdictAge(TimeSpan age) =>
-        new PromptComposer().FormatVerdictAge(age);
-
-    // Cold-tier extraction forwarder: implementation lives on PromptComposer.
-    internal static (int Count, string Summary) BuildBlockingFindingSummary(AuditProgressSnapshot snapshot) =>
-        new PromptComposer().BuildBlockingFindingSummary(snapshot);
-
-    private static AuditMaxIterationsEscalationDetails BuildAuditMaxIterationEscalationDetails(
-        WorkItemId workItemId,
-        IReadOnlyList<AuditProgressSnapshot> history)
-    {
-        var last = history[^1];
-        var signals = BuildAuditProgressSignals(history);
-        return new AuditMaxIterationsEscalationDetails
-        {
-            WorkItemId = workItemId.ToString(),
-            Iteration = last.Iteration,
-            MaxIterations = last.MaxIterations,
-            BlockingFindings = last.BlockingFindings,
-            NonBlockingFindings = last.NonBlockingFindings,
-            ProgressObserved = signals.Count > 0,
-            ProgressSignals = signals,
-            History = BuildAuditProgressIterationDetails(history),
-            RemainingBlockingFindings = BlockingProgressFindingsForSummary(last)
-                .Take(AuditEscalationFindingsPerIterationLimit)
-                .Select(ToEscalationWebhookFinding)
-                .ToList(),
-            ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
-            VerdictStatus = last.Status,
-            VerdictRecordedAt = last.RecordedAt,
-        };
-    }
-
-    private static IReadOnlyList<AuditProgressIterationDetails> BuildAuditProgressIterationDetails(
-        IReadOnlyList<AuditProgressSnapshot> history)
-        => history.TakeLast(AuditEscalationHistoryLimit)
-            .Select(h => new AuditProgressIterationDetails
-            {
-                Iteration = h.Iteration,
-                BlockingFindings = h.BlockingFindings,
-                NonBlockingFindings = h.NonBlockingFindings,
-                Status = h.Status,
-                RecordedAt = h.RecordedAt,
-                BlockingFindingsDetails = h.BlockingFindingsDetails
-                    .Take(AuditEscalationFindingsPerIterationLimit)
-                    .Select(ToEscalationWebhookFinding)
-                    .ToList(),
-                Findings = h.Findings
-                    .Take(AuditEscalationFindingsPerIterationLimit)
-                    .Select(ToEscalationWebhookFinding)
-                    .ToList(),
-            })
-            .ToList();
-
-    private static IReadOnlyList<string> BuildAuditProgressSignals(IReadOnlyList<AuditProgressSnapshot> history)
-    {
-        if (history.Count < 2)
-            return [];
-
-        var last = history[^1];
-        var signals = new List<string>();
-        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings > last.BlockingFindings))
-            signals.Add("blocking_findings_decreased");
-
-        var lastTotal = last.BlockingFindings + last.NonBlockingFindings;
-        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings + h.NonBlockingFindings > lastTotal))
-            signals.Add("total_findings_decreased");
-
-        var lastIds = last.BlockingFindingIds.ToHashSet(StringComparer.Ordinal);
-        if (history.Take(history.Count - 1).Any(h => !h.BlockingFindingIds.ToHashSet(StringComparer.Ordinal).SetEquals(lastIds)))
-            signals.Add("blocking_findings_changed");
-
-        if (last.WorkBranchTip is { } lastTip
-            && history.Take(history.Count - 1).Any(h => h.WorkBranchTip is { } tip && !string.Equals(tip, lastTip, StringComparison.Ordinal)))
-            signals.Add("work_branch_tip_changed");
-
-        return signals;
-    }
+        DateTimeOffset? now = null) =>
+        PipelineControlDecisions.BuildEmptyReworkEscalationMessage(
+            history, agent, reworkIterationNumber, attempts, converging, now);
 
     /// <summary>
     /// Deployment-stage outcome for one audit iteration. Null (rather than an

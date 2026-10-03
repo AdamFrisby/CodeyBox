@@ -1376,7 +1376,7 @@ public sealed partial class PipelineRunner
             MaxStderrBytes = 4096,
             KillOnOutputLimit = true,
         }, ct);
-        ThrowIfExecutionUnavailable(removal);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(removal);
         if (!removal.Success || removal.StdoutLimitExceeded || removal.StderrLimitExceeded)
             throw new InvalidOperationException("Failed to remove reserved agent scratchpad paths from the Git index.");
 
@@ -1447,7 +1447,7 @@ public sealed partial class PipelineRunner
             MaxStderrBytes = 4096,
             KillOnOutputLimit = true,
         }, ct);
-        ThrowIfExecutionUnavailable(check);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(check);
         if (!check.Success || check.StdoutLimitExceeded || check.StderrLimitExceeded)
             throw new InvalidOperationException("Failed to verify reserved agent scratchpad paths are absent from Git.");
         if (!string.IsNullOrEmpty(check.Stdout))

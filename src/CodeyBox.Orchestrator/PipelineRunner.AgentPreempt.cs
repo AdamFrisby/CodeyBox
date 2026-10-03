@@ -52,7 +52,7 @@ public sealed partial class PipelineRunner
                 MaxStderrBytes = 4096,
                 KillOnOutputLimit = true,
             }, conversionCts.Token);
-            ThrowIfExecutionUnavailable(retainedBranch);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(retainedBranch);
             if (!retainedBranch.Success
                 || retainedBranch.OutputLimitExceeded
                 || !string.Equals(retainedBranch.Stdout.Trim(), branch, StringComparison.Ordinal))
@@ -68,7 +68,7 @@ public sealed partial class PipelineRunner
                 MaxStderrBytes = 4096,
                 KillOnOutputLimit = true,
             }, conversionCts.Token);
-            ThrowIfExecutionUnavailable(retainedOrigin);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(retainedOrigin);
             if (!retainedOrigin.Success
                 || retainedOrigin.OutputLimitExceeded
                 || !string.Equals(retainedOrigin.Stdout.Trim(), expectedOrigin, StringComparison.Ordinal))
@@ -166,7 +166,7 @@ public sealed partial class PipelineRunner
                 await RemovePreemptScratchpadFilesAsync(sandbox, ct);
             }
 
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "add", "-A");
             var suggestionsRemoval = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv =
@@ -179,7 +179,7 @@ public sealed partial class PipelineRunner
                 MaxStderrBytes = 4096,
                 KillOnOutputLimit = true,
             }, ct);
-            ThrowIfExecutionUnavailable(suggestionsRemoval);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(suggestionsRemoval);
             if (!suggestionsRemoval.Success || suggestionsRemoval.OutputLimitExceeded)
                 throw new InvalidOperationException("Failed to remove suggestions.json from the preempt checkpoint index.");
             // Keep the internal agent-log scratch dir out of the preempt checkpoint
@@ -188,7 +188,7 @@ public sealed partial class PipelineRunner
             await StripAgentLogScratchFromIndexAsync(sandbox, ct);
             await StripReservedScratchpadPathsFromIndexAsync(sandbox, ct);
             var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, agentKind, observedModelId, ct);
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
                 $"codeybox: preempt checkpoint {item.Title}\n\n{trailerBlock}");
             await EnsureReservedScratchpadPathsAbsentFromTreeAsync(sandbox, ct);
             var sourceCommitSha = await ReadSandboxHeadShaAsync(sandbox, ct);
@@ -206,7 +206,7 @@ public sealed partial class PipelineRunner
                 scratchpadStoreForRollback = scratchpadStore;
                 savedCheckpointRef = typedCheckpointRef;
             }
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
+            await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{checkpointRef}");
             await sandbox.SyncStateToHostAsync(ct);
 
             var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -438,7 +438,7 @@ public sealed partial class PipelineRunner
             ],
             WorkingDirectory = "/",
         }, ct);
-        ThrowIfExecutionUnavailable(result);
+        PipelineAgentExecutor.ThrowIfExecutionUnavailable(result);
         if (!result.Success)
         {
             throw new InvalidOperationException(

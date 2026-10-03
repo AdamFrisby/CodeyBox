@@ -36,7 +36,7 @@ public sealed partial class PipelineRunner
             ? auditors
                 .Where(a => a.Role == AuditorRole.BuildTestGate)
                 .Select((auditor, index) => new { Auditor = auditor, Index = index })
-                .OrderBy(x => BuildTestGateOrderingTier(x.Auditor))
+                .OrderBy(x => PipelineControlDecisions.BuildTestGateOrderingTier(x.Auditor))
                 .ThenBy(x => x.Index)
                 .Select(x => x.Auditor)
                 .ToList()
@@ -86,7 +86,7 @@ public sealed partial class PipelineRunner
 
         var gatedReviewAuditors = enforceBuildTestGates
             ? remainingAuditors
-                .Where(RequiresPassedBuildTestGate)
+                .Where(PipelineControlDecisions.RequiresPassedBuildTestGate)
                 .ToList()
             : new List<IAuditor>();
         if (gatedReviewAuditors.Count > 0
@@ -100,14 +100,14 @@ public sealed partial class PipelineRunner
 
             if (!prefix.BuildTestGateFailed && !HasPassedBuildAndTestGateEvidence(prefix))
             {
-                var missingGate = MissingBuildTestGateFinding(gatedReviewAuditors);
+                var missingGate = PipelineControlDecisions.MissingBuildTestGateFinding(gatedReviewAuditors);
                 prefix = MergeAuditorBatchResults(
                     prefix,
                     new AuditorBatchResult([missingGate], null, false));
             }
 
             remainingAuditors = remainingAuditors
-                .Where(a => !RequiresPassedBuildTestGate(a))
+                .Where(a => !PipelineControlDecisions.RequiresPassedBuildTestGate(a))
                 .ToList();
 
             if (remainingAuditors.Count == 0)
@@ -248,31 +248,6 @@ public sealed partial class PipelineRunner
             remaining);
     }
 
-    private static IReadOnlyList<IAuditor> OrderAuditorsForShortCircuit(
-        IReadOnlyList<IAuditor> auditors,
-        bool auditShortCircuitEnabled)
-    {
-        if (!auditShortCircuitEnabled || auditors.Count <= 1)
-            return auditors;
-
-        return auditors
-            .Select((auditor, index) => new { Auditor = auditor, Index = index })
-            .OrderBy(x => AuditorOrdering.TierOf(x.Auditor))
-            .ThenBy(x => x.Index)
-            .Select(x => x.Auditor)
-            .ToList();
-    }
-
-    private static bool HasAuditBlockingFinding(AuditResult result, Project project)
-        => result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity);
-
-    private static bool IsDeclaredShortCircuitBlockingResult(AuditResult result)
-        => !result.Passed || result.Findings.Any(f => f.Severity == AuditSeverity.Error);
-
-    private static bool RequiresPassedBuildTestGate(IAuditor auditor)
-        => auditor is IRequiresPassedBuildTestGate
-           || string.Equals(auditor.Kind, "llm", StringComparison.OrdinalIgnoreCase);
-
     private static AuditorBatchResult EmptyAuditorBatchResult()
         => new([], null, false, CompletedAuditors: []);
 
@@ -284,16 +259,6 @@ public sealed partial class PipelineRunner
             false,
             CompletedAuditors: [],
             PassedBuildTestGateEvidence: passedBuildTestGateEvidence);
-
-    private static int BuildTestGateOrderingTier(IAuditor auditor)
-    {
-        var evidence = auditor.BuildTestGateEvidence;
-        if ((evidence & BuildTestGateEvidence.Build) == BuildTestGateEvidence.Build)
-            return 0;
-        if ((evidence & BuildTestGateEvidence.Test) == BuildTestGateEvidence.Test)
-            return 1;
-        return 2;
-    }
 
     private static AuditorBatchResult MergeAuditorBatchResults(
         AuditorBatchResult first,
@@ -331,16 +296,6 @@ public sealed partial class PipelineRunner
         };
     }
 
-    private static AuditFinding MissingBuildTestGateFinding(IReadOnlyList<IAuditor> gatedReviewAuditors)
-    {
-        var auditorList = string.Join(", ", gatedReviewAuditors.Select(a => a.Name));
-        return new AuditFinding(
-            AuditorName: "audit:build-test-gate",
-            Severity: AuditSeverity.Error,
-            Title: "build/test-gated auditor skipped because no verified build/test gate passed",
-            Description: $"The configured build/test-gated auditor(s) require verified deterministic build and test evidence before they can run: {auditorList}. Configure build/test auditor(s) with role 'build-test-gate' and gateEvidence 'build-and-test', or separate 'build' and 'test' gates, that actually run and pass before the gated auditor(s).");
-    }
-
     private static bool HasPassedBuildAndTestGateEvidence(AuditorBatchResult result)
         => (result.PassedBuildTestGateEvidence & BuildTestGateEvidence.BuildAndTest)
            == BuildTestGateEvidence.BuildAndTest;
@@ -357,7 +312,7 @@ public sealed partial class PipelineRunner
         if (run.Auditor.Role != AuditorRole.BuildTestGate)
             return run;
 
-        var blocking = HasAuditBlockingFinding(run.Result, project);
+        var blocking = PipelineControlDecisions.HasAuditBlockingFinding(run.Result, project);
         var unverified = run.Result.Passed
             && !blocking
             && run.Result.BuildTestGateEvidenceVerified == false
@@ -425,39 +380,6 @@ public sealed partial class PipelineRunner
            && run.Result.Passed
            && run.Result.BuildTestGateEvidenceVerified == false
            && run.Result.Findings.Count == 0;
-
-    /// <summary>
-    /// Synthesizes the explicit not-run result for an auditor whose invocation
-    /// consumes gate outputs that no declared build/test gate produced this
-    /// iteration (the gate failed, could not verify, or is scheduled later).
-    /// The Warning finding records the skip without adding a second blocking
-    /// finding on top of the failed gate's own verdict; the auditor is
-    /// counted as completed so the iteration's completeness accounting stays
-    /// whole.
-    /// </summary>
-    private static AuditResult SkippedGateConsumerResult(
-        IAuditor auditor,
-        BuildTestGateEvidence missingEvidence)
-    {
-        var description =
-            $"skipped: {missingEvidence} gate evidence was not produced this iteration, so the auditor was not run. " +
-            "The failing gate's own findings drive the rework verdict; running anyway could only surface a " +
-            "derived runner failure against absent build outputs.";
-        return new AuditResult(
-            Passed: false,
-            Findings:
-            [
-                new AuditFinding(
-                    auditor.Name,
-                    AuditSeverity.Warning,
-                    "skipped: build failed",
-                    description),
-            ],
-            RawOutput: description)
-        {
-            BuildTestGateEvidenceVerified = false,
-        };
-    }
 
     private async Task<AuditorBatchResult> CollectFindingsBatchAsync(
         WorkItem item,
@@ -637,15 +559,15 @@ public sealed partial class PipelineRunner
                             async (setupSandbox, setupCt) =>
                             {
                                 if (credential is not null && credential.Files.Count > 0)
-                                    await MaterialiseCredentialFilesAsync(setupSandbox, credential, setupCt);
-                                await RunWithCancellation(
+                                    await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(setupSandbox, credential, setupCt);
+                                await PipelineAgentExecutor.RunWithCancellation(
                                     setupSandbox,
                                     setupCt,
                                     "git",
                                     "clone",
                                     repositoryAccess.CloneUrlInsideSandbox,
                                     SandboxConventions.WorkDir);
-                                await RunWithCancellation(
+                                await PipelineAgentExecutor.RunWithCancellation(
                                     setupSandbox,
                                     setupCt,
                                     "git",
@@ -655,7 +577,7 @@ public sealed partial class PipelineRunner
                                     ctx.WorkBranch);
                                 // Heal an inherited root-owned $HOME/.nuget once, before
                                 // this shared sandbox's dotnet build/test/format gates run.
-                                await HealAuditNuGetHomeAsync(setupSandbox, setupCt);
+                                await PipelineAgentExecutor.HealAuditNuGetHomeAsync(setupSandbox, setupCt);
                                 // Stage the freshest ancestry-reachable
                                 // test-selection baseline (read-only) so the
                                 // coverage selector can narrow the run.
@@ -692,7 +614,7 @@ public sealed partial class PipelineRunner
                             & ~passedBuildTestGateEvidence;
                         if (missingConsumedEvidence != BuildTestGateEvidence.None)
                         {
-                            var skipped = SkippedGateConsumerResult(auditor, missingConsumedEvidence);
+                            var skipped = PipelineControlDecisions.SkippedGateConsumerResult(auditor, missingConsumedEvidence);
                             buildTestGateFailed = true;
                             findings.AddRange(skipped.Findings);
                             completedAuditors.Add(auditor.Name);
@@ -791,11 +713,11 @@ public sealed partial class PipelineRunner
                         await PublishPartialProgressAsync(findings.ToList(), completedAuditors.ToList(), ct);
                         if (detectDeclaredShortCircuit
                             && auditor.CanShortCircuitOnBlockingFinding
-                            && IsDeclaredShortCircuitBlockingResult(run.Result))
+                            && PipelineControlDecisions.IsDeclaredShortCircuitBlockingResult(run.Result))
                         {
                             declaredShortCircuitBlocking = true;
                         }
-                        var blockingForThisAuditor = HasAuditBlockingFinding(run.Result, project);
+                        var blockingForThisAuditor = PipelineControlDecisions.HasAuditBlockingFinding(run.Result, project);
                         if (project.Audit.StopOnFirstFailure && blockingForThisAuditor)
                             return new AuditorBatchResult(
                                 findings.ToList(),
@@ -930,15 +852,15 @@ public sealed partial class PipelineRunner
                         {
                             await dotnetShim.InstallAsync(setupSandbox, setupCt);
                             if (candidateCredential is not null && candidateCredential.Files.Count > 0)
-                                await MaterialiseCredentialFilesAsync(setupSandbox, candidateCredential, setupCt);
-                            await RunWithCancellation(
+                                await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(setupSandbox, candidateCredential, setupCt);
+                            await PipelineAgentExecutor.RunWithCancellation(
                                 setupSandbox,
                                 setupCt,
                                 "git",
                                 "clone",
                                 access.CloneUrlInsideSandbox,
                                 SandboxConventions.WorkDir);
-                            await RunWithCancellation(
+                            await PipelineAgentExecutor.RunWithCancellation(
                                 setupSandbox,
                                 setupCt,
                                 "git",
@@ -1282,7 +1204,7 @@ public sealed partial class PipelineRunner
                                 activeAuditAgentKind ??= run.Runner.Kind;
                             if (detectDeclaredShortCircuit
                                 && run.Auditor.CanShortCircuitOnBlockingFinding
-                                && IsDeclaredShortCircuitBlockingResult(run.Result))
+                                && PipelineControlDecisions.IsDeclaredShortCircuitBlockingResult(run.Result))
                             {
                                 declaredShortCircuitBlocking = true;
                             }
@@ -1334,7 +1256,7 @@ public sealed partial class PipelineRunner
                         completedAuditors.Add(run.Auditor.Name);
                         if (detectDeclaredShortCircuit
                             && run.Auditor.CanShortCircuitOnBlockingFinding
-                            && IsDeclaredShortCircuitBlockingResult(run.Result))
+                            && PipelineControlDecisions.IsDeclaredShortCircuitBlockingResult(run.Result))
                         {
                             declaredShortCircuitBlocking = true;
                         }
@@ -1389,19 +1311,10 @@ public sealed partial class PipelineRunner
 
         return resolved
             .Select((entry, index) => new { Entry = entry, Index = index })
-            .OrderBy(x => BatchOrderingTier(x.Entry.Auditor, detectDeclaredShortCircuit))
+            .OrderBy(x => PipelineControlDecisions.BatchOrderingTier(x.Entry.Auditor, detectDeclaredShortCircuit))
             .ThenBy(x => x.Index)
             .Select(x => x.Entry)
             .ToList();
-    }
-
-    private static int BatchOrderingTier(IAuditor auditor, bool detectDeclaredShortCircuit)
-    {
-        if (auditor.Role == AuditorRole.BuildTestGate)
-            return 0;
-        if (detectDeclaredShortCircuit && auditor.CanShortCircuitOnBlockingFinding)
-            return 1;
-        return 2;
     }
 
     private static AgentKind AuditorTimeoutAgentKind(IAuditor auditor, IAgentRunner runner) =>
@@ -1559,7 +1472,7 @@ public sealed partial class PipelineRunner
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
         }
-        result = NormalizePlanReviewRunResult(auditor, ctx, result);
+        result = PipelineControlDecisions.NormalizePlanReviewRunResult(auditor, ctx, result);
         sw.Stop();
         await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner, result));
         CodeyBoxMeters.AuditorDuration.Record(
@@ -1578,32 +1491,6 @@ public sealed partial class PipelineRunner
             sw.Elapsed,
             timingScope.ElapsedMs,
             canCaptureStructuredStream);
-    }
-
-    private static AuditResult NormalizePlanReviewRunResult(
-        IAuditor auditor,
-        AuditContext ctx,
-        AuditResult result)
-    {
-        if (!AuditTargetSemantics.IsPlanReview(ctx.EffectiveTarget)
-            || result.Passed
-            || result.Findings.Any(f => f.Severity == AuditSeverity.Error))
-        {
-            return result;
-        }
-
-        return result with
-        {
-            Findings =
-            [
-                .. result.Findings,
-                new AuditFinding(
-                    auditor.Name,
-                    AuditSeverity.Error,
-                    "plan rejected by reviewer",
-                    "The plan reviewer returned an explicit reject verdict (passed=false) without an error-severity finding."),
-            ],
-        };
     }
 
 }

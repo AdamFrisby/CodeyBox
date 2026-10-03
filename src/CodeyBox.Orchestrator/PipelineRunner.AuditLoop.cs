@@ -67,9 +67,9 @@ public sealed partial class PipelineRunner
                 }
             }
         }
-        var configuredMaxIterations = ResolveConfiguredAuditMaxIterations(item, project);
-        var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
-        var incompleteFinalReworkExtensionUsed = HasIncompleteFinalReworkExtension(
+        var configuredMaxIterations = PipelineControlDecisions.ResolveConfiguredAuditMaxIterations(item, project);
+        var maxIterations = PipelineControlDecisions.ResolveAuditMaxIterations(item, project, priorAuditHistory);
+        var incompleteFinalReworkExtensionUsed = PipelineControlDecisions.HasIncompleteFinalReworkExtension(
             priorAuditHistory,
             configuredMaxIterations);
         var auditHistory = priorAuditHistory
@@ -161,7 +161,7 @@ public sealed partial class PipelineRunner
             using var auditPhaseScope = BeginPhaseScope(item, "audit");
 
             var auditShortCircuitEnabled = _pipelineTuning.Current.AuditShortCircuitEnabled;
-            var scheduledAuditors = OrderAuditorsForShortCircuit(auditors, auditShortCircuitEnabled);
+            var scheduledAuditors = PipelineControlDecisions.OrderAuditorsForShortCircuit(auditors, auditShortCircuitEnabled);
             var scheduledAuditorNames = scheduledAuditors.Select(a => a.Name).ToList();
             await PublishAuditStartedAsync(item, project, iteration, scheduledAuditors, ct);
             var auditPhaseStart = DateTimeOffset.UtcNow;
@@ -270,7 +270,7 @@ public sealed partial class PipelineRunner
                 var prePassedBuildTestGateEvidence = BuildTestGateEvidence.None;
                 var auditorsForCollection = scheduledAuditors;
                 var preGateAttributions = new List<TestFailureAttributionResult>();
-                if (scheduledAuditors.Any(RequiresPassedBuildTestGate))
+                if (scheduledAuditors.Any(PipelineControlDecisions.RequiresPassedBuildTestGate))
                 {
                     var requiredBuildGateResult = await _requiredBuildGate.RunForAuditGateAsync(
                         item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
@@ -282,7 +282,7 @@ public sealed partial class PipelineRunner
                     {
                         preCollectedFindings.Add(requiredBuildGateResult.Finding);
                         auditorsForCollection = scheduledAuditors
-                            .Where(a => !RequiresPassedBuildTestGate(a))
+                            .Where(a => !PipelineControlDecisions.RequiresPassedBuildTestGate(a))
                             .ToList();
                     }
                 }
@@ -321,7 +321,7 @@ public sealed partial class PipelineRunner
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
 
-                if (incompleteVerdict || scheduledAuditors.Any(RequiresPassedBuildTestGate))
+                if (incompleteVerdict || scheduledAuditors.Any(PipelineControlDecisions.RequiresPassedBuildTestGate))
                 {
                     requiredBuildFinding = null;
                 }
@@ -599,7 +599,7 @@ public sealed partial class PipelineRunner
 
             if (iteration == maxIterations)
             {
-                if (HasAuditConvergenceProgress(auditHistory))
+                if (PipelineControlDecisions.HasAuditConvergenceProgress(auditHistory))
                 {
                     var escalated = await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
                     var outcome = escalated ? "delegation_escalated" : "needs_operator_input";
@@ -833,7 +833,7 @@ public sealed partial class PipelineRunner
         if (auditHistory.Count == 0 || !AuditProgressRequiresRework(auditHistory[^1]))
             return false;
 
-        if (HasAuditConvergenceProgress(auditHistory))
+        if (PipelineControlDecisions.HasAuditConvergenceProgress(auditHistory))
         {
             var escalated = await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
             var outcome = escalated ? "delegation_escalated" : "needs_operator_input";
@@ -884,7 +884,7 @@ public sealed partial class PipelineRunner
         }
 
         var findings = last.Findings
-            .Select(ToAuditFinding)
+            .Select(PipelineControlDecisions.ToAuditFinding)
             .ToList();
         _log.LogInformation(
             "Resuming work item {Id} from parked audit history by reworking iteration {AuditIteration} findings before audit iteration {NextIteration}",

@@ -60,7 +60,7 @@ public sealed partial class PipelineRunner
         if (auditHistory[^1].BlockingFindings == 0 || !auditHistory[^1].IsComplete)
             _availability?.RefundNoChangesOutcome(emptyEx.Agent, item.Id);
 
-        var converging = HasAuditConvergenceProgress(auditHistory);
+        var converging = PipelineControlDecisions.HasAuditConvergenceProgress(auditHistory);
         var configuredRetries = Math.Max(0, _pipelineTuning.Current.EmptyReworkEscalationRetries);
         var attempts = converging ? configuredRetries : 0;
 
@@ -83,7 +83,7 @@ public sealed partial class PipelineRunner
                 throw reworkPhase.Wrap(oce);
             }
 
-            var escalatedPrompt = BuildEmptyReworkEscalationPrompt(
+            var escalatedPrompt = PipelineControlDecisions.BuildEmptyReworkEscalationPrompt(
                 originalPrompt: baseReworkPrompt,
                 attempt: attempt,
                 totalAttempts: attempts);
@@ -157,22 +157,6 @@ public sealed partial class PipelineRunner
         return true;
     }
 
-    private static string BuildEmptyReworkEscalationPrompt(
-        string originalPrompt,
-        int attempt,
-        int totalAttempts)
-    {
-        var header = $"""
-            [empty-rework escalation attempt {attempt}/{totalAttempts}]
-            Your previous pass committed NO changes. You MUST modify files to
-            address the listed audit findings, or for each finding state precisely
-            why it is invalid/already-satisfied. If all escalation attempts are
-            exhausted without a commit, this work item will park for operator review.
-
-            """;
-        return string.IsNullOrEmpty(originalPrompt) ? header : header + originalPrompt;
-    }
-
     private async Task<bool> ParkAuditMaxIterationsForOperatorAsync(
         WorkItem item,
         Project project,
@@ -180,7 +164,7 @@ public sealed partial class PipelineRunner
         CancellationToken ct)
     {
         var message = _promptComposer.BuildAuditMaxIterationEscalationMessage(history);
-        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+        var details = PipelineControlDecisions.BuildAuditMaxIterationEscalationDetails(item.Id, history);
         if (_delegationEscalation is not null
             && _delegationEscalation.IsAutoTriggerArmed(DelegationTriggers.AuditMaxIterations, item))
         {
@@ -225,13 +209,13 @@ public sealed partial class PipelineRunner
         bool converging,
         CancellationToken ct)
     {
-        var message = BuildEmptyReworkEscalationMessage(
+        var message = PipelineControlDecisions.BuildEmptyReworkEscalationMessage(
             history,
             agent,
             reworkIterationNumber,
             attempts,
             converging);
-        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+        var details = PipelineControlDecisions.BuildAuditMaxIterationEscalationDetails(item.Id, history);
         await ParkAuditForOperatorAsync(
             item,
             project,
@@ -276,7 +260,7 @@ public sealed partial class PipelineRunner
                 // configured) carry no attempt and set no failure flag.
                 DelegationNote = null,
                 DelegationFailed = current.DelegationFailed
-                    || (countAttempt && IsNonAdvancingDelegationOutcome(outcome)),
+                    || (countAttempt && PipelineControlDecisions.IsNonAdvancingDelegationOutcome(outcome)),
             };
             var updated = await _store.TryUpdateIfStateAsync(parked, current.State, transitionCt);
             if (!updated)
@@ -313,16 +297,6 @@ public sealed partial class PipelineRunner
             }, CancellationToken.None);
         });
     }
-
-    /// <summary>
-    /// Whether a delegation-turn outcome completed without advancing the item
-    /// (no changes to audit, or the turn itself failed). Only counted turns
-    /// feed this verdict; parks that never ran a turn are excluded by the
-    /// caller via <c>countAttempt</c>.
-    /// </summary>
-    private static bool IsNonAdvancingDelegationOutcome(string outcome) =>
-        string.Equals(outcome, DelegationOutcomes.NoChanges, StringComparison.Ordinal)
-        || string.Equals(outcome, DelegationOutcomes.Failed, StringComparison.Ordinal);
 
     /// <summary>
     /// Appends the first-class delegation event (brief + agent/model +
@@ -701,9 +675,9 @@ public sealed partial class PipelineRunner
             maxIterations,
             blocking.Count,
             nonBlocking,
-            FingerprintFindings(blocking),
-            blocking.Select(ToProgressFinding).ToList(),
-            findings.Select(ToProgressFinding).ToList(),
+            PipelineControlDecisions.FingerprintFindings(blocking),
+            blocking.Select(PipelineControlDecisions.ToProgressFinding).ToList(),
+            findings.Select(PipelineControlDecisions.ToProgressFinding).ToList(),
             workBranchTip,
             status,
             scheduledAuditors,
@@ -725,24 +699,6 @@ public sealed partial class PipelineRunner
             record.ScheduledAuditors,
             record.CompletedAuditors,
             record.RecordedAt);
-
-    private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
-        => BuildAuditProgressSignals(history).Count > 0;
-
-    internal static bool AuditProgressRequiresRework(AuditProgressSnapshot progress)
-        // A rework iteration only makes sense when something is blocking the
-        // merge. Zero-blocking snapshots (pass verdicts, or partial in-progress
-        // snapshots holding advisory findings only) must not dispatch rework:
-        // there are no changes for the agent to make, so the pass would come
-        // back empty and wedge the item in an empty-rework park loop. Final
-        // incomplete verdicts that need attention already promote their
-        // findings to blocking at record time, so they still carry
-        // BlockingFindings > 0 here.
-        => progress.BlockingFindings > 0;
-
-    // Cold-tier extraction forwarder: implementation lives on PromptComposer.
-    internal static IReadOnlyList<AuditProgressFinding> BlockingProgressFindingsForSummary(AuditProgressSnapshot progress) =>
-        new PromptComposer().BlockingProgressFindingsForSummary(progress);
 
     private async Task<IReadOnlyList<AuditProgressSnapshot>> LoadPersistedAuditProgressHistoryAsync(
         WorkItem item,

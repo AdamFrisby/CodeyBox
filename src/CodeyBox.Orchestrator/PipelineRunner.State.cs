@@ -16,9 +16,6 @@ namespace CodeyBox.Orchestrator;
 // PipelineRunner.State.cs — Constructor, configuration fields, and shared pipeline state. The orchestration spine (RunAsync) lives in PipelineRunner.cs; phase logic lives in sibling partials.
 public sealed partial class PipelineRunner
 {
-    private const int AuditEscalationHistoryLimit = 25;
-    private const int AuditEscalationFindingsPerIterationLimit = 20;
-    private const int AuditEscalationFindingDescriptionLimit = 2000;
     // Synthetic quota probes only ask provider availability; router score is
     // irrelevant, but AgentMembership requires a valid score.
     private const int SyntheticQuotaProbeQualityScore = 100;
@@ -165,6 +162,12 @@ public sealed partial class PipelineRunner
     // Placement-driven sandbox acquisition for the work phase (null keeps the
     // legacy direct-provider path).
     private readonly SandboxPlacementAcquirer? _sandboxPlacer;
+    // Data-plane executor for agent-phase sandbox mechanics. Composed here
+    // from the same provider/placer the runner was built with, so existing
+    // construction is unchanged; the control plane calls into it for every
+    // sandbox acquisition, in-sandbox command, credential materialisation,
+    // and agent-visible-text projection.
+    private readonly PipelineAgentExecutor _agentExecutor;
     // Per-agent CLI session slot gate shared with the orchestrator's
     // concurrency accounting. Every LLM auditor attempt acquires one audit
     // slot through it, so AgentConcurrency.Members.*.MaxConcurrent bounds the
@@ -739,7 +742,7 @@ public sealed partial class PipelineRunner
         // tests and for callers that wire their own hook.
         _agenticConflictResolver = agenticConflictResolver
             ?? new AgenticConflictResolver(
-                credentialFileMaterialiser: MaterialiseCredentialFilesAsync,
+                credentialFileMaterialiser: PipelineAgentExecutor.MaterialiseCredentialFilesAsync,
                 agentSupervision: _agentSupervision,
                 authFailureClassifier: _authFailureClassifier);
         _promptComposer = new PromptComposer();
@@ -759,6 +762,7 @@ public sealed partial class PipelineRunner
         _delegationOptionsAccessor = delegationOptionsAccessor ?? (() => new DelegationOptions());
         _delegationEscalation = delegationEscalation;
         _sandboxPlacer = sandboxPlacer;
+        _agentExecutor = new PipelineAgentExecutor(sandboxes, sandboxPlacer);
         _secretLeases = secretLeases;
         _sessionSlotGate = sessionSlotGate;
         _baselineScheduler = baselineScheduler;
