@@ -715,4 +715,46 @@ public sealed class RunloopSandboxProviderTests
         Assert.Equal("sub/file", HostedGuestPath.GetRelativePath("/work", "/work/sub/file"));
         Assert.Throws<ArgumentException>(() => HostedGuestPath.GetRelativePath("/work", "/other/file"));
     }
+
+    [Fact]
+    public async Task CreateAsync_SymlinkedMountSubdir_RefusesWithoutUploadingOutsideFiles()
+    {
+        var handler = new FakeRunloopHandler();
+        var provider = NewProvider(handler);
+
+        var hostDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var outsideDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(hostDir);
+        Directory.CreateDirectory(outsideDir);
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(hostDir, "input.txt"), "hello-mount");
+            const string outsideSecret = "outside-secret-must-never-upload-41bd";
+            await File.WriteAllTextAsync(Path.Combine(outsideDir, "secret.txt"), outsideSecret);
+            Directory.CreateSymbolicLink(Path.Combine(hostDir, "linkdir"), outsideDir);
+
+            var spec = BasicSpec() with
+            {
+                Mounts = [new SandboxMount { SandboxPath = "/data", HostPath = hostDir }],
+            };
+
+            // Before the staging guard, enumeration followed the symlinked
+            // dir and uploaded the outside file to hosted storage.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => provider.CreateAsync(spec, CancellationToken.None));
+            Assert.Contains("symlink", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+            var outsideBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(outsideSecret));
+            foreach (var request in handler.Requests)
+            {
+                Assert.DoesNotContain(outsideSecret, request.Body, StringComparison.Ordinal);
+                Assert.DoesNotContain(outsideBase64, request.Body, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            Directory.Delete(hostDir, recursive: true);
+            Directory.Delete(outsideDir, recursive: true);
+        }
+    }
 }

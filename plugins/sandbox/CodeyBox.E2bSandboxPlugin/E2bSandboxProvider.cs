@@ -665,27 +665,9 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
         }
         else
         {
-            foreach (var hostFile in Directory.EnumerateFiles(hostRoot, "*", SearchOption.AllDirectories))
+            foreach (var staged in HostedMountStaging.CollectStageFiles(hostRoot, "E2B", opts.MaxStageFileCount, ct))
             {
-                ct.ThrowIfCancellationRequested();
-                var full = Path.GetFullPath(hostFile);
-                if (!full.StartsWith(hostRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-                {
-                    throw new InvalidOperationException($"Mount source escapes its root: '{hostFile}'.");
-                }
-
-                var relative = Path.GetRelativePath(hostRoot, full);
-                if (relative.Split(Path.DirectorySeparatorChar).Any(static s => s == ".." || s.Length == 0))
-                {
-                    throw new InvalidOperationException($"Mount source escapes its root: '{hostFile}'.");
-                }
-
-                files.Add((full, relative));
-                if (files.Count > opts.MaxStageFileCount)
-                {
-                    throw new InvalidOperationException(
-                        $"E2B mount staging exceeds {opts.MaxStageFileCount} files; refusing to stage.");
-                }
+                files.Add(staged);
             }
         }
 
@@ -707,6 +689,8 @@ public sealed class E2bSandboxProvider : ISandboxProvider, ISuspendingSandboxPro
 
             var guestPath = guestRoot.TrimEnd('/') + "/" + relative.Replace(Path.DirectorySeparatorChar, '/');
             HostedGuestPath.ValidateAbsolute(guestPath);
+
+            HostedMountStaging.ThrowIfSymlinked(hostRoot, hostFull, relative, "E2B");
 
             byte[] content;
             try
