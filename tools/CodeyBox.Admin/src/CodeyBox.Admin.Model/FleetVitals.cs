@@ -62,7 +62,7 @@ public static class VitalsEvaluator
         foreach (var item in items)
         {
             var state = item.State ?? string.Empty;
-            if (ItemStates.IsQueued(state))
+            if (ItemStates.IsQueued(state) || item.HasPendingResume)
             {
                 queued++;
             }
@@ -72,7 +72,14 @@ public static class VitalsEvaluator
             }
             else if (!ItemStates.IsTerminal(state))
             {
-                inFlight++;
+                // Running derives from the bound-worker signal, not the
+                // lifecycle state: a retried checkpoint sitting in Working
+                // with no worker holding it waits in the queue depth above
+                // instead of inflating the running count.
+                if (item.IsRunning)
+                    inFlight++;
+                else
+                    queued++;
             }
             if (ItemStates.IsTerminal(state) && item.UpdatedAt >= windowStart)
             {

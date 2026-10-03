@@ -1955,6 +1955,9 @@ internal static class WorkItemEndpoints
             TerminalFailureCount: item.TerminalFailureCount,
             MergeAttempts: item.MergeAttempts,
             MergeRetryReason: item.MergeRetryReason,
+            StartedAt: item.StartedAt,
+            IsRunning: WorkItemInFlight.IsRunning(item),
+            HasPendingResume: WorkItemInFlight.HasPendingResume(item),
             Knobs: item.Knobs.Count == 0
                 ? null
                 : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
@@ -2377,6 +2380,27 @@ public sealed record WorkItemDto(
     int MergeAttempts = 0,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     string? MergeRetryReason = null,
+    /// <summary>
+    /// First pickup instant of the current attempt; null until a worker
+    /// claims the item. The durable proxy for a bound worker: an item in
+    /// <c>Working</c> with no <c>StartedAt</c> is waiting for a dispatch
+    /// slot, not running. Null for items that never started.
+    /// </summary>
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    DateTimeOffset? StartedAt = null,
+    /// <summary>
+    /// Whether a worker currently holds the item. Derived from the bound
+    /// worker (<see cref="CodeyBox.Core.WorkItemInFlight.IsRunning"/>), not
+    /// from the lifecycle state alone.
+    /// </summary>
+    bool IsRunning = false,
+    /// <summary>
+    /// Whether the item sits in a worker-occupiable state with a durable
+    /// agent-turn recovery boundary but no worker holding it — a retried
+    /// checkpoint waiting for a dispatch slot. Renders as "waiting to
+    /// resume", never as running.
+    /// </summary>
+    bool HasPendingResume = false,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyDictionary<string, string>? Knobs = null);
 

@@ -677,6 +677,43 @@ public interface IWorkItemStore
     Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default);
 
     /// <summary>
+    /// Fleet aggregation over worker-held rows only: the same shape as
+    /// <see cref="GetFleetStateCountsAsync"/> but restricted to items a worker
+    /// currently holds (<see cref="WorkItemInFlight.IsRunning"/> — started,
+    /// not terminal, not parked). A durable agent-turn resume retried into
+    /// <see cref="WorkItemState.Working"/> reports here only after a worker
+    /// picks it up, so fleet "running" counts agree with occupied worker
+    /// slots instead of echoing the lifecycle state. The default
+    /// implementation streams <see cref="ListAsync"/> so existing
+    /// <see cref="IWorkItemStore"/> stubs keep working; the SQLite store
+    /// overrides with a single grouped query.
+    /// </summary>
+    async Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetRunningCountsAsync(CancellationToken ct = default)
+    {
+        var groups = new Dictionary<(string ProjectId, int State), (int Count, string MaxUpdatedAt)>();
+        await foreach (var item in ListAsync(ct).ConfigureAwait(false))
+        {
+            if (!WorkItemInFlight.IsRunning(item))
+                continue;
+            var key = (item.ProjectId.Value, (int)item.State);
+            var updatedAt = item.UpdatedAt.ToString("o");
+            if (groups.TryGetValue(key, out var existing))
+            {
+                groups[key] = (
+                    existing.Count + 1,
+                    string.CompareOrdinal(updatedAt, existing.MaxUpdatedAt) > 0 ? updatedAt : existing.MaxUpdatedAt);
+            }
+            else
+            {
+                groups[key] = (1, updatedAt);
+            }
+        }
+        return groups
+            .Select(kv => (kv.Key.ProjectId, kv.Key.State, kv.Value.Count, kv.Value.MaxUpdatedAt))
+            .ToList();
+    }
+
+    /// <summary>
     /// Fleet aggregation: returns the most-recent <paramref name="perProject"/> terminal work item states
     /// per project, newest-first. Uses ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC).
     /// Terminal states: Done, Failed, AuditFailed, MergeConflictResolutionFailed, Cancelled.

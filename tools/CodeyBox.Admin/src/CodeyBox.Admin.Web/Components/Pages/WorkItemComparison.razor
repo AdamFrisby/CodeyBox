@@ -53,7 +53,7 @@ else
         <div class="comparison-row-label">Status</div>
         @foreach (var col in _columns)
         {
-            <div class="comparison-cell"><StatusChip Info="@StatusVocabulary.ForWorkItem(col.State)" /></div>
+            <div class="comparison-cell"><StatusChip Info="@StatusVocabulary.ForWorkItem(col.State, col.IsRunning, col.HasPendingResume)" /></div>
         }
 
         <div class="comparison-row-label">Work branch</div>

@@ -59,6 +59,8 @@ public static class FleetMapSnapshotMapper
                     Id = item.Id,
                     Title = item.Title ?? string.Empty,
                     State = item.State ?? string.Empty,
+                    IsRunning = item.IsRunning ?? ItemStates.IsInFlightState(item.State),
+                    HasPendingResume = item.HasPendingResume ?? false,
                     Agent = item.Agent ?? string.Empty,
                     CreatedAt = item.CreatedAt,
                     UpdatedAt = item.UpdatedAt,

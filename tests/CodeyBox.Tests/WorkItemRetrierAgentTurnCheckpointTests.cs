@@ -1,4 +1,5 @@
 using CodeyBox.Agents;
+using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -51,6 +52,54 @@ public sealed class WorkItemRetrierAgentTurnCheckpointTests : IDisposable
         Assert.Equal("high", persisted.AgentTurnResumeCheckpoint.ReasoningMode);
         Assert.Equal("native-session-retrier", persisted.AgentTurnResumeCheckpoint.NativeSessionId?.Value);
         Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CheckpointRetry_ReportsNotRunningUntilPickedUp()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = NewGitHost();
+        var item = NewRecoverableItem(
+            WorkItemState.Failed,
+            AgentTurnResumePhase.Work,
+            failureKind: WorkItemFailureKinds.Infrastructure);
+        await store.CreateAsync(item);
+        await CreateRepositoryAsync(gitHost, item, createWorkBranch: false);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: null);
+
+        Assert.True(result.Success, result.Error);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        // The lifecycle state names the resume target, but no worker holds
+        // the row: the item reports not-running until a worker picks it up.
+        Assert.Equal(WorkItemState.Working, persisted!.State);
+        Assert.Null(persisted.StartedAt);
+        Assert.False(WorkItemInFlight.IsRunning(persisted));
+        Assert.True(WorkItemInFlight.HasPendingResume(persisted));
+
+        var dto = WorkItemEndpoints.ToDto(
+            persisted,
+            project: null,
+            statesById: new Dictionary<WorkItemId, WorkItemState>());
+        Assert.Equal("Working", dto.State);
+        Assert.False(dto.IsRunning);
+        Assert.True(dto.HasPendingResume);
+        Assert.Null(dto.StartedAt);
+
+        // A worker pickup stamps StartedAt: the same row then reports running.
+        var pickedUp = persisted with { StartedAt = DateTimeOffset.UtcNow };
+        await store.UpdateAsync(pickedUp);
+        var pickedUpDto = WorkItemEndpoints.ToDto(
+            pickedUp,
+            project: null,
+            statesById: new Dictionary<WorkItemId, WorkItemState>());
+        Assert.True(pickedUpDto.IsRunning);
+        Assert.False(pickedUpDto.HasPendingResume);
+        Assert.NotNull(pickedUpDto.StartedAt);
     }
 
     [Fact]

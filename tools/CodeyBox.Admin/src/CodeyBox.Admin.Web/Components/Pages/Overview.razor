@@ -143,24 +143,28 @@ else
 
     // Constraint first, then what is actually happening — so the line never ends
     // on a complaint. Order matters: each constraint makes the ones below it moot.
+    // "In flight" counts items a worker holds (the bound-worker signal), so
+    // the number agrees with occupied worker slots; retried checkpoints
+    // waiting for a dispatch slot count as waiting, never as running.
     private static (string, string) BuildSentence(
         List<WorkItemDto> live, int attention, int folded, ConcurrencyDto? conc, FleetProjection proj)
     {
         var running = conc?.CurrentlyRunningTotal ?? 0;
         var max = conc?.GlobalMaxConcurrent ?? 0;
         var bad = proj.Vitals.Count(v => v.Band == VitalBand.Bad);
+        var inFlight = live.Count(i => i.IsRunning ?? i.IsInFlight);
 
         if (attention > 0)
-            return ($"{attention} {(attention == 1 ? "item needs" : "items need")} you. {running} of {max} slots busy, {live.Count} in flight.", "bad");
+            return ($"{attention} {(attention == 1 ? "item needs" : "items need")} you. {running} of {max} slots busy, {inFlight} in flight.", "bad");
         if (bad > 0)
-            return ($"{bad} {(bad == 1 ? "vital is" : "vitals are")} off. {running} of {max} slots busy, {live.Count} in flight.", "bad");
+            return ($"{bad} {(bad == 1 ? "vital is" : "vitals are")} off. {running} of {max} slots busy, {inFlight} in flight.", "bad");
         if (max > 0 && running >= max)
             return ($"Capacity-bound. All {max} slots busy, {folded} waiting for one.", "neutral");
         if (folded > 0 && running == 0)
             return ($"Nothing running. {folded} waiting on capacity or a dependency.", "bad");
         if (live.Count == 0)
             return ("Queue is empty. Nothing to do.", "good");
-        return ($"Moving. {running} of {max} slots busy, {live.Count} in flight.", "good");
+        return ($"Moving. {running} of {max} slots busy, {inFlight} in flight.", "good");
     }
 
     private static bool IsTerminal(string s) =>

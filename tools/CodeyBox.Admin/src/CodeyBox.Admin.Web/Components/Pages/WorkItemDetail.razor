@@ -63,7 +63,7 @@ else
         }
         <tr><th>Project</th><td>@_item.ProjectId</td></tr>
         <tr><th>Agent</th><td>@_item.Agent</td></tr>
-        <tr><th>State</th><td><StatusChip Info="@StatusVocabulary.ForWorkItem(_item.State)" /></td></tr>
+        <tr><th>State</th><td><StatusChip Info="@StatusVocabulary.ForWorkItem(_item.State, _item.IsRunning, _item.HasPendingResume)" /></td></tr>
         <tr><th>Base branch</th><td>@(_item.BaseBranch is null ? "(project default)" : "")@if (_item.BaseBranch is not null)
             {
                 <CopyableId Value="@_item.BaseBranch" ShowFull="true" />

@@ -110,7 +110,10 @@ else
                             <StatusChip Info="@StatusVocabulary.ForWorkItem(s.CurrentPhase)" />
                         }</td>
                     <td>@AdminFormat.FormatCount(s.QueuedCount)</td>
-                    <td>@AdminFormat.FormatCount(s.InFlightCount)</td>
+                    <td>@AdminFormat.FormatCount(s.InFlightCount)@if (s.WaitingCount > 0)
+                        {
+                            <span class="fleet-waiting" title="Active states with no worker holding them — e.g. retried checkpoints waiting for a dispatch slot"> (+@AdminFormat.FormatCount(s.WaitingCount) waiting)</span>
+                        }</td>
                     <td class="fleet-outcomes">
                         @foreach (var o in s.RecentOutcomes)
                         {

@@ -27,7 +27,7 @@
         else
         {
             var item = _item;
-            var vocab = StatusVocabulary.ForWorkItem(item.State);
+            var vocab = StatusVocabulary.ForWorkItem(item.State, item.IsRunning, item.HasPendingResume);
             <div class="fm-ov-head">
                 <h2 id="fm-ov-title" class="fm-ov-title">@item.Title</h2>
                 <span class="fm-ov-spacer"></span>
