@@ -30,6 +30,7 @@ public static class Program
         {
             "jobtrack" => await RunJobTrackAsync(args[1..], output, error),
             "admin-seeded" => await RunAdminSeededAsync(args[1..], output, error),
+            "openstack-smoke" => await RunOpenStackSmokeAsync(args[1..], output, error),
             _ => UnknownCommand(args[0], error),
         };
     }
@@ -193,6 +194,24 @@ public static class Program
         }
     }
 
+    private static async Task<int> RunOpenStackSmokeAsync(string[] args, TextWriter output, TextWriter error)
+    {
+        var parsed = OpenStackSmokeCommand.Parse(args);
+        switch (parsed.Status)
+        {
+            case OpenStackSmokeCommand.ParseStatus.Usage:
+                if (!string.IsNullOrEmpty(parsed.Error))
+                    error.WriteLine(parsed.Error);
+                OpenStackSmokeCommand.PrintUsage(error);
+                return ExitUsage;
+            case OpenStackSmokeCommand.ParseStatus.Invalid:
+                error.WriteLine(parsed.Error);
+                return ExitLaunchFailed;
+            default:
+                return await OpenStackSmokeCommand.RunAsync(parsed, output, error).ConfigureAwait(false);
+        }
+    }
+
     private static MultipassSandboxOptions ResolveMultipassOptions()
     {
         var bridge = Environment.GetEnvironmentVariable("CODEYBOX_GRAPHICAL_BRIDGE");
@@ -235,6 +254,7 @@ public static class Program
               codeybox-harness jobtrack launch --source <path> [options]
               codeybox-harness admin-seeded seed --seed 42 --db /tmp/seed/admin.db
               codeybox-harness admin-seeded serve --seed 42 --db /tmp/seed/admin.db
+              codeybox-harness openstack-smoke [--config <path>]
 
             Environment:
               JOBTRACK_SOURCE              Default --source when flag omitted

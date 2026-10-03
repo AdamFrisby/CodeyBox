@@ -129,3 +129,7 @@ not; `NotEnforced` providers are logged as a warning stating the restriction.
 - [`modal-sandbox-plugin.md`](modal-sandbox-plugin.md) — hosted Modal
   Sandboxes (`ProviderKind: modal`; `NotEnforced` classification, custom
   images, filesystem snapshots, high concurrency, streaming execution).
+- [`openstack-sandbox-plugin.md`](openstack-sandbox-plugin.md) — hosted
+  OpenStack Nova VMs (`ProviderKind: openstack`; `NotEnforced`
+  classification, dedicated kernel, Incus-parity Glance baseline images,
+  per-sandbox SSH keypairs and security groups).
