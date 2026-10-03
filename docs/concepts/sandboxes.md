@@ -18,6 +18,7 @@ operational trade-off matches your deployment.
 | `runloop`         | Hosted VM (plugin, `codeybox.runloop`)       | Runloop account and API key; plugin allowlisted and enabled      | Working — plugin, off by default |
 | `blaxel`          | Hosted microVM (plugin, `codeybox.blaxel`)   | Blaxel account, workspace and API key; plugin allowlisted and enabled | Working — plugin, off by default |
 | `modal`           | Hosted container (plugin, `codeybox.modal`)  | Modal account and token pair; plugin allowlisted and enabled     | Working — plugin, off by default |
+| `openstack`       | Hosted VM (plugin, `codeybox.openstack-sandbox`) | OpenStack application credential; plugin allowlisted and enabled | Working — plugin, off by default |
 
 Multipass and Incus are configured independently: selecting Incus is explicit
 and inherits none of Multipass's configuration, baselines, or lifecycle state.
@@ -818,6 +819,32 @@ between them:
   filesystem as a named snapshot and then terminates the sandbox; there is no
   resume path to adopt, so recovery leases are explicitly refused.
 
+## `openstack` — hosted VMs via the `codeybox.openstack-sandbox` plugin
+
+Sandboxes run as Nova VMs on a standard OpenStack cloud (first target:
+Infomaniak Public Cloud), contributed as a sandbox provider kind through the
+plugin trust model — off unless the operator allowlists **and** enables
+`codeybox.openstack-sandbox`. Full operator reference lives in
+[`docs/extending/openstack-sandbox-plugin.md`](../extending/openstack-sandbox-plugin.md):
+what to configure (endpoints, flavor, network, image), what it costs, and
+what it cannot do.
+
+The posture mirrors `runloop` (hosted guest, staged mounts, provider-owned
+egress, `NotEnforced`) with three differences that matter when choosing
+between them:
+
+- **Real VMs with a dedicated kernel.** Each sandbox is a Nova VM with its
+  own guest kernel (`DedicatedKernel` for workload-trust routing), and tmpfs
+  mounts — including the credential directory — are genuine RAM-backed
+  tmpfs, so file-backed agent credentials are supported (and refused outside
+  tmpfs).
+- **Baseline images work like the local ones.** Content-hashed Glance images
+  carry the same toolchain as the Incus baseline (same hash inputs), so the
+  provider declares `baseline-bake` and cross-provider pins resolve by hash.
+- **Credentials are application credentials.** The credential id and secret
+  come only from the standard `OS_*` environment variables — never from
+  configuration — and every endpoint must be `https`.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -831,6 +858,7 @@ between them:
 | Hosted VMs with snapshots/suspend-resume, plugin-managed      | `runloop`           |
 | Hosted microVMs with standby suspend/resume, plugin-managed  | `blaxel`            |
 | Hosted containers with custom images/snapshots, high concurrency | `modal`         |
+| Hosted VMs on OpenStack with Incus-parity baselines, plugin-managed | `openstack`     |
 
 ## Sandbox classes (`CodeyBox:SandboxClasses`)
 
@@ -914,6 +942,7 @@ varies by provider:**
 | runloop      | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
 | blaxel       | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
 | modal        | None — plugin kind, classified `NotEnforced`; named network profiles are refused (`AllowedHosts` is recorded intent only) |
+| openstack    | None — plugin kind, classified `NotEnforced`; named network profiles are refused (per-sandbox security group is best-effort only) |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
