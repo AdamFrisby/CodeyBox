@@ -1,0 +1,16 @@
+[
+  {
+    "metadata": {
+      "name": "codeybox-legacy-1",
+      "url": "https://sbx-codeybox-legacy-1-testws.eu-lon-1.bl.run",
+      "workspace": "testws",
+      "labels": {
+        "codeybox-managed": "true",
+        "codeybox-provider": "blaxel"
+      }
+    },
+    "spec": { "region": "eu-lon-1" },
+    "state": "RUNNING",
+    "status": "DEPLOYED"
+  }
+]

@@ -16,6 +16,7 @@ operational trade-off matches your deployment.
 | `multipass-remote` | Real Ubuntu VM on remote executor hosts     | `ssh` from orchestrator + `snap install multipass` per executor  | Working — distributed executor pool |
 | `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
 | `runloop`         | Hosted VM (plugin, `codeybox.runloop`)       | Runloop account and API key; plugin allowlisted and enabled      | Working — plugin, off by default |
+| `blaxel`          | Hosted microVM (plugin, `codeybox.blaxel`)   | Blaxel account, workspace and API key; plugin allowlisted and enabled | Working — plugin, off by default |
 
 Multipass and Incus are configured independently: selecting Incus is explicit
 and inherits none of Multipass's configuration, baselines, or lifecycle state.
@@ -767,6 +768,29 @@ egress) with three differences that matter when choosing between them:
   allowed hosts through its API, `runloop` refuses any named network profile
   outright (`NotEnforced`): unprofiled work only.
 
+## `blaxel` — hosted microVMs via the `codeybox.blaxel` plugin
+
+Sandboxes run as Blaxel perpetual sandboxes (hosted microVMs with automatic
+scale-to-zero standby that preserves memory, processes, and filesystem, and
+millisecond resume), contributed as a sandbox provider kind through the
+plugin trust model — off unless the operator allowlists **and** enables
+`codeybox.blaxel`. Full operator reference lives in
+[`plugins/sandbox/CodeyBox.BlaxelSandboxPlugin/README.md`](../../plugins/sandbox/CodeyBox.BlaxelSandboxPlugin/README.md):
+what to configure, what it costs, and what it cannot do.
+
+The posture mirrors `runloop` (hosted guest, staged mounts, provider-owned
+egress) with two differences that matter when choosing between them:
+
+- **Suspend preserves the whole guest.** Standby keeps memory, running
+  processes, and filesystem (stronger than `runloop`'s disk-only suspend),
+  and every resume is verified with an exec probe before it counts.
+- **No snapshots, bakes, disk guard, cache seeding, or port publishing.**
+  The provider declares only suspend/resume and teardown; anything else is
+  refused by placement when requested.
+
+Like `runloop` it refuses any named network profile outright
+(`NotEnforced`): unprofiled work only.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -778,6 +802,7 @@ egress) with three differences that matter when choosing between them:
 | Persistent, high-throughput headless host with a ZFS/Btrfs pool | `incus`          |
 | No local KVM available, hosted VMs acceptable               | `sprites`           |
 | Hosted VMs with snapshots/suspend-resume, plugin-managed      | `runloop`           |
+| Hosted microVMs with standby suspend/resume, plugin-managed  | `blaxel`            |
 
 ## Sandbox classes (`CodeyBox:SandboxClasses`)
 
@@ -859,6 +884,7 @@ varies by provider:**
 | multipass-remote | Bridges named per profile on the **executor** host; the profile→bridge map is CodeyBox config, but the bridges and their nftables rules must be created on that host |
 | sprites      | Allowed hosts declared per profile through the Sprites API; enforced by the provider, not by you |
 | runloop      | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
+| blaxel       | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
