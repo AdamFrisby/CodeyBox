@@ -30,7 +30,15 @@ builder.Services.AddSingleton<Func<ExecutorOptions>>(sp =>
 // ExecutorOptions), and one host may declare several kinds.
 builder.Services.AddExecutorSandboxProviders();
 
+// Agent execution composes through the same unit the orchestrator calls, so
+// the executor resolves every agent runner, the registry, and the credential
+// chain identically — a credential that works in-process works here. Adding
+// an agent edits that one composition site; no executor-side change is
+// needed for the new runner to become available (and advertisable) here.
+builder.Services.AddAgentExecution(builder.Configuration);
+
 builder.Services.AddSingleton<ExecutorSandboxTracker>();
+builder.Services.AddSingleton<ExecutorAgentAdvertiser>();
 builder.Services.AddHttpClient("executor");
 builder.Services.AddSingleton<ExecutorClient>(sp =>
 {
@@ -47,7 +55,8 @@ builder.Services.AddSingleton<ExecutorClient>(sp =>
         sp.GetRequiredService<ExecutorSandboxTracker>(),
         phaseRunner: null,
         log: sp.GetRequiredService<ILogger<ExecutorClient>>(),
-        providerRegistry: sp.GetRequiredService<ISandboxProviderRegistry>());
+        providerRegistry: sp.GetRequiredService<ISandboxProviderRegistry>(),
+        agentAdvertiser: sp.GetRequiredService<ExecutorAgentAdvertiser>());
 });
 builder.Services.AddHostedService<ExecutorWorker>();
 builder.Services.AddHostedService<ExecutorStartupValidator>();

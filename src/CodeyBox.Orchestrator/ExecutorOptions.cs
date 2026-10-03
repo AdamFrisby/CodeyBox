@@ -44,8 +44,22 @@ public sealed class ExecutorOptions
     /// </summary>
     public List<string> AllowedNetworkProfiles { get; set; } = [];
 
-    /// <summary>Names of the agent credential sets this host holds.</summary>
+    /// <summary>
+    /// Operator narrowing allow-list for the agent credential sets this host
+    /// advertises. Empty (or <c>"*"</c>) means "advertise everything actually
+    /// runnable"; otherwise only listed names are kept. The effective
+    /// declaration is always derived from composed runners plus held
+    /// credentials (see <see cref="ExecutorAgentAdvertiser"/>), so this list
+    /// can only narrow, never widen.
+    /// </summary>
     public List<string> DeclaredCredentials { get; set; } = [];
+
+    /// <summary>
+    /// Per-agent ceiling for credential probing when registration derives the
+    /// declared credential set (see <see cref="ExecutorAgentAdvertiser"/>).
+    /// Bounds one slow provider so it cannot stall registration. Default 10 s.
+    /// </summary>
+    public TimeSpan AgentCredentialProbeTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// Clearance tags this host is trusted to handle, in the same vocabulary
@@ -175,6 +189,9 @@ public sealed class ExecutorOptions
     /// <summary>
     /// Builds the registration assertion sent on connect. Registration is the
     /// executor's claim of what it can run; the orchestrator decides placement.
+    /// <see cref="DeclaredCredentials"/> is the operator's narrowing allow-list
+    /// here — the client replaces it with the derived runnable set (intersected
+    /// with this list) whenever an <see cref="ExecutorAgentAdvertiser"/> is wired.
     /// </summary>
     public ExecutorRegistration ToRegistration() => new()
     {
@@ -220,6 +237,8 @@ public sealed class ExecutorOptions
             throw new InvalidOperationException("CodeyBox:Executor:HeartbeatInterval must be positive.");
         if (RequestTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException("CodeyBox:Executor:RequestTimeout must be positive.");
+        if (AgentCredentialProbeTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException("CodeyBox:Executor:AgentCredentialProbeTimeout must be positive.");
         if (!Enum.IsDefined(DisconnectPolicy))
             throw new InvalidOperationException("CodeyBox:Executor:DisconnectPolicy names an unknown policy.");
         var provider = (LocalSandboxProvider ?? "").Trim().ToLowerInvariant();
