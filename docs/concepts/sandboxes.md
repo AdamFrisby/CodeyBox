@@ -16,6 +16,7 @@ operational trade-off matches your deployment.
 | `multipass-remote` | Real Ubuntu VM on remote executor hosts     | `ssh` from orchestrator + `snap install multipass` per executor  | Working — distributed executor pool |
 | `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
 | `runloop`         | Hosted VM (plugin, `codeybox.runloop`)       | Runloop account and API key; plugin allowlisted and enabled      | Working — plugin, off by default |
+| `modal`           | Hosted container (plugin, `codeybox.modal`)  | Modal account and token pair; plugin allowlisted and enabled     | Working — plugin, off by default |
 
 Multipass and Incus are configured independently: selecting Incus is explicit
 and inherits none of Multipass's configuration, baselines, or lifecycle state.
@@ -767,6 +768,32 @@ egress) with three differences that matter when choosing between them:
   allowed hosts through its API, `runloop` refuses any named network profile
   outright (`NotEnforced`): unprofiled work only.
 
+## `modal` — hosted containers via the `codeybox.modal` plugin
+
+Sandboxes run as Modal Sandboxes (hosted containers with custom images,
+filesystem snapshots, high concurrency, and streaming execution), contributed
+as a sandbox provider kind through the plugin trust model — off unless the
+operator allowlists **and** enables `codeybox.modal`. Full operator reference
+lives in
+[`plugins/sandbox/CodeyBox.ModalSandboxPlugin/README.md`](../../plugins/sandbox/CodeyBox.ModalSandboxPlugin/README.md)
+and [`docs/extending/modal-sandbox-plugin.md`](../extending/modal-sandbox-plugin.md):
+what to configure, what it costs, and what it cannot do.
+
+The posture mirrors `runloop` (hosted guest, staged mounts, provider-owned
+egress, `NotEnforced`) with three differences that matter when choosing
+between them:
+
+- **Concurrency is the point.** Member capacity may legitimately be far above
+  any local provider's; admission gates and live load keep least-loaded
+  placement accurate at that scale.
+- **Images, not bakes.** The toolchain arrives via the operator-baked
+  `ImageRef` (or a restore `SnapshotId`); the provider declares no
+  `baseline-bake`, `suspend-resume`, disk guard, cache seeding, or port
+  publishing — only `teardown`.
+- **Preserve is snapshot-and-terminate.** `StopAndPreserveAsync` freezes the
+  filesystem as a named snapshot and then terminates the sandbox; there is no
+  resume path to adopt, so recovery leases are explicitly refused.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -778,6 +805,7 @@ egress) with three differences that matter when choosing between them:
 | Persistent, high-throughput headless host with a ZFS/Btrfs pool | `incus`          |
 | No local KVM available, hosted VMs acceptable               | `sprites`           |
 | Hosted VMs with snapshots/suspend-resume, plugin-managed      | `runloop`           |
+| Hosted containers with custom images/snapshots, high concurrency | `modal`         |
 
 ## Sandbox classes (`CodeyBox:SandboxClasses`)
 
@@ -859,6 +887,7 @@ varies by provider:**
 | multipass-remote | Bridges named per profile on the **executor** host; the profile→bridge map is CodeyBox config, but the bridges and their nftables rules must be created on that host |
 | sprites      | Allowed hosts declared per profile through the Sprites API; enforced by the provider, not by you |
 | runloop      | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
+| modal        | None — plugin kind, classified `NotEnforced`; named network profiles are refused (`AllowedHosts` is recorded intent only) |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in

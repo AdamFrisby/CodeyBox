@@ -136,6 +136,7 @@
     <Project Path="plugins/sandbox/CodeyBox.DaytonaSandboxPlugin/CodeyBox.DaytonaSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.BoxLiteSandboxPlugin/CodeyBox.BoxLiteSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.RunloopPlugin/CodeyBox.RunloopPlugin.csproj" />
+    <Project Path="plugins/sandbox/CodeyBox.ModalSandboxPlugin/CodeyBox.ModalSandboxPlugin.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CodeyBox.Tests/CodeyBox.Tests.csproj" />

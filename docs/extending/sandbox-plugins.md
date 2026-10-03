@@ -126,3 +126,6 @@ not; `NotEnforced` providers are logged as a warning stating the restriction.
 - [`boxlite-sandbox-plugin.md`](boxlite-sandbox-plugin.md) — embedded/local
   BoxLite microVMs (`ProviderKind: boxlite`; `NotEnforced` classification,
   OCI images, baseline snapshots, suspend/resume, retain/adopt).
+- [`modal-sandbox-plugin.md`](modal-sandbox-plugin.md) — hosted Modal
+  Sandboxes (`ProviderKind: modal`; `NotEnforced` classification, custom
+  images, filesystem snapshots, high concurrency, streaming execution).
