@@ -39,8 +39,9 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         var provider = new ScriptableSandboxProvider();
         var handler = new ScriptablePhaseHandler();
         var runner = NewRunner(provider, handler, out var tracker, out var staging);
-        var staged = StageRepo(staging, out var repositoryId);
+        var repositoryId = NewRepositoryId();
         var request = NewRequest(phase: "work", repositoryId: repositoryId);
+        var staged = StageRepo(staging, request);
 
         var result = await runner.ExecutePhaseAsync(request, CancellationToken.None);
 
@@ -69,10 +70,10 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         var provider = new ScriptableSandboxProvider();
         var handler = new ScriptablePhaseHandler();
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
+        var request = NewRequest(phase: phase, repositoryId: NewRepositoryId());
+        StageRepo(staging, request);
 
-        var result = await runner.ExecutePhaseAsync(NewRequest(phase: phase, repositoryId: repositoryId), CancellationToken.None);
+        var result = await runner.ExecutePhaseAsync(request, CancellationToken.None);
 
         Assert.Equal(ExecutorPhaseOutcome.Succeeded, result.Outcome);
         Assert.Contains(phase, handler.SeenPhases);
@@ -89,9 +90,10 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             provider, new ExecutorSandboxTracker(), handler, () => options,
             () => new ExecutorPhaseDispatchOptions());
         var repositoryId = NewRepositoryId();
-        StageRepo(options.PhaseStagingRoot, repositoryId);
+        var mergeRequest = NewRequest(phase: "merge", repositoryId: repositoryId);
+        StageRepo(options.PhaseStagingRoot, mergeRequest);
 
-        await runner.ExecutePhaseAsync(NewRequest(phase: "merge", repositoryId: repositoryId), CancellationToken.None);
+        await runner.ExecutePhaseAsync(mergeRequest, CancellationToken.None);
 
         var spec = Assert.Single(provider.CreatedSpecs);
         Assert.Equal("img:phase-1", spec.ImageReference);
@@ -109,8 +111,8 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         var handler = new ScriptablePhaseHandler();
         var runner = NewRunner(provider, handler, out _, out var staging);
         var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
         var request = NewRequest(payload: "{\"v\":1}", repositoryId: repositoryId);
+        StageRepo(staging, request);
 
         var first = await runner.ExecutePhaseAsync(request, CancellationToken.None);
         var second = await runner.ExecutePhaseAsync(request, CancellationToken.None);
@@ -127,10 +129,11 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         var handler = new ScriptablePhaseHandler();
         var runner = NewRunner(provider, handler, out _, out var staging);
         var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
         var item = Guid.NewGuid().ToString("N");
+        var firstStaged = NewRequest(item, "work", 0, "{\"v\":1}", repositoryId);
+        StageRepo(staging, firstStaged);
 
-        await runner.ExecutePhaseAsync(NewRequest(item, "work", 0, "{\"v\":1}", repositoryId), CancellationToken.None);
+        await runner.ExecutePhaseAsync(firstStaged, CancellationToken.None);
         var conflict = await Assert.ThrowsAsync<ExecutorPhaseConflictException>(
             () => runner.ExecutePhaseAsync(NewRequest(item, "work", 0, "{\"v\":2}", repositoryId), CancellationToken.None));
 
@@ -149,9 +152,8 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             BeforeResult = ct => gate.Task.WaitAsync(ct),
         };
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
-        var request = NewRequest(repositoryId: repositoryId);
+        var request = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, request);
 
         var executions = Enumerable.Range(0, 5)
             .Select(_ => runner.ExecutePhaseAsync(request, CancellationToken.None))
@@ -183,9 +185,8 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             },
         };
         var runner = NewRunner(provider, handler, out var tracker, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
-        var request = NewRequest(repositoryId: repositoryId);
+        var request = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, request);
 
         var first = runner.ExecutePhaseAsync(request, CancellationToken.None);
         Assert.True(entered.Wait(TimeSpan.FromSeconds(10)), "phase did not start");
@@ -258,9 +259,9 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         var requests = Enumerable.Range(0, 3)
             .Select(_ =>
             {
-                var repositoryId = NewRepositoryId();
-                StageRepo(staging, repositoryId);
-                return NewRequest(repositoryId: repositoryId);
+                var capacityRequest = NewRequest(repositoryId: NewRepositoryId());
+                StageRepo(staging, capacityRequest);
+                return capacityRequest;
             })
             .ToList();
 
@@ -290,11 +291,11 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         var runner = new ExecutorHostPhaseRunner(
             provider, new ExecutorSandboxTracker(), handler, () => options,
             () => new ExecutorPhaseDispatchOptions());
-        var repositoryId = NewRepositoryId();
-        StageRepo(options.PhaseStagingRoot, repositoryId);
+        var zeroRequest = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(options.PhaseStagingRoot, zeroRequest);
 
         var thrown = await Assert.ThrowsAsync<ExecutorPhaseTransportException>(
-            () => runner.ExecutePhaseAsync(NewRequest(repositoryId: repositoryId), CancellationToken.None));
+            () => runner.ExecutePhaseAsync(zeroRequest, CancellationToken.None));
 
         Assert.Equal("capacity", thrown.Operation);
         Assert.Empty(provider.CreatedSpecs);
@@ -312,9 +313,8 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         };
         var handler = new ScriptablePhaseHandler();
         var runner = NewRunner(provider, handler, out var tracker, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
-        var request = NewRequest(repositoryId: repositoryId);
+        var request = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, request);
 
         var thrown = await Assert.ThrowsAsync<ExecutorPhaseTransportException>(
             () => runner.ExecutePhaseAsync(request, CancellationToken.None));
@@ -340,11 +340,11 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             Throw = new SandboxExecutionUnavailableException(137),
         };
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
+        var lossRequest = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, lossRequest);
 
         var thrown = await Assert.ThrowsAsync<ExecutorPhaseTransportException>(
-            () => runner.ExecutePhaseAsync(NewRequest(repositoryId: repositoryId), CancellationToken.None));
+            () => runner.ExecutePhaseAsync(lossRequest, CancellationToken.None));
 
         Assert.Equal("run-phase", thrown.Operation);
         var sandbox = Assert.Single(provider.CreatedSandboxes);
@@ -360,11 +360,11 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             Throw = new InvalidOperationException("handler bug"),
         };
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
+        var bugRequest = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, bugRequest);
 
         await Assert.ThrowsAsync<ExecutorPhaseTransportException>(
-            () => runner.ExecutePhaseAsync(NewRequest(repositoryId: repositoryId), CancellationToken.None));
+            () => runner.ExecutePhaseAsync(bugRequest, CancellationToken.None));
     }
 
     [Fact]
@@ -382,9 +382,8 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             },
         };
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
-        var request = NewRequest(repositoryId: repositoryId);
+        var request = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, request);
 
         var first = await runner.ExecutePhaseAsync(request, CancellationToken.None);
         var second = await runner.ExecutePhaseAsync(request, CancellationToken.None);
@@ -408,10 +407,10 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             },
         };
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
+        var credentialRequest = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, credentialRequest);
 
-        var result = await runner.ExecutePhaseAsync(NewRequest(repositoryId: repositoryId), CancellationToken.None);
+        var result = await runner.ExecutePhaseAsync(credentialRequest, CancellationToken.None);
 
         Assert.Equal(ExecutorPhaseOutcome.AgentFailed, result.Outcome);
         Assert.StartsWith(ExecutorPhaseProxy.CredentialMissingErrorPrefix, result.ErrorMessage, StringComparison.Ordinal);
@@ -442,11 +441,11 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
         var provider = new ScriptableSandboxProvider();
         var handler = new ScriptablePhaseHandler();
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
+        var invalidRequest = NewRequest(phase: phase, repositoryId: NewRepositoryId());
+        StageRepo(staging, invalidRequest);
 
         await Assert.ThrowsAsync<ArgumentException>(
-            () => runner.ExecutePhaseAsync(NewRequest(phase: phase, repositoryId: repositoryId), CancellationToken.None));
+            () => runner.ExecutePhaseAsync(invalidRequest, CancellationToken.None));
 
         Assert.Empty(provider.CreatedSpecs);
         Assert.Equal(0, handler.Calls);
@@ -469,9 +468,8 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             },
         };
         var runner = NewRunner(provider, handler, out var tracker, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
-        var request = NewRequest(repositoryId: repositoryId);
+        var request = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, request);
 
         using var cts = new CancellationTokenSource();
         var execution = runner.ExecutePhaseAsync(request, cts.Token);
@@ -502,9 +500,8 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             },
         };
         var runner = NewRunner(provider, handler, out _, out var staging);
-        var repositoryId = NewRepositoryId();
-        StageRepo(staging, repositoryId);
-        var request = NewRequest(repositoryId: repositoryId);
+        var request = NewRequest(repositoryId: NewRepositoryId());
+        StageRepo(staging, request);
 
         await Assert.ThrowsAsync<ExecutorPhaseException>(() => runner.ExecutePhaseAsync(request, CancellationToken.None));
         handler.Result = new ExecutorPhaseResult
@@ -532,12 +529,12 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             () => new ExecutorPhaseDispatchOptions(), clock: clock,
             log: NullLogger<ExecutorHostPhaseRunner>.Instance);
         var repositoryId = NewRepositoryId();
-        StageRepo(options.PhaseStagingRoot, repositoryId);
-        var request = NewRequest(repositoryId: repositoryId);
+        var expiryRequest = NewRequest(repositoryId: repositoryId);
+        StageRepo(options.PhaseStagingRoot, expiryRequest);
 
-        await runner.ExecutePhaseAsync(request, CancellationToken.None);
+        await runner.ExecutePhaseAsync(expiryRequest, CancellationToken.None);
         clock.Advance(TimeSpan.FromHours(2));
-        await runner.ExecutePhaseAsync(request, CancellationToken.None);
+        await runner.ExecutePhaseAsync(expiryRequest, CancellationToken.None);
 
         Assert.Equal(2, provider.ProvisionCount);
     }
@@ -553,11 +550,11 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
             provider, new ExecutorSandboxTracker(), handler, () => options,
             () => new ExecutorPhaseDispatchOptions());
         var firstRepo = NewRepositoryId();
-        StageRepo(options.PhaseStagingRoot, firstRepo);
-        var secondRepo = NewRepositoryId();
-        StageRepo(options.PhaseStagingRoot, secondRepo);
         var first = NewRequest(item: Guid.NewGuid().ToString("N"), repositoryId: firstRepo);
+        StageRepo(options.PhaseStagingRoot, first);
+        var secondRepo = NewRepositoryId();
         var second = NewRequest(item: Guid.NewGuid().ToString("N"), repositoryId: secondRepo);
+        StageRepo(options.PhaseStagingRoot, second);
 
         await runner.ExecutePhaseAsync(first, CancellationToken.None);
         await runner.ExecutePhaseAsync(second, CancellationToken.None);
@@ -597,15 +594,9 @@ public sealed class ExecutorHostPhaseRunnerTests : IDisposable
 
     private static string NewRepositoryId() => Guid.NewGuid().ToString("N");
 
-    private string StageRepo(string staging, out string repositoryId)
+    private static string StageRepo(string staging, ExecutorPhaseRequest request)
     {
-        repositoryId = NewRepositoryId();
-        return StageRepo(staging, repositoryId);
-    }
-
-    private static string StageRepo(string staging, string repositoryId)
-    {
-        var dir = Path.Combine(staging, repositoryId);
+        var dir = ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(staging, request);
         Directory.CreateDirectory(dir);
         File.WriteAllText(Path.Combine(dir, "HEAD"), "ref: refs/heads/main\n");
         return dir;

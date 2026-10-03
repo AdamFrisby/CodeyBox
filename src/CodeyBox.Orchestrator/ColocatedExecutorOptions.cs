@@ -25,8 +25,10 @@ public sealed class ColocatedExecutorOptions
 
     /// <summary>
     /// Root under which the colocated transport stages the phase's single
-    /// bare repo, one leaf per <c>RepositoryId</c>. Empty means a process-temp
-    /// subdirectory reserved for the colocated host (never shared with a
+    /// bare repo, one leaf per dispatch (per <c>RepositoryId</c> plus the
+    /// dispatch key, so concurrent dispatches against one repo stay
+    /// isolated). Empty means a per-process subdirectory of the process temp
+    /// directory reserved for the colocated host (never shared with a
     /// remote executor's staging root on the same machine). Must be absolute
     /// when set.
     /// </summary>

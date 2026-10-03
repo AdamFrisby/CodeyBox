@@ -36,11 +36,21 @@ public sealed class ColocatedExecutorHost
     /// <summary>Default staging root leaf under the process temp directory.</summary>
     public const string DefaultStagingLeaf = "codeybox-colocated-phases";
 
+    /// <summary>
+    /// Placeholder satisfying the runner's absolute-URL validation. The
+    /// colocated runner never performs HTTP; every load-bearing field comes
+    /// from the colocated options, so this value is intentionally dummy and
+    /// must never be treated as a real endpoint to configure.
+    /// </summary>
+    private const string UnusedOrchestratorBaseUrlPlaceholder = "http://localhost/";
+
     private readonly ISandboxProvider _sandboxes;
     private readonly IExecutorPhaseHandler? _handler;
     private readonly Func<ColocatedExecutorOptions> _optionsAccessor;
     private readonly Func<ExecutorPhaseDispatchOptions> _dispatchOptionsAccessor;
     private readonly Func<ExecutorPhaseRequest, SandboxSpec>? _specFactory;
+    private readonly Func<string?>? _repositoriesRootAccessor;
+    private readonly StagingCopyGate _copyGate;
     private readonly ExecutorSandboxTracker _tracker;
     private readonly TimeProvider _clock;
     private readonly ILoggerFactory _loggerFactory;
@@ -55,7 +65,9 @@ public sealed class ColocatedExecutorHost
         ExecutorSandboxTracker? tracker = null,
         Func<ExecutorPhaseRequest, SandboxSpec>? sandboxSpecFactory = null,
         TimeProvider? clock = null,
-        ILoggerFactory? loggerFactory = null)
+        ILoggerFactory? loggerFactory = null,
+        Func<string?>? repositoriesRootAccessor = null,
+        StagingCopyGate? copyGate = null)
     {
         _sandboxes = sandboxes ?? throw new ArgumentNullException(nameof(sandboxes));
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
@@ -63,6 +75,8 @@ public sealed class ColocatedExecutorHost
         _handler = handler;
         _tracker = tracker ?? new ExecutorSandboxTracker();
         _specFactory = sandboxSpecFactory;
+        _repositoriesRootAccessor = repositoriesRootAccessor;
+        _copyGate = copyGate ?? new StagingCopyGate();
         _clock = clock ?? TimeProvider.System;
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         if (handler is not null)
@@ -114,9 +128,11 @@ public sealed class ColocatedExecutorHost
 
     /// <summary>
     /// Resolved staging root for the colocated transport: the configured
-    /// absolute root, or a process-temp subdirectory reserved for the
-    /// colocated host (never shared with a remote executor's staging root
-    /// on the same machine).
+    /// absolute root, or a per-process subdirectory of the process temp
+    /// directory reserved for the colocated host. The per-process leaf (never
+    /// shared with a remote executor's staging root, nor with another
+    /// orchestrator process on the same machine) keeps one process from
+    /// deleting or copying through a predictable path another process owns.
     /// </summary>
     public string GetStagingRoot()
     {
@@ -124,7 +140,7 @@ public sealed class ColocatedExecutorHost
         options.Validate();
         if (!string.IsNullOrWhiteSpace(options.StagingRoot))
             return Path.GetFullPath(options.StagingRoot.Trim());
-        return Path.Combine(Path.GetTempPath(), DefaultStagingLeaf);
+        return Path.Combine(Path.GetTempPath(), $"{DefaultStagingLeaf}-p{Environment.ProcessId}");
     }
 
     /// <summary>
@@ -139,26 +155,26 @@ public sealed class ColocatedExecutorHost
             ?? throw new InvalidOperationException(
                 "The colocated executor has no phase handler composed; it cannot accept phases yet. " +
                 $"Compose an {nameof(IExecutorPhaseHandler)} to enable local execution through host '{HostId}'.");
-        return new ColocatedExecutorTransport(HostId, GetStagingRoot(), runner);
+        return new ColocatedExecutorTransport(
+            HostId, GetStagingRoot(), runner, _repositoriesRootAccessor?.Invoke(), _copyGate);
     }
 
     private ExecutorOptions RunnerOptions()
     {
         // Adapts the colocated knobs to the runner's options surface. The
-        // runner never performs HTTP, so OrchestratorBaseUrl is an unused
-        // placeholder satisfying the absolute-URL validation; every load-
-        // bearing field (capacity, staging, image, cache bounds) comes from
-        // the colocated options above.
+        // runner never performs HTTP, so OrchestratorBaseUrl is the unused
+        // placeholder above; every load-bearing field (capacity, staging,
+        // image, cache bounds) comes from the colocated options. The staging
+        // root resolves through GetStagingRoot so transport and runner can
+        // never diverge on the default leaf.
         var options = _optionsAccessor();
         options.Validate();
         return new ExecutorOptions
         {
             HostId = HostId,
-            OrchestratorBaseUrl = "http://localhost/",
+            OrchestratorBaseUrl = UnusedOrchestratorBaseUrlPlaceholder,
             MaxConcurrentSandboxes = options.MaxConcurrentSandboxes,
-            PhaseStagingRoot = string.IsNullOrWhiteSpace(options.StagingRoot)
-                ? Path.Combine(Path.GetTempPath(), DefaultStagingLeaf)
-                : options.StagingRoot.Trim(),
+            PhaseStagingRoot = GetStagingRoot(),
             PhaseSandboxImageReference = options.PhaseSandboxImageReference ?? string.Empty,
             MaxCachedPhaseResults = options.MaxCachedPhaseResults,
             PhaseResultCacheTtl = options.PhaseResultCacheTtl,
@@ -188,12 +204,12 @@ public sealed class ColocatedExecutorTransportFactory : IExecutorPhaseTransportF
 
     public Task<IExecutorPhaseTransport?> ResolveAsync(string hostId, CancellationToken ct)
     {
-        if (hostId is not null
-            && string.Equals(hostId.Trim(), ColocatedExecutorHost.HostId, StringComparison.Ordinal))
+        ArgumentNullException.ThrowIfNull(hostId);
+        var normalized = hostId.Trim();
+        if (string.Equals(normalized, ColocatedExecutorHost.HostId, StringComparison.Ordinal))
             return Task.FromResult<IExecutorPhaseTransport?>(_local.CreateTransport());
         if (_remote is null)
             return Task.FromResult<IExecutorPhaseTransport?>(null);
-        ArgumentNullException.ThrowIfNull(hostId);
-        return _remote.ResolveAsync(hostId, ct);
+        return _remote.ResolveAsync(normalized, ct);
     }
 }

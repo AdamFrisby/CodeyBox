@@ -148,10 +148,11 @@ public sealed class ExecutorOptions
 
     /// <summary>
     /// Root directory under which the executor resolves staged bare-repo
-    /// copies, one leaf per dispatched <c>RepositoryId</c>. Empty means a
-    /// process-temp subdirectory. The delivery plane stages the phase's
-    /// single bare repo here; the phase runner resolves it with
-    /// canonicalize-then-contain and refuses to run when it is absent.
+    /// copies, one leaf per dispatch (per dispatched <c>RepositoryId</c> plus
+    /// the dispatch key, so concurrent dispatches against one repo stay
+    /// isolated). Empty means a process-temp subdirectory. The delivery plane
+    /// stages the phase's single bare repo here; the phase runner resolves it
+    /// with canonicalize-then-contain and refuses to run when it is absent.
     /// </summary>
     public string PhaseStagingRoot { get; set; } = "";
 

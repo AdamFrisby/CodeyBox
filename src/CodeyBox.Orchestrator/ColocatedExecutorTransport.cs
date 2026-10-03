@@ -18,14 +18,20 @@ namespace CodeyBox.Orchestrator;
 /// instance per resolve, and the proxy uses one instance per host attempt, so
 /// concurrent dispatches never share staging state. Sequential reuse is safe
 /// (a new stage-in overwrites the recorded source); concurrent use of one
-/// instance is not supported.
+/// instance is not supported. Each dispatch stages to its own leaf (the
+/// per-repo leaf plus a dispatch-key hash, resolved identically by the
+/// executor-side runner), so concurrent dispatches against the same repo
+/// cannot interleave delete/copy/run/tar; same-key duplicates serialize
+/// their copy window on the shared <see cref="StagingCopyGate"/>.
 /// </remarks>
 public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
 {
     private const int CopyBufferSize = 128 * 1024;
 
     private readonly string _stagingRoot;
+    private readonly string? _repositoriesRoot;
     private readonly ExecutorHostPhaseRunner _runner;
+    private readonly StagingCopyGate _copyGate;
 
     private string? _sourceRepoPath;
     private string? _sourceRootName;
@@ -34,20 +40,33 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
     public ColocatedExecutorTransport(
         string hostId,
         string stagingRoot,
-        ExecutorHostPhaseRunner runner)
+        ExecutorHostPhaseRunner runner,
+        string? repositoriesRootDirectory = null,
+        StagingCopyGate? copyGate = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(hostId);
         ArgumentException.ThrowIfNullOrWhiteSpace(stagingRoot);
         ArgumentNullException.ThrowIfNull(runner);
         HostId = hostId.Trim();
         _stagingRoot = Path.GetFullPath(stagingRoot.Trim());
+        _repositoriesRoot = string.IsNullOrWhiteSpace(repositoriesRootDirectory)
+            ? null
+            : Path.GetFullPath(repositoriesRootDirectory.Trim());
         _runner = runner;
+        _copyGate = copyGate ?? new StagingCopyGate();
     }
 
     /// <inheritdoc />
     public string HostId { get; }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// The path is canonicalized and — when the transport was composed with
+    /// the repositories root — contained under it here at the sink, so the
+    /// guard travels with this public entry point instead of living only at
+    /// the proxy's distant call site. Links are never followed: a staged
+    /// source that is itself a link, or contains one, fails loudly.
+    /// </remarks>
     public Task StageInAsync(string hostRepoPath, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -62,8 +81,17 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
         {
             throw new ExecutorPhaseTransportException(HostId, "stage-in", "Host repository path is not a valid path.", ex);
         }
+        if (_repositoriesRoot is not null)
+        {
+            var prefix = _repositoriesRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+            if (!canonical.StartsWith(prefix, StringComparison.Ordinal))
+                throw new ExecutorPhaseTransportException(HostId, "stage-in", "Host repository path escapes the repositories root.");
+        }
         if (!Directory.Exists(canonical))
             throw new ExecutorPhaseTransportException(HostId, "stage-in", $"Host repository path does not exist: '{canonical}'.");
+        if (IsLink(canonical))
+            throw new ExecutorPhaseTransportException(HostId, "stage-in", "Host repository path is a link; refusing to stage through it.");
         var rootName = Path.GetFileName(canonical.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
         if (string.IsNullOrEmpty(rootName))
             throw new ExecutorPhaseTransportException(HostId, "stage-in", "Host repository path has no directory name.");
@@ -79,8 +107,16 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
         ArgumentNullException.ThrowIfNull(request);
         var source = _sourceRepoPath
             ?? throw new ExecutorPhaseTransportException(HostId, "run-phase", "No repository was staged; StageInAsync must run first.");
-        var staged = ExecutorPhaseExecution.ResolveStagedRepoPath(_stagingRoot, request.RepositoryId);
-        RefreshStagedCopy(source, staged, ct);
+        // Per-dispatch leaf: concurrent dispatches against the same repo run
+        // on isolated copies. A failed run intentionally leaves its leaf
+        // behind — a same-key duplicate may still reference it, and a
+        // failover retry re-stages under the copy gate — while stage-out
+        // deletes the leaf once the tar is written.
+        var staged = ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(_stagingRoot, request);
+        using (await _copyGate.AcquireAsync(staged, ct).ConfigureAwait(false))
+        {
+            RefreshStagedCopy(source, staged, ct);
+        }
         _stagedLeaf = staged;
         try
         {
@@ -163,6 +199,26 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
         {
             throw new ExecutorPhaseTransportException(HostId, "stage-out", ex.Message, ex);
         }
+        finally
+        {
+            // The tar now carries the result; drop the per-dispatch leaf so
+            // staging does not accumulate one directory per phase run.
+            _stagedLeaf = null;
+            DeleteQuietly(staged);
+        }
+    }
+
+    private static void DeleteQuietly(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                DeleteDirectory(path);
+        }
+        catch (Exception)
+        {
+            // Best-effort temp cleanup: never mask the dispatch outcome.
+        }
     }
 
     private void RefreshStagedCopy(string source, string staged, CancellationToken ct)
@@ -170,12 +226,27 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
         ct.ThrowIfCancellationRequested();
         try
         {
+            // A link at the staging root or the staged leaf would redirect
+            // the delete/create/copy below onto attacker-chosen targets, so
+            // refuse before touching anything. Directory.CreateDirectory on a
+            // link to a directory would silently succeed, hence check first.
+            if (Directory.Exists(_stagingRoot) && IsLink(_stagingRoot))
+                throw new ExecutorPhaseTransportException(HostId, "stage", "Staging root is a link; refusing to stage through it.");
+            Directory.CreateDirectory(_stagingRoot);
+            if ((Directory.Exists(staged) || File.Exists(staged)) && IsLink(staged))
+                throw new ExecutorPhaseTransportException(HostId, "stage", "Staged repository path is a link; refusing to stage through it.");
             if (Directory.Exists(staged))
                 DeleteDirectory(staged);
+            else if (File.Exists(staged))
+                throw new ExecutorPhaseTransportException(HostId, "stage", "Staged repository path is blocked by a file.");
             Directory.CreateDirectory(staged);
             CopyDirectory(source, staged, ct);
         }
         catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (ExecutorPhaseTransportException)
         {
             throw;
         }
@@ -185,42 +256,131 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
         }
     }
 
-    private static void CopyDirectory(string source, string destination, CancellationToken ct)
+    private static bool IsLink(string path) =>
+        (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+
+    private static string RelativeName(string root, string path)
     {
-        foreach (var dir in Directory.GetDirectories(source, "*", SearchOption.AllDirectories))
+        var relative = Path.GetRelativePath(root, path);
+        if (relative.Length > 256)
+            relative = relative[..256] + "…";
+        return relative;
+    }
+
+    /// <summary>
+    /// Copies one level at a time, refusing every link before descending or
+    /// opening: enumerating with <see cref="SearchOption.AllDirectories"/>
+    /// would follow a planted directory link and copy outside content, and
+    /// the tar writer would then materialize the link target as regular
+    /// files. The source is orchestrator-owned, so a link there is anomalous
+    /// and fails the dispatch loudly instead of being followed or silently
+    /// dropped. The check-then-open window is best-effort (the platform
+    /// offers no open-without-following here); worst case under a concurrent
+    /// swap is a partially refreshed copy, which the dispatch treats as a
+    /// transport failure on the next inconsistent read.
+    /// </summary>
+    private void CopyDirectory(string source, string destination, CancellationToken ct)
+    {
+        foreach (var entry in Directory.EnumerateFileSystemEntries(source, "*", SearchOption.TopDirectoryOnly))
         {
             ct.ThrowIfCancellationRequested();
-            Directory.CreateDirectory(Path.Combine(destination, Path.GetRelativePath(source, dir)));
+            bool isLink;
+            try
+            {
+                isLink = IsLink(entry);
+            }
+            catch (FileNotFoundException)
+            {
+                continue;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                continue;
+            }
+            if (isLink)
+                throw new ExecutorPhaseTransportException(
+                    HostId, "stage",
+                    $"Refusing to stage link '{RelativeName(source, entry)}'.");
+            if (Directory.Exists(entry))
+            {
+                var target = Path.Combine(destination, Path.GetFileName(entry));
+                Directory.CreateDirectory(target);
+                CopyDirectory(entry, target, ct);
+            }
+            else if (File.Exists(entry))
+            {
+                var target = Path.Combine(destination, Path.GetFileName(entry));
+                var attributes = File.GetAttributes(entry);
+                using var input = File.OpenRead(entry);
+                using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                input.CopyTo(output);
+                File.SetAttributes(target, attributes & ~(FileAttributes.ReadOnly | FileAttributes.Hidden));
+            }
         }
-        foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
-        {
-            ct.ThrowIfCancellationRequested();
-            var target = Path.Combine(destination, Path.GetRelativePath(source, file));
-            using var input = File.OpenRead(file);
-            using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-            input.CopyTo(output);
-            File.SetAttributes(target, File.GetAttributes(file) & ~(FileAttributes.ReadOnly | FileAttributes.Hidden));
-        }
-        foreach (var dir in Directory.GetDirectories(destination, "*", SearchOption.AllDirectories))
-            File.SetAttributes(dir, File.GetAttributes(dir) & ~(FileAttributes.ReadOnly | FileAttributes.Hidden));
     }
 
     private static void DeleteDirectory(string path)
     {
-        foreach (var entry in Directory.GetFileSystemEntries(path, "*", SearchOption.AllDirectories))
+        foreach (var entry in Directory.EnumerateFileSystemEntries(path, "*", SearchOption.TopDirectoryOnly))
         {
+            bool isLink;
             try
             {
-                var attributes = File.GetAttributes(entry);
-                if ((attributes & FileAttributes.ReadOnly) != 0)
-                    File.SetAttributes(entry, attributes & ~FileAttributes.ReadOnly);
+                isLink = IsLink(entry);
             }
-            catch (FileNotFoundException) { }
-            catch (DirectoryNotFoundException) { }
+            catch (FileNotFoundException)
+            {
+                continue;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                continue;
+            }
+            try
+            {
+                // Delete the link itself, never its target: recursive delete
+                // must not follow directory links into outside trees.
+                if (isLink)
+                {
+                    if (Directory.Exists(entry) && !File.Exists(entry))
+                        Directory.Delete(entry, recursive: false);
+                    else
+                        File.Delete(entry);
+                }
+                else if (Directory.Exists(entry))
+                {
+                    DeleteDirectory(entry);
+                    var attributes = File.GetAttributes(entry);
+                    if ((attributes & FileAttributes.ReadOnly) != 0)
+                        File.SetAttributes(entry, attributes & ~FileAttributes.ReadOnly);
+                    Directory.Delete(entry, recursive: false);
+                }
+                else if (File.Exists(entry))
+                {
+                    var attributes = File.GetAttributes(entry);
+                    if ((attributes & FileAttributes.ReadOnly) != 0)
+                        File.SetAttributes(entry, attributes & ~FileAttributes.ReadOnly);
+                    File.Delete(entry);
+                }
+            }
+            catch (FileNotFoundException)
+            {
+            }
+            catch (DirectoryNotFoundException)
+            {
+            }
         }
-        Directory.Delete(path, recursive: true);
+        Directory.Delete(path, recursive: false);
     }
 
+    /// <summary>
+    /// Tars the staged copy one level at a time, refusing every link before
+    /// reading: a link that survived to stage-out (planted mid-phase) must
+    /// fail the transfer loudly rather than have its target materialized as
+    /// regular-file entries that bypass the stage-out link rejection.
+    /// Deterministic entry order (ordinal per level, directories before
+    /// files) so repeated runs tar identically.
+    /// </summary>
     private static async Task WriteTarOfDirectoryAsync(
         string sourceDir,
         string rootName,
@@ -228,20 +388,72 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
         CancellationToken ct)
     {
         await using var writer = new TarWriter(destination, TarEntryFormat.Pax, leaveOpen: true);
-        foreach (var dir in Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories).OrderBy(x => x, StringComparer.Ordinal))
+        await WriteTarLevelAsync(writer, sourceDir, sourceDir, rootName, ct).ConfigureAwait(false);
+    }
+
+    private static async Task WriteTarLevelAsync(
+        TarWriter writer,
+        string rootDir,
+        string levelDir,
+        string rootName,
+        CancellationToken ct)
+    {
+        var entries = Directory.EnumerateFileSystemEntries(levelDir, "*", SearchOption.TopDirectoryOnly)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList();
+        foreach (var entry in entries)
         {
             ct.ThrowIfCancellationRequested();
-            var name = rootName + "/" + Path.GetRelativePath(sourceDir, dir).Replace('\\', '/');
-            await writer.WriteEntryAsync(new PaxTarEntry(TarEntryType.Directory, name), ct).ConfigureAwait(false);
+            bool isLink;
+            try
+            {
+                isLink = IsLink(entry);
+            }
+            catch (FileNotFoundException)
+            {
+                continue;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                continue;
+            }
+            if (isLink)
+                throw new ExecutorPhaseException(
+                    $"Refusing to archive link '{RelativeName(rootDir, entry)}' from the staged copy.");
+            var name = rootName + "/" + Path.GetRelativePath(rootDir, entry).Replace('\\', '/');
+            if (Directory.Exists(entry))
+            {
+                await writer.WriteEntryAsync(new PaxTarEntry(TarEntryType.Directory, name), ct).ConfigureAwait(false);
+            }
+            else if (File.Exists(entry))
+            {
+                var tarEntry = new PaxTarEntry(TarEntryType.RegularFile, name);
+                await using var data = File.OpenRead(entry);
+                tarEntry.DataStream = data;
+                await writer.WriteEntryAsync(tarEntry, ct).ConfigureAwait(false);
+            }
         }
-        foreach (var file in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories).OrderBy(x => x, StringComparer.Ordinal))
+        foreach (var entry in entries)
         {
             ct.ThrowIfCancellationRequested();
-            var name = rootName + "/" + Path.GetRelativePath(sourceDir, file).Replace('\\', '/');
-            var entry = new PaxTarEntry(TarEntryType.RegularFile, name);
-            await using var data = File.OpenRead(file);
-            entry.DataStream = data;
-            await writer.WriteEntryAsync(entry, ct).ConfigureAwait(false);
+            if (Directory.Exists(entry) && !IsLinkQuiet(entry))
+                await WriteTarLevelAsync(writer, rootDir, entry, rootName, ct).ConfigureAwait(false);
+        }
+    }
+
+    private static bool IsLinkQuiet(string path)
+    {
+        try
+        {
+            return IsLink(path);
+        }
+        catch (FileNotFoundException)
+        {
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return true;
         }
     }
 

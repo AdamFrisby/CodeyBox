@@ -447,11 +447,6 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
                 $"A remote executor registered under the reserved host id '{ColocatedExecutorHost.HostId}'; rename the remote host.");
         hosts.Add(SandboxPlacementMember.FromExecutorRegistration(_local.GetRegistration()));
 
-        if (hosts.Count == 0)
-            throw new InvalidOperationException(
-                "No executor host is available for phase dispatch: the colocated executor is missing. " +
-                "This is a configuration fault, not a retryable placement miss.");
-
         var requirements = ExecutorPlacementRequirements.FromRequest(request);
         var loads = BuildLoads(workers);
         var now = _clock.GetUtcNow();

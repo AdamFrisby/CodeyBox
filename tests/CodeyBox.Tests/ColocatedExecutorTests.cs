@@ -83,10 +83,12 @@ public sealed class ColocatedExecutorTests : IDisposable
         var twin = WorkItemId.New();
         await SeedBareRepoAsync(ctx.Git, item);
         await SeedBareRepoAsync(ctx.Git, twin);
-        StageDirectRepo(ctx.Git, twin, ctx.DirectStagingRoot);
+        var viaRequest = NewRequest(item, "work", 0);
+        var directRequest = NewRequest(twin, "work", 0);
+        StageDirectRepo(ctx.Git, directRequest, ctx.DirectStagingRoot);
 
-        var viaProxy = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
-        var direct = await ctx.Runner.ExecutePhaseAsync(NewRequest(twin, "work", 0), CancellationToken.None);
+        var viaProxy = await ctx.Proxy.ExecutePhaseAsync(viaRequest, CancellationToken.None);
+        var direct = await ctx.Runner.ExecutePhaseAsync(directRequest, CancellationToken.None);
 
         AssertResultsEqual(direct, viaProxy);
         var viaBare = ctx.Git.GetRepoPath(item.ToString());
@@ -94,7 +96,7 @@ public sealed class ColocatedExecutorTests : IDisposable
         Assert.Contains(viaProxy.CommitSha!, viaLog.Split('\n', StringSplitOptions.RemoveEmptyEntries));
         // The direct runner commits into its staged copy (like any remote
         // host); the proxy stages that copy back over the orchestrator repo.
-        var stagedLeaf = ExecutorPhaseExecution.ResolveStagedRepoPath(ctx.DirectStagingRoot, twin.ToString());
+        var stagedLeaf = ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(ctx.DirectStagingRoot, directRequest);
         var directLog = await RunGitBareCapture(stagedLeaf, "log", "--format=%H", "phase/work-0");
         Assert.Contains(direct.CommitSha!, directLog.Split('\n', StringSplitOptions.RemoveEmptyEntries));
     }
@@ -108,10 +110,12 @@ public sealed class ColocatedExecutorTests : IDisposable
         var twin = WorkItemId.New();
         await SeedBareRepoAsync(ctx.Git, item);
         await SeedBareRepoAsync(ctx.Git, twin);
-        StageDirectRepo(ctx.Git, twin, ctx.DirectStagingRoot);
+        var viaRequest = NewRequest(item, "work", 0);
+        var directRequest = NewRequest(twin, "work", 0);
+        StageDirectRepo(ctx.Git, directRequest, ctx.DirectStagingRoot);
 
-        var viaProxy = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
-        var direct = await ctx.Runner.ExecutePhaseAsync(NewRequest(twin, "work", 0), CancellationToken.None);
+        var viaProxy = await ctx.Proxy.ExecutePhaseAsync(viaRequest, CancellationToken.None);
+        var direct = await ctx.Runner.ExecutePhaseAsync(directRequest, CancellationToken.None);
 
         Assert.Equal(ExecutorPhaseOutcome.AgentFailed, viaProxy.Outcome);
         AssertResultsEqual(direct, viaProxy);
@@ -196,6 +200,136 @@ public sealed class ColocatedExecutorTests : IDisposable
         new ColocatedExecutorOptions().Validate();
     }
 
+    [Fact]
+    public void DefaultStagingRoot_IsPerProcessSubdirectory()
+    {
+        using var ctx = CreateContext();
+        var @default = new ColocatedExecutorHost(
+            new NoopSandboxProvider(),
+            () => new ColocatedExecutorOptions(),
+            () => new ExecutorPhaseDispatchOptions(),
+            ctx.Handler).GetStagingRoot();
+        Assert.Contains($"codeybox-colocated-phases-p{Environment.ProcessId}", @default);
+        Assert.True(Path.IsPathFullyQualified(@default));
+    }
+
+    // ── staging isolation and link safety (regression) ──────────────────────
+
+    [Fact]
+    public void StagedLeaves_IsolatedPerDispatch_Deterministic()
+    {
+        using var ctx = CreateContext();
+        var root = ctx.Local.GetStagingRoot();
+        var item = WorkItemId.New();
+        var first = NewRequest(item, "work", 0);
+        var sameAgain = NewRequest(item, "work", 0);
+        var otherAttempt = NewRequest(item, "work", 1);
+
+        // Deterministic from the request so transport and runner agree on
+        // the leaf without extra I/O, and distinct per dispatch so
+        // concurrent same-repo phases never share a leaf.
+        Assert.Equal(
+            ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(root, first),
+            ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(root, sameAgain));
+        Assert.NotEqual(
+            ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(root, first),
+            ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(root, otherAttempt));
+        Assert.StartsWith(
+            Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
+            ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(root, first),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ConcurrentSameRepoTransports_StayIsolated()
+    {
+        using var ctx = CreateContext();
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+        var bare = ctx.Git.GetRepoPath(item.ToString());
+        var first = NewRequest(item, "work", 0);
+        var second = NewRequest(item, "work", 1);
+
+        // Two single-dispatch transports over the one shared host (and its
+        // one shared copy gate), racing the same bare repo the way two
+        // concurrent same-repo dispatches do. Separate leaves mean no
+        // delete/copy interleaving; afterwards stage-out removes its leaf.
+        var firstTransport = ctx.Local.CreateTransport();
+        var secondTransport = ctx.Local.CreateTransport();
+        await firstTransport.StageInAsync(bare, CancellationToken.None);
+        await secondTransport.StageInAsync(bare, CancellationToken.None);
+        var results = await Task.WhenAll(
+            firstTransport.RunPhaseAsync(first, CancellationToken.None),
+            secondTransport.RunPhaseAsync(second, CancellationToken.None));
+
+        Assert.All(results, r => Assert.Equal(ExecutorPhaseOutcome.Succeeded, r.Outcome));
+        Assert.NotEqual(results[0].CommitSha, results[1].CommitSha);
+        var firstTar = Path.Combine(_root, "first-" + Guid.NewGuid().ToString("N") + ".tar");
+        var secondTar = Path.Combine(_root, "second-" + Guid.NewGuid().ToString("N") + ".tar");
+        await firstTransport.StageOutToArchiveAsync(firstTar, 256 * 1024 * 1024, CancellationToken.None);
+        await secondTransport.StageOutToArchiveAsync(secondTar, 256 * 1024 * 1024, CancellationToken.None);
+        Assert.True(new FileInfo(firstTar).Length > 0);
+        Assert.True(new FileInfo(secondTar).Length > 0);
+        Assert.Empty(Directory.GetDirectories(ctx.Local.GetStagingRoot()));
+    }
+
+    [Fact]
+    public async Task SymlinkedSourceEntry_RefusedLoudly_NothingStagedThroughIt()
+    {
+        using var ctx = CreateContext();
+        var item = WorkItemId.New();
+        await SeedBareRepoAsync(ctx.Git, item);
+        var bare = ctx.Git.GetRepoPath(item.ToString());
+        var outside = Directory.CreateTempSubdirectory("codeybox-colocated-outside-").FullName;
+        await File.WriteAllTextAsync(Path.Combine(outside, "secret.txt"), "top-secret");
+        try
+        {
+            File.CreateSymbolicLink(Path.Combine(bare, "evil-link"), Path.Combine(outside, "secret.txt"));
+
+            var ex = await Assert.ThrowsAsync<ExecutorPhaseTransportException>(
+                () => ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None));
+            Assert.Equal("local", ex.HostId);
+
+            // The link target never lands in staging, and the bare repo
+            // gains no phase branch: the dispatch failed before running.
+            Assert.Empty(Directory.GetFiles(ctx.Local.GetStagingRoot(), "secret.txt", SearchOption.AllDirectories));
+            var branches = await RunGitBareCapture(bare, "branch", "--list", "phase/work-0");
+            Assert.True(string.IsNullOrWhiteSpace(branches));
+        }
+        finally
+        {
+            try { File.Delete(Path.Combine(bare, "evil-link")); } catch { }
+            try { Directory.Delete(outside, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task StageIn_OutsideRepositoriesRoot_RejectedAtSink()
+    {
+        using var ctx = CreateContext();
+        var staging = Directory.CreateTempSubdirectory("codeybox-colocated-sink-").FullName;
+        var transport = new ColocatedExecutorTransport(
+            ColocatedExecutorHost.HostId,
+            staging,
+            ctx.Runner,
+            repositoriesRootDirectory: ctx.Git.RepositoriesRootDirectory);
+        var outside = Directory.CreateTempSubdirectory("codeybox-colocated-elsewhere-").FullName;
+        try
+        {
+            await Assert.ThrowsAsync<ExecutorPhaseTransportException>(
+                () => transport.StageInAsync(outside, CancellationToken.None));
+
+            var item = WorkItemId.New();
+            await SeedBareRepoAsync(ctx.Git, item);
+            await transport.StageInAsync(ctx.Git.GetRepoPath(item.ToString()), CancellationToken.None);
+        }
+        finally
+        {
+            try { Directory.Delete(staging, recursive: true); } catch { }
+            try { Directory.Delete(outside, recursive: true); } catch { }
+        }
+    }
+
     // ── local overhead measurement ──────────────────────────────────────────
 
     private readonly ITestOutputHelper _output;
@@ -218,7 +352,8 @@ public sealed class ColocatedExecutorTests : IDisposable
             var twin = WorkItemId.New();
             await SeedBareRepoAsync(ctx.Git, item);
             await SeedBareRepoAsync(ctx.Git, twin);
-            StageDirectRepo(ctx.Git, twin, ctx.DirectStagingRoot);
+            var directRequest = NewRequest(twin, "work", 0);
+            StageDirectRepo(ctx.Git, directRequest, ctx.DirectStagingRoot);
 
             var sw = Stopwatch.StartNew();
             var viaProxy = await ctx.Proxy.ExecutePhaseAsync(NewRequest(item, "work", 0), CancellationToken.None);
@@ -227,7 +362,7 @@ public sealed class ColocatedExecutorTests : IDisposable
             Assert.Equal(ExecutorPhaseOutcome.Succeeded, viaProxy.Outcome);
 
             sw.Restart();
-            var direct = await ctx.Runner.ExecutePhaseAsync(NewRequest(twin, "work", 0), CancellationToken.None);
+            var direct = await ctx.Runner.ExecutePhaseAsync(directRequest, CancellationToken.None);
             sw.Stop();
             directMs.Add(sw.ElapsedMilliseconds);
             Assert.Equal(ExecutorPhaseOutcome.Succeeded, direct.Outcome);
@@ -520,12 +655,12 @@ public sealed class ColocatedExecutorTests : IDisposable
     /// Stages a bare repo into a bare executor-side runner's staging root,
     /// mirroring what the delivery plane does over the transport. The direct
     /// runner — like any remote host — refuses to run when its staged copy
-    /// is absent.
+    /// is absent. Stages to the same per-dispatch leaf the runner resolves.
     /// </summary>
-    private static void StageDirectRepo(LocalGitHost git, WorkItemId item, string stagingRoot)
+    private static void StageDirectRepo(LocalGitHost git, ExecutorPhaseRequest request, string stagingRoot)
     {
-        var bare = git.GetRepoPath(item.ToString());
-        var leaf = ExecutorPhaseExecution.ResolveStagedRepoPath(stagingRoot, item.ToString());
+        var bare = git.GetRepoPath(request.RepositoryId);
+        var leaf = ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(stagingRoot, request);
         if (Directory.Exists(leaf))
             Directory.Delete(leaf, recursive: true);
         Directory.CreateDirectory(leaf);

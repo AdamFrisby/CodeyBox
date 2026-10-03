@@ -134,7 +134,7 @@ All operational values live under `CodeyBox:Executor` and are hot-reloadable
 | `SandboxProviders` | `string[]` | `[]` (means `[LocalSandboxProvider]`) | Every provider kind this host serves. When non-empty it wins entirely, so one host can offer both an Incus VM and a lightweight process sandbox |
 | `Bubblewrap`, `Multipass`, `Incus`, `MultipassRemote`, `Sprites` | sections | provider defaults | Per-provider settings under `CodeyBox:Executor:<Kind>` (for example `CodeyBox:Executor:Incus:ProjectName`), tuned the same way as the orchestrator's provider sections |
 | `HeartbeatInterval` | `string` (TimeSpan) | `"00:00:15"` | Registry heartbeat cadence |
-| `PhaseStagingRoot` | `string` | `""` (process-temp subdirectory) | Root under which the delivery plane stages the phase's single bare repo, one leaf per `RepositoryId`; the phase runner resolves it with canonicalize-then-contain and refuses to run when it is absent |
+| `PhaseStagingRoot` | `string` | `""` (process-temp subdirectory) | Root under which the delivery plane stages the phase's single bare repo, one leaf per dispatch (`RepositoryId` plus dispatch key); the phase runner resolves it with canonicalize-then-contain and refuses to run when it is absent |
 | `PhaseSandboxImageReference` | `string` | `""` (provider default) | Image reference stamped on sandbox specs the phase runner provisions. Hosts on VM-backed providers must set a real image |
 | `MaxCachedPhaseResults` | `int` | `1024` | Maximum completed phase results the executor-side replay guard keeps; oldest-completed evicted first, in-flight never evicted |
 | `PhaseResultCacheTtl` | `string` (TimeSpan) | `"24:00:00"` | How long the executor replays a completed phase result on redelivery |

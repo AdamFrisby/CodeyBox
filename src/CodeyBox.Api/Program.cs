@@ -587,7 +587,8 @@ builder.Services.AddSingleton(sp => new ColocatedExecutorHost(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ExecutorPhaseDispatch,
     sp.GetService<IExecutorPhaseHandler>(),
     tracker: new ExecutorSandboxTracker(),
-    loggerFactory: sp.GetRequiredService<ILoggerFactory>()));
+    loggerFactory: sp.GetRequiredService<ILoggerFactory>(),
+    repositoriesRootAccessor: () => sp.GetRequiredService<IGitHost>().RepositoriesRootDirectory));
 builder.Services.AddSingleton<IExecutorPhaseTransportFactory>(sp =>
     new ColocatedExecutorTransportFactory(sp.GetRequiredService<ColocatedExecutorHost>()));
 

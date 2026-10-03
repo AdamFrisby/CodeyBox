@@ -41,12 +41,32 @@ internal static class ExecutorPhaseExecution
     /// content-hashed leaf, and the result is canonicalized and contained
     /// under the root before it is returned.
     /// </summary>
-    internal static string ResolveStagedRepoPath(string stagingRoot, string repositoryId)
+    internal static string ResolveStagedRepoPath(string stagingRoot, string repositoryId) =>
+        CombineLeaf(stagingRoot, ToSafeLeaf(repositoryId), repositoryId);
+
+    /// <summary>
+    /// Resolves the staged bare-repo path for one dispatch: the per-repo leaf
+    /// plus a hash of the dispatch key (work item + phase + attempt), so two
+    /// concurrent dispatches against the same repo stage, run and tar
+    /// isolated copies instead of interleaving delete/copy/run/tar on one
+    /// shared leaf. Deterministic from the request so the colocated transport
+    /// and the executor-side runner agree on the leaf without extra I/O.
+    /// Same containment guarantees as <see cref="ResolveStagedRepoPath"/>.
+    /// </summary>
+    internal static string ResolveStagedRepoPathForDispatch(string stagingRoot, ExecutorPhaseRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var dispatchKey = ExecutorPhaseProxy.BuildDispatchKey(request);
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(dispatchKey));
+        var suffix = Convert.ToHexString(hash).ToLowerInvariant()[..16];
+        return CombineLeaf(stagingRoot, ToSafeLeaf(request.RepositoryId) + "-d-" + suffix, request.RepositoryId);
+    }
+
+    private static string CombineLeaf(string stagingRoot, string leaf, string repositoryId)
     {
         if (string.IsNullOrWhiteSpace(stagingRoot))
             throw new ExecutorPhaseException("No executor staging root is configured; cannot resolve the staged repository.");
         var rootFull = Path.GetFullPath(stagingRoot);
-        var leaf = ToSafeLeaf(repositoryId);
         var full = Path.GetFullPath(Path.Combine(rootFull, leaf));
         var prefix = rootFull.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             + Path.DirectorySeparatorChar;
@@ -260,7 +280,7 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
         var stagingRoot = string.IsNullOrWhiteSpace(options.PhaseStagingRoot)
             ? Path.Combine(Path.GetTempPath(), "codeybox-executor-phases")
             : options.PhaseStagingRoot.Trim();
-        var repoPath = ExecutorPhaseExecution.ResolveStagedRepoPath(stagingRoot, request.RepositoryId);
+        var repoPath = ExecutorPhaseExecution.ResolveStagedRepoPathForDispatch(stagingRoot, request);
         if (!Directory.Exists(repoPath))
             throw new ExecutorPhaseTransportException(
                 hostId,
