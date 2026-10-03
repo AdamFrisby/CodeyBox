@@ -1,0 +1,26 @@
+{
+  "type": "message",
+  "id": "ACTIVITY_ID",
+  "timestamp": "2026-09-18T12:00:00.000Z",
+  "serviceUrl": "https://smba.trafficmanager.net/teams/",
+  "channelId": "19:channel-id@thread.tacv2",
+  "from": {
+    "id": "29:alice-user-id",
+    "name": "Alice"
+  },
+  "conversation": {
+    "id": "19:channel-id@thread.tacv2",
+    "name": "deployments"
+  },
+  "recipient": {
+    "id": "28:bot-id",
+    "name": "CodeyBox"
+  },
+  "text": "Use rollbacks",
+  "value": {
+    "w": "WORK_ITEM_ID",
+    "q": "q-001",
+    "a": "Use rollbacks",
+    "c": "WORK_ITEM_ID:q-001"
+  }
+}

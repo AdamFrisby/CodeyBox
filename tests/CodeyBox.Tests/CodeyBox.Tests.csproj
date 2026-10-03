@@ -121,6 +121,7 @@
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.SlackPlugin\CodeyBox.SlackPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.GotifyPlugin\CodeyBox.GotifyPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.NtfyPlugin\CodeyBox.NtfyPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\notifications\CodeyBox.TeamsPlugin\CodeyBox.TeamsPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.DaytonaSandboxPlugin\CodeyBox.DaytonaSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.BoxLiteSandboxPlugin\CodeyBox.BoxLiteSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Majordomo\CodeyBox.Majordomo.csproj" />

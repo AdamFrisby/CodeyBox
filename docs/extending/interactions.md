@@ -59,13 +59,17 @@ Supported schemes (`Scheme` per provider entry):
 | `hmac-sha256` | `X-CodeyBox-Signature: sha256=<hex HMAC over raw body>`, `X-CodeyBox-Timestamp` (unix seconds) | env var named by `SigningSecretEnvVar` |
 | `slack-v0` | `X-Slack-Signature: v0=<hex HMAC over "v0:{ts}:{body}">`, `X-Slack-Request-Timestamp` | Slack signing secret via `SigningSecretEnvVar` |
 | `ntfy-hmac` | `X-CodeyBox-Signature: sha256=<hex HMAC over raw body>` — no timestamp; the ntfy client invokes a button minted at publish time, so replays are absorbed by dedup + question state | interaction secret via `SigningSecretEnvVar` |
+| `botframework-jwt` | `Authorization: Bearer <RS256 JWT>` issued by `https://api.botframework.com` — no timestamp; the token's own expiry plus dedup + question state absorb replays | expected App ID (token audience) via `SigningSecretEnvVar` |
 
 Slack posts its native `block_actions` form body (`payload={...}`) rather
 than the canonical JSON: on a `slack-v0` provider the endpoint maps that
 shape after verification (see
-[`slack-notifications.md`](slack-notifications.md)). ntfy buttons carry
-the canonical JSON verbatim — the provider signs exactly the bytes the
-endpoint receives (see
+[`slack-notifications.md`](slack-notifications.md)). Teams posts the
+native Bot Framework activity for an `Action.Submit` delivery: on a
+`botframework-jwt` provider the endpoint maps that shape after
+verification (see [`teams-notifications.md`](teams-notifications.md)).
+ntfy buttons carry the canonical JSON verbatim — the provider signs
+exactly the bytes the endpoint receives (see
 [`ntfy-notifications.md`](ntfy-notifications.md)).
 
 Header names are overridable per provider (`SignatureHeader`,
