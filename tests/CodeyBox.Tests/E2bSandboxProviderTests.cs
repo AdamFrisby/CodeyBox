@@ -793,4 +793,149 @@ public sealed class E2bSandboxProviderTests
         Assert.Equal("sub/file", E2bGuestPath.GetRelativePath("/work", "/work/sub/file"));
         Assert.Throws<ArgumentException>(() => E2bGuestPath.GetRelativePath("/work", "/other/file"));
     }
+
+    private static E2bSandbox NewSyncSandbox(FakeE2bHandler handler, E2bSandboxOptions? opts = null)
+    {
+        var options = opts ?? TestOptions();
+        return new E2bSandbox(
+            "sb_test_sync",
+            "envd_token_test",
+            new E2bApiClient(new HttpClient(handler)),
+            () => options,
+            () => "test-key",
+            BasicSpec(),
+            TimeProvider.System,
+            NullLogger.Instance,
+            _ => { });
+    }
+
+    [Fact]
+    public async Task SyncBack_DanglingHostSymlink_RefusedWithoutWritingOutsideMount()
+    {
+        var handler = new FakeE2bHandler
+        {
+            CommandResponder = _ => (0, "/data/evil.txt\n", string.Empty),
+            ReadFileBody = "guest-bytes"u8.ToArray(),
+        };
+        var sandbox = NewSyncSandbox(handler);
+        var hostDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(hostDir);
+        try
+        {
+            var outside = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            var link = Path.Combine(hostDir, "evil.txt");
+            File.CreateSymbolicLink(link, outside);
+            sandbox.SetWritableMounts([new E2bWritableMountSync("/data", hostDir)]);
+
+            var syncError = await sandbox.SyncWritableMountsBackAsync(TestOptions(), CancellationToken.None);
+            Assert.NotNull(syncError);
+            Assert.Contains("symlink", syncError, StringComparison.OrdinalIgnoreCase);
+            Assert.False(File.Exists(outside), "sync-back must not follow the host symlink");
+            Assert.NotNull(new FileInfo(link).LinkTarget);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => sandbox.SyncStateToHostAsync(CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(hostDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SyncBack_LiveHostSymlink_RefusedWithoutOverwritingTarget()
+    {
+        var handler = new FakeE2bHandler
+        {
+            CommandResponder = _ => (0, "/data/evil.txt\n", string.Empty),
+            ReadFileBody = "guest-bytes"u8.ToArray(),
+        };
+        var sandbox = NewSyncSandbox(handler);
+        var hostDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(hostDir);
+        var outside = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            await File.WriteAllTextAsync(outside, "original-outside");
+            var link = Path.Combine(hostDir, "evil.txt");
+            File.CreateSymbolicLink(link, outside);
+            sandbox.SetWritableMounts([new E2bWritableMountSync("/data", hostDir)]);
+
+            var syncError = await sandbox.SyncWritableMountsBackAsync(TestOptions(), CancellationToken.None);
+            Assert.NotNull(syncError);
+            Assert.Contains("symlink", syncError, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("original-outside", await File.ReadAllTextAsync(outside));
+        }
+        finally
+        {
+            Directory.Delete(hostDir, recursive: true);
+            File.Delete(outside);
+        }
+    }
+
+    [Fact]
+    public async Task SyncBack_RegularFile_WritesThroughAndSyncStateSucceeds()
+    {
+        var handler = new FakeE2bHandler
+        {
+            CommandResponder = _ => (0, "/data/notes.txt\n", string.Empty),
+            ReadFileBody = "guest-bytes"u8.ToArray(),
+        };
+        var sandbox = NewSyncSandbox(handler);
+        var hostDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(hostDir);
+        try
+        {
+            sandbox.SetWritableMounts([new E2bWritableMountSync("/data", hostDir)]);
+            await sandbox.SyncStateToHostAsync(CancellationToken.None);
+            Assert.Equal("guest-bytes", await File.ReadAllTextAsync(Path.Combine(hostDir, "notes.txt")));
+        }
+        finally
+        {
+            Directory.Delete(hostDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SyncStateToHostAsync_ServiceFailure_ThrowsInsteadOfSwallowing()
+    {
+        var handler = new FakeE2bHandler { FailCommandStatus = HttpStatusCode.InternalServerError };
+        var sandbox = NewSyncSandbox(handler);
+        var hostDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(hostDir);
+        try
+        {
+            sandbox.SetWritableMounts([new E2bWritableMountSync("/data", hostDir)]);
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => sandbox.SyncStateToHostAsync(CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(hostDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SyncStateToHostAsync_CancelledToken_ThrowsCancellation()
+    {
+        var handler = new FakeE2bHandler
+        {
+            CommandResponder = _ => (0, "/data/notes.txt\n", string.Empty),
+        };
+        var sandbox = NewSyncSandbox(handler);
+        var hostDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(hostDir);
+        try
+        {
+            sandbox.SetWritableMounts([new E2bWritableMountSync("/data", hostDir)]);
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => sandbox.SyncStateToHostAsync(cts.Token));
+        }
+        finally
+        {
+            Directory.Delete(hostDir, recursive: true);
+        }
+    }
 }

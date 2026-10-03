@@ -426,22 +426,30 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
 
     public async Task SyncStateToHostAsync(CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         string? syncError;
         try
         {
             syncError = await SyncWritableMountsBackAsync(_readOptions(), ct).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "E2B sandbox {SandboxId}: SyncStateToHostAsync failed.", Id);
-            return;
+            throw;
         }
 
         if (syncError is not null)
         {
             _log.LogWarning(
-                "E2B sandbox {SandboxId}: teardown sync-back incomplete ({Reason}); continuing.",
+                "E2B sandbox {SandboxId}: teardown sync-back incomplete ({Reason}).",
                 Id, syncError);
+            ct.ThrowIfCancellationRequested();
+            throw new InvalidOperationException(
+                $"E2B sandbox {Id}: teardown sync-back incomplete ({syncError}).");
         }
     }
 
@@ -559,6 +567,15 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
 
                 try
                 {
+                    // Re-check immediately before touching the host filesystem: the
+                    // earlier probe ran before a network round-trip, so a symlink
+                    // swapped into the host tree in between must still be refused
+                    // rather than followed by CreateDirectory/WriteAllBytesAsync.
+                    if (HostPathPassesThroughSymlink(mount.HostPath, hostFile))
+                    {
+                        return $"host path passes through a symlink for {guestFile}";
+                    }
+
                     Directory.CreateDirectory(Path.GetDirectoryName(hostFile)!);
                     await File.WriteAllBytesAsync(hostFile, bytes, ct).ConfigureAwait(false);
                 }
@@ -574,12 +591,12 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
 
     private static bool HostPathPassesThroughSymlink(string mountRoot, string hostFile)
     {
+        // Inspect every component with lstat semantics (LinkTarget does not
+        // follow the final link), starting at the final component itself: an
+        // Exists-based probe would miss a dangling symlink, and
+        // WriteAllBytesAsync follows links when opening, so the final
+        // component must never be skipped.
         var current = hostFile;
-        if (!File.Exists(current) && !Directory.Exists(current))
-        {
-            current = Path.GetDirectoryName(current) ?? mountRoot;
-        }
-
         while (true)
         {
             if (string.Equals(current, mountRoot, StringComparison.Ordinal))
@@ -587,17 +604,7 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
                 return false;
             }
 
-            try
-            {
-                if (File.Exists(current) || Directory.Exists(current))
-                {
-                    if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
-                    {
-                        return true;
-                    }
-                }
-            }
-            catch (Exception)
+            if (IsSymlinkNoFollow(current))
             {
                 return true;
             }
@@ -609,10 +616,32 @@ public sealed class E2bSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSand
             }
 
             current = parent;
-            if (!current.StartsWith(mountRoot, StringComparison.Ordinal))
+            if (!current.Equals(mountRoot, StringComparison.Ordinal)
+                && !current.StartsWith(mountRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
             {
                 return true;
             }
+        }
+    }
+
+    private static bool IsSymlinkNoFollow(string path)
+    {
+        try
+        {
+            // LinkTarget lstats without following: non-null for live and
+            // dangling links alike, null for non-links (including paths that
+            // do not exist). Both views are probed because a directory link
+            // may surface through either.
+            if (new FileInfo(path).LinkTarget is not null)
+            {
+                return true;
+            }
+
+            return new DirectoryInfo(path).LinkTarget is not null;
+        }
+        catch (Exception)
+        {
+            return true;
         }
     }
 
