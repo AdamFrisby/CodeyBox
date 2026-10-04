@@ -53,21 +53,32 @@ namespace CodeyBox.BrakemanAuditorPlugin;
 /// <c>ExpectedVersion</c> is an infrastructure failure naming the tool —
 /// never a pass, never a finding.</para>
 ///
-/// <para><b>Repository-controlled suppression.</b> Brakeman honors an ignore
-/// file authored inside the audited repository
-/// (<c>config/brakeman.ignore</c> by default) — and the audit subject writes
-/// that repository. An auditor its subject can silence is not a gate, so by
-/// default the scan passes <c>--show-ignored</c>, which keeps ignored
-/// warnings in the report (marked with SARIF <c>suppressions</c>) without
-/// letting them soften the exit code; findings then surface for code the
-/// ignore file would have hidden. Operators who deliberately trust
-/// repo-authored suppression set <c>TrustRepositorySuppression</c> in
-/// scoped config. A Brakeman YAML config file
-/// (<c>config/brakeman.yml</c>) in the audited tree is likewise read by the
-/// tool when present — keep scanner-affecting options out of it, or point
-/// the tool at an operator-owned file with <c>-c</c> via
-/// <c>ExtraArguments</c>; paths there must resolve inside the sandbox, not
-/// the audited tree.</para>
+/// <para><b>Repository-controlled suppression.</b> Brakeman honors two
+/// surfaces authored inside the audited repository — the ignore file
+/// (<c>config/brakeman.ignore</c> by default) and the YAML config file
+/// (<c>config/brakeman.yml</c>, loaded from the application path when
+/// present) — and the audit subject writes that repository. An auditor its
+/// subject can silence is not a gate. The ignore file has no disabling
+/// switch, so by default the scan passes <c>--show-ignored</c>, which keeps
+/// ignored warnings in the report (marked with SARIF <c>suppressions</c>)
+/// without letting them soften the exit code; findings then surface for
+/// code the ignore file would have hidden. The YAML config instead fails
+/// closed: when <c>config/brakeman.yml</c> is present in the audited tree
+/// the run is infrastructure — its scanner-weakening options (skipped
+/// checks, skipped paths) would otherwise yield a clean verdict over
+/// vulnerable code, and the gate runs even when <c>ExtraArguments</c>
+/// supplies <c>-c</c> because the tool only prefers the operator file when
+/// it names an existing file, which is the operator's to mispoint, not the
+/// gate's to assume. Operators who deliberately trust repo-authored
+/// suppression set <c>TrustRepositorySuppression</c> in scoped config,
+/// which lifts both the ignore-file visibility flag and the config-file
+/// gate. An operator-owned file passed with <c>-c</c>/<c>--config-file</c>
+/// or <c>-i</c>/<c>--ignore-config</c> via <c>ExtraArguments</c> is
+/// canonicalized in the sandbox and rejected when it resolves inside the
+/// audited worktree; <c>--no-exit-on-error</c> (scan errors masquerading as
+/// a clean verdict) and <c>-f</c>/<c>--format</c> or
+/// <c>-o</c>/<c>--output</c> (replacing or diverting the SARIF the parser
+/// expects) are rejected outright.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: PluginId,
@@ -93,9 +104,10 @@ public sealed class BrakemanAuditor : ExternalToolAuditorBase, IPluginInitialize
     public const string DefaultExpectedVersion = "8.0.6";
 
     /// <summary>
-    /// Scoped-config key opting in to repository-authored ignore-file
-    /// suppression. Default false: the audited repo must not be able to
-    /// silence the audit.
+    /// Scoped-config key opting in to repository-authored suppression
+    /// surfaces (the <c>config/brakeman.ignore</c> entries and the
+    /// <c>config/brakeman.yml</c> scanner config). Default false: the
+    /// audited repo must not be able to silence the audit.
     /// </summary>
     internal const string TrustRepositorySuppressionKey = "TrustRepositorySuppression";
 
@@ -193,6 +205,138 @@ public sealed class BrakemanAuditor : ExternalToolAuditorBase, IPluginInitialize
             args.Add("--show-ignored");
 
         return args;
+    }
+
+    // Brakeman loads this from the application path (the audited worktree
+    // root) when present — the audit subject's to abuse when the worktree
+    // is the scan root. The ignore file needs no presence gate:
+    // --show-ignored keeps its entries in the report by default.
+    private static readonly string[] RepositoryConfigFiles = ["config/brakeman.yml"];
+
+    // ExtraArguments flags whose presence would collapse the declared
+    // exit-code contract into a clean verdict (--no-exit-on-error) or
+    // replace/divert the SARIF report the parser expects (-f/--format,
+    // -o/--output). Rejected deterministically in VerifyToolAsync.
+    private static readonly (string Long, string Short)[] ReservedFlags =
+    [
+        ("--no-exit-on-error", ""),
+        ("--format", "-f"),
+        ("--output", "-o"),
+    ];
+
+    // ExtraArguments flags whose value is a file the tool loads for
+    // gate-shaping content — the YAML config and the ignore file — each
+    // with its short form (verified against Brakeman's options.rb:
+    // -c/--config-file, -i/--ignore-config). Gated outside the worktree in
+    // VerifyToolAsync.
+    private static readonly (string LongFlag, string? ShortFlag)[] PathValuedArgumentFlags =
+    [
+        ("--config-file", "-c"),
+        ("--ignore-config", "-i"),
+    ];
+
+    /// <summary>
+    /// Pre-scan preconditions beyond the base's presence and pinned-version
+    /// checks: operator-supplied gate-shaping flags in
+    /// <c>ExtraArguments</c> are rejected or contained, and — unless the
+    /// operator opted in — the repository-controlled Brakeman config file
+    /// must be absent from the audited tree. All fail closed as
+    /// infrastructure before the scan runs.
+    /// </summary>
+    protected override async Task VerifyToolAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string tool,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        RejectReservedExtraArguments(options);
+        await ThrowIfPathFlagResolvesInWorktreeAsync(sandbox, workingDirectory, options, ct)
+            .ConfigureAwait(false);
+
+        if (_trustRepositorySuppression())
+            return;
+
+        // Brakeman loads config/brakeman.yml from the application path when
+        // present (Brakeman.config_file checks the in-tree path alongside
+        // the operator's -c and the machine-wide defaults). Its options can
+        // skip checks and paths, so a repo-authored file yields a clean
+        // verdict over vulnerable code: presence fails closed unless the
+        // operator trusts repository-controlled suppression. The gate runs
+        // even when ExtraArguments supplies -c: the tool only prefers the
+        // operator file when it names an existing file, which is the
+        // operator's to mispoint, not the gate's to assume.
+        var present = await ProbeRepositoryFilesPresentAsync(
+            sandbox,
+            workingDirectory,
+            tool,
+            RepositoryConfigFiles,
+            options,
+            ct).ConfigureAwait(false);
+        if (present.Count > 0)
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{tool}' found repository-controlled file(s) "
+                + $"'{string.Join("', '", present)}' in the audited repository — "
+                + "brakeman loads that config from the application path and its options "
+                + "can skip checks and paths, so the audit subject could hide a "
+                + "vulnerability. Remove the file(s), or set "
+                + $"CodeyBox:Plugins:{PluginId}:{TrustRepositorySuppressionKey} to true "
+                + "to trust repository-controlled suppression surfaces.")
+            { IsDeterministic = true };
+    }
+
+    private void RejectReservedExtraArguments(ExternalToolAuditorOptions options)
+    {
+        var offenders = new List<string>();
+        foreach (var (longFlag, shortFlag) in ReservedFlags)
+        {
+            var flags = shortFlag.Length == 0 ? new[] { longFlag } : new[] { longFlag, shortFlag };
+            if (ExtraArgumentsSupplyFlag(options, flags))
+                offenders.Add(longFlag);
+        }
+
+        if (offenders.Count == 0)
+            return;
+        throw new AuditUnavailableException(
+            $"could-not-verify: auditor '{Name}' was configured with ExtraArguments carrying "
+            + $"reserved flag(s) '{string.Join("', '", offenders)}' — they would collapse the "
+            + "declared exit-code contract into a clean verdict or replace/divert the SARIF "
+            + "report the parser expects. Use the scoped keys under "
+            + $"CodeyBox:Plugins:{PluginId} (MinimumSeverity, IncludedRules, ExcludedRules, "
+            + "ExcludePaths); ExtraArguments is for everything else (e.g. -t/--test, -x/--except).")
+            { IsDeterministic = true };
+    }
+
+    /// <summary>
+    /// Canonicalizes the value of every <c>ExtraArguments</c> flag that names
+    /// a gate-shaping file the tool loads and fails closed when it resolves
+    /// inside the audited worktree. The flags resolve against the tool's cwd
+    /// — the worktree — so a relative or in-tree value would hand the
+    /// scanner config or ignore list to repository-controlled content.
+    /// Runs in both trust modes: it guards the operator knob, and the
+    /// opt-in <c>TrustRepositorySuppression</c> already covers the
+    /// sanctioned repo files without a flag.
+    /// </summary>
+    private async Task ThrowIfPathFlagResolvesInWorktreeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        ExternalToolAuditorOptions options,
+        CancellationToken ct)
+    {
+        foreach (var (longFlag, shortFlag) in PathValuedArgumentFlags)
+        {
+            if (!TryGetExtraArgumentsFlagValue(options, longFlag, shortFlag, out var value))
+                continue;
+            if (value is null)
+                throw new AuditUnavailableException(
+                    $"could-not-verify: auditor '{Name}' ExtraArguments supplies '{longFlag}' "
+                    + $"with no following value — pass it as '{longFlag} <path>' or "
+                    + $"'{longFlag}=<path>'.")
+                { IsDeterministic = true };
+            await CanonicalizeOutsideWorktreeAsync(
+                sandbox, workingDirectory, value,
+                $"ExtraArguments '{longFlag}'", options, ct).ConfigureAwait(false);
+        }
     }
 
     /// <inheritdoc />

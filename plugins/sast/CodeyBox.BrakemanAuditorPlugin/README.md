@@ -46,26 +46,33 @@ scan errors) is infrastructure — never a pass.
   `suppressions`) instead of silently disappearing. Operators who
   deliberately trust repo-authored suppression set
   `TrustRepositorySuppression` in scoped config.
-- **Repository config files are read, not honored blindly.** Brakeman reads
-  `config/brakeman.yml` and `config/brakeman.ignore` from the audited tree
-  when present — files the audit subject controls. There is no CLI switch
-  that disables the ignore file (hence `--show-ignored` above); keep
-  scanner-weakening options out of `config/brakeman.yml`, or point the tool
-  at an operator-owned file with `-c` via `ExtraArguments`. A path passed
-  with `-c`/`-i` must resolve inside the sandbox, never inside the audited
-  tree.
+- **Repository config files fail closed, they are not honored blindly.**
+  Brakeman reads `config/brakeman.yml` and `config/brakeman.ignore` from
+  the audited tree when present — files the audit subject controls. There
+  is no CLI switch that disables the ignore file (hence `--show-ignored`
+  above). A present `config/brakeman.yml` fails the run closed as
+  infrastructure instead: its options can skip checks and paths, so
+  honoring it would let the subject shape the gate. Remove the file, or set
+  `TrustRepositorySuppression` to trust it. An operator-owned file passed
+  with `-c`/`--config-file` or `-i`/`--ignore-config` via `ExtraArguments`
+  is canonicalized in the sandbox and rejected when it resolves inside the
+  audited worktree — and it does not lift the `config/brakeman.yml` gate,
+  because the tool only prefers the operator file when it names an existing
+  file.
 - **Findings under excluded prefixes.** `ExcludePaths` is a finding filter —
   Brakeman still walks those files (except `vendor/`, which it skips at
   scan time unless `--skip-vendor` is negated), but findings under
   `vendor/`, `third_party/`, `node_modules/` are dropped. Override
   `ExcludePaths` to re-include them.
-- **The exit-code overrides.** The auditor relies on the default exit
-  convention (exit `3` means warnings were found, exit `7` means the scan
-  errored). An operator must not pass `--no-exit-on-error` via
-  `ExtraArguments`: scan errors would masquerade as a clean verdict instead
-  of failing closed as infrastructure. Negating `-z`/`--exit-on-warn`
-  changes nothing the parser sees (exit `0` is still findings-producing),
-  but it departs from the verified convention for no benefit.
+- **The exit-code overrides are rejected, not just discouraged.** The
+  auditor relies on the default exit convention (exit `3` means warnings
+  were found, exit `7` means the scan errored). `--no-exit-on-error` in
+  `ExtraArguments` is rejected deterministically: scan errors would
+  otherwise masquerade as a clean verdict instead of failing closed as
+  infrastructure. `-f`/`--format` and `-o`/`--output` are rejected for the
+  same reason — they would replace or divert the SARIF report the parser
+  expects. Negating `-z`/`--exit-on-warn` changes nothing the parser sees
+  (exit `0` is still findings-producing), so it is left alone.
 
 ## Exit codes and failure classification
 
@@ -142,11 +149,11 @@ Scoped under `CodeyBox:Plugins:codeybox.brakeman`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `8.0.6` | Pinned Brakeman release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `TrustRepositorySuppression` | `false` | When `true`, omits `--show-ignored` so repo-authored `config/brakeman.ignore` entries silently suppress findings. Default keeps ignored warnings visible. |
+| `TrustRepositorySuppression` | `false` | When `true`, omits `--show-ignored` so repo-authored `config/brakeman.ignore` entries silently suppress findings, and lifts the fail-closed gate on a repo-authored `config/brakeman.yml`. Default keeps ignored warnings visible and fails closed on the config file. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
 | `IncludedRules` / `ExcludedRules` | — | Exact Brakeman rule ids to keep/drop (e.g. `BRAKE0018`). Output filters; they do not change which checks run. To run or skip checks by name (e.g. `-t SQL`, `-x Redirect`), use `ExtraArguments`. |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra argv appended to `brakeman` after the built-in args (never via a shell). Never pass `--no-exit-on-error` (scan errors would masquerade as a clean verdict instead of failing closed as infrastructure) or `-f`/`--format`/`-o`/`--output` (would replace or divert the SARIF report the parser expects). |
+| `ExtraArguments` | — | Extra argv appended to `brakeman` after the built-in args (never via a shell). `--no-exit-on-error` (scan errors would masquerade as a clean verdict) and `-f`/`--format`/`-o`/`--output` (would replace or divert the SARIF report the parser expects) are rejected deterministically. `-c`/`--config-file` and `-i`/`--ignore-config` values are canonicalized in the sandbox and rejected when they resolve inside the audited worktree. |
 | `TimeoutSeconds` | `300` | Per-run bound — exceeding it is infrastructure, not a pass. A Rails-app scan is normally seconds; raise it only for very large trees. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. Large applications can exceed 1 MiB of SARIF — raise the former (up to 64 MiB) rather than wondering where findings went. |
 

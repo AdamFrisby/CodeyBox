@@ -102,7 +102,7 @@ public sealed class BrakemanAuditorTests
         SandboxExec? scanExec = null;
         var sandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
                 return Task.FromResult(Ok(exec));
             scanExec = exec;
             return Task.FromResult(new SandboxExecResult(3, SarifWithSqlInjection, ""));
@@ -251,7 +251,7 @@ public sealed class BrakemanAuditorTests
         SandboxExec? defaultExec = null;
         var defaultSandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
                 return Task.FromResult(Ok(exec));
             defaultExec = exec;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -265,7 +265,7 @@ public sealed class BrakemanAuditorTests
         SandboxExec? trustingExec = null;
         var trustingSandbox = new FakeSandbox((exec, _) =>
         {
-            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
                 return Task.FromResult(Ok(exec));
             trustingExec = exec;
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
@@ -318,6 +318,8 @@ public sealed class BrakemanAuditorTests
                     0,
                     "brakeman " + BrakemanAuditor.DefaultExpectedVersion + "\n",
                     ""));
+            if (IsRepoFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
         });
 
@@ -342,6 +344,8 @@ public sealed class BrakemanAuditorTests
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             if (IsVersionProbe(exec))
                 return Task.FromResult(new SandboxExecResult(0, "brakeman 7.0.0\n", ""));
+            if (IsRepoFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             return Task.FromResult(new SandboxExecResult(3, SarifWithSqlInjection, ""));
         });
 
@@ -395,6 +399,201 @@ public sealed class BrakemanAuditorTests
             "/work", FakeContext(), CancellationToken.None);
         Assert.True(dropped.Passed);
         Assert.Empty(dropped.Findings);
+    }
+
+    [Fact]
+    public async Task RepositoryConfig_Present_FailsClosed_UnlessTrusted()
+    {
+        // Brakeman loads config/brakeman.yml from the application path when
+        // present, and its options can skip checks and paths — a
+        // repo-authored file shapes the gate, so presence fails closed as
+        // infrastructure before the scan runs.
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "config/brakeman.yml\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new BrakemanAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("brakeman", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("config/brakeman.yml", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task RepositoryConfig_Present_TrustedOperator_ScanRuns()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRepoFileProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, "config/brakeman.yml\n", ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var auditor = new BrakemanAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:TrustRepositorySuppression"] = "true",
+            }),
+            CancellationToken.None);
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.Equal(1, scanExecs);
+    }
+
+    // Gate-shaping ExtraArguments would collapse the exit-code contract
+    // (--no-exit-on-error) or replace/divert the SARIF the parser expects
+    // (-f/--format, -o/--output): all fail closed deterministically before
+    // the scan runs, in both trust modes.
+    [Theory]
+    [InlineData("--no-exit-on-error")]
+    [InlineData("--format,sarif")]
+    [InlineData("-f,sarif")]
+    [InlineData("--format=json")]
+    [InlineData("--output,/tmp/out.sarif")]
+    [InlineData("-o,/tmp/out.sarif")]
+    public async Task ReservedExtraArguments_AreRejected_BeforeScan(string extraArguments)
+    {
+        var auditor = new BrakemanAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = extraArguments,
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("ExtraArguments", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    // An operator file flag whose value resolves inside the audited
+    // worktree hands gate-shaping content (scanner config, ignore list) to
+    // repo-controlled bytes — the flags resolve against the tool's cwd —
+    // so it fails closed before the scan runs.
+    [Theory]
+    [InlineData("--config-file,ops/brakeman.yml")]
+    [InlineData("--config-file=ops/brakeman.yml")]
+    [InlineData("-cops/brakeman.yml")]
+    [InlineData("--ignore-config,ops/brakeman.ignore")]
+    [InlineData("-iops/brakeman.ignore")]
+    public async Task ExtraArgumentsFileFlag_ResolvingInsideWorktree_FailsClosed(string extraArguments)
+    {
+        var auditor = new BrakemanAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = extraArguments,
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRealpathProbe(exec))
+                return Task.FromResult(RealpathResult(insideWorktree: true));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("worktree", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task ExtraArgumentsFileFlag_WithoutValue_FailsClosed()
+    {
+        var auditor = new BrakemanAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--config-file",
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("--config-file", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task ExtraArgumentsFileFlag_ResolvingOutsideWorktree_ScanRuns()
+    {
+        var auditor = new BrakemanAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "--config-file,/etc/brakeman/config.yml",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsRealpathProbe(exec))
+                return Task.FromResult(RealpathResult(insideWorktree: false));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        // The gate contains, it does not strip — the operator flag still
+        // reaches the scan argv verbatim.
+        var argv = scanExec!.Argv.ToList();
+        var configFlag = argv.IndexOf("--config-file");
+        Assert.True(configFlag >= 0 && configFlag + 1 < argv.Count);
+        Assert.Equal("/etc/brakeman/config.yml", argv[configFlag + 1]);
     }
 
     // Fixture sources assembled at runtime so this test file does not itself
@@ -636,7 +835,7 @@ public sealed class BrakemanAuditorTests
 
     private static FakeSandbox HealthyTool(int scanExit, string scanStdout)
         => new((exec, _) => Task.FromResult(
-            IsPresenceProbe(exec) || IsVersionProbe(exec)
+            IsPresenceProbe(exec) || IsVersionProbe(exec) || IsRepoFileProbe(exec)
                 ? Ok(exec)
                 : new SandboxExecResult(scanExit, scanStdout, "")));
 
@@ -648,6 +847,26 @@ public sealed class BrakemanAuditorTests
 
     private static bool IsVersionProbe(SandboxExec exec)
         => exec.Argv.Count == 2 && exec.Argv[0] == "brakeman" && exec.Argv[1] == "--version";
+
+    // The VerifyToolAsync repository-config probe is an sh -c presence
+    // script without the "command -v" presence marker; answering it with
+    // exit 0 and empty stdout means "config/brakeman.yml absent".
+    private static bool IsRepoFileProbe(SandboxExec exec)
+        => exec.Argv.Count >= 3
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && !exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
+
+    private static bool IsRealpathProbe(SandboxExec exec)
+        => exec.Argv.Count >= 2 && exec.Argv[0] == "realpath";
+
+    // Two-line realpath -m answer: the canonicalized configured path and
+    // the canonicalized worktree. Inside-worktree values fail the
+    // out-of-worktree containment gate; outside values let the scan run.
+    private static SandboxExecResult RealpathResult(bool insideWorktree)
+        => insideWorktree
+            ? new SandboxExecResult(0, "/work/ops/brakeman.yml\n/work\n", "")
+            : new SandboxExecResult(0, "/etc/brakeman/config.yml\n/work\n", "");
 
     private static async Task<string> SeedFixtureRepoAsync(params (string Name, string Content)[] files)
     {
