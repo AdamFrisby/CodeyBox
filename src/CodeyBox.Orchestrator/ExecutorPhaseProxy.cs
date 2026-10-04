@@ -40,9 +40,24 @@ namespace CodeyBox.Orchestrator;
 /// <item>While the phase runs, relay its live agent-output chunks into the
 /// orchestrator-side stream capture (same directory, same phase/iteration
 /// key a local phase would write) and the existing stdout broadcast, so a
-/// remote phase leaves the same observable artefact as a local one. Relay
+/// remote phase leaves the same observable artefact as a local one. The
+/// capture file always lands on the orchestrator — never on the executing
+/// host — so post-hoc diagnosis and the existing retention sweep apply
+/// identically however the phase ran; live subscribers use the unchanged hub
+/// contract. Both colocated and remote transports stream incrementally
+/// (never buffered to completion); a remote executor posts each chunk over
+/// its existing outbound channel, never through an inbound port. Relay
 /// failure never fails the phase; a lost or reordered chunk is recorded as
-/// an explicit gap marker, never silently omitted.</item>
+/// an explicit gap marker, never silently omitted. The colocated-vs-remote
+/// parity suite pins this equivalence (stream events, capture files, usage
+/// rows, findings, failure classification).</item>
+/// <item>Attribute the phase's cost, usage and timing through
+/// <see cref="CostUsageRecorder.TryRecordExecutorUsageAsync"/> for
+/// <i>every</i> host — colocated and remote alike — so
+/// <see cref="ExecutorPhaseUsage"/> reaches the same cost/usage accounting
+/// the local path feeds, with the dispatch wall-clock attributed identically
+/// however the phase ran. Recording is best-effort and never fails the
+/// phase.</item>
 /// <item>Validate the staged-back archive (size, entry count, expansion
 /// ratio, path containment) and install it over the bare repo. Violations
 /// fail the phase without writing to the bare repo and without caching.</item>
@@ -107,6 +122,8 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
     private readonly Dictionary<string, RuntimeUnhealthyState> _runtimeUnhealthy = new(StringComparer.Ordinal);
     private readonly object _runtimeUnhealthyLock = new();
 
+    private readonly CostUsageRecorder? _usageRecorder;
+
     public ExecutorPhaseProxy(
         IWorkerRegistry registry,
         IExecutorPhaseTransportFactory transports,
@@ -117,7 +134,8 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         TimeProvider? clock = null,
         ILogger<ExecutorPhaseProxy>? log = null,
         IAgentStreamStore? streamStore = null,
-        IStdoutBroadcaster? broadcaster = null)
+        IStdoutBroadcaster? broadcaster = null,
+        CostUsageRecorder? usageRecorder = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _transports = transports ?? throw new ArgumentNullException(nameof(transports));
@@ -129,6 +147,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
         _log = log ?? NullLogger<ExecutorPhaseProxy>.Instance;
         _streamStore = streamStore;
         _broadcaster = broadcaster;
+        _usageRecorder = usageRecorder;
     }
 
     public async Task<ExecutorPhaseResult> ExecutePhaseAsync(ExecutorPhaseRequest request, CancellationToken ct)
@@ -158,14 +177,21 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
 
         var hostIds = await SelectExecutorChainAsync(request, options, ct).ConfigureAwait(false);
 
-        var result = await ExecuteRemoteWithFailoverAsync(request, hostIds, options, dispatchKey, ct).ConfigureAwait(false);
+        // Timing attribution starts at dispatch: both colocated and remote
+        // phases attribute transfer, queueing and execution identically
+        // through the usage recorder below.
+        var startedAt = _clock.GetUtcNow();
+        var (result, ranOnHostId) = await ExecuteRemoteWithFailoverAsync(request, hostIds, options, dispatchKey, ct).ConfigureAwait(false);
+        var endedAt = _clock.GetUtcNow();
+        if (_usageRecorder is not null)
+            await _usageRecorder.TryRecordExecutorUsageAsync(request, result, ranOnHostId, startedAt, endedAt, ct).ConfigureAwait(false);
         await _idempotency.PutAsync(
             new IdempotencyEntry(dispatchKey, bodyHash, 200, SerializeResult(result), "application/json", now + options.IdempotencyTtl),
             ct).ConfigureAwait(false);
         return result;
     }
 
-    private async Task<ExecutorPhaseResult> ExecuteRemoteWithFailoverAsync(
+    private async Task<(ExecutorPhaseResult Result, string HostId)> ExecuteRemoteWithFailoverAsync(
         ExecutorPhaseRequest request,
         IReadOnlyList<string> hostIds,
         ExecutorPhaseDispatchOptions options,
@@ -180,7 +206,7 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
             try
             {
                 var result = await ExecuteRemoteAsync(request, hostId, options, ct).ConfigureAwait(false);
-                return result;
+                return (result, hostId);
             }
             catch (ExecutorPhaseTransportException ex)
             {

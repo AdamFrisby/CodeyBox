@@ -592,6 +592,21 @@ builder.Services.AddSingleton(sp => new ColocatedExecutorHost(
 builder.Services.AddSingleton<IExecutorPhaseTransportFactory>(sp =>
     new ColocatedExecutorTransportFactory(sp.GetRequiredService<ColocatedExecutorHost>()));
 
+// Remote phase-dispatch rendezvous: the poll-driven protocol's
+// orchestrator-side state (pending queues, in-flight dispatches, chunk
+// relay) plus the stage-out upload registry backing the two-call complete
+// protocol. Both live as long as the process; the broker fails pending
+// dispatches and deletes temp archives on shutdown. Reached only through the
+// executor-initiated phase endpoints below — the orchestrator never dials
+// an executor.
+builder.Services.AddSingleton(sp => new ExecutorPhaseBroker(
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ExecutorPhaseDispatch,
+    log: sp.GetRequiredService<ILoggerFactory>().CreateLogger<ExecutorPhaseBroker>()));
+builder.Services.AddSingleton<ExecutorPhaseStageOutUploads>();
+builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
+builder.Services.AddSingleton<Func<ExecutorPhaseDispatchOptions>>(sp =>
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ExecutorPhaseDispatch);
+
 // Member-keyed provider registry for sandbox placement. Each provider kind
 // named by a SandboxClass member is constructed once here (via the same
 // BuildSandboxProviderInner the singleton uses, or via the plugin catalog for
@@ -4813,6 +4828,7 @@ FleetEndpoints.Map(app);
 PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
 ExecutorEndpoints.Map(app);
+ExecutorPhaseEndpoints.Map(app);
 AgentSupervisionEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 SandboxResourceUsageEndpoints.Map(app);

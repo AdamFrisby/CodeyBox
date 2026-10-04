@@ -24,6 +24,29 @@ public interface IExecutorPhaseHandler
 }
 
 /// <summary>
+/// Optional streaming extension to <see cref="IExecutorPhaseHandler"/>: a
+/// handler implementing this interface emits live agent-output chunks to
+/// <paramref name="onChunk"/> as they are produced, and the executor-side
+/// runner forwards them to the orchestrator while the phase runs — over the
+/// colocated transport's in-process callback for the <c>"local"</c> host and
+/// over the executor's existing outbound channel (poll-driven chunk posts,
+/// never an inbound port) for remote hosts. Implementations MUST NOT buffer
+/// to phase end: the orchestrator feeds chunks into the live capture and the
+/// supervision hub in real time. A null callback behaves exactly like the
+/// non-streaming overload. The callback never fails the phase: a throwing
+/// callback is swallowed executor-side and only degrades observability.
+/// </summary>
+public interface IStreamingExecutorPhaseHandler : IExecutorPhaseHandler
+{
+    Task<ExecutorPhaseResult> ExecuteAsync(
+        ExecutorPhaseRequest request,
+        string repoPath,
+        ISandbox sandbox,
+        Func<ExecutorStreamChunk, CancellationToken, Task>? onChunk,
+        CancellationToken ct);
+}
+
+/// <summary>
 /// Phase-execution interface for one work-item phase. Implemented by
 /// <see cref="ExecutorHostPhaseRunner"/> (runs the phase on an executor host
 /// against its staged copy — including the colocated in-process host) and

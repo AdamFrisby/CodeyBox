@@ -46,6 +46,57 @@ builder.Services.AddAgentExecution(builder.Configuration);
 builder.Services.AddSingleton<ExecutorSandboxTracker>();
 builder.Services.AddSingleton<ExecutorAgentAdvertiser>();
 builder.Services.AddHttpClient("executor");
+// The executor-side phase runner: the same runner the colocated host uses,
+// so a remote phase runs the identical execution path (envelope validation,
+// idempotent replay, capacity gating, sandbox tracking). Held nullable —
+// without a composed handler the executor keeps the acceptance state:
+// registered and heartbeating, never sent work.
+builder.Services.AddSingleton<ExecutorPhaseRunnerHolder>(sp =>
+{
+    var handler = sp.GetService<IExecutorPhaseHandler>();
+    if (handler is null)
+        return new ExecutorPhaseRunnerHolder(null);
+    return new ExecutorPhaseRunnerHolder(new ExecutorHostPhaseRunner(
+        sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<ExecutorSandboxTracker>(),
+        handler,
+        sp.GetRequiredService<Func<ExecutorOptions>>(),
+        sp.GetRequiredService<Func<ExecutorPhaseDispatchOptions>>(),
+        log: sp.GetRequiredService<ILogger<ExecutorHostPhaseRunner>>()));
+});
+// Outbound-only phase channel: every leg (poll, stage-in download, chunk
+// posts, complete/fail) is executor-initiated over plain HTTPS, so the
+// executor still needs no inbound port when it starts accepting phases.
+builder.Services.AddSingleton<IExecutorPhaseChannel>(sp =>
+{
+    var options = sp.GetRequiredService<Func<ExecutorOptions>>()();
+    if (string.IsNullOrWhiteSpace(options.OrchestratorBaseUrl))
+        throw new InvalidOperationException("CodeyBox:Executor:OrchestratorBaseUrl is required to run executor mode.");
+    var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient("executor");
+    http.BaseAddress = new Uri(options.OrchestratorBaseUrl.Trim(), UriKind.Absolute);
+    return new HttpExecutorPhaseChannel(
+        http,
+        options.HostId,
+        sp.GetRequiredService<Func<ExecutorOptions>>(),
+        sp.GetRequiredService<Func<ExecutorPhaseDispatchOptions>>(),
+        sp.GetRequiredService<ILogger<HttpExecutorPhaseChannel>>());
+});
+builder.Services.AddSingleton<ExecutorPhasePollWorker>(sp =>
+{
+    var options = sp.GetRequiredService<Func<ExecutorOptions>>()();
+    var stagingRoot = string.IsNullOrWhiteSpace(options.PhaseStagingRoot)
+        ? Path.Combine(Path.GetTempPath(), "codeybox-executor-phases")
+        : options.PhaseStagingRoot.Trim();
+    // The worker is always composed; without a runner it idles while
+    // registration and heartbeats continue elsewhere.
+    return new ExecutorPhasePollWorker(
+        sp.GetRequiredService<IExecutorPhaseChannel>(),
+        options.HostId,
+        sp.GetRequiredService<ExecutorPhaseRunnerHolder>().Runner,
+        stagingRoot,
+        sp.GetRequiredService<Func<ExecutorPhaseDispatchOptions>>(),
+        log: sp.GetRequiredService<ILogger<ExecutorPhasePollWorker>>());
+});
 builder.Services.AddSingleton<ExecutorClient>(sp =>
 {
     var options = sp.GetRequiredService<Func<ExecutorOptions>>()();
@@ -55,18 +106,7 @@ builder.Services.AddSingleton<ExecutorClient>(sp =>
     var http = factory.CreateClient("executor");
     http.BaseAddress = new Uri(options.OrchestratorBaseUrl.Trim(), UriKind.Absolute);
     var tracker = sp.GetRequiredService<ExecutorSandboxTracker>();
-    ExecutorHostPhaseRunner? phaseRunner = null;
-    var handler = sp.GetService<IExecutorPhaseHandler>();
-    if (handler is not null)
-    {
-        phaseRunner = new ExecutorHostPhaseRunner(
-            sp.GetRequiredService<ISandboxProvider>(),
-            tracker,
-            handler,
-            sp.GetRequiredService<Func<ExecutorOptions>>(),
-            sp.GetRequiredService<Func<ExecutorPhaseDispatchOptions>>(),
-            log: sp.GetRequiredService<ILogger<ExecutorHostPhaseRunner>>());
-    }
+    var phaseRunner = sp.GetRequiredService<ExecutorPhaseRunnerHolder>().Runner;
     return new ExecutorClient(
         http,
         sp.GetRequiredService<Func<ExecutorOptions>>(),
@@ -78,11 +118,45 @@ builder.Services.AddSingleton<ExecutorClient>(sp =>
         agentAdvertiser: sp.GetRequiredService<ExecutorAgentAdvertiser>(),
         activePhaseCountProvider: phaseRunner is null ? null : () => phaseRunner.ActivePhaseCount);
 });
+builder.Services.AddHostedService<ExecutorPhaseWorker>();
 builder.Services.AddHostedService<ExecutorWorker>();
 builder.Services.AddHostedService<ExecutorStartupValidator>();
 
 var host = builder.Build();
 await host.RunAsync().ConfigureAwait(false);
+
+/// <summary>
+/// Holds the executor-side phase runner, which is absent until a phase
+/// handler is composed. A dedicated holder (instead of a nullable service
+/// registration) keeps the absence explicit in the type system.
+/// </summary>
+internal sealed class ExecutorPhaseRunnerHolder(ExecutorHostPhaseRunner? runner)
+{
+    public ExecutorHostPhaseRunner? Runner { get; } = runner;
+}
+
+/// <summary>
+/// Polls the orchestrator for phase assignments over the outbound-only
+/// channel and executes them through the executor-local runner. Idles when
+/// no phase handler is composed (acceptance state); runs alongside
+/// <see cref="ExecutorWorker"/> otherwise. Never binds a listening socket.
+/// </summary>
+internal sealed class ExecutorPhaseWorker : BackgroundService
+{
+    private readonly ExecutorPhasePollWorker _worker;
+    private readonly ILogger<ExecutorPhaseWorker> _log;
+
+    public ExecutorPhaseWorker(ExecutorPhasePollWorker worker, ILogger<ExecutorPhaseWorker> log)
+    {
+        _worker = worker;
+        _log = log;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await _worker.RunAsync(stoppingToken).ConfigureAwait(false);
+    }
+}
 
 /// <summary>
 /// Fail-fast startup validation: a bad host id, orchestrator URL, provider

@@ -24,7 +24,7 @@ namespace CodeyBox.Orchestrator;
 /// cannot interleave delete/copy/run/tar; same-key duplicates serialize
 /// their copy window on the shared <see cref="StagingCopyGate"/>.
 /// </remarks>
-public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
+public sealed class ColocatedExecutorTransport : IStreamingExecutorPhaseTransport
 {
     private const int CopyBufferSize = 128 * 1024;
 
@@ -102,7 +102,22 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
     }
 
     /// <inheritdoc />
-    public async Task<ExecutorPhaseResult> RunPhaseAsync(ExecutorPhaseRequest request, CancellationToken ct)
+    public Task<ExecutorPhaseResult> RunPhaseAsync(ExecutorPhaseRequest request, CancellationToken ct) =>
+        RunPhaseAsync(request, onChunk: null, ct);
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The colocated streaming path: the in-process runner forwards
+    /// <paramref name="onChunk"/> to a streaming handler as agent output is
+    /// produced, so a local phase streams incrementally through the same
+    /// orchestrator-side relay a remote phase uses — never buffered to
+    /// completion. A null callback behaves exactly like the non-streaming
+    /// overload; a non-streaming handler ignores the callback.
+    /// </remarks>
+    public async Task<ExecutorPhaseResult> RunPhaseAsync(
+        ExecutorPhaseRequest request,
+        Func<ExecutorStreamChunk, CancellationToken, Task>? onChunk,
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
         var source = _sourceRepoPath
@@ -120,7 +135,7 @@ public sealed class ColocatedExecutorTransport : IExecutorPhaseTransport
         _stagedLeaf = staged;
         try
         {
-            return await _runner.ExecutePhaseAsync(request, ct).ConfigureAwait(false);
+            return await _runner.ExecutePhaseAsync(request, onChunk, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
