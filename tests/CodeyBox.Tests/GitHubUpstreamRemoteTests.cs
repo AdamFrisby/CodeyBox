@@ -1189,23 +1189,28 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
-    public async Task CompleteAsync_PullsReturns422_ReturnsGracefulOutcomeWithoutThrow()
+    public async Task CompleteAsync_PullsReturns422WithoutResolvableTip_ThrowsRatherThanReportingSuccess()
     {
+        // Regression for sig-pr422-delivery-reconciliation: every POST /pulls
+        // 422 used to map to a BranchPushed-only outcome that the orchestrator
+        // turned into Done with no PR identity or merge evidence. Now the
+        // remote refuses to assume a duplicate when the pushed revision cannot
+        // even be resolved — the orchestrator parks instead of completing.
         var gitHost = new FakeGitHost();
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(JsonResponse(HttpStatusCode.UnprocessableEntity,
             """{"message":"Validation Failed","errors":[{"message":"A pull request already exists"}]}"""));
 
         var remote = BuildRemote(gitHost, handler);
-        var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
 
-        // Branch was still pushed
-        Assert.True(outcome.BranchPushed);
-        // PR info absent — graceful
-        Assert.Null(outcome.PullRequestUrl);
-        Assert.Null(outcome.PullRequestNumber);
-        Assert.NotNull(outcome.Notes);
-        Assert.Contains("422", outcome.Notes);
+        // Branch was still pushed before the create conflicted.
+        Assert.Single(gitHost.Pushes);
+        Assert.Contains("422", ex.Message);
+        // No merge was attempted against an unidentified PR.
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.Method == HttpMethod.Put && r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1413,6 +1418,362 @@ public sealed class GitHubUpstreamRemoteTests
 
         Assert.Empty(handler.Requests);
     }
+
+    // ---------------------------------------------------------------------
+    // sig-pr422-delivery-reconciliation: 422 classification matrix.
+    //
+    // Every test below pins one dimension of the exact-match rule (head
+    // owner, head ref, base ref, pushed revision, cardinality, lifecycle).
+    // Removing any single guard flips exactly its test from throw to false
+    // success (or vice versa), so the matrix is mutation-sensitive rather
+    // than a mirror of the implementation.
+    // ---------------------------------------------------------------------
+
+    private const string PushedTipSha = "aaaabbbbccccddddeeeeffff0000111122223333";
+    private const string OtherTipSha = "9999888877776666555544443333222211110000";
+
+    private static FakeGitHost GitHostWithTip(string tip = PushedTipSha)
+    {
+        var gitHost = new FakeGitHost();
+        gitHost.ResolveCommits[SampleRequest.WorkBranch] = tip;
+        return gitHost;
+    }
+
+    private static HttpResponseMessage AlreadyExists422Response() =>
+        JsonResponse(HttpStatusCode.UnprocessableEntity,
+            """{"message":"Validation Failed","errors":[{"code":"custom","message":"A pull request already exists for codeybox/abc123."}]}""");
+
+    private static HttpResponseMessage PrListResponse(params int[] numbers) =>
+        JsonResponse(HttpStatusCode.OK, JsonSerializer.Serialize(
+            numbers.Select(n => new { number = n })));
+
+    private static HttpResponseMessage PrDetailResponse(
+        int number,
+        string state,
+        bool merged,
+        string? mergeCommitSha,
+        string headRef,
+        string headSha,
+        string headOwner,
+        string baseRef) =>
+        JsonResponse(HttpStatusCode.OK, JsonSerializer.Serialize(new
+        {
+            number,
+            html_url = $"https://github.com/myorg/myrepo/pull/{number}",
+            state,
+            merged,
+            merge_commit_sha = mergeCommitSha,
+            mergeable = (bool?)true,
+            mergeable_state = "clean",
+            head = new { @ref = headRef, sha = headSha, user = new { login = headOwner } },
+            @base = new { @ref = baseRef },
+        }));
+
+    private static bool IsMergePut(HttpRequestMessage r) =>
+        r.Method == HttpMethod.Put && r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal);
+
+    [Fact]
+    public async Task CompleteAsync_422WithExactOpenPr_ReusesPrAndMergesWithoutDuplicating()
+    {
+        // Duplicate-PR race: our POST lost to a concurrent create of the exact
+        // same PR. The remote must reuse it and run the ordinary configured
+        // merge flow — never POST a second PR.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse(42));
+        handler.Enqueue(PrDetailResponse(42, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+        handler.Enqueue(MergeOkResponse("forge-merge-sha"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.True(outcome.BranchPushed);
+        Assert.Equal(42, outcome.PullRequestNumber);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/42", outcome.PullRequestUrl);
+        Assert.Equal("forge-merge-sha", outcome.MergedSha);
+        Assert.False(outcome.AutoMergeRaced);
+        Assert.Equal(1, handler.Requests.Count(r => r.Method == HttpMethod.Post));
+        Assert.Contains(handler.Requests, r =>
+            r.Method == HttpMethod.Put && r.RequestUri!.PathAndQuery.Contains("/pulls/42/merge", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithNoMatchingPr_ThrowsValidationFailure()
+    {
+        // The 422 is an unrelated validation error (bad base), not a duplicate:
+        // open and closed listings are both empty, so there is nothing to reuse.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(JsonResponse(HttpStatusCode.UnprocessableEntity,
+            """{"message":"Validation Failed","errors":[{"code":"invalid","field":"base","message":"Invalid base branch"}]}"""));
+        handler.Enqueue(PrListResponse());
+        handler.Enqueue(PrListResponse());
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("validation failure", ex.Message);
+        Assert.Contains("Invalid base branch", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithWrongHeadOwner_ThrowsRatherThanClaimingForeignPr()
+    {
+        // Same branch name in a fork owned by someone else is not our PR.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse(7));
+        handler.Enqueue(PrDetailResponse(7, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "someone-else", "main"));
+        handler.Enqueue(PrListResponse());
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("validation failure", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithWrongBase_ThrowsRatherThanClaimingRetargetedPr()
+    {
+        // A PR for the same head retargeted at another base is not the
+        // delivery this work item promised.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse(7));
+        handler.Enqueue(PrDetailResponse(7, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "develop"));
+        handler.Enqueue(PrListResponse());
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("validation failure", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithStaleHeadRevision_RejectsPreviouslyAuditedContent()
+    {
+        // The head changed after audit (or before merge): the existing PR
+        // carries the previously-audited revision while the pushed tip moved
+        // on. Reusing it would deliver unaudited content as audited.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse(7));
+        handler.Enqueue(PrDetailResponse(7, "open", merged: false, null, SampleRequest.WorkBranch, OtherTipSha, "myorg", "main"));
+        handler.Enqueue(PrListResponse());
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("revision", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithMultipleExactMatches_ThrowsAmbiguous()
+    {
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse(11, 12));
+        handler.Enqueue(PrDetailResponse(11, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+        handler.Enqueue(PrDetailResponse(12, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("refusing to pick", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithClosedUnmergedPr_ThrowsNotDelivered()
+    {
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse());
+        handler.Enqueue(PrListResponse(13));
+        handler.Enqueue(PrDetailResponse(13, "closed", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("closed without merge", ex.Message);
+        Assert.Contains("not delivered", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithAlreadyMergedExactPr_ReturnsProvenMergeWithoutMergeCall()
+    {
+        // The exact revision was already merged (e.g. a retried create after
+        // the merge landed). The forge merge sha is the delivery — no second
+        // merge call, and the local squash sha never masquerades as it.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse());
+        handler.Enqueue(PrListResponse(14));
+        handler.Enqueue(PrDetailResponse(14, "closed", merged: true, "forge-proven-sha", SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.True(outcome.BranchPushed);
+        Assert.Equal(14, outcome.PullRequestNumber);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/14", outcome.PullRequestUrl);
+        Assert.Equal("forge-proven-sha", outcome.MergedSha);
+        Assert.NotEqual(SampleRequest.MergeSha, outcome.MergedSha);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_422WithMergedPrForOtherRevision_ThrowsBranchNameReuseInsufficient()
+    {
+        // A merged PR under the same branch name but a different head revision
+        // proves nothing about this work — branch-name reuse is insufficient.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse());
+        handler.Enqueue(PrListResponse(14));
+        handler.Enqueue(PrDetailResponse(14, "closed", merged: true, "some-older-merge-sha", SampleRequest.WorkBranch, OtherTipSha, "myorg", "main"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("validation failure", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_CreateTimeoutAfterServerSuccess_ReconcilesInsteadOfDuplicating()
+    {
+        // Lost create response: the PR exists server-side but the POST reply
+        // never arrived. The retry must reuse the exact PR, not POST again.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.EnqueueException(new TaskCanceledException("A task was canceled."));
+        handler.Enqueue(PrListResponse(15));
+        handler.Enqueue(PrDetailResponse(15, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+        handler.Enqueue(MergeOkResponse("post-timeout-merge-sha"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.Equal(15, outcome.PullRequestNumber);
+        Assert.Equal("post-timeout-merge-sha", outcome.MergedSha);
+        Assert.Equal(1, handler.Requests.Count(r => r.Method == HttpMethod.Post));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_CreateTimeoutWithNoMatchingPr_RethrowsOriginal()
+    {
+        // Nothing was created server-side: the original transport error must
+        // surface (into the orchestrator's bounded retry) rather than a guess.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.EnqueueException(new HttpRequestException("connection reset"));
+        handler.Enqueue(PrListResponse());
+        handler.Enqueue(PrListResponse());
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("connection reset", ex.Message);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeTimeoutAfterServerMerge_VerifiesMergeViaReRead()
+    {
+        // Lost merge response: the merge landed but the PUT reply never
+        // arrived. Re-reading the PR proves the authoritative merge sha
+        // without issuing a second merge mutation.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(16, "https://github.com/myorg/myrepo/pull/16"));
+        handler.EnqueueException(new TaskCanceledException("A task was canceled."));
+        handler.Enqueue(PrDetailResponse(16, "closed", merged: true, "recovered-merge-sha", SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.Equal(16, outcome.PullRequestNumber);
+        Assert.Equal("recovered-merge-sha", outcome.MergedSha);
+        Assert.NotNull(outcome.Notes);
+        Assert.Contains("verified", outcome.Notes);
+        Assert.Equal(1, handler.Requests.Count(IsMergePut));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeTimeoutWithoutMergeProof_RethrowsOriginal()
+    {
+        // The merge did not land (PR still open): the original transport error
+        // surfaces so the orchestrator can retry the merge boundedly.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(16, "https://github.com/myorg/myrepo/pull/16"));
+        handler.EnqueueException(new TaskCanceledException("A task was canceled."));
+        handler.Enqueue(PrDetailResponse(16, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        await Assert.ThrowsAsync<TaskCanceledException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeSuccessWithoutProof_ThrowsRatherThanReportingDelivery()
+    {
+        // A 200 merge reply with merged=false and no sha is not merge proof.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(16, "https://github.com/myorg/myrepo/pull/16"));
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK,
+            """{"sha":null,"merged":false,"message":"Queued"}"""));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+
+        Assert.Contains("did not prove a merge", ex.Message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_AutoMergeFalse422WithExactOpenPr_ReturnsIdentifiedOpenPr()
+    {
+        // Intentional AutoMerge=false operation is preserved: an identified
+        // open PR is the configured completion result — no merge call.
+        var gitHost = GitHostWithTip();
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(AlreadyExists422Response());
+        handler.Enqueue(PrListResponse(17));
+        handler.Enqueue(PrDetailResponse(17, "open", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = false });
+        var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
+
+        Assert.True(outcome.BranchPushed);
+        Assert.Equal(17, outcome.PullRequestNumber);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/17", outcome.PullRequestUrl);
+        Assert.Null(outcome.MergedSha);
+        Assert.DoesNotContain(handler.Requests, IsMergePut);
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1424,12 +1785,18 @@ internal sealed class FakeGitHost : IGitHost
     public List<(string RepositoryId, string Url, string Branch, UpstreamPushReconcileStrategy ReconcileStrategy)> Pushes { get; } = new();
     public List<(string RepositoryId, string Url, string Branch, IReadOnlyDictionary<string, string> Env)> Fetches { get; } = new();
 
-    /// <summary>
-    /// When set, <see cref="FetchUpstreamBranchAsync"/> returns this sha rather
+    /// <summary>When set, <see cref="FetchUpstreamBranchAsync"/> returns this sha rather
     /// than the default-interface null. Lets tests assert the sha is propagated
-    /// out of <see cref="GitHubUpstreamRemote.FetchBaseBranchAsync"/>.
-    /// </summary>
+    /// out of <see cref="GitHubUpstreamRemote.FetchBaseBranchAsync"/>.</summary>
     public string? FetchUpstreamShaToReturn { get; set; }
+
+    /// <summary>
+    /// Work-branch tips for <see cref="ResolveCommitAsync"/>, keyed by
+    /// commitish. Lets 422-reconciliation tests prove the pushed revision.
+    /// Empty (default) means unresolvable — reconciliation must then refuse
+    /// to match rather than assume a duplicate.
+    /// </summary>
+    public Dictionary<string, string> ResolveCommits { get; } = new(StringComparer.Ordinal);
 
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
@@ -1464,6 +1831,11 @@ internal sealed class FakeGitHost : IGitHost
         Fetches.Add((repositoryId, upstreamUrl, branch, upstreamEnv));
         return Task.FromResult(FetchUpstreamShaToReturn);
     }
+
+    public Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
+        => ResolveCommits.TryGetValue(commitish, out var sha)
+            ? Task.FromResult(sha)
+            : throw new NotSupportedException($"FakeGitHost has no commit for '{commitish}'.");
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;

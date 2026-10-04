@@ -192,26 +192,18 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         else
         {
             prDescription = await BuildDescriptionAsync(request, ct);
-            GitHubPrResponse? pr;
+            ReconciledPullRequest pr;
             await using (var createPrScope = await TimingScope.BeginAsync(
                 _timings, request.WorkItemId, "upstream_push", "upstream.api_create_pr",
                 log: _log))
             {
-                pr = await CreatePullRequestAsync(request, prTitle, prDescription.Body, ct);
+                pr = await CreateOrReconcilePullRequestAsync(request, prTitle, prDescription.Body, ct);
             }
 
-            if (pr is null)
-            {
-                // 422 — branch already has an open PR or the request was otherwise
-                // unprocessable; leave it open for a human to sort out.
-                return new UpstreamCompletionOutcome
-                {
-                    BranchPushed = true,
-                    Notes = "PR creation skipped (422 — branch may already have an open PR)",
-                };
-            }
-
-            _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
+            if (pr.ReusedExisting)
+                _log.LogInformation("GitHub PR #{N} reused after create conflict: {Url}", pr.Number, pr.HtmlUrl);
+            else
+                _log.LogInformation("GitHub PR opened: {Url}", pr.HtmlUrl);
             AuditLog.UpstreamPrOpened(pr.Number, pr.HtmlUrl, request.WorkBranch, request.BaseBranch);
 
             if (pr.HtmlUrl is null)
@@ -219,6 +211,26 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
             prNumber = pr.Number;
             prHtmlUrl = pr.HtmlUrl;
+
+            if (pr.AuthoritativeMergeSha is not null)
+            {
+                // The exact PR for this work is already merged on the forge —
+                // proven by head-sha match against the just-pushed tip, never by
+                // branch-name reuse. No merge call is needed; the remote merge
+                // commit is the delivery and MergedSha carries the forge-side
+                // sha (never the local squash sha) so monitoring code resolves
+                // it on the commits API.
+                _log.LogInformation("GitHub PR #{N} already merged: {Sha}", prNumber, pr.AuthoritativeMergeSha);
+                AuditLog.UpstreamPrMerged(prNumber, pr.AuthoritativeMergeSha);
+                return new UpstreamCompletionOutcome
+                {
+                    BranchPushed = true,
+                    PullRequestUrl = prHtmlUrl,
+                    PullRequestNumber = prNumber,
+                    MergedSha = pr.AuthoritativeMergeSha,
+                    Notes = "PR already merged on the forge for the exact pushed revision; reused existing merge",
+                };
+            }
         }
 
         if (!_opts.AutoMerge)
@@ -730,7 +742,20 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     // GitHub API helpers
     // -------------------------------------------------------------------------
 
-    private async Task<GitHubPrResponse?> CreatePullRequestAsync(
+    /// <summary>
+    /// Outcome of PR creation: either a freshly opened PR or an existing PR
+    /// reclaimed after a create conflict / transport uncertainty.
+    /// <see cref="AuthoritativeMergeSha"/> is non-null only when the exact PR
+    /// for the pushed revision is already merged on the forge (proven by
+    /// head-sha match); the caller then reports delivery without a merge call.
+    /// </summary>
+    private sealed record ReconciledPullRequest(
+        int Number,
+        string? HtmlUrl,
+        string? AuthoritativeMergeSha,
+        bool ReusedExisting);
+
+    private async Task<ReconciledPullRequest> CreateOrReconcilePullRequestAsync(
         UpstreamCompletionRequest request, string prTitle, string description, CancellationToken ct)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls";
@@ -740,28 +765,289 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         req.Content = JsonContent.Create(body);
 
         var postPrSw = Stopwatch.StartNew();
-        using var response = await SendAsync(req, ct);
-        postPrSw.Stop();
-        CodeyBoxMeters.UpstreamApiCallDuration.Record(postPrSw.ElapsedMilliseconds,
-            new KeyValuePair<string, object?>("endpoint", "POST /pulls"),
-            new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
-
-        if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
+        HttpResponseMessage response;
+        try
         {
+            response = await SendAsync(req, ct);
+        }
+        catch (Exception ex) when (IsTransportUncertainty(ex, ct))
+        {
+            // The create may have succeeded server-side while the response was
+            // lost (timeout / reset). Reconcile before any other mutation so a
+            // retry does not create a duplicate PR.
+            postPrSw.Stop();
             _log.LogWarning(
-                "GitHub POST /pulls returned 422 for {Owner}/{Repo} head={WorkBranch} base={BaseBranch}; skipping PR creation",
-                _opts.Owner, _opts.Repository, request.WorkBranch, request.BaseBranch);
-            AuditLog.UpstreamApiCallFailed("POST /pulls", 422, _opts.Owner, _opts.Repository);
+                "GitHub POST /pulls transport failed ({Kind}); reconciling before any further mutation",
+                ex.GetType().Name);
+            var reused = await TryReconcileAfterCreateUncertaintyAsync(request, ct);
+            if (reused is not null)
+                return reused;
+            throw;
+        }
+        postPrSw.Stop();
+
+        using (response)
+        {
+            CodeyBoxMeters.UpstreamApiCallDuration.Record(postPrSw.ElapsedMilliseconds,
+                new KeyValuePair<string, object?>("endpoint", "POST /pulls"),
+                new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
+
+            if (response.StatusCode == HttpStatusCode.UnprocessableEntity)
+            {
+                var detail = await ReadErrorDetailAsync(response, ct);
+                _log.LogWarning(
+                    "GitHub POST /pulls returned 422 for {Owner}/{Repo} head={WorkBranch} base={BaseBranch}; reconciling rather than assuming a duplicate",
+                    _opts.Owner, _opts.Repository, request.WorkBranch, request.BaseBranch);
+                AuditLog.UpstreamApiCallFailed("POST /pulls", 422, _opts.Owner, _opts.Repository);
+                return await ReconcileExistingPullRequestAsync(request, detail, ct);
+            }
+
+            if (!response.IsSuccessStatusCode)
+                AuditLog.UpstreamApiCallFailed("POST /pulls", (int)response.StatusCode, _opts.Owner, _opts.Repository);
+
+            response.EnsureSuccessStatusCode();
+            var created = await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct)
+                ?? throw new InvalidOperationException(
+                    $"GitHub POST /pulls returned success but response body could not be deserialised (head={request.WorkBranch})");
+            return new ReconciledPullRequest(created.Number, created.HtmlUrl, AuthoritativeMergeSha: null, ReusedExisting: false);
+        }
+    }
+
+    /// <summary>
+    /// True for transport failures where the server may already have applied
+    /// the mutation (timeout, reset, TLS teardown). Caller cancellation
+    /// (<paramref name="ct"/> requested) is never uncertainty — it rethrows.
+    /// </summary>
+    private static bool IsTransportUncertainty(Exception ex, CancellationToken ct) =>
+        ex is HttpRequestException
+        || ex is TimeoutException
+        || (ex is OperationCanceledException && !ct.IsCancellationRequested);
+
+    /// <summary>Best-effort read of a forge error body for diagnostics. Never throws.</summary>
+    private static async Task<string> ReadErrorDetailAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        const int maxDetailChars = 2000;
+        try
+        {
+            var text = (await response.Content.ReadAsStringAsync(ct) ?? string.Empty).Trim();
+            // Flatten line breaks: this detail is embedded in exception
+            // messages that flow to LastError and webhook payloads.
+            var flattened = SanitizeForLog(text);
+            return flattened.Length <= maxDetailChars ? flattened : flattened[..maxDetailChars] + "…(truncated)";
+        }
+        catch (Exception)
+        {
+            // Never fail reconciliation because the error body was unreadable.
+            return "(unreadable response body)";
+        }
+    }
+
+    /// <summary>
+    /// Resolves the just-pushed tip of the work branch in the host bare repo.
+    /// Null when unresolvable — the caller then refuses to match, because
+    /// revision proof is impossible.
+    /// </summary>
+    private async Task<string?> ResolveWorkBranchTipAsync(UpstreamCompletionRequest request, CancellationToken ct)
+    {
+        try
+        {
+            return await _gitHost.ResolveCommitAsync(request.RepositoryId, request.WorkBranch, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug("Could not resolve pushed tip of '{Branch}': {Message}", SanitizeForLog(request.WorkBranch), ex.Message);
             return null;
         }
+    }
 
-        if (!response.IsSuccessStatusCode)
-            AuditLog.UpstreamApiCallFailed("POST /pulls", (int)response.StatusCode, _opts.Owner, _opts.Repository);
+    // Bounds for 422 reconciliation: one list per state (open, then closed
+    // only when no exact open PR exists) plus one detail fetch per candidate.
+    // Hitting a bound is itself a refusal — never a guess.
+    private const int ReconcileListPerPage = 100;
+    private const int ReconcileListMaxPages = 3;
+    private const int ReconcileMaxDetailFetches = 10;
 
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<GitHubPrResponse>(ct)
-            ?? throw new InvalidOperationException(
-                $"GitHub POST /pulls returned success but response body could not be deserialised (head={request.WorkBranch})");
+    /// <summary>
+    /// Classifies a POST /pulls 422 without assuming duplicate success. Only an
+    /// exact PR — same repository (by construction of the listing URL), same
+    /// head owner/ref, same base ref, same pushed revision — may be reused.
+    /// Anything else (validation errors, wrong owner/base/revision, ambiguous
+    /// or closed-unmerged matches) throws with an actionable diagnostic so the
+    /// orchestrator parks rather than reporting delivery.
+    /// </summary>
+    private async Task<ReconciledPullRequest> ReconcileExistingPullRequestAsync(
+        UpstreamCompletionRequest request, string createErrorDetail, CancellationToken ct)
+    {
+        var expectedHeadSha = await ResolveWorkBranchTipAsync(request, ct);
+        if (string.IsNullOrWhiteSpace(expectedHeadSha))
+            throw new InvalidOperationException(
+                $"GitHub POST /pulls returned 422 but the pushed revision of '{SanitizeForLog(request.WorkBranch)}' could not be resolved, " +
+                $"so no existing PR can be proven to carry this work; refusing to assume a duplicate. Forge detail: {createErrorDetail}");
+
+        var openNumbers = await ListPullRequestNumbersForBranchAsync(request, "open", ct);
+        var openMatches = await FindExactMatchesAsync(request, openNumbers, expectedHeadSha, ct);
+        if (openMatches.Count > 1)
+            throw new InvalidOperationException(
+                $"GitHub POST /pulls returned 422 and {openMatches.Count} open PRs exactly match head='{SanitizeForLog(request.WorkBranch)}' " +
+                $"base='{SanitizeForLog(request.BaseBranch)}' revision; refusing to pick one. Resolve the duplicates manually.");
+        if (openMatches.Count == 1)
+            return ClassifySingleMatch(request, openMatches[0]);
+
+        // No exact open PR. The 422 may still name a closed or merged PR for
+        // this branch: a closed-unmerged PR is not delivered, and an
+        // already-merged PR counts only when its head is the pushed revision
+        // (a reused branch name alone is insufficient).
+        var closedNumbers = await ListPullRequestNumbersForBranchAsync(request, "closed", ct);
+        var closedMatches = await FindExactMatchesAsync(request, closedNumbers, expectedHeadSha, ct);
+        var merged = closedMatches.FirstOrDefault(d => d.Merged);
+        if (merged is not null)
+            return ClassifySingleMatch(request, merged);
+        if (closedMatches.Count > 0)
+            throw new InvalidOperationException(
+                $"GitHub POST /pulls returned 422 and PR #{closedMatches[0].Number} for head='{SanitizeForLog(request.WorkBranch)}' " +
+                $"base='{SanitizeForLog(request.BaseBranch)}' is closed without merge; this work is not delivered. Reopen it or open a new PR manually.");
+        throw new InvalidOperationException(
+            $"GitHub POST /pulls returned 422 and no existing PR exactly matches head='{SanitizeForLog(request.WorkBranch)}' " +
+            $"base='{SanitizeForLog(request.BaseBranch)}' pushed revision; treating as a validation failure, not a duplicate. " +
+            $"Forge detail: {createErrorDetail}");
+    }
+
+    private ReconciledPullRequest ClassifySingleMatch(UpstreamCompletionRequest request, GitHubPrDetailMergeable match)
+    {
+        if (match.Merged)
+        {
+            if (string.IsNullOrWhiteSpace(match.MergeCommitSha))
+                throw new InvalidOperationException(
+                    $"GitHub PR #{match.Number} for head='{SanitizeForLog(request.WorkBranch)}' is marked merged but reports no merge commit; " +
+                    "delivery cannot be proven. Resolve manually.");
+            return new ReconciledPullRequest(
+                match.Number,
+                match.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{match.Number}",
+                match.MergeCommitSha,
+                ReusedExisting: true);
+        }
+        if (string.Equals(match.State, "closed", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"GitHub PR #{match.Number} for head='{SanitizeForLog(request.WorkBranch)}' base='{SanitizeForLog(request.BaseBranch)}' " +
+                "is closed without merge; this work is not delivered. Reopen it or open a new PR manually.");
+        return new ReconciledPullRequest(
+            match.Number,
+            match.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{match.Number}",
+            AuthoritativeMergeSha: null,
+            ReusedExisting: true);
+    }
+
+    /// <summary>
+    /// Single bounded reconcile attempt after a lost create response. Returns
+    /// the exact PR when exactly one open match is provable, else null so the
+    /// caller rethrows the original transport error into the bounded retry loop
+    /// (whose next attempt reconciles through the 422 path instead of
+    /// duplicating the PR).
+    /// </summary>
+    private async Task<ReconciledPullRequest?> TryReconcileAfterCreateUncertaintyAsync(
+        UpstreamCompletionRequest request, CancellationToken ct)
+    {
+        try
+        {
+            var expectedHeadSha = await ResolveWorkBranchTipAsync(request, ct);
+            if (string.IsNullOrWhiteSpace(expectedHeadSha))
+                return null;
+            var openNumbers = await ListPullRequestNumbersForBranchAsync(request, "open", ct);
+            var matches = await FindExactMatchesAsync(request, openNumbers, expectedHeadSha, ct);
+            if (matches.Count != 1)
+                return null;
+            try
+            {
+                return ClassifySingleMatch(request, matches[0]);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _log.LogDebug("Create-uncertainty reconcile found PR #{N} but it is not reusable: {Message}", matches[0].Number, ex.Message);
+                return null;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug("Reconciliation after create uncertainty failed: {Message}", ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Lists candidate PR numbers for this exact head/base pair. The head/base
+    /// filter runs server-side; every candidate is still verified client-side
+    /// against owner/ref/revision before use.
+    /// </summary>
+    private async Task<IReadOnlyList<int>> ListPullRequestNumbersForBranchAsync(
+        UpstreamCompletionRequest request, string state, CancellationToken ct)
+    {
+        var numbers = new List<int>();
+        for (var page = 1; page <= ReconcileListMaxPages; page++)
+        {
+            var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls" +
+                $"?state={state}&head={_opts.Owner}:{request.WorkBranch}&base={request.BaseBranch}" +
+                $"&per_page={ReconcileListPerPage}&page={page}";
+            using var listReq = await BuildRequestAsync(HttpMethod.Get, url, ct);
+            using var listResp = await SendAsync(listReq, ct);
+            if (!listResp.IsSuccessStatusCode)
+            {
+                AuditLog.UpstreamApiCallFailed($"GET /pulls?state={state}", (int)listResp.StatusCode, _opts.Owner, _opts.Repository);
+                throw new InvalidOperationException(
+                    $"GitHub POST /pulls conflicted but reconciliation listing (state={state}) failed with {(int)listResp.StatusCode}; " +
+                    $"no existing PR can be proven to carry the pushed revision of '{SanitizeForLog(request.WorkBranch)}'.");
+            }
+            var summaries = await listResp.Content.ReadFromJsonAsync<GitHubPrSummary[]>(ct) ?? [];
+            foreach (var summary in summaries)
+                numbers.Add(summary.Number);
+            if (summaries.Length < ReconcileListPerPage) break;
+        }
+        return numbers;
+    }
+
+    /// <summary>
+    /// Fetches details for each candidate (bounded) and keeps only exact
+    /// revision matches: same head ref, same base ref, same head owner when
+    /// reported, same head sha as the just-pushed tip. Unfetchable candidates
+    /// are skipped — they are unprovable, never assumed.
+    /// </summary>
+    private async Task<IReadOnlyList<GitHubPrDetailMergeable>> FindExactMatchesAsync(
+        UpstreamCompletionRequest request, IReadOnlyList<int> numbers, string expectedHeadSha, CancellationToken ct)
+    {
+        if (numbers.Count > ReconcileMaxDetailFetches)
+            throw new InvalidOperationException(
+                $"GitHub POST /pulls conflicted with {numbers.Count} candidate PRs for head='{SanitizeForLog(request.WorkBranch)}'; " +
+                "too many to disambiguate safely. Resolve manually.");
+        var matches = new List<GitHubPrDetailMergeable>();
+        foreach (var number in numbers)
+        {
+            var detail = await FetchPullRequestDetailAsync(number, ct);
+            if (detail is null) continue;
+            if (IsExactRevisionMatch(detail, request, expectedHeadSha))
+                matches.Add(detail);
+        }
+        return matches;
+    }
+
+    private bool IsExactRevisionMatch(GitHubPrDetailMergeable detail, UpstreamCompletionRequest request, string expectedHeadSha)
+    {
+        if (!string.Equals(detail.Head?.Ref, request.WorkBranch, StringComparison.Ordinal))
+            return false;
+        if (!string.Equals(detail.Base?.Ref, request.BaseBranch, StringComparison.Ordinal))
+            return false;
+        var login = detail.Head?.User?.Login;
+        if (!string.IsNullOrWhiteSpace(login) && !string.Equals(login, _opts.Owner, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (!string.Equals(detail.Head?.Sha, expectedHeadSha, StringComparison.OrdinalIgnoreCase))
+            return false;
+        return true;
     }
 
     private async Task<GitHubPrResponse?> TryFetchPullRequestAsync(int prNumber, CancellationToken ct)
@@ -816,35 +1102,105 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         req.Content = JsonContent.Create(body);
 
         var putMergeSw = Stopwatch.StartNew();
-        using var response = await SendAsync(req, ct);
-        putMergeSw.Stop();
-        CodeyBoxMeters.UpstreamApiCallDuration.Record(putMergeSw.ElapsedMilliseconds,
-            new KeyValuePair<string, object?>("endpoint", "PUT /pulls/merge"),
-            new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
-
-        if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
+        HttpResponseMessage response;
+        try
         {
-            // 405 here is conventionally "PR not mergeable" — usually a race
-            // against upstream main motion (someone pushed to base between our
-            // local merge phase and this PUT). The orchestrator catches the
-            // AutoMergeRaced flag, re-fetches base, re-runs the merge phase
-            // against the new tip, and retries this PUT. Branch protection can
-            // also surface as 405; in that case re-fetching shows base unchanged
-            // and the orchestrator parks the item rather than spinning.
-            const string note = "GitHub PUT /pulls/N/merge returned 405 (PR not mergeable — likely a race against upstream base; orchestrator will re-fetch base and re-run merge phase)";
-            _log.LogWarning(
-                "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable); orchestrator will re-fetch base and re-run merge phase",
-                prNumber);
-            AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", 405, _opts.Owner, _opts.Repository);
-            return (null, note, true);
+            response = await SendAsync(req, ct);
         }
+        catch (Exception ex) when (IsTransportUncertainty(ex, ct))
+        {
+            // The merge may have landed server-side while the response was
+            // lost. Verify the authoritative PR state before any other
+            // mutation (in particular, before retrying the PUT, which would
+            // act on an already-merged PR).
+            putMergeSw.Stop();
+            _log.LogWarning(
+                "GitHub PUT /pulls/{N}/merge transport failed ({Kind}); verifying merge state before any further mutation",
+                prNumber, ex.GetType().Name);
+            var verified = await TryVerifyMergeAfterUncertaintyAsync(prNumber, completionRequest, ct);
+            if (verified is not null)
+                return verified.Value;
+            throw;
+        }
+        putMergeSw.Stop();
 
-        if (!response.IsSuccessStatusCode)
-            AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", (int)response.StatusCode, _opts.Owner, _opts.Repository);
+        using (response)
+        {
+            CodeyBoxMeters.UpstreamApiCallDuration.Record(putMergeSw.ElapsedMilliseconds,
+                new KeyValuePair<string, object?>("endpoint", "PUT /pulls/merge"),
+                new KeyValuePair<string, object?>("status_code", (int)response.StatusCode));
 
-        response.EnsureSuccessStatusCode();
-        var result = await response.Content.ReadFromJsonAsync<GitHubMergeResponse>(ct);
-        return (result?.Sha, null, false);
+            if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
+            {
+                // 405 here is conventionally "PR not mergeable" — usually a race
+                // against upstream main motion (someone pushed to base between our
+                // local merge phase and this PUT). The orchestrator catches the
+                // AutoMergeRaced flag, re-fetches base, re-runs the merge phase
+                // against the new tip, and retries this PUT. Branch protection can
+                // also surface as 405; in that case re-fetching shows base unchanged
+                // and the orchestrator parks the item rather than spinning.
+                const string note = "GitHub PUT /pulls/N/merge returned 405 (PR not mergeable — likely a race against upstream base; orchestrator will re-fetch base and re-run merge phase)";
+                _log.LogWarning(
+                    "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable); orchestrator will re-fetch base and re-run merge phase",
+                    prNumber);
+                AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", 405, _opts.Owner, _opts.Repository);
+                return (null, note, true);
+            }
+
+            if (!response.IsSuccessStatusCode)
+                AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", (int)response.StatusCode, _opts.Owner, _opts.Repository);
+
+            response.EnsureSuccessStatusCode();
+            var result = await response.Content.ReadFromJsonAsync<GitHubMergeResponse>(ct);
+            // A merge counts as delivery only with the forge's own proof: the
+            // merged flag plus a non-empty authoritative sha. Branch push, an
+            // unidentified PR, or a sha-less success response is not proof.
+            if (result?.Merged != true || string.IsNullOrWhiteSpace(result.Sha))
+                throw new InvalidOperationException(
+                    $"GitHub PUT /pulls/{prNumber}/merge returned success but did not prove a merge " +
+                    $"(merged={result?.Merged}, sha present={!string.IsNullOrWhiteSpace(result?.Sha)}); refusing to report delivery.");
+            return (result.Sha, null, false);
+        }
+    }
+
+    /// <summary>
+    /// Single bounded verification after a lost merge response: the PR counts
+    /// as merged only when the forge reports merged with a merge commit sha
+    /// AND the PR head is still the revision we pushed (a reused branch name
+    /// alone is insufficient). Null when unprovable — the caller rethrows the
+    /// original transport error into the bounded retry loop.
+    /// </summary>
+    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced)?> TryVerifyMergeAfterUncertaintyAsync(
+        int prNumber, UpstreamCompletionRequest request, CancellationToken ct)
+    {
+        try
+        {
+            var expectedHeadSha = await ResolveWorkBranchTipAsync(request, ct);
+            if (string.IsNullOrWhiteSpace(expectedHeadSha))
+                return null;
+            var detail = await FetchPullRequestDetailAsync(prNumber, ct);
+            if (detail?.Merged != true || string.IsNullOrWhiteSpace(detail.MergeCommitSha))
+                return null;
+            if (!string.Equals(detail.Head?.Sha, expectedHeadSha, StringComparison.OrdinalIgnoreCase))
+            {
+                _log.LogWarning(
+                    "GitHub PR #{N} is merged but its head no longer matches the pushed revision; refusing to claim this work as delivered",
+                    prNumber);
+                return null;
+            }
+            _log.LogInformation("GitHub PR #{N} merge verified after transport failure: {Sha}", prNumber, detail.MergeCommitSha);
+            AuditLog.UpstreamPrMerged(prNumber, detail.MergeCommitSha);
+            return (detail.MergeCommitSha, "Merge response was lost in transport; delivery verified by re-reading the merged PR state.", false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug("Merge verification after transport failure failed: {Message}", ex.Message);
+            return null;
+        }
     }
 
     private async Task<GitHubMergeRequest> BuildMergeRequestAsync(
@@ -1438,7 +1794,8 @@ internal sealed record GitHubPrResponse(
     [property: JsonPropertyName("body")] string? Body = null);
 
 internal sealed record GitHubMergeResponse(
-    [property: JsonPropertyName("sha")] string? Sha);
+    [property: JsonPropertyName("sha")] string? Sha,
+    [property: JsonPropertyName("merged")] bool Merged = false);
 
 internal sealed record GitHubPullRequestCommitResponse(
     [property: JsonPropertyName("commit")] GitHubPullRequestCommitDetail? Commit);
@@ -1477,4 +1834,14 @@ internal sealed record GitHubPrDetailMergeable(
     [property: JsonPropertyName("mergeable_state")] string? MergeableState,
     [property: JsonPropertyName("state")] string? State = null,
     [property: JsonPropertyName("merged")] bool Merged = false,
-    [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha = null);
+    [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha = null,
+    [property: JsonPropertyName("head")] GitHubPrEndpointDetail? Head = null,
+    [property: JsonPropertyName("base")] GitHubPrEndpointDetail? Base = null);
+
+internal sealed record GitHubPrEndpointDetail(
+    [property: JsonPropertyName("ref")] string? Ref,
+    [property: JsonPropertyName("sha")] string? Sha,
+    [property: JsonPropertyName("user")] GitHubPrUser? User = null);
+
+internal sealed record GitHubPrUser(
+    [property: JsonPropertyName("login")] string? Login);
