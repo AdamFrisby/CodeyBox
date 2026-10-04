@@ -1593,8 +1593,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Work item {Id} failed", item.Id);
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+            if (ShutdownCheckpointGuard.ShouldSuppressTerminalFailure(ex, hostShutdownToken, current.Id))
+            {
+                // Graceful shutdown checkpointed this item before VM teardown,
+                // so a disposed sandbox (or a SIGTERMed VM start) observed by
+                // the still-running worker is the shutdown's own doing, not a
+                // work failure. Leave the checkpointed state alone so the next
+                // boot restarts cleanly instead of recording Failed over it.
+                _log.LogInformation(
+                    ex,
+                    "Work item {Id} hit {ExceptionType} during host shutdown after shutdown checkpoint; leaving checkpointed state {State} intact instead of failing",
+                    current.Id, ex.GetType().Name, current.State);
+                return;
+            }
+            _log.LogError(ex, "Work item {Id} failed", item.Id);
             var failureKind = current.AgentTurnRecoveryLease is not null
                 && current.HasTypedAgentTurnRecoveryBoundary
                     ? WorkItemFailureKinds.Infrastructure
