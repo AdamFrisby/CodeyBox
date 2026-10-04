@@ -104,6 +104,7 @@
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.CodeqlAuditorPlugin\CodeyBox.CodeqlAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.DevSkimAuditorPlugin\CodeyBox.DevSkimAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.BrakemanAuditorPlugin\CodeyBox.BrakemanAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\sast\CodeyBox.BanditAuditorPlugin\CodeyBox.BanditAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.SemgrepAuditorPlugin\CodeyBox.SemgrepAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
