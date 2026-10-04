@@ -129,6 +129,16 @@ public sealed partial class PipelineRunner
                 MergeMethod = project.Upstream.MergeMethod,
             };
 
+            // Restart evidence: a previous attempt may have opened (or raced)
+            // the PR and persisted its number before the process went away.
+            // Resuming against that PR avoids a duplicate create and keeps
+            // create/merge/persist idempotent across restarts.
+            {
+                var stored = await _store.GetAsync(item.Id, ct);
+                if (request.ExistingPullRequestNumber is null && stored?.MergedPrNumber is not null)
+                    request = request with { ExistingPullRequestNumber = stored.MergedPrNumber };
+            }
+
             // Pre-merge CI gate. The forge's textual `mergeable` flag does not
             // catch the case where a clean merge against newly-moved `main`
             // still breaks the build or tests (e.g. a helper renamed on `main`
@@ -380,6 +390,19 @@ public sealed partial class PipelineRunner
                             AgentStdout = agentStdout,
                             ExistingPullRequestNumber = outcome.PullRequestNumber,
                         };
+                        // Persist the PR identity before looping: if the process
+                        // restarts between create/merge/persist, the next run
+                        // reseeds ExistingPullRequestNumber from the store
+                        // instead of creating a duplicate PR.
+                        if (outcome.PullRequestNumber is not null || outcome.PullRequestUrl is not null)
+                        {
+                            var racedPersist = await _store.GetAsync(item.Id, ct) ?? item;
+                            await _store.UpdateAsync(racedPersist with
+                            {
+                                MergedPrNumber = outcome.PullRequestNumber ?? racedPersist.MergedPrNumber,
+                                MergedPrUrl = outcome.PullRequestUrl ?? racedPersist.MergedPrUrl,
+                            }, ct);
+                        }
                         continue;
                     }
 
@@ -499,6 +522,31 @@ public sealed partial class PipelineRunner
                         MergedPrNumber = completed.PullRequestNumber ?? preMergePersist.MergedPrNumber,
                         MergedPrUrl = completed.PullRequestUrl ?? preMergePersist.MergedPrUrl,
                     }, ct);
+                }
+
+                // Verified-delivery gate (sig-pr422-delivery-reconciliation):
+                // with AutoMerge on a PR forge, only an authoritative merge SHA
+                // proves delivery. A bare branch push, an unidentified or
+                // unmerged PR, a timeout, or a failed reconciliation parks as an
+                // infrastructure failure so dependents are never released on
+                // unverified work. Noop, generic-git, and AutoMerge=false
+                // outcomes are unaffected by this gate.
+                if (project.Upstream.AutoMerge
+                    && !completed.Skipped
+                    && string.Equals(upstream.Name, "github", StringComparison.OrdinalIgnoreCase)
+                    && completed.MergedSha is null)
+                {
+                    static string SanitizeBranch(string branch) =>
+                        branch.Replace("\r", "\\r", StringComparison.Ordinal).Replace("\n", "\\n", StringComparison.Ordinal);
+                    var unverifiedReason = completed.AutoMergeRaced
+                        ? $"upstream delivery unverified for work branch '{SanitizeBranch(workBranch)}': auto-merge raced with no merge proof and no further recovery configured"
+                            + (completed.PullRequestNumber is { } racedPr ? $" (PR #{racedPr})" : " (no PR number returned)") + ". Resolve manually."
+                        : completed.PullRequestNumber is { } openPr
+                            ? $"upstream delivery unverified for work branch '{SanitizeBranch(workBranch)}': PR #{openPr} is open but not merged and auto-merge produced no verified merge SHA. Resolve manually."
+                            : $"upstream delivery unverified for work branch '{SanitizeBranch(workBranch)}': PR creation produced no PR identity (validation failure, timeout, or failed reconciliation) and auto-merge produced no verified merge SHA. Resolve manually.";
+                    _log.LogWarning("Work item {Id} upstream delivery unverified: {Reason}", item.Id, unverifiedReason);
+                    await TransitionFailed(item, unverifiedReason, ct, project, failureKind: "infrastructure");
+                    return;
                 }
 
                 if (completed.PullRequestUrl is not null && completed.PullRequestNumber is not null)

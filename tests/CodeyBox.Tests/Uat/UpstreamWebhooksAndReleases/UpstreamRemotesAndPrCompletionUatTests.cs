@@ -134,8 +134,14 @@ public sealed class UpstreamRemotesAndPrCompletionUatTests : IDisposable
     }
 
     [Fact]
-    public async Task GitHubUpstream_PrAlreadyExistsReturnsPartialOutcomeRatherThanDuplicateFailure()
+    public async Task GitHubUpstream_PrAlreadyExistsWithoutProvableMatchThrowsRatherThanPartialOutcome()
     {
+        // sig-pr422-delivery-reconciliation: a 422 is never mapped to an
+        // unidentified BranchPushed-only outcome (the orchestrator used to
+        // turn that into Done with no PR identity or merge evidence). With no
+        // provable exact match the remote throws so the item parks instead;
+        // the request log proves no duplicate PR was POSTed and no merge was
+        // attempted against an unidentified PR.
         var gitHost = new CapturingGitHost();
         var handler = new SequenceHttpMessageHandler();
         handler.Enqueue(UpstreamWebhooksAndReleasesHelpers.Json(
@@ -143,13 +149,51 @@ public sealed class UpstreamRemotesAndPrCompletionUatTests : IDisposable
             """{"message":"Validation Failed","errors":[{"message":"A pull request already exists"}]}"""));
         var remote = UpstreamWebhooksAndReleasesHelpers.GitHubRemote(gitHost, handler);
 
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            remote.CompleteAsync(UpstreamWebhooksAndReleasesHelpers.Request()));
+
+        Assert.Contains("422", ex.Message);
+        Assert.Single(gitHost.Pushes);
+        Assert.Equal(1, handler.Requests.Count(r => r.Method == HttpMethod.Post));
+        Assert.DoesNotContain(handler.Requests, r => r.Method == HttpMethod.Put);
+    }
+
+    [Fact]
+    public async Task GitHubUpstream_PrAlreadyExistsWithExactMatchReusesIdentifiedOpenPr()
+    {
+        // The 422 names our exact PR (same head owner/ref, base ref, pushed
+        // revision): with AutoMerge=false the identified open PR is the
+        // configured completion result — reused, never duplicated or merged.
+        const string tip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var gitHost = new CapturingGitHost();
+        gitHost.ResolveCommits["feature/uat-upstream"] = tip;
+        var handler = new SequenceHttpMessageHandler();
+        handler.Enqueue(UpstreamWebhooksAndReleasesHelpers.Json(
+            HttpStatusCode.UnprocessableEntity,
+            """{"message":"Validation Failed","errors":[{"message":"A pull request already exists"}]}"""));
+        handler.Enqueue(UpstreamWebhooksAndReleasesHelpers.Json(HttpStatusCode.OK, """[{"number":31}]"""));
+        handler.Enqueue(UpstreamWebhooksAndReleasesHelpers.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new
+        {
+            number = 31,
+            html_url = "https://github.com/owner/repo/pull/31",
+            state = "open",
+            merged = false,
+            merge_commit_sha = (string?)null,
+            mergeable = (bool?)true,
+            mergeable_state = "clean",
+            head = new { @ref = "feature/uat-upstream", sha = tip, user = new { login = "owner" } },
+            @base = new { @ref = "main" },
+        })));
+        var remote = UpstreamWebhooksAndReleasesHelpers.GitHubRemote(gitHost, handler);
+
         var outcome = await remote.CompleteAsync(UpstreamWebhooksAndReleasesHelpers.Request());
 
         Assert.True(outcome.BranchPushed);
-        Assert.Null(outcome.PullRequestNumber);
-        Assert.Contains("422", outcome.Notes);
-        Assert.Single(gitHost.Pushes);
-        Assert.Single(handler.Requests);
+        Assert.Equal(31, outcome.PullRequestNumber);
+        Assert.Equal("https://github.com/owner/repo/pull/31", outcome.PullRequestUrl);
+        Assert.Null(outcome.MergedSha);
+        Assert.Equal(1, handler.Requests.Count(r => r.Method == HttpMethod.Post));
+        Assert.DoesNotContain(handler.Requests, r => r.Method == HttpMethod.Put);
     }
 
     [Fact]

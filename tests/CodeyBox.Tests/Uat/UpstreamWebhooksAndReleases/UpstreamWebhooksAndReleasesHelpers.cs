@@ -103,6 +103,7 @@ internal sealed class CapturingGitHost : IGitHost
 {
     public List<UpstreamPushCall> Pushes { get; } = [];
     public Exception? PushException { get; init; }
+    public Dictionary<string, string> ResolveCommits { get; } = new(StringComparer.Ordinal);
 
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
@@ -133,6 +134,11 @@ internal sealed class CapturingGitHost : IGitHost
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;
+
+    public Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
+        => ResolveCommits.TryGetValue(commitish, out var sha)
+            ? Task.FromResult(sha)
+            : throw new NotSupportedException($"CapturingGitHost has no commit for '{commitish}'.");
 
     public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
         => Task.FromResult(true);
