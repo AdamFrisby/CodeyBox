@@ -38,6 +38,9 @@ internal static class AgentInvolvementOutcomes
         // The agent ran cleanly and delivered its no-action determination;
         // the report is the work product, not a run failure.
         NoActionRequiredException => Success,
+        // The build failure traces to the base branch, not to anything the
+        // agent produced — the attempt is infrastructure, not agent fault.
+        BaseBuildBrokenException => FailureInfrastructure,
         OperationCanceledException => FailureCancelled,
         _ => FailureAgent,
     };

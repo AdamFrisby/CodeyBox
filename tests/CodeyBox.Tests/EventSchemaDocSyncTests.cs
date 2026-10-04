@@ -13,7 +13,7 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class EventSchemaDocSyncTests
 {
-    private const string ExpectedCurrentSchemaVersion = "1.6";
+    private const string ExpectedCurrentSchemaVersion = "1.7";
 
     private static string FindRepoRoot()
     {
@@ -139,6 +139,9 @@ public sealed class EventSchemaDocSyncTests
             "audit.auditor_timed_out",
             "quota.reset_optimal",
             "work_item.no_action_required",
+            "project.base_broken_detected",
+            "project.base_broken_cleared",
+            "work_item.base_broken_parked",
         };
 
         Assert.All(schema.Envelope.Values, field =>
@@ -161,6 +164,9 @@ public sealed class EventSchemaDocSyncTests
         Assert.Equal("1.5", schema.EventTypes["audit.auditor_timed_out"].IntroducedIn);
         Assert.Equal("1.6", schema.EventTypes["quota.reset_optimal"].IntroducedIn);
         Assert.Equal("1.6", schema.EventTypes["work_item.no_action_required"].IntroducedIn);
+        Assert.Equal("1.7", schema.EventTypes["project.base_broken_detected"].IntroducedIn);
+        Assert.Equal("1.7", schema.EventTypes["project.base_broken_cleared"].IntroducedIn);
+        Assert.Equal("1.7", schema.EventTypes["work_item.base_broken_parked"].IntroducedIn);
     }
 
     private static IReadOnlyDictionary<string, string> ParseDocEventTypeVersions(string doc)

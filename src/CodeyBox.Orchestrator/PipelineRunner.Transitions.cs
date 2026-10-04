@@ -498,7 +498,7 @@ public sealed partial class PipelineRunner
         return DurableResumeStateForInterruptedPhase(phase) ?? WorkItemState.Queued;
     }
 
-    private static WorkItemState? DurableResumeStateForInterruptedPhase(string phase) => phase switch
+    internal static WorkItemState? DurableResumeStateForInterruptedPhase(string phase) => phase switch
     {
         // Work / rework-resume / rework / audit all left the agent commits on
         // the work branch (or about to); resume at the matching phase entry.

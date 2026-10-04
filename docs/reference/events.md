@@ -13,7 +13,7 @@ without the other, CI fails.
 ## Current version
 
 ```
-eventSchemaVersion = "1.6"
+eventSchemaVersion = "1.7"
 ```
 
 The `eventSchemaVersion` string is semver (`major.minor`). Trackers should
@@ -33,7 +33,7 @@ Every webhook + SSE payload is a JSON object with this shape:
 ```jsonc
 {
   // ── Required (since 1.0) ─────────────────────────────────────
-  "eventSchemaVersion": "1.6",                  // semver string
+  "eventSchemaVersion": "1.7",                  // semver string
   "eventType":          "work_item.done",       // stable identifier
   "emittedAt":          "2026-05-18T12:34:56.789+00:00",
 
@@ -100,6 +100,8 @@ subscribe to.
 | `project.budget_warning` | 1.0 | Project crossed the cost warning threshold. |
 | `project.budget_exceeded` | 1.0 | Project crossed the cost hard cap. |
 | `project.budget_recovered` | 1.0 | Project spend dropped below the warning threshold. |
+| `project.base_broken_detected` | 1.7 | The project's base branch tip reproduces the required-build failure; build-dependent dispatch is held. Details include `projectId`, `baseBranch`, `baseSha`. |
+| `project.base_broken_cleared` | 1.7 | The base tip builds again; held items resume. |
 | `work_item.planning` | 1.5 | Planning-only agent turn started. |
 | `work_item.plan_review` | 1.5 | Planning artifact entered review. |
 | `work_item.plan_approved` | 1.5 | Planning artifact was approved; implementation may start. |
@@ -124,6 +126,7 @@ subscribe to.
 | `work_item.waiting_for_quota_reset` | 1.0 | Work item parked until quota reset window. |
 | `work_item.waiting_for_agent_resume` | 1.3 | Work item parked because its only eligible agent is paused. |
 | `work_item.waiting_for_transient_retry` | 1.4 | Work item parked until the transient transport/network retry backoff expires. |
+| `work_item.base_broken_parked` | 1.7 | A required-build failure was attributed to the broken base branch rather than the item's diff; the item returned to a resumable state (branch preserved, no failure charge). Details include `baseBranch`, `baseSha`, `resumeState`, `fixWorkItemId`, `phase`. |
 | `work_item.agent_stuck` | 1.0 | Stuck-agent probe killed a hung agent. |
 | `work_item.auto_retry` | 1.0 | Quota/transient auto-retry re-queued a failed item. |
 | `work_item.agent_restore_requeued` | 1.5 | Agent-restore infra sweep re-queued a failed item. |
@@ -155,6 +158,9 @@ worker-pool health watchdog events for dispatcher stalls and restart
 escalation. Schema 1.3 adds per-agent pause/resume and agent-pause waiting
 events. Schema 1.4 adds transient transport retry waiting events. Schema 1.5 adds planning-phase transition events and auditor-timeout
 attribution events. Schema 1.6 adds the quota-reset optimal-spend advisory event.
+Schema 1.7 adds base-broken detection/containment events: project-level
+detected/cleared conditions plus the work-item park that preserves the
+branch without a failure charge.
 
 ## Evolution rules (additive-only)
 

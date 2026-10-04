@@ -1336,6 +1336,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex.Phase ?? "(unknown)");
             await TransitionWaitingForTransientRetryAsync(item, ex.Message, project, ex.Phase, item.Agent);
         }
+        catch (BaseBuildBrokenException ex)
+        {
+            // The required build fails on the BASE tip with no contributing
+            // error file inside this item's diff: the base is broken, the
+            // item is not. Park it at the phase-appropriate resumable state
+            // (branch preserved, no failure charge), record the project
+            // condition that holds build-dependent dispatch, and file the
+            // one deduped fix item for the broken SHA.
+            _log.LogWarning(
+                "Work item {Id} required-build failure attributed to broken base '{Base}' tip {Sha}; parking at {ResumeState}",
+                item.Id, ex.BaseBranch, ex.BaseSha, ex.ResumeState);
+            await ParkForBaseBrokenBaseAsync(item, project, ex);
+        }
         catch (RequiredBuildFailedException ex)
         {
             _log.LogWarning("Work item {Id} failed required build gate: {Error}", item.Id, ex.Message);

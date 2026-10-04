@@ -586,6 +586,15 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.MergeGuardReworkMaxAttempts):
                 opts.MergeGuardReworkMaxAttempts += 10;
                 break;
+            case nameof(PipelineTuningOptions.BaseBrokenDetectionEnabled):
+                opts.BaseBrokenDetectionEnabled = !opts.BaseBrokenDetectionEnabled;
+                break;
+            case nameof(PipelineTuningOptions.BaseBrokenFixItemPriority):
+                opts.BaseBrokenFixItemPriority -= 10;
+                break;
+            case nameof(PipelineTuningOptions.BaseBrokenRecheckInterval):
+                opts.BaseBrokenRecheckInterval += TimeSpan.FromMinutes(1);
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(field), field, "No mutator for this PipelineTuning field.");
         }

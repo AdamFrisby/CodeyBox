@@ -1250,6 +1250,11 @@ public sealed partial class PipelineRunner
         // wrong, so the retry must not feed the agent's failure window.
         if (error is MergeBaseMovedException)
             return null;
+        // A broken base attribution is repository state, not agent
+        // performance: the item parks and the project holds rather than the
+        // attempt counting toward the breaker.
+        if (error is BaseBuildBrokenException)
+            return null;
         // Every other terminal exception is a real dispatch failure.
         return false;
     }

@@ -47,6 +47,55 @@ internal sealed class RequiredBuildFailedException : Exception
 }
 
 /// <summary>
+/// The required build failed on the work branch AND the same failure
+/// reproduces on the base branch tip with no contributing error file inside
+/// the item's diff — the base is broken, not the work. Thrown by
+/// <see cref="RequiredBuildGate"/> instead of
+/// <see cref="RequiredBuildFailedException"/>; the outer catch parks the
+/// item at <see cref="ResumeState"/> (branch preserved, no failure charge),
+/// records the project-level base-broken condition, and holds
+/// build-dependent dispatch until the base tip builds again.
+/// </summary>
+internal sealed class BaseBuildBrokenException : Exception
+{
+    public BaseBuildBrokenException(
+        string message,
+        string baseBranch,
+        string baseSha,
+        string? baseBuildOutput,
+        WorkItemState resumeState,
+        string? phase = null)
+        : base(message)
+    {
+        BaseBranch = baseBranch;
+        BaseSha = baseSha;
+        BaseBuildOutput = baseBuildOutput;
+        ResumeState = resumeState;
+        Phase = phase;
+    }
+
+    /// <summary>The base branch whose tip failed the same required build.</summary>
+    public string BaseBranch { get; }
+
+    /// <summary>The base branch tip SHA that reproduced the failure.</summary>
+    public string BaseSha { get; }
+
+    /// <summary>Bounded, redacted output of the failing base-tip build.</summary>
+    public string? BaseBuildOutput { get; }
+
+    /// <summary>
+    /// The resumable state the item returns to while the hold is active:
+    /// Queued for a work-phase detection (branch preserved via
+    /// <see cref="WorkItem.PreserveWorkBranchOnQueuedPickup"/>), WorkComplete
+    /// for the audit/rework gate, AuditPassed for the merge-resume gate.
+    /// </summary>
+    public WorkItemState ResumeState { get; }
+
+    /// <summary>Pipeline phase string that detected the failure (for logging).</summary>
+    public string? Phase { get; }
+}
+
+/// <summary>
 /// A declared e2e-replay capability could not be made green by the
 /// post-implementation replay gate (missing/broken replay that authoring +
 /// verification could not resolve). Like <see cref="RequiredBuildFailedException"/>

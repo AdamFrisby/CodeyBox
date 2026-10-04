@@ -33,7 +33,7 @@ public sealed class EventSchemaEndpointTests : IDisposable
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        Assert.Equal("1.6", root.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal("1.7", root.GetProperty("eventSchemaVersion").GetString());
 
         var eventTypes = root.GetProperty("eventTypes");
         // Every event type the code knows about must appear in the endpoint payload.
@@ -55,5 +55,8 @@ public sealed class EventSchemaEndpointTests : IDisposable
         Assert.Equal(
             "1.6",
             eventTypes.GetProperty("quota.reset_optimal").GetProperty("introducedIn").GetString());
+        Assert.Equal(
+            "1.7",
+            eventTypes.GetProperty("project.base_broken_detected").GetProperty("introducedIn").GetString());
     }
 }

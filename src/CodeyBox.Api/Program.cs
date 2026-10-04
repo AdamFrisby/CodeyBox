@@ -3960,6 +3960,43 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
+// Base-broken attribution + containment: the verifier sandbox-builds the
+// base tip through the same IRequiredBuildVerifier path (verdicts cached
+// per SHA); the tracker owns the durable project condition, the per-SHA
+// fix-item dedupe, and the dispatcher hold; the monitor clears conditions
+// once the base tip builds again.
+builder.Services.AddSingleton<IBaseBrokenConditionStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteBaseBrokenConditionStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<ILogger<SqliteBaseBrokenConditionStore>>(),
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
+builder.Services.AddSingleton<BaseBuildVerifier>(sp => new BaseBuildVerifier(
+    sp.GetRequiredService<IRequiredBuildVerifier>(),
+    sp.GetRequiredService<IToolchainFaultClassifier>(),
+    sp.GetRequiredService<ILogger<BaseBuildVerifier>>()));
+builder.Services.AddSingleton<BaseBrokenConditionTracker>(sp => new BaseBrokenConditionTracker(
+    sp.GetRequiredService<IBaseBrokenConditionStore>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetService<ITaskQueue>(),
+    sp.GetService<IWebhookDispatcher>(),
+    sp.GetService<TimeProvider>(),
+    sp.GetRequiredService<ILogger<BaseBrokenConditionTracker>>()));
+builder.Services.AddSingleton<IBaseBrokenConditionStatusProvider>(sp =>
+    sp.GetRequiredService<BaseBrokenConditionTracker>());
+builder.Services.AddSingleton<BaseBrokenMonitorService>(sp => new BaseBrokenMonitorService(
+    sp.GetRequiredService<BaseBrokenConditionTracker>(),
+    sp.GetRequiredService<BaseBuildVerifier>(),
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<PipelineTuningSnapshot>(),
+    sp.GetService<TimeProvider>(),
+    sp.GetRequiredService<ILogger<BaseBrokenMonitorService>>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BaseBrokenMonitorService>());
+
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -4069,7 +4106,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     baselineScheduler: sp.GetRequiredService<TestSelectionBaselineScheduler>(),
     baselineProductionOptions: () => sp.GetRequiredService<IOptionsMonitor<TestSelectionBaselineProductionOptions>>().CurrentValue,
     baselineStager: sp.GetRequiredService<TestSelectionBaselineAuditStager>(),
-    providerTransientCorrelation: sp.GetRequiredService<ProviderTransientCorrelationTracker>()));
+    providerTransientCorrelation: sp.GetRequiredService<ProviderTransientCorrelationTracker>(),
+    baseBuildVerifier: sp.GetRequiredService<BaseBuildVerifier>(),
+    baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -4334,7 +4373,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     costStore: sp.GetService<IWorkItemCostStore>(),
     burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>(),
     dispatchLiveness: sp.GetRequiredService<DispatchItemLivenessTracker>(),
-    hostTransientPause: sp.GetRequiredService<ProviderTransientCorrelationTracker>()));
+    hostTransientPause: sp.GetRequiredService<ProviderTransientCorrelationTracker>(),
+    baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(

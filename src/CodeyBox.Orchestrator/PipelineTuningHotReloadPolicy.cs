@@ -67,6 +67,9 @@ public static class PipelineTuningHotReloadPolicy
         nameof(PipelineTuningOptions.SuggestionDedupeSimilarityThreshold),
         nameof(PipelineTuningOptions.SuggestionDedupeDismissedMatchWindow),
         nameof(PipelineTuningOptions.SuggestionDedupeMaxRecordedSources),
+        nameof(PipelineTuningOptions.BaseBrokenDetectionEnabled),
+        nameof(PipelineTuningOptions.BaseBrokenFixItemPriority),
+        nameof(PipelineTuningOptions.BaseBrokenRecheckInterval),
     ];
 
     /// <summary>

@@ -367,7 +367,13 @@ internal static class TestSupport
         // exercise AgentConcurrency session accounting pass the real
         // orchestrator (or a deferred wrapper around it); null leaves audit
         // sessions ungated, matching embeddings without the orchestrator.
-        IAgentSessionSlotGate? sessionSlotGate = null)
+        IAgentSessionSlotGate? sessionSlotGate = null,
+        // Base-broken attribution + containment. Null keeps the historical
+        // item-attributed required-build behaviour; tests that exercise the
+        // feature wire the real verifier/tracker over the same store and
+        // scripted build verifier.
+        BaseBuildVerifier? baseBuildVerifier = null,
+        BaseBrokenConditionTracker? baseBrokenConditions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -599,7 +605,9 @@ internal static class TestSupport
             delegationEvents: delegationEvents,
             delegationEscalation: delegationEscalation,
             sandboxPlacer: sandboxPlacer,
-            sessionSlotGate: sessionSlotGate);
+            sessionSlotGate: sessionSlotGate,
+            baseBuildVerifier: baseBuildVerifier,
+            baseBrokenConditions: baseBrokenConditions);
 
         return new TestPipeline(
             pipeline,

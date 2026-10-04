@@ -72,17 +72,20 @@ internal sealed class RequiredBuildGate
     private readonly PersistAuditReport? _persistReport;
     private readonly IToolchainFaultClassifier? _toolchainFaultClassifier;
     private readonly IToolchainFaultRecordStore? _toolchainFaultRecords;
+    private readonly BaseBrokenBuildClassifier? _baseBrokenClassifier;
 
     public RequiredBuildGate(
         IRequiredBuildVerifier verifier,
         PersistAuditReport? persistReport,
         IToolchainFaultClassifier? toolchainFaultClassifier = null,
-        IToolchainFaultRecordStore? toolchainFaultRecords = null)
+        IToolchainFaultRecordStore? toolchainFaultRecords = null,
+        BaseBrokenBuildClassifier? baseBrokenClassifier = null)
     {
         _verifier = verifier ?? throw new ArgumentNullException(nameof(verifier));
         _persistReport = persistReport;
         _toolchainFaultClassifier = toolchainFaultClassifier;
         _toolchainFaultRecords = toolchainFaultRecords;
+        _baseBrokenClassifier = baseBrokenClassifier;
     }
 
     /// <summary>
@@ -166,7 +169,16 @@ internal sealed class RequiredBuildGate
         CancellationToken ct)
     {
         var result = await VerifyAsync(
-            item, project, repoId, baseBranch, workBranch, phase: agentPhase, iteration: null, ct);
+            item,
+            project,
+            repoId,
+            baseBranch,
+            workBranch,
+            phase: agentPhase,
+            iteration: null,
+            baseBrokenResumeState: PipelineRunner.DurableResumeStateForInterruptedPhase(agentPhase)
+                ?? WorkItemState.Queued,
+            ct);
         if (result.Status != RequiredBuildVerificationStatus.Failed)
             return RequiredBuildWorkPhaseOutcome.PassedOrSkipped;
 
@@ -193,7 +205,15 @@ internal sealed class RequiredBuildGate
         CancellationToken ct)
     {
         var result = await VerifyAsync(
-            item, project, repoId, baseBranch, workBranch, phase: "audit", iteration: iteration, ct);
+            item,
+            project,
+            repoId,
+            baseBranch,
+            workBranch,
+            phase: "audit",
+            iteration: iteration,
+            baseBrokenResumeState: WorkItemState.WorkComplete,
+            ct);
         if (result.Status == RequiredBuildVerificationStatus.Skipped)
             return new RequiredBuildAuditGateResult(Applies: false, Finding: null);
         if (result.Status != RequiredBuildVerificationStatus.Failed)
@@ -240,7 +260,15 @@ internal sealed class RequiredBuildGate
         if (!applies) return;
 
         var result = await VerifyAsync(
-            item, project, repoId, baseBranch, workBranch, phase: "audit", iteration: null, ct);
+            item,
+            project,
+            repoId,
+            baseBranch,
+            workBranch,
+            phase: "audit",
+            iteration: null,
+            baseBrokenResumeState: WorkItemState.AuditPassed,
+            ct);
         if (result.Status == RequiredBuildVerificationStatus.Failed)
         {
             throw new AuditFailedException(
@@ -256,6 +284,7 @@ internal sealed class RequiredBuildGate
         string workBranch,
         string phase,
         int? iteration,
+        WorkItemState baseBrokenResumeState,
         CancellationToken ct)
     {
         var auditTarget = SandboxTargetResolver.ResolveAudit(
@@ -304,7 +333,64 @@ internal sealed class RequiredBuildGate
                 result.Reason ?? "could not verify required build: verifier unavailable");
         }
 
+        await ThrowIfBaseBrokenAsync(
+            item,
+            project,
+            repoId,
+            baseBranch,
+            workBranch,
+            request.SandboxPolicy,
+            phase,
+            baseBrokenResumeState,
+            result,
+            ct);
+
         return result;
+    }
+
+    /// <summary>
+    /// Base-broken attribution for a Failed result: when no compiler error
+    /// file from the work-branch build output is inside the item's diff and
+    /// the base tip reproduces the same build failure, throws
+    /// <see cref="BaseBuildBrokenException"/> carrying the resume state the
+    /// caller mapped for this gate entry point. Runs AFTER the toolchain
+    /// check (a retryable toolchain fault re-runs the same commit and never
+    /// reaches attribution) and after Unavailable (infra, not a verdict).
+    /// Ordering against the item's own failure handling is what the
+    /// classifier's fail-closed contract guarantees: any indeterminate
+    /// outcome keeps the historical item-attributed path.
+    /// </summary>
+    private async Task ThrowIfBaseBrokenAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        RequiredBuildSandboxPolicy sandboxPolicy,
+        string phase,
+        WorkItemState resumeState,
+        RequiredBuildVerificationResult result,
+        CancellationToken ct)
+    {
+        if (_baseBrokenClassifier is null)
+            return;
+        if (result.Status != RequiredBuildVerificationStatus.Failed)
+            return;
+
+        var verdict = await _baseBrokenClassifier.TryClassifyAsync(
+            item, project, repoId, baseBranch, workBranch, result, sandboxPolicy, ct);
+        if (verdict is null)
+            return;
+
+        throw new BaseBuildBrokenException(
+            $"required build failed on base branch '{baseBranch}' tip {verdict.BaseSha[..Math.Min(12, verdict.BaseSha.Length)]} " +
+            $"with no error file inside the item diff: the base is broken, not the work " +
+            $"(phase '{phase}' detected it)",
+            baseBranch,
+            verdict.BaseSha,
+            verdict.BaseBuildOutput,
+            resumeState,
+            phase);
     }
 
     /// <summary>

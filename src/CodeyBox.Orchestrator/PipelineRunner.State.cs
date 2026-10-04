@@ -605,7 +605,15 @@ public sealed partial class PipelineRunner
         // production DI shares one process-wide instance with the dispatch
         // loop's pause gate; null falls back to a runner-local default
         // tracker so the behavior is on everywhere.
-        ProviderTransientCorrelationTracker? providerTransientCorrelation = null)
+        ProviderTransientCorrelationTracker? providerTransientCorrelation = null,
+        // Base-broken attribution + containment. Both are optional: null
+        // keeps the historical item-attributed required-build failure path
+        // (the gate classifies nothing and no project hold can be recorded).
+        // BaseBuildVerifier resolves and sandbox-builds the base tip with a
+        // per-SHA verdict cache; the tracker owns the durable project
+        // condition, the fix-item dedupe, and the dispatcher hold.
+        BaseBuildVerifier? baseBuildVerifier = null,
+        BaseBrokenConditionTracker? baseBrokenConditions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -770,13 +778,23 @@ public sealed partial class PipelineRunner
         _baselineStager = baselineStager;
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
         _mergeLandingGate = mergeLandingGate ?? MergeLandingGate.Shared;
+        _baseBrokenConditions = baseBrokenConditions;
+        var effectiveToolchainFaultClassifier =
+            toolchainFaultClassifier ?? new ToolchainFaultClassifier(snapshot: null);
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
             _auditReports is null ? null : PersistAuditReportAsync,
-            toolchainFaultClassifier ?? new ToolchainFaultClassifier(snapshot: null),
-            toolchainFaultRecords ?? new InMemoryToolchainFaultRecordStore());
+            effectiveToolchainFaultClassifier,
+            toolchainFaultRecords ?? new InMemoryToolchainFaultRecordStore(),
+            baseBrokenClassifier: baseBuildVerifier is null
+                ? null
+                : new BaseBrokenBuildClassifier(
+                    _gitHost,
+                    baseBuildVerifier,
+                    _pipelineTuning));
     }
 
     private readonly RequiredBuildGate _requiredBuildGate;
+    private readonly BaseBrokenConditionTracker? _baseBrokenConditions;
 
 }

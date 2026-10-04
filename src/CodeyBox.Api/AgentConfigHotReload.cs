@@ -1650,6 +1650,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.SuggestionDedupeSimilarityThreshold,
                 SuggestionDedupeDismissedMatchWindowSeconds = opts.SuggestionDedupeDismissedMatchWindow.TotalSeconds,
                 opts.SuggestionDedupeMaxRecordedSources,
+                opts.BaseBrokenDetectionEnabled,
+                opts.BaseBrokenFixItemPriority,
+                BaseBrokenRecheckIntervalSeconds = opts.BaseBrokenRecheckInterval.TotalSeconds,
             },
             JsonOpts);
 
