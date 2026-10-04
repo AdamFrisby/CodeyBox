@@ -186,6 +186,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     // membership is answered live from _deferredItems so the two cannot drift.
     private readonly DispatchItemLivenessTracker? _dispatchLiveness;
     private readonly ProviderTransientCorrelationTracker? _hostTransientPause;
+    private readonly BaseBrokenConditionTracker? _baseBrokenConditions;
 
     /// <summary>Test/diagnostic hook for the dispatch-liveness record.</summary>
     internal DispatchItemLivenessTracker? DispatchLiveness => _dispatchLiveness;
@@ -351,7 +352,11 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         // briefly instead of dispatching into a host/network blip. Optional;
         // null disables the gate. Production DI shares the process-wide
         // instance the PipelineRunner observes into.
-        ProviderTransientCorrelationTracker? hostTransientPause = null)
+        ProviderTransientCorrelationTracker? hostTransientPause = null,
+        // Project-level base-broken hold: while a condition is active for a
+        // project, build-dependent candidates are skipped at pickup (the
+        // filed fix item is exempt). Optional; null disables the gate.
+        BaseBrokenConditionTracker? baseBrokenConditions = null)
     {
         _queue = queue;
         _store = store;
@@ -384,6 +389,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         _time = timeProvider ?? TimeProvider.System;
         _dispatchLiveness = dispatchLiveness;
         _hostTransientPause = hostTransientPause;
+        _baseBrokenConditions = baseBrokenConditions;
         if (_dispatchLiveness is not null)
             _dispatchLiveness.IsDeferredProvider = id => _deferredItems.Contains(id);
         _activeSandboxCountProvider = activeSandboxCountProvider ?? (static () => SandboxLiveCounter.Active);
@@ -2058,6 +2064,23 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
             {
                 if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
                     continue;
+
+                // Base-broken hold: while the project's base branch is
+                // recorded as failing the required build at its tip,
+                // build-dependent candidates must not dispatch — every
+                // pickup lands on the same broken base and burns an
+                // attempt. The auto-filed fix item for the broken SHA is
+                // exempt (it is the repair path). Checked before the
+                // quota-retry promotion so a WaitingForQuotaReset item on a
+                // broken base also stays held.
+                if (_baseBrokenConditions is not null
+                    && await _baseBrokenConditions.HoldsBuildPhasesAsync(candidate, stoppingToken))
+                {
+                    _log.LogInformation(
+                        "Dispatch skip {Id}: project {ProjectId} base branch is broken at a recorded tip — build phases held until it builds again",
+                        candidate.Id, candidate.ProjectId.Value);
+                    continue;
+                }
 
                 if (candidate.State == WorkItemState.WaitingForQuotaReset)
                 {

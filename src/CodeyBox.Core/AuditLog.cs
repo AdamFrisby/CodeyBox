@@ -1358,6 +1358,34 @@ public static class AuditLog
         Audit("project_queue.resumed")
             .Information("Project {ProjectId} queue resumed", projectId.Value);
 
+    /// <summary>
+    /// A required-build failure was attributed to the project's base branch
+    /// (the base tip reproduces it with no contributing error file inside the
+    /// item diff). While the condition is active the dispatcher holds
+    /// build-dependent phases for the project.
+    /// </summary>
+    public static void BaseBrokenDetected(
+        ProjectId projectId,
+        string baseBranch,
+        string baseSha,
+        string? errorSummary = null) =>
+        Audit("project.base_broken_detected")
+            .Warning(
+                "Project {ProjectId} base branch {BaseBranch} tip {BaseSha} fails the required build; build-dependent phases held: {ErrorSummary}",
+                projectId.Value.Replace("\r", "").Replace("\n", ""),
+                AuditSingleLine(baseBranch, 128),
+                AuditSingleLine(baseSha, 64),
+                AuditSingleLine(errorSummary ?? "(no output)", 512));
+
+    /// <summary>The base tip builds again; held items may resume.</summary>
+    public static void BaseBrokenCleared(ProjectId projectId, string baseBranch, string baseSha) =>
+        Audit("project.base_broken_cleared")
+            .Information(
+                "Project {ProjectId} base branch {BaseBranch} tip {BaseSha} builds again; held items resuming",
+                projectId.Value.Replace("\r", "").Replace("\n", ""),
+                AuditSingleLine(baseBranch, 128),
+                AuditSingleLine(baseSha, 64));
+
     public static void BudgetAlertWarning(ProjectId projectId, decimal spendUsd, decimal budgetUsd, double pct) =>
         Audit("budget_alert.warning")
             .Warning("Project {ProjectId} budget warning: ${SpendUsd:F4} of ${BudgetUsd:F2} ({Pct:F1}%)",

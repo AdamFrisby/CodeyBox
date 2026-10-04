@@ -580,6 +580,9 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 | `MergeGuardReworkMaxAttempts` | `2` | Conflict-rework turns after a resolver safety guard fires (edits outside the permitted conflict hunks, or a rework that discarded prior commits). Each turn runs on the refreshed base with the guard reason in the brief; past the cap the item parks at `MergeConflictResolutionFailed`. Hot-reloadable. |
 | `SuggestionDedupeDismissedMatchWindow` | `30.00:00:00` (30 days) | How far back a dismissed suggestion still attracts repeats: a matching suggestion dismissed within this window bumps its occurrence count instead of spawning a new row (the dismissal sticks). Open suggestions always match. Hot-reloadable. |
 | `SuggestionDedupeMaxRecordedSources` | `25` | Cap on the source work-item id list recorded on a merged suggestion. Once full, repeats still bump the occurrence count but stop appending ids. Must be ≥ 1. Hot-reloadable. |
+| `BaseBrokenDetectionEnabled` | `true` | When a required-build failure's compiler errors point at files outside the item's diff, the orchestrator sandbox-builds the base tip (verdict cached per base SHA). A reproducing failure parks the item without a failure charge and records a project-level base-broken condition that holds build-dependent dispatch; `false` keeps every required-build failure item-attributed. Hot-reloadable. |
+| `BaseBrokenFixItemPriority` | `1000` | Dispatch priority for the auto-filed base-fix work item (one per broken base SHA). Must be within [-1000, 1000]. Hot-reloadable. |
+| `BaseBrokenRecheckInterval` | `00:02:00` (2 min) | Interval between base-tip re-checks for active base-broken conditions: the same SHA skips the rebuild, a moved tip is built once and the condition clears when it passes. Must be positive. Hot-reloadable. |
 
 Durable agent-turn scratchpad archives have a non-configurable 32 MiB safety
 cap. They are stored as content-verified, host-private SQLite BLOBs and are

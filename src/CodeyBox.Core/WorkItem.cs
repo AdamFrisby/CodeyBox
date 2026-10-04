@@ -502,7 +502,8 @@ public sealed record WorkItem
     /// Dispatch priority for Queued items. Higher values pick up first; ties break by
     /// <see cref="CreatedAt"/> ascending so equal-priority items remain FIFO. Default 0;
     /// negative values sort behind defaults, positive values ahead. The API clamps to
-    /// the range [-1000, 1000] and may apply a per-project cap.
+    /// the range [<see cref="WorkItemLimits.MinPriority"/>,
+    /// <see cref="WorkItemLimits.MaxPriority"/>] and may apply a per-project cap.
     /// </summary>
     public int Priority { get; init; } = 0;
 

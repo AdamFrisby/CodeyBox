@@ -23,6 +23,7 @@ public static class EventSchema
     private const string TransientRetryVersion = "1.4";
     private const string PlanningVersion = "1.5";
     private const string QuotaResetOptimalVersion = "1.6";
+    private const string BaseBrokenVersion = "1.7";
 
     /// <summary>
     /// Returns the schema document. Plain value type so it serialises cleanly
@@ -64,6 +65,8 @@ public static class EventSchema
         {
             "quota.reset_optimal" => QuotaResetOptimalVersion,
             "work_item.no_action_required" => QuotaResetOptimalVersion,
+            "project.base_broken_detected" or "project.base_broken_cleared"
+                or "work_item.base_broken_parked" => BaseBrokenVersion,
             "upstream.pr_stale_base" => UpstreamPrStaleBaseVersion,
             "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
             "work_item.waiting_for_transient_retry" => TransientRetryVersion,
@@ -110,6 +113,8 @@ public static class EventSchema
         "project.budget_warning",
         "project.budget_exceeded",
         "project.budget_recovered",
+        "project.base_broken_detected",
+        "project.base_broken_cleared",
         // Work-item state transitions
         "work_item.planning",
         "work_item.plan_review",
@@ -135,6 +140,7 @@ public static class EventSchema
         "work_item.waiting_for_quota_reset",
         "work_item.waiting_for_agent_resume",
         "work_item.waiting_for_transient_retry",
+        "work_item.base_broken_parked",
         // Work-item lifecycle / operator interaction
         "work_item.agent_stuck",
         "work_item.auto_retry",

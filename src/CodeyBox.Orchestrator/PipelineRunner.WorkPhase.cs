@@ -1528,7 +1528,12 @@ public sealed partial class PipelineRunner
             && ex is not AgentTurnCheckpointConvertedException
             && ex is not AgentTurnResumeClaimConflictException
             && ex is not AgentInfrastructureFailureException
-            && ex is not SandboxProvisioningDeferredException)
+            && ex is not SandboxProvisioningDeferredException
+            // A broken-base attribution is a work-item outcome, not a
+            // checkpoint-conversion failure: it must reach the outer
+            // BaseBuildBrokenException catch unwrapped so the item parks
+            // (branch preserved) instead of failing as infrastructure.
+            && ex is not BaseBuildBrokenException)
         {
             throw new AgentInfrastructureFailureException(
                 runner.Kind,

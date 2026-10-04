@@ -809,9 +809,14 @@ internal sealed class WorkItemCommandService
             catch (ArgumentException ex) { return CommandPlan<WorkItemExternalIdsPlan>.Refused(WorkItemCommandOutcome.BadRequest(ex.Message)); }
             if (value is null)
             {
+                // Deleting a system-reserved marker is always allowed so
+                // operators can clean up a marker that predates the
+                // reservation; (re)setting one never is.
                 resulting.Remove(ns);
                 continue;
             }
+            try { Validation.ThrowIfSystemExternalIdNamespace(ns, $"externalIds key '{nsLabel}'"); }
+            catch (ArgumentException ex) { return CommandPlan<WorkItemExternalIdsPlan>.Refused(WorkItemCommandOutcome.BadRequest(ex.Message)); }
             try { Validation.ValidateExternalId(value, $"externalIds['{nsLabel}']"); }
             catch (ArgumentException ex) { return CommandPlan<WorkItemExternalIdsPlan>.Refused(WorkItemCommandOutcome.BadRequest(ex.Message)); }
             resulting[ns] = value;

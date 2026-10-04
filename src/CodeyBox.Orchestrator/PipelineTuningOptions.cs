@@ -391,6 +391,36 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public int SuggestionDedupeMaxRecordedSources { get; set; } = 25;
 
+    /// <summary>
+    /// Master switch for base-broken attribution and containment. When true
+    /// (default), a required-build failure whose compiler errors point at
+    /// files outside the item's diff triggers a base-tip sandbox build; a
+    /// reproducing failure parks the item (no failure charge) and sets the
+    /// project-level base-broken condition that holds build-dependent
+    /// dispatch. When false, every required-build failure stays
+    /// item-attributed (historical behaviour). Hot-reloaded with the rest
+    /// of <c>PipelineTuning</c>.
+    /// </summary>
+    public bool BaseBrokenDetectionEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Dispatch priority for the auto-filed base-fix work item — one per
+    /// broken base SHA. Defaults to <see cref="Core.WorkItemLimits.MaxPriority"/>
+    /// so the repair path always outranks ordinary work. Clamped to the
+    /// valid priority range. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>.
+    /// </summary>
+    public int BaseBrokenFixItemPriority { get; set; } = Core.WorkItemLimits.MaxPriority;
+
+    /// <summary>
+    /// Interval between base-tip re-checks for active base-broken
+    /// conditions. A sweep resolves the base tip; the same broken SHA skips
+    /// the rebuild (its verdict is immutable), a moved tip is built once
+    /// and the condition clears when it passes. Default 2 minutes; must be
+    /// positive. Hot-reloaded with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public TimeSpan BaseBrokenRecheckInterval { get; set; } = TimeSpan.FromMinutes(2);
+
     public void Validate()
     {
         _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
@@ -511,6 +541,21 @@ public sealed class PipelineTuningOptions
             throw new ArgumentOutOfRangeException(
                 nameof(SandboxPermitWaitWarningThreshold),
                 "SandboxPermitWaitWarningThreshold must be non-negative (zero disables the slow-permit warning)");
+        }
+        if (BaseBrokenFixItemPriority < Core.WorkItemLimits.MinPriority
+            || BaseBrokenFixItemPriority > Core.WorkItemLimits.MaxPriority)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(BaseBrokenFixItemPriority),
+                BaseBrokenFixItemPriority,
+                $"BaseBrokenFixItemPriority must be within [{Core.WorkItemLimits.MinPriority}, {Core.WorkItemLimits.MaxPriority}]");
+        }
+        if (BaseBrokenRecheckInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(BaseBrokenRecheckInterval),
+                BaseBrokenRecheckInterval,
+                "BaseBrokenRecheckInterval must be a positive TimeSpan");
         }
         new Core.SuggestionDedupePolicy
         {

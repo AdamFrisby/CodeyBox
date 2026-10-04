@@ -1310,6 +1310,22 @@ internal static class WorkItemEndpoints
         CancellationToken ct)
     {
         var refactorGates = await refactorProjectGates.GetRefactorProjectGateStatusAsync(ct);
+        // Optional: projects whose base branch tip is recorded as failing
+        // the required build report their hold here — the same reason the
+        // dispatcher logs when it skips a held candidate.
+        var baseBroken = context.RequestServices
+            .GetService<IBaseBrokenConditionStatusProvider>()
+            ?.GetActiveConditions()
+            .Select(c => new
+            {
+                projectId = c.ProjectId.Value,
+                baseBranch = c.BaseBranch,
+                baseSha = c.BaseSha,
+                detectedAt = c.DetectedAt,
+                fixWorkItemId = c.FixWorkItemId?.ToString(),
+                reason = $"base branch '{c.BaseBranch}' fails the required build at tip {c.BaseSha[..Math.Min(12, c.BaseSha.Length)]}; build-dependent phases held",
+            })
+            .ToArray() ?? [];
         // Optional: items that have waited purely on quota past the notice
         // threshold surface as "waiting on quota for {agent} since ..." so a
         // long quota stall reads as waiting — not wedged — in queue status.
@@ -1340,6 +1356,7 @@ internal static class WorkItemEndpoints
             pausedAt = queueController.PausedAt,
             pausedReason = queueController.PausedReason,
             quotaWaiting,
+            baseBroken,
             refactorGates = refactorGates.Select(g => new
             {
                 projectId = g.ProjectId.Value,

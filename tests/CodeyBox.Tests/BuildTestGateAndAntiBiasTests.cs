@@ -1199,7 +1199,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
         Assert.NotNull(timeoutEvent);
-        Assert.Equal("1.6", timeoutEvent.EventSchemaVersion);
+        Assert.Equal("1.7", timeoutEvent.EventSchemaVersion);
         var details = Assert.IsType<AuditAuditorTimedOutDetails>(timeoutEvent.Details);
 
         Assert.Equal(item.Id.ToString(), details.WorkItemId);
@@ -1264,7 +1264,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 
         var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
         Assert.NotNull(timeoutEvent);
-        Assert.Equal("1.6", timeoutEvent.EventSchemaVersion);
+        Assert.Equal("1.7", timeoutEvent.EventSchemaVersion);
         var details = Assert.IsType<AuditAuditorTimedOutDetails>(timeoutEvent.Details);
 
         Assert.Equal(item.Id.ToString(), details.WorkItemId);
